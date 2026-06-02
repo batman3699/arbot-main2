@@ -1662,33 +1662,25 @@ where
         let mut pending = self.pending.lock().await;
 
         let now = Instant::now();
-        pending.retain(|_, time| now.duration_since(*time) < Duration::from_secs(60));
+        // Drop stale in-flight markers (beyond any realistic inclusion window).
+        pending.retain(|_, time| now.duration_since(*time) < Duration::from_secs(120));
 
-        if pending.len() > 5 {
-            let chain_nonce = self
-                .provider
-                .get_transaction_count(self.wallet, None)
-                .await?;
-            *current = Some(chain_nonce);
-            pending.clear();
-        }
+        // Authoritative starting point: the chain's PENDING nonce accounts for our
+        // txs already seen by the node's mempool. Using `Latest` (confirmed) here
+        // was the historical bug — it could hand out a nonce still occupied by an
+        // unconfirmed tx, causing replacement wars or silently dropped txs.
+        let chain_pending = self
+            .provider
+            .get_transaction_count(self.wallet, Some(BlockNumber::Pending.into()))
+            .await
+            .context("fetch pending nonce")?;
 
-        let next = match *current {
-            Some(nonce) => {
-                let next = nonce;
-                *current = Some(nonce.saturating_add(U256::one()));
-                next
-            }
-            None => {
-                let chain_nonce = self
-                    .provider
-                    .get_transaction_count(self.wallet, None)
-                    .await?;
-                *current = Some(chain_nonce.saturating_add(U256::one()));
-                chain_nonce
-            }
-        };
+        // Local high-water mark guards against an RPC pending view that lags our
+        // privately-submitted bundles (relay txs may not be in this node's mempool).
+        let local_floor = current.unwrap_or(chain_pending);
+        let next = std::cmp::max(chain_pending, local_floor);
 
+        *current = Some(next.saturating_add(U256::one()));
         pending.insert(next, now);
         Ok(next)
     }
@@ -1699,8 +1691,19 @@ where
     }
 
     async fn mark_failed(&self, nonce: U256) {
+        let mut current = self.current.lock().await;
         let mut pending = self.pending.lock().await;
         pending.remove(&nonce);
+
+        // Gap recovery: if the failed nonce was the highest we allocated and nothing
+        // higher is still in flight, reclaim it so the next dispatch reuses it instead
+        // of leaving a permanent mempool gap. If the tx actually landed despite the
+        // local failure, the next get_next() reconciles via the chain pending nonce
+        // (max(chain_pending, local_floor)), so we never reuse a nonce that confirmed.
+        let highest_in_flight = pending.keys().copied().max();
+        if highest_in_flight.map(|h| h < nonce).unwrap_or(true) {
+            *current = Some(nonce);
+        }
     }
 }
 
@@ -3604,18 +3607,30 @@ where
         let expected_univ3_edges =
             expected_univ3_edge_upper_bound(self.hot_univ3_pools.read().await.len());
 
+        // FAIL CLOSED: the latest block number is a required freshness signal. It
+        // drives stale-edge quarantine (max_quote_block_lag) and congestion limits.
+        // If we cannot obtain a non-zero head, we must NOT scan or broadcast on
+        // unknown/stale state. Returning an rpc-classified error aborts this cycle
+        // and lets the run loop back off and retry instead of trading blind.
         let (base_fee, block_number) = match self.provider.get_block(BlockNumber::Latest).await {
-            Ok(opt_block) => {
-                let number = opt_block
-                    .as_ref()
-                    .and_then(|block| block.number)
-                    .unwrap_or_default();
-                let fee = opt_block.and_then(|block| block.base_fee_per_gas);
-                (fee, number)
+            Ok(Some(block)) => {
+                let number = block.number.unwrap_or_default();
+                if number.is_zero() {
+                    return Err(anyhow!(
+                        "rpc returned latest block with no number; refusing to scan on stale state (fail-closed)"
+                    ));
+                }
+                (block.base_fee_per_gas, number)
+            }
+            Ok(None) => {
+                return Err(anyhow!(
+                    "rpc returned no latest block; refusing to scan on stale state (fail-closed)"
+                ));
             }
             Err(err) => {
-                warn!(error = %err, "Failed to fetch latest block for congestion tracking");
-                (None, U64::zero())
+                warn!(error = %err, "Failed to fetch latest block; failing closed");
+                return Err(anyhow::Error::new(err)
+                    .context("fetch latest block (rpc); refusing to scan on stale state"));
             }
         };
 
