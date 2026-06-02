@@ -1,0 +1,6 @@
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: "arbot"
+    static_configs:
+      - targets: ["localhost:9000"]

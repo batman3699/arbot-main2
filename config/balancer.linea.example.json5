@@ -1,0 +1,12 @@
+[
+  // Balancer pools (Linea)
+  // Format: { poolId, tokenIn, tokenOut }
+  //
+  // NOTE: As of the Balancer docs, Balancer V3 deployments/subgraphs are listed for:
+  // Arbitrum, Avalanche, Base, Ethereum, Gnosis, Optimism, Plasma, Sepolia.
+  // Linea is not listed, so keep this empty until Balancer is deployed here.
+  //
+  // Common routing tokens on Linea (for convenience when you add pools):
+  // - WETH: 0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f
+  // - USDC: 0x176211869cA2b568f2A7d4EE941E073a821EE1ff
+]

@@ -1,0 +1,5 @@
+[
+  // Balancer v2 pools (Optimism)
+  // Format: { poolId, tokenIn, tokenOut }
+  // NOTE: Populate with poolIds you want to quote (e.g. from Balancer UI URLs).
+]

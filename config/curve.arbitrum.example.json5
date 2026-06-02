@@ -1,0 +1,19 @@
+[
+  // Curve 2pool (USDC.e/USDT)
+  {
+    "pool": "0x7f90122BF0700F9E7e1F688fe926940E8839F353",
+    "tokenIn": "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+    "tokenOut": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+    "selector": "0x3df02124", // get_dy(uint256,uint256,uint256)
+    "i": 0,
+    "j": 1
+  },
+  {
+    "pool": "0x7f90122BF0700F9E7e1F688fe926940E8839F353",
+    "tokenIn": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+    "tokenOut": "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+    "selector": "0x3df02124", // get_dy(uint256,uint256,uint256)
+    "i": 1,
+    "j": 0
+  }
+]

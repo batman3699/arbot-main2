@@ -1,0 +1,76 @@
+[
+  // SushiSwap WETH/stable pairs
+  {
+    pair: "0x905dfCD5649217c42684f23958568e533C711Aa3", // WETH/USDC.e
+    tokenIn: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    tokenOut: "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+    feeBps: 30,
+  },
+  {
+    pair: "0x905dfCD5649217c42684f23958568e533C711Aa3",
+    tokenIn: "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+    tokenOut: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    feeBps: 30,
+  },
+  {
+    pair: "0x57b85FEf094e10b5eeCDF350Af688299E9553378", // WETH/USDC
+    tokenIn: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    tokenOut: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    feeBps: 30,
+  },
+  {
+    pair: "0x57b85FEf094e10b5eeCDF350Af688299E9553378",
+    tokenIn: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    tokenOut: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    feeBps: 30,
+  },
+  {
+    pair: "0xCB0E5bFa72bBb4d16AB5aA0c60601c438F04b4ad", // WETH/USDT
+    tokenIn: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    tokenOut: "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+    feeBps: 30,
+  },
+  {
+    pair: "0xCB0E5bFa72bBb4d16AB5aA0c60601c438F04b4ad",
+    tokenIn: "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+    tokenOut: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    feeBps: 30,
+  },
+  // Camelot WETH/stable pairs
+  {
+    pair: "0x84652bb2539513BAf36e225c930Fdd8eaa63CE27", // WETH/USDC.e
+    tokenIn: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    tokenOut: "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+    feeBps: 30,
+  },
+  {
+    pair: "0x84652bb2539513BAf36e225c930Fdd8eaa63CE27",
+    tokenIn: "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+    tokenOut: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    feeBps: 30,
+  },
+  {
+    pair: "0x54B26fAf3671677C19F70c4B879A6f7B898F732c", // WETH/USDC
+    tokenIn: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    tokenOut: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    feeBps: 30,
+  },
+  {
+    pair: "0x54B26fAf3671677C19F70c4B879A6f7B898F732c",
+    tokenIn: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    tokenOut: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    feeBps: 30,
+  },
+  {
+    pair: "0x97b192198d164C2a1834295e302B713bc32C8F1d", // WETH/USDT
+    tokenIn: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    tokenOut: "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+    feeBps: 30,
+  },
+  {
+    pair: "0x97b192198d164C2a1834295e302B713bc32C8F1d",
+    tokenIn: "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+    tokenOut: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    feeBps: 30,
+  },
+]

@@ -1,0 +1,589 @@
+chains:
+- chain_name: ethereum
+  chain_id: 1
+  env_prefix: ETH
+  rpc_http_urls:
+  - https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}
+  - https://rpc.ankr.com/eth
+  rpc_ws_urls:
+  - wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}
+  gas_model: eip1559
+  executor_address: '0x1c3d856D29eA2118c8d955070a6AD83C984586f3'
+  executor_owner: '0x36C77CC277e73CCcd199d1989828739722Fe5450'
+  permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+  venues:
+  - name: uniswap_v3
+    kind: univ3_like
+    factory: '0x1F98431c8aD98523631AE4a59f267346ea31F984'
+    router: '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45'
+    quoter: '0x61fFE014bA17989E743c5F6cB21bF9697530B21e'
+    fee_tiers:
+    - 500
+    - 3000
+    - 10000
+  - name: uniswap_v4
+    kind: univ4
+    pool_manager: '0x000000000004444c5dc75cB358380D2e3dE08A90'
+  - name: curve
+    kind: curve_like
+    registry: '0xF98B45FA17DE75FB1aD0e7aFD971b0ca00e379fC'
+  - name: balancer
+    kind: balancer_like
+    vault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8'
+  - name: sushiswap_v2
+    kind: univ2_like
+    factory: '0xC0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac'
+    router: '0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F'
+    fee_bps: 30
+    pool_init_code_hash: '0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f'
+  - name: uniswap_v2
+    kind: univ2_like
+    factory: '0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f'
+    router: '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D'
+    fee_bps: 30
+    pool_init_code_hash: '0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f'
+  flashloans:
+  - name: aave_v3
+    kind: aave_v3_like
+    pool: '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2'
+    max_loan_assets:
+    - '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+    - '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
+    - '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+    allowlist_tokens:
+    - '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+    - '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
+    - '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+  - name: balancer_vault
+    kind: balancer_vault_like
+    vault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8'
+    max_loan_assets:
+    - '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+    - '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
+    - '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+    allowlist_tokens:
+    - '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+    - '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
+    - '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+  broadcast:
+    mode: private
+    private_relays:
+    - https://rpc.flashbots.net/fast
+    - https://rpc.titanbuilder.xyz
+    - https://rpc.beaverbuild.org
+    public_mempool_jitter_bps: 35
+- chain_name: arbitrum
+  chain_id: 42161
+  env_prefix: ARB
+  rpc_http_urls:
+  rpc_ws_urls:
+  gas_model: arbitrum
+  arbitrum_l1_per_byte_wei: '0'
+  arbitrum_l1_per_byte_max_deviation_bps: 2000
+  executor_address: ${ARB_EXECUTOR_ADDRESS}
+  executor_owner: ${ARB_EXECUTOR_OWNER}
+  permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+  venues:
+  - name: uniswap_v3
+    kind: univ3_like
+    factory: '0x1F98431c8aD98523631AE4a59f267346ea31F984'
+    router: '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45'
+    quoter: '0x61fFE014bA17989E743c5F6cB21bF9697530B21e'
+    fee_tiers:
+    - 100
+    - 500
+    - 3000
+  flashloans:
+  - name: balancer_vault
+    kind: balancer_vault_like
+    vault: '0xba12222222228d8ba445958a75a0704d566bf2c8'
+    lender: null
+    fee_bps: 9
+    max_loan_assets:
+    - '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1'
+    - '0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8'
+    allowlist_tokens:
+    - '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1'
+    - '0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8'
+  broadcast:
+    mode: private
+    private_relays:
+    - https://rpc.titanbuilder.xyz
+    - https://rpc.beaverbuild.org
+    public_mempool_jitter_bps: 75
+- chain_name: optimism
+  chain_id: 10
+  env_prefix: OPT
+  rpc_http_urls:
+  - ${OPT_PRIVATE_RPC_HTTP_URL}
+  rpc_ws_urls:
+  - ${OPT_PRIVATE_RPC_WS_URL}
+  gas_model: op_stack
+  executor_address: ${OPT_EXECUTOR_ADDRESS}
+  executor_owner: ${OPT_EXECUTOR_OWNER}
+  permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+  venues:
+  - name: uniswap_v3
+    kind: univ3_like
+    factory: '0x1F98431c8aD98523631AE4a59f267346ea31F984'
+    router: '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45'
+    quoter: '0x61fFE014bA17989E743c5F6cB21bF9697530B21e'
+    fee_tiers:
+    - 100
+    - 500
+    - 3000
+  flashloans:
+  - name: aave_v3
+    kind: aave_v3_like
+    pool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD'
+    max_loan_assets:
+    - '0x4200000000000000000000000000000000000006'
+    allowlist_tokens:
+    - '0x4200000000000000000000000000000000000006'
+  broadcast:
+    mode: private
+    private_relays:
+    - ${OPT_PRIVATE_RELAY_URL}
+    public_mempool_jitter_bps: 75
+- chain_name: base
+  chain_id: 8453
+  env_prefix: BASE
+  rpc_http_urls:
+  - https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}
+  - https://base-mainnet.publicnode.com
+  rpc_ws_urls:
+  - wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}
+  gas_model: op_stack
+  executor_address: '0x627e54a5Fad377d0d0eef60298f7F3d0e2c15E7A'
+  executor_owner: '0xA6080B97261C4F5AAB13C5533e75d36890cbD1E3'
+  permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+  venues:
+  - name: uniswap_v2
+    kind: univ2_like
+    factory: '0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6'
+    router: '0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24'
+    fee_bps: 30
+    pool_init_code_hash: '0x96e8ac4277198ff8b6f785478aa9a39f403cb768dd02cbee326c3e7da348845f'
+  - name: uniswap_v3
+    kind: univ3_like
+    factory: '0x33128a8fC17869897dcE68Ed026d694621f6FDfD'
+    router: '0x2626664c2603336E57B271c5C0b26F421741e481'
+    quoter: '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a'
+    permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+    fee_tiers:
+     - 100
+     - 500
+     - 3000
+     - 10000
+  flashloans:
+  - name: aave_v3
+    kind: aave_v3_like
+    pool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5'
+    fee_bps: 5
+    max_loan_assets:
+      - '0x4200000000000000000000000000000000000006' # WETH
+      - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
+    allowlist_tokens:
+      - '0x4200000000000000000000000000000000000006' # WETH
+      - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
+  - name: balancer_v2
+    kind: balancer_vault_like
+    vault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8'
+    fee_bps: 0
+    max_loan_assets:
+      - '0x4200000000000000000000000000000000000006' # WETH
+      - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
+    allowlist_tokens:
+      - '0x4200000000000000000000000000000000000006' # WETH
+      - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
+  broadcast:
+    mode: private
+    private_relays:
+    - https://api.blxrbdn.com
+    private_method_policy: bundle_then_private_raw
+    public_mempool_jitter_bps: 75
+- chain_name: linea
+  chain_id: 59144
+  env_prefix: LINEA
+  rpc_http_urls:
+  - ${LINEA_PRIVATE_RPC_HTTP_URL}
+  rpc_ws_urls:
+  - ${LINEA_PRIVATE_RPC_WS_URL}
+  gas_model: linea_estimateGas
+  executor_address: ${LINEA_EXECUTOR_ADDRESS}
+  executor_owner: ${LINEA_EXECUTOR_OWNER}
+  permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+  venues: []
+  flashloans:
+  - name: univ3_flash
+    kind: univ3_flash
+    factory: '0x1F98431c8aD98523631AE4a59f267346ea31F984'
+    max_loan_assets:
+    - '0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f'
+    allowlist_tokens:
+    - '0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f'
+  broadcast:
+    mode: private
+    private_relays:
+    - ${LINEA_PRIVATE_RELAY_URL}
+    public_mempool_jitter_bps: 75
+- chain_name: abstract
+  chain_id: 2741
+  env_prefix: ABSTRACT
+  rpc_http_urls:
+  - https://abstract-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}
+  rpc_ws_urls:
+  - wss://abstract-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}
+  gas_model: custom_rpc_method
+  gas_rpc_method: eth_gasPrice
+  executor_address: ${ABSTRACT_EXECUTOR_ADDRESS}
+  executor_owner: ${ABSTRACT_EXECUTOR_OWNER}
+  permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+  venues:
+  - name: curve
+    kind: curve_like
+    registry: '0x0000000022D53366457F9d5E68Ec105046FC4383'
+  flashloans:
+  - name: univ2_flash
+    kind: univ2_flashswap
+    factory: '0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f'
+    max_loan_assets:
+    - '0x3439153EB7AF838Ad19d56E1571FBD09333C2809'
+    allowlist_tokens:
+    - '0x3439153EB7AF838Ad19d56E1571FBD09333C2809'
+  broadcast:
+    mode: private
+    private_relays:
+    - https://rpc.titanbuilder.xyz
+    - https://rpc.beaverbuild.org
+    public_mempool_jitter_bps: 75
+- chain_name: ink
+  chain_id: 57073
+  env_prefix: INK
+  rpc_http_urls:
+  - ${INK_PRIVATE_RPC_HTTP_URL}
+  rpc_ws_urls:
+  - ${INK_PRIVATE_RPC_WS_URL}
+  gas_model: op_stack
+  executor_address: ${INK_EXECUTOR_ADDRESS}
+  executor_owner: ${INK_EXECUTOR_OWNER}
+  permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+  venues:
+  - name: balancer
+    kind: balancer_like
+    vault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8'
+  flashloans:
+  - name: aave_v3
+    kind: aave_v3_like
+    pool: '0x2816cf15F6d2A220E789aA011D5EE4eB6c47FEbA'
+    max_loan_assets:
+    - '0x4200000000000000000000000000000000000006'
+    allowlist_tokens:
+    - '0x4200000000000000000000000000000000000006'
+  broadcast:
+    mode: private
+    private_relays:
+    - ${INK_PRIVATE_RELAY_URL}
+    public_mempool_jitter_bps: 75
+universe:
+  dynamic_top_tokens_30d: 60
+  include_usd_stablecoins: true
+  include_weth: true
+  include_wbtc: true
+  pair_prune_min_liquidity_usd: 250000
+  token_seeds:
+  - address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+    symbol: WETH
+    decimals: 18
+  - address: '0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
+    symbol: USDC
+    decimals: 6
+  - address: '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+    symbol: USDT
+    decimals: 6
+  - address: '0x6B175474E89094C44Da98b954EedeAC495271d0F'
+    symbol: DAI
+    decimals: 18
+  - address: '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599'
+    symbol: WBTC
+    decimals: 8
+  - address: '0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84'
+    symbol: stETH
+    decimals: 18
+  - address: '0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0'
+    symbol: wstETH
+    decimals: 18
+  - address: '0xae78736Cd615f374D3085123A210448E74Fc6393'
+    symbol: rETH
+    decimals: 18
+  - address: '0xBe9895146f7AF43049ca1c1AE358B0541Ea49704'
+    symbol: cbETH
+    decimals: 18
+  token_blacklist:
+  - '0x000000000000000000000000000000000000dEaD'
+  hub_tokens:
+  - '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+  - '0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48'
+  - '0xdAC17F958D2ee523a2206206994597C13D831ec7'
+  - '0x6B175474E89094C44Da98b954EedeAC495271d0F'
+  - '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599'
+  min_pool_liquidity_usd: 250000
+  min_pool_liquidity_tokens: 1
+  max_hot_pools_per_chain_per_venue: 250
+  max_cold_pools_stored: 1000
+  max_edges_hot: 400
+  topk_per_token: 4
+  max_hops: 6
+  cycle_candidate_cap_per_block: 500
+  event_sampling_rate: 0.85
+  event_sampling_block_window: 120
+  hot_pool_refresh_secs: 30
+  time_budget_ms:
+    search: 250
+    quoting: 150
+    simulation: 200
+risk:
+  per_chain:
+  - chain_name: ethereum
+    min_net_profit_usd: 25
+    max_gas_units_per_tx: 600000000000000000
+    max_fee_per_gas_cap: 21000000000000000000
+    max_slippage_bps: 50
+    max_price_impact_bps: 75
+    must_simulate_before_send: true
+    revert_penalty_model:
+      kind: flat
+      flat_bps: 25
+  - chain_name: arbitrum
+    min_net_profit_usd: 20
+    max_gas_units_per_tx: 500000
+    max_fee_per_gas_cap: 200000000000
+    max_slippage_bps: 60
+    max_price_impact_bps: 80
+    must_simulate_before_send: true
+    revert_penalty_model:
+      kind: linear
+      linear_base_bps: 10
+      linear_per_gas_bps: 1
+  - chain_name: optimism
+    min_net_profit_usd: 20
+    max_gas_units_per_tx: 500000
+    max_fee_per_gas_cap: 200000000000
+    max_slippage_bps: 60
+    max_price_impact_bps: 80
+    must_simulate_before_send: true
+    revert_penalty_model:
+      kind: linear
+      linear_base_bps: 10
+      linear_per_gas_bps: 1
+  - chain_name: base
+    min_net_profit_usd: 15
+    max_gas_units_per_tx: 500000
+    max_fee_per_gas_cap: 200000000000
+    max_slippage_bps: 50
+    max_price_impact_bps: 70
+    must_simulate_before_send: true
+    revert_penalty_model:
+      kind: linear
+      linear_base_bps: 10
+      linear_per_gas_bps: 1
+  - chain_name: linea
+    min_net_profit_usd: 15
+    max_gas_units_per_tx: 450000
+    max_fee_per_gas_cap: 200000000000
+    max_slippage_bps: 70
+    max_price_impact_bps: 90
+    must_simulate_before_send: true
+    revert_penalty_model:
+      kind: exponential
+      exponential_base_bps: 10
+      exponential_factor: 2
+  - chain_name: abstract
+    min_net_profit_usd: 10
+    max_gas_units_per_tx: 400000
+    max_fee_per_gas_cap: 200000000000
+    max_slippage_bps: 80
+    max_price_impact_bps: 100
+    must_simulate_before_send: true
+    revert_penalty_model:
+      kind: flat
+      flat_bps: 30
+  - chain_name: ink
+    min_net_profit_usd: 10
+    max_gas_units_per_tx: 400000
+    max_fee_per_gas_cap: 200000000000
+    max_slippage_bps: 80
+    max_price_impact_bps: 100
+    must_simulate_before_send: true
+    revert_penalty_model:
+      kind: flat
+      flat_bps: 30
+features:
+  enable_backrun:
+  - arbitrum
+  - base
+  - linea
+  enable_liquidations:
+  - base
+  - ethereum
+  liquidation_markets:
+  - chain_name: ethereum
+    aave_v3:
+      pool: '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2'
+      data_provider: '0x0a16f2FCC0D44FaE41cc54e079281D84A363bECD'
+      price_oracle: '0x54586bE62E3c3580375aE3723C145253060Ca0C2'
+    compound_v3:
+      comet: '0xc3d688B66703497DAA19211EEdff47f25384cdc3'
+      rewards: '0x1B0e765F6224C21223AeA2af16c1C46E38885a40'
+      configurator: '0x316f9708bB98af7dA9c68C1C3b5e79039cD336E3'
+      oracle: '0x54586bE62E3c3580375aE3723C145253060Ca0C2'
+    candidate_ttl_secs: 120
+    candidate_min_score: 2
+    candidate_max: 50
+    revert_threshold: 3
+    revert_cooldown_secs: 600
+    markets:
+    - name: aave_usdc_weth
+      kind: aave
+      adapter: '0x1c3d856D29eA2118c8d955070a6AD83C984586f3'
+      flash_loan_pool: '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2'
+      debt_token: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
+      collateral_token: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+      bonus_bps: 800
+      collateral_exchange_rate_bps: 10000
+      estimated_gas: 550000
+      selector: '0x6f307dc3'
+      receive_atoken: false
+      max_repay_wei: '0'
+    - name: compound_usdc_weth
+      kind: compound
+      adapter: '0x1c3d856D29eA2118c8d955070a6AD83C984586f3'
+      flash_loan_pool: '0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2'
+      debt_token: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
+      collateral_token: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2'
+      bonus_bps: 700
+      collateral_exchange_rate_bps: 10000
+      estimated_gas: 550000
+      selector: '0x6f307dc3'
+      receive_atoken: false
+      max_repay_wei: '0'
+  - chain_name: arbitrum
+    aave_v3:
+      pool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD'
+      data_provider: '0x243Aa95cAC2a25651eda86e80bEe66114413c43b'
+      price_oracle: '0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7'
+    compound_v3:
+      comet: '0x9c4ec768c28520B50860ea7a15bd7213a9fF58bf'
+      rewards: '0x88730d254A2f7e6AC8388c3198aFd694bA9f7fae'
+      configurator: '0xb21b06D71c75973babdE35b49fFDAc3F82Ad3775'
+      oracle: '0xb56c2F0B653B2e0b10C9b928C8580Ac5Df02C7C7'
+    candidate_ttl_secs: 120
+    candidate_min_score: 2
+    candidate_max: 50
+    revert_threshold: 3
+    revert_cooldown_secs: 600
+    markets:
+    - name: aave_usdc_weth
+      kind: aave
+      adapter: ${ARB_EXECUTOR_ADDRESS}
+      flash_loan_pool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD'
+      debt_token: '0xaf88d065E77c8cC2239327C5EDb0A33064e74E0B'
+      collateral_token: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1'
+      bonus_bps: 800
+      collateral_exchange_rate_bps: 10000
+      estimated_gas: 450000
+      selector: '0x6f307dc3'
+      receive_atoken: false
+      max_repay_wei: '0'
+    - name: compound_usdc_weth
+      kind: compound
+      adapter: ${ARB_EXECUTOR_ADDRESS}
+      flash_loan_pool: '0x794a61358D6845594F94dc1DB02A252b5b4814aD'
+      debt_token: '0xaf88d065E77c8cC2239327C5EDb0A33064e74E0B'
+      collateral_token: '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1'
+      bonus_bps: 700
+      collateral_exchange_rate_bps: 10000
+      estimated_gas: 450000
+      selector: '0x6f307dc3'
+      receive_atoken: false
+      max_repay_wei: '0'
+  - chain_name: base
+    aave_v3:
+      pool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5'
+      data_provider: '0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A'
+      price_oracle: '0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156'
+    compound_v3:
+      comet: '0xb125E6687d4313864e53df431d5425969c15Eb2F'
+      rewards: '0x123964802e6ABabBE1Bc9547D72Ef1B69B00A6b1'
+      configurator: '0x45939657d1CA34A8FA39A924B71D28Fe8431e581'
+      oracle: '0x2Cc0Fc26eD4563A5ce5e8bdcfe1A2878676Ae156'
+    candidate_ttl_secs: 120
+    candidate_min_score: 2
+    candidate_max: 50
+    revert_threshold: 3
+    revert_cooldown_secs: 600
+    markets:
+    - name: aave_usdc_weth
+      kind: aave
+      adapter: '0x627e54a5Fad377d0d0eef60298f7F3d0e2c15E7A'
+      flash_loan_pool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5'
+      debt_token: '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913'
+      collateral_token: '0x4200000000000000000000000000000000000006'
+      bonus_bps: 800
+      collateral_exchange_rate_bps: 10000
+      estimated_gas: 450000
+      selector: '0x6f307dc3'
+      receive_atoken: false
+      max_repay_wei: '0'
+    - name: compound_usdc_weth
+      kind: compound
+      adapter: '0x627e54a5Fad377d0d0eef60298f7F3d0e2c15E7A'
+      flash_loan_pool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5'
+      debt_token: '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913'
+      collateral_token: '0x4200000000000000000000000000000000000006'
+      bonus_bps: 700
+      collateral_exchange_rate_bps: 10000
+      estimated_gas: 450000
+      selector: '0x6f307dc3'
+      receive_atoken: false
+      max_repay_wei: '0'
+  - chain_name: linea
+    aave_v3:
+      pool: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      data_provider: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      price_oracle: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+    compound_v3:
+      comet: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      rewards: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      configurator: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      oracle: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+    candidate_ttl_secs: 120
+    candidate_min_score: 2
+    candidate_max: 50
+    revert_threshold: 3
+    revert_cooldown_secs: 600
+    markets:
+    - name: aave_usdc_weth
+      kind: aave
+      adapter: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      flash_loan_pool: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      debt_token: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      collateral_token: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      bonus_bps: 800
+      collateral_exchange_rate_bps: 10000
+      estimated_gas: 450000
+      selector: 1865448899
+      receive_atoken: false
+      max_repay_wei: '0'
+    - name: compound_usdc_weth
+      kind: compound
+      adapter: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      flash_loan_pool: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      debt_token: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      collateral_token: '0xCfDAdA7D65e8e5B2564BDed4d79e0c084d595e90'
+      bonus_bps: 700
+      collateral_exchange_rate_bps: 10000
+      estimated_gas: 450000
+      selector: 1865448899
+      receive_atoken: false
+      max_repay_wei: '0'

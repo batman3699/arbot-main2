@@ -1,0 +1,29 @@
+[
+  {
+    name: "stargate-arb-usdc->base-usdc",
+    router: "0x53E0bca35eC356BD5ddDFebbD1Fc0f2F2866a71d",
+    tokenIn: "0xFF970A61A04b1cA14834A43f5de4533eBDDB5CC8",
+    tokenOut: "0x833589fcd6edb6e08f4c7c0e6c4ab6b9ade20482",
+    dstChainId: 8453,
+    feeBps: 8,
+    selector: "0x0d3c3e77",
+    estimatedGas: 550000,
+    estimatedTimeSecs: 300,
+    maxTimeSecs: 900,
+    maxNotionalWei: "500000000000000000000",
+  },
+  {
+    name: "layerzero-arb-usdc->base-usdc",
+    // LayerZero endpoint on Arbitrum One
+    router: "0x3c2269811836af69497e5f486a85d7316753cf62",
+    tokenIn: "0xFF970A61A04b1cA14834A43f5de4533eBDDB5CC8",
+    tokenOut: "0x833589fcd6edb6e08f4c7c0e6c4ab6b9ade20482",
+    dstChainId: 8453,
+    feeBps: 5,
+    selector: "0x00000000",
+    estimatedGas: 450000,
+    estimatedTimeSecs: 45,
+    maxTimeSecs: 300,
+    maxNotionalWei: "1000000000000",
+  },
+]

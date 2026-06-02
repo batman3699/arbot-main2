@@ -1,0 +1,39 @@
+# ───────────────────────────────────────────────────────────────
+# Secrets and local runtime config — NEVER commit live credentials.
+# ───────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+env.example
+*.key
+*.pem
+*secret*
+*.secrets
+
+# Rust build artifacts
+/target/
+
+# Foundry
+/out/
+/cache/
+/cache_foundry/
+
+# Runtime caches, logs, accounting, ingested data (large + sensitive)
+/logs/
+/accounting/
+/data/
+*.out
+*.jsonl
+
+# Vendored monitoring binaries (download separately; do not commit)
+grafana-*/
+grafana-*.tar.gz
+prometheus-*/
+prometheus-*.tar.gz
+*.tar.gz
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

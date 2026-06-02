@@ -1,0 +1,5 @@
+[
+  // UniV2-style pairs (Ink)
+  // Format: { pair, tokenIn, tokenOut, feeBps }
+  // NOTE: Populate with real DEX pair addresses on Ink.
+]

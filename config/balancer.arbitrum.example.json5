@@ -1,0 +1,21 @@
+[
+  // Balancer v2 pools (Arbitrum One)
+  // Format: { poolId, tokenIn, tokenOut }
+  // poolId is bytes32 (0x + 64 hex chars), e.g. from the Balancer UI URL.
+
+  // Gyroscope ECLP WETH/USDC
+  { poolId: "0x2c045c3065622000a2cf5ecb97c1d8b20d19e5e60002000000000000000005e6", tokenIn: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", tokenOut: "0xaf88d065e77c8cc2239327c5edb3a432268e5831" },
+  { poolId: "0x2c045c3065622000a2cf5ecb97c1d8b20d19e5e60002000000000000000005e6", tokenIn: "0xaf88d065e77c8cc2239327c5edb3a432268e5831", tokenOut: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" },
+
+  // Gyroscope Dynamic ECLP WETH/USDC
+  { poolId: "0xaf0561dc5bfbb6a85ccf7f9449199c65f23e5f340002000000000000000005f1", tokenIn: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", tokenOut: "0xaf88d065e77c8cc2239327c5edb3a432268e5831" },
+  { poolId: "0xaf0561dc5bfbb6a85ccf7f9449199c65f23e5f340002000000000000000005f1", tokenIn: "0xaf88d065e77c8cc2239327c5edb3a432268e5831", tokenOut: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" },
+
+  // Radiant (RDNT) / WETH
+  { poolId: "0x32df62dc3aed2cd6224193052ce665dc181658410002000000000000000003bd", tokenIn: "0x3082cc23568ea640225c2467653db90e9250aaa0", tokenOut: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" },
+  { poolId: "0x32df62dc3aed2cd6224193052ce665dc181658410002000000000000000003bd", tokenIn: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", tokenOut: "0x3082cc23568ea640225c2467653db90e9250aaa0" },
+
+  // 33WETH / 33WBTC / 33USDC.e (used here only for WETH <-> USDC.e swaps)
+  { poolId: "0x64541216bafffeec8ea535bb71fbc927831d0595000100000000000000000002", tokenIn: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", tokenOut: "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8" },
+  { poolId: "0x64541216bafffeec8ea535bb71fbc927831d0595000100000000000000000002", tokenIn: "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8", tokenOut: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" }
+]
