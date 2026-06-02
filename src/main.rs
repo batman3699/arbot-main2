@@ -1701,6 +1701,14 @@ struct CircuitBreaker {
     hourly_losses: Mutex<VecDeque<(Instant, U256)>>,
     daily_losses: Mutex<VecDeque<(Instant, U256)>>,
     consecutive_failures: Mutex<u32>,
+    // Health-based triggers (plan.md: abnormal revert rate / RPC lag).
+    revert_window: Mutex<VecDeque<(Instant, bool)>>,
+    revert_window_dur: Duration,
+    revert_rate_limit: f64,
+    revert_min_samples: usize,
+    rpc_errors: Mutex<VecDeque<Instant>>,
+    rpc_error_window: Duration,
+    rpc_error_limit: usize,
 }
 
 impl CircuitBreaker {
@@ -1712,6 +1720,78 @@ impl CircuitBreaker {
             hourly_losses: Mutex::new(VecDeque::new()),
             daily_losses: Mutex::new(VecDeque::new()),
             consecutive_failures: Mutex::new(0),
+            // Safe defaults: revert/RPC triggers require a minimum sample so they
+            // never trip on the empty windows used in unit tests.
+            revert_window: Mutex::new(VecDeque::new()),
+            revert_window_dur: Duration::from_secs(600),
+            revert_rate_limit: 0.5,
+            revert_min_samples: 8,
+            rpc_errors: Mutex::new(VecDeque::new()),
+            rpc_error_window: Duration::from_secs(120),
+            rpc_error_limit: 30,
+        }
+    }
+
+    /// Override health-trigger thresholds from environment (production only).
+    fn configure_health_from_env(mut self) -> Self {
+        if let Some(v) = std::env::var("CB_REVERT_RATE_LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse::<f64>().ok())
+        {
+            self.revert_rate_limit = v;
+        }
+        if let Some(v) = std::env::var("CB_REVERT_MIN_SAMPLES")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+        {
+            self.revert_min_samples = v.max(1);
+        }
+        if let Some(v) = std::env::var("CB_REVERT_WINDOW_SECS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+        {
+            self.revert_window_dur = Duration::from_secs(v.max(1));
+        }
+        if let Some(v) = std::env::var("CB_RPC_ERROR_LIMIT")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+        {
+            self.rpc_error_limit = v;
+        }
+        if let Some(v) = std::env::var("CB_RPC_ERROR_WINDOW_SECS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+        {
+            self.rpc_error_window = Duration::from_secs(v.max(1));
+        }
+        self
+    }
+
+    /// Record an execution outcome (true = on-chain revert/failed inclusion).
+    async fn record_execution_outcome(&self, reverted: bool) {
+        let now = Instant::now();
+        let mut window = self.revert_window.lock().await;
+        window.push_back((now, reverted));
+        while let Some((time, _)) = window.front() {
+            if now.duration_since(*time) > self.revert_window_dur {
+                window.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Record a runtime RPC failure for the RPC-lag trigger.
+    async fn record_rpc_error(&self) {
+        let now = Instant::now();
+        let mut errors = self.rpc_errors.lock().await;
+        errors.push_back(now);
+        while let Some(time) = errors.front() {
+            if now.duration_since(*time) > self.rpc_error_window {
+                errors.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
@@ -1763,6 +1843,14 @@ impl CircuitBreaker {
             let mut failures = self.consecutive_failures.lock().await;
             *failures = 0;
         }
+        {
+            let mut window = self.revert_window.lock().await;
+            window.clear();
+        }
+        {
+            let mut errors = self.rpc_errors.lock().await;
+            errors.clear();
+        }
         self.current_status().await
     }
 
@@ -1780,7 +1868,38 @@ impl CircuitBreaker {
         };
         let consecutive_failures = *self.consecutive_failures.lock().await;
 
-        let reason = self.evaluate_reason(hourly_total, daily_total, consecutive_failures);
+        let (revert_samples, revert_reverts) = {
+            let mut window = self.revert_window.lock().await;
+            while let Some((time, _)) = window.front() {
+                if now.duration_since(*time) > self.revert_window_dur {
+                    window.pop_front();
+                } else {
+                    break;
+                }
+            }
+            let reverts = window.iter().filter(|(_, reverted)| *reverted).count();
+            (window.len(), reverts)
+        };
+        let rpc_error_count = {
+            let mut errors = self.rpc_errors.lock().await;
+            while let Some(time) = errors.front() {
+                if now.duration_since(*time) > self.rpc_error_window {
+                    errors.pop_front();
+                } else {
+                    break;
+                }
+            }
+            errors.len()
+        };
+
+        let reason = self.evaluate_reason(
+            hourly_total,
+            daily_total,
+            consecutive_failures,
+            revert_samples,
+            revert_reverts,
+            rpc_error_count,
+        );
         let is_tripped = reason.is_some();
 
         CircuitBreakerStatus {
@@ -1797,27 +1916,49 @@ impl CircuitBreaker {
         hourly_total: U256,
         daily_total: U256,
         consecutive_failures: u32,
+        revert_samples: usize,
+        revert_reverts: usize,
+        rpc_error_count: usize,
     ) -> Option<String> {
         if !self.hourly_loss_limit.is_zero() && hourly_total > self.hourly_loss_limit {
-            Some(format!(
+            return Some(format!(
                 "hourly loss {} exceeds limit {}",
                 hourly_total, self.hourly_loss_limit
-            ))
-        } else if !self.daily_loss_limit.is_zero() && daily_total > self.daily_loss_limit {
-            Some(format!(
+            ));
+        }
+        if !self.daily_loss_limit.is_zero() && daily_total > self.daily_loss_limit {
+            return Some(format!(
                 "daily loss {} exceeds limit {}",
                 daily_total, self.daily_loss_limit
-            ))
-        } else if self.consecutive_fail_limit > 0
-            && consecutive_failures > self.consecutive_fail_limit
-        {
-            Some(format!(
+            ));
+        }
+        if self.consecutive_fail_limit > 0 && consecutive_failures > self.consecutive_fail_limit {
+            return Some(format!(
                 "consecutive failures {} exceeds limit {}",
                 consecutive_failures, self.consecutive_fail_limit
-            ))
-        } else {
-            None
+            ));
         }
+        if self.revert_rate_limit > 0.0 && revert_samples >= self.revert_min_samples {
+            let rate = revert_reverts as f64 / revert_samples as f64;
+            if rate > self.revert_rate_limit {
+                return Some(format!(
+                    "revert rate {:.0}% ({}/{}) exceeds limit {:.0}%",
+                    rate * 100.0,
+                    revert_reverts,
+                    revert_samples,
+                    self.revert_rate_limit * 100.0
+                ));
+            }
+        }
+        if self.rpc_error_limit > 0 && rpc_error_count >= self.rpc_error_limit {
+            return Some(format!(
+                "rpc errors {} within {}s window exceed limit {}",
+                rpc_error_count,
+                self.rpc_error_window.as_secs(),
+                self.rpc_error_limit
+            ));
+        }
+        None
     }
 
     fn prune_losses(losses: &mut VecDeque<(Instant, U256)>, now: Instant, window: Duration) {
@@ -4114,7 +4255,9 @@ where
                     if let Some(metrics) = &self.metrics {
                         metrics.record_failure(U256::zero());
                     }
-                    let _ = self.circuit_breaker.record_failure(U256::zero()).await;
+                    // Pre-execution graph/plan errors are zero-loss and must NOT trip
+                    // the circuit breaker (former false-positive halt source). Only real
+                    // execution reverts/losses count, recorded at dispatch time.
                     continue 'cycle;
                 };
                 estimated_cycle_gas = estimated_cycle_gas.saturating_add(edge.estimated_gas);
@@ -4288,7 +4431,9 @@ where
                     if let Some(metrics) = &self.metrics {
                         metrics.record_failure(U256::zero());
                     }
-                    let _ = self.circuit_breaker.record_failure(U256::zero()).await;
+                    // Pre-execution graph/plan errors are zero-loss and must NOT trip
+                    // the circuit breaker (former false-positive halt source). Only real
+                    // execution reverts/losses count, recorded at dispatch time.
                     continue;
                 }
             };
@@ -4393,7 +4538,9 @@ where
                     if let Some(metrics) = &self.metrics {
                         metrics.record_failure(U256::zero());
                     }
-                    let _ = self.circuit_breaker.record_failure(U256::zero()).await;
+                    // Pre-execution graph/plan errors are zero-loss and must NOT trip
+                    // the circuit breaker (former false-positive halt source). Only real
+                    // execution reverts/losses count, recorded at dispatch time.
                     continue;
                 }
             };
@@ -5295,6 +5442,24 @@ where
                 min_profit: min_profit_target,
                 max_slippage_bps: candidate.max_slippage_bps,
             };
+            // Final safety gate: the run-loop breaker check can be seconds stale by
+            // the time we finish scanning/simulating. Re-check immediately before we
+            // allocate a nonce or broadcast, so a trip mid-cycle still blocks the send.
+            {
+                let breaker_status = self.circuit_breaker.current_status().await;
+                if breaker_status.is_tripped {
+                    warn!(
+                        chain = %self.chain_name,
+                        candidate = %candidate.candidate_id,
+                        reason = %breaker_status.active_reason(),
+                        "Circuit breaker tripped; blocking broadcast before dispatch"
+                    );
+                    return Err(anyhow!(
+                        "circuit breaker tripped before broadcast: {}",
+                        breaker_status.active_reason()
+                    ));
+                }
+            }
             let broadcast_start = Instant::now();
             let dispatch = match self
                 .dispatch_call(
@@ -6218,6 +6383,7 @@ where
                             }
                         }
                         self.circuit_breaker.record_success().await;
+                        self.circuit_breaker.record_execution_outcome(false).await;
                         last_execution = Some(summary.clone());
                         status_tx
                             .send(StatusSnapshot::new(
@@ -6296,6 +6462,7 @@ where
                             expected_univ3_edges,
                             estimated_loss_wei
                         );
+                        self.circuit_breaker.record_execution_outcome(true).await;
                         let breaker_status = self
                             .circuit_breaker
                             .record_failure(estimated_loss_wei)
@@ -6334,6 +6501,7 @@ where
                             if let Some(metrics) = &self.metrics {
                                 metrics.record_rpc_error(&self.chain_name);
                             }
+                            self.circuit_breaker.record_rpc_error().await;
                             lock_unpoison(self.rpc_health.as_ref()).record_failure(
                                 &self.rpc_endpoint,
                                 true,
@@ -6501,6 +6669,62 @@ mod runner_tests {
     use std::sync::Arc;
     use std::time::Instant;
     use tokio::time::{sleep, Duration};
+
+    #[tokio::test]
+    async fn circuit_breaker_trips_on_high_revert_rate() {
+        // consecutive/loss limits effectively disabled so only the revert trigger is active.
+        let breaker = CircuitBreaker::new(U256::zero(), U256::zero(), 100);
+        // 8 samples (>= default min 8), 5 reverts => 62.5% > 50% default limit.
+        for reverted in [true, true, true, false, true, false, true, false] {
+            breaker.record_execution_outcome(reverted).await;
+        }
+        let status = breaker.current_status().await;
+        assert!(status.is_tripped, "high revert rate should trip the breaker");
+        assert!(
+            status.active_reason().contains("revert rate"),
+            "reason was: {}",
+            status.active_reason()
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_ignores_revert_rate_below_min_samples() {
+        let breaker = CircuitBreaker::new(U256::zero(), U256::zero(), 100);
+        // Only 4 samples (< default min 8): even 100% reverts must not trip yet.
+        for _ in 0..4 {
+            breaker.record_execution_outcome(true).await;
+        }
+        assert!(!breaker.current_status().await.is_tripped);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_trips_on_rpc_error_burst() {
+        let breaker = CircuitBreaker::new(U256::zero(), U256::zero(), 100);
+        for _ in 0..30 {
+            breaker.record_rpc_error().await;
+        }
+        let status = breaker.current_status().await;
+        assert!(status.is_tripped, "rpc error burst should trip the breaker");
+        assert!(
+            status.active_reason().contains("rpc errors"),
+            "reason was: {}",
+            status.active_reason()
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_reset_clears_health_windows() {
+        let breaker = CircuitBreaker::new(U256::zero(), U256::zero(), 100);
+        for _ in 0..30 {
+            breaker.record_rpc_error().await;
+        }
+        assert!(breaker.current_status().await.is_tripped);
+        breaker.reset().await;
+        assert!(
+            !breaker.current_status().await.is_tripped,
+            "reset must clear rpc/revert health windows"
+        );
+    }
 
     #[derive(Clone, Debug)]
     struct TestMiddleware {
@@ -8405,11 +8629,14 @@ async fn launch_chain_runtime(
         None
     };
 
-    let circuit_breaker = Arc::new(CircuitBreaker::new(
-        cb_hourly_loss_limit,
-        cb_daily_loss_limit,
-        cb_max_consecutive_failures,
-    ));
+    let circuit_breaker = Arc::new(
+        CircuitBreaker::new(
+            cb_hourly_loss_limit,
+            cb_daily_loss_limit,
+            cb_max_consecutive_failures,
+        )
+        .configure_health_from_env(),
+    );
 
     let metrics_port = std::env::var("PROMETHEUS_PORT")
         .ok()
