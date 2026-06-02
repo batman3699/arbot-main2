@@ -26,6 +26,7 @@ mod quote_univ2;
 mod quote_univ3;
 mod quote_univ4;
 mod registry;
+mod rpc_failover;
 mod sandwich;
 mod sizing;
 mod token_refresh;
@@ -94,6 +95,7 @@ use crate::liquidity_cache::PoolDepthCache;
 use crate::metrics::Metrics;
 use crate::ops_inputs::load_ops_inputs;
 use crate::quote_univ3::{UniQuoter, UniV3ValidationConfig, FEE_TIERS};
+use crate::rpc_failover::FailoverClient;
 use crate::sandwich::{SandwichMonitor, SandwichOpportunity};
 use crate::sizing::{optimize_trade_size, OptimizeTradeParams};
 use crate::token_refresh::TokenList;
@@ -1435,84 +1437,51 @@ fn lock_unpoison<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
 async fn connect_http_provider_with_health(
     label: &str,
     endpoints: &[String],
-    max_backoff: Duration,
+    _max_backoff: Duration,
     health: Arc<StdMutex<HealthTracker>>,
-) -> Result<(Provider<Http>, String)> {
+) -> Result<(Provider<FailoverClient>, String)> {
     if endpoints.is_empty() {
         return Err(anyhow!("no http endpoints configured for {label}"));
     }
 
-    let mut attempt: u32 = 0;
-    loop {
-        let ordered: Vec<String> = {
-            let tracker = lock_unpoison(health.as_ref());
-            let mut sorted: Vec<String> = endpoints.to_vec();
-            sorted.sort_by(|a, b| {
-                let score_a = tracker.health_score(a);
-                let score_b = tracker.health_score(b);
-                score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal)
-            });
-            sorted
-        };
+    // Build ONE self-healing transport over every configured endpoint. The
+    // failover client retries/rotates per request at runtime, so we no longer
+    // pin to a single URL that can fail permanently.
+    let failover = FailoverClient::new(endpoints)
+        .with_context(|| format!("build failover rpc client for {label}"))?;
+    let endpoint_label = failover.endpoint_label();
+    let endpoint_count = failover.endpoint_count();
+    let provider = Provider::new(failover);
 
-        let mut any_healthy = false;
-        for endpoint in ordered {
-            let is_healthy = { lock_unpoison(health.as_ref()).is_healthy(&endpoint) };
-            if !is_healthy {
-                continue;
-            }
-            any_healthy = true;
-
-            info!(target: "rpc", %label, endpoint = %endpoint, "connecting http endpoint");
-            let start = Instant::now();
-            match Provider::<Http>::try_from(endpoint.as_str()) {
-                Ok(provider) => {
-                    lock_unpoison(health.as_ref()).record_success(&endpoint, Some(start.elapsed()));
-                    info!(
-                        target: "rpc",
-                        %label,
-                        endpoint = %endpoint,
-                        "http endpoint connected"
-                    );
-                    return Ok((provider, endpoint));
-                }
-                Err(err) => {
-                    lock_unpoison(health.as_ref()).record_failure(
-                        &endpoint,
-                        true,
-                        Some(start.elapsed()),
-                    );
-                    warn!(
-                        target: "rpc",
-                        %label,
-                        endpoint = %endpoint,
-                        error = ?err,
-                        "http endpoint connection failed"
-                    );
-                }
-            }
+    // Best-effort boot probe: confirm at least one endpoint answers, but proceed
+    // regardless because runtime failover + the fail-closed scan guard handle
+    // ongoing/transient outages without trading on stale state.
+    let start = Instant::now();
+    match provider.get_block_number().await {
+        Ok(head) => {
+            lock_unpoison(health.as_ref()).record_success(&endpoint_label, Some(start.elapsed()));
+            info!(
+                target: "rpc",
+                %label,
+                endpoints = %endpoint_label,
+                endpoint_count,
+                head = %head,
+                "failover http rpc connected"
+            );
         }
-
-        if !any_healthy {
+        Err(err) => {
+            lock_unpoison(health.as_ref()).record_failure(&endpoint_label, true, Some(start.elapsed()));
             warn!(
                 target: "rpc",
                 %label,
-                "all http endpoints marked unhealthy; retrying with backoff"
+                endpoints = %endpoint_label,
+                error = %err,
+                "failover http rpc boot probe failed; proceeding (runtime failover will retry)"
             );
         }
-
-        attempt = attempt.saturating_add(1);
-        let capped = attempt.min(5);
-        let backoff_secs = 1u64 << capped;
-        let delay = Duration::from_secs(backoff_secs).min(max_backoff);
-        error!(
-            target: "rpc",
-            %label,
-            ?delay,
-            "all http endpoints failed, backing off before retry"
-        );
-        sleep(delay).await;
     }
+
+    Ok((provider, endpoint_label))
 }
 
 async fn connect_private_relays(
@@ -8955,11 +8924,14 @@ fn validate_global_config() -> Result<()> {
     Ok(())
 }
 
-async fn validate_aave_pool_probes(
+async fn validate_aave_pool_probes<C>(
     cfg: &ChainCfg,
-    provider: &Provider<Http>,
+    provider: &Provider<C>,
     ops_inputs: &crate::ops_inputs::OpsInputs,
-) -> Result<()> {
+) -> Result<()>
+where
+    C: JsonRpcClient + 'static,
+{
     let mut probe_targets = Vec::new();
     if let Some(pool) = cfg.aave_pool {
         probe_targets.push((pool, "chain_cfg.aave_pool".to_string()));
@@ -9254,10 +9226,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_chain_targets_defaults_to_arbitrum_when_unset() {
+    fn parse_chain_targets_defaults_to_base_when_unset() {
+        // When neither CHAIN_LIST nor CHAIN yields a target, the engine defaults
+        // to the production primary chain (base), matching the live .env CHAIN=base.
         let targets = parse_chain_targets_from_env(None, Some("   ".to_string()));
 
-        assert_eq!(targets, vec!["arbitrum"]);
+        assert_eq!(targets, vec!["base"]);
     }
 
     #[test]

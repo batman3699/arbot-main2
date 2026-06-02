@@ -12,9 +12,16 @@ fn load(path: &Path) -> String {
     })
 }
 
+/// Resolve a repo-relative path against the crate manifest dir so these tests are
+/// immune to the process working directory being changed by a parallel test
+/// (e.g. registry.rs's DirGuard calls set_current_dir).
+fn manifest_path(rel: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
 #[test]
 fn token_lists_are_valid() {
-    for entry in fs::read_dir("config").expect("config dir") {
+    for entry in fs::read_dir(manifest_path("config")).expect("config dir") {
         let path = entry.expect("dir entry").path();
         let name = path
             .file_name()
@@ -38,7 +45,7 @@ fn token_lists_are_valid() {
 
 #[test]
 fn pool_configs_are_valid() {
-    for entry in fs::read_dir("config").expect("config dir") {
+    for entry in fs::read_dir(manifest_path("config")).expect("config dir") {
         let path = entry.expect("dir entry").path();
         let name = path
             .file_name()
@@ -66,7 +73,7 @@ fn pool_configs_are_valid() {
 
 #[test]
 fn registry_example_is_valid_json() {
-    let raw = load(Path::new("config/registry.example.json"));
+    let raw = load(&manifest_path("config/registry.example.json"));
     let registry: Registry = serde_json::from_str(&raw).expect("parse registry");
     assert!(
         !registry.chains.is_empty(),
@@ -76,7 +83,7 @@ fn registry_example_is_valid_json() {
 
 #[test]
 fn bridge_routes_example_is_valid() {
-    let raw = load(Path::new("config/bridge_routes.example.json5"));
+    let raw = load(&manifest_path("config/bridge_routes.example.json5"));
     let routes: Vec<BridgeRouteCfg> =
         json5::from_str(&raw).expect("parse bridge routes example config");
     assert!(
@@ -87,7 +94,7 @@ fn bridge_routes_example_is_valid() {
 
 #[test]
 fn ops_inputs_example_is_valid_yaml() {
-    let raw = load(Path::new("ops/inputs.example.yaml"));
+    let raw = load(&manifest_path("ops/inputs.example.yaml"));
     let cfg = parse_ops_inputs(&raw).expect("parse ops inputs example");
     assert!(
         !cfg.chains.is_empty(),

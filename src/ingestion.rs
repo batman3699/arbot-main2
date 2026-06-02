@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use ethers::{
     prelude::*,
-    providers::{Http, JsonRpcClient, Ws},
+    providers::{JsonRpcClient, Ws},
     types::{BlockId, BlockNumber, Filter, H256, U64},
 };
 use futures_util::StreamExt;
@@ -335,13 +335,15 @@ where
     }
 }
 
-pub async fn spawn_pending_tx_monitor(
-    http_provider: Arc<Provider<Http>>,
+pub async fn spawn_pending_tx_monitor<C>(
+    http_provider: Arc<Provider<C>>,
     initial_ws_provider: Option<Arc<Provider<Ws>>>,
     ws_endpoints: Vec<String>,
     ws_backoff: Duration,
     metrics: Option<Arc<Metrics>>,
-) {
+) where
+    C: JsonRpcClient + 'static,
+{
     const FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(2);
     const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
     let mut ws_provider = initial_ws_provider;
@@ -418,10 +420,10 @@ fn is_websocket_subscription_close(message: &str) -> bool {
         || (lower.contains("websocket") && lower.contains("closed"))
 }
 
-async fn poll_pending_block(
-    provider: &Provider<Http>,
-    metrics: &Option<Arc<Metrics>>,
-) -> Result<()> {
+async fn poll_pending_block<C>(provider: &Provider<C>, metrics: &Option<Arc<Metrics>>) -> Result<()>
+where
+    C: JsonRpcClient + 'static,
+{
     let pending_block = provider
         .get_block_with_txs(BlockId::Number(BlockNumber::Pending))
         .await?;
