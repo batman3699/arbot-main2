@@ -3,11 +3,83 @@ use async_trait::async_trait;
 use ethers::prelude::*;
 use ethers::providers::JsonRpcClient;
 
-use crate::graph::{Graph, VenueEdge};
+use crate::graph::{Edge, Graph, VenueEdge};
 use crate::math::mul_div;
+use crate::quote_solidly::{quote_exact_input_from_state as quote_solidly_out, SolidlyPairState};
+use crate::quote_univ2::{quote_exact_input_from_state as quote_univ2_out, UniV2PairState};
 use crate::quote_univ3::UniQuoter;
 use crate::util::{apply_slippage, encode_univ3_path};
 use tracing::{info, warn};
+
+/// Real expected output for a single hop at the actual (optimized) trade size.
+///
+/// For constant-product (UniV2) and Solidly pools the full curve state lives on
+/// the edge, so we compute the TRUE on-chain output. The previous implementation
+/// linearly extrapolated the probe-size rate (`rate_num/rate_den`), which
+/// overstates output at larger sizes (a secant lies above the convex AMM curve)
+/// and makes exact-output UniV2/Solidly swaps revert on-chain. Other venues
+/// (UniV3/Curve/Balancer) keep the linear estimate, where min_out is only a floor
+/// and is validated by pre-broadcast simulation.
+fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
+    let linear = mul_div(current_amount, edge.rate_num, edge.rate_den);
+    match &edge.venue {
+        VenueEdge::UniV2 {
+            token0,
+            token1,
+            reserve_in,
+            reserve_out,
+            fee_bps,
+            ..
+        } => {
+            let (reserve0, reserve1) = if from == *token0 {
+                (*reserve_in, *reserve_out)
+            } else {
+                (*reserve_out, *reserve_in)
+            };
+            let state = UniV2PairState {
+                token0: *token0,
+                token1: *token1,
+                reserve0,
+                reserve1,
+            };
+            match quote_univ2_out(&state, from, current_amount, *fee_bps) {
+                Ok(Some(quote)) => quote.amount_out,
+                _ => linear,
+            }
+        }
+        VenueEdge::SolidlyV2 {
+            token0,
+            token1,
+            stable,
+            reserve_in,
+            reserve_out,
+            fee_bps,
+            decimals0,
+            decimals1,
+            ..
+        } => {
+            let (reserve0, reserve1) = if from == *token0 {
+                (*reserve_in, *reserve_out)
+            } else {
+                (*reserve_out, *reserve_in)
+            };
+            let state = SolidlyPairState {
+                token0: *token0,
+                token1: *token1,
+                reserve0,
+                reserve1,
+                stable: *stable,
+                decimals0: *decimals0,
+                decimals1: *decimals1,
+            };
+            match quote_solidly_out(&state, from, current_amount, *fee_bps) {
+                Ok(Some(quote)) => quote.amount_out,
+                _ => linear,
+            }
+        }
+        _ => linear,
+    }
+}
 
 pub enum GenericPreAction {
     Approve { token: Address, amount: U256 },
@@ -123,7 +195,7 @@ pub async fn build_plan_for_cycle(
             warn!(from = %from, to = %to, "Skipping plan build for missing edge");
             return Err(anyhow!("missing edge between {from:?} and {to:?}"));
         };
-        let expected_out = mul_div(current_amount, edge.rate_num, edge.rate_den);
+        let expected_out = hop_expected_out(edge, from, current_amount);
         let min_out = apply_slippage(expected_out, edge.tolerance_bps);
         if min_out.is_zero() {
             return Err(anyhow!("min_out is zero for hop {from:?}->{to:?}"));
@@ -670,7 +742,99 @@ mod tests {
         let amount0_out = decoded[0].clone().into_uint().unwrap();
         let amount1_out = decoded[1].clone().into_uint().unwrap();
         assert_eq!(amount0_out, U256::zero());
-        assert_eq!(amount1_out, U256::from(1_000u64));
+        // Real constant-product output for 1_000 in @ 30bps on 1e6/1e6 reserves.
+        // (Was 1_000 under the old linear extrapolation of rate_num/rate_den.)
+        assert_eq!(amount1_out, U256::from(996u64));
+    }
+
+    #[tokio::test]
+    async fn univ2_step_uses_real_curve_not_linear_extrapolation() {
+        // Regression: for a trade size large vs. reserves, linear extrapolation of
+        // the probe-size rate overstates output and makes the exact-output UniV2
+        // swap revert on-chain. The plan must request the REAL constant-product
+        // output instead.
+        let mut graph = Graph::default();
+        let token_in = addr(10);
+        let token_out = addr(11);
+        let pair = addr(12);
+
+        // Probe-size rate stored on the edge is ~1:1 (rate_num==rate_den), so the
+        // old linear path would request 100_000 out for 100_000 in.
+        graph.add_edge(Edge {
+            from: token_in,
+            to: token_out,
+            rate_num: U256::from(1_000u64),
+            rate_den: U256::from(1_000u64),
+            venue: VenueEdge::UniV2 {
+                pair,
+                token_out,
+                token0: token_in,
+                token1: token_out,
+                reserve_in: U256::from(1_000_000u64),
+                reserve_out: U256::from(1_000_000u64),
+                fee_bps: 30,
+            },
+            estimated_gas: 0,
+            weight: fp_weight(1, 1),
+            max_input: U256::MAX,
+            tolerance_bps: 100,
+            observed_slippage_bps: 100,
+            quote_block: None,
+            active: true,
+        });
+        graph.add_edge(Edge {
+            from: token_out,
+            to: token_in,
+            rate_num: U256::from(1_000u64),
+            rate_den: U256::from(1_000u64),
+            venue: VenueEdge::Balancer {
+                pool_id: [1u8; 32],
+                token_in: token_out,
+                token_out: token_in,
+            },
+            estimated_gas: 0,
+            weight: fp_weight(1, 1),
+            max_input: U256::MAX,
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+        });
+
+        let cycle = vec![
+            *graph.ix.get(&token_in).unwrap(),
+            *graph.ix.get(&token_out).unwrap(),
+            *graph.ix.get(&token_in).unwrap(),
+        ];
+        let trade = U256::from(100_000u64);
+        let plan = build_plan_for_cycle(&graph, &cycle, trade, addr(99), None, None, U64::zero())
+            .await
+            .expect("plan should build");
+
+        let StepData::Generic { call, .. } = &plan.steps[0] else {
+            panic!("expected generic step");
+        };
+        let decoded = decode(
+            &[
+                ParamType::Uint(256),
+                ParamType::Uint(256),
+                ParamType::Address,
+                ParamType::Bytes,
+            ],
+            &call.0[4..],
+        )
+        .expect("decode univ2 swap");
+        let amount1_out = decoded[1].clone().into_uint().unwrap();
+
+        // Real constant-product output for 100_000 in @ 30bps on 1e6/1e6 reserves.
+        let amount_in_with_fee = U256::from(100_000u64) * U256::from(9_970u64) / U256::from(10_000u64);
+        let expected_real =
+            amount_in_with_fee * U256::from(1_000_000u64) / (U256::from(1_000_000u64) + amount_in_with_fee);
+        assert_eq!(amount1_out, expected_real, "must request real CPMM output");
+        assert!(
+            amount1_out < trade,
+            "real output {amount1_out} must be below the linear extrapolation {trade}"
+        );
     }
 
     #[tokio::test]
@@ -844,7 +1008,9 @@ mod tests {
         let amount0_out = decoded[0].clone().into_uint().expect("amount0");
         let amount1_out = decoded[1].clone().into_uint().expect("amount1");
         assert_eq!(amount0_out, U256::zero());
-        assert_eq!(amount1_out, U256::from(5_000u64));
+        // Real volatile (x*y=k) output for 1_000 in @ 30bps on 1e6/1e6 reserves.
+        // (Was 5_000 under the old linear extrapolation of rate_num/rate_den.)
+        assert_eq!(amount1_out, U256::from(996u64));
     }
 
     #[tokio::test]
@@ -1156,7 +1322,11 @@ mod tests {
 
         assert_eq!(plan.steps.len(), 2);
 
-        let expected_out = mul_div(base_amount, U256::from(3u64), U256::from(2u64));
+        // Plan now requests the REAL constant-product output (reserves 1e6/1e6,
+        // 30bps), not the linear rate_num/rate_den extrapolation.
+        let aiwf = base_amount * U256::from(9_970u64) / U256::from(10_000u64);
+        let expected_out =
+            aiwf * U256::from(1_000_000u64) / (U256::from(1_000_000u64) + aiwf);
 
         match &plan.steps[0] {
             StepData::Generic {
