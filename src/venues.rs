@@ -2185,6 +2185,7 @@ async fn collect_solidly_edges<C>(
     default_profile: TradeSizing,
     gas_price: U256,
     native_token_prices: Arc<HashMap<Address, NativePrice>>,
+    token_decimals: Arc<HashMap<Address, u8>>,
 ) -> Result<Vec<Edge>>
 where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
@@ -2205,12 +2206,29 @@ where
                 .unwrap_or(default_profile);
             let base_amount_in = profile.base_amount;
             let tolerance_bps = profile.slippage_tolerance_bps;
+            // Stable-pool math requires real token decimals to normalize reserves to
+            // 1e18. Fail closed for stable pools when decimals are unknown rather than
+            // quoting on a wrong (defaulted) scale.
+            let decimals0 = token_decimals.get(&state.token0).copied();
+            let decimals1 = token_decimals.get(&state.token1).copied();
+            if pool.stable && (decimals0.is_none() || decimals1.is_none()) {
+                warn!(
+                    target: "venue::solidly",
+                    pair = ?pool.pair,
+                    "skipping stable Solidly pool: missing token decimals for correct stableswap quote"
+                );
+                continue;
+            }
+            let decimals0 = decimals0.unwrap_or(18);
+            let decimals1 = decimals1.unwrap_or(18);
             let solidly_state = SolidlyPairState {
                 token0: state.token0,
                 token1: state.token1,
                 reserve0: state.reserve0,
                 reserve1: state.reserve1,
                 stable: pool.stable,
+                decimals0,
+                decimals1,
             };
             let quote = adjust_trade_size_sync(base_amount_in, tolerance_bps, |amount| {
                 let quote =
@@ -2256,6 +2274,8 @@ where
                         reserve_in,
                         reserve_out,
                         fee_bps: pool.fee_bps,
+                        decimals0,
+                        decimals1,
                     },
                     estimated_gas: ESTIMATED_GAS_SOLIDLYV2,
                     weight,
@@ -2282,6 +2302,23 @@ async fn collect_univ4_edges(
     let mut edges = Vec::new();
     let env_key = format!("{chain_env_prefix}_UNIV4_POOLS");
     if let Some((raw, source)) = env_var_with_fallback(&env_key, "UNIV4_POOLS") {
+        // The UniV4 quote here is a FIXED-PRICE (zero price-impact) approximation:
+        // it assumes infinite liquidity at spot and produces phantom profits for any
+        // non-trivial size. A correct V4 quote needs concentrated-liquidity tick
+        // crossing (on-chain Quoter/StateView). Until that exists, these edges are
+        // OFF by default and must be explicitly opted into.
+        let allow_fixed_price = std::env::var("ENABLE_UNIV4_FIXED_PRICE_QUOTES")
+            .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if !allow_fixed_price {
+            warn!(
+                target: "venue::univ4",
+                source = %source,
+                "UniV4 pools configured but disabled: fixed-price quote is unsound (no tick crossing). \
+                 Set ENABLE_UNIV4_FIXED_PRICE_QUOTES=1 to override (NOT recommended for live capital)."
+            );
+            return Ok(edges);
+        }
         let pools = resolve_univ4_pools(&raw, &source)?;
         for pool in pools {
             let profile = base_profiles
@@ -2521,6 +2558,7 @@ where
             default_profile,
             gas_price,
             Arc::clone(&native_token_prices),
+            token_decimals.clone(),
         ),
         collect_univ4_edges(
             chain_env_prefix,

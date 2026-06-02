@@ -346,6 +346,8 @@ where
             reserve_out,
             fee_bps,
             stable,
+            decimals0,
+            decimals1,
             ..
         } => {
             let (reserve0, reserve1) = if edge.from == *token0 {
@@ -359,6 +361,8 @@ where
                 reserve0,
                 reserve1,
                 stable: *stable,
+                decimals0: *decimals0,
+                decimals1: *decimals1,
             };
             let quote =
                 quote_solidly_exact_input(&state, edge.from, amount_in, *fee_bps).ok()??;

@@ -47,6 +47,8 @@ pub enum VenueEdge {
         reserve_in: U256,
         reserve_out: U256,
         fee_bps: u32,
+        decimals0: u8,
+        decimals1: u8,
     },
     Univ4 {
         pool_manager: Address,

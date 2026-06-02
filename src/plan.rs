@@ -779,6 +779,8 @@ mod tests {
                 reserve_in: U256::from(1_000_000u64),
                 reserve_out: U256::from(1_000_000u64),
                 fee_bps: 30,
+                decimals0: 18,
+                decimals1: 18,
             },
             estimated_gas: 0,
             weight: fp_weight(5, 1),
