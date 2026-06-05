@@ -752,6 +752,7 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         if (vaultAddr == address(0)) revert InvalidVault();
         (bytes32 poolId, address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut) =
             abi.decode(data, (bytes32, address, address, uint256, uint256));
+        if (minOut == 0 || minOut > uint256(type(int256).max)) revert();
         address[] memory assets = new address[](2);
         assets[0] = tokenIn;
         assets[1] = tokenOut;
@@ -759,14 +760,26 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         swaps[0] = IBalancerVault.BatchSwapStep({
             poolId: poolId, assetInIndex: 0, assetOutIndex: 1, amount: amountIn, userData: bytes("")
         });
+        int256[] memory limits = new int256[](2);
+        limits[0] = int256(amountIn);
+        limits[1] = -int256(minOut);
+        _ensureAllowance(tokenIn, vaultAddr, amountIn);
+        // FundManagement construction + the 6-arg batchSwap are isolated in a thin
+        // helper so the decoded locals above do not all stay live at the external
+        // call site. This keeps the legacy (non-viaIR) codegen under the 16-slot
+        // EVM stack limit (fixes "Stack too deep" at the batchSwap call).
+        _runBalancerBatchSwap(swaps, assets, limits, deadline);
+    }
+
+    function _runBalancerBatchSwap(
+        IBalancerVault.BatchSwapStep[] memory swaps,
+        address[] memory assets,
+        int256[] memory limits,
+        uint256 deadline
+    ) private {
         IBalancerVault.FundManagement memory fm = IBalancerVault.FundManagement({
             sender: address(this), fromInternalBalance: false, recipient: address(this), toInternalBalance: false
         });
-        int256[] memory limits = new int256[](2);
-        limits[0] = int256(amountIn);
-        if (minOut == 0 || minOut > uint256(type(int256).max)) revert();
-        limits[1] = -int256(minOut);
-        _ensureAllowance(tokenIn, vaultAddr, amountIn);
         vault.batchSwap(IBalancerVault.SwapKind.GIVEN_IN, swaps, assets, fm, limits, deadline);
     }
 
@@ -829,9 +842,45 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         if (v3.token0() != token0 || v3.token1() != token1) revert InvalidGenericAction();
 
         (, int24 tick,,,,,) = v3.slot0();
-        int24 spacing = v3.tickSpacing();
-        if (spacing <= 0) revert InvalidGenericAction();
+        // Tick-range and liquidity math are isolated in pure helpers so their
+        // intermediate locals (spacing/base/range/sqrt prices) do not all stay
+        // live here. Keeps legacy (non-viaIR) codegen under the EVM stack limit.
+        (int24 tickLower, int24 tickUpper) = _jitTickRange(tick, v3.tickSpacing(), tickRangeRaw);
 
+        uint128 liquidity = _jitLiquidity(tick, tickLower, tickUpper, amount0, amount1);
+        if (liquidity == 0) revert InvalidGenericAction();
+
+        _jitMintAndStore(v3, pool, tickLower, tickUpper, liquidity);
+    }
+
+    /// Mints the JIT position and records it. The post-mint liquidity re-check
+    /// (re-entrancy guard against the mint callback) and the storage write keep the
+    /// exact ordering of the previous inline version. mint()'s returned used0/used1
+    /// were already ignored, so they are simply not bound here.
+    function _jitMintAndStore(
+        IUniswapV3Pool v3,
+        address pool,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity
+    ) private {
+        jitMintPool = pool;
+        v3.mint(address(this), tickLower, tickUpper, liquidity, abi.encode(pool));
+        jitMintPool = address(0);
+
+        if (jitPositions[pool].liquidity != 0) revert InvalidGenericAction();
+
+        jitPositions[pool] = JitPosition({tickLower: tickLower, tickUpper: tickUpper, liquidity: liquidity});
+    }
+
+    /// Aligns the current tick to `spacing` and widens by `tickRangeRaw` spacings on
+    /// each side. Pure; identical math/checks to the previous inline version.
+    function _jitTickRange(int24 tick, int24 spacing, uint256 tickRangeRaw)
+        private
+        pure
+        returns (int24 tickLower, int24 tickUpper)
+    {
+        if (spacing <= 0) revert InvalidGenericAction();
         int256 base = (int256(tick) / int256(spacing)) * int256(spacing);
         int256 range = int256(uint256(uint24(tickRangeRaw))) * int256(spacing);
         int256 tickLowerI = base - range;
@@ -839,28 +888,25 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         if (tickLowerI < int256(type(int24).min) || tickUpperI > int256(type(int24).max)) {
             revert InvalidGenericAction();
         }
-
-        int24 tickLower = int24(tickLowerI);
-        int24 tickUpper = int24(tickUpperI);
+        tickLower = int24(tickLowerI);
+        tickUpper = int24(tickUpperI);
         if (tickLower >= tickUpper) revert InvalidGenericAction();
+    }
 
-        uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(tick);
-        uint160 sqrtLower = TickMath.getSqrtRatioAtTick(tickLower);
-        uint160 sqrtUpper = TickMath.getSqrtRatioAtTick(tickUpper);
-
-        uint128 liquidity =
-            LiquidityAmounts.getLiquidityForAmounts(sqrtPriceX96, sqrtLower, sqrtUpper, amount0, amount1);
-        if (liquidity == 0) revert InvalidGenericAction();
-
-        jitMintPool = pool;
-        (uint256 used0, uint256 used1) = v3.mint(address(this), tickLower, tickUpper, liquidity, abi.encode(pool));
-        jitMintPool = address(0);
-
-        if (jitPositions[pool].liquidity != 0) revert InvalidGenericAction();
-
-        jitPositions[pool] = JitPosition({tickLower: tickLower, tickUpper: tickUpper, liquidity: liquidity});
-        used0;
-        used1;
+    /// Liquidity for the given current/lower/upper ticks and token amounts. Pure;
+    /// identical to the previous inline sqrt-price computation.
+    function _jitLiquidity(int24 tick, int24 tickLower, int24 tickUpper, uint256 amount0, uint256 amount1)
+        private
+        pure
+        returns (uint128)
+    {
+        return LiquidityAmounts.getLiquidityForAmounts(
+            TickMath.getSqrtRatioAtTick(tick),
+            TickMath.getSqrtRatioAtTick(tickLower),
+            TickMath.getSqrtRatioAtTick(tickUpper),
+            amount0,
+            amount1
+        );
     }
 
     function _validateActiveLoanAndSender(LoanProvider provider, bytes calldata data) private view returns (address sender) {
