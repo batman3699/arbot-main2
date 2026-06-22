@@ -92,7 +92,8 @@ validate the **execution path** you must deploy the executor to Base
 
 Every Base address the bot uses was validated **twice**: against the official
 source-of-truth, and **on-chain** via `scripts/shadow/validate_base_addresses.sh`
-(interface probes, not just existence). Result: **28 pass / 1 fail (B2) / 1 warn**.
+(interface probes, not just existence). Result: **38 pass / 0 fail / 0 warn**
+(executor deployed + allowlisted, Aerodrome wired).
 
 | Component | Address | Official source | On-chain probe |
 |---|---|---|---|
@@ -101,6 +102,8 @@ source-of-truth, and **on-chain** via `scripts/shadow/validate_base_addresses.sh
 | UniV3 SwapRouter | `0x2626664c2603336E57B271c5C0b26F421741e481` | docs.base.org | `factory()` → V3 factory ✓ |
 | UniV2 Factory | `0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6` | docs.base.org | has code |
 | UniV2 Router | `0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24` | docs.base.org | `factory()`/`WETH()` ✓ |
+| Aerodrome PoolFactory | `0x420DD381b31aEf6683db6B902084cB0FFECe40Da` | aerodrome-finance/contracts | has code; `getPool(WETH,USDC,false)` ✓ |
+| Aerodrome Router | `0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43` | aerodrome-finance/contracts | `defaultFactory()` → PoolFactory ✓ |
 | Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` | docs.base.org / canonical | has code |
 | Balancer V2 Vault | `0xBA12222222228d8Ba445958a75a0704d566BF2C8` | balancer canonical multichain | `WETH()` → WETH ✓ |
 | Aave V3 Pool | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5` | bgd-labs/aave-address-book (AaveV3Base) | `ADDRESSES_PROVIDER()` ✓; flash premium = 5 (0.05%) |
@@ -112,7 +115,8 @@ source-of-truth, and **on-chain** via `scripts/shadow/validate_base_addresses.sh
 | Compound Rewards | `0x123964802e6ABabBE1Bc9547D72Ef1B69B00A6b1` | comet roots.json | has code |
 | WETH | `0x4200000000000000000000000000000000000006` | Base predeploy (WETH9) | `symbol()=WETH`, 18 dec ✓ |
 | USDC (native) | `0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913` | Circle / BaseScan FiatTokenProxy | `symbol()=USDC`, 6 dec ✓ |
-| **Executor (yours)** | `0x627e54a5Fad377d0d0eef60298f7F3d0e2c15E7A` | your deployment | **NO CODE (B2)** |
+| **Executor clone (yours)** | `0x9445f7d3E1aA38bC9A9B373dc905D9fde7B9B852` | your deployment (live on Base) | has code; `owner()`→BatchRouter; hot signer allowlisted ✓ |
+| **BatchRouter (owner)** | `0x46C6d9003FB9FBFE29d60ae6feF869F7CAe6f499` | your deployment (live on Base) | `owner()`→operator hot wallet ✓ |
 
 ### Universe tokens (`BASE_TOKENS`) — identified on-chain
 
@@ -129,6 +133,41 @@ source-of-truth, and **on-chain** via `scripts/shadow/validate_base_addresses.sh
 > low-liquidity tokens. They add phantom-cycle noise and revert risk. For a
 > profit-focused Base run, consider trimming the universe to WETH/USDC/AERO/cbETH/
 > cbBTC-class assets. This is a config change in `BASE_TOKENS` / `registry.json`.
+
+### DEX venue coverage (incl. Aerodrome)
+
+The Base scan graph is built from these venues (see `ops/inputs.yaml` → `chains.base.venues`):
+
+| Venue | Kind | Pools source | Notes |
+|---|---|---|---|
+| Uniswap V3 | `univ3_like` | `data/base/uniswap_v3/pools.jsonl` (liquidity-ranked) | concentrated liquidity, fee tiers 100/500/3000/10000 |
+| Uniswap V2 | `univ2_like` | `data/base/uniswap_v2/pools.jsonl` | thin on Base (few liquid pools) |
+| **Aerodrome** | `solidly_v2_like` | **`config/base_aerodrome_pools.json`** via `BASE_SOLIDLY_V2_POOLS` | **Base's dominant DEX**; vAMM (volatile) + sAMM (stable) |
+
+**Aerodrome integration:**
+- Pool list is enumerated on-chain from the Aerodrome `PoolFactory.getPool(tokenA,tokenB,stable)`
+  across hub × {hub, major} pairs, keeping pools with real liquidity. Each pool's
+  fee is read live from `PoolFactory.getFee(pool,stable)` (e.g. 30 bps volatile,
+  varies per pool), and both swap directions are emitted.
+- Quoting uses the correct Solidly curves: constant-product for volatile, the
+  `x³y + xy³` stableswap (decimals-normalized to 1e18) for stable pools
+  (`src/quote_solidly.rs`). The executor swaps Aerodrome pools via the generic
+  transfer-then-`pair.swap` step (same `swap(uint,uint,address,bytes)` ABI as V2).
+- Regenerate the pool list any time:
+
+```bash
+ALCHEMY_KEY=<paid_key> python3 scripts/data/build_aerodrome_pools.py
+# writes config/base_aerodrome_pools.json (directional {pair,tokenIn,tokenOut,stable,feeBps})
+```
+
+- Runtime confirmation: startup logs `venue::solidly: Loaded Solidly/Aerodrome edges
+  configured_pools=N edges_built=M`. Wiring this venue is what enables the
+  cross-venue edge (Aerodrome ↔ Uniswap V3) where most Base arbitrage lives.
+
+> **Remaining venue gap (next phase):** Aerodrome **Slipstream** (concentrated-liquidity,
+> factory `0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A`) is not yet wired — it needs a
+> tickSpacing-keyed CL path distinct from Uniswap's fee-tier model. The AMM (vAMM/sAMM)
+> pools above are fully integrated.
 
 ### Known dead config (harmless)
 
@@ -155,7 +194,7 @@ BASE_SHADOW_RPC_URL=https://mainnet.base.org scripts/shadow/validate_base_addres
 | Quote via on-chain QuoterV2 (`eth_call`) | ✅ | ✅ (real RPC load) |
 | Optimal sizing | ✅ | ✅ |
 | Build plan / calldata | ✅ | ✅ |
-| Pre-broadcast simulation (`eth_call`) | ✅ | ✅ (needs executor deployed — B2) |
+| Pre-broadcast simulation (`eth_call`) | ✅ | ✅ (executor deployed + signer allowlisted) |
 | **Submit bundle / raw tx to relay** | ✅ | ❌ **stubbed** (`shadow_dispatch`) |
 | Nonce consumption | ✅ | ❌ (no real tx) |
 | Wallet balance requirement | enforced | **0** (unfunded key OK) |

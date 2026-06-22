@@ -29,6 +29,7 @@ use crate::quote_solidly::{
 };
 use crate::quote_univ2::{load_pair_state, quote_exact_input_from_state, UniV2PairState};
 use crate::quote_univ3::{UniQuoter, UniV3ValidationConfig, FEE_TIERS};
+use futures_util::{stream, StreamExt};
 use crate::quote_univ4::quote_fixed_price_exact_input;
 use crate::util::{
     apply_slippage, compute_edge_weight, decimal_ratio, u256_to_decimal, NativePrice, TradeSizing,
@@ -44,9 +45,12 @@ const ESTIMATED_GAS_CURVE: u64 = 180_000;
 const ESTIMATED_GAS_UNIV2: u64 = 130_000;
 const ESTIMATED_GAS_SOLIDLYV2: u64 = 135_000;
 const ESTIMATED_GAS_UNIV4: u64 = 160_000;
-const DEFAULT_RPC_QUOTE_TIMEOUT_SECS: u64 = 8;
-const DEFAULT_QUEUE_WAIT_TIMEOUT_SECS: u64 = 8;
-const DEFAULT_UNIV3_TOTAL_DEADLINE_SECS: u64 = 20;
+// Production scan budgets run 150-250ms; a hung quote must never be able to
+// pin a pool for multiple seconds. 2s matches the validated Base shadow
+// override (ARBOT_RPC_QUOTE_TIMEOUT_SECS=2) and is now the fail-safe default.
+const DEFAULT_RPC_QUOTE_TIMEOUT_SECS: u64 = 2;
+const DEFAULT_QUEUE_WAIT_TIMEOUT_SECS: u64 = 2;
+const DEFAULT_UNIV3_TOTAL_DEADLINE_SECS: u64 = 8;
 const RPC_QUOTE_TIMEOUT_ENV: &str = "ARBOT_RPC_QUOTE_TIMEOUT_SECS";
 const QUEUE_WAIT_TIMEOUT_ENV: &str = "ARBOT_UNIV3_QUEUE_WAIT_TIMEOUT_SECS";
 const UNIV3_TOTAL_DEADLINE_ENV: &str = "ARBOT_UNIV3_TOTAL_DEADLINE_SECS";
@@ -367,6 +371,143 @@ fn slippage_from_samples(
         .unwrap_or(u32::MAX)
 }
 
+/// Fixed, log-ish-spaced grid of trade sizes for batched UniV3 sizing. The
+/// smallest entry (a small probe) anchors the slippage estimate; the rest span
+/// up to 10x the base amount. Deterministic multiplicative steps (no floats),
+/// covering the same range the sequential adaptive search explored.
+fn univ3_size_grid(base_amount: U256) -> Vec<U256> {
+    if base_amount.is_zero() {
+        return Vec::new();
+    }
+    let probe = probe_amount(base_amount).max(U256::one());
+    let mut grid = vec![probe];
+    for (num, den) in [
+        (1u64, 4u64),
+        (1, 2),
+        (1, 1),
+        (2, 1),
+        (4, 1),
+        (8, 1),
+        (10, 1),
+    ] {
+        let amount = base_amount.saturating_mul(U256::from(num)) / U256::from(den);
+        if !amount.is_zero() {
+            grid.push(amount);
+        }
+    }
+    grid.sort();
+    grid.dedup();
+    grid
+}
+
+/// Pick the most profitable grid point within the slippage tolerance, using the
+/// smallest valid quote as the spot/probe reference (mirrors the sequential
+/// path's `slippage_from_samples` semantics).
+fn best_from_grid(
+    amounts: &[U256],
+    outs: &[Option<U256>],
+    tolerance_bps: u32,
+) -> Option<QuoteComputation> {
+    let mut probe: Option<(U256, U256)> = None;
+    for (amount, out) in amounts.iter().zip(outs.iter()) {
+        if let Some(value) = out {
+            if *value > U256::zero() {
+                probe = Some((*amount, *value));
+                break;
+            }
+        }
+    }
+    let (probe_in, probe_out) = probe?;
+    let mut candidates = Vec::new();
+    for (amount, out) in amounts.iter().zip(outs.iter()) {
+        if let Some(value) = out {
+            if value.is_zero() {
+                continue;
+            }
+            let slippage_bps = slippage_from_samples(*amount, *value, probe_in, probe_out);
+            if slippage_bps <= tolerance_bps {
+                candidates.push(QuoteComputation {
+                    amount_in: *amount,
+                    amount_out: *value,
+                    slippage_bps,
+                });
+            }
+        }
+    }
+    best_quote(&candidates).copied()
+}
+
+/// Batched UniV3 sizing: quote the whole size grid in one Multicall3 round-trip
+/// (one RTT instead of ~2N sequential quotes). Returns `Err` on transport
+/// failure so the caller can fall back to the sequential adaptive search;
+/// `Ok(None)` means the grid was quoted but no size is profitable within
+/// tolerance (no fallback needed).
+async fn univ3_grid_quote<C>(
+    quoter: &UniQuoter<C>,
+    path: Vec<(Address, Option<u32>)>,
+    base_amount: U256,
+    tolerance_bps: u32,
+    block: U64,
+    quote_semaphore: &Arc<Semaphore>,
+) -> Result<Option<QuoteComputation>>
+where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    let grid = univ3_size_grid(base_amount);
+    if grid.is_empty() {
+        return Ok(None);
+    }
+    let permit = match timeout(queue_wait_timeout(), quote_semaphore.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err(anyhow!("univ3 quote semaphore closed")),
+        Err(_) => return Err(anyhow!("univ3 grid quote semaphore wait timed out")),
+    };
+    let result = timeout(rpc_quote_timeout(), quoter.quote_path_grid(path, &grid, block)).await;
+    drop(permit);
+    match result {
+        Ok(Ok(outs)) => Ok(best_from_grid(&grid, &outs, tolerance_bps)),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(anyhow!("univ3 grid quote timed out")),
+    }
+}
+
+/// Expansion-phase probe count for the trade-size search. Each probe is one
+/// quote; on the async (UniV3 `eth_call`) path this dominates per-scan latency,
+/// so it is tunable. Default preserves prior behavior (12).
+fn size_search_expand_iters() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SIZE_SEARCH_EXPAND_ITERS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(12)
+            .clamp(3, 24)
+    })
+}
+
+/// Refinement-phase iteration count (each does up to 2 quotes). Default 8.
+fn size_search_refine_iters() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SIZE_SEARCH_REFINE_ITERS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(2, 16)
+    })
+}
+
+/// Bounded concurrency for loading Solidly/Aerodrome pair state. Each pool needs
+/// 3 RPCs (getReserves + token0 + token1); loading them concurrently (instead of
+/// sequentially per directional entry) is the dominant solidly latency win.
+fn solidly_state_concurrency() -> usize {
+    std::env::var("SOLIDLY_STATE_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(32)
+        .clamp(1, 128)
+}
+
 fn adjust_trade_size_sync<F>(
     base_amount: U256,
     threshold_bps: u32,
@@ -524,7 +665,7 @@ where
     let mut prev_profit = Decimal::MIN;
     let mut bracket: Option<(U256, U256)> = None;
     let mut last_amount: Option<U256> = None;
-    for _ in 0..12 {
+    for _ in 0..size_search_expand_iters() {
         if current.is_zero() || current > max_amount {
             break;
         }
@@ -554,7 +695,7 @@ where
     }
 
     if let Some((mut low, mut high)) = bracket {
-        for _ in 0..8 {
+        for _ in 0..size_search_refine_iters() {
             if high <= low {
                 break;
             }
@@ -1211,6 +1352,7 @@ where
     }
 
     let stats = Arc::new(Univ3Stats::default());
+    let collector_started_at = Instant::now();
     let gas_price = ctx.edge_ctx.gas_price;
     let allowed_fee_tiers = ctx.allowed_fee_tiers.as_ref().and_then(|tiers| {
         if tiers.is_empty() {
@@ -1297,7 +1439,28 @@ where
                 let path = vec![(token_in, None), (token_out, Some(pool.fee))];
                 let hot_paths_quote = Arc::clone(&hot_paths);
                 let quote_semaphore_fee = Arc::clone(&quote_semaphore);
-                let quote = adjust_trade_size_async(base_amount_in, tolerance_bps, {
+                // FAST PATH: batch the whole size grid into ONE Multicall3 call
+                // (one RTT for all sizes). Fall back to the sequential adaptive
+                // search only on transport failure; Ok(None) means "quoted, nothing
+                // profitable within tolerance" and needs no fallback.
+                let quote = match univ3_grid_quote(
+                    quoter.as_ref(),
+                    path.clone(),
+                    base_amount_in,
+                    tolerance_bps,
+                    block_number,
+                    &quote_semaphore_fee,
+                )
+                .await
+                {
+                    Ok(opt) => {
+                        stats.quote_attempts.fetch_add(1, Ordering::Relaxed);
+                        if opt.is_some() {
+                            stats.quote_success.fetch_add(1, Ordering::Relaxed);
+                        }
+                        opt
+                    }
+                    Err(_) => adjust_trade_size_async(base_amount_in, tolerance_bps, {
                     let quoter = quoter.clone();
                     let path_clone = path.clone();
                     let stats = Arc::clone(&stats);
@@ -1569,7 +1732,8 @@ where
                         }
                     }
                 })
-                .await?;
+                .await?,
+                };
 
                 let Some(quote) = quote else {
                     hot_paths_quote
@@ -1654,6 +1818,7 @@ where
         max_permit_hold_ms = stats.max_permit_hold_ms.load(Ordering::Relaxed),
         max_pool_tasks,
         pool_tasks_spawned,
+        elapsed_ms = collector_started_at.elapsed().as_millis() as u64,
         "UniV3 hot pool summary",
     );
     Ok(edges)
@@ -2191,13 +2356,36 @@ where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
 {
     let mut edges = Vec::new();
+    let solidly_started_at = Instant::now();
     let env_key = format!("{chain_env_prefix}_SOLIDLY_V2_POOLS");
     if let Some((raw, source)) = env_var_with_fallback(&env_key, "SOLIDLY_V2_POOLS") {
         let pools = resolve_solidly_pools(&raw, &source)?;
+        let configured_pools = pools.len();
+
+        // Load each UNIQUE pair's on-chain state ONCE, concurrently. The prior
+        // sequential per-entry load (load_pair_state = 3 RPCs each, repeated for
+        // both directions of every pool) was the dominant scan-latency cost
+        // (~13s for ~26 entries). Dedup + bounded fan-out collapses it to ~1 RTT.
+        let mut unique_pairs: Vec<Address> = pools.iter().map(|pool| pool.pair).collect();
+        unique_pairs.sort_unstable();
+        unique_pairs.dedup();
+        let state_concurrency = solidly_state_concurrency();
+        let loaded_states: Vec<(Address, Option<UniV2PairState>)> =
+            stream::iter(unique_pairs.into_iter().map(|pair| {
+                let provider = provider.clone();
+                async move { (pair, load_pair_state(provider, pair).await.unwrap_or(None)) }
+            }))
+            .buffer_unordered(state_concurrency)
+            .collect()
+            .await;
+        let pair_states: HashMap<Address, UniV2PairState> = loaded_states
+            .into_iter()
+            .filter_map(|(pair, state)| state.map(|state| (pair, state)))
+            .collect();
+
         for pool in pools {
-            let state = match load_pair_state(provider.clone(), pool.pair).await? {
-                Some(state) => state,
-                None => continue,
+            let Some(state) = pair_states.get(&pool.pair).cloned() else {
+                continue;
             };
             let profile = base_profiles
                 .as_ref()
@@ -2288,6 +2476,15 @@ where
                 edges.push(edge);
             }
         }
+        tracing::info!(
+            target: "venue::solidly",
+            chain = %chain_env_prefix,
+            source = %source,
+            configured_pools,
+            edges_built = edges.len(),
+            elapsed_ms = solidly_started_at.elapsed().as_millis() as u64,
+            "Loaded Solidly/Aerodrome edges"
+        );
     }
     Ok(edges)
 }

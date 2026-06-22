@@ -66,6 +66,12 @@ UNIV3_ROUTER=0x2626664c2603336E57B271c5C0b26F421741e481
 UNIV2_FACTORY=0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6
 UNIV2_ROUTER=0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24
 
+# Aerodrome (Base's dominant DEX, Solidly-style AMM)
+AERO_FACTORY=0x420DD381b31aEf6683db6B902084cB0FFECe40Da
+AERO_ROUTER=0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43
+WETH_TOKEN=0x4200000000000000000000000000000000000006
+USDC_TOKEN=0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913
+
 BAL_VAULT=0xBA12222222228d8Ba445958a75a0704d566BF2C8
 
 AAVE_POOL=0xA238Dd80C259a72e81d7e4664a9801593F98d1c5
@@ -77,8 +83,20 @@ COMET_USDC=0xb125E6687d4313864e53df431d5425969c15Eb2F
 COMET_CONFIGURATOR=0x45939657d1CA34A8FA39A924B71D28Fe8431e581
 COMET_REWARDS=0x123964802e6ABabBE1Bc9547D72Ef1B69B00A6b1
 
-EXECUTOR=0x627e54a5Fad377d0d0eef60298f7F3d0e2c15E7A
-EXECUTOR_OWNER=0xA6080B97261C4F5AAB13C5533e75d36890cbD1E3
+# Executor + operator are resolved from the live config (env first, then .env),
+# so this preflight always validates the ACTUAL deployed clone rather than a
+# stale hardcoded address. Defaults are the current Base deployment.
+EXECUTOR="${BASE_EXECUTOR_ADDRESS:-}"
+if [ -z "$EXECUTOR" ] && [ -f .env ]; then
+  EXECUTOR="$(grep -E '^BASE_EXECUTOR_ADDRESS=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+fi
+EXECUTOR="${EXECUTOR:-0x9445f7d3E1aA38bC9A9B373dc905D9fde7B9B852}"
+
+EXECUTOR_OWNER="${BASE_EXECUTOR_OWNER:-}"
+if [ -z "$EXECUTOR_OWNER" ] && [ -f .env ]; then
+  EXECUTOR_OWNER="$(grep -E '^BASE_EXECUTOR_OWNER=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+fi
+EXECUTOR_OWNER="${EXECUTOR_OWNER:-0xD7A4D612E572B5877b0E2fC7cE8683e36360f04c}"
 
 # Universe tokens (BASE_TOKENS) — identified on-chain below.
 UNIVERSE_TOKENS=(
@@ -160,6 +178,42 @@ check_call_addr "UniV2 Router -> WETH" "$UNIV2_ROUTER" "WETH()(address)" "$WETH"
 check_code "UniV2 Factory" "$UNIV2_FACTORY"
 check_code "Permit2" "$PERMIT2"
 
+# --- 1b) Aerodrome (Solidly AMM) --------------------------------------------
+echo ""
+echo "[1b] Aerodrome (Solidly AMM)"
+check_code "Aerodrome PoolFactory" "$AERO_FACTORY"
+check_call_addr "Aerodrome Router -> defaultFactory" "$AERO_ROUTER" "defaultFactory()(address)" "$AERO_FACTORY"
+# Confirm the canonical WETH/USDC volatile pool exists, is liquid, and reports stable=false.
+AERO_VPOOL="$(cast call "$AERO_FACTORY" "getPool(address,address,bool)(address)" "$WETH_TOKEN" "$USDC_TOKEN" false --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
+if [ -n "$AERO_VPOOL" ] && [ "$(lc "$AERO_VPOOL")" != "0x0000000000000000000000000000000000000000" ]; then
+  ok "Aerodrome getPool(WETH,USDC,volatile) -> $AERO_VPOOL"
+  AERO_STABLE="$(cast call "$AERO_VPOOL" "stable()(bool)" --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
+  if [ "$AERO_STABLE" = "false" ]; then
+    ok "Aerodrome WETH/USDC pool stable() = false (volatile vAMM)"
+  else
+    warn "Aerodrome WETH/USDC pool stable() = ${AERO_STABLE:-<none>} (expected false)"
+  fi
+  AERO_FEE="$(cast call "$AERO_FACTORY" "getFee(address,bool)(uint256)" "$AERO_VPOOL" false --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$AERO_FEE" ] && [ "$AERO_FEE" -gt 0 ] 2>/dev/null && [ "$AERO_FEE" -le 1000 ] 2>/dev/null; then
+    ok "Aerodrome getFee(WETH/USDC,volatile) = ${AERO_FEE} bps (plausible)"
+  else
+    warn "Aerodrome getFee returned '${AERO_FEE:-<none>}' (expected small bps)"
+  fi
+else
+  bad "Aerodrome getPool(WETH,USDC,volatile) returned empty/zero — factory wrong or RPC issue"
+fi
+# Confirm the configured pool list is present + parseable.
+AERO_POOLS_FILE="${BASE_SOLIDLY_V2_POOLS:-}"
+if [ -z "$AERO_POOLS_FILE" ] && [ -f .env ]; then
+  AERO_POOLS_FILE="$(grep -E '^BASE_SOLIDLY_V2_POOLS=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+fi
+if [ -n "$AERO_POOLS_FILE" ] && [ -f "$AERO_POOLS_FILE" ]; then
+  POOL_COUNT="$(grep -c '"pair"' "$AERO_POOLS_FILE" 2>/dev/null || echo 0)"
+  ok "Aerodrome pool list present: $AERO_POOLS_FILE ($POOL_COUNT directional entries)"
+else
+  warn "Aerodrome pool list (BASE_SOLIDLY_V2_POOLS) missing — solidly edges will be empty"
+fi
+
 # --- 2) Flash-loan providers -------------------------------------------------
 echo ""
 echo "[2] Flash-loan providers"
@@ -200,16 +254,30 @@ check_code "Compound Rewards" "$COMET_REWARDS"
 echo ""
 echo "[4] Arb executor (your deployed contract)"
 check_code "Executor" "$EXECUTOR"
-# Executor owner() is best-effort: the MultiVenueArb clone exposes owner().
-OWNER_GOT="$(cast call "$EXECUTOR" "owner()(address)" --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
-if [ -n "$OWNER_GOT" ]; then
-  if [ "$(lc "$OWNER_GOT")" = "$(lc "$EXECUTOR_OWNER")" ]; then
-    ok "Executor owner() = $OWNER_GOT (matches BASE_EXECUTOR_OWNER)"
-  else
-    warn "Executor owner() = $OWNER_GOT (config BASE_EXECUTOR_OWNER=$EXECUTOR_OWNER) — confirm intentional"
+# Ownership model for this deployment: the clone is owned by the BatchRouter,
+# and the BatchRouter is owned by the operator hot wallet (BASE_EXECUTOR_OWNER).
+CLONE_OWNER="$(cast call "$EXECUTOR" "owner()(address)" --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
+if [ -n "$CLONE_OWNER" ] && [ "$(lc "$CLONE_OWNER")" != "$(lc "$ZERO")" ]; then
+  ok "Executor owner() = $CLONE_OWNER (BatchRouter)"
+  ROUTER_OWNER="$(cast call "$CLONE_OWNER" "owner()(address)" --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$ROUTER_OWNER" ]; then
+    if [ "$(lc "$ROUTER_OWNER")" = "$(lc "$EXECUTOR_OWNER")" ]; then
+      ok "Router owner() = $ROUTER_OWNER (matches BASE_EXECUTOR_OWNER)"
+    else
+      warn "Router owner() = $ROUTER_OWNER (config BASE_EXECUTOR_OWNER=$EXECUTOR_OWNER) — confirm intentional"
+    fi
   fi
 else
   warn "Executor owner() not callable — confirm $EXECUTOR is your MultiVenueArb executor"
+fi
+# CRITICAL: start/startV2 are onlyExecutor. The hot signer MUST be allowlisted or
+# every execution — including the shadow-mode eth_call simulation — reverts
+# NotExecutor. (In this deployment owner==signer; adjust if you split keys.)
+EXEC_ALLOWED="$(cast call "$EXECUTOR" "executors(address)(bool)" "$EXECUTOR_OWNER" --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
+if [ "$EXEC_ALLOWED" = "true" ]; then
+  ok "Executor allowlist: hot signer $EXECUTOR_OWNER is approved (startV2 callable)"
+else
+  bad "Executor allowlist: hot signer $EXECUTOR_OWNER NOT approved — startV2 reverts NotExecutor (run setExecutor via router.multicall)"
 fi
 
 # --- 5) Token identity + decimals -------------------------------------------

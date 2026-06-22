@@ -14,7 +14,6 @@
 //!   * returns an error only when every endpoint has failed.
 
 use std::fmt::Debug;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,8 +65,23 @@ impl FailoverClient {
             if trimmed.is_empty() {
                 continue;
             }
-            let client = Http::from_str(trimmed)
+            let url = reqwest::Url::parse(trimmed)
                 .map_err(|err| anyhow!("invalid rpc url '{trimmed}': {err}"))?;
+            // Force HTTP/1.1 with a real connection pool. Under bursty concurrent
+            // quoting, HTTP/2 multiplexes every request over a single connection
+            // (head-of-line blocking + provider per-connection stream caps), which
+            // measured ~5x slower than an HTTP/1.1 pool of parallel connections and
+            // previously triggered h2 "locally-reset streams" exhaustion. A pooled
+            // HTTP/1.1 client opens parallel sockets so 24-48 concurrent quotes run
+            // truly in parallel.
+            let http_client = reqwest::Client::builder()
+                .http1_only()
+                .pool_max_idle_per_host(64)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Some(Duration::from_secs(60)))
+                .build()
+                .map_err(|err| anyhow!("failed to build http client for '{trimmed}': {err}"))?;
+            let client = Http::new_with_client(url, http_client);
             endpoints.push(Endpoint {
                 url: trimmed.to_string(),
                 client,

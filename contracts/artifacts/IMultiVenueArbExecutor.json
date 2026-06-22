@@ -1,0 +1,210 @@
+{
+	"deploy": {
+		"VM:-": {
+			"linkReferences": {},
+			"autoDeployLib": true
+		},
+		"main:1": {
+			"linkReferences": {},
+			"autoDeployLib": true
+		},
+		"ropsten:3": {
+			"linkReferences": {},
+			"autoDeployLib": true
+		},
+		"rinkeby:4": {
+			"linkReferences": {},
+			"autoDeployLib": true
+		},
+		"kovan:42": {
+			"linkReferences": {},
+			"autoDeployLib": true
+		},
+		"goerli:5": {
+			"linkReferences": {},
+			"autoDeployLib": true
+		},
+		"Custom": {
+			"linkReferences": {},
+			"autoDeployLib": true
+		}
+	},
+	"data": {
+		"bytecode": {
+			"functionDebugData": {},
+			"generatedSources": [],
+			"linkReferences": {},
+			"object": "",
+			"opcodes": "",
+			"sourceMap": ""
+		},
+		"deployedBytecode": {
+			"functionDebugData": {},
+			"generatedSources": [],
+			"immutableReferences": {},
+			"linkReferences": {},
+			"object": "",
+			"opcodes": "",
+			"sourceMap": ""
+		},
+		"gasEstimates": null,
+		"methodIdentifiers": {
+			"owner()": "8da5cb5b",
+			"start((address,uint256,uint8,uint16,(uint8,bytes)[],uint256))": "81de96ec",
+			"startV2(((address,uint256,uint8,address)[],uint16,(uint8,bytes)[],uint256))": "b8de19e3"
+		}
+	},
+	"abi": [
+		{
+			"inputs": [],
+			"name": "owner",
+			"outputs": [
+				{
+					"internalType": "address",
+					"name": "",
+					"type": "address"
+				}
+			],
+			"stateMutability": "view",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"components": [
+						{
+							"internalType": "address",
+							"name": "loanToken",
+							"type": "address"
+						},
+						{
+							"internalType": "uint256",
+							"name": "amountIn",
+							"type": "uint256"
+						},
+						{
+							"internalType": "enum IMultiVenueArbExecutor.LoanProvider",
+							"name": "loanProvider",
+							"type": "uint8"
+						},
+						{
+							"internalType": "uint16",
+							"name": "cycleSlippageBps",
+							"type": "uint16"
+						},
+						{
+							"components": [
+								{
+									"internalType": "enum IMultiVenueArbExecutor.Op",
+									"name": "op",
+									"type": "uint8"
+								},
+								{
+									"internalType": "bytes",
+									"name": "data",
+									"type": "bytes"
+								}
+							],
+							"internalType": "struct IMultiVenueArbExecutor.Step[]",
+							"name": "steps",
+							"type": "tuple[]"
+						},
+						{
+							"internalType": "uint256",
+							"name": "minProfit",
+							"type": "uint256"
+						}
+					],
+					"internalType": "struct IMultiVenueArbExecutor.PlanLegacy",
+					"name": "plan",
+					"type": "tuple"
+				}
+			],
+			"name": "start",
+			"outputs": [
+				{
+					"internalType": "uint256",
+					"name": "grossProfit",
+					"type": "uint256"
+				}
+			],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		},
+		{
+			"inputs": [
+				{
+					"components": [
+						{
+							"components": [
+								{
+									"internalType": "address",
+									"name": "token",
+									"type": "address"
+								},
+								{
+									"internalType": "uint256",
+									"name": "amount",
+									"type": "uint256"
+								},
+								{
+									"internalType": "enum IMultiVenueArbExecutor.LoanProvider",
+									"name": "provider",
+									"type": "uint8"
+								},
+								{
+									"internalType": "address",
+									"name": "providerAddr",
+									"type": "address"
+								}
+							],
+							"internalType": "struct IMultiVenueArbExecutor.Loan[]",
+							"name": "loans",
+							"type": "tuple[]"
+						},
+						{
+							"internalType": "uint16",
+							"name": "cycleSlippageBps",
+							"type": "uint16"
+						},
+						{
+							"components": [
+								{
+									"internalType": "enum IMultiVenueArbExecutor.Op",
+									"name": "op",
+									"type": "uint8"
+								},
+								{
+									"internalType": "bytes",
+									"name": "data",
+									"type": "bytes"
+								}
+							],
+							"internalType": "struct IMultiVenueArbExecutor.Step[]",
+							"name": "steps",
+							"type": "tuple[]"
+						},
+						{
+							"internalType": "uint256",
+							"name": "minProfit",
+							"type": "uint256"
+						}
+					],
+					"internalType": "struct IMultiVenueArbExecutor.PlanV2",
+					"name": "plan",
+					"type": "tuple"
+				}
+			],
+			"name": "startV2",
+			"outputs": [
+				{
+					"internalType": "uint256",
+					"name": "grossProfit",
+					"type": "uint256"
+				}
+			],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		}
+	]
+}

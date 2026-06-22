@@ -11,6 +11,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use futures_util::{stream, StreamExt};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
@@ -219,69 +220,90 @@ where
     let block = current_block(provider.clone()).await;
     let from_block = block.saturating_sub(U64::from(config.event_sampling_blocks));
     let sample_indices = pool_sample_indices(capped.len(), config.event_sampling_rate);
-    let mut sampled_volume: HashMap<Address, Decimal> = HashMap::new();
     let mut liquidity_failures = 0usize;
+    let concurrency = hot_pool_rank_concurrency();
 
-    for idx in sample_indices {
-        let record = &capped[idx];
-        match timeout(
-            rpc_timeout,
-            univ2_volume(provider.clone(), record.pool, from_block, block),
-        )
-        .await
-        {
-            Err(_) => {
-                warn!(
-                    timeout_ms = rpc_timeout.as_millis() as u64,
-                    pool = %format!("0x{}", hex::encode(record.pool)),
-                    "timed out loading univ2 swap volume"
-                );
-            }
-            Ok(Err(err)) => {
-                warn!(
-                    error = %err,
-                    pool = %format!("0x{}", hex::encode(record.pool)),
-                    "failed to load univ2 swap volume"
-                );
-            }
-            Ok(Ok(volume)) => {
-                let volume_dec = u256_to_decimal(volume);
-                sampled_volume.insert(record.pool, volume_dec);
+    // Volume sampling: issue swap-log queries with bounded concurrency rather
+    // than serially, so ranking stays fast regardless of universe size.
+    let volume_pairs: Vec<(Address, Decimal)> = stream::iter(sample_indices.into_iter().map(|idx| {
+        let pool = capped[idx].pool;
+        let provider = provider.clone();
+        async move {
+            match timeout(rpc_timeout, univ2_volume(provider, pool, from_block, block)).await {
+                Err(_) => {
+                    warn!(
+                        timeout_ms = rpc_timeout.as_millis() as u64,
+                        pool = %format!("0x{}", hex::encode(pool)),
+                        "timed out loading univ2 swap volume"
+                    );
+                    None
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        error = %err,
+                        pool = %format!("0x{}", hex::encode(pool)),
+                        "failed to load univ2 swap volume"
+                    );
+                    None
+                }
+                Ok(Ok(volume)) => Some((pool, u256_to_decimal(volume))),
             }
         }
-    }
+    }))
+    .buffer_unordered(concurrency)
+    .filter_map(|entry| async move { entry })
+    .collect()
+    .await;
+    let sampled_volume: HashMap<Address, Decimal> = volume_pairs.into_iter().collect();
 
-    for record in capped.iter() {
-        let Some(liquidity_score) = (match timeout(
-            rpc_timeout,
-            univ2_liquidity_score(provider.clone(), record, token_decimals),
-        )
-        .await
-        {
-            Err(_) => {
-                liquidity_failures = liquidity_failures.saturating_add(1);
-                warn!(
-                    timeout_ms = rpc_timeout.as_millis() as u64,
-                    pool = %format!("0x{}", hex::encode(record.pool)),
-                    "timed out loading univ2 liquidity"
-                );
-                None
+    // Liquidity scoring: same bounded-concurrency treatment over every cold pool.
+    let token_decimals = Arc::new(token_decimals.clone());
+    let min_liquidity_tokens = config.min_liquidity_tokens;
+    let liquidity_outcomes: Vec<(PoolRecord, Option<Decimal>, bool)> =
+        stream::iter(capped.iter().cloned().map(|record| {
+            let provider = provider.clone();
+            let token_decimals = token_decimals.clone();
+            async move {
+                match timeout(
+                    rpc_timeout,
+                    univ2_liquidity_score(provider, &record, token_decimals.as_ref()),
+                )
+                .await
+                {
+                    Err(_) => {
+                        warn!(
+                            timeout_ms = rpc_timeout.as_millis() as u64,
+                            pool = %format!("0x{}", hex::encode(record.pool)),
+                            "timed out loading univ2 liquidity"
+                        );
+                        (record, None, true)
+                    }
+                    Ok(Err(err)) => {
+                        warn!(
+                            error = %err,
+                            pool = %format!("0x{}", hex::encode(record.pool)),
+                            "failed to load univ2 liquidity"
+                        );
+                        (record, None, true)
+                    }
+                    Ok(Ok(value)) => (record, value, false),
+                }
             }
-            Ok(Err(err)) => {
-                liquidity_failures = liquidity_failures.saturating_add(1);
-                warn!(
-                    error = %err,
-                    pool = %format!("0x{}", hex::encode(record.pool)),
-                    "failed to load univ2 liquidity"
-                );
-                None
-            }
-            Ok(Ok(value)) => value,
-        }) else {
+        }))
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    for (record, liquidity_value, failed) in liquidity_outcomes {
+        if failed {
+            liquidity_failures = liquidity_failures.saturating_add(1);
+            continue;
+        }
+        let Some(liquidity_score) = liquidity_value else {
             continue;
         };
-        if config.min_liquidity_tokens > 0.0 {
-            let min = Decimal::from_f64(config.min_liquidity_tokens).unwrap_or(Decimal::ZERO);
+        if min_liquidity_tokens > 0.0 {
+            let min = Decimal::from_f64(min_liquidity_tokens).unwrap_or(Decimal::ZERO);
             if liquidity_score < min {
                 continue;
             }
@@ -291,7 +313,7 @@ where
             .cloned()
             .unwrap_or(Decimal::ZERO);
         scores.push(PoolScore {
-            pool: record.clone(),
+            pool: record,
             liquidity_score,
             volume_score,
         });
@@ -339,63 +361,82 @@ where
     let block = current_block(provider.clone()).await;
     let from_block = block.saturating_sub(U64::from(config.event_sampling_blocks));
     let sample_indices = pool_sample_indices(capped.len(), config.event_sampling_rate);
-    let mut sampled_volume: HashMap<Address, Decimal> = HashMap::new();
     let mut liquidity_failures = 0usize;
+    let concurrency = hot_pool_rank_concurrency();
 
-    for idx in sample_indices {
-        let record = &capped[idx];
-        match timeout(
-            rpc_timeout,
-            univ3_volume(provider.clone(), record.pool, from_block, block),
-        )
-        .await
-        {
-            Err(_) => {
-                warn!(
-                    timeout_ms = rpc_timeout.as_millis() as u64,
-                    pool = %format!("0x{}", hex::encode(record.pool)),
-                    "timed out loading univ3 swap volume"
-                );
-            }
-            Ok(Err(err)) => {
-                warn!(
-                    error = %err,
-                    pool = %format!("0x{}", hex::encode(record.pool)),
-                    "failed to load univ3 swap volume"
-                );
-            }
-            Ok(Ok(volume)) => {
-                let volume_dec = u256_to_decimal(volume);
-                sampled_volume.insert(record.pool, volume_dec);
-            }
-        }
-    }
-
-    for record in capped.iter() {
-        let liquidity_score =
-            match timeout(rpc_timeout, univ3_liquidity_score(provider.clone(), record)).await {
+    // Volume sampling: bounded-concurrency swap-log queries.
+    let volume_pairs: Vec<(Address, Decimal)> = stream::iter(sample_indices.into_iter().map(|idx| {
+        let pool = capped[idx].pool;
+        let provider = provider.clone();
+        async move {
+            match timeout(rpc_timeout, univ3_volume(provider, pool, from_block, block)).await {
                 Err(_) => {
-                    liquidity_failures = liquidity_failures.saturating_add(1);
                     warn!(
                         timeout_ms = rpc_timeout.as_millis() as u64,
-                        pool = %format!("0x{}", hex::encode(record.pool)),
-                        "timed out loading univ3 liquidity"
+                        pool = %format!("0x{}", hex::encode(pool)),
+                        "timed out loading univ3 swap volume"
                     );
-                    continue;
+                    None
                 }
                 Ok(Err(err)) => {
-                    liquidity_failures = liquidity_failures.saturating_add(1);
                     warn!(
                         error = %err,
-                        pool = %format!("0x{}", hex::encode(record.pool)),
-                        "failed to load univ3 liquidity"
+                        pool = %format!("0x{}", hex::encode(pool)),
+                        "failed to load univ3 swap volume"
                     );
-                    continue;
+                    None
                 }
-                Ok(Ok(value)) => value,
-            };
-        if config.min_liquidity_tokens > 0.0 {
-            let min = Decimal::from_f64(config.min_liquidity_tokens).unwrap_or(Decimal::ZERO);
+                Ok(Ok(volume)) => Some((pool, u256_to_decimal(volume))),
+            }
+        }
+    }))
+    .buffer_unordered(concurrency)
+    .filter_map(|entry| async move { entry })
+    .collect()
+    .await;
+    let sampled_volume: HashMap<Address, Decimal> = volume_pairs.into_iter().collect();
+
+    // Liquidity scoring: bounded-concurrency probes over every cold pool.
+    let liquidity_outcomes: Vec<(PoolRecord, Option<Decimal>, bool)> =
+        stream::iter(capped.iter().cloned().map(|record| {
+            let provider = provider.clone();
+            async move {
+                match timeout(rpc_timeout, univ3_liquidity_score(provider, &record)).await {
+                    Err(_) => {
+                        warn!(
+                            timeout_ms = rpc_timeout.as_millis() as u64,
+                            pool = %format!("0x{}", hex::encode(record.pool)),
+                            "timed out loading univ3 liquidity"
+                        );
+                        (record, None, true)
+                    }
+                    Ok(Err(err)) => {
+                        warn!(
+                            error = %err,
+                            pool = %format!("0x{}", hex::encode(record.pool)),
+                            "failed to load univ3 liquidity"
+                        );
+                        (record, None, true)
+                    }
+                    Ok(Ok(value)) => (record, Some(value), false),
+                }
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    let min_liquidity_tokens = config.min_liquidity_tokens;
+    for (record, liquidity_value, failed) in liquidity_outcomes {
+        if failed {
+            liquidity_failures = liquidity_failures.saturating_add(1);
+            continue;
+        }
+        let Some(liquidity_score) = liquidity_value else {
+            continue;
+        };
+        if min_liquidity_tokens > 0.0 {
+            let min = Decimal::from_f64(min_liquidity_tokens).unwrap_or(Decimal::ZERO);
             if liquidity_score < min {
                 continue;
             }
@@ -405,7 +446,7 @@ where
             .cloned()
             .unwrap_or(Decimal::ZERO);
         scores.push(PoolScore {
-            pool: record.clone(),
+            pool: record,
             liquidity_score,
             volume_score,
         });
@@ -440,6 +481,19 @@ fn hot_pool_rpc_timeout() -> Duration {
         .unwrap_or(1_500)
         .max(100);
     Duration::from_millis(ms)
+}
+
+/// Bounded fan-out for hot-pool ranking RPC. Ranking issues one liquidity probe
+/// per cold pool (plus sampled volume queries); doing these serially makes
+/// startup and the periodic refresh scale linearly with the universe size. We
+/// run them concurrently with a bounded window so a large universe still ranks
+/// in seconds without overwhelming the RPC endpoint.
+fn hot_pool_rank_concurrency() -> usize {
+    std::env::var("HOT_POOL_RANK_CONCURRENCY")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(64)
+        .clamp(1, 256)
 }
 
 pub fn log_hot_pool_refresh(chain: &str, venue: &str, kind: &str, hot: usize) {

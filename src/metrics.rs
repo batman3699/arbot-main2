@@ -53,6 +53,7 @@ pub struct Metrics {
     pub liquidity_cache_hits: CounterVec,
     pub liquidity_cache_misses: CounterVec,
     pub liquidity_cache_evictions: CounterVec,
+    pub worker_restarts: CounterVec,
 }
 
 impl Metrics {
@@ -395,6 +396,17 @@ impl Metrics {
             .register(Box::new(liquidity_cache_evictions.clone()))
             .context("register liquidity_cache_evictions_total counter")?;
 
+        let worker_restarts = CounterVec::new(
+            Opts::new(
+                "worker_restarts_total",
+                "Total supervised background worker restarts after exit or panic",
+            ),
+            &["chain", "worker"],
+        )?;
+        registry
+            .register(Box::new(worker_restarts.clone()))
+            .context("register worker_restarts_total counter")?;
+
         Ok(Self {
             registry,
             opportunities_detected,
@@ -433,6 +445,7 @@ impl Metrics {
             liquidity_cache_hits,
             liquidity_cache_misses,
             liquidity_cache_evictions,
+            worker_restarts,
         })
     }
 
@@ -584,6 +597,12 @@ impl Metrics {
                 .with_label_values(&[chain])
                 .inc_by(count as f64);
         }
+    }
+
+    pub fn record_worker_restart(&self, chain: &str, worker: &str) {
+        self.worker_restarts
+            .with_label_values(&[chain, worker])
+            .inc();
     }
 
     pub async fn export_to_prometheus(self: Arc<Self>, port: u16) -> Result<()> {

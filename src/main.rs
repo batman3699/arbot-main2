@@ -26,8 +26,10 @@ mod quote_univ2;
 mod quote_univ3;
 mod quote_univ4;
 mod registry;
+mod risk_policy;
 mod rpc_failover;
 mod sandwich;
+mod sim_quorum;
 mod sizing;
 mod token_refresh;
 mod util;
@@ -51,7 +53,7 @@ use ethers::{
     types::{Address, BlockId, BlockNumber, Bytes, NameOrAddress, TxHash, H256, U256, U64},
 };
 use math::mul_div;
-use plan::{build_plan_for_cycle, GenericPreAction, JitConfig, StepData};
+use plan::{build_plan_for_cycle, GenericPreAction, JitConfig, Plan, StepData};
 use std::{
     cmp::Ordering,
     cmp::Reverse,
@@ -84,6 +86,7 @@ use serde::Serialize;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use venues::populate_edges;
+use futures_util::{stream, StreamExt};
 
 use crate::bridge::BridgePlanner;
 use crate::discovery::{LowLiquidityPool, LowLiquidityScanner};
@@ -95,9 +98,11 @@ use crate::liquidity_cache::PoolDepthCache;
 use crate::metrics::Metrics;
 use crate::ops_inputs::load_ops_inputs;
 use crate::quote_univ3::{UniQuoter, UniV3ValidationConfig, FEE_TIERS};
+use crate::risk_policy::RuntimeRiskPolicy;
 use crate::rpc_failover::FailoverClient;
 use crate::sandwich::{SandwichMonitor, SandwichOpportunity};
-use crate::sizing::{optimize_trade_size, OptimizeTradeParams};
+use crate::sim_quorum::SimQuorum;
+use crate::sizing::{optimize_trade_size, OptimizeTradeParams, SizingResult};
 use crate::token_refresh::TokenList;
 use crate::util::{
     CandidateDecisionLogger, CandidateDecisionRecord,
@@ -742,6 +747,7 @@ fn start_token_pricing_reliable(
     native_price.is_reliable()
 }
 
+#[allow(dead_code)]
 fn should_reuse_cached_native_price(
     token: Address,
     wrapped_native: Address,
@@ -750,12 +756,41 @@ fn should_reuse_cached_native_price(
     token == wrapped_native || native_price.is_reliable()
 }
 
+#[allow(dead_code)]
 fn should_cache_native_price(
     token: Address,
     wrapped_native: Address,
     native_price: NativePrice,
 ) -> bool {
     token == wrapped_native || native_price.is_reliable()
+}
+
+/// How long a token's native (WETH-denominated) price is reused before being
+/// re-quoted. Caching every verdict — including "unreliable" — for this window
+/// is what stops the per-scan re-quote of unpriceable tokens (the dominant
+/// native-price latency), while keeping prices fresh enough for the
+/// profit-threshold conversion. Configurable via NATIVE_PRICE_TTL_SECS.
+fn native_price_cache_ttl() -> Duration {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let secs = *V.get_or_init(|| {
+        std::env::var("NATIVE_PRICE_TTL_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(120)
+            .clamp(5, 3600)
+    });
+    Duration::from_secs(secs)
+}
+
+/// Bounded concurrency for refreshing native (token->WETH) prices. The TTL
+/// refresh re-quotes every universe token at once; doing it sequentially was a
+/// ~20s blind spike every TTL window, so fan it out.
+fn native_price_concurrency() -> usize {
+    std::env::var("NATIVE_PRICE_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(32)
+        .clamp(1, 128)
 }
 
 fn cap_cycles_per_start(
@@ -960,10 +995,81 @@ struct ProfitThresholdParams<'a> {
     backrun_hint: Option<&'a BackrunHint>,
 }
 
+/// Default number of candidate cycles sized concurrently per scan. Sizing is
+/// RPC-bound (quote grids), so modest parallelism multiplies how many
+/// candidates fit inside the quote budget without saturating the endpoint.
+const DEFAULT_CANDIDATE_PREP_CONCURRENCY: usize = 4;
+
+fn candidate_prep_concurrency() -> usize {
+    std::env::var("ARBOT_CANDIDATE_CONCURRENCY")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CANDIDATE_PREP_CONCURRENCY)
+}
+
+/// Shared read-only inputs for concurrent candidate preparation.
+struct CandidatePrepCtx<'a> {
+    native_prices_map: &'a HashMap<Address, NativePrice>,
+    base_profiles_map: &'a HashMap<Address, TradeSizing>,
+    capital_snapshot: &'a CapitalSnapshot,
+    competition_snapshot: &'a CompetitionSnapshot,
+    gas_parameters: &'a FeeEstimate,
+    executor_address: Address,
+    block_number: U64,
+    edges_scanned: usize,
+}
+
+/// Result of the RPC-heavy candidate preparation stage (validation, flash
+/// quotes, sizing grid, plan construction). Rejections have already emitted
+/// their candidate-stage logs; the caller only consumes the skip detail.
+enum CandidatePrep {
+    /// Quote budget elapsed before this candidate could start sizing.
+    Budgeted,
+    Rejected {
+        skip_detail: Option<String>,
+    },
+    Sized(Box<SizedCandidate>),
+}
+
+struct SizedCandidate {
+    cycle_ix: Vec<usize>,
+    candidate_id: String,
+    cycle_start: Address,
+    native_price: NativePrice,
+    pricing_reliable: bool,
+    competition_buffer: U256,
+    cycle_latency_secs: f64,
+    cycle_edges_vec: Vec<Edge>,
+    has_bridge_step: bool,
+    backrun_hint: Option<BackrunHint>,
+    adjusted_cycle_gas: u64,
+    sizing: SizingResult,
+    plan: Plan,
+    trade_amount: U256,
+}
+
 struct DynamicProfitParams<'a> {
     fee: &'a FeeEstimate,
     est_gas: u64,
     est_gross: U256,
+    congestion: f64,
+    competition: &'a CompetitionSnapshot,
+    latency_secs: f64,
+    native_price: NativePrice,
+}
+
+/// Inputs to the unified pre-/post-simulation profit threshold. Both gates
+/// must be fed through `unified_min_profit_threshold` so they cannot drift.
+struct UnifiedThresholdParams<'a> {
+    fee: &'a FeeEstimate,
+    est_gas: u64,
+    est_gross_after_fee: U256,
+    flash_fee_amount: U256,
+    slippage_floor: U256,
+    competition_buffer: U256,
+    has_bridge_step: bool,
+    backrun_hint: Option<&'a BackrunHint>,
     congestion: f64,
     competition: &'a CompetitionSnapshot,
     latency_secs: f64,
@@ -1117,6 +1223,35 @@ impl PrivateRelayProvider {
     }
 }
 
+/// Runtime kill-switch for the private raw-transaction fallback. Lets ops
+/// force bundle-only submission without editing ops/inputs.yaml.
+fn private_raw_fallback_disabled() -> bool {
+    std::env::var("ARBOT_DISABLE_PRIVATE_RAW_FALLBACK")
+        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Only relay errors that mean "this endpoint does not implement
+/// eth_sendBundle" may trigger the raw fallback. Content rejections (bundle
+/// validation, reverts, rate limits) must NOT leak the transaction through
+/// eth_sendRawTransaction, which lacks bundle atomicity/revert protection.
+fn bundle_method_unsupported(err: &ProviderError) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    // JSON-RPC standard "method not found" code.
+    if text.contains("-32601") {
+        return true;
+    }
+    // Geth-style: "the method eth_sendBundle does not exist/is not available";
+    // require the word "method" so content rejections mentioning e.g.
+    // "pool does not exist" can never unlock the raw fallback.
+    text.contains("method")
+        && (text.contains("not found")
+            || text.contains("not supported")
+            || text.contains("unsupported")
+            || text.contains("does not exist")
+            || text.contains("not available"))
+}
+
 async fn send_private_rpc_bundle<P: JsonRpcClient>(
     provider: &Provider<P>,
     raw: Bytes,
@@ -1132,14 +1267,15 @@ async fn send_private_rpc_bundle<P: JsonRpcClient>(
             request["params"].clone(),
         )
         .await;
+    let allow_fallback = allow_private_raw_fallback && !private_raw_fallback_disabled();
     match bundle_attempt {
         Ok(_) => Ok((tx_hash, PrivateSubmissionMethod::Bundle)),
-        Err(err) if allow_private_raw_fallback => {
+        Err(err) if allow_fallback && bundle_method_unsupported(&err) => {
             warn!(
                 target: "broadcast",
                 chain = chain_name,
                 error = %err,
-                "eth_sendBundle failed on private RPC relay; trying eth_sendRawTransaction fallback"
+                "eth_sendBundle unsupported on private RPC relay; falling back to private eth_sendRawTransaction (no bundle revert protection)"
             );
             provider
                 .request::<serde_json::Value, serde_json::Value>(
@@ -1149,7 +1285,16 @@ async fn send_private_rpc_bundle<P: JsonRpcClient>(
                 .await?;
             Ok((tx_hash, PrivateSubmissionMethod::PrivateRaw))
         }
-        Err(err) => Err(err),
+        Err(err) => {
+            if allow_private_raw_fallback && !allow_fallback {
+                warn!(
+                    target: "broadcast",
+                    chain = chain_name,
+                    "private raw fallback suppressed by ARBOT_DISABLE_PRIVATE_RAW_FALLBACK"
+                );
+            }
+            Err(err)
+        }
     }
 }
 
@@ -2636,6 +2781,8 @@ where
     metrics: Option<Arc<Metrics>>,
     accounting: Option<Arc<Accounting>>,
     fee_estimator: FeeEstimator<C>,
+    risk_policy: Option<RuntimeRiskPolicy>,
+    sim_quorum: Arc<SimQuorum>,
 }
 
 struct Runner<M, C>
@@ -2722,11 +2869,14 @@ where
     metrics: Option<Arc<Metrics>>,
     accounting: Option<Arc<Accounting>>,
     token_decimals: Arc<Mutex<HashMap<Address, u8>>>,
-    native_price_cache: Arc<Mutex<HashMap<Address, NativePrice>>>,
+    native_price_cache: Arc<Mutex<HashMap<Address, (NativePrice, Instant)>>>,
     fee_estimator: FeeEstimator<C>,
     last_graph_digest: Arc<Mutex<Option<GraphDigest>>>,
     previous_cycle_seeds: Arc<Mutex<Vec<Vec<Address>>>>,
     candidate_logger: Arc<CandidateDecisionLogger>,
+    risk_policy: Option<RuntimeRiskPolicy>,
+    sim_quorum: Arc<SimQuorum>,
+    last_scanned_block: Arc<Mutex<Option<U64>>>,
 }
 
 impl<M, C> Runner<M, C>
@@ -2816,6 +2966,8 @@ where
             metrics,
             accounting,
             fee_estimator,
+            risk_policy,
+            sim_quorum,
         } = config;
         let bal_flashloan_tokens = bal_flashloan_tokens.map(Arc::new);
         let aave_flashloan_tokens = aave_flashloan_tokens.map(Arc::new);
@@ -2920,6 +3072,9 @@ where
             last_graph_digest: Arc::new(Mutex::new(None)),
             previous_cycle_seeds: Arc::new(Mutex::new(Vec::new())),
             candidate_logger: Arc::new(CandidateDecisionLogger::from_env()),
+            risk_policy,
+            sim_quorum,
+            last_scanned_block: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -3301,42 +3456,64 @@ where
         token_decimals: &HashMap<Address, u8>,
         block_number: U64,
     ) -> HashMap<Address, NativePrice> {
-        let mut cache = self.native_price_cache.lock().await;
-        for &token in tokens.iter() {
-            if let Some(cached) = cache.get(&token) {
-                if should_reuse_cached_native_price(token, self.wrapped_native, *cached) {
-                    continue;
-                }
-            }
-
-            let decimals = token_decimals.get(&token).copied().unwrap_or(18);
-            let price = self
-                .fetch_native_price(token, decimals, block_number)
-                .await
-                .unwrap_or_else(|| {
-                    if token == self.wrapped_native {
-                        let amount = U256::exp10(decimals.min(18) as usize);
-                        NativePrice::new(amount, amount, true)
+        let ttl = native_price_cache_ttl();
+        // 1) Pick the tokens whose cached verdict (reliable OR unreliable) has
+        //    expired. Caching the unreliable verdict too is what stops the
+        //    per-scan re-quote of unpriceable tokens.
+        let to_fetch: Vec<(Address, u8)> = {
+            let cache = self.native_price_cache.lock().await;
+            tokens
+                .iter()
+                .filter_map(|&token| {
+                    let fresh = cache
+                        .get(&token)
+                        .map(|(_, at)| at.elapsed() < ttl)
+                        .unwrap_or(false);
+                    if fresh {
+                        None
                     } else {
-                        NativePrice::new(U256::zero(), U256::zero(), false)
+                        Some((token, token_decimals.get(&token).copied().unwrap_or(18)))
                     }
-                });
-            if should_cache_native_price(token, self.wrapped_native, price) {
-                cache.insert(token, price);
-            } else {
-                cache.remove(&token);
+                })
+                .collect()
+        };
+
+        // 2) Fetch the expired tokens CONCURRENTLY (lock released). The previous
+        //    sequential refresh was a ~20s blind spike every TTL window.
+        if !to_fetch.is_empty() {
+            let concurrency = native_price_concurrency();
+            let fetched: Vec<(Address, NativePrice)> = stream::iter(to_fetch.into_iter().map(
+                |(token, decimals)| async move {
+                    let price = self
+                        .fetch_native_price(token, decimals, block_number)
+                        .await
+                        .unwrap_or_else(|| {
+                            if token == self.wrapped_native {
+                                let amount = U256::exp10(decimals.min(18) as usize);
+                                NativePrice::new(amount, amount, true)
+                            } else {
+                                NativePrice::new(U256::zero(), U256::zero(), false)
+                            }
+                        });
+                    (token, price)
+                },
+            ))
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+            let mut cache = self.native_price_cache.lock().await;
+            let now = Instant::now();
+            for (token, price) in fetched {
+                cache.insert(token, (price, now));
             }
         }
 
-        cache
+        // 3) Build the result snapshot from the (now-fresh) cache.
+        let cache = self.native_price_cache.lock().await;
+        tokens
             .iter()
-            .filter_map(|(token, price)| {
-                if tokens.contains(token) {
-                    Some((*token, *price))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|&token| cache.get(&token).map(|(price, _)| (token, *price)))
             .collect()
     }
 
@@ -3479,6 +3656,114 @@ where
             U256::from(pressure_scaled),
             U256::from(1_000_000u64),
         )
+    }
+
+    /// Single source of truth for the dispatch profit threshold.
+    ///
+    /// Pre-simulation and post-simulation gating MUST use this same formula:
+    /// dynamic gas/competition base plus revert-risk premium, flash-fee
+    /// buffer, bridge premium, backrun discount, slippage floor and risk net
+    /// floor. The historical drift (post-sim recomputation dropping the
+    /// flash-fee buffer, bridge premium, and backrun discount) made the two
+    /// gates disagree and could either skip profitable trades or dispatch
+    /// trades the pre-sim gate would have rejected.
+    fn unified_min_profit_threshold(&self, params: UnifiedThresholdParams<'_>) -> U256 {
+        let mut base_threshold = self.dynamic_min_profit(DynamicProfitParams {
+            fee: params.fee,
+            est_gas: params.est_gas,
+            est_gross: params.est_gross_after_fee,
+            congestion: params.congestion,
+            competition: params.competition,
+            latency_secs: params.latency_secs,
+            native_price: params.native_price,
+        });
+
+        // Risk policy: price expected revert losses into the threshold as a
+        // premium over the gas cost (revert_penalty_model from ops inputs).
+        if let Some(policy) = &self.risk_policy {
+            let penalty_bps = policy.revert_penalty_bps(params.est_gas);
+            if penalty_bps > 0 {
+                let gas_cost_native = params
+                    .fee
+                    .gas_price
+                    .saturating_mul(U256::from(params.est_gas))
+                    .saturating_add(params.fee.l1_data_fee);
+                if let Some(gas_cost_tokens) = params
+                    .native_price
+                    .tokens_for_native_strict(gas_cost_native)
+                {
+                    let premium = mul_div(
+                        gas_cost_tokens,
+                        U256::from(penalty_bps as u64),
+                        U256::from(10_000u64),
+                    );
+                    base_threshold = base_threshold.saturating_add(premium);
+                }
+            }
+        }
+
+        let threshold = finalize_profit_threshold(ProfitThresholdParams {
+            base_threshold,
+            competition_buffer: params.competition_buffer,
+            flash_fee_amount: params.flash_fee_amount,
+            slippage_floor: params.slippage_floor,
+            has_bridge_step: params.has_bridge_step,
+            est_gross_after_fee: params.est_gross_after_fee,
+            cross_chain_profit_bps: self.cross_chain_profit_bps,
+            cross_chain_min_profit_wei: self.cross_chain_min_profit_wei,
+            backrun_hint: params.backrun_hint,
+        });
+
+        // Risk policy: the declared net-profit floor also floors the on-chain
+        // min_profit so the executor itself refuses sub-floor fills.
+        match self.risk_min_net_profit_tokens(params.native_price) {
+            Some(floor) => threshold.max(floor),
+            None => threshold,
+        }
+    }
+
+    /// Declared risk net-profit floor converted into start-token units.
+    fn risk_min_net_profit_tokens(&self, native_price: NativePrice) -> Option<U256> {
+        let floor_wei = self.risk_policy.as_ref()?.min_net_profit_wei?;
+        native_price.tokens_for_native_strict(floor_wei)
+    }
+
+    /// Enforce the gas-unit and fee-per-gas caps from the risk policy against
+    /// a candidate's fee estimate. Returns the rejection reason when violated.
+    fn risk_gas_violation(&self, fee: &FeeEstimate, gas_units: u64) -> Option<&'static str> {
+        let policy = self.risk_policy.as_ref()?;
+        if let Some(max_gas) = policy.max_gas_units_per_tx {
+            if gas_units > max_gas {
+                return Some("risk_max_gas_units_exceeded");
+            }
+        }
+        if let Some(cap) = policy.max_fee_per_gas_cap {
+            let effective_fee = fee.max_fee_per_gas.unwrap_or(fee.gas_price);
+            if effective_fee > cap {
+                return Some("risk_max_fee_per_gas_exceeded");
+            }
+        }
+        None
+    }
+
+    /// Enforce slippage and price-impact tolerances from the risk policy.
+    fn risk_slippage_violation(
+        &self,
+        swap_slippage_bps: u32,
+        price_impact_bps: u32,
+    ) -> Option<&'static str> {
+        let policy = self.risk_policy.as_ref()?;
+        if let Some(max_slippage) = policy.max_slippage_bps {
+            if swap_slippage_bps > max_slippage {
+                return Some("risk_max_slippage_exceeded");
+            }
+        }
+        if let Some(max_impact) = policy.max_price_impact_bps {
+            if price_impact_bps > max_impact {
+                return Some("risk_max_price_impact_exceeded");
+            }
+        }
+        None
     }
 
     async fn process_sandwich_opportunities(
@@ -3674,6 +3959,441 @@ where
         compute_start_priorities_inner(graph, base_profiles, backrun_hints, self.min_flash_loan_wei)
     }
 
+    /// RPC-heavy candidate preparation: validation, flash-loan quotes, sizing
+    /// grid, and executor plan construction for one cycle. Safe to run
+    /// concurrently across candidates (only shared reads; quote concurrency is
+    /// bounded by the UniV3 semaphore). Rejections emit their candidate-stage
+    /// logs and zero-loss metrics here, exactly as the sequential pipeline did.
+    async fn prepare_candidate(
+        &self,
+        graph: &Graph,
+        cycle_ix: Vec<usize>,
+        ctx: &CandidatePrepCtx<'_>,
+    ) -> CandidatePrep {
+        if cycle_ix.len() < 2 {
+            return CandidatePrep::Rejected { skip_detail: None };
+        }
+        let cycle_start_ix = match cycle_ix.first() {
+            Some(ix) => *ix,
+            None => return CandidatePrep::Rejected { skip_detail: None },
+        };
+        let cycle_start = graph.nodes[cycle_start_ix];
+        let mut native_price = self.native_price_for(cycle_start, ctx.native_prices_map);
+        if cycle_start == self.wrapped_native && !native_price.is_reliable() {
+            let amount = U256::exp10(18);
+            native_price = NativePrice::new(amount, amount, true);
+        }
+        let pricing_reliable =
+            start_token_pricing_reliable(cycle_start, self.wrapped_native, native_price);
+        let candidate_id =
+            self.stage_candidate_id(cycle_start, &cycle_ix, graph, ctx.block_number, &[]);
+        if !pricing_reliable {
+            self.log_candidate_stage(
+                "candidate_rejected_pre_sim",
+                &self.chain_name,
+                Some(candidate_id),
+                Some(cycle_start),
+                Some(cycle_ix.len().saturating_sub(1)),
+                ctx.edges_scanned,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                Some("unreliable_native_price_for_start_token"),
+                None,
+                false,
+                false,
+            );
+            return CandidatePrep::Rejected {
+                skip_detail: Some(format!(
+                    "cycle start=0x{} rejected: unreliable native price for start token",
+                    hex::encode(cycle_start)
+                )),
+            };
+        }
+        let Some(competition_buffer) =
+            native_price.tokens_for_native_strict(ctx.competition_snapshot.extra_buffer_wei)
+        else {
+            self.log_candidate_stage(
+                "candidate_rejected_pre_sim",
+                &self.chain_name,
+                Some(candidate_id.clone()),
+                Some(cycle_start),
+                Some(cycle_ix.len().saturating_sub(1)),
+                ctx.edges_scanned,
+                None,
+                None,
+                Some(ctx.competition_snapshot.extra_buffer_wei),
+                None,
+                false,
+                None,
+                Some("unreliable_native_price_for_start_token"),
+                None,
+                false,
+                false,
+            );
+            return CandidatePrep::Rejected { skip_detail: None };
+        };
+        if let Some(&last_ix) = cycle_ix.last() {
+            debug_assert_eq!(
+                graph.nodes[last_ix], cycle_start,
+                "cycle must terminate at the starting token"
+            );
+        }
+
+        let cycle_base_amount = ctx
+            .base_profiles_map
+            .get(&cycle_start)
+            .map(|profile| profile.base_amount)
+            .unwrap_or(ctx.capital_snapshot.base_amount);
+        let mut estimated_cycle_gas: u64 = 0;
+        let mut cycle_max_input = cycle_base_amount;
+        let cycle_latency_secs = self.estimate_cycle_latency(graph, &cycle_ix);
+        let mut cycle_edges_vec: Vec<Edge> = Vec::with_capacity(cycle_ix.len().saturating_sub(1));
+        let mut backrun_hint: Option<BackrunHint> = None;
+        let mut has_bridge_step = false;
+        for window in cycle_ix.windows(2) {
+            let u = graph.nodes[window[0]];
+            let v = graph.nodes[window[1]];
+            let Some(edge) = graph.edge_between(u, v) else {
+                warn!(from = %u, to = %v, "Skipping cycle due to missing edge");
+                self.log_candidate_stage(
+                    "candidate_rejected_pre_sim",
+                    &self.chain_name,
+                    Some(candidate_id.clone()),
+                    Some(cycle_start),
+                    Some(cycle_ix.len().saturating_sub(1)),
+                    ctx.edges_scanned,
+                    None,
+                    None,
+                    None,
+                    None,
+                    pricing_reliable,
+                    None,
+                    Some("invalid_edge"),
+                    None,
+                    false,
+                    false,
+                );
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_failure(U256::zero());
+                }
+                // Pre-execution graph/plan errors are zero-loss and must NOT trip
+                // the circuit breaker (former false-positive halt source). Only real
+                // execution reverts/losses count, recorded at dispatch time.
+                return CandidatePrep::Rejected { skip_detail: None };
+            };
+            estimated_cycle_gas = estimated_cycle_gas.saturating_add(edge.estimated_gas);
+            cycle_max_input = cycle_max_input.min(edge.max_input);
+            if matches!(edge.venue, VenueEdge::Bridge { .. }) {
+                has_bridge_step = true;
+            }
+            cycle_edges_vec.push(edge.clone());
+        }
+
+        if has_bridge_step && !self.feature_gate.bridge {
+            self.log_candidate_stage(
+                "candidate_rejected_pre_sim",
+                &self.chain_name,
+                Some(candidate_id.clone()),
+                Some(cycle_start),
+                Some(cycle_ix.len().saturating_sub(1)),
+                ctx.edges_scanned,
+                None,
+                None,
+                None,
+                None,
+                pricing_reliable,
+                None,
+                Some("invalid_candidate_path"),
+                None,
+                has_bridge_step,
+                false,
+            );
+            return CandidatePrep::Rejected {
+                skip_detail: Some(
+                    "cycle requires bridge step but FEATURE_BRIDGE=0".to_string(),
+                ),
+            };
+        }
+
+        if cycle_max_input.is_zero() {
+            self.log_candidate_stage(
+                "candidate_rejected_pre_sim",
+                &self.chain_name,
+                Some(candidate_id.clone()),
+                Some(cycle_start),
+                Some(cycle_ix.len().saturating_sub(1)),
+                ctx.edges_scanned,
+                None,
+                None,
+                None,
+                None,
+                pricing_reliable,
+                None,
+                Some("no_liquidity"),
+                None,
+                has_bridge_step,
+                false,
+            );
+            return CandidatePrep::Rejected {
+                skip_detail: Some(format!(
+                    "cycle start=0x{} has zero capacity after slippage control",
+                    hex::encode(cycle_start)
+                )),
+            };
+        }
+
+        let mut trade_cap = cycle_base_amount.min(cycle_max_input);
+
+        if let Some(monitor) = &self.backrun {
+            if self.broadcast.role == MevRole::Filler && cycle_ix.len() >= 2 {
+                let from = graph.nodes[cycle_ix[0]];
+                let next_idx = cycle_ix[1];
+                let to = graph.nodes[next_idx];
+                if let Some(pending_amount) = monitor
+                    .best_amount_for(from, to, Duration::from_secs(30))
+                    .await
+                {
+                    if !pending_amount.is_zero() {
+                        trade_cap = trade_cap.min(pending_amount);
+                    }
+                }
+
+                if let Some(hint) = monitor.hint_for(from, to, Duration::from_secs(45)).await {
+                    backrun_hint = Some(hint);
+                    if let Some(amount) = backrun_hint.as_ref().map(|h| h.amount_in) {
+                        trade_cap = trade_cap.min(amount);
+                    }
+                }
+            }
+        }
+
+        if trade_cap.is_zero() {
+            self.log_candidate_stage(
+                "candidate_rejected_pre_sim",
+                &self.chain_name,
+                Some(candidate_id.clone()),
+                Some(cycle_start),
+                Some(cycle_ix.len().saturating_sub(1)),
+                ctx.edges_scanned,
+                None,
+                None,
+                None,
+                None,
+                pricing_reliable,
+                None,
+                Some("no_quote_available"),
+                None,
+                has_bridge_step,
+                false,
+            );
+            return CandidatePrep::Rejected {
+                skip_detail: Some(format!(
+                    "cycle start=0x{} reduced to zero trade size",
+                    hex::encode(cycle_start)
+                )),
+            };
+        }
+
+        let quotes = self.flash_loan_quotes(cycle_start, trade_cap);
+        if quotes.is_empty() {
+            self.log_candidate_stage(
+                "candidate_rejected_pre_sim",
+                &self.chain_name,
+                Some(candidate_id.clone()),
+                Some(cycle_start),
+                Some(cycle_ix.len().saturating_sub(1)),
+                ctx.edges_scanned,
+                None,
+                None,
+                None,
+                None,
+                pricing_reliable,
+                None,
+                Some("no_flashloan_provider"),
+                None,
+                has_bridge_step,
+                false,
+            );
+            return CandidatePrep::Rejected {
+                skip_detail: Some(format!(
+                    "cycle start=0x{} unsupported by flash loan providers",
+                    hex::encode(cycle_start)
+                )),
+            };
+        }
+
+        let preview_plan = match build_plan_for_cycle(
+            graph,
+            &cycle_ix,
+            cycle_base_amount,
+            ctx.executor_address,
+            self.jit_config.as_ref(),
+            Some(self.quoter.as_ref()),
+            ctx.block_number,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(err) => {
+                warn!(error = %err, "Skipping candidate due to plan construction failure");
+                self.log_candidate_stage(
+                    "candidate_rejected_pre_sim",
+                    &self.chain_name,
+                    Some(candidate_id.clone()),
+                    Some(cycle_start),
+                    Some(cycle_ix.len().saturating_sub(1)),
+                    ctx.edges_scanned,
+                    None,
+                    None,
+                    None,
+                    None,
+                    pricing_reliable,
+                    None,
+                    Some("plan_build_failed"),
+                    None,
+                    has_bridge_step,
+                    false,
+                );
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_failure(U256::zero());
+                }
+                // Pre-execution graph/plan errors are zero-loss and must NOT trip
+                // the circuit breaker (former false-positive halt source). Only real
+                // execution reverts/losses count, recorded at dispatch time.
+                return CandidatePrep::Rejected { skip_detail: None };
+            }
+        };
+
+        let mut adjusted_cycle_gas = estimated_cycle_gas;
+        if self
+            .jit_config
+            .as_ref()
+            .map(|cfg| cfg.enabled)
+            .unwrap_or(false)
+        {
+            let jit_add_steps = preview_plan
+                .steps
+                .iter()
+                .filter(|s| matches!(s, StepData::JitLiquidityAdd { .. }))
+                .count() as u64;
+            let jit_remove_steps = preview_plan
+                .steps
+                .iter()
+                .filter(|s| matches!(s, StepData::JitLiquidityRemove { .. }))
+                .count() as u64;
+            adjusted_cycle_gas = adjusted_cycle_gas
+                .saturating_add(jit_add_steps.saturating_mul(JIT_PRESWAP_ESTIMATED_GAS))
+                .saturating_add(jit_add_steps.saturating_mul(JIT_LP_ADD_ESTIMATED_GAS))
+                .saturating_add(jit_remove_steps.saturating_mul(JIT_LP_REMOVE_ESTIMATED_GAS));
+        }
+
+        let Some(sizing) = optimize_trade_size(OptimizeTradeParams {
+            edges: &cycle_edges_vec,
+            quotes: &quotes,
+            min_amount: ctx.capital_snapshot.min_flash_loan,
+            max_amount: trade_cap,
+            gas_price: ctx.gas_parameters.gas_price,
+            estimated_gas: adjusted_cycle_gas,
+            l1_data_fee: ctx.gas_parameters.l1_data_fee,
+            native_price,
+            quoter: self.quoter.as_ref(),
+            bal_quote: self.bal_quote.as_ref(),
+            curve_quote: self.curve_quote.as_ref(),
+            block_number: ctx.block_number,
+        })
+        .await
+        else {
+            self.log_candidate_stage(
+                "candidate_rejected_pre_sim",
+                &self.chain_name,
+                Some(candidate_id.clone()),
+                Some(cycle_start),
+                Some(cycle_ix.len().saturating_sub(1)),
+                ctx.edges_scanned,
+                None,
+                None,
+                None,
+                None,
+                pricing_reliable,
+                None,
+                Some("no_quote_available"),
+                None,
+                has_bridge_step,
+                false,
+            );
+            return CandidatePrep::Rejected {
+                skip_detail: Some(format!(
+                    "cycle start=0x{} had no profitable sizing",
+                    hex::encode(cycle_start)
+                )),
+            };
+        };
+
+        let trade_amount = sizing.amount_in;
+        let plan = match build_plan_for_cycle(
+            graph,
+            &cycle_ix,
+            trade_amount,
+            ctx.executor_address,
+            self.jit_config.as_ref(),
+            Some(self.quoter.as_ref()),
+            ctx.block_number,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(err) => {
+                warn!(error = %err, "Skipping candidate due to plan reconstruction failure");
+                self.log_candidate_stage(
+                    "candidate_rejected_pre_sim",
+                    &self.chain_name,
+                    Some(candidate_id.clone()),
+                    Some(cycle_start),
+                    Some(cycle_ix.len().saturating_sub(1)),
+                    ctx.edges_scanned,
+                    None,
+                    None,
+                    None,
+                    None,
+                    pricing_reliable,
+                    None,
+                    Some("plan_build_failed"),
+                    None,
+                    has_bridge_step,
+                    false,
+                );
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_failure(U256::zero());
+                }
+                // Pre-execution graph/plan errors are zero-loss and must NOT trip
+                // the circuit breaker (former false-positive halt source). Only real
+                // execution reverts/losses count, recorded at dispatch time.
+                return CandidatePrep::Rejected { skip_detail: None };
+            }
+        };
+
+        CandidatePrep::Sized(Box::new(SizedCandidate {
+            cycle_ix,
+            candidate_id,
+            cycle_start,
+            native_price,
+            pricing_reliable,
+            competition_buffer,
+            cycle_latency_secs,
+            cycle_edges_vec,
+            has_bridge_step,
+            backrun_hint,
+            adjusted_cycle_gas,
+            sizing,
+            plan,
+            trade_amount,
+        }))
+    }
+
     async fn scan_once_with<F>(&self, mut populate: F) -> Result<ScanOutcome>
     where
         F: for<'a> FnMut(
@@ -3722,27 +4442,84 @@ where
         // If we cannot obtain a non-zero head, we must NOT scan or broadcast on
         // unknown/stale state. Returning an rpc-classified error aborts this cycle
         // and lets the run loop back off and retry instead of trading blind.
-        let (base_fee, block_number) = match self.provider.get_block(BlockNumber::Latest).await {
-            Ok(Some(block)) => {
-                let number = block.number.unwrap_or_default();
-                if number.is_zero() {
+        //
+        // Block-driven cadence: rebuilding the full graph against an unchanged
+        // head re-quotes identical chain state for zero information gain. When
+        // the head has not advanced since the previous scan, poll cheaply for a
+        // new block instead of re-running the populate/quote pipeline, unless a
+        // live mempool backrun hint justifies a same-block rescan.
+        let rescan_same_block = std::env::var("ARBOT_RESCAN_SAME_BLOCK")
+            .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let block_poll_interval = Duration::from_millis(
+            std::env::var("ARBOT_BLOCK_POLL_MS")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .unwrap_or(150),
+        );
+        let new_block_wait = Duration::from_millis(
+            std::env::var("ARBOT_NEW_BLOCK_WAIT_MS")
+                .ok()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .unwrap_or(4_000),
+        );
+        let block_wait_start = Instant::now();
+        let (base_fee, block_number) = loop {
+            let fetched = match self.provider.get_block(BlockNumber::Latest).await {
+                Ok(Some(block)) => {
+                    let number = block.number.unwrap_or_default();
+                    if number.is_zero() {
+                        return Err(anyhow!(
+                            "rpc returned latest block with no number; refusing to scan on stale state (fail-closed)"
+                        ));
+                    }
+                    (block.base_fee_per_gas, number)
+                }
+                Ok(None) => {
                     return Err(anyhow!(
-                        "rpc returned latest block with no number; refusing to scan on stale state (fail-closed)"
+                        "rpc returned no latest block; refusing to scan on stale state (fail-closed)"
                     ));
                 }
-                (block.base_fee_per_gas, number)
+                Err(err) => {
+                    warn!(error = %err, "Failed to fetch latest block; failing closed");
+                    return Err(anyhow::Error::new(err)
+                        .context("fetch latest block (rpc); refusing to scan on stale state"));
+                }
+            };
+            if rescan_same_block {
+                break fetched;
             }
-            Ok(None) => {
-                return Err(anyhow!(
-                    "rpc returned no latest block; refusing to scan on stale state (fail-closed)"
-                ));
+            let already_scanned = {
+                let guard = self.last_scanned_block.lock().await;
+                *guard == Some(fetched.1)
+            };
+            if !already_scanned {
+                break fetched;
             }
-            Err(err) => {
-                warn!(error = %err, "Failed to fetch latest block; failing closed");
-                return Err(anyhow::Error::new(err)
-                    .context("fetch latest block (rpc); refusing to scan on stale state"));
+            if let Some(monitor) = &self.backrun {
+                if !monitor.active_hints(Duration::from_secs(45)).await.is_empty() {
+                    break fetched;
+                }
             }
+            if block_wait_start.elapsed() >= new_block_wait {
+                return Ok(ScanOutcome::NotProfitable {
+                    reason: format!(
+                        "block {} already scanned; no new head within {}ms",
+                        fetched.1,
+                        new_block_wait.as_millis()
+                    ),
+                    edges: 0,
+                    expected_univ3_edges,
+                });
+            }
+            sleep(block_poll_interval).await;
         };
+        {
+            let mut guard = self.last_scanned_block.lock().await;
+            *guard = Some(block_number);
+        }
 
         let priority_fee = self.broadcast.priority_fee();
         let baseline_calldata = vec![0u8; 120];
@@ -3793,6 +4570,16 @@ where
             }
         }
 
+        // Risk policy fee cap is a hard ceiling: congestion scaling must never
+        // raise the effective cap above the declared per-chain limit.
+        if let Some(cap) = self
+            .risk_policy
+            .as_ref()
+            .and_then(|policy| policy.max_fee_per_gas_cap)
+        {
+            max_gas_threshold = max_gas_threshold.min(cap);
+        }
+
         if max_gas_threshold != U256::MAX && gas_parameters.gas_price > max_gas_threshold {
             return Ok(ScanOutcome::NotProfitable {
                 reason: format!(
@@ -3818,10 +4605,12 @@ where
 
         let token_decimals_map = Arc::new(self.load_token_decimals().await);
         let tokens = self.tokens.current();
+        let t_native = Instant::now();
         let native_prices_map = Arc::new(
             self.load_native_prices(tokens.as_ref(), token_decimals_map.as_ref(), block_number)
                 .await,
         );
+        let native_ms = t_native.elapsed().as_millis() as u64;
         let base_profiles_map = Arc::new(
             self.compute_base_amounts(token_decimals_map.as_ref(), &capital_snapshot)
                 .await,
@@ -3835,12 +4624,14 @@ where
         } else if self.sandwich.is_some() {
             warn!("Sandwich monitor present but FEATURE_SANDWICH=0; ignoring opportunities");
         }
+        let t_lowliq = Instant::now();
         let low_liquidity_pools = if let Some(scanner) = &self.low_liquidity {
             let mut guard = scanner.lock().await;
             guard.poll(token_decimals_map.as_ref()).await?
         } else {
             Vec::new()
         };
+        let lowliq_ms = t_lowliq.elapsed().as_millis() as u64;
         let base_token_whitelist = self.tokens.current_set();
         let hot_univ2_tokens = self.hot_univ2_pools.read().await.clone();
         let hot_univ3_tokens = self.hot_univ3_pools.read().await.clone();
@@ -3865,6 +4656,7 @@ where
             self.dynamic_top_tokens_30d,
             token_whitelist_cap,
         ));
+        let t_populate = Instant::now();
         let mut edges = populate(
             &mut graph,
             self.provider.clone(),
@@ -3887,7 +4679,9 @@ where
             block_number,
         )
         .await?;
+        let populate_ms = t_populate.elapsed().as_millis() as u64;
 
+        let t_liq = Instant::now();
         if self.feature_gate.bridge {
             if let Some(bridge) = &self.bridge {
                 let mut bridge_edges = bridge.add_edges(
@@ -3933,6 +4727,16 @@ where
         } else if self.liquidations.is_some() {
             warn!("Liquidation monitor present but FEATURE_LIQUIDATIONS=0; skipping liquidation edges");
         }
+        let liq_ms = t_liq.elapsed().as_millis() as u64;
+        info!(
+            target: "arb_exec",
+            chain = %self.chain_name,
+            native_ms,
+            lowliq_ms,
+            populate_ms,
+            liq_ms,
+            "scan phase timing breakdown"
+        );
 
         let profitability = build_profitability_snapshot(&self.hot_paths).await;
         prune_edges_by_quality(
@@ -3969,6 +4773,7 @@ where
             cycle_start: Address,
             amount_in: U256,
             est_gross_after_fee: U256,
+            flash_fee_amount: U256,
             gas_cost: U256,
             gas_cost_native: U256,
             net_profit: U256,
@@ -3986,6 +4791,7 @@ where
             native_price: NativePrice,
             cycle_edges: Vec<(Address, Address, u32)>,
             has_bridge_step: bool,
+            backrun_hint: Option<BackrunHint>,
             liquidation_markets: Vec<String>,
             strategy: Strategy,
             venue_path: Vec<String>,
@@ -4010,16 +4816,22 @@ where
                 .collect()
         };
         let raw_cycles: Vec<Vec<usize>> = if significant_change {
-            let mut cycles: Vec<Vec<usize>> = graph
-                .bellman_ford(
+            // Bellman-Ford fans out across rayon worker threads. Running it
+            // inline on a tokio worker stalls the async runtime (timers, RPC
+            // polling, other chains) for the whole search. block_in_place
+            // moves this runtime thread out of the async pool for the
+            // duration so the executor keeps servicing tasks.
+            let mut cycles: Vec<Vec<usize>> = tokio::task::block_in_place(|| {
+                graph.bellman_ford(
                     &start_priorities,
                     &self.cycle_limits,
                     self.max_candidate_paths,
                     self.metrics.as_deref(),
                 )
-                .into_iter()
-                .map(|candidate| candidate.cycle)
-                .collect();
+            })
+            .into_iter()
+            .map(|candidate| candidate.cycle)
+            .collect();
             if !seed_cycles.is_empty() {
                 cycles.splice(0..0, seed_cycles.clone());
             }
@@ -4137,414 +4949,92 @@ where
         }
 
         let quote_start = Instant::now();
-        'cycle: for cycle_ix in candidate_cycles {
-            if cycle_ix.len() < 2 {
-                continue;
-            }
-            if quote_start.elapsed() > self.quote_budget {
+        // Candidate preparation (validation, flash quotes, sizing grids, plan
+        // construction) is RPC-bound and previously ran strictly sequentially:
+        // with tight quote budgets only the first candidate was ever sized and
+        // the hard budget break silently dropped the rest. Prepare candidates
+        // concurrently (order-preserving, so the best-ranked cycles from the
+        // search phase are still evaluated first), then run the cheap
+        // threshold/gas pipeline over the sized results.
+        let prep_deadline = quote_start + self.quote_budget;
+        let prep_ctx = CandidatePrepCtx {
+            native_prices_map: native_prices_map.as_ref(),
+            base_profiles_map: base_profiles_map.as_ref(),
+            capital_snapshot: &capital_snapshot,
+            competition_snapshot: &competition_snapshot,
+            gas_parameters: &gas_parameters,
+            executor_address,
+            block_number,
+            edges_scanned,
+        };
+        let prep_ctx_ref = &prep_ctx;
+        let graph_ref = &graph;
+        let prepared_candidates: Vec<CandidatePrep> = stream::iter(
+            candidate_cycles.into_iter().map(|cycle_ix| async move {
+                if Instant::now() >= prep_deadline {
+                    return CandidatePrep::Budgeted;
+                }
+                self.prepare_candidate(graph_ref, cycle_ix, prep_ctx_ref).await
+            }),
+        )
+        .buffered(candidate_prep_concurrency())
+        .collect()
+        .await;
+        let budget_skipped = prepared_candidates
+            .iter()
+            .filter(|prep| matches!(prep, CandidatePrep::Budgeted))
+            .count();
+        if budget_skipped > 0 {
+            warn!(
+                elapsed_ms = quote_start.elapsed().as_millis(),
+                budget_ms = self.quote_budget.as_millis(),
+                skipped = budget_skipped,
+                "quote budget exhausted during candidate sizing; lower-ranked candidates skipped"
+            );
+        }
+
+        let mut evaluated_sized = 0usize;
+        for prep in prepared_candidates {
+            let sized = match prep {
+                CandidatePrep::Budgeted => continue,
+                CandidatePrep::Rejected { skip_detail } => {
+                    if let Some(detail) = skip_detail {
+                        last_skip_reason = Some(detail);
+                    }
+                    continue;
+                }
+                CandidatePrep::Sized(sized) => sized,
+            };
+            // Always evaluate at least one sized candidate; afterwards stop
+            // once the post-sizing pipeline has consumed twice the quote
+            // budget (gas estimation below costs one RPC round-trip each).
+            if evaluated_sized > 0
+                && quote_start.elapsed() > self.quote_budget.saturating_mul(2)
+            {
                 warn!(
                     elapsed_ms = quote_start.elapsed().as_millis(),
                     budget_ms = self.quote_budget.as_millis(),
-                    "quote budget exceeded; skipping remaining candidates"
+                    "post-sizing budget exceeded; skipping remaining sized candidates"
                 );
                 break;
             }
-            let cycle_start_ix = match cycle_ix.first() {
-                Some(ix) => *ix,
-                None => continue,
-            };
-            let cycle_start = graph.nodes[cycle_start_ix];
-            let mut native_price = self.native_price_for(cycle_start, native_prices_map.as_ref());
-            if cycle_start == self.wrapped_native && !native_price.is_reliable() {
-                let amount = U256::exp10(18);
-                native_price = NativePrice::new(amount, amount, true);
-            }
-            let pricing_reliable =
-                start_token_pricing_reliable(cycle_start, self.wrapped_native, native_price);
-            let candidate_id =
-                self.stage_candidate_id(cycle_start, &cycle_ix, &graph, block_number, &[]);
-            if !pricing_reliable {
-                self.log_candidate_stage(
-                    "candidate_rejected_pre_sim",
-                    &self.chain_name,
-                    Some(candidate_id),
-                    Some(cycle_start),
-                    Some(cycle_ix.len().saturating_sub(1)),
-                    edges_scanned,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                    Some("unreliable_native_price_for_start_token"),
-                    None,
-                    false,
-                    false,
-                );
-                last_skip_reason = Some(format!(
-                    "cycle start=0x{} rejected: unreliable native price for start token",
-                    hex::encode(cycle_start)
-                ));
-                continue;
-            }
-            let Some(competition_buffer) =
-                native_price.tokens_for_native_strict(competition_snapshot.extra_buffer_wei)
-            else {
-                self.log_candidate_stage(
-                    "candidate_rejected_pre_sim",
-                    &self.chain_name,
-                    Some(candidate_id.clone()),
-                    Some(cycle_start),
-                    Some(cycle_ix.len().saturating_sub(1)),
-                    edges_scanned,
-                    None,
-                    None,
-                    Some(competition_snapshot.extra_buffer_wei),
-                    None,
-                    false,
-                    None,
-                    Some("unreliable_native_price_for_start_token"),
-                    None,
-                    false,
-                    false,
-                );
-                continue;
-            };
-            if let Some(&last_ix) = cycle_ix.last() {
-                debug_assert_eq!(
-                    graph.nodes[last_ix], cycle_start,
-                    "cycle must terminate at the starting token"
-                );
-            }
-
-            let cycle_base_amount = base_profiles_map
-                .get(&cycle_start)
-                .map(|profile| profile.base_amount)
-                .unwrap_or(capital_snapshot.base_amount);
-            let mut estimated_cycle_gas: u64 = 0;
-            let mut cycle_max_input = cycle_base_amount;
-            let cycle_latency_secs = self.estimate_cycle_latency(&graph, &cycle_ix);
-            let mut cycle_edges_vec: Vec<Edge> =
-                Vec::with_capacity(cycle_ix.len().saturating_sub(1));
-            let mut backrun_hint: Option<BackrunHint> = None;
-            let mut has_bridge_step = false;
-            for window in cycle_ix.windows(2) {
-                let u = graph.nodes[window[0]];
-                let v = graph.nodes[window[1]];
-                let Some(edge) = graph.edge_between(u, v) else {
-                    warn!(from = %u, to = %v, "Skipping cycle due to missing edge");
-                    self.log_candidate_stage(
-                        "candidate_rejected_pre_sim",
-                        &self.chain_name,
-                        Some(candidate_id.clone()),
-                        Some(cycle_start),
-                        Some(cycle_ix.len().saturating_sub(1)),
-                        edges_scanned,
-                        None,
-                        None,
-                        None,
-                        None,
-                        pricing_reliable,
-                        None,
-                        Some("invalid_edge"),
-                        None,
-                        false,
-                        false,
-                    );
-                    if let Some(metrics) = &self.metrics {
-                        metrics.record_failure(U256::zero());
-                    }
-                    // Pre-execution graph/plan errors are zero-loss and must NOT trip
-                    // the circuit breaker (former false-positive halt source). Only real
-                    // execution reverts/losses count, recorded at dispatch time.
-                    continue 'cycle;
-                };
-                estimated_cycle_gas = estimated_cycle_gas.saturating_add(edge.estimated_gas);
-                cycle_max_input = cycle_max_input.min(edge.max_input);
-                if matches!(edge.venue, VenueEdge::Bridge { .. }) {
-                    has_bridge_step = true;
-                }
-                cycle_edges_vec.push(edge.clone());
-            }
-
-            if has_bridge_step && !self.feature_gate.bridge {
-                self.log_candidate_stage(
-                    "candidate_rejected_pre_sim",
-                    &self.chain_name,
-                    Some(candidate_id.clone()),
-                    Some(cycle_start),
-                    Some(cycle_ix.len().saturating_sub(1)),
-                    edges_scanned,
-                    None,
-                    None,
-                    None,
-                    None,
-                    pricing_reliable,
-                    None,
-                    Some("invalid_candidate_path"),
-                    None,
-                    has_bridge_step,
-                    false,
-                );
-                last_skip_reason =
-                    Some("cycle requires bridge step but FEATURE_BRIDGE=0".to_string());
-                continue;
-            }
-
-            if cycle_max_input.is_zero() {
-                self.log_candidate_stage(
-                    "candidate_rejected_pre_sim",
-                    &self.chain_name,
-                    Some(candidate_id.clone()),
-                    Some(cycle_start),
-                    Some(cycle_ix.len().saturating_sub(1)),
-                    edges_scanned,
-                    None,
-                    None,
-                    None,
-                    None,
-                    pricing_reliable,
-                    None,
-                    Some("no_liquidity"),
-                    None,
-                    has_bridge_step,
-                    false,
-                );
-                last_skip_reason = Some(format!(
-                    "cycle start=0x{} has zero capacity after slippage control",
-                    hex::encode(cycle_start)
-                ));
-                continue;
-            }
-
-            let mut trade_cap = cycle_base_amount.min(cycle_max_input);
-
-            if let Some(monitor) = &self.backrun {
-                if self.broadcast.role == MevRole::Filler && cycle_ix.len() >= 2 {
-                    let from = graph.nodes[cycle_ix[0]];
-                    let next_idx = cycle_ix[1];
-                    let to = graph.nodes[next_idx];
-                    if let Some(pending_amount) = monitor
-                        .best_amount_for(from, to, Duration::from_secs(30))
-                        .await
-                    {
-                        if !pending_amount.is_zero() {
-                            trade_cap = trade_cap.min(pending_amount);
-                        }
-                    }
-
-                    if let Some(hint) = monitor.hint_for(from, to, Duration::from_secs(45)).await {
-                        backrun_hint = Some(hint);
-                        if let Some(amount) = backrun_hint.as_ref().map(|h| h.amount_in) {
-                            trade_cap = trade_cap.min(amount);
-                        }
-                    }
-                }
-            }
-
-            if trade_cap.is_zero() {
-                self.log_candidate_stage(
-                    "candidate_rejected_pre_sim",
-                    &self.chain_name,
-                    Some(candidate_id.clone()),
-                    Some(cycle_start),
-                    Some(cycle_ix.len().saturating_sub(1)),
-                    edges_scanned,
-                    None,
-                    None,
-                    None,
-                    None,
-                    pricing_reliable,
-                    None,
-                    Some("no_quote_available"),
-                    None,
-                    has_bridge_step,
-                    false,
-                );
-                last_skip_reason = Some(format!(
-                    "cycle start=0x{} reduced to zero trade size",
-                    hex::encode(cycle_start)
-                ));
-                continue;
-            }
-
-            let quotes = self.flash_loan_quotes(cycle_start, trade_cap);
-            if quotes.is_empty() {
-                self.log_candidate_stage(
-                    "candidate_rejected_pre_sim",
-                    &self.chain_name,
-                    Some(candidate_id.clone()),
-                    Some(cycle_start),
-                    Some(cycle_ix.len().saturating_sub(1)),
-                    edges_scanned,
-                    None,
-                    None,
-                    None,
-                    None,
-                    pricing_reliable,
-                    None,
-                    Some("no_flashloan_provider"),
-                    None,
-                    has_bridge_step,
-                    false,
-                );
-                last_skip_reason = Some(format!(
-                    "cycle start=0x{} unsupported by flash loan providers",
-                    hex::encode(cycle_start)
-                ));
-                continue;
-            }
-
-            let preview_plan = match build_plan_for_cycle(
-                &graph,
-                &cycle_ix,
-                cycle_base_amount,
-                executor_address,
-                self.jit_config.as_ref(),
-                Some(self.quoter.as_ref()),
-                block_number,
-            )
-            .await
-            {
-                Ok(plan) => plan,
-                Err(err) => {
-                    warn!(error = %err, "Skipping candidate due to plan construction failure");
-                    self.log_candidate_stage(
-                        "candidate_rejected_pre_sim",
-                        &self.chain_name,
-                        Some(candidate_id.clone()),
-                        Some(cycle_start),
-                        Some(cycle_ix.len().saturating_sub(1)),
-                        edges_scanned,
-                        None,
-                        None,
-                        None,
-                        None,
-                        pricing_reliable,
-                        None,
-                        Some("plan_build_failed"),
-                        None,
-                        has_bridge_step,
-                        false,
-                    );
-                    if let Some(metrics) = &self.metrics {
-                        metrics.record_failure(U256::zero());
-                    }
-                    // Pre-execution graph/plan errors are zero-loss and must NOT trip
-                    // the circuit breaker (former false-positive halt source). Only real
-                    // execution reverts/losses count, recorded at dispatch time.
-                    continue;
-                }
-            };
-
-            let mut adjusted_cycle_gas = estimated_cycle_gas;
-            if self
-                .jit_config
-                .as_ref()
-                .map(|cfg| cfg.enabled)
-                .unwrap_or(false)
-            {
-                let jit_add_steps = preview_plan
-                    .steps
-                    .iter()
-                    .filter(|s| matches!(s, StepData::JitLiquidityAdd { .. }))
-                    .count() as u64;
-                let jit_remove_steps = preview_plan
-                    .steps
-                    .iter()
-                    .filter(|s| matches!(s, StepData::JitLiquidityRemove { .. }))
-                    .count() as u64;
-                adjusted_cycle_gas = adjusted_cycle_gas
-                    .saturating_add(jit_add_steps.saturating_mul(JIT_PRESWAP_ESTIMATED_GAS))
-                    .saturating_add(jit_add_steps.saturating_mul(JIT_LP_ADD_ESTIMATED_GAS))
-                    .saturating_add(jit_remove_steps.saturating_mul(JIT_LP_REMOVE_ESTIMATED_GAS));
-            }
-
-            let Some(sizing) = optimize_trade_size(OptimizeTradeParams {
-                edges: &cycle_edges_vec,
-                quotes: &quotes,
-                min_amount: capital_snapshot.min_flash_loan,
-                max_amount: trade_cap,
-                gas_price: gas_parameters.gas_price,
-                estimated_gas: adjusted_cycle_gas,
-                l1_data_fee: gas_parameters.l1_data_fee,
+            evaluated_sized += 1;
+            let SizedCandidate {
+                cycle_ix,
+                candidate_id,
+                cycle_start,
                 native_price,
-                quoter: self.quoter.as_ref(),
-                bal_quote: self.bal_quote.as_ref(),
-                curve_quote: self.curve_quote.as_ref(),
-                block_number,
-            })
-            .await
-            else {
-                self.log_candidate_stage(
-                    "candidate_rejected_pre_sim",
-                    &self.chain_name,
-                    Some(candidate_id.clone()),
-                    Some(cycle_start),
-                    Some(cycle_ix.len().saturating_sub(1)),
-                    edges_scanned,
-                    None,
-                    None,
-                    None,
-                    None,
-                    pricing_reliable,
-                    None,
-                    Some("no_quote_available"),
-                    None,
-                    has_bridge_step,
-                    false,
-                );
-                last_skip_reason = Some(format!(
-                    "cycle start=0x{} had no profitable sizing",
-                    hex::encode(cycle_start)
-                ));
-                continue;
-            };
-
-            let trade_amount = sizing.amount_in;
-            let plan = match build_plan_for_cycle(
-                &graph,
-                &cycle_ix,
+                pricing_reliable,
+                competition_buffer,
+                cycle_latency_secs,
+                cycle_edges_vec,
+                has_bridge_step,
+                backrun_hint,
+                adjusted_cycle_gas,
+                sizing,
+                plan,
                 trade_amount,
-                executor_address,
-                self.jit_config.as_ref(),
-                Some(self.quoter.as_ref()),
-                block_number,
-            )
-            .await
-            {
-                Ok(plan) => plan,
-                Err(err) => {
-                    warn!(error = %err, "Skipping candidate due to plan reconstruction failure");
-                    self.log_candidate_stage(
-                        "candidate_rejected_pre_sim",
-                        &self.chain_name,
-                        Some(candidate_id.clone()),
-                        Some(cycle_start),
-                        Some(cycle_ix.len().saturating_sub(1)),
-                        edges_scanned,
-                        None,
-                        None,
-                        None,
-                        None,
-                        pricing_reliable,
-                        None,
-                        Some("plan_build_failed"),
-                        None,
-                        has_bridge_step,
-                        false,
-                    );
-                    if let Some(metrics) = &self.metrics {
-                        metrics.record_failure(U256::zero());
-                    }
-                    // Pre-execution graph/plan errors are zero-loss and must NOT trip
-                    // the circuit breaker (former false-positive halt source). Only real
-                    // execution reverts/losses count, recorded at dispatch time.
-                    continue;
-                }
-            };
-
+            } = *sized;
             let est_gross = sizing.gross;
             let flash_fee_amount = sizing.flash_fee;
             let est_gross_after_fee = est_gross.saturating_sub(flash_fee_amount);
@@ -4588,25 +5078,55 @@ where
                 U256::from(10_000u64),
             );
 
-            let mut min_profit_requirement = finalize_profit_threshold(ProfitThresholdParams {
-                base_threshold: self.dynamic_min_profit(DynamicProfitParams {
+            // Risk policy: declared slippage / price-impact tolerances are
+            // hard limits, not advisory. sizing.max_slippage_bps is the sized
+            // price impact estimate from the quote grid.
+            if let Some(reason) =
+                self.risk_slippage_violation(swap_slippage_bps, sizing.max_slippage_bps)
+            {
+                self.log_candidate_stage(
+                    "candidate_rejected_pre_sim",
+                    &self.chain_name,
+                    Some(candidate_id.clone()),
+                    Some(cycle_start),
+                    Some(cycle_ix.len().saturating_sub(1)),
+                    edges_scanned,
+                    None,
+                    Some(est_gross_after_fee),
+                    None,
+                    None,
+                    pricing_reliable,
+                    None,
+                    Some(reason),
+                    None,
+                    has_bridge_step,
+                    false,
+                );
+                last_skip_reason = Some(format!(
+                    "cycle start=0x{} rejected by risk policy: {} (swap_slippage_bps={}, price_impact_bps={})",
+                    hex::encode(cycle_start),
+                    reason,
+                    swap_slippage_bps,
+                    sizing.max_slippage_bps
+                ));
+                continue;
+            }
+
+            let mut min_profit_requirement =
+                self.unified_min_profit_threshold(UnifiedThresholdParams {
                     fee: &gas_parameters,
                     est_gas: adjusted_cycle_gas,
-                    est_gross: est_gross_after_fee,
+                    est_gross_after_fee,
+                    flash_fee_amount,
+                    slippage_floor,
+                    competition_buffer,
+                    has_bridge_step,
+                    backrun_hint: backrun_hint.as_ref(),
                     congestion: congestion_multiplier,
                     competition: &competition_snapshot,
                     latency_secs: cycle_latency_secs,
                     native_price,
-                }),
-                competition_buffer,
-                flash_fee_amount,
-                slippage_floor,
-                has_bridge_step,
-                est_gross_after_fee,
-                cross_chain_profit_bps: self.cross_chain_profit_bps,
-                cross_chain_min_profit_wei: self.cross_chain_min_profit_wei,
-                backrun_hint: backrun_hint.as_ref(),
-            });
+                });
 
             if est_gross_after_fee <= min_profit_requirement {
                 self.log_candidate_stage(
@@ -4913,25 +5433,51 @@ where
                 gas_limit.as_u64()
             };
 
-            let final_threshold = self.dynamic_min_profit(DynamicProfitParams {
+            // Risk policy: per-tx gas-unit cap and fee-per-gas ceiling are
+            // enforced against the real (estimated) fee profile, not just the
+            // scan-level baseline.
+            if let Some(reason) = self.risk_gas_violation(&fee_estimate, gas_units) {
+                self.log_candidate_stage(
+                    "candidate_rejected_pre_sim",
+                    &self.chain_name,
+                    Some(candidate_id.clone()),
+                    Some(cycle_start),
+                    Some(cycle_ix.len().saturating_sub(1)),
+                    edges_scanned,
+                    None,
+                    Some(est_gross_after_fee),
+                    Some(fee_estimate.total_fee_native),
+                    None,
+                    pricing_reliable,
+                    Some(min_profit_requirement),
+                    Some(reason),
+                    None,
+                    has_bridge_step,
+                    false,
+                );
+                last_skip_reason = Some(format!(
+                    "cycle start=0x{} rejected by risk policy: {} (gas_units={}, max_fee_per_gas={:?})",
+                    hex::encode(cycle_start),
+                    reason,
+                    gas_units,
+                    fee_estimate.max_fee_per_gas
+                ));
+                continue;
+            }
+
+            min_profit_requirement = self.unified_min_profit_threshold(UnifiedThresholdParams {
                 fee: &fee_estimate,
                 est_gas: gas_units,
-                est_gross: est_gross_after_fee,
+                est_gross_after_fee,
+                flash_fee_amount,
+                slippage_floor,
+                competition_buffer,
+                has_bridge_step,
+                backrun_hint: backrun_hint.as_ref(),
                 congestion: congestion_multiplier,
                 competition: &competition_snapshot,
                 latency_secs: cycle_latency_secs,
                 native_price,
-            });
-            min_profit_requirement = finalize_profit_threshold(ProfitThresholdParams {
-                base_threshold: final_threshold,
-                competition_buffer,
-                flash_fee_amount,
-                slippage_floor,
-                has_bridge_step,
-                est_gross_after_fee,
-                cross_chain_profit_bps: self.cross_chain_profit_bps,
-                cross_chain_min_profit_wei: self.cross_chain_min_profit_wei,
-                backrun_hint: backrun_hint.as_ref(),
             });
             plan_args.min_profit = min_profit_requirement;
 
@@ -4986,7 +5532,12 @@ where
                 continue;
             };
             let net_profit = est_gross_after_fee.saturating_sub(gas_cost);
-            if net_profit.is_zero() {
+            // Risk policy: the declared net-profit floor (USD/native from ops
+            // inputs) is enforced on estimated NET profit, not just gross.
+            let risk_net_floor = self
+                .risk_min_net_profit_tokens(native_price)
+                .unwrap_or_else(U256::zero);
+            if net_profit.is_zero() || net_profit < risk_net_floor {
                 self.log_candidate_stage(
                     "candidate_rejected_pre_sim",
                     &self.chain_name,
@@ -4999,15 +5550,17 @@ where
                     Some(gas_cost_native),
                     Some(gas_cost),
                     pricing_reliable,
-                    Some(min_profit_requirement),
+                    Some(min_profit_requirement.max(risk_net_floor)),
                     Some("below_min_profit_threshold"),
                     None,
                     has_bridge_step,
                     false,
                 );
                 last_skip_reason = Some(format!(
-                    "cycle start=0x{} net profit zero after gas",
-                    hex::encode(cycle_start)
+                    "cycle start=0x{} net profit {} below floor (risk floor {})",
+                    hex::encode(cycle_start),
+                    net_profit,
+                    risk_net_floor
                 ));
                 continue;
             }
@@ -5071,6 +5624,7 @@ where
                     cycle_start,
                     amount_in: trade_amount,
                     est_gross_after_fee,
+                    flash_fee_amount,
                     gas_cost,
                     gas_cost_native,
                     l1_data_fee: fee_estimate.l1_data_fee,
@@ -5103,6 +5657,7 @@ where
                         })
                         .collect(),
                     has_bridge_step,
+                    backrun_hint,
                     liquidation_markets,
                     strategy,
                     venue_path,
@@ -5309,18 +5864,62 @@ where
                 candidate.gas_limit.as_u64()
             };
 
-            let recomputed_min_profit = self
-                .dynamic_min_profit(DynamicProfitParams {
+            // Risk policy: re-check the gas-unit cap against the simulated
+            // (buffered) gas limit before committing to dispatch.
+            if let Some(reason) = self.risk_gas_violation(&candidate.fee_estimate, gas_limit_u64) {
+                self.log_candidate_stage(
+                    "candidate_rejected_post_sim",
+                    &self.chain_name,
+                    Some(candidate.candidate_id.to_string()),
+                    Some(candidate.cycle_start),
+                    Some(candidate.hops),
+                    edges_scanned,
+                    Some(candidate.venue_path.clone()),
+                    Some(candidate.est_gross_after_fee),
+                    Some(candidate.gas_cost_native),
+                    Some(candidate.gas_cost),
+                    start_token_pricing_reliable(
+                        candidate.cycle_start,
+                        self.wrapped_native,
+                        candidate.native_price,
+                    ),
+                    Some(candidate.plan_args.min_profit),
+                    Some(reason),
+                    Some("risk_gate_failed"),
+                    candidate.has_bridge_step,
+                    !candidate.liquidation_markets.is_empty(),
+                );
+                return Ok(ScanOutcome::NotProfitable {
+                    reason: format!(
+                        "cycle start=0x{} rejected by risk policy after simulation: {} (gas_units={})",
+                        hex::encode(candidate.cycle_start),
+                        reason,
+                        gas_limit_u64
+                    ),
+                    edges: edges_scanned,
+                    expected_univ3_edges,
+                });
+            }
+
+            // Post-simulation threshold MUST be derived from the exact same
+            // formula as the pre-simulation gate (flash-fee buffer, bridge
+            // premium, backrun discount, revert premium, risk floor included),
+            // only refreshed with the simulated gas profile.
+            let recomputed_min_profit =
+                self.unified_min_profit_threshold(UnifiedThresholdParams {
                     fee: &candidate.fee_estimate,
                     est_gas: gas_limit_u64,
-                    est_gross: candidate.est_gross_after_fee,
+                    est_gross_after_fee: candidate.est_gross_after_fee,
+                    flash_fee_amount: candidate.flash_fee_amount,
+                    slippage_floor: candidate.slippage_floor,
+                    competition_buffer: candidate.competition_buffer,
+                    has_bridge_step: candidate.has_bridge_step,
+                    backrun_hint: candidate.backrun_hint.as_ref(),
                     congestion: candidate.congestion_multiplier,
                     competition: &candidate.competition_snapshot,
                     latency_secs: candidate.cycle_latency_secs,
                     native_price: candidate.native_price,
-                })
-                .saturating_add(candidate.competition_buffer)
-                .max(candidate.slippage_floor);
+                });
             if recomputed_min_profit != candidate.plan_args.min_profit {
                 candidate.plan_args.min_profit = recomputed_min_profit;
             }
@@ -5467,6 +6066,7 @@ where
                     candidate.gas_limit,
                     &candidate.fee_estimate,
                     Some(shadow_meta),
+                    true,
                 )
                 .await
             {
@@ -5707,7 +6307,22 @@ where
         gas_limit: U256,
         gas: &FeeEstimate,
         shadow_meta: Option<ShadowPlanMeta>,
+        simulation_verified: bool,
     ) -> Result<DispatchResult> {
+        // Risk policy: must_simulate_before_send is enforced at the dispatch
+        // boundary, not assumed. Any future call path that skips simulation
+        // fails closed here instead of broadcasting unverified plans.
+        if !simulation_verified
+            && self
+                .risk_policy
+                .as_ref()
+                .map(|policy| policy.must_simulate_before_send)
+                .unwrap_or(true)
+        {
+            return Err(anyhow!(
+                "risk policy requires simulation before send; refusing to dispatch unsimulated plan"
+            ));
+        }
         apply_gas_parameters(&mut call.tx, gas);
         call.tx.set_gas(gas_limit);
         if let Some(wallet) = &self.wallet {
@@ -6251,6 +6866,14 @@ where
             return Err(anyhow!("simulation profit below min_profit"));
         }
 
+        // Cross-check the primary simulation against independent RPC
+        // endpoints. A compromised or stale primary must not be able to
+        // single-handedly green-light a dispatch.
+        self.sim_quorum
+            .verify(&tx, plan.min_profit)
+            .await
+            .context("simulation quorum verification failed")?;
+
         let gas_used = client
             .estimate_gas(&tx, Some(BlockId::Number(BlockNumber::Pending)))
             .await
@@ -6569,6 +7192,63 @@ struct ChainRuntimeHandle {
     command_tx: mpsc::Sender<Command>,
     status_rx: watch::Receiver<StatusSnapshot>,
     join_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Supervised replacement for fire-and-forget `tokio::spawn` of long-lived
+/// background workers (pool refreshers, mempool monitors, exporters).
+///
+/// These workers feed the trading path with liquidity/competition data; if one
+/// dies silently the bot keeps trading on progressively staler state. The
+/// supervisor isolates panics in an inner task, logs every exit, bumps the
+/// `worker_restarts_total{chain,worker}` metric, and restarts the worker with
+/// capped exponential backoff (2s..64s) so a persistent fault degrades to a
+/// loud periodic retry instead of a silent feature loss.
+fn spawn_supervised<F, Fut>(
+    worker: &'static str,
+    chain: String,
+    metrics: Option<Arc<Metrics>>,
+    mut factory: F,
+) where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut restarts: u32 = 0;
+        loop {
+            // Inner spawn so a worker panic is contained and observable
+            // instead of unwinding this supervisor.
+            match tokio::spawn(factory()).await {
+                Ok(()) => {
+                    warn!(
+                        worker,
+                        chain = %chain,
+                        restarts,
+                        "supervised worker exited unexpectedly; restarting"
+                    );
+                }
+                Err(err) if err.is_panic() => {
+                    error!(
+                        worker,
+                        chain = %chain,
+                        restarts,
+                        error = %err,
+                        "supervised worker PANICKED; restarting"
+                    );
+                }
+                Err(err) => {
+                    // Cancelled: runtime is shutting down.
+                    info!(worker, chain = %chain, error = %err, "supervised worker cancelled");
+                    return;
+                }
+            }
+            if let Some(metrics) = &metrics {
+                metrics.record_worker_restart(&chain, worker);
+            }
+            restarts = restarts.saturating_add(1);
+            let backoff_secs = 2u64.saturating_pow(restarts.min(6));
+            sleep(Duration::from_secs(backoff_secs)).await;
+        }
+    });
 }
 
 async fn broadcast_command(
@@ -6926,6 +7606,8 @@ mod runner_tests {
                     ArbitrumFeeConfig::default(),
                     None,
                 ),
+                risk_policy: None,
+                sim_quorum: Arc::new(SimQuorum::disabled("test")),
             },
             executor,
         );
@@ -7000,6 +7682,57 @@ mod runner_tests {
         assert!(message.contains("EXECUTOR_ADDRESS"));
         assert!(message.contains("no contract code"));
         assert!(message.contains("http://test-rpc"));
+    }
+
+    #[tokio::test]
+    async fn ensure_contract_deployed_enforces_pinned_codehash() {
+        use std::env;
+        let _guard = crate::tests::ENV_LOCK.lock().expect("env lock");
+        let code = vec![1u8, 2u8];
+        let good_hash = H256::from(ethers::utils::keccak256(&code));
+
+        // Pin matches on-chain code -> pass.
+        env::set_var("PINTEST_EXECUTOR_CODEHASH", format!("{good_hash:#x}"));
+        let (provider, mock) = Provider::mocked();
+        mock.push::<Bytes, _>(Bytes::from(code.clone())).unwrap();
+        let ok = ensure_contract_deployed(
+            &provider,
+            ContractDeploymentCheck {
+                chain: "test",
+                env_prefix: "PINTEST",
+                label: "executor",
+                suffix: "EXECUTOR_ADDRESS",
+                address: Address::random(),
+                expected_chain_id: 1,
+                rpc_endpoint: "http://test-rpc",
+            },
+        )
+        .await;
+        assert!(ok.is_ok(), "matching codehash must pass: {ok:?}");
+
+        // Pin differs from on-chain code -> hard failure.
+        env::set_var(
+            "PINTEST_EXECUTOR_CODEHASH",
+            format!("{:#x}", H256::repeat_byte(0xab)),
+        );
+        let (provider, mock) = Provider::mocked();
+        mock.push::<Bytes, _>(Bytes::from(code)).unwrap();
+        let err = ensure_contract_deployed(
+            &provider,
+            ContractDeploymentCheck {
+                chain: "test",
+                env_prefix: "PINTEST",
+                label: "executor",
+                suffix: "EXECUTOR_ADDRESS",
+                address: Address::random(),
+                expected_chain_id: 1,
+                rpc_endpoint: "http://test-rpc",
+            },
+        )
+        .await
+        .expect_err("mismatched codehash must fail startup");
+        assert!(err.to_string().contains("bytecode hash mismatch"));
+        env::remove_var("PINTEST_EXECUTOR_CODEHASH");
     }
 
     fn profit_bytes(amount: U256) -> String {
@@ -7147,6 +7880,8 @@ mod runner_tests {
                     ArbitrumFeeConfig::default(),
                     None,
                 ),
+                risk_policy: None,
+                sim_quorum: Arc::new(SimQuorum::disabled("test")),
             },
             executor,
         );
@@ -7313,6 +8048,8 @@ mod runner_tests {
                     ArbitrumFeeConfig::default(),
                     None,
                 ),
+                risk_policy: None,
+                sim_quorum: Arc::new(SimQuorum::disabled("test")),
             },
             executor,
         );
@@ -7636,6 +8373,32 @@ struct ContractDeploymentCheck<'a> {
     rpc_endpoint: &'a str,
 }
 
+/// Resolve the pinned bytecode hash for a contract check from the environment.
+/// For a suffix like `EXECUTOR_ADDRESS` this reads `{PREFIX}_EXECUTOR_CODEHASH`
+/// then `EXECUTOR_CODEHASH`.
+fn resolve_expected_codehash(env_prefix: &str, suffix: &str) -> Result<Option<H256>> {
+    let hash_suffix = suffix
+        .strip_suffix("_ADDRESS")
+        .map(|stem| format!("{stem}_CODEHASH"))
+        .unwrap_or_else(|| format!("{suffix}_CODEHASH"));
+    let prefixed_key = format!("{env_prefix}_{hash_suffix}");
+    let raw = std::env::var(&prefixed_key)
+        .or_else(|_| std::env::var(&hash_suffix))
+        .ok();
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim().trim_start_matches("0x");
+    let bytes = hex::decode(trimmed)
+        .map_err(|err| anyhow!("invalid codehash in {prefixed_key}/{hash_suffix}: {err}"))?;
+    ensure!(
+        bytes.len() == 32,
+        "codehash in {prefixed_key}/{hash_suffix} must be 32 bytes, got {}",
+        bytes.len()
+    );
+    Ok(Some(H256::from_slice(&bytes)))
+}
+
 async fn ensure_contract_deployed<M: Middleware>(
     provider: &M,
     check: ContractDeploymentCheck<'_>,
@@ -7674,6 +8437,52 @@ check {} or ops inputs {}.{} (rpc {}, {})",
             check.rpc_endpoint,
             chain_hint,
         );
+    }
+
+    // Attestation: pin the deployed bytecode to a known-good hash so a wrong
+    // or malicious implementation at the configured address fails startup
+    // instead of passing on a non-empty-code check alone.
+    let onchain_codehash = H256::from(ethers::utils::keccak256(&code.0));
+    match resolve_expected_codehash(check.env_prefix, check.suffix)? {
+        Some(expected) => {
+            ensure!(
+                onchain_codehash == expected,
+                "{} bytecode hash mismatch on {} at {:#x}: on-chain {:#x} != pinned {:#x}; \
+refusing to start against unattested code",
+                check.label,
+                check.chain,
+                check.address,
+                onchain_codehash,
+                expected,
+            );
+            info!(
+                chain = %check.chain,
+                label = %check.label,
+                address = %format!("{:#x}", check.address),
+                codehash = %format!("{:#x}", onchain_codehash),
+                "contract bytecode hash attested against pinned value"
+            );
+        }
+        None => {
+            if check.label == "executor" && production_mode_enabled() {
+                anyhow::bail!(
+                    "production mode requires a pinned executor bytecode hash; set {}_EXECUTOR_CODEHASH={:#x} \
+(current on-chain hash at {:#x}) after verifying the deployment",
+                    check.env_prefix,
+                    onchain_codehash,
+                    check.address,
+                );
+            }
+            warn!(
+                chain = %check.chain,
+                label = %check.label,
+                address = %format!("{:#x}", check.address),
+                codehash = %format!("{:#x}", onchain_codehash),
+                "no pinned bytecode hash configured; set {}_{}_CODEHASH to attest this deployment",
+                check.env_prefix,
+                check.suffix.strip_suffix("_ADDRESS").unwrap_or(check.suffix),
+            );
+        }
     }
     Ok(())
 }
@@ -7988,6 +8797,32 @@ async fn launch_chain_runtime(
         siphon_target,
     )?);
 
+    // Metrics are created before any background workers so every supervised
+    // worker can report restarts via worker_restarts_total.
+    let metrics_port = std::env::var("PROMETHEUS_PORT")
+        .ok()
+        .and_then(|raw| raw.parse::<u16>().ok());
+    let metrics: Option<Arc<Metrics>> = if let Some(port) = metrics_port {
+        let metrics = Arc::new(Metrics::new()?);
+        let exporter = metrics.clone();
+        spawn_supervised(
+            "prometheus_exporter",
+            cfg.name.clone(),
+            Some(metrics.clone()),
+            move || {
+                let exporter = exporter.clone();
+                async move {
+                    if let Err(err) = exporter.export_to_prometheus(port).await {
+                        warn!(port = port, error = %err, "Prometheus exporter terminated");
+                    }
+                }
+            },
+        );
+        Some(metrics)
+    } else {
+        None
+    };
+
     let pool_depth_refresh_secs = std::env::var("POOL_DEPTH_REFRESH_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
@@ -8001,13 +8836,21 @@ async fn launch_chain_runtime(
     {
         let cache = pool_depth_cache.clone();
         let interval = pool_depth_refresh;
-        tokio::spawn(async move {
-            cache.refresh_all().await;
-            loop {
-                sleep(interval).await;
-                cache.refresh_all().await;
-            }
-        });
+        spawn_supervised(
+            "pool_depth_refresh",
+            cfg.name.clone(),
+            metrics.clone(),
+            move || {
+                let cache = cache.clone();
+                async move {
+                    cache.refresh_all().await;
+                    loop {
+                        sleep(interval).await;
+                        cache.refresh_all().await;
+                    }
+                }
+            },
+        );
     }
 
     let universe_cfg = &ops_inputs.universe;
@@ -8535,7 +9378,16 @@ async fn launch_chain_runtime(
             min_price_impact_bps,
             token_list.clone(),
         ));
-        tokio::spawn(monitor.clone().run(provider.clone(), poll_interval));
+        {
+            let monitor = monitor.clone();
+            let provider = provider.clone();
+            spawn_supervised(
+                "backrun_monitor",
+                cfg.name.clone(),
+                metrics.clone(),
+                move || monitor.clone().run(provider.clone(), poll_interval),
+            );
+        }
         Some(monitor)
     } else {
         None
@@ -8560,9 +9412,17 @@ async fn launch_chain_runtime(
             Ok(monitor) => {
                 let monitor = Arc::new(monitor);
                 let task_monitor = monitor.clone();
-                tokio::spawn(async move {
-                    task_monitor.run(Duration::from_millis(300)).await;
-                });
+                spawn_supervised(
+                    "sandwich_monitor",
+                    cfg.name.clone(),
+                    metrics.clone(),
+                    move || {
+                        let monitor = task_monitor.clone();
+                        async move {
+                            monitor.run(Duration::from_millis(300)).await;
+                        }
+                    },
+                );
                 Some(monitor)
             }
             Err(err) => {
@@ -8637,23 +9497,6 @@ async fn launch_chain_runtime(
         )
         .configure_health_from_env(),
     );
-
-    let metrics_port = std::env::var("PROMETHEUS_PORT")
-        .ok()
-        .and_then(|raw| raw.parse::<u16>().ok());
-
-    let metrics: Option<Arc<Metrics>> = if let Some(port) = metrics_port {
-        let metrics = Arc::new(Metrics::new()?);
-        let exporter = metrics.clone();
-        tokio::spawn(async move {
-            if let Err(err) = exporter.export_to_prometheus(port).await {
-                warn!(port = port, error = %err, "Prometheus exporter terminated");
-            }
-        });
-        Some(metrics)
-    } else {
-        None
-    };
 
     if let Some(metrics) = &metrics {
         metrics.record_capital(&capital_manager.snapshot());
@@ -8861,51 +9704,67 @@ async fn launch_chain_runtime(
         let hot_univ2_by_venue = Arc::clone(&hot_univ2_by_venue);
         let token_decimals_hint = token_decimals_hint.clone();
         let pool_monitor = pool_monitor.clone();
-        tokio::spawn(async move {
-            info!(
-                chain = %chain,
-                venue = %venue,
-                kind = "univ2_like",
-                cold_pool_records = cold.len(),
-                refresh_secs = hot_config.refresh_interval.as_secs(),
-                "spawned hot pool refresh worker"
-            );
-            loop {
-                match rank_univ2_pools(
-                    provider.clone(),
-                    cold.as_slice(),
-                    &token_decimals_hint,
-                    &hot_config,
-                )
-                .await
-                {
-                    Ok(hot) => {
-                        log_hot_pool_refresh(&chain, &venue, "univ2_like", hot.len());
-                        let configs = univ2_configs_from_records(&hot);
+        spawn_supervised(
+            "hot_pools_univ2",
+            cfg.name.clone(),
+            metrics.clone(),
+            move || {
+                let provider = provider.clone();
+                let venue = venue.clone();
+                let chain = chain.clone();
+                let hot_config = hot_config.clone();
+                let hot_univ2_pools = Arc::clone(&hot_univ2_pools);
+                let hot_univ2_by_venue = Arc::clone(&hot_univ2_by_venue);
+                let token_decimals_hint = token_decimals_hint.clone();
+                let pool_monitor = pool_monitor.clone();
+                let cold = cold.clone();
+                async move {
+                    info!(
+                        chain = %chain,
+                        venue = %venue,
+                        kind = "univ2_like",
+                        cold_pool_records = cold.len(),
+                        refresh_secs = hot_config.refresh_interval.as_secs(),
+                        "spawned hot pool refresh worker"
+                    );
+                    loop {
+                        match rank_univ2_pools(
+                            provider.clone(),
+                            cold.as_slice(),
+                            &token_decimals_hint,
+                            &hot_config,
+                        )
+                        .await
                         {
-                            let mut guard = hot_univ2_by_venue.write().await;
-                            guard.insert(venue.clone(), configs.clone());
+                            Ok(hot) => {
+                                log_hot_pool_refresh(&chain, &venue, "univ2_like", hot.len());
+                                let configs = univ2_configs_from_records(&hot);
+                                {
+                                    let mut guard = hot_univ2_by_venue.write().await;
+                                    guard.insert(venue.clone(), configs.clone());
+                                }
+                                let combined = {
+                                    let guard = hot_univ2_by_venue.read().await;
+                                    guard.values().flat_map(|v| v.clone()).collect::<Vec<_>>()
+                                };
+                                {
+                                    let mut guard = hot_univ2_pools.write().await;
+                                    *guard = combined.clone();
+                                }
+                                if let Some(monitor) = pool_monitor.as_ref() {
+                                    let monitored = monitored_pools_from_configs(&combined);
+                                    monitor.set_pools(monitored).await;
+                                }
+                            }
+                            Err(err) => {
+                                warn!(error = %err, chain = %chain, venue = %venue, "failed to refresh univ2 hot pools");
+                            }
                         }
-                        let combined = {
-                            let guard = hot_univ2_by_venue.read().await;
-                            guard.values().flat_map(|v| v.clone()).collect::<Vec<_>>()
-                        };
-                        {
-                            let mut guard = hot_univ2_pools.write().await;
-                            *guard = combined.clone();
-                        }
-                        if let Some(monitor) = pool_monitor.as_ref() {
-                            let monitored = monitored_pools_from_configs(&combined);
-                            monitor.set_pools(monitored).await;
-                        }
-                    }
-                    Err(err) => {
-                        warn!(error = %err, chain = %chain, venue = %venue, "failed to refresh univ2 hot pools");
+                        sleep(hot_config.refresh_interval).await;
                     }
                 }
-                sleep(hot_config.refresh_interval).await;
-            }
-        });
+            },
+        );
     }
 
     for (venue_name, cold) in cold_univ3_by_venue.clone() {
@@ -8915,47 +9774,73 @@ async fn launch_chain_runtime(
         let hot_config = hot_pool_config.clone();
         let hot_univ3_pools = Arc::clone(&hot_univ3_pools);
         let hot_univ3_by_venue = Arc::clone(&hot_univ3_by_venue);
-        tokio::spawn(async move {
-            info!(
-                chain = %chain,
-                venue = %venue,
-                kind = "univ3_like",
-                cold_pool_records = cold.len(),
-                refresh_secs = hot_config.refresh_interval.as_secs(),
-                "spawned hot pool refresh worker"
-            );
-            loop {
-                match rank_univ3_pools(provider.clone(), cold.as_slice(), &hot_config).await {
-                    Ok(hot) => {
-                        log_hot_pool_refresh(&chain, &venue, "univ3_like", hot.len());
+        spawn_supervised(
+            "hot_pools_univ3",
+            cfg.name.clone(),
+            metrics.clone(),
+            move || {
+                let provider = provider.clone();
+                let venue = venue.clone();
+                let chain = chain.clone();
+                let hot_config = hot_config.clone();
+                let hot_univ3_pools = Arc::clone(&hot_univ3_pools);
+                let hot_univ3_by_venue = Arc::clone(&hot_univ3_by_venue);
+                let cold = cold.clone();
+                async move {
+                    info!(
+                        chain = %chain,
+                        venue = %venue,
+                        kind = "univ3_like",
+                        cold_pool_records = cold.len(),
+                        refresh_secs = hot_config.refresh_interval.as_secs(),
+                        "spawned hot pool refresh worker"
+                    );
+                    loop {
+                        match rank_univ3_pools(provider.clone(), cold.as_slice(), &hot_config)
+                            .await
                         {
-                            let mut guard = hot_univ3_by_venue.write().await;
-                            guard.insert(venue.clone(), hot.clone());
+                            Ok(hot) => {
+                                log_hot_pool_refresh(&chain, &venue, "univ3_like", hot.len());
+                                {
+                                    let mut guard = hot_univ3_by_venue.write().await;
+                                    guard.insert(venue.clone(), hot.clone());
+                                }
+                                let combined = {
+                                    let guard = hot_univ3_by_venue.read().await;
+                                    guard.values().flat_map(|v| v.clone()).collect::<Vec<_>>()
+                                };
+                                let mut guard = hot_univ3_pools.write().await;
+                                *guard = combined;
+                            }
+                            Err(err) => {
+                                warn!(error = %err, chain = %chain, venue = %venue, "failed to refresh univ3 hot pools");
+                            }
                         }
-                        let combined = {
-                            let guard = hot_univ3_by_venue.read().await;
-                            guard.values().flat_map(|v| v.clone()).collect::<Vec<_>>()
-                        };
-                        let mut guard = hot_univ3_pools.write().await;
-                        *guard = combined;
-                    }
-                    Err(err) => {
-                        warn!(error = %err, chain = %chain, venue = %venue, "failed to refresh univ3 hot pools");
+                        sleep(hot_config.refresh_interval).await;
                     }
                 }
-                sleep(hot_config.refresh_interval).await;
-            }
-        });
+            },
+        );
     }
 
     if ws_provider.is_some() || !ws_endpoints.is_empty() {
-        tokio::spawn(spawn_pending_tx_monitor(
-            provider.clone(),
-            ws_provider.clone(),
-            ws_endpoints.clone(),
-            ws_backoff,
-            None,
-        ));
+        let provider = provider.clone();
+        let ws_provider = ws_provider.clone();
+        let ws_endpoints = ws_endpoints.clone();
+        spawn_supervised(
+            "pending_tx_monitor",
+            cfg.name.clone(),
+            metrics.clone(),
+            move || {
+                spawn_pending_tx_monitor(
+                    provider.clone(),
+                    ws_provider.clone(),
+                    ws_endpoints.clone(),
+                    ws_backoff,
+                    None,
+                )
+            },
+        );
     }
 
     let fee_estimator = FeeEstimator::new(
@@ -8981,6 +9866,30 @@ async fn launch_chain_runtime(
     } else {
         0
     };
+
+    // Resolve the declared per-chain risk policy into enforceable runtime
+    // limits. Fails closed when the declaration cannot be honored (e.g. USD
+    // floor without a native USD price).
+    let risk_policy =
+        RuntimeRiskPolicy::resolve(&cfg.name, ops_inputs, native_usd_price(&cfg.env_prefix))?;
+    match &risk_policy {
+        Some(policy) => info!(
+            chain = %cfg.name,
+            min_net_profit_wei = ?policy.min_net_profit_wei,
+            max_gas_units_per_tx = ?policy.max_gas_units_per_tx,
+            max_fee_per_gas_cap = ?policy.max_fee_per_gas_cap,
+            max_slippage_bps = ?policy.max_slippage_bps,
+            max_price_impact_bps = ?policy.max_price_impact_bps,
+            must_simulate_before_send = policy.must_simulate_before_send,
+            revert_penalty = ?policy.revert_penalty,
+            "risk policy ACTIVE: ops/inputs.yaml limits enforced at runtime"
+        ),
+        None => warn!(
+            chain = %cfg.name,
+            "no risk.per_chain entry in ops inputs for this chain; runtime risk limits DISABLED"
+        ),
+    }
+    let sim_quorum = Arc::new(SimQuorum::from_endpoints(&cfg.name, &http_endpoints));
 
     let runner_config = RunnerConfig {
         feature_gate,
@@ -9067,6 +9976,8 @@ async fn launch_chain_runtime(
         metrics: metrics.clone(),
         accounting,
         fee_estimator,
+        risk_policy,
+        sim_quorum,
     };
 
     let runner = Runner::new(runner_config, executor);
@@ -9316,7 +10227,7 @@ mod tests {
     use std::env;
     use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_private_relays_match_bundle_pipeline_targets() {
@@ -9402,6 +10313,42 @@ mod tests {
             }]),
         )
         .expect("bundle request asserted");
+    }
+
+    #[tokio::test]
+    async fn send_private_rpc_bundle_never_leaks_content_rejections_to_raw() {
+        let (provider, mock) = Provider::mocked();
+        // Bundle rejected for a content reason (not method support): the tx
+        // must NOT be re-broadcast via eth_sendRawTransaction even though the
+        // policy allows the fallback.
+        mock.push_response(ethers::providers::MockResponse::Error(
+            ethers::providers::JsonRpcError {
+                code: -32000,
+                message: "bundle rejected: reverting transaction".into(),
+                data: None,
+            },
+        ));
+        let raw = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+
+        let err = send_private_rpc_bundle(&provider, raw, U64::from(42u64), "base", true)
+            .await
+            .expect_err("content rejection must propagate, not fall back");
+
+        assert!(format!("{err}").contains("bundle rejected"));
+    }
+
+    #[test]
+    fn bundle_method_unsupported_classifies_errors() {
+        let unsupported =
+            ProviderError::CustomError("(code: -32601, message: Method not found)".into());
+        assert!(bundle_method_unsupported(&unsupported));
+
+        let by_text = ProviderError::CustomError("the method eth_sendBundle does not exist".into());
+        assert!(bundle_method_unsupported(&by_text));
+
+        let content =
+            ProviderError::CustomError("bundle rejected: nonce too low".into());
+        assert!(!bundle_method_unsupported(&content));
     }
 
     #[test]

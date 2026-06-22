@@ -10,6 +10,9 @@ use std::{
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 use tracing::warn;
+use ethers::abi::{ParamType, Token};
+use ethers::types::transaction::eip2718::TypedTransaction;
+use std::str::FromStr;
 
 fn is_block_out_of_range_error(err: &impl std::fmt::Display) -> bool {
     let message = err.to_string();
@@ -176,6 +179,83 @@ where
                 value: out,
             },
         );
+        Ok(out)
+    }
+
+    /// Quote a fixed set of input amounts for ONE path in a SINGLE eth_call by
+    /// batching `quoteExactInput` through Multicall3.aggregate3. Returns one
+    /// optional `amountOut` per input amount (None when that sub-call failed or
+    /// returned empty). This collapses N sequential quote round-trips into one
+    /// RTT — the dominant scan-latency cost is per-quote network RTT, so this is
+    /// the decisive latency lever.
+    pub async fn quote_path_grid(
+        &self,
+        path: Vec<(Address, Option<u32>)>,
+        amounts: &[U256],
+        block: U64,
+    ) -> Result<Vec<Option<U256>>> {
+        if amounts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let path_bytes = Bytes::from(encode_univ3_path(&path)?);
+        let quoter_addr = self.quoter.address();
+        let multicall3 = Address::from_str("0xcA11bde05977b3631167028862bE2a173976CA11")
+            .map_err(|err| anyhow::anyhow!("invalid multicall3 address: {err}"))?;
+
+        let mut call_tokens = Vec::with_capacity(amounts.len());
+        for &amount in amounts {
+            let inner = self
+                .quoter
+                .quote_exact_input(path_bytes.clone(), amount)
+                .calldata()
+                .ok_or_else(|| anyhow::anyhow!("failed to encode quoteExactInput calldata"))?;
+            call_tokens.push(Token::Tuple(vec![
+                Token::Address(quoter_addr),
+                Token::Bool(true), // allowFailure: a bad size must not fail the batch
+                Token::Bytes(inner.to_vec()),
+            ]));
+        }
+        // aggregate3((address,bool,bytes)[]) selector = 0x82ad56cb
+        let mut data = vec![0x82u8, 0xad, 0x56, 0xcb];
+        data.extend(ethers::abi::encode(&[Token::Array(call_tokens)]));
+
+        let block_id = if block.is_zero() {
+            BlockId::Number(BlockNumber::Latest)
+        } else {
+            BlockId::Number(BlockNumber::Number(block))
+        };
+        let tx: TypedTransaction = TransactionRequest::new()
+            .to(multicall3)
+            .data(Bytes::from(data))
+            .into();
+        let raw = self.provider.call(&tx, Some(block_id)).await?;
+
+        let decoded = ethers::abi::decode(
+            &[ParamType::Array(Box::new(ParamType::Tuple(vec![
+                ParamType::Bool,
+                ParamType::Bytes,
+            ])))],
+            raw.as_ref(),
+        )?;
+
+        let mut out = vec![None; amounts.len()];
+        if let Some(Token::Array(results)) = decoded.into_iter().next() {
+            for (i, result) in results.into_iter().enumerate() {
+                if i >= out.len() {
+                    break;
+                }
+                if let Token::Tuple(fields) = result {
+                    let success = matches!(fields.first(), Some(Token::Bool(true)));
+                    if success {
+                        if let Some(Token::Bytes(return_data)) = fields.get(1) {
+                            if return_data.len() >= 32 {
+                                out[i] = Some(U256::from_big_endian(&return_data[..32]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 
