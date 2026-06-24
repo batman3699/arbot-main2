@@ -4,7 +4,7 @@ use std::env;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 #[path = "../ops_inputs.rs"]
 mod ops_inputs;
@@ -28,6 +28,15 @@ mod events {
 
 const DEFAULT_BLOCK_CHUNK_SIZE: u64 = 10_000;
 const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 45;
+const INTER_CHUNK_DELAY_MS: u64 = 350;
+
+fn rpc_error_is_rate_limited(err: &impl std::fmt::Display) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("429")
+        || msg.contains("rate limit")
+        || msg.contains("compute units per second")
+        || msg.contains("too many requests")
+}
 
 fn parse_args() -> Result<(String, String, u64, u64, u64, Duration)> {
     let mut chain = None;
@@ -127,21 +136,39 @@ async fn ingest_univ2(
     let mut records = Vec::new();
     for (window_start, window_end) in block_windows(from_block, to_block, chunk_size) {
         println!("Ingesting UniV2 pool logs for block window [{window_start}, {window_end}]...");
-        let events = timeout(
-            query_timeout,
-            contract
-                .event::<events::PairCreatedFilter>()
-                .from_block(window_start)
-                .to_block(window_end)
-                .query_with_meta(),
-        )
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "timed out querying PairCreated logs for block window [{window_start}, {window_end}] after {:?}",
-                query_timeout
+        let mut backoff = Duration::from_secs(2);
+        let events = loop {
+            match timeout(
+                query_timeout,
+                contract
+                    .event::<events::PairCreatedFilter>()
+                    .from_block(window_start)
+                    .to_block(window_end)
+                    .query_with_meta(),
             )
-        })??;
+            .await
+            {
+                Ok(Ok(events)) => break events,
+                Ok(Err(err)) => {
+                    if rpc_error_is_rate_limited(&err) {
+                        eprintln!(
+                            "RPC rate limited on PairCreated [{window_start}, {window_end}]; backing off {:?}",
+                            backoff
+                        );
+                        sleep(backoff).await;
+                        backoff = backoff.saturating_mul(2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                    return Err(anyhow::Error::msg(err.to_string()));
+                }
+                Err(_) => {
+                    return Err(anyhow!(
+                        "timed out querying PairCreated logs for block window [{window_start}, {window_end}] after {:?}",
+                        query_timeout
+                    ));
+                }
+            }
+        };
 
         for (event, meta) in events {
             let block = meta.block_number.as_u64();
@@ -151,8 +178,10 @@ async fn ingest_univ2(
                 token1: event.token_1,
                 fee: fee_bps,
                 created_block: block,
+                hub_usd_liquidity: None,
             });
         }
+        sleep(Duration::from_millis(INTER_CHUNK_DELAY_MS)).await;
     }
     Ok(records)
 }
@@ -170,21 +199,39 @@ async fn ingest_univ3(
     let mut records = Vec::new();
     for (window_start, window_end) in block_windows(from_block, to_block, chunk_size) {
         println!("Ingesting UniV3 pool logs for block window [{window_start}, {window_end}]...");
-        let events = timeout(
-            query_timeout,
-            contract
-                .event::<events::PoolCreatedFilter>()
-                .from_block(window_start)
-                .to_block(window_end)
-                .query_with_meta(),
-        )
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "timed out querying PoolCreated logs for block window [{window_start}, {window_end}] after {:?}",
-                query_timeout
+        let mut backoff = Duration::from_secs(2);
+        let events = loop {
+            match timeout(
+                query_timeout,
+                contract
+                    .event::<events::PoolCreatedFilter>()
+                    .from_block(window_start)
+                    .to_block(window_end)
+                    .query_with_meta(),
             )
-        })??;
+            .await
+            {
+                Ok(Ok(events)) => break events,
+                Ok(Err(err)) => {
+                    if rpc_error_is_rate_limited(&err) {
+                        eprintln!(
+                            "RPC rate limited on PoolCreated [{window_start}, {window_end}]; backing off {:?}",
+                            backoff
+                        );
+                        sleep(backoff).await;
+                        backoff = backoff.saturating_mul(2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                    return Err(anyhow::Error::msg(err.to_string()));
+                }
+                Err(_) => {
+                    return Err(anyhow!(
+                        "timed out querying PoolCreated logs for block window [{window_start}, {window_end}] after {:?}",
+                        query_timeout
+                    ));
+                }
+            }
+        };
 
         for (event, meta) in events {
             let block = meta.block_number.as_u64();
@@ -194,8 +241,10 @@ async fn ingest_univ3(
                 token1: event.token_1,
                 fee: event.fee,
                 created_block: block,
+                hub_usd_liquidity: None,
             });
         }
+        sleep(Duration::from_millis(INTER_CHUNK_DELAY_MS)).await;
     }
     Ok(records)
 }

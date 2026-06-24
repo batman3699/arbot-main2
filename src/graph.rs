@@ -677,11 +677,20 @@ impl Graph {
             .collect();
 
         if timed_out.load(AtomicOrdering::Relaxed) {
-            warn!("Cycle search timed out before completion");
+            // A timeout means some start nodes were not fully explored, but every
+            // cycle already in `discovered` is a fully-validated negative cycle
+            // found before the deadline. Discarding them throws away real,
+            // already-paid-for opportunities and guarantees a missed block.
+            // Rank and return what we have; only yield nothing if nothing was
+            // found. Start nodes are explored in descending priority order, so
+            // the partial set is biased toward the highest-value cycles.
             if let Some(metrics) = metrics {
                 metrics.record_cycle_search_timeout();
             }
-            return Vec::new();
+            warn!(
+                discovered = discovered.len(),
+                "Cycle search timed out before completion; ranking partial results"
+            );
         }
 
         let mut by_color: HashMap<u64, Vec<ScoredCycle>> = HashMap::new();
@@ -1315,6 +1324,88 @@ mod tests {
 
         let unique_hops = cycle.windows(2).count();
         assert_eq!(unique_hops, cycle.len() - 1);
+    }
+
+    #[test]
+    fn bellman_ford_detects_two_pool_arb() {
+        // The most common real arb: one token pair priced differently across
+        // two venues (e.g. WETH/USDC on Uniswap vs Aerodrome). This is a 2-hop
+        // cycle a->b->a using two DISTINCT pools. It must be discoverable with
+        // min_hops=2; the token graph resolves the best edge per direction, so
+        // the forward leg uses the venue that overpays for `a` and the return
+        // leg uses the venue that sells `a` cheaply.
+        let mut graph = Graph::default();
+
+        let a = addr(101);
+        let b = addr(102);
+
+        // Pool 1 (a->b): 1 a yields 2100 b (a is richly priced here).
+        graph.add_edge(Edge {
+            from: a,
+            to: b,
+            rate_num: U256::from(2100u64),
+            rate_den: U256::from(1u64),
+            venue: VenueEdge::UniV2 {
+                pair: addr(900),
+                token_out: b,
+                token0: a,
+                token1: b,
+                reserve_in: U256::from(1_000_000u64),
+                reserve_out: U256::from(2_100_000_000u64),
+                fee_bps: 30,
+            },
+            estimated_gas: 0,
+            weight: fp_weight(2100, 1),
+            max_input: U256::from(1_000u64),
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+        });
+        // Pool 2 (b->a): 2000 b buys 1 a (a is cheap here) -> round trip nets +5%.
+        graph.add_edge(Edge {
+            from: b,
+            to: a,
+            rate_num: U256::from(1u64),
+            rate_den: U256::from(2000u64),
+            venue: VenueEdge::UniV2 {
+                pair: addr(901),
+                token_out: a,
+                token0: a,
+                token1: b,
+                reserve_in: U256::from(2_000_000_000u64),
+                reserve_out: U256::from(1_000_000u64),
+                fee_bps: 30,
+            },
+            estimated_gas: 0,
+            weight: fp_weight(1, 2000),
+            max_input: U256::from(2_000_000u64),
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+        });
+
+        let mut priorities = HashMap::new();
+        priorities.insert(a, 10);
+        priorities.insert(b, 1);
+
+        let cycles = graph.bellman_ford(&priorities, &limits(6), 4, None);
+        let cycle = cycles
+            .iter()
+            .find(|c| c.weight < 0)
+            .expect("expected a profitable two-pool (2-hop) cycle");
+
+        // 2-hop cycle = 3 node entries (start repeated), 2 edges.
+        assert_eq!(
+            cycle.cycle.len(),
+            3,
+            "two-pool arb must be a 2-hop cycle, got {:?}",
+            cycle.cycle
+        );
+        let first = graph.nodes[cycle.cycle[0]];
+        let last = graph.nodes[*cycle.cycle.last().unwrap()];
+        assert_eq!(first, last, "cycle must return to its start");
     }
 
     #[test]

@@ -564,9 +564,12 @@ Recommended: `0` if siphoning is disabled.
 # 10. Search and sizing constraints
 
 ## MIN_HOPS
-Minimum hops in a cycle.
+Minimum hops (edges) in a cycle.
 
-Recommended: `3`.
+Recommended: `2` — enables two-pool, single-pair cross-venue arbs (the most
+frequent opportunity class). Same-pool round-trips self-reject, so a floor of 2
+only adds genuine cross-venue spreads. Use `3` only to deliberately exclude
+two-pool arbs.
 
 ## MAX_HOPS / MAX_HOPS_CAP
 Maximum allowed hop count.

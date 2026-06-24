@@ -425,9 +425,15 @@ Recommended: `0` is fine if siphoning is disabled.
 # 9. Search and sizing constraints
 
 ## MIN_HOPS
-Minimum hops in a cycle.
+Minimum hops (edges) in a cycle.
 
-Recommended: `3`.
+Recommended: `2`.
+
+`2` enables two-pool, single-pair cross-venue arbitrage (e.g. WETH/USDC priced
+differently on Uniswap vs Aerodrome) — the most frequent and highest-turnover
+opportunity class. Same-pool round-trips self-reject (their weight is never
+negative), so lowering this floor only adds genuine cross-venue spreads. Set to
+`3` only if you deliberately want to exclude two-pool arbs.
 
 ## MAX_HOPS / MAX_HOPS_CAP
 Maximum allowed hop count.

@@ -5,8 +5,8 @@ reserves, and rewrite the inventory sorted by hub-side USD liquidity descending.
 
 WHY: the shipped inventories (data/base/<venue>/pools.jsonl) are enumerated by
 creation block, not liquidity. The runtime hot-pool ranker only scores the first
-`max_cold_pools` records, so a creation-ordered file feeds it the *oldest*
-(mostly dead) pools. Re-sorting the file by real on-chain liquidity makes the
+`max_cold_pools` records, so a creation-ordered file feeds it the *newest*
+(mostly illiquid) pools. Re-sorting the file by real on-chain liquidity makes the
 top records the genuinely liquid, hub-connected pools that arbitrage needs.
 
 HOW: for every pool that pairs a known hub token, we read the hub token's
@@ -34,37 +34,76 @@ RPC_URL = os.environ.get(
     f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_KEY}",
 )
 
-# hub address (lowercase) -> (symbol, decimals, usd_price)
-# Prices are live QuoterV2 hub->USDC snapshots; ETH-LSTs use the WETH price
-# (they are ETH-equivalent and their thin direct USDC pools misquote).
-WETH_USD = 1638.12
-HUBS = {
-    "0x4200000000000000000000000000000000000006": ("WETH", 18, WETH_USD),
-    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": ("USDC", 6, 1.0),
-    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": ("USDbC", 6, 1.0),
-    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb": ("DAI", 18, 1.0),
-    "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf": ("cbBTC", 8, 61601.79),
-    "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22": ("cbETH", 18, WETH_USD),
-    "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452": ("wstETH", 18, WETH_USD),
-    "0x940181a94a35a4569e4529a3cdfb74e38fd98631": ("AERO", 18, 0.332132),
-}
-# Preference when both tokens are hubs (deepest/most-canonical first).
-HUB_PRIORITY = [
-    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
-    "0x4200000000000000000000000000000000000006",  # WETH
-    "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",  # cbBTC
-    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC
-    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI
-    "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",  # cbETH
-    "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452",  # wstETH
-    "0x940181a94a35a4569e4529a3cdfb74e38fd98631",  # AERO
-]
-BALANCE_OF = "0x70a08231"  # balanceOf(address) selector
+WETH = "0x4200000000000000000000000000000000000006"
+USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+QUOTER = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"
 
-MIN_USD = float(os.environ.get("RANK_MIN_USD", "10000"))   # keep pools with >= this hub-side USD
-TOP_N = int(os.environ.get("RANK_TOP_N", "1500"))          # cap records written
-BATCH = int(os.environ.get("RANK_BATCH", "60"))            # eth_calls per JSON-RPC batch
+MIN_USD = float(os.environ.get("RANK_MIN_USD", "10000"))
+TOP_N = int(os.environ.get("RANK_TOP_N", "1500"))
+BATCH = int(os.environ.get("RANK_BATCH", "60"))
 WORKERS = int(os.environ.get("RANK_WORKERS", "16"))
+BALANCE_OF = "0x70a08231"
+
+HUB_PRIORITY = [
+    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "0x4200000000000000000000000000000000000006",
+    "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
+    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",
+    "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",
+    "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452",
+    "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+]
+
+
+def fetch_weth_usd(session: requests.Session) -> float:
+    """Live WETH/USDC quote from Base QuoterV2 (500 bps tier)."""
+    amount_in = 10**15
+    data = (
+        "0xcdca1753"
+        + WETH[2:].lower().rjust(64, "0")
+        + USDC[2:].lower().rjust(64, "0")
+        + format(amount_in, "064x")
+        + format(500, "064x")
+        + "0" * 64
+    )
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{"to": QUOTER, "data": data}, "latest"],
+    }
+    try:
+        r = session.post(RPC_URL, json=payload, timeout=20)
+        r.raise_for_status()
+        result = r.json().get("result")
+        if isinstance(result, str) and len(result) >= 66:
+            usdc_out = int(result[:66], 16)
+            return (usdc_out / 1e6) / (amount_in / 1e18)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  WARN: live WETH quote failed ({exc}); using env fallback", file=sys.stderr)
+    return float(os.environ.get("RANK_WETH_USD", "2500"))
+
+
+def build_hubs(weth_usd: float) -> dict:
+    return {
+        WETH: ("WETH", 18, weth_usd),
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": ("USDC", 6, 1.0),
+        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": ("USDbC", 6, 1.0),
+        "0x50c5725949a6f0c72e6c4a641f24049a917db0cb": ("DAI", 18, 1.0),
+        "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf": (
+            "cbBTC",
+            8,
+            float(os.environ.get("RANK_CBTC_USD", "95000")),
+        ),
+        "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22": ("cbETH", 18, weth_usd),
+        "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452": ("wstETH", 18, weth_usd),
+        "0x940181a94a35a4569e4529a3cdfb74e38fd98631": (
+            "AERO",
+            18,
+            float(os.environ.get("RANK_AERO_USD", "0.35")),
+        ),
+    }
 
 
 def pick_hub(token0: str, token1: str):
@@ -80,8 +119,7 @@ def balance_call(hub: str, pool: str):
     }
 
 
-def run_batch(session, jobs):
-    """jobs: list of (index, hub, pool). Returns list of (index, balance_int)."""
+def run_batch(session: requests.Session, jobs):
     payload = [
         {
             "jsonrpc": "2.0",
@@ -116,7 +154,46 @@ def run_batch(session, jobs):
     return [(idx, 0) for (idx, _h, _p) in jobs]
 
 
-def rank_file(path: str):
+LIQUIDITY = "0x1a686502"  # UniV3 pool.liquidity()
+
+
+def run_univ3_liquidity_batch(session: requests.Session, jobs):
+    """jobs: list of (index, pool_address). Returns (index, liquidity_uint)."""
+    payload = [
+        {
+            "jsonrpc": "2.0",
+            "id": idx,
+            "method": "eth_call",
+            "params": [{"to": pool, "data": LIQUIDITY}, "latest"],
+        }
+        for (idx, pool) in jobs
+    ]
+    for attempt in range(4):
+        try:
+            r = session.post(RPC_URL, json=payload, timeout=30)
+            r.raise_for_status()
+            out = []
+            for item in r.json():
+                idx = item.get("id")
+                res = item.get("result")
+                if isinstance(res, str) and len(res) >= 66:
+                    try:
+                        out.append((idx, int(res[:66], 16)))
+                    except ValueError:
+                        out.append((idx, 0))
+                else:
+                    out.append((idx, 0))
+            return out
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 3:
+                print(f"  batch failed after retries: {exc}", file=sys.stderr)
+                return [(idx, 0) for (idx, _p) in jobs]
+            time.sleep(0.5 * (attempt + 1))
+    return [(idx, 0) for (idx, _p) in jobs]
+
+
+def rank_univ3_file(path: str, session: requests.Session):
+    """Rank UniV3 pools by on-chain liquidity() — correct metric for concentrated liquidity."""
     if not os.path.exists(path):
         print(f"  skip (missing): {path}")
         return
@@ -133,7 +210,77 @@ def rank_file(path: str):
     total = len(records)
     print(f"  loaded {total} records from {path}")
 
-    # Build jobs only for hub-anchored pools.
+    jobs = [(i, rec["pool"]) for i, rec in enumerate(records)]
+    print(f"  probing liquidity() on {len(jobs)} pools (batch={BATCH}, workers={WORKERS})")
+
+    liquidity_scores = {}
+    batches = [jobs[k : k + BATCH] for k in range(0, len(jobs), BATCH)]
+    done = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for result in pool.map(lambda b: run_univ3_liquidity_batch(session, b), batches):
+            for idx, liq in result:
+                liquidity_scores[idx] = liq
+            done += 1
+            if done % 20 == 0:
+                print(f"    probed {done}/{len(batches)} batches", flush=True)
+
+    scored = []
+    unscored = []
+    for i, rec in enumerate(records):
+        liq = liquidity_scores.get(i, 0)
+        rec = dict(rec)
+        if liq > 0:
+            rec["hub_usd_liquidity"] = float(liq)
+            scored.append(rec)
+        else:
+            unscored.append(rec)
+
+    scored.sort(key=lambda r: r["hub_usd_liquidity"], reverse=True)
+    kept = scored[:TOP_N] + unscored
+    if len(kept) < min(total, max(100, TOP_N // 3)):
+        print(
+            f"  ABORT: only {len(scored)} pools with liquidity; refusing destructive rewrite",
+            file=sys.stderr,
+        )
+        return
+
+    print(f"  pools with liquidity>0: {len(scored)} ; writing {len(kept)} records")
+    if scored:
+        print("  top 8 by liquidity():")
+        for r in scored[:8]:
+            print(
+                f"    liq={r['hub_usd_liquidity']:>18,.0f}  "
+                f"{r['pool']}  fee={r.get('fee')}"
+            )
+
+    bak = path + ".bak"
+    if not os.path.exists(bak):
+        os.rename(path, bak)
+        print(f"  backed up original -> {bak}")
+    with open(path, "w") as fh:
+        for r in kept:
+            fh.write(json.dumps(r) + "\n")
+    print(f"  wrote {len(kept)} liquidity-ranked records -> {path}")
+
+
+def rank_file(path: str, session: requests.Session, hubs: dict):
+    """Hub balanceOf ranking — appropriate for UniV2-style pools only."""
+    if not os.path.exists(path):
+        print(f"  skip (missing): {path}")
+        return
+    records = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    total = len(records)
+    print(f"  loaded {total} records from {path}")
+
     jobs = []
     hub_for = {}
     for i, rec in enumerate(records):
@@ -147,26 +294,29 @@ def rank_file(path: str):
     balances = {}
     batches = [jobs[k : k + BATCH] for k in range(0, len(jobs), BATCH)]
     done = 0
-    with requests.Session() as session:
-        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            for result in pool.map(lambda b: run_batch(session, b), batches):
-                for idx, bal in result:
-                    balances[idx] = bal
-                done += 1
-                if done % 50 == 0:
-                    print(f"    probed {done}/{len(batches)} batches", flush=True)
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        for result in pool.map(lambda b: run_batch(session, b), batches):
+            for idx, bal in result:
+                balances[idx] = bal
+            done += 1
+            if done % 50 == 0:
+                print(f"    probed {done}/{len(batches)} batches", flush=True)
 
     scored = []
+    unscored = []
     for i, rec in enumerate(records):
         if i not in hub_for:
+            unscored.append(rec)
             continue
         hub = hub_for[i]
-        sym, dec, price = HUBS[hub]
+        sym, dec, price = hubs[hub]
         bal = balances.get(i, 0)
         if bal <= 0:
+            unscored.append(rec)
             continue
-        usd = (bal / (10 ** dec)) * price
+        usd = (bal / (10**dec)) * price
         if usd < MIN_USD:
+            unscored.append(rec)
             continue
         rec = dict(rec)
         rec["hub_usd_liquidity"] = round(usd, 2)
@@ -174,11 +324,18 @@ def rank_file(path: str):
         scored.append(rec)
 
     scored.sort(key=lambda r: r["hub_usd_liquidity"], reverse=True)
-    kept = scored[:TOP_N]
-    print(f"  qualified (>= ${MIN_USD:,.0f}): {len(scored)} ; keeping top {len(kept)}")
-    if kept:
+    kept = scored[:TOP_N] + unscored
+    if len(scored) < min(total, max(50, TOP_N // 10)):
+        print(
+            f"  ABORT: only {len(scored)} pools qualified; leaving {path} unchanged",
+            file=sys.stderr,
+        )
+        return
+
+    print(f"  qualified (>= ${MIN_USD:,.0f}): {len(scored)} ; writing {len(kept)} records")
+    if scored:
         print("  top 8:")
-        for r in kept[:8]:
+        for r in scored[:8]:
             print(
                 f"    ${r['hub_usd_liquidity']:>14,.0f}  {r['hub_symbol']:>6}  "
                 f"{r['pool']}  fee={r.get('fee')}"
@@ -188,8 +345,6 @@ def rank_file(path: str):
     if not os.path.exists(bak):
         os.rename(path, bak)
         print(f"  backed up original -> {bak}")
-    else:
-        print(f"  backup already exists -> {bak} (left intact)")
     with open(path, "w") as fh:
         for r in kept:
             fh.write(json.dumps(r) + "\n")
@@ -197,15 +352,19 @@ def rank_file(path: str):
 
 
 def main():
-    targets = sys.argv[1:] or [
-        "data/base/uniswap_v2/pools.jsonl",
-        "data/base/uniswap_v3/pools.jsonl",
-    ]
+    targets = sys.argv[1:] or ["data/base/uniswap_v3/pools.jsonl"]
     print(f"RPC: {RPC_URL.split('/v2/')[0]}/v2/****")
     print(f"MIN_USD={MIN_USD} TOP_N={TOP_N}")
-    for path in targets:
-        print(f"\n=== ranking {path} ===")
-        rank_file(path)
+    with requests.Session() as session:
+        for path in targets:
+            print(f"\n=== ranking {path} ===")
+            if "uniswap_v3" in path.replace("\\", "/"):
+                rank_univ3_file(path, session)
+            else:
+                weth_usd = fetch_weth_usd(session)
+                hubs = build_hubs(weth_usd)
+                print(f"WETH/USD (live quoter): ${weth_usd:,.2f}")
+                rank_file(path, session, hubs)
 
 
 if __name__ == "__main__":

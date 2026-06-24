@@ -228,17 +228,45 @@ def main():
         return recs
 
     for venue in ("uniswap_v2", "uniswap_v3"):
-        recs = emit(venue)
+        core = emit(venue)
         path = f"data/base/{venue}/pools.jsonl"
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        # MERGE, never overwrite. A previous version of this script replaced the
+        # whole inventory with this ~16-token core set, which silently destroyed
+        # a 491-pool factory ingest and collapsed the live universe to 24 pools
+        # (graph pruned to ~95 edges, zero arbs). Union by pool address instead:
+        # the core can only ADD the guaranteed-liquid majors, never shrink the
+        # discovered long tail.
+        existing = []
+        if os.path.exists(path):
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        existing.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        by_pool = {}
+        for r in existing + core:  # core last so its enriched fields win on conflict
+            pool = r.get("pool")
+            if not pool:
+                continue
+            by_pool[pool.lower()] = r
+        merged = list(by_pool.values())
         bak = path + ".core.bak"
         if os.path.exists(path) and not os.path.exists(bak):
-            os.replace(path, bak)
+            import shutil
+            shutil.copy2(path, bak)  # COPY (non-destructive), don't move
         with open(path, "w") as fh:
-            for r in recs:
+            for r in merged:
                 fh.write(json.dumps(r) + "\n")
-        print(f"\n=== {venue}: wrote {len(recs)} liquid pools -> {path} ===")
-        for r in recs[:10]:
+        print(
+            f"\n=== {venue}: merged {len(core)} liquid-core pools into "
+            f"{len(existing)} existing -> {len(merged)} total at {path} ==="
+        )
+        for r in core[:10]:
             print(f"  ${r['hub_usd_liquidity']:>14,.0f}  {r['pool']}  fee={r['fee']}")
 
 

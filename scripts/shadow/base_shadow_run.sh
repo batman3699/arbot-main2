@@ -73,7 +73,9 @@ export CHAOS_DISABLE_WS=false
 
 # Observability defaults (override by exporting before calling).
 export RUST_LOG="${RUST_LOG:-info,arb_exec=info,arb_exec::venues=info,venue::univ3=warn}"
-export PROMETHEUS_PORT="${PROMETHEUS_PORT:-9100}"
+export PROMETHEUS_PORT=9101
+export HOT_POOL_SKIP_VOLUME="${HOT_POOL_SKIP_VOLUME:-1}"
+export HOT_POOL_RANK_CONCURRENCY="${HOT_POOL_RANK_CONCURRENCY:-32}"
 
 # --- Hard safety assertion ---------------------------------------------------
 if [ "${SHADOW_MODE}" != "1" ]; then

@@ -295,7 +295,7 @@ chains:
     - ${INK_PRIVATE_RELAY_URL}
     public_mempool_jitter_bps: 75
 universe:
-  dynamic_top_tokens_30d: 60
+  dynamic_top_tokens_30d: 200
   include_usd_stablecoins: true
   include_weth: true
   include_wbtc: true
@@ -336,7 +336,7 @@ universe:
   min_pool_liquidity_usd: 250000
   min_pool_liquidity_tokens: 1
   max_hot_pools_per_chain_per_venue: 250
-  max_cold_pools_stored: 500
+  max_cold_pools_stored: 1500
   max_edges_hot: 400
   topk_per_token: 4
   max_hops: 6
@@ -345,7 +345,7 @@ universe:
   event_sampling_block_window: 120
   hot_pool_refresh_secs: 300
   time_budget_ms:
-    search: 250
+    search: 600
     quoting: 150
     simulation: 200
 risk:
@@ -383,7 +383,7 @@ risk:
       linear_base_bps: 10
       linear_per_gas_bps: 1
   - chain_name: base
-    min_net_profit_usd: 15
+    min_net_profit_usd: 8
     max_gas_units_per_tx: 500000
     max_fee_per_gas_cap: 200000000000
     max_slippage_bps: 50
@@ -531,7 +531,7 @@ features:
     markets:
     - name: aave_usdc_weth
       kind: aave
-      adapter: '0x627e54a5Fad377d0d0eef60298f7F3d0e2c15E7A'
+      adapter: '0x9445f7d3E1aA38bC9A9B373dc905D9fde7B9B852'
       flash_loan_pool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5'
       debt_token: '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913'
       collateral_token: '0x4200000000000000000000000000000000000006'
@@ -543,7 +543,7 @@ features:
       max_repay_wei: '0'
     - name: compound_usdc_weth
       kind: compound
-      adapter: '0x627e54a5Fad377d0d0eef60298f7F3d0e2c15E7A'
+      adapter: '0x9445f7d3E1aA38bC9A9B373dc905D9fde7B9B852'
       flash_loan_pool: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5'
       debt_token: '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913'
       collateral_token: '0x4200000000000000000000000000000000000006'

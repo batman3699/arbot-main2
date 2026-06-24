@@ -123,6 +123,21 @@ impl NativePrice {
         ))
     }
 
+    /// Convert a start-token amount into native (wei). Inverse of
+    /// `tokens_for_native_strict`; used to denominate token-denominated profit
+    /// in native so it can be priced against per-gas priority fees. Returns
+    /// `None` when the price is unreliable (fail closed — never bid on a guess).
+    pub fn native_for_tokens_strict(&self, token_amount: U256) -> Option<U256> {
+        if !self.is_reliable() || self.token_amount.is_zero() {
+            return None;
+        }
+        Some(mul_div(
+            token_amount,
+            self.native_amount.max(U256::one()),
+            self.token_amount,
+        ))
+    }
+
     #[allow(dead_code)]
     pub fn native_per_token(&self) -> Decimal {
         if self.token_amount.is_zero() {
@@ -519,6 +534,26 @@ mod tests {
 
     fn addr(n: u64) -> Address {
         Address::from_low_u64_be(n)
+    }
+
+    #[test]
+    fn native_for_tokens_strict_is_inverse_of_tokens_for_native() {
+        // 1 native = 2000 tokens (e.g. 1 ETH = 2000 USDC).
+        let price = NativePrice::new(U256::from(2_000u64), U256::from(1u64), true);
+        // 4000 tokens of profit -> 2 native.
+        assert_eq!(
+            price.native_for_tokens_strict(U256::from(4_000u64)),
+            Some(U256::from(2u64))
+        );
+        // Round-trips back to tokens.
+        let native = price.native_for_tokens_strict(U256::from(4_000u64)).unwrap();
+        assert_eq!(price.tokens_for_native_strict(native), Some(U256::from(4_000u64)));
+    }
+
+    #[test]
+    fn native_for_tokens_strict_fails_closed_when_unreliable() {
+        let price = NativePrice::new(U256::from(2_000u64), U256::from(1u64), false);
+        assert!(price.native_for_tokens_strict(U256::from(4_000u64)).is_none());
     }
 
     #[test]

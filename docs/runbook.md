@@ -95,7 +95,7 @@ Set the universe controls in `ops/inputs.yaml`:
 
 ```yaml
 universe:
-  dynamic_top_tokens_30d: 60
+  dynamic_top_tokens_30d: 200
   include_usd_stablecoins: true
   include_weth: true
   include_wbtc: true

@@ -16,7 +16,7 @@ use ethers::{
 };
 use futures_util::StreamExt;
 use tokio::{
-    sync::{Notify, RwLock},
+    sync::{watch, Notify, RwLock},
     task::JoinHandle,
     time::{interval, sleep, timeout},
 };
@@ -442,6 +442,112 @@ where
     }
 
     Ok(())
+}
+
+/// Pair used to wake the scan loop as soon as a new canonical head arrives.
+pub fn block_head_channel() -> (watch::Sender<U64>, watch::Receiver<U64>) {
+    watch::channel(U64::zero())
+}
+
+async fn poll_block_head<C>(provider: &Provider<C>, head_tx: &watch::Sender<U64>)
+where
+    C: JsonRpcClient + 'static,
+{
+    if let Ok(Some(block)) = provider.get_block(BlockNumber::Latest).await {
+        if let Some(number) = block.number {
+            if head_tx.borrow().as_u64() != number.as_u64() {
+                let _ = head_tx.send(number);
+            }
+        }
+    }
+}
+
+/// Subscribe to `newHeads` over websocket (HTTP poll fallback) and publish the
+/// latest canonical block number to the scan loop.
+pub async fn spawn_block_head_monitor<C>(
+    http_provider: Arc<Provider<C>>,
+    initial_ws_provider: Option<Arc<Provider<Ws>>>,
+    ws_endpoints: Vec<String>,
+    ws_backoff: Duration,
+    head_tx: watch::Sender<U64>,
+    chain_name: String,
+) where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    const FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
+    const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    let mut ws_provider = initial_ws_provider;
+
+    loop {
+        if ws_provider.is_none() && ws_endpoints.is_empty() {
+            poll_block_head(&http_provider, &head_tx).await;
+            sleep(FALLBACK_POLL_INTERVAL).await;
+            continue;
+        }
+
+        let provider = if let Some(provider) = ws_provider.take() {
+            provider
+        } else {
+            let connect =
+                connect_ws_provider_with_fallbacks("block-head-rpc", &ws_endpoints, ws_backoff);
+            match timeout(WS_CONNECT_TIMEOUT, connect).await {
+                Ok(Ok(provider)) => Arc::new(provider),
+                Ok(Err(err)) => {
+                    warn!(
+                        chain = %chain_name,
+                        error = %err,
+                        "failed to connect websocket for block head monitor"
+                    );
+                    poll_block_head(&http_provider, &head_tx).await;
+                    sleep(FALLBACK_POLL_INTERVAL).await;
+                    continue;
+                }
+                Err(_) => {
+                    warn!(
+                        chain = %chain_name,
+                        timeout_secs = WS_CONNECT_TIMEOUT.as_secs(),
+                        "websocket connection timed out for block head monitor"
+                    );
+                    poll_block_head(&http_provider, &head_tx).await;
+                    sleep(FALLBACK_POLL_INTERVAL).await;
+                    continue;
+                }
+            }
+        };
+
+        match provider.subscribe_blocks().await {
+            Ok(mut stream) => {
+                info!(chain = %chain_name, "newHeads block monitor connected");
+                while let Some(block) = stream.next().await {
+                    if let Some(number) = block.number {
+                        let _ = head_tx.send(number);
+                    }
+                }
+                warn!(
+                    chain = %chain_name,
+                    "newHeads block monitor disconnected; reconnecting"
+                );
+            }
+            Err(err) => {
+                if is_websocket_subscription_close(&err.to_string()) {
+                    info!(
+                        chain = %chain_name,
+                        error = %err,
+                        "newHeads websocket closed; using RPC fallback before reconnect"
+                    );
+                } else {
+                    warn!(
+                        chain = %chain_name,
+                        error = %err,
+                        "failed to subscribe to newHeads"
+                    );
+                }
+            }
+        }
+
+        poll_block_head(&http_provider, &head_tx).await;
+        sleep(FALLBACK_POLL_INTERVAL).await;
+    }
 }
 
 #[derive(Default)]

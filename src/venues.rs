@@ -45,6 +45,14 @@ const ESTIMATED_GAS_CURVE: u64 = 180_000;
 const ESTIMATED_GAS_UNIV2: u64 = 130_000;
 const ESTIMATED_GAS_SOLIDLYV2: u64 = 135_000;
 const ESTIMATED_GAS_UNIV4: u64 = 160_000;
+
+fn univ2_load_concurrency() -> usize {
+    std::env::var("UNIV2_LOAD_CONCURRENCY")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(32)
+        .clamp(4, 128)
+}
 // Production scan budgets run 150-250ms; a hung quote must never be able to
 // pin a pool for multiple seconds. 2s matches the validated Base shadow
 // override (ARBOT_RPC_QUOTE_TIMEOUT_SECS=2) and is now the fail-safe default.
@@ -129,6 +137,32 @@ fn edge_health_score_bps(edge: &Edge, current_block: U64, max_block_lag: U64) ->
 
     // Composite edge health score: liquidity depth (50%), slippage quality (35%), quote freshness (15%).
     ((liquidity_score * 50) + (slippage_score * 35) + (freshness_score * 15)) / 100
+}
+
+fn pool_pair_in_whitelist(token_a: Address, token_b: Address, whitelist: &HashSet<Address>) -> bool {
+    whitelist.contains(&token_a) && whitelist.contains(&token_b)
+}
+
+fn filter_hot_univ3_pools(
+    pools: &[PoolRecord],
+    whitelist: &HashSet<Address>,
+) -> Vec<PoolRecord> {
+    pools
+        .iter()
+        .filter(|pool| pool_pair_in_whitelist(pool.token0, pool.token1, whitelist))
+        .cloned()
+        .collect()
+}
+
+fn filter_hot_univ2_pools(
+    pools: &[ResolvedUniV2PoolCfg],
+    whitelist: &HashSet<Address>,
+) -> Vec<ResolvedUniV2PoolCfg> {
+    pools
+        .iter()
+        .filter(|pool| pool_pair_in_whitelist(pool.token_in, pool.token_out, whitelist))
+        .cloned()
+        .collect()
 }
 
 fn apply_pruning(
@@ -1254,6 +1288,7 @@ where
                         token1: token_b,
                         fee: *fee,
                         created_block: 0,
+                        hub_usd_liquidity: None,
                     }),
                     Ok(None) => {}
                     Err(err) => {
@@ -2219,33 +2254,46 @@ where
     }
 
     let mut cached_states: Vec<(ResolvedUniV2PoolCfg, UniV2PairState, Option<U64>)> = Vec::new();
-    for pool in hot_pools.iter().cloned() {
-        let snapshot = if let Some(monitor) = &pool_monitor {
-            monitor.state_with_block(pool.pair).await
-        } else {
-            None
-        };
+    let concurrency = univ2_load_concurrency();
+    let pool_monitor = pool_monitor.clone();
+    let load_outcomes: Vec<Option<(ResolvedUniV2PoolCfg, UniV2PairState, Option<U64>)>> =
+        stream::iter(hot_pools.iter().cloned().map(|pool| {
+            let provider = provider.clone();
+            let pool_monitor = pool_monitor.clone();
+            async move {
+                let snapshot = if let Some(monitor) = &pool_monitor {
+                    monitor.state_with_block(pool.pair).await
+                } else {
+                    None
+                };
 
-        match snapshot {
-            Some((state, last_block)) => cached_states.push((pool, state, last_block)),
-            None => match load_pair_state(provider.clone(), pool.pair).await {
-                Ok(Some(state)) => cached_states.push((pool, state, Some(block_number))),
-                Ok(None) => {
-                    debug!(
-                        pair = %format!("0x{}", hex::encode(pool.pair)),
-                        "Skipping UniV2 pair with unsupported interface"
-                    );
+                match snapshot {
+                    Some((state, last_block)) => Some((pool, state, last_block)),
+                    None => match load_pair_state(provider, pool.pair).await {
+                        Ok(Some(state)) => Some((pool, state, Some(block_number))),
+                        Ok(None) => {
+                            debug!(
+                                pair = %format!("0x{}", hex::encode(pool.pair)),
+                                "Skipping UniV2 pair with unsupported interface"
+                            );
+                            None
+                        }
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                pair = %format!("0x{}", hex::encode(pool.pair)),
+                                "Failed to load UniV2 state"
+                            );
+                            None
+                        }
+                    },
                 }
-                Err(err) => {
-                    warn!(
-                        error = %err,
-                        pair = %format!("0x{}", hex::encode(pool.pair)),
-                        "Failed to load UniV2 state"
-                    );
-                }
-            },
-        }
-    }
+            }
+        }))
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+    cached_states.extend(load_outcomes.into_iter().flatten());
 
     for (pool, state, last_block) in cached_states {
         let quote_block = last_block.or(Some(block_number));
@@ -2709,6 +2757,28 @@ where
         token_whitelist: Arc::new(token_whitelist.clone()),
         chain_env_prefix: chain_env_prefix.to_string(),
     };
+    let hot_univ3_filtered = filter_hot_univ3_pools(hot_univ3_pools, token_whitelist);
+    let hot_univ2_filtered = filter_hot_univ2_pools(hot_univ2_pools, token_whitelist);
+    let univ3_skipped = hot_univ3_pools
+        .len()
+        .saturating_sub(hot_univ3_filtered.len());
+    let univ2_skipped = hot_univ2_pools
+        .len()
+        .saturating_sub(hot_univ2_filtered.len());
+    if univ3_skipped > 0 || univ2_skipped > 0 {
+        debug!(
+            chain = %chain_name,
+            univ3_hot = hot_univ3_pools.len(),
+            univ3_quoted = hot_univ3_filtered.len(),
+            univ3_skipped,
+            univ2_hot = hot_univ2_pools.len(),
+            univ2_quoted = hot_univ2_filtered.len(),
+            univ2_skipped,
+            whitelist_tokens = token_whitelist.len(),
+            "Pre-filtered hot pools outside token whitelist before quoting"
+        );
+    }
+
     type EdgeJoinResult = (
         Vec<Edge>,
         Vec<Edge>,
@@ -2725,7 +2795,7 @@ where
         mut solidly_edges,
         mut univ4_edges,
     ): EdgeJoinResult = tokio::try_join!(
-        collect_univ3_edges(hot_univ3_pools, &univ3_ctx),
+        collect_univ3_edges(&hot_univ3_filtered, &univ3_ctx),
         collect_balancer_edges(provider.clone(), bal_vault, chain_env_prefix, &edge_ctx),
         collect_curve_edges(
             provider.clone(),
@@ -2739,7 +2809,7 @@ where
         collect_univ2_edges(
             provider.clone(),
             pool_monitor.clone(),
-            hot_univ2_pools,
+            &hot_univ2_filtered,
             base_profiles.clone(),
             default_profile,
             gas_price,
@@ -3260,5 +3330,38 @@ mod tests {
         let used = AtomicUsize::new(0);
         assert!(reserve_forced_discovery_quote(true, &used, 1));
         assert_eq!(used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn hot_pool_prefilter_requires_both_tokens_in_whitelist() {
+        let token_a = Address::from_low_u64_be(1);
+        let token_b = Address::from_low_u64_be(2);
+        let token_c = Address::from_low_u64_be(3);
+        let mut whitelist = HashSet::new();
+        whitelist.insert(token_a);
+        whitelist.insert(token_b);
+
+        let pools = vec![
+            PoolRecord {
+                pool: Address::from_low_u64_be(100),
+                token0: token_a,
+                token1: token_b,
+                fee: 500,
+                created_block: 0,
+                hub_usd_liquidity: None,
+            },
+            PoolRecord {
+                pool: Address::from_low_u64_be(101),
+                token0: token_a,
+                token1: token_c,
+                fee: 500,
+                created_block: 0,
+                hub_usd_liquidity: None,
+            },
+        ];
+
+        let filtered = filter_hot_univ3_pools(&pools, &whitelist);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pool, pools[0].pool);
     }
 }

@@ -15,6 +15,9 @@ pub struct PoolRecord {
     pub fee: u32,
     #[allow(dead_code)]
     pub created_block: u64,
+    /// Hub-side USD liquidity from offline ranking (`rank_base_pools.py`).
+    /// When present, cold-pool truncation prefers highest-liquidity pools.
+    pub hub_usd_liquidity: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -33,6 +36,8 @@ pub(crate) struct PoolRecordJson {
     token1: String,
     fee: u32,
     created_block: u64,
+    #[serde(default)]
+    hub_usd_liquidity: Option<f64>,
 }
 
 impl PoolRecord {
@@ -45,6 +50,7 @@ impl PoolRecord {
                 .context("token1 must be a valid address")?,
             fee: record.fee,
             created_block: record.created_block,
+            hub_usd_liquidity: record.hub_usd_liquidity,
         })
     }
 
@@ -56,6 +62,7 @@ impl PoolRecord {
             token1: format!("0x{}", hex::encode(self.token1)),
             fee: self.fee,
             created_block: self.created_block,
+            hub_usd_liquidity: self.hub_usd_liquidity,
         }
     }
 }
@@ -128,6 +135,27 @@ pub fn write_pool_records(path: impl AsRef<Path>, records: &[PoolRecord]) -> Res
     Ok(())
 }
 
+/// Keep the most liquid cold-pool candidates when inventory exceeds the cap.
+/// Prefers `hub_usd_liquidity` from offline ranking; falls back to newest
+/// `created_block` when liquidity metadata is absent.
+pub fn prioritize_cold_pool_inventory(records: &mut Vec<PoolRecord>, max_cold: usize) {
+    if records.len() <= max_cold {
+        return;
+    }
+    records.sort_by(|left, right| {
+        match (left.hub_usd_liquidity, right.hub_usd_liquidity) {
+            (Some(l), Some(r)) => r
+                .partial_cmp(&l)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| right.created_block.cmp(&left.created_block)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => right.created_block.cmp(&left.created_block),
+        }
+    });
+    records.truncate(max_cold);
+}
+
 #[allow(dead_code)]
 pub fn merge_pool_records(existing: Vec<PoolRecord>, incoming: Vec<PoolRecord>) -> Vec<PoolRecord> {
     let mut merged: HashMap<Address, PoolRecord> = HashMap::new();
@@ -141,6 +169,9 @@ pub fn merge_pool_records(existing: Vec<PoolRecord>, incoming: Vec<PoolRecord>) 
                 entry.fee = record.fee;
                 entry.token0 = record.token0;
                 entry.token1 = record.token1;
+                if record.hub_usd_liquidity.is_some() {
+                    entry.hub_usd_liquidity = record.hub_usd_liquidity;
+                }
             })
             .or_insert(record);
     }
@@ -171,7 +202,7 @@ pub fn univ2_configs_from_records(records: &[PoolRecord]) -> Vec<ResolvedUniV2Po
 
 #[cfg(test)]
 mod tests {
-    use super::{load_pool_records, merge_pool_records, write_pool_records, PoolRecord};
+    use super::{load_pool_records, merge_pool_records, prioritize_cold_pool_inventory, write_pool_records, PoolRecord};
     use ethers::types::Address;
     use tempfile::tempdir;
 
@@ -185,6 +216,7 @@ mod tests {
             token1: Address::from_low_u64_be(3),
             fee: 30,
             created_block: 12,
+            hub_usd_liquidity: Some(1_000_000.0),
         }];
         write_pool_records(&path, &records).expect("write");
         let loaded = load_pool_records(&path).expect("load");
@@ -202,6 +234,7 @@ mod tests {
             token1: Address::from_low_u64_be(12),
             fee: 30,
             created_block: 50,
+            hub_usd_liquidity: None,
         }];
         let incoming = vec![PoolRecord {
             pool,
@@ -209,11 +242,37 @@ mod tests {
             token1: Address::from_low_u64_be(22),
             fee: 25,
             created_block: 20,
+            hub_usd_liquidity: Some(2_000_000.0),
         }];
         let merged = merge_pool_records(existing, incoming);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].created_block, 20);
         assert_eq!(merged[0].fee, 25);
+    }
+
+    #[test]
+    fn prioritize_cold_pool_inventory_prefers_hub_liquidity() {
+        let mut pools = vec![
+            PoolRecord {
+                pool: Address::from_low_u64_be(1),
+                token0: Address::from_low_u64_be(2),
+                token1: Address::from_low_u64_be(3),
+                fee: 500,
+                created_block: 99,
+                hub_usd_liquidity: Some(10_000.0),
+            },
+            PoolRecord {
+                pool: Address::from_low_u64_be(4),
+                token0: Address::from_low_u64_be(5),
+                token1: Address::from_low_u64_be(6),
+                fee: 500,
+                created_block: 1,
+                hub_usd_liquidity: Some(5_000_000.0),
+            },
+        ];
+        prioritize_cold_pool_inventory(&mut pools, 1);
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].pool, Address::from_low_u64_be(4));
     }
 
     #[test]

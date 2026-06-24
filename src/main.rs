@@ -77,16 +77,20 @@ use tokio::{
 use graph::{canonicalize_cycle, BellmanFordLimits, Edge, Graph, VenueEdge};
 use hot_path::{HotPathCache, ProfitabilitySnapshot};
 use hot_pools::{log_hot_pool_refresh, rank_univ2_pools, rank_univ3_pools, HotPoolConfig};
-use ingestion::{spawn_pending_tx_monitor, MonitoredPool, PoolMonitor};
+use ingestion::{
+    block_head_channel, spawn_block_head_monitor, spawn_pending_tx_monitor, MonitoredPool,
+    PoolMonitor,
+};
 use pool_store::{
-    load_pool_records, pool_data_path, univ2_configs_from_records, PoolRecord, ResolvedUniV2PoolCfg,
+    load_pool_records, pool_data_path, prioritize_cold_pool_inventory, univ2_configs_from_records,
+    PoolRecord, ResolvedUniV2PoolCfg,
 };
 use registry::{apply_pool_env_overrides, maybe_load_registry, parse_address, RegistryChain};
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use venues::populate_edges;
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, stream::FuturesUnordered, StreamExt};
 
 use crate::bridge::BridgePlanner;
 use crate::discovery::{LowLiquidityPool, LowLiquidityScanner};
@@ -393,9 +397,9 @@ fn derive_chain_time_budget_ms(
             simulation_ms.max(450),
         ),
         "base" | "arbitrum" | "optimism" => (
-            search_ms.min(250),
-            quoting_ms.min(150),
-            simulation_ms.min(200),
+            search_ms.min(600),
+            quoting_ms.min(175),
+            simulation_ms.min(250),
         ),
         _ => (search_ms, quoting_ms, simulation_ms),
     }
@@ -514,6 +518,16 @@ fn build_hub_tokens(ops_inputs: &crate::ops_inputs::OpsInputs) -> HashSet<Addres
     hubs
 }
 
+fn pool_liquidity_weight(pool: &PoolRecord, rank_index: usize, total: usize) -> u64 {
+    pool.hub_usd_liquidity
+        .map(|usd| ((usd.max(1.0)) as u64).saturating_mul(1_000))
+        .unwrap_or_else(|| {
+            total
+                .saturating_sub(rank_index)
+                .max(1) as u64
+        })
+}
+
 fn build_dynamic_token_whitelist(
     hot_univ2: &[ResolvedUniV2PoolCfg],
     hot_univ3: &[PoolRecord],
@@ -547,9 +561,9 @@ fn build_dynamic_token_whitelist(
             .and_modify(|score| *score = score.saturating_add(weight))
             .or_insert(weight);
     }
-    let univ3_total = hot_univ3.len() as u64;
+    let univ3_total = hot_univ3.len();
     for (idx, pool) in hot_univ3.iter().enumerate() {
-        let weight = univ3_total.saturating_sub(idx as u64).max(1);
+        let weight = pool_liquidity_weight(pool, idx, univ3_total);
         token_scores
             .entry(pool.token0)
             .and_modify(|score| *score = score.saturating_add(weight))
@@ -591,6 +605,13 @@ fn sanitize_token_whitelist_cap(configured_cap: usize) -> usize {
 
 fn sanitize_dynamic_top_tokens_30d(configured: usize) -> usize {
     configured.max(60)
+}
+
+fn scan_idle_sleep_ms() -> u64 {
+    std::env::var("ARBOT_SCAN_IDLE_SLEEP_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(50)
 }
 
 fn is_usd_stable_symbol(symbol: &str) -> bool {
@@ -1223,6 +1244,133 @@ impl PrivateRelayProvider {
     }
 }
 
+fn parallel_private_relay_blast_enabled() -> bool {
+    std::env::var("ARBOT_RELAY_PARALLEL_BLAST")
+        .map(|raw| !matches!(raw.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+        .unwrap_or(true)
+}
+
+/// Blast the same signed bundle to every healthy relay against one target block,
+/// then race inclusion polls. Avoids serial inclusion timeouts on relay #1 while
+/// relay #2+ would still be viable on the same block.
+async fn parallel_private_relay_blast<M>(
+    client: Arc<M>,
+    raw: Bytes,
+    target_bundle_block: U64,
+    relay_candidates: Vec<(usize, RelayEndpoint)>,
+    inclusion_timeout: Duration,
+    relay_health: Arc<StdMutex<HealthTracker>>,
+    chaos: ChaosConfig,
+) -> Result<(TxHash, TransactionReceipt, usize, PrivateSubmissionMethod), Vec<String>>
+where
+    M: Middleware + Send + Sync + 'static,
+{
+    let mut send_jobs = FuturesUnordered::new();
+    for (index, relay) in relay_candidates {
+        let chaos = chaos.clone();
+        if chaos.should_reject_relay() {
+            continue;
+        }
+        let raw = raw.clone();
+        let target = target_bundle_block;
+        let chain_name = relay.chain_name.clone();
+        let allow_fallback = relay.allow_private_raw_fallback;
+        let provider = relay.provider.clone();
+        let label = relay.label().to_string();
+        send_jobs.push(async move {
+            let started = Instant::now();
+            match provider
+                .send_bundle_transaction(raw, target, &chain_name, allow_fallback)
+                .await
+            {
+                Ok((tx_hash, method)) => Ok((index, label, tx_hash, method, started)),
+                Err(err) => Err((label, err.to_string(), started)),
+            }
+        });
+    }
+
+    let mut accepted: Vec<(usize, String, TxHash, PrivateSubmissionMethod, Instant)> =
+        Vec::new();
+    let mut relay_errors: Vec<String> = Vec::new();
+    while let Some(result) = send_jobs.next().await {
+        match result {
+            Ok(entry) => accepted.push(entry),
+            Err((label, err, started)) => {
+                lock_unpoison(relay_health.as_ref()).record_failure(
+                    &label,
+                    true,
+                    Some(started.elapsed()),
+                );
+                relay_errors.push(format!("{label}: {err}"));
+            }
+        }
+    }
+
+    if accepted.is_empty() {
+        return Err(relay_errors);
+    }
+
+    info!(
+        target: "broadcast",
+        relay_count = accepted.len(),
+        target_block = %target_bundle_block,
+        "Parallel private relay blast accepted submissions"
+    );
+
+    let mut inclusion_race = FuturesUnordered::new();
+    for (index, label, tx_hash, method, send_started) in accepted {
+        let client = client.clone();
+        let relay_health = Arc::clone(&relay_health);
+        inclusion_race.push(async move {
+            let poll = async {
+                loop {
+                    match client.get_transaction_receipt(tx_hash).await {
+                        Ok(Some(receipt)) => break Ok(receipt),
+                        Ok(None) => {
+                            sleep(Duration::from_millis(200)).await;
+                        }
+                        Err(err) => break Err(err),
+                    }
+                }
+            };
+            match timeout(inclusion_timeout, poll).await {
+                Ok(Ok(receipt)) => {
+                    lock_unpoison(relay_health.as_ref()).record_success(
+                        &label,
+                        Some(send_started.elapsed()),
+                    );
+                    Ok((tx_hash, receipt, index, method))
+                }
+                Ok(Err(err)) => {
+                    lock_unpoison(relay_health.as_ref()).record_failure(
+                        &label,
+                        true,
+                        Some(send_started.elapsed()),
+                    );
+                    Err(format!("{label}: {err}"))
+                }
+                Err(_) => {
+                    lock_unpoison(relay_health.as_ref()).record_failure(
+                        &label,
+                        true,
+                        Some(send_started.elapsed()),
+                    );
+                    Err(format!("{label}: timeout"))
+                }
+            }
+        });
+    }
+
+    while let Some(result) = inclusion_race.next().await {
+        match result {
+            Ok(success) => return Ok(success),
+            Err(err) => relay_errors.push(err),
+        }
+    }
+
+    Err(relay_errors)
+}
+
 /// Runtime kill-switch for the private raw-transaction fallback. Lets ops
 /// force bundle-only submission without editing ops/inputs.yaml.
 fn private_raw_fallback_disabled() -> bool {
@@ -1404,6 +1552,12 @@ struct BroadcastConfig {
     public_jitter_bps: u32,
     private_inclusion_timeout: Duration,
     relay_health: Arc<StdMutex<HealthTracker>>,
+    /// Fraction (bps) of a candidate's expected NET profit that may be bid as
+    /// priority fee / builder tip to win inclusion. 0 disables profit-aware
+    /// bidding (static role fee only). Builders order by effective priority fee,
+    /// so a flat 1-2 gwei tip loses every contested opportunity; bidding a share
+    /// of profit is how searchers actually win blockspace while keeping margin.
+    bid_profit_fraction_bps: u32,
 }
 
 impl BroadcastConfig {
@@ -1412,6 +1566,48 @@ impl BroadcastConfig {
             MevRole::Searcher => self.searcher_priority_fee,
             MevRole::Filler => self.filler_priority_fee,
         }
+    }
+
+    /// Compute the priority fee (per gas) to bid for an opportunity.
+    ///
+    /// `net_profit_native` is the expected net profit in native wei AFTER the
+    /// baseline gas cost already counted by the profit gate. We may spend up to
+    /// `bid_profit_fraction_bps` of it as ADDITIONAL tip on top of the static
+    /// floor, so the trade always retains at least `(1 - fraction)` of profit.
+    /// `max_fee_per_gas_cap` (risk policy) and `base_fee` bound the result so
+    /// `base_fee + priority` never exceeds the declared per-gas ceiling.
+    fn competitive_priority_fee(
+        &self,
+        net_profit_native: Option<U256>,
+        gas_units: u64,
+        base_fee: Option<U256>,
+        max_fee_per_gas_cap: Option<U256>,
+    ) -> Option<U256> {
+        let floor = self.priority_fee();
+        let extra = match (net_profit_native, self.bid_profit_fraction_bps) {
+            (Some(profit), fraction) if fraction > 0 && gas_units > 0 && !profit.is_zero() => {
+                let budget = mul_div(profit, U256::from(fraction), U256::from(10_000u64));
+                budget / U256::from(gas_units)
+            }
+            _ => U256::zero(),
+        };
+
+        let mut priority = match floor {
+            Some(floor) => floor.saturating_add(extra),
+            None if extra.is_zero() => return None,
+            None => extra,
+        };
+
+        // The risk-policy fee ceiling is a hard safety limit and wins even over
+        // the static floor: base_fee + priority must never breach the cap.
+        if let Some(cap) = max_fee_per_gas_cap {
+            let headroom = cap.saturating_sub(base_fee.unwrap_or_default());
+            if priority > headroom {
+                priority = headroom;
+            }
+        }
+
+        Some(priority)
     }
 }
 
@@ -2783,6 +2979,7 @@ where
     fee_estimator: FeeEstimator<C>,
     risk_policy: Option<RuntimeRiskPolicy>,
     sim_quorum: Arc<SimQuorum>,
+    block_head_rx: Option<Arc<Mutex<watch::Receiver<U64>>>>,
 }
 
 struct Runner<M, C>
@@ -2877,6 +3074,7 @@ where
     risk_policy: Option<RuntimeRiskPolicy>,
     sim_quorum: Arc<SimQuorum>,
     last_scanned_block: Arc<Mutex<Option<U64>>>,
+    block_head_rx: Option<Arc<Mutex<watch::Receiver<U64>>>>,
 }
 
 impl<M, C> Runner<M, C>
@@ -2968,6 +3166,7 @@ where
             fee_estimator,
             risk_policy,
             sim_quorum,
+            block_head_rx,
         } = config;
         let bal_flashloan_tokens = bal_flashloan_tokens.map(Arc::new);
         let aave_flashloan_tokens = aave_flashloan_tokens.map(Arc::new);
@@ -3075,6 +3274,20 @@ where
             risk_policy,
             sim_quorum,
             last_scanned_block: Arc::new(Mutex::new(None)),
+            block_head_rx,
+        }
+    }
+
+    async fn wait_for_scan_cadence(&self) {
+        let idle = Duration::from_millis(scan_idle_sleep_ms());
+        if let Some(rx) = &self.block_head_rx {
+            let mut guard = rx.lock().await;
+            if guard.has_changed().unwrap_or(false) {
+                return;
+            }
+            let _ = timeout(idle.max(Duration::from_millis(25)), guard.changed()).await;
+        } else {
+            sleep(idle).await;
         }
     }
 
@@ -4433,7 +4646,6 @@ where
         }
 
         let mut graph = Graph::default();
-        let search_start = Instant::now();
         let expected_univ3_edges =
             expected_univ3_edge_upper_bound(self.hot_univ3_pools.read().await.len());
 
@@ -4514,7 +4726,20 @@ where
                     expected_univ3_edges,
                 });
             }
-            sleep(block_poll_interval).await;
+            if let Some(rx) = &self.block_head_rx {
+                let remaining = new_block_wait.saturating_sub(block_wait_start.elapsed());
+                let head_wait = {
+                    let mut guard = rx.lock().await;
+                    timeout(remaining, guard.changed()).await
+                };
+                match head_wait {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(_)) => sleep(block_poll_interval).await,
+                    Err(_) => sleep(block_poll_interval).await,
+                }
+            } else {
+                sleep(block_poll_interval).await;
+            }
         };
         {
             let mut guard = self.last_scanned_block.lock().await;
@@ -4815,6 +5040,7 @@ where
                 .filter_map(|cycle| map_cycle_addresses_to_indices(&graph, cycle))
                 .collect()
         };
+        let search_start = Instant::now();
         let raw_cycles: Vec<Vec<usize>> = if significant_change {
             // Bellman-Ford fans out across rayon worker threads. Running it
             // inline on a tokio worker stalls the async runtime (timers, RPC
@@ -6060,6 +6286,11 @@ where
                 }
             }
             let broadcast_start = Instant::now();
+            // Denominate the candidate's net profit in native wei so the
+            // dispatcher can bid a share of it as priority fee. Fail closed to
+            // the static fee when pricing is unreliable (never bid on a guess).
+            let bid_net_profit_native =
+                candidate.native_price.native_for_tokens_strict(candidate.net_profit);
             let dispatch = match self
                 .dispatch_call(
                     call,
@@ -6067,6 +6298,7 @@ where
                     &candidate.fee_estimate,
                     Some(shadow_meta),
                     true,
+                    bid_net_profit_native,
                 )
                 .await
             {
@@ -6308,6 +6540,7 @@ where
         gas: &FeeEstimate,
         shadow_meta: Option<ShadowPlanMeta>,
         simulation_verified: bool,
+        bid_net_profit_native: Option<U256>,
     ) -> Result<DispatchResult> {
         // Risk policy: must_simulate_before_send is enforced at the dispatch
         // boundary, not assumed. Any future call path that skips simulation
@@ -6410,15 +6643,28 @@ where
 
                 let start = Instant::now();
                 let private_relay_rejected = false;
-                if let Some(priority_fee) = self.broadcast.priority_fee() {
-                    let base_fee =
-                        client
-                            .get_block(BlockNumber::Latest)
-                            .await
-                            .ok()
-                            .and_then(|maybe_block| {
-                                maybe_block.and_then(|block| block.base_fee_per_gas)
-                            });
+                let base_fee =
+                    client
+                        .get_block(BlockNumber::Latest)
+                        .await
+                        .ok()
+                        .and_then(|maybe_block| {
+                            maybe_block.and_then(|block| block.base_fee_per_gas)
+                        });
+                // Profit-aware bid: lift the priority fee toward a share of the
+                // opportunity's net profit so we actually win builder ordering,
+                // bounded by the risk policy fee ceiling and the static floor.
+                let risk_fee_cap = self
+                    .risk_policy
+                    .as_ref()
+                    .and_then(|policy| policy.max_fee_per_gas_cap);
+                let effective_priority_fee = self.broadcast.competitive_priority_fee(
+                    bid_net_profit_native,
+                    gas_limit.min(U256::from(u64::MAX)).as_u64(),
+                    base_fee,
+                    risk_fee_cap,
+                );
+                if let Some(priority_fee) = effective_priority_fee {
                     match &mut tx {
                         TypedTransaction::Eip1559(inner) => {
                             let current_max_fee = inner.max_fee_per_gas.unwrap_or_default();
@@ -6428,6 +6674,11 @@ where
                                 base_fee.map(|base| base + priority_fee).unwrap_or_else(|| {
                                     priority_fee.saturating_mul(U256::from(2u64))
                                 })
+                            };
+                            // Keep max_fee within the risk ceiling if one is set.
+                            let suggested_max_fee = match risk_fee_cap {
+                                Some(cap) if suggested_max_fee > cap => cap,
+                                _ => suggested_max_fee,
                             };
                             inner.max_priority_fee_per_gas = Some(priority_fee);
                             inner.max_fee_per_gas = Some(suggested_max_fee);
@@ -6476,7 +6727,7 @@ where
                         }
                         let score = tracker.health_score(label);
                         scores.insert(label.to_string(), score);
-                        candidates.push((index, relay));
+                        candidates.push((index, relay.clone()));
                     }
                     (candidates, scores)
                 };
@@ -6512,105 +6763,142 @@ where
                     }
                 };
 
-                for (index, relay) in relay_candidates {
-                    if self.chaos.should_reject_relay() {
-                        relay_errors.push("chaos: relay rejected tx".to_string());
-                        continue;
+                if parallel_private_relay_blast_enabled() {
+                    match parallel_private_relay_blast(
+                        Arc::clone(&client),
+                        raw.clone(),
+                        target_bundle_block,
+                        relay_candidates,
+                        self.broadcast.private_inclusion_timeout,
+                        Arc::clone(&self.broadcast.relay_health),
+                        self.chaos.clone(),
+                    )
+                    .await
+                    {
+                        Ok((tx_hash, receipt, relay_index, method)) => {
+                            if let Some((manager, nonce)) = &nonce_record {
+                                manager.mark_confirmed(*nonce).await;
+                            }
+                            info!(
+                                target: "broadcast",
+                                relay_index,
+                                latency_ms = start.elapsed().as_millis(),
+                                method = method.as_str(),
+                                "Private relay inclusion confirmed (parallel blast)",
+                            );
+                            return Ok(DispatchResult {
+                                tx_hash,
+                                receipt: Some(receipt),
+                                latency: start.elapsed(),
+                                private_relay_rejected,
+                                private_submission_method: Some(method),
+                            });
+                        }
+                        Err(errors) => {
+                            relay_errors = errors;
+                        }
                     }
-                    let attempt_start = Instant::now();
-                    let send_result = relay
-                        .provider
-                        .send_bundle_transaction(
-                            raw.clone(),
-                            target_bundle_block,
-                            &relay.chain_name,
-                            relay.allow_private_raw_fallback,
-                        )
-                        .await;
-                    match send_result {
-                        Ok((tx_hash, method)) => {
-                            let receipt_poll = async {
-                                loop {
-                                    match client.get_transaction_receipt(tx_hash).await {
-                                        Ok(Some(receipt)) => break Ok(receipt),
-                                        Ok(None) => {
-                                            sleep(Duration::from_millis(200)).await;
-                                            continue;
-                                        }
-                                        Err(err) => break Err(err),
-                                    }
-                                }
-                            };
-
-                            match tokio::time::timeout(
-                                self.broadcast.private_inclusion_timeout,
-                                receipt_poll,
+                } else {
+                    for (index, relay) in relay_candidates {
+                        if self.chaos.should_reject_relay() {
+                            relay_errors.push("chaos: relay rejected tx".to_string());
+                            continue;
+                        }
+                        let attempt_start = Instant::now();
+                        let send_result = relay
+                            .provider
+                            .send_bundle_transaction(
+                                raw.clone(),
+                                target_bundle_block,
+                                &relay.chain_name,
+                                relay.allow_private_raw_fallback,
                             )
-                            .await
-                            {
-                                Ok(Ok(receipt)) => {
-                                    lock_unpoison(self.broadcast.relay_health.as_ref())
-                                        .record_success(
-                                            relay.label(),
-                                            Some(attempt_start.elapsed()),
-                                        );
-                                    if let Some((manager, nonce)) = &nonce_record {
-                                        manager.mark_confirmed(*nonce).await;
+                            .await;
+                        match send_result {
+                            Ok((tx_hash, method)) => {
+                                let receipt_poll = async {
+                                    loop {
+                                        match client.get_transaction_receipt(tx_hash).await {
+                                            Ok(Some(receipt)) => break Ok(receipt),
+                                            Ok(None) => {
+                                                sleep(Duration::from_millis(200)).await;
+                                                continue;
+                                            }
+                                            Err(err) => break Err(err),
+                                        }
                                     }
-                                    receipt_result = Some((tx_hash, receipt, index, method));
-                                    break;
-                                }
-                                Ok(Err(err)) => {
-                                    warn!(
-                                        target: "broadcast",
-                                        relay_index = index,
-                                        relay = %relay.label(),
-                                        error = %err,
-                                        "Private relay receipt poll failed",
-                                    );
-                                    lock_unpoison(self.broadcast.relay_health.as_ref())
-                                        .record_failure(
-                                            relay.label(),
-                                            true,
-                                            Some(attempt_start.elapsed()),
+                                };
+
+                                match tokio::time::timeout(
+                                    self.broadcast.private_inclusion_timeout,
+                                    receipt_poll,
+                                )
+                                .await
+                                {
+                                    Ok(Ok(receipt)) => {
+                                        lock_unpoison(self.broadcast.relay_health.as_ref())
+                                            .record_success(
+                                                relay.label(),
+                                                Some(attempt_start.elapsed()),
+                                            );
+                                        if let Some((manager, nonce)) = &nonce_record {
+                                            manager.mark_confirmed(*nonce).await;
+                                        }
+                                        receipt_result = Some((tx_hash, receipt, index, method));
+                                        break;
+                                    }
+                                    Ok(Err(err)) => {
+                                        warn!(
+                                            target: "broadcast",
+                                            relay_index = index,
+                                            relay = %relay.label(),
+                                            error = %err,
+                                            "Private relay receipt poll failed",
                                         );
-                                    relay_errors.push(err.to_string());
-                                }
-                                Err(_) => {
-                                    warn!(
-                                        target: "broadcast",
-                                        relay_index = index,
-                                        relay = %relay.label(),
-                                        timeout_ms = self
-                                            .broadcast
-                                            .private_inclusion_timeout
-                                            .as_millis(),
-                                        "Private relay inclusion timeout",
-                                    );
-                                    lock_unpoison(self.broadcast.relay_health.as_ref())
-                                        .record_failure(
-                                            relay.label(),
-                                            true,
-                                            Some(attempt_start.elapsed()),
+                                        lock_unpoison(self.broadcast.relay_health.as_ref())
+                                            .record_failure(
+                                                relay.label(),
+                                                true,
+                                                Some(attempt_start.elapsed()),
+                                            );
+                                        relay_errors.push(err.to_string());
+                                    }
+                                    Err(_) => {
+                                        warn!(
+                                            target: "broadcast",
+                                            relay_index = index,
+                                            relay = %relay.label(),
+                                            timeout_ms = self
+                                                .broadcast
+                                                .private_inclusion_timeout
+                                                .as_millis(),
+                                            "Private relay inclusion timeout",
                                         );
-                                    relay_errors.push("timeout".to_string());
+                                        lock_unpoison(self.broadcast.relay_health.as_ref())
+                                            .record_failure(
+                                                relay.label(),
+                                                true,
+                                                Some(attempt_start.elapsed()),
+                                            );
+                                        relay_errors.push("timeout".to_string());
+                                    }
                                 }
                             }
-                        }
-                        Err(err) => {
-                            warn!(
-                                target: "broadcast",
-                                relay_index = index,
-                                relay = %relay.label(),
-                                error = %err,
-                                "Private relay broadcast attempt failed",
-                            );
-                            lock_unpoison(self.broadcast.relay_health.as_ref()).record_failure(
-                                relay.label(),
-                                true,
-                                Some(attempt_start.elapsed()),
-                            );
-                            relay_errors.push(err.to_string());
+                            Err(err) => {
+                                warn!(
+                                    target: "broadcast",
+                                    relay_index = index,
+                                    relay = %relay.label(),
+                                    error = %err,
+                                    "Private relay broadcast attempt failed",
+                                );
+                                lock_unpoison(self.broadcast.relay_health.as_ref()).record_failure(
+                                    relay.label(),
+                                    true,
+                                    Some(attempt_start.elapsed()),
+                                );
+                                relay_errors.push(err.to_string());
+                            }
                         }
                     }
                 }
@@ -7047,7 +7335,7 @@ where
                                 last_execution.clone(),
                             ))
                             .ok();
-                        sleep(Duration::from_millis(500)).await;
+                        self.wait_for_scan_cadence().await;
                     }
                     Ok(ScanOutcome::NoOpportunity {
                         edges,
@@ -7062,7 +7350,7 @@ where
                                 last_execution.clone(),
                             ))
                             .ok();
-                        sleep(Duration::from_millis(500)).await;
+                        self.wait_for_scan_cadence().await;
                     }
                     Ok(ScanOutcome::Failed {
                         reason,
@@ -7117,7 +7405,7 @@ where
                                 last_execution.clone(),
                             ))
                             .ok();
-                        sleep(Duration::from_millis(500)).await;
+                        self.wait_for_scan_cadence().await;
                     }
                     Err(err) => {
                         if is_rpc_error(&err) {
@@ -7583,6 +7871,7 @@ mod runner_tests {
                     public_jitter_bps: 0,
                     private_inclusion_timeout: Duration::from_millis(4500),
                     relay_health,
+                    bid_profit_fraction_bps: 0,
                 },
                 shadow: ShadowConfig::disabled(),
                 chaos: ChaosConfig {
@@ -7608,6 +7897,7 @@ mod runner_tests {
                 ),
                 risk_policy: None,
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
+                block_head_rx: None,
             },
             executor,
         );
@@ -7857,6 +8147,7 @@ mod runner_tests {
                     public_jitter_bps: 0,
                     private_inclusion_timeout: Duration::from_millis(4500),
                     relay_health: relay_health.clone(),
+                    bid_profit_fraction_bps: 0,
                 },
                 shadow: ShadowConfig::disabled(),
                 chaos: ChaosConfig {
@@ -7882,6 +8173,7 @@ mod runner_tests {
                 ),
                 risk_policy: None,
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
+                block_head_rx: None,
             },
             executor,
         );
@@ -8025,6 +8317,7 @@ mod runner_tests {
                         0.5,
                         HealthThresholds::default(),
                     ))),
+                    bid_profit_fraction_bps: 0,
                 },
                 shadow: ShadowConfig::disabled(),
                 chaos: ChaosConfig {
@@ -8050,6 +8343,7 @@ mod runner_tests {
                 ),
                 risk_policy: None,
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
+                block_head_rx: None,
             },
             executor,
         );
@@ -9039,10 +9333,16 @@ async fn launch_chain_runtime(
         .unwrap_or_else(|_| "0.45".into())
         .parse()
         .unwrap_or(0.45);
+    // Two-pool arbs (a single token pair priced differently across two venues,
+    // e.g. WETH/USDC on Uniswap vs Aerodrome) are 2-hop cycles and are the most
+    // frequent, highest-turnover opportunity on every chain. The token graph
+    // resolves the best edge per direction, so same-pool round-trips self-reject
+    // (weight >= 0) and only genuine cross-venue spreads survive. A min_hops of
+    // 3 silently excluded this entire opportunity class; 2 is the correct floor.
     let min_hops: usize = std::env::var("MIN_HOPS")
         .ok()
         .and_then(|raw| raw.parse().ok())
-        .unwrap_or(3);
+        .unwrap_or(2);
     let cycle_limits = BellmanFordLimits {
         min_hops: min_hops.min(max_hops.max(1)),
         max_hops,
@@ -9060,7 +9360,11 @@ async fn launch_chain_runtime(
         .unwrap_or(auto_max_edges_hot)
         .max(1);
     let topk_per_token = universe_cfg.topk_per_token.unwrap_or(3).max(1);
-    let raw_dynamic_top_tokens_30d = universe_cfg.dynamic_top_tokens_30d.unwrap_or(60);
+    let raw_dynamic_top_tokens_30d = std::env::var("DYNAMIC_TOP_TOKENS_30D")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .or(universe_cfg.dynamic_top_tokens_30d)
+        .unwrap_or(200);
     let dynamic_top_tokens_30d = sanitize_dynamic_top_tokens_30d(raw_dynamic_top_tokens_30d);
     if raw_dynamic_top_tokens_30d < 60 {
         warn!(
@@ -9280,6 +9584,16 @@ async fn launch_chain_runtime(
         .or_else(|| resolve_public_jitter_bps(&cfg.env_prefix))
         .unwrap_or(75);
 
+    // Profit-aware bidding: share of expected net profit biddable as priority
+    // tip. Default 50% — aggressive enough to win contested inclusion while
+    // guaranteeing the trade keeps at least half its edge. Clamped to <=90% so
+    // a bid can never erase the entire margin. Set 0 to disable.
+    let bid_profit_fraction_bps = std::env::var("ARBOT_BID_PROFIT_FRACTION_BPS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .unwrap_or(5_000)
+        .min(9_000);
+
     let broadcast = BroadcastConfig {
         endpoint: broadcast_endpoint,
         role: mev_role,
@@ -9292,6 +9606,7 @@ async fn launch_chain_runtime(
             .map(Duration::from_millis)
             .unwrap_or_else(|| Duration::from_millis(4500)),
         relay_health: relay_health.clone(),
+        bid_profit_fraction_bps,
     };
 
     let shadow_enabled = std::env::var("SHADOW_MODE")
@@ -9550,6 +9865,16 @@ async fn launch_chain_runtime(
         };
         match kind {
             crate::ops_inputs::VenueKind::Univ2Like => {
+                if cfg.name.eq_ignore_ascii_case("base") {
+                    info!(
+                        chain = %cfg.name,
+                        venue = %venue.name,
+                        kind = "univ2_like",
+                        "skipping univ2 cold inventory on Base; Aerodrome + UniV3 carry liquidity"
+                    );
+                    cold_univ2_by_venue.insert(venue.name.clone(), Vec::new());
+                    continue;
+                }
                 let path = pool_data_path(&cfg.name, &venue.name);
                 info!(
                     chain = %cfg.name,
@@ -9570,7 +9895,7 @@ async fn launch_chain_runtime(
                     require_pool_inventory(&cfg.name, &venue.name, &path, &cold)?;
                 }
                 if cold.len() > hot_pool_config.max_cold_pools {
-                    cold.truncate(hot_pool_config.max_cold_pools);
+                    prioritize_cold_pool_inventory(&mut cold, hot_pool_config.max_cold_pools);
                 }
                 info!(
                     chain = %cfg.name,
@@ -9580,18 +9905,6 @@ async fn launch_chain_runtime(
                     max_cold_pools = hot_pool_config.max_cold_pools,
                     "loaded cold pool inventory"
                 );
-                let hot = rank_univ2_pools(
-                    provider.clone(),
-                    cold.as_slice(),
-                    &token_decimals_hint,
-                    &hot_pool_config,
-                )
-                .await
-                .unwrap_or_default();
-                log_hot_pool_refresh(&cfg.name, &venue.name, "univ2_like", hot.len());
-                let configs = univ2_configs_from_records(&hot);
-                combined_univ2.extend(configs.clone());
-                hot_univ2_by_venue.insert(venue.name.clone(), configs);
                 cold_univ2_by_venue.insert(venue.name.clone(), cold);
             }
             crate::ops_inputs::VenueKind::Univ3Like => {
@@ -9617,7 +9930,7 @@ async fn launch_chain_runtime(
                 }
 
                 if cold.len() > hot_pool_config.max_cold_pools {
-                    cold.truncate(hot_pool_config.max_cold_pools);
+                    prioritize_cold_pool_inventory(&mut cold, hot_pool_config.max_cold_pools);
                 }
                 info!(
                     chain = %cfg.name,
@@ -9627,30 +9940,80 @@ async fn launch_chain_runtime(
                     max_cold_pools = hot_pool_config.max_cold_pools,
                     "loaded cold pool inventory"
                 );
-
-                let hot =
-                    match rank_univ3_pools(provider.clone(), cold.as_slice(), &hot_pool_config)
-                        .await
-                    {
-                        Ok(hot) => hot,
-                        Err(err) => {
-                            warn!(
-                                error = %err,
-                                chain = %cfg.name,
-                                venue = %venue.name,
-                                "failed to rank initial univ3 hot pools; continuing with empty set"
-                            );
-                            Vec::new()
-                        }
-                    };
-
-                log_hot_pool_refresh(&cfg.name, &venue.name, "univ3_like", hot.len());
-                combined_univ3.extend(hot.clone());
-                hot_univ3_by_venue.insert(venue.name.clone(), hot);
                 cold_univ3_by_venue.insert(venue.name.clone(), cold);
             }
             _ => {}
         }
+    }
+
+    let v2_rank_inputs: Vec<(String, Vec<PoolRecord>)> = cold_univ2_by_venue
+        .iter()
+        .map(|(name, cold)| (name.clone(), cold.clone()))
+        .collect();
+    let v3_rank_inputs: Vec<(String, Vec<PoolRecord>)> = cold_univ3_by_venue
+        .iter()
+        .map(|(name, cold)| (name.clone(), cold.clone()))
+        .collect();
+    let chain_for_rank = cfg.name.clone();
+    let chain_for_rank_v3 = chain_for_rank.clone();
+    let provider_v2 = provider.clone();
+    let provider_v3 = provider.clone();
+    let hot_config_v2 = hot_pool_config.clone();
+    let hot_config_v3 = hot_pool_config.clone();
+    let decimals_for_rank = token_decimals_hint.clone();
+
+    let (v2_ranked, v3_ranked) = tokio::join!(
+        async move {
+            let mut ranked = Vec::new();
+            for (venue_name, cold) in v2_rank_inputs {
+                let hot = rank_univ2_pools(
+                    provider_v2.clone(),
+                    cold.as_slice(),
+                    &decimals_for_rank,
+                    &hot_config_v2,
+                )
+                .await
+                .unwrap_or_default();
+                log_hot_pool_refresh(&chain_for_rank, &venue_name, "univ2_like", hot.len());
+                ranked.push((venue_name, univ2_configs_from_records(&hot)));
+            }
+            ranked
+        },
+        async move {
+            let mut ranked = Vec::new();
+            for (venue_name, cold) in v3_rank_inputs {
+                let hot = match rank_univ3_pools(
+                    provider_v3.clone(),
+                    cold.as_slice(),
+                    &hot_config_v3,
+                )
+                .await
+                {
+                    Ok(hot) => hot,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            chain = %chain_for_rank_v3,
+                            venue = %venue_name,
+                            "failed to rank initial univ3 hot pools; continuing with empty set"
+                        );
+                        Vec::new()
+                    }
+                };
+                log_hot_pool_refresh(&chain_for_rank_v3, &venue_name, "univ3_like", hot.len());
+                ranked.push((venue_name, hot));
+            }
+            ranked
+        }
+    );
+
+    for (venue_name, configs) in v2_ranked {
+        combined_univ2.extend(configs.clone());
+        hot_univ2_by_venue.insert(venue_name, configs);
+    }
+    for (venue_name, hot) in v3_ranked {
+        combined_univ3.extend(hot.clone());
+        hot_univ3_by_venue.insert(venue_name, hot);
     }
 
     let hot_univ2_pools = Arc::new(tokio::sync::RwLock::new(combined_univ2));
@@ -9728,6 +10091,7 @@ async fn launch_chain_runtime(
                         "spawned hot pool refresh worker"
                     );
                     loop {
+                        sleep(hot_config.refresh_interval).await;
                         match rank_univ2_pools(
                             provider.clone(),
                             cold.as_slice(),
@@ -9760,7 +10124,6 @@ async fn launch_chain_runtime(
                                 warn!(error = %err, chain = %chain, venue = %venue, "failed to refresh univ2 hot pools");
                             }
                         }
-                        sleep(hot_config.refresh_interval).await;
                     }
                 }
             },
@@ -9796,6 +10159,7 @@ async fn launch_chain_runtime(
                         "spawned hot pool refresh worker"
                     );
                     loop {
+                        sleep(hot_config.refresh_interval).await;
                         match rank_univ3_pools(provider.clone(), cold.as_slice(), &hot_config)
                             .await
                         {
@@ -9816,28 +10180,59 @@ async fn launch_chain_runtime(
                                 warn!(error = %err, chain = %chain, venue = %venue, "failed to refresh univ3 hot pools");
                             }
                         }
-                        sleep(hot_config.refresh_interval).await;
                     }
                 }
             },
         );
     }
 
+    let (block_head_tx, block_head_rx) = block_head_channel();
+    let block_head_rx_for_runner = Some(Arc::new(Mutex::new(block_head_rx)));
+
     if ws_provider.is_some() || !ws_endpoints.is_empty() {
-        let provider = provider.clone();
-        let ws_provider = ws_provider.clone();
-        let ws_endpoints = ws_endpoints.clone();
+        let pending_provider = provider.clone();
+        let pending_ws = ws_provider.clone();
+        let pending_endpoints = ws_endpoints.clone();
         spawn_supervised(
             "pending_tx_monitor",
             cfg.name.clone(),
             metrics.clone(),
             move || {
+                let pending_provider = pending_provider.clone();
+                let pending_ws = pending_ws.clone();
+                let pending_endpoints = pending_endpoints.clone();
                 spawn_pending_tx_monitor(
-                    provider.clone(),
-                    ws_provider.clone(),
-                    ws_endpoints.clone(),
+                    pending_provider,
+                    pending_ws,
+                    pending_endpoints,
                     ws_backoff,
                     None,
+                )
+            },
+        );
+
+        let head_provider = provider.clone();
+        let head_ws = ws_provider.clone();
+        let head_endpoints = ws_endpoints.clone();
+        let chain_name = cfg.name.clone();
+        let head_tx = block_head_tx.clone();
+        spawn_supervised(
+            "block_head_monitor",
+            cfg.name.clone(),
+            metrics.clone(),
+            move || {
+                let head_provider = head_provider.clone();
+                let head_ws = head_ws.clone();
+                let head_endpoints = head_endpoints.clone();
+                let head_tx = head_tx.clone();
+                let chain_name = chain_name.clone();
+                spawn_block_head_monitor(
+                    head_provider,
+                    head_ws,
+                    head_endpoints,
+                    ws_backoff,
+                    head_tx,
+                    chain_name,
                 )
             },
         );
@@ -9978,6 +10373,7 @@ async fn launch_chain_runtime(
         fee_estimator,
         risk_policy,
         sim_quorum,
+        block_head_rx: block_head_rx_for_runner,
     };
 
     let runner = Runner::new(runner_config, executor);
@@ -10337,6 +10733,82 @@ mod tests {
         assert!(format!("{err}").contains("bundle rejected"));
     }
 
+    fn bid_broadcast(filler: Option<U256>, fraction_bps: u32) -> BroadcastConfig {
+        BroadcastConfig {
+            endpoint: BroadcastEndpoint::Public,
+            role: MevRole::Filler,
+            filler_priority_fee: filler,
+            searcher_priority_fee: None,
+            public_jitter_bps: 0,
+            private_inclusion_timeout: Duration::from_millis(1000),
+            relay_health: Arc::new(StdMutex::new(HealthTracker::new(
+                0.5,
+                HealthThresholds::default(),
+            ))),
+            bid_profit_fraction_bps: fraction_bps,
+        }
+    }
+
+    #[test]
+    fn competitive_priority_fee_bids_share_of_profit() {
+        // 1 ETH net profit, 1e6 gas, 50% => extra = 0.5e18 / 1e6 = 5e11 wei/gas,
+        // added on top of the 2 gwei static floor.
+        let bc = bid_broadcast(Some(U256::from(2_000_000_000u64)), 5_000);
+        let fee = bc
+            .competitive_priority_fee(
+                Some(U256::exp10(18)),
+                1_000_000,
+                Some(U256::from(1_000_000_000u64)),
+                None,
+            )
+            .expect("fee present");
+        let expected = U256::from(2_000_000_000u64)
+            + U256::exp10(18) / U256::from(2u64) / U256::from(1_000_000u64);
+        assert_eq!(fee, expected);
+    }
+
+    #[test]
+    fn competitive_priority_fee_hard_caps_at_risk_ceiling() {
+        // base 9 gwei, cap 10 gwei => priority headroom is 1 gwei. The risk cap
+        // wins even though the aggressive bid (and the floor) want more.
+        let bc = bid_broadcast(Some(U256::from(2_000_000_000u64)), 9_000);
+        let fee = bc
+            .competitive_priority_fee(
+                Some(U256::exp10(18)),
+                1_000_000,
+                Some(U256::from(9_000_000_000u64)),
+                Some(U256::from(10_000_000_000u64)),
+            )
+            .expect("fee present");
+        assert_eq!(fee, U256::from(1_000_000_000u64));
+    }
+
+    #[test]
+    fn competitive_priority_fee_falls_back_to_floor_without_reliable_profit() {
+        let bc = bid_broadcast(Some(U256::from(2_000_000_000u64)), 5_000);
+        let fee = bc
+            .competitive_priority_fee(None, 1_000_000, None, None)
+            .expect("fee present");
+        assert_eq!(fee, U256::from(2_000_000_000u64));
+    }
+
+    #[test]
+    fn competitive_priority_fee_disabled_returns_static_floor() {
+        let bc = bid_broadcast(Some(U256::from(2_000_000_000u64)), 0);
+        let fee = bc
+            .competitive_priority_fee(Some(U256::exp10(18)), 1_000_000, None, None)
+            .expect("fee present");
+        assert_eq!(fee, U256::from(2_000_000_000u64));
+    }
+
+    #[test]
+    fn competitive_priority_fee_none_without_floor_or_profit() {
+        let bc = bid_broadcast(None, 5_000);
+        assert!(bc
+            .competitive_priority_fee(None, 1_000_000, None, None)
+            .is_none());
+    }
+
     #[test]
     fn bundle_method_unsupported_classifies_errors() {
         let unsupported =
@@ -10606,6 +11078,16 @@ mod tests {
     }
 
     #[test]
+    fn derive_chain_time_budget_base_allows_600ms_search() {
+        let (search, quote, sim) = derive_chain_time_budget_ms("base", 600, 150, 200);
+        assert_eq!(search, 600);
+        assert_eq!(quote, 150);
+        assert_eq!(sim, 200);
+        let (search_capped, _, _) = derive_chain_time_budget_ms("base", 1200, 300, 500);
+        assert_eq!(search_capped, 600);
+    }
+
+    #[test]
     fn sanitize_token_whitelist_cap_enforces_minimum_pair_capacity() {
         assert_eq!(sanitize_token_whitelist_cap(0), 64);
         assert_eq!(sanitize_token_whitelist_cap(1), 64);
@@ -10743,6 +11225,7 @@ mod tests {
             token1: Address::from_low_u64_be(3),
             fee: 500,
             created_block: 1,
+            hub_usd_liquidity: None,
         }];
         require_pool_inventory("arbitrum", "uniswap_v3", path, &records)
             .expect("inventory should be accepted");
@@ -11170,6 +11653,7 @@ mod tests {
             token1: extra_d,
             fee: 500,
             created_block: 1,
+            hub_usd_liquidity: None,
         }];
 
         let mandatory = HashSet::new();
@@ -11196,6 +11680,7 @@ mod tests {
             token1: Address::from_low_u64_be(5),
             fee: 500,
             created_block: 1,
+            hub_usd_liquidity: None,
         }];
 
         let mandatory = HashSet::new();
