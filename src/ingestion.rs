@@ -473,19 +473,32 @@ where
     Ok(())
 }
 
-/// Pair used to wake the scan loop as soon as a new canonical head arrives.
-pub fn block_head_channel() -> (watch::Sender<U64>, watch::Receiver<U64>) {
-    watch::channel(U64::zero())
+/// Latest canonical head published to the scan loop. Carries the base fee so
+/// the scan can price gas for the block without a separate get_block round-trip
+/// at the front of the block race. `number == 0` is the uninitialized state
+/// (no head delivered yet); consumers must treat it as "fall back to RPC".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlockHead {
+    pub number: U64,
+    pub base_fee_per_gas: Option<U256>,
 }
 
-async fn poll_block_head<C>(provider: &Provider<C>, head_tx: &watch::Sender<U64>)
+/// Pair used to wake the scan loop as soon as a new canonical head arrives.
+pub fn block_head_channel() -> (watch::Sender<BlockHead>, watch::Receiver<BlockHead>) {
+    watch::channel(BlockHead::default())
+}
+
+async fn poll_block_head<C>(provider: &Provider<C>, head_tx: &watch::Sender<BlockHead>)
 where
     C: JsonRpcClient + 'static,
 {
     if let Ok(Some(block)) = provider.get_block(BlockNumber::Latest).await {
         if let Some(number) = block.number {
-            if head_tx.borrow().as_u64() != number.as_u64() {
-                let _ = head_tx.send(number);
+            if head_tx.borrow().number.as_u64() != number.as_u64() {
+                let _ = head_tx.send(BlockHead {
+                    number,
+                    base_fee_per_gas: block.base_fee_per_gas,
+                });
             }
         }
     }
@@ -498,7 +511,7 @@ pub async fn spawn_block_head_monitor<C>(
     initial_ws_provider: Option<Arc<Provider<Ws>>>,
     ws_endpoints: Vec<String>,
     ws_backoff: Duration,
-    head_tx: watch::Sender<U64>,
+    head_tx: watch::Sender<BlockHead>,
     chain_name: String,
 ) where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
@@ -549,7 +562,10 @@ pub async fn spawn_block_head_monitor<C>(
                 info!(chain = %chain_name, "newHeads block monitor connected");
                 while let Some(block) = stream.next().await {
                     if let Some(number) = block.number {
-                        let _ = head_tx.send(number);
+                        let _ = head_tx.send(BlockHead {
+                            number,
+                            base_fee_per_gas: block.base_fee_per_gas,
+                        });
                     }
                 }
                 warn!(

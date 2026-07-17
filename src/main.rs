@@ -90,7 +90,7 @@ use hot_pools::{
     rank_univ3_pools, HotPoolConfig, UniV3RankContext,
 };
 use ingestion::{
-    block_head_channel, spawn_block_head_monitor, MonitoredPool,
+    block_head_channel, spawn_block_head_monitor, BlockHead, MonitoredPool,
     PoolMonitor,
 };
 use mempool::{spawn_live_mempool_monitor, BackrunHint, BackrunMonitor};
@@ -2954,7 +2954,7 @@ where
     fee_estimator: FeeEstimator<C>,
     risk_policy: Option<RuntimeRiskPolicy>,
     sim_quorum: Arc<SimQuorum>,
-    block_head_rx: Option<Arc<Mutex<watch::Receiver<U64>>>>,
+    block_head_rx: Option<Arc<Mutex<watch::Receiver<BlockHead>>>>,
     bf_skip_on_stable_graph: bool,
 }
 
@@ -3063,7 +3063,7 @@ where
     risk_policy: Option<RuntimeRiskPolicy>,
     sim_quorum: Arc<SimQuorum>,
     last_scanned_block: Arc<Mutex<Option<U64>>>,
-    block_head_rx: Option<Arc<Mutex<watch::Receiver<U64>>>>,
+    block_head_rx: Option<Arc<Mutex<watch::Receiver<BlockHead>>>>,
     populate_cache: Arc<Mutex<PopulateCacheState>>,
 }
 
@@ -4808,6 +4808,44 @@ where
         }))
     }
 
+    /// Current canonical head as `(base_fee, number)`.
+    ///
+    /// Prefers the websocket-fed head from `block_head_rx`, which already
+    /// carries the block number and its base fee — this removes a synchronous
+    /// `get_block(Latest)` HTTP round-trip from the front of every scan (the
+    /// most latency-sensitive point in the block race). Falls back to a single
+    /// `get_block(Latest)` when no websocket head has been delivered yet (the
+    /// channel still holds the zero default, e.g. WS disabled or not yet
+    /// connected), failing closed on a missing/zero head exactly as the direct
+    /// fetch did.
+    async fn current_block_head(&self) -> Result<(Option<U256>, U64)> {
+        if let Some(rx) = &self.block_head_rx {
+            let head = *rx.lock().await.borrow();
+            if !head.number.is_zero() {
+                return Ok((head.base_fee_per_gas, head.number));
+            }
+        }
+        match self.provider.get_block(BlockNumber::Latest).await {
+            Ok(Some(block)) => {
+                let number = block.number.unwrap_or_default();
+                if number.is_zero() {
+                    return Err(anyhow!(
+                        "rpc returned latest block with no number; refusing to scan on stale state (fail-closed)"
+                    ));
+                }
+                Ok((block.base_fee_per_gas, number))
+            }
+            Ok(None) => Err(anyhow!(
+                "rpc returned no latest block; refusing to scan on stale state (fail-closed)"
+            )),
+            Err(err) => {
+                warn!(error = %err, "Failed to fetch latest block; failing closed");
+                Err(anyhow::Error::new(err)
+                    .context("fetch latest block (rpc); refusing to scan on stale state"))
+            }
+        }
+    }
+
     async fn scan_once_with<F>(&self, mut populate: F) -> Result<ScanOutcome>
     where
         F: for<'a> FnMut(
@@ -4880,27 +4918,10 @@ where
         );
         let block_wait_start = Instant::now();
         let (base_fee, block_number) = loop {
-            let fetched = match self.provider.get_block(BlockNumber::Latest).await {
-                Ok(Some(block)) => {
-                    let number = block.number.unwrap_or_default();
-                    if number.is_zero() {
-                        return Err(anyhow!(
-                            "rpc returned latest block with no number; refusing to scan on stale state (fail-closed)"
-                        ));
-                    }
-                    (block.base_fee_per_gas, number)
-                }
-                Ok(None) => {
-                    return Err(anyhow!(
-                        "rpc returned no latest block; refusing to scan on stale state (fail-closed)"
-                    ));
-                }
-                Err(err) => {
-                    warn!(error = %err, "Failed to fetch latest block; failing closed");
-                    return Err(anyhow::Error::new(err)
-                        .context("fetch latest block (rpc); refusing to scan on stale state"));
-                }
-            };
+            // Prefer the websocket-fed head (number + base fee) instead of a
+            // fresh get_block(Latest) on every loop turn; fail closed on a
+            // missing/zero head. See current_block_head.
+            let fetched = self.current_block_head().await?;
             if rescan_same_block {
                 break fetched;
             }
