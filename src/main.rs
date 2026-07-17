@@ -2954,6 +2954,7 @@ where
     fee_estimator: FeeEstimator<C>,
     risk_policy: Option<RuntimeRiskPolicy>,
     sim_quorum: Arc<SimQuorum>,
+    chain_id: u64,
     block_head_rx: Option<Arc<Mutex<watch::Receiver<BlockHead>>>>,
     bf_skip_on_stable_graph: bool,
 }
@@ -3062,6 +3063,7 @@ where
     candidate_logger: Arc<CandidateDecisionLogger>,
     risk_policy: Option<RuntimeRiskPolicy>,
     sim_quorum: Arc<SimQuorum>,
+    chain_id: u64,
     last_scanned_block: Arc<Mutex<Option<U64>>>,
     block_head_rx: Option<Arc<Mutex<watch::Receiver<BlockHead>>>>,
     populate_cache: Arc<Mutex<PopulateCacheState>>,
@@ -3178,6 +3180,7 @@ where
             fee_estimator,
             risk_policy,
             sim_quorum,
+            chain_id,
             block_head_rx,
             bf_skip_on_stable_graph,
         } = config;
@@ -3321,6 +3324,7 @@ where
             candidate_logger: Arc::new(CandidateDecisionLogger::from_env()),
             risk_policy,
             sim_quorum,
+            chain_id,
             last_scanned_block: Arc::new(Mutex::new(None)),
             block_head_rx,
             populate_cache: Arc::new(Mutex::new(PopulateCacheState::default())),
@@ -6282,7 +6286,11 @@ where
             );
             let (simulated_gas_used, simulated_profit, simulated_l1_fee) = match timeout(
                 self.simulation_budget,
-                self.simulate_plan_execution(&candidate.plan_args, &candidate.fee_estimate),
+                self.simulate_plan_execution(
+                    &candidate.plan_args,
+                    &candidate.fee_estimate,
+                    block_number,
+                ),
             )
             .await
             {
@@ -7532,6 +7540,7 @@ where
         &self,
         plan: &ExecutorPlan,
         gas: &FeeEstimate,
+        block_number: U64,
     ) -> Result<(U256, U256, U256)> {
         let mut call = self.executor.start_v2(plan.clone());
         if let Some(wallet) = &self.wallet {
@@ -7543,16 +7552,13 @@ where
         let executor_address = self.executor.address();
 
         if sim_revm_enabled() {
-            let block_number = client
-                .get_block_number()
-                .await
-                .context("revm fork block number")?
-                .as_u64();
-            let chain_id = client
-                .get_chainid()
-                .await
-                .context("revm fork chain id")?
-                .as_u64();
+            // Fork at the head this scan was built against (from the websocket
+            // block feed) rather than re-fetching it, and use the statically
+            // configured chain id instead of an RPC round-trip — both are known
+            // and constant for the scan, so querying them per candidate only
+            // added latency to the pre-broadcast path.
+            let block_number = block_number.as_u64();
+            let chain_id = self.chain_id;
             let timeout_ms = sim_revm_timeout_ms();
             let mut prefetch_extra = Vec::new();
             for loan in &plan.loans {
@@ -8425,6 +8431,7 @@ mod runner_tests {
                 ),
                 risk_policy: None,
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
+                chain_id: 8453,
                 block_head_rx: None,
                 bf_skip_on_stable_graph: false,
             },
@@ -8716,6 +8723,7 @@ mod runner_tests {
                 ),
                 risk_policy: None,
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
+                chain_id: 8453,
                 block_head_rx: None,
                 bf_skip_on_stable_graph: false,
             },
@@ -8745,7 +8753,7 @@ mod runner_tests {
         };
 
         let (gas_used, profit, _l1_fee) = runner
-            .simulate_plan_execution(&plan_args, &fee)
+            .simulate_plan_execution(&plan_args, &fee, U64::from(1u64))
             .await
             .expect("simulate plan execution");
 
@@ -8901,6 +8909,7 @@ mod runner_tests {
                 ),
                 risk_policy: None,
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
+                chain_id: 8453,
                 block_head_rx: None,
                 bf_skip_on_stable_graph: false,
             },
@@ -11562,6 +11571,7 @@ async fn launch_chain_runtime(
         fee_estimator,
         risk_policy,
         sim_quorum,
+        chain_id: cfg.chain_id,
         block_head_rx: block_head_rx_for_runner,
         bf_skip_on_stable_graph,
     };
