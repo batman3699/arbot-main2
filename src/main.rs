@@ -3694,40 +3694,67 @@ where
 
     async fn load_token_decimals(&self) -> HashMap<Address, u8> {
         let tokens = self.tokens.current();
-        let mut cache = self.token_decimals.lock().await;
 
-        for &token in tokens.iter() {
-            if cache.contains_key(&token) {
-                continue;
-            }
+        // 1) Snapshot the tokens still missing a cached decimals value under a
+        //    short lock, then release it. The lock must NOT be held across the
+        //    RPC fetches below: erc20_decimals with its 3-attempt backoff can
+        //    take seconds, and holding token_decimals across it serialized every
+        //    concurrent consumer of the cache (the whole scan pipeline stalled
+        //    behind one cold-token lookup).
+        let to_fetch: Vec<Address> = {
+            let cache = self.token_decimals.lock().await;
+            tokens
+                .iter()
+                .copied()
+                .filter(|token| !cache.contains_key(token))
+                .collect()
+        };
 
-            let mut last_err = None;
-            for attempt in 0..3 {
-                match erc20_decimals(self.provider.clone(), token).await {
-                    Ok(decimals) => {
-                        cache.insert(token, decimals);
-                        last_err = None;
-                        break;
-                    }
-                    Err(err) => {
-                        last_err = Some(err);
-                        if attempt < 2 {
-                            sleep(Duration::from_millis(200 << attempt)).await;
+        // 2) Fetch the missing decimals CONCURRENTLY (lock released), preserving
+        //    the per-token 3-attempt retry with exponential backoff. A token
+        //    whose fetch fails is left absent so callers fall back to 18, exactly
+        //    as before.
+        if !to_fetch.is_empty() {
+            let concurrency = native_price_concurrency();
+            let fetched: Vec<(Address, Option<u8>)> = stream::iter(to_fetch.into_iter().map(
+                |token| async move {
+                    let mut last_err = None;
+                    for attempt in 0..3 {
+                        match erc20_decimals(self.provider.clone(), token).await {
+                            Ok(decimals) => return (token, Some(decimals)),
+                            Err(err) => {
+                                last_err = Some(err);
+                                if attempt < 2 {
+                                    sleep(Duration::from_millis(200 << attempt)).await;
+                                }
+                            }
                         }
                     }
-                }
-            }
+                    if let Some(err) = last_err {
+                        warn!(
+                            error = %err,
+                            token = %format!("0x{}", hex::encode(token)),
+                            retries = 3,
+                            "Failed to fetch token decimals after retries; defaulting to 18 for now",
+                        );
+                    }
+                    (token, None)
+                },
+            ))
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
 
-            if let Some(err) = last_err {
-                warn!(
-                    error = %err,
-                    token = %format!("0x{}", hex::encode(token)),
-                    retries = 3,
-                    "Failed to fetch token decimals after retries; defaulting to 18 for now",
-                );
+            let mut cache = self.token_decimals.lock().await;
+            for (token, decimals) in fetched {
+                if let Some(decimals) = decimals {
+                    cache.insert(token, decimals);
+                }
             }
         }
 
+        // 3) Return the full decimals snapshot from the (now-updated) cache.
+        let cache = self.token_decimals.lock().await;
         cache.clone()
     }
 
