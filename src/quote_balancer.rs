@@ -55,14 +55,7 @@ abigen!(
 
 pub use i_balancer_vault::{BatchSwapStep, FundManagement};
 
-fn is_block_out_of_range_error(err: &impl std::fmt::Display) -> bool {
-    let message = err.to_string();
-    let lower = message.to_ascii_lowercase();
-    lower.contains("blockoutofrangeerror")
-        || lower.contains("block out of range")
-        || lower.contains("header not found")
-        || lower.contains("requested was")
-}
+use crate::quote_common::is_block_out_of_range_error;
 
 pub struct BalQuote<C>
 where

@@ -15,6 +15,7 @@ pub mod ops_inputs;
 pub mod plan;
 pub mod pool_store;
 pub mod quote_balancer;
+pub mod quote_common;
 pub mod quote_curve;
 pub mod quote_solidly;
 pub mod quote_univ2;

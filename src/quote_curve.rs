@@ -3,14 +3,7 @@ use ethers::{prelude::*, providers::JsonRpcClient};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
-fn is_block_out_of_range_error(err: &impl std::fmt::Display) -> bool {
-    let message = err.to_string();
-    let lower = message.to_ascii_lowercase();
-    lower.contains("blockoutofrangeerror")
-        || lower.contains("block out of range")
-        || lower.contains("header not found")
-        || lower.contains("requested was")
-}
+use crate::quote_common::is_block_out_of_range_error;
 
 fn should_cache_quote(block: U64, used_latest_fallback: bool) -> bool {
     block.is_zero() || !used_latest_fallback

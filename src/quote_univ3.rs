@@ -14,14 +14,7 @@ use ethers::abi::{ParamType, Token};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use std::str::FromStr;
 
-pub(crate) fn is_block_out_of_range_error(err: &impl std::fmt::Display) -> bool {
-    let message = err.to_string();
-    let lower = message.to_ascii_lowercase();
-    lower.contains("blockoutofrangeerror")
-        || lower.contains("block out of range")
-        || lower.contains("header not found")
-        || lower.contains("requested was")
-}
+pub(crate) use crate::quote_common::is_block_out_of_range_error;
 
 #[derive(Clone, Debug)]
 pub struct UniV3ValidationConfig {

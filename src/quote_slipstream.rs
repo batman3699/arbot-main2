@@ -1,4 +1,5 @@
-use crate::quote_univ3::{is_block_out_of_range_error, UniV3ValidationConfig};
+use crate::quote_common::is_block_out_of_range_error;
+use crate::quote_univ3::UniV3ValidationConfig;
 use crate::util::encode_univ3_path;
 use anyhow::{ensure, Result};
 use ethers::abi::{ParamType, Token};
