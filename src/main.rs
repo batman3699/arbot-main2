@@ -10052,10 +10052,7 @@ async fn launch_chain_runtime(
         .and_then(|raw| raw.parse::<u64>().ok())
         .map(U64::from)
         .unwrap_or_else(|| U64::from(2u64));
-    let jit_enabled = std::env::var("JIT_LP_ENABLED")
-        .unwrap_or_else(|_| "false".to_string())
-        .to_lowercase()
-        == "true";
+    let jit_enabled = read_feature_flag("JIT_LP_ENABLED", false);
     let jit_min_amount_in = std::env::var("JIT_MIN_AMOUNT_WEI")
         .ok()
         .and_then(|v| U256::from_dec_str(&v).ok())
@@ -11982,6 +11979,34 @@ mod tests {
         );
 
         assert_eq!(targets, vec!["arbitrum", "optimism", "base"]);
+    }
+
+    #[test]
+    fn jit_lp_enabled_flag_accepts_all_truthy_spellings() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let prior = env::var("JIT_LP_ENABLED").ok();
+
+        for truthy in ["1", "true", "yes", "TRUE", "Yes"] {
+            env::set_var("JIT_LP_ENABLED", truthy);
+            assert!(
+                read_feature_flag("JIT_LP_ENABLED", false),
+                "JIT_LP_ENABLED={truthy} must enable the feature",
+            );
+        }
+        for falsy in ["0", "false", "no", "off", ""] {
+            env::set_var("JIT_LP_ENABLED", falsy);
+            assert!(
+                !read_feature_flag("JIT_LP_ENABLED", false),
+                "JIT_LP_ENABLED={falsy} must not enable the feature",
+            );
+        }
+        env::remove_var("JIT_LP_ENABLED");
+        assert!(!read_feature_flag("JIT_LP_ENABLED", false));
+
+        match prior {
+            Some(value) => env::set_var("JIT_LP_ENABLED", value),
+            None => env::remove_var("JIT_LP_ENABLED"),
+        }
     }
 
     #[test]
