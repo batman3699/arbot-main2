@@ -3,10 +3,9 @@ chains:
   chain_id: 1
   env_prefix: ETH
   rpc_http_urls:
-  - https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}
-  - https://rpc.ankr.com/eth
+  - http://127.0.0.1:8565
   rpc_ws_urls:
-  - wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}
+  - ws://127.0.0.1:8566
   gas_model: eip1559
   executor_address: '0x1c3d856D29eA2118c8d955070a6AD83C984586f3'
   executor_owner: '0x36C77CC277e73CCcd199d1989828739722Fe5450'
@@ -156,8 +155,11 @@ chains:
   gas_model: op_stack
   executor_address: '0x9445f7d3E1aA38bC9A9B373dc905D9fde7B9B852'
   executor_owner: '0xD7A4D612E572B5877b0E2fC7cE8683e36360f04c'
+  batch_router_address: '0x46C6d9003FB9FBFE29d60ae6feF869F7CAe6f499'
   permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
   venues:
+  # UniV2 factory is listed for registry completeness; runtime skips cold
+  # inventory on Base (see main.rs) — Aerodrome solidly_v2_like covers V2 curves.
   - name: uniswap_v2
     kind: univ2_like
     factory: '0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6'
@@ -184,6 +186,33 @@ chains:
     router: '0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43'
     fee_bps: 30
     pool_init_code_hash: '0x6f178972b07752b522a4da1c5b71af6524e8b0bd6027ccb29e5312b0e5bcdc3c'
+  # Aerodrome Slipstream — concentrated-liquidity pools (tickSpacing, not UniV3 fee tiers).
+  # Pool inventory: data/base/aerodrome_slipstream/pools.jsonl (build_slipstream_pools.py).
+  - name: aerodrome_slipstream
+    kind: slipstream_like
+    factory: '0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A'
+    router: '0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5'
+    quoter: '0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0'
+    fee_tiers:
+     - 1
+     - 10
+     - 50
+     - 100
+     - 200
+     - 2000
+  # PancakeSwap V3 — UniV3-compatible CL pools (separate factory/quoter from Base UniV3).
+  # Pool inventory: data/base/pancakeswap_v3/pools.jsonl (build_pancakeswap_pools.py).
+  - name: pancakeswap_v3
+    kind: univ3_like
+    factory: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865'
+    router: '0x1b81D678ffb9C0263b24A97847620C99d213eB14'
+    quoter: '0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997'
+    permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+    fee_tiers:
+     - 100
+     - 500
+     - 2500
+     - 10000
   flashloans:
   - name: aave_v3
     kind: aave_v3_like
@@ -207,8 +236,11 @@ chains:
       - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
   broadcast:
     mode: private
+    # Base has no Flashbots-style bundle market; submit via private RPC
+    # (eth_sendRawTransaction) with bundle_then_private_raw fallback policy.
     private_relays:
-    - https://api.blxrbdn.com
+    - https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}
+    - https://base-rpc.publicnode.com
     private_method_policy: bundle_then_private_raw
     public_mempool_jitter_bps: 75
 - chain_name: linea
@@ -295,11 +327,11 @@ chains:
     - ${INK_PRIVATE_RELAY_URL}
     public_mempool_jitter_bps: 75
 universe:
-  dynamic_top_tokens_30d: 200
+  dynamic_top_tokens_30d: 300
   include_usd_stablecoins: true
   include_weth: true
   include_wbtc: true
-  pair_prune_min_liquidity_usd: 250000
+  pair_prune_min_liquidity_usd: 100000
   token_seeds:
   - address: '0x4200000000000000000000000000000000000006'
     symbol: WETH
@@ -333,26 +365,28 @@ universe:
   - '0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA'
   - '0x940181a94A35A4569E4529A3CDfB74e38FD98631'
   - '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf'
-  min_pool_liquidity_usd: 250000
+  - '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22'
+  - '0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452'
+  min_pool_liquidity_usd: 100000
   min_pool_liquidity_tokens: 1
-  max_hot_pools_per_chain_per_venue: 250
-  max_cold_pools_stored: 1500
-  max_edges_hot: 400
-  topk_per_token: 4
+  max_hot_pools_per_chain_per_venue: 256
+  max_cold_pools_stored: 512
+  max_edges_hot: 320
+  topk_per_token: 6
   max_hops: 6
   cycle_candidate_cap_per_block: 500
   event_sampling_rate: 0.85
   event_sampling_block_window: 120
   hot_pool_refresh_secs: 300
   time_budget_ms:
-    search: 600
-    quoting: 150
-    simulation: 200
+    search: 550
+    quoting: 320
+    simulation: 380
 risk:
   per_chain:
   - chain_name: ethereum
     min_net_profit_usd: 25
-    max_gas_units_per_tx: 600000000000000000
+    max_gas_units_per_tx: 600000
     max_fee_per_gas_cap: 21000000000000000000
     max_slippage_bps: 50
     max_price_impact_bps: 75
@@ -383,9 +417,13 @@ risk:
       linear_base_bps: 10
       linear_per_gas_bps: 1
   - chain_name: base
-    min_net_profit_usd: 8
+  # Base L2 gas ~0.005 gwei base + ~0.005–0.05 gwei tip → ~$0.01–0.05 gas per
+  # 550k-gas arb tx at $1,665/ETH. Floor targets ~$2 net after gas/flash on
+  # Balancer 0%-fee paths; Aave 5 bps paths need larger gross spreads.
+    min_net_profit_usd: 2
+    min_net_profit_native: 0.0008
     max_gas_units_per_tx: 500000
-    max_fee_per_gas_cap: 200000000000
+    max_fee_per_gas_cap: 5000000000000
     max_slippage_bps: 50
     max_price_impact_bps: 70
     must_simulate_before_send: true
@@ -426,7 +464,7 @@ risk:
       flat_bps: 30
 features:
   enable_backrun:
-  - arbitrum
+  - ethereum
   - base
   - linea
   enable_liquidations:

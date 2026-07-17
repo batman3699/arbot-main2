@@ -158,6 +158,9 @@ The Base scan graph is built from these venues (see `ops/inputs.yaml` → `chain
 ```bash
 ALCHEMY_KEY=<paid_key> python3 scripts/data/build_aerodrome_pools.py
 # writes config/base_aerodrome_pools.json (directional {pair,tokenIn,tokenOut,stable,feeBps})
+
+ALCHEMY_KEY=<paid_key> python3 scripts/data/rank_base_pools.py data/base/uniswap_v3/pools.jsonl
+# re-sorts cold inventory by hub-side USD liquidity (default RANK_MIN_USD=500 for UniV3)
 ```
 
 - Runtime confirmation: startup logs `venue::solidly: Loaded Solidly/Aerodrome edges

@@ -8,7 +8,8 @@ use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal::MathematicalOps;
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use futures_util::{stream, StreamExt};
@@ -17,7 +18,7 @@ use tracing::{info, warn};
 
 use crate::pool_store::PoolRecord;
 use crate::quote_univ2::load_pair_state;
-use crate::util::u256_to_decimal;
+use crate::util::{u256_to_decimal, IERC20};
 
 mod univ2_events {
     use ethers::prelude::abigen;
@@ -35,10 +36,13 @@ mod univ3_events {
     );
 }
 
-abigen!(
-    UniV3PoolReader,
-    r#"[function liquidity() external view returns (uint128)]"#,
-);
+#[derive(Clone, Debug, Default)]
+pub struct UniV3RankContext {
+    pub hub_tokens: Vec<Address>,
+    pub hub_usd_prices: HashMap<Address, f64>,
+    pub token_decimals: HashMap<Address, u8>,
+    pub pinned_pairs: Vec<(Address, Address)>,
+}
 
 #[derive(Clone, Debug)]
 pub struct HotPoolConfig {
@@ -205,20 +209,143 @@ where
     ))
 }
 
-async fn univ3_liquidity_score<C>(
+fn canonical_pair(a: Address, b: Address) -> (Address, Address) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// All undirected pairs among configured hub tokens (e.g. WETH/USDC).
+pub fn build_pinned_hub_pairs(hub_tokens: &[Address]) -> Vec<(Address, Address)> {
+    let mut pairs = Vec::new();
+    for i in 0..hub_tokens.len() {
+        for j in (i + 1)..hub_tokens.len() {
+            pairs.push(canonical_pair(hub_tokens[i], hub_tokens[j]));
+        }
+    }
+    pairs
+}
+
+/// Prefer stable hubs for USD accounting, matching offline rank_base_pools.py.
+pub fn hub_priority_order(hub_tokens: &[Address]) -> Vec<Address> {
+    const PREFERRED: &[&str] = &[
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC
+        "0x4200000000000000000000000000000000000006", // WETH
+        "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf", // cbBTC
+        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca", // USDbC
+        "0x50c5725949a6f0c72e6c4a641f24049a917db0cb", // DAI
+        "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22", // cbETH
+        "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452", // wstETH
+        "0x940181a94a35a4569e4529a3cdfb74e38fd98631", // AERO
+    ];
+    let hub_set: HashSet<Address> = hub_tokens.iter().copied().collect();
+    let mut ordered = Vec::new();
+    for raw in PREFERRED {
+        if let Ok(addr) = Address::from_str(raw) {
+            if hub_set.contains(&addr) {
+                ordered.push(addr);
+            }
+        }
+    }
+    for hub in hub_tokens {
+        if !ordered.contains(hub) {
+            ordered.push(*hub);
+        }
+    }
+    ordered
+}
+
+fn pick_hub_token(token0: Address, token1: Address, hub_priority: &[Address]) -> Option<Address> {
+    for hub in hub_priority {
+        if *hub == token0 || *hub == token1 {
+            return Some(*hub);
+        }
+    }
+    None
+}
+
+fn pool_matches_pair(record: &PoolRecord, a: Address, b: Address) -> bool {
+    (record.token0 == a && record.token1 == b) || (record.token0 == b && record.token1 == a)
+}
+
+fn collect_pinned_pools(cold: &[PoolRecord], pinned_pairs: &[(Address, Address)]) -> Vec<PoolRecord> {
+    let mut seen = HashSet::new();
+    let mut pinned = Vec::new();
+    for (a, b) in pinned_pairs {
+        for record in cold {
+            if pool_matches_pair(record, *a, *b) && seen.insert(record.pool) {
+                pinned.push(record.clone());
+            }
+        }
+    }
+    pinned
+}
+
+fn finalize_hot_with_pins(
+    scored_hot: Vec<PoolRecord>,
+    pinned: Vec<PoolRecord>,
+    max_hot: usize,
+) -> Vec<PoolRecord> {
+    let max_hot = max_hot.max(1);
+    let mut hot = Vec::with_capacity(max_hot);
+    let mut seen = HashSet::new();
+    for record in pinned {
+        if seen.insert(record.pool) {
+            hot.push(record);
+        }
+    }
+    for record in scored_hot {
+        if hot.len() >= max_hot {
+            break;
+        }
+        if seen.insert(record.pool) {
+            hot.push(record);
+        }
+    }
+    hot
+}
+
+async fn univ3_hub_usd_liquidity_score<C>(
     provider: Arc<Provider<C>>,
     record: &PoolRecord,
-) -> Result<Decimal>
+    rank_ctx: &UniV3RankContext,
+) -> Result<Option<Decimal>>
 where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
 {
-    let contract = UniV3PoolReader::new(record.pool, provider);
-    let liquidity = contract
-        .liquidity()
+    let hub = match pick_hub_token(record.token0, record.token1, &rank_ctx.hub_tokens) {
+        Some(hub) => hub,
+        None => return Ok(None),
+    };
+    let price = match rank_ctx
+        .hub_usd_prices
+        .get(&hub)
+        .copied()
+        .filter(|value| value.is_finite() && *value > 0.0)
+    {
+        Some(price) => price,
+        None => return Ok(None),
+    };
+    let decimals = rank_ctx.token_decimals.get(&hub).copied().unwrap_or(18);
+    let contract = IERC20::new(hub, provider);
+    let balance = contract
+        .balance_of(record.pool)
         .call()
         .await
-        .context("read univ3 liquidity")?;
-    Ok(Decimal::from_u128(liquidity).unwrap_or(Decimal::ZERO))
+        .context("read hub token balanceOf(pool)")?;
+    if balance.is_zero() {
+        return Ok(None);
+    }
+    let tokens = token_amount(balance, decimals);
+    let usd = tokens.checked_mul(
+        Decimal::from_f64(price).unwrap_or(Decimal::ZERO),
+    ).unwrap_or(Decimal::ZERO);
+    if usd.is_zero() {
+        return Ok(None);
+    }
+    Ok(Some(usd))
 }
 
 async fn current_block<C>(provider: Arc<Provider<C>>) -> U64
@@ -397,6 +524,7 @@ pub async fn rank_univ3_pools<C>(
     provider: Arc<Provider<C>>,
     cold_pools: &[PoolRecord],
     config: &HotPoolConfig,
+    rank_ctx: &UniV3RankContext,
 ) -> Result<Vec<PoolRecord>>
 where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
@@ -405,6 +533,7 @@ where
     let rpc_timeout = hot_pool_rpc_timeout();
     let volume_timeout = hot_pool_volume_timeout();
     let mut scores = Vec::new();
+    let pinned = collect_pinned_pools(cold_pools, &rank_ctx.pinned_pairs);
     let capped = cold_pools
         .iter()
         .take(config.max_cold_pools.max(1))
@@ -413,13 +542,20 @@ where
 
     let mut liquidity_failures = 0usize;
     let concurrency = hot_pool_rank_concurrency();
+    let rank_ctx = Arc::new(rank_ctx.clone());
 
-    // Liquidity scoring first; volume probes only on top liquidity candidates.
+    // Hub-side USD liquidity scoring; volume probes only on top candidates.
     let liquidity_outcomes: Vec<(PoolRecord, Option<Decimal>, bool)> =
         stream::iter(capped.iter().cloned().map(|record| {
             let provider = provider.clone();
+            let rank_ctx = rank_ctx.clone();
             async move {
-                match timeout(rpc_timeout, univ3_liquidity_score(provider, &record)).await {
+                match timeout(
+                    rpc_timeout,
+                    univ3_hub_usd_liquidity_score(provider, &record, rank_ctx.as_ref()),
+                )
+                .await
+                {
                     Err(_) => {
                         warn!(
                             timeout_ms = rpc_timeout.as_millis() as u64,
@@ -436,7 +572,7 @@ where
                         );
                         (record, None, true)
                     }
-                    Ok(Ok(value)) => (record, Some(value), false),
+                    Ok(Ok(value)) => (record, value, false),
                 }
             }
         }))
@@ -528,11 +664,13 @@ where
     }
 
     scores.sort_by_key(|score| Reverse(score.score_tuple()));
-    let hot = scores
+    let scored_hot = scores
         .into_iter()
         .take(config.max_hot_pools.max(1))
         .map(|score| score.pool)
         .collect::<Vec<_>>();
+    let pinned_count = pinned.len();
+    let hot = finalize_hot_with_pins(scored_hot, pinned, config.max_hot_pools);
     if hot.is_empty() && liquidity_failures > 0 {
         return Err(anyhow!(
             "univ3 ranking aborted: {liquidity_failures} liquidity RPC calls failed"
@@ -541,6 +679,7 @@ where
     info!(
         cold_pool_records = capped.len(),
         sampled_pools = sampled_volume.len(),
+        pinned_pools = pinned_count,
         hot_pools = hot.len(),
         elapsed_ms = started_at.elapsed().as_millis() as u64,
         timeout_ms = rpc_timeout.as_millis() as u64,
@@ -588,4 +727,61 @@ pub fn log_hot_pool_refresh(chain: &str, venue: &str, kind: &str, hot: usize) {
         hot_pools = hot,
         "refreshed hot pool list"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers::types::Address;
+
+    #[test]
+    fn build_pinned_hub_pairs_covers_all_hub_combinations() {
+        let hubs = vec![
+            Address::from_low_u64_be(1),
+            Address::from_low_u64_be(2),
+            Address::from_low_u64_be(3),
+        ];
+        let pairs = build_pinned_hub_pairs(&hubs);
+        assert_eq!(pairs.len(), 3);
+    }
+
+    #[test]
+    fn finalize_hot_with_pins_keeps_hub_pairs_first() {
+        let pinned_pool = PoolRecord {
+            pool: Address::from_low_u64_be(1),
+            token0: Address::from_low_u64_be(2),
+            token1: Address::from_low_u64_be(3),
+            fee: 500,
+            created_block: 1,
+            hub_usd_liquidity: None,
+        };
+        let scored_pool = PoolRecord {
+            pool: Address::from_low_u64_be(9),
+            token0: Address::from_low_u64_be(4),
+            token1: Address::from_low_u64_be(5),
+            fee: 500,
+            created_block: 2,
+            hub_usd_liquidity: Some(1_000_000.0),
+        };
+        let hot = finalize_hot_with_pins(vec![scored_pool], vec![pinned_pool.clone()], 1);
+        assert_eq!(hot.len(), 1);
+        assert_eq!(hot[0].pool, pinned_pool.pool);
+    }
+
+    #[test]
+    fn pool_matches_pair_is_direction_insensitive() {
+        let record = PoolRecord {
+            pool: Address::from_low_u64_be(1),
+            token0: Address::from_low_u64_be(2),
+            token1: Address::from_low_u64_be(3),
+            fee: 500,
+            created_block: 1,
+            hub_usd_liquidity: None,
+        };
+        assert!(pool_matches_pair(
+            &record,
+            Address::from_low_u64_be(3),
+            Address::from_low_u64_be(2)
+        ));
+    }
 }

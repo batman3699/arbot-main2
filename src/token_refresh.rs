@@ -3,11 +3,12 @@ use ethers::types::Address;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TokenList {
     inner: Arc<TokenListInner>,
 }
 
+#[derive(Debug)]
 struct TokenListInner {
     list: ArcSwap<Vec<Address>>,
     set: ArcSwap<HashSet<Address>>,

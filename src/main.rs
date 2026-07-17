@@ -1,7 +1,9 @@
 mod accounting;
+mod backrun_state;
 mod bridge;
 mod capital;
 mod chain;
+mod cl_sim;
 #[cfg(test)]
 mod config_validation;
 mod discovery;
@@ -9,8 +11,9 @@ mod fees;
 mod flash_loan;
 mod graph;
 mod health;
-mod hot_path;
+mod mempool;
 mod hot_pools;
+mod hot_path;
 mod ingestion;
 mod liquidations;
 mod liquidity_cache;
@@ -24,12 +27,14 @@ mod quote_curve;
 mod quote_solidly;
 mod quote_univ2;
 mod quote_univ3;
+mod quote_slipstream;
 mod quote_univ4;
 mod registry;
 mod risk_policy;
 mod rpc_failover;
 mod sandwich;
 mod sim_quorum;
+mod sim_revm;
 mod sizing;
 mod token_refresh;
 mod util;
@@ -74,13 +79,20 @@ use tokio::{
     time::{sleep, timeout, Duration},
 };
 
-use graph::{canonicalize_cycle, BellmanFordLimits, Edge, Graph, VenueEdge};
+use graph::{
+    canonicalize_cycle, rotate_indexed_cycle, BellmanFordLimits, CycleCandidate, Edge, Graph,
+    IndexedCycle, VenueEdge,
+};
 use hot_path::{HotPathCache, ProfitabilitySnapshot};
-use hot_pools::{log_hot_pool_refresh, rank_univ2_pools, rank_univ3_pools, HotPoolConfig};
+use hot_pools::{
+    build_pinned_hub_pairs, hub_priority_order, log_hot_pool_refresh, rank_univ2_pools,
+    rank_univ3_pools, HotPoolConfig, UniV3RankContext,
+};
 use ingestion::{
-    block_head_channel, spawn_block_head_monitor, spawn_pending_tx_monitor, MonitoredPool,
+    block_head_channel, spawn_block_head_monitor, MonitoredPool,
     PoolMonitor,
 };
+use mempool::{spawn_live_mempool_monitor, BackrunHint, BackrunMonitor};
 use pool_store::{
     load_pool_records, pool_data_path, prioritize_cold_pool_inventory, univ2_configs_from_records,
     PoolRecord, ResolvedUniV2PoolCfg,
@@ -89,7 +101,9 @@ use registry::{apply_pool_env_overrides, maybe_load_registry, parse_address, Reg
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
-use venues::populate_edges;
+use venues::{
+    populate_edges, solidly_monitored_pools, EdgeDigest, PopulateOptions,
+};
 use futures_util::{stream, stream::FuturesUnordered, StreamExt};
 
 use crate::bridge::BridgePlanner;
@@ -101,11 +115,19 @@ use crate::liquidations::LiquidationMonitor;
 use crate::liquidity_cache::PoolDepthCache;
 use crate::metrics::Metrics;
 use crate::ops_inputs::load_ops_inputs;
-use crate::quote_univ3::{UniQuoter, UniV3ValidationConfig, FEE_TIERS};
+use crate::quote_slipstream::{default_slipstream_validation_base, SlipstreamQuoter};
+use crate::quote_univ3::{
+    default_pancakeswap_validation_base, UniQuoter, UniV3ValidationConfig, FEE_TIERS,
+};
 use crate::risk_policy::RuntimeRiskPolicy;
 use crate::rpc_failover::FailoverClient;
 use crate::sandwich::{SandwichMonitor, SandwichOpportunity};
 use crate::sim_quorum::SimQuorum;
+use crate::sim_revm::{
+    record_revm_metrics, sim_revm_enabled, sim_revm_timeout_ms, simulate_via_revm, RevmSimOutcome,
+    SimForkRequest,
+};
+use crate::backrun_state::{apply_post_state_hints, backrun_post_state_enabled, log_backrun_opportunity, targeted_bf_limits};
 use crate::sizing::{optimize_trade_size, OptimizeTradeParams, SizingResult};
 use crate::token_refresh::TokenList;
 use crate::util::{
@@ -116,6 +138,13 @@ use crate::util::{
 
 use crate::{quote_balancer::BalQuote, quote_curve::CurveQuote};
 use arb_exec::abi::{ExecutorLoan, ExecutorPlan, ExecutorStep, MultiVenueArbExecutor};
+
+abigen!(
+    BatchRouterAdmin,
+    r#"[
+        function owner() external view returns (address)
+    ]"#
+);
 
 const JIT_PRESWAP_ESTIMATED_GAS: u64 = 160_000;
 const JIT_LP_ADD_ESTIMATED_GAS: u64 = 260_000;
@@ -168,12 +197,16 @@ fn ensure_single_loan_allocation(
 }
 
 impl FeatureGate {
-    fn from_env() -> Self {
+    fn from_env_for_chain(ops_inputs: &crate::ops_inputs::OpsInputs, chain_name: &str) -> Self {
+        let backrun_default = ops_inputs.backrun_enabled_for(chain_name);
         Self {
             cycle_arb: read_feature_flag("FEATURE_CYCLE_ARB", true),
-            backrun: read_feature_flag("FEATURE_BACKRUN", false),
+            backrun: read_feature_flag("FEATURE_BACKRUN", backrun_default),
             sandwich: read_feature_flag("FEATURE_SANDWICH", false),
-            liquidations: read_feature_flag("FEATURE_LIQUIDATIONS", false),
+            liquidations: read_feature_flag(
+                "FEATURE_LIQUIDATIONS",
+                ops_inputs.liquidations_enabled_for(chain_name),
+            ),
             bridge: read_feature_flag("FEATURE_BRIDGE", false),
         }
     }
@@ -397,9 +430,9 @@ fn derive_chain_time_budget_ms(
             simulation_ms.max(450),
         ),
         "base" | "arbitrum" | "optimism" => (
-            search_ms.min(600),
-            quoting_ms.min(175),
-            simulation_ms.min(250),
+            search_ms.min(800),
+            quoting_ms.min(350),
+            simulation_ms.min(400),
         ),
         _ => (search_ms, quoting_ms, simulation_ms),
     }
@@ -490,9 +523,72 @@ fn monitored_pools_from_configs(pools: &[ResolvedUniV2PoolCfg]) -> Vec<Monitored
             token_in: pool.token_in,
             token_out: pool.token_out,
             fee_bps: pool.fee_bps,
+            stable: false,
+            kind: ingestion::PoolMonitorKind::UniV2,
         });
     }
     unique.into_values().collect()
+}
+
+fn load_token_decimals_map(ops_inputs: &crate::ops_inputs::OpsInputs) -> HashMap<Address, u8> {
+    let mut decimals = HashMap::new();
+    for seed in ops_inputs.universe.token_seeds.iter() {
+        let Ok(addr) = Address::from_str(&seed.address) else {
+            continue;
+        };
+        if let Some(value) = seed.decimals {
+            decimals.insert(addr, value);
+        }
+    }
+    decimals
+}
+
+fn build_univ3_rank_context(
+    ops_inputs: &crate::ops_inputs::OpsInputs,
+    env_prefix: &str,
+) -> UniV3RankContext {
+    let mut hub_tokens = Vec::new();
+    for addr in &ops_inputs.universe.hub_tokens {
+        if let Ok(parsed) = Address::from_str(addr) {
+            hub_tokens.push(parsed);
+        }
+    }
+    let hub_priority = hub_priority_order(&hub_tokens);
+    let pinned_pairs = build_pinned_hub_pairs(&hub_tokens);
+    let native_usd = native_usd_price(env_prefix).unwrap_or(2500.0);
+    let mut token_decimals = HashMap::new();
+    let mut hub_usd_prices = HashMap::new();
+    for seed in ops_inputs.universe.token_seeds.iter() {
+        let Ok(addr) = Address::from_str(&seed.address) else {
+            continue;
+        };
+        if let Some(decimals) = seed.decimals {
+            token_decimals.insert(addr, decimals);
+        }
+        let symbol = seed.symbol.as_deref().unwrap_or("").to_ascii_uppercase();
+        let price = match symbol.as_str() {
+            "WETH" | "CBETH" | "WSTETH" => Some(native_usd),
+            "USDC" | "USDBC" | "DAI" | "USDT" | "EURC" => Some(1.0),
+            "CBBTC" | "WBTC" => std::env::var("RANK_CBTC_USD")
+                .ok()
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .or(Some(95_000.0)),
+            "AERO" => std::env::var("RANK_AERO_USD")
+                .ok()
+                .and_then(|raw| raw.parse::<f64>().ok())
+                .or(Some(0.35)),
+            _ => None,
+        };
+        if let Some(price) = price {
+            hub_usd_prices.insert(addr, price);
+        }
+    }
+    UniV3RankContext {
+        hub_tokens: hub_priority,
+        hub_usd_prices,
+        token_decimals,
+        pinned_pairs,
+    }
 }
 
 fn build_hub_tokens(ops_inputs: &crate::ops_inputs::OpsInputs) -> HashSet<Address> {
@@ -673,6 +769,88 @@ fn collect_univ3_fee_tiers(
         if !matches!(venue.kind, Some(crate::ops_inputs::VenueKind::Univ3Like)) {
             continue;
         }
+        if is_pancakeswap_univ3_venue(&venue.name) {
+            continue;
+        }
+        if let Some(venue_tiers) = venue.fee_tiers.as_ref() {
+            tiers.extend(venue_tiers.iter().copied());
+        }
+    }
+    tiers
+}
+
+fn collect_slipstream_tick_spacings(
+    ops_inputs: &crate::ops_inputs::OpsInputs,
+    chain_name: &str,
+) -> HashSet<u32> {
+    let mut spacings = HashSet::new();
+    let Some(chain) = ops_inputs.chain_inputs(chain_name) else {
+        return spacings;
+    };
+    for venue in &chain.venues {
+        if !matches!(
+            venue.kind,
+            Some(crate::ops_inputs::VenueKind::SlipstreamLike)
+        ) {
+            continue;
+        }
+        if let Some(tiers) = venue.fee_tiers.as_ref() {
+            spacings.extend(tiers.iter().copied());
+        }
+    }
+    spacings
+}
+
+fn resolve_slipstream_venue(
+    ops_inputs: &crate::ops_inputs::OpsInputs,
+    chain_name: &str,
+) -> Option<(Address, Address, Address)> {
+    let chain = ops_inputs.chain_inputs(chain_name)?;
+    let venue = chain.venues.iter().find(|venue| {
+        matches!(
+            venue.kind,
+            Some(crate::ops_inputs::VenueKind::SlipstreamLike)
+        )
+    })?;
+    let factory = venue.factory.as_ref()?.parse().ok()?;
+    let router = venue.router.as_ref()?.parse().ok()?;
+    let quoter = venue.quoter.as_ref()?.parse().ok()?;
+    Some((factory, router, quoter))
+}
+
+const PANCAKESWAP_V3_VENUE: &str = "pancakeswap_v3";
+
+fn is_pancakeswap_univ3_venue(name: &str) -> bool {
+    name.eq_ignore_ascii_case(PANCAKESWAP_V3_VENUE)
+}
+
+fn resolve_pancakeswap_venue(
+    ops_inputs: &crate::ops_inputs::OpsInputs,
+    chain_name: &str,
+) -> Option<(Address, Address, Address)> {
+    let chain = ops_inputs.chain_inputs(chain_name)?;
+    let venue = chain
+        .venues
+        .iter()
+        .find(|venue| is_pancakeswap_univ3_venue(&venue.name))?;
+    let factory = venue.factory.as_ref()?.parse().ok()?;
+    let router = venue.router.as_ref()?.parse().ok()?;
+    let quoter = venue.quoter.as_ref()?.parse().ok()?;
+    Some((factory, router, quoter))
+}
+
+fn collect_pancakeswap_fee_tiers(
+    ops_inputs: &crate::ops_inputs::OpsInputs,
+    chain_name: &str,
+) -> HashSet<u32> {
+    let mut tiers = HashSet::new();
+    let Some(chain) = ops_inputs.chain_inputs(chain_name) else {
+        return tiers;
+    };
+    for venue in &chain.venues {
+        if !is_pancakeswap_univ3_venue(&venue.name) {
+            continue;
+        }
         if let Some(venue_tiers) = venue.fee_tiers.as_ref() {
             tiers.extend(venue_tiers.iter().copied());
         }
@@ -681,10 +859,10 @@ fn collect_univ3_fee_tiers(
 }
 
 fn filter_cycles_by_hubs(
-    cycles: Vec<Vec<usize>>,
+    cycles: Vec<IndexedCycle>,
     graph: &Graph,
     hub_tokens: &HashSet<Address>,
-) -> Vec<Vec<usize>> {
+) -> Vec<IndexedCycle> {
     let strict_intermediates = read_feature_flag("STRICT_HUB_INTERMEDIATES", false);
     let strict_start = read_feature_flag("STRICT_START_TOKEN_HUB_ONLY", false);
     if hub_tokens.is_empty() && !strict_start {
@@ -692,7 +870,8 @@ fn filter_cycles_by_hubs(
     }
     cycles
         .into_iter()
-        .filter(|cycle| {
+        .filter(|indexed| {
+            let cycle = &indexed.cycle;
             let Some(start_ix) = cycle.first().copied() else {
                 return false;
             };
@@ -757,6 +936,99 @@ fn cycle_rejected_by_hub_filter(
     false
 }
 
+fn map_cycle_addresses_to_indices(graph: &Graph, cycle: &[Address]) -> Option<Vec<usize>> {
+    if cycle.len() < 2 {
+        return None;
+    }
+    let mut indices = Vec::with_capacity(cycle.len() + 1);
+    for addr in cycle.iter() {
+        let idx = graph.ix.get(addr)?;
+        indices.push(*idx);
+    }
+    if indices.first() != indices.last() {
+        if let Some(first) = indices.first().copied() {
+            indices.push(first);
+        }
+    }
+    Some(indices)
+}
+
+fn cycle_indices_to_addresses(graph: &Graph, cycle: &[usize]) -> Vec<Address> {
+    cycle
+        .iter()
+        .filter_map(|idx| graph.nodes.get(*idx).copied())
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct CycleSeed {
+    addresses: Vec<Address>,
+    edge_indices: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EdgeScoreWeights {
+    liquidity: f64,
+    profitability: f64,
+    slippage: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ScoredEdge {
+    idx: usize,
+    score: f64,
+    liquidity: U256,
+    slippage_bps: u32,
+    weight: i64,
+}
+
+impl PartialEq for ScoredEdge {
+    fn eq(&self, other: &Self) -> bool {
+        self.idx == other.idx
+    }
+}
+
+impl Eq for ScoredEdge {}
+
+impl PartialOrd for ScoredEdge {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredEdge {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.liquidity.cmp(&other.liquidity))
+            .then_with(|| other.slippage_bps.cmp(&self.slippage_bps))
+            .then_with(|| other.weight.cmp(&self.weight))
+            .then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+
+fn edge_fee_bps(edge: &Edge) -> Option<u32> {
+    match &edge.venue {
+        VenueEdge::UniV3 { path, .. } => {
+            if path.len() < 2 {
+                return None;
+            }
+            path.iter()
+                .skip(1)
+                .find_map(|(_, maybe_fee)| maybe_fee.as_ref().copied())
+        }
+        VenueEdge::Slipstream { path, .. } => {
+            if path.len() < 2 {
+                return None;
+            }
+            path.iter()
+                .skip(1)
+                .find_map(|(_, maybe_spacing)| maybe_spacing.as_ref().copied())
+        }
+        _ => None,
+    }
+}
+
 fn start_token_pricing_reliable(
     start_token: Address,
     wrapped_native: Address,
@@ -815,114 +1087,41 @@ fn native_price_concurrency() -> usize {
 }
 
 fn cap_cycles_per_start(
-    cycles: Vec<Vec<usize>>,
+    cycles: Vec<IndexedCycle>,
     graph: &Graph,
     topk_per_token: usize,
-) -> Vec<Vec<usize>> {
+) -> Vec<IndexedCycle> {
     if topk_per_token == 0 {
         return Vec::new();
     }
-    let mut per_start: HashMap<Address, Vec<(i64, Vec<usize>)>> = HashMap::new();
-    for cycle in cycles {
-        let Some(start_ix) = cycle.first() else {
+    let mut per_start: HashMap<Address, Vec<(i64, IndexedCycle)>> = HashMap::new();
+    for indexed in cycles {
+        let Some(start_ix) = indexed.cycle.first() else {
             continue;
         };
         let Some(start_token) = graph.nodes.get(*start_ix) else {
             continue;
         };
-        let weight = graph.cycle_weight(&cycle).unwrap_or(i64::MAX);
+        let weight = if indexed.edge_indices_valid() {
+            graph
+                .cycle_weight_from_edge_indices(&indexed.edge_indices)
+                .unwrap_or(i64::MAX)
+        } else {
+            graph.cycle_weight(&indexed.cycle).unwrap_or(i64::MAX)
+        };
         per_start
             .entry(*start_token)
             .or_default()
-            .push((weight, cycle));
+            .push((weight, indexed));
     }
     let mut capped = Vec::new();
     for entries in per_start.values_mut() {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (_, cycle) in entries.drain(..).take(topk_per_token) {
-            capped.push(cycle);
+        for (_, indexed) in entries.drain(..).take(topk_per_token) {
+            capped.push(indexed);
         }
     }
     capped
-}
-
-fn map_cycle_addresses_to_indices(graph: &Graph, cycle: &[Address]) -> Option<Vec<usize>> {
-    if cycle.len() < 2 {
-        return None;
-    }
-    let mut indices = Vec::with_capacity(cycle.len() + 1);
-    for addr in cycle.iter() {
-        let idx = graph.ix.get(addr)?;
-        indices.push(*idx);
-    }
-    if indices.first() != indices.last() {
-        if let Some(first) = indices.first().copied() {
-            indices.push(first);
-        }
-    }
-    Some(indices)
-}
-
-fn cycle_indices_to_addresses(graph: &Graph, cycle: &[usize]) -> Vec<Address> {
-    cycle
-        .iter()
-        .filter_map(|idx| graph.nodes.get(*idx).copied())
-        .collect()
-}
-
-#[derive(Clone, Copy, Debug)]
-struct EdgeScoreWeights {
-    liquidity: f64,
-    profitability: f64,
-    slippage: f64,
-}
-
-#[derive(Clone, Debug)]
-struct ScoredEdge {
-    idx: usize,
-    score: f64,
-    liquidity: U256,
-    slippage_bps: u32,
-    weight: i64,
-}
-
-impl PartialEq for ScoredEdge {
-    fn eq(&self, other: &Self) -> bool {
-        self.idx == other.idx
-    }
-}
-
-impl Eq for ScoredEdge {}
-
-impl PartialOrd for ScoredEdge {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for ScoredEdge {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.score
-            .total_cmp(&other.score)
-            .then_with(|| self.liquidity.cmp(&other.liquidity))
-            .then_with(|| other.slippage_bps.cmp(&self.slippage_bps))
-            .then_with(|| other.weight.cmp(&self.weight))
-            .then_with(|| self.idx.cmp(&other.idx))
-    }
-}
-
-fn edge_fee_bps(edge: &Edge) -> Option<u32> {
-    match &edge.venue {
-        VenueEdge::UniV3 { path, .. } => {
-            if path.len() < 2 {
-                return None;
-            }
-            path.iter()
-                .skip(1)
-                .find_map(|(_, maybe_fee)| maybe_fee.as_ref().copied())
-        }
-        _ => None,
-    }
 }
 
 fn edge_quality_score(edge: &Edge, profitability: f64, weights: EdgeScoreWeights) -> f64 {
@@ -943,12 +1142,25 @@ async fn prune_edges_by_quality(
     min_score: f64,
     weights: EdgeScoreWeights,
     profitability: &ProfitabilitySnapshot,
+    hub_tokens: &HashSet<Address>,
 ) {
     if max_edges == 0 || graph.edges.len() <= max_edges {
         return;
     }
 
     let mut heap: BinaryHeap<Reverse<ScoredEdge>> = BinaryHeap::with_capacity(max_edges + 1);
+    let mut pinned_hub_edges = HashSet::new();
+    for (idx, edge) in graph.edges.iter().enumerate() {
+        if !edge.active {
+            continue;
+        }
+        if matches!(edge.venue, VenueEdge::SolidlyV2 { .. })
+            && hub_tokens.contains(&edge.from)
+            && hub_tokens.contains(&edge.to)
+        {
+            pinned_hub_edges.insert(idx);
+        }
+    }
     for (idx, edge) in graph.edges.iter().enumerate() {
         if !edge.active {
             continue;
@@ -975,7 +1187,7 @@ async fn prune_edges_by_quality(
         }
     }
 
-    let mut keep = HashSet::new();
+    let mut keep = pinned_hub_edges;
     for Reverse(entry) in heap.into_sorted_vec() {
         if keep.len() >= max_edges {
             break;
@@ -1027,6 +1239,18 @@ fn candidate_prep_concurrency() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_CANDIDATE_PREP_CONCURRENCY)
+}
+
+/// How many ranked candidates to attempt at simulation when the top choice
+/// fails eth_call, quorum, or post-sim profit gates.
+const DEFAULT_SIM_CASCADE_DEPTH: usize = 3;
+
+fn sim_cascade_depth() -> usize {
+    std::env::var("ARBOT_SIM_CASCADE_DEPTH")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SIM_CASCADE_DEPTH)
 }
 
 /// Shared read-only inputs for concurrent candidate preparation.
@@ -1932,12 +2156,6 @@ async fn connect_private_relays(
     Vec::new()
 }
 
-#[derive(Clone)]
-struct PendingSwap {
-    amount_in: U256,
-    last_seen: Instant,
-}
-
 #[derive(Debug)]
 enum HealthStatus {
     Healthy { balance: U256, reserve_txs: U256 },
@@ -2319,268 +2537,6 @@ impl CircuitBreaker {
     }
 }
 
-#[derive(Clone, Debug)]
-struct BackrunHint {
-    from: Address,
-    to: Address,
-    amount_in: U256,
-    price_impact_bps: u32,
-    source: String,
-    observed_at: Instant,
-}
-
-struct HintParams<'a> {
-    from: Address,
-    to: Address,
-    amount_in: U256,
-    estimated_impact: u32,
-    source: &'a str,
-    now: Instant,
-}
-
-struct BackrunMonitor {
-    swaps: Arc<Mutex<HashMap<(Address, Address), PendingSwap>>>,
-    hints: Arc<Mutex<VecDeque<BackrunHint>>>,
-    min_amount: U256,
-    min_price_impact_bps: u32,
-    tokens: TokenList,
-}
-
-impl BackrunMonitor {
-    fn new(min_amount: U256, min_price_impact_bps: u32, tokens: TokenList) -> Self {
-        Self {
-            swaps: Arc::new(Mutex::new(HashMap::new())),
-            hints: Arc::new(Mutex::new(VecDeque::new())),
-            min_amount,
-            min_price_impact_bps,
-            tokens,
-        }
-    }
-
-    async fn record(&self, path: &[Address], amount_in: U256, source: &str) {
-        if amount_in < self.min_amount || path.len() < 2 {
-            return;
-        }
-        let tokens = self.tokens.current_set();
-        if !path.iter().all(|token| tokens.contains(token)) {
-            return;
-        }
-        let mut swaps = self.swaps.lock().await;
-        let now = Instant::now();
-        if let Some(&from) = path.first() {
-            if let Some(&to) = path.get(1) {
-                let estimated_impact = self.estimate_price_impact(amount_in);
-                if estimated_impact < self.min_price_impact_bps {
-                    return;
-                }
-                let params = HintParams {
-                    from,
-                    to,
-                    amount_in,
-                    estimated_impact,
-                    source,
-                    now,
-                };
-                self.push_hint(&mut swaps, params).await;
-            }
-        }
-    }
-
-    async fn record_liquidation(
-        &self,
-        debt_token: Address,
-        collateral_token: Address,
-        repay_amount: U256,
-        protocol: &str,
-    ) {
-        let mut swaps = self.swaps.lock().await;
-        let now = Instant::now();
-        let estimated_impact = self.estimate_price_impact(repay_amount);
-        if repay_amount < self.min_amount || estimated_impact < self.min_price_impact_bps {
-            return;
-        }
-        let params = HintParams {
-            from: debt_token,
-            to: collateral_token,
-            amount_in: repay_amount,
-            estimated_impact,
-            source: protocol,
-            now,
-        };
-        self.push_hint(&mut swaps, params).await;
-    }
-
-    async fn push_hint(
-        &self,
-        swaps: &mut HashMap<(Address, Address), PendingSwap>,
-        params: HintParams<'_>,
-    ) {
-        swaps.insert(
-            (params.from, params.to),
-            PendingSwap {
-                amount_in: params.amount_in,
-                last_seen: params.now,
-            },
-        );
-
-        let mut hints = self.hints.lock().await;
-        hints.push_back(BackrunHint {
-            from: params.from,
-            to: params.to,
-            amount_in: params.amount_in,
-            price_impact_bps: params.estimated_impact,
-            source: params.source.to_string(),
-            observed_at: params.now,
-        });
-        while hints.len() > 32 {
-            hints.pop_front();
-        }
-    }
-
-    fn estimate_price_impact(&self, amount_in: U256) -> u32 {
-        if amount_in.is_zero() {
-            return 0;
-        }
-        let rough = mul_div(
-            amount_in,
-            U256::from(10_000u64),
-            amount_in.saturating_add(self.min_amount),
-        );
-        u32::try_from(rough.as_u64()).unwrap_or(u32::MAX)
-    }
-
-    async fn prune(&self, ttl: Duration) {
-        let mut swaps = self.swaps.lock().await;
-        let now = Instant::now();
-        swaps.retain(|_, swap| now.duration_since(swap.last_seen) <= ttl);
-        let mut hints = self.hints.lock().await;
-        hints.retain(|hint| now.duration_since(hint.observed_at) <= ttl);
-    }
-
-    async fn active_hints(&self, ttl: Duration) -> Vec<BackrunHint> {
-        self.prune(ttl).await;
-        let now = Instant::now();
-        let hints = self.hints.lock().await;
-        hints
-            .iter()
-            .filter(|hint| now.duration_since(hint.observed_at) <= ttl)
-            .cloned()
-            .collect()
-    }
-
-    async fn best_amount_for(&self, from: Address, to: Address, ttl: Duration) -> Option<U256> {
-        let swaps = self.swaps.lock().await;
-        if let Some(swap) = swaps.get(&(from, to)) {
-            if Instant::now().duration_since(swap.last_seen) <= ttl {
-                return Some(swap.amount_in);
-            }
-        }
-        None
-    }
-
-    async fn hint_for(&self, from: Address, to: Address, ttl: Duration) -> Option<BackrunHint> {
-        let now = Instant::now();
-        let mut hints = self.hints.lock().await;
-        let mut found_idx = None;
-        for (idx, hint) in hints.iter().enumerate() {
-            if hint.from == from && hint.to == to && now.duration_since(hint.observed_at) <= ttl {
-                found_idx = Some(idx);
-                break;
-            }
-        }
-        if let Some(idx) = found_idx {
-            if let Some(hint) = hints.remove(idx) {
-                return Some(hint);
-            }
-            if let Some(fallback) = hints.pop_front() {
-                warn!("Backrun hints cache missing expected index; using fallback");
-                return Some(fallback);
-            }
-            warn!("Backrun hints cache empty when expecting entry");
-        }
-        None
-    }
-
-    async fn run<C>(self: Arc<Self>, provider: Arc<Provider<C>>, interval: Duration)
-    where
-        C: JsonRpcClient + Clone + Send + Sync + 'static,
-    {
-        loop {
-            let pending_block = provider
-                .get_block_with_txs(BlockNumber::Pending)
-                .await
-                .ok()
-                .flatten();
-
-            if let Some(block) = pending_block {
-                for tx in block.transactions {
-                    if let Some((amount_in, path)) = decode_univ2_swap(&tx) {
-                        self.record(&path, amount_in, "pending").await;
-                    }
-                }
-            }
-
-            let latest_block = provider
-                .get_block_with_txs(BlockNumber::Latest)
-                .await
-                .ok()
-                .flatten();
-
-            if let Some(block) = latest_block {
-                for tx in block.transactions {
-                    if let Some((amount_in, path)) = decode_univ2_swap(&tx) {
-                        self.record(&path, amount_in, "latest").await;
-                    }
-                }
-            }
-
-            self.prune(Duration::from_secs(30)).await;
-            sleep(interval).await;
-        }
-    }
-}
-
-fn decode_univ2_swap(tx: &Transaction) -> Option<(U256, Vec<Address>)> {
-    if tx.input.0.len() < 4 {
-        return None;
-    }
-    let selector: [u8; 4] = tx.input.0[0..4].try_into().ok()?;
-    const SWAP_EXACT_TOKENS_FOR_TOKENS: [u8; 4] = [0x38, 0xed, 0x17, 0x39];
-    const SWAP_EXACT_TOKENS_FOR_TOKENS_SUPPORTING_FEE_ON_TRANSFER: [u8; 4] =
-        [0x5c, 0x11, 0xd7, 0x95];
-    if selector != SWAP_EXACT_TOKENS_FOR_TOKENS
-        && selector != SWAP_EXACT_TOKENS_FOR_TOKENS_SUPPORTING_FEE_ON_TRANSFER
-    {
-        return None;
-    }
-
-    let params = vec![
-        ParamType::Uint(256),
-        ParamType::Uint(256),
-        ParamType::Array(Box::new(ParamType::Address)),
-        ParamType::Address,
-        ParamType::Uint(256),
-    ];
-    let decoded = decode(&params, &tx.input.0[4..]).ok()?;
-    let amount_in = decoded[0].clone().into_uint()?;
-    if amount_in.is_zero() {
-        return None;
-    }
-    let path_tokens = decoded[2].clone().into_array()?;
-    if path_tokens.len() < 2 {
-        return None;
-    }
-    let mut path = Vec::with_capacity(path_tokens.len());
-    for token in path_tokens {
-        if let Some(addr) = token.into_address() {
-            path.push(addr);
-        } else {
-            return None;
-        }
-    }
-    Some((amount_in, path))
-}
-
 #[derive(Debug)]
 struct CongestionTracker {
     alpha: f64,
@@ -2819,8 +2775,12 @@ fn compute_start_priorities_inner(
         let boost = scaled_amount
             .saturating_mul(impact)
             .saturating_add(impact.saturating_mul(10));
-        let entry = priorities.entry(hint.from).or_insert(0);
-        *entry = entry.saturating_add(boost).clamp(i128::MIN + 1, i128::MAX);
+        // Boost both legs: victim sells `from` (pool receives) and buys `to`
+        // (pool depletes). Backrun cycles often start from the dislocated token.
+        for token in [hint.from, hint.to] {
+            let entry = priorities.entry(token).or_insert(0);
+            *entry = entry.saturating_add(boost).clamp(i128::MIN + 1, i128::MAX);
+        }
     }
 
     priorities
@@ -2919,6 +2879,7 @@ where
     univ3_fee_tiers: Option<Arc<HashSet<u32>>>,
     bal_vault: Address,
     aave_pool: Option<Address>,
+    aave_fee_bps: u32,
     erc3156_lender: Option<Address>,
     erc3156_fee_bps: u32,
     bal_flashloan_tokens: Option<HashSet<Address>>,
@@ -2928,12 +2889,25 @@ where
     univ3_flashloan_tokens: Option<HashSet<Address>>,
     chain_env_prefix: String,
     tokens: TokenList,
+    initial_token_decimals: HashMap<Address, u8>,
     wrapped_native: Address,
     capital: Arc<CapitalManager>,
     pool_depth_cache: Arc<PoolDepthCache>,
     pool_monitor: Option<Arc<ingestion::PoolMonitor<C>>>,
     hot_univ2_pools: Arc<tokio::sync::RwLock<Vec<ResolvedUniV2PoolCfg>>>,
     hot_univ3_pools: Arc<tokio::sync::RwLock<Vec<PoolRecord>>>,
+    hot_slipstream_pools: Arc<tokio::sync::RwLock<Vec<PoolRecord>>>,
+    slipstream_quoter_addr: Address,
+    slipstream_factory: Address,
+    slipstream_router: Address,
+    slipstream_validation: Option<UniV3ValidationConfig>,
+    slipstream_tick_spacings: Option<Arc<HashSet<u32>>>,
+    hot_pancakeswap_pools: Arc<tokio::sync::RwLock<Vec<PoolRecord>>>,
+    pancakeswap_quoter_addr: Address,
+    pancakeswap_factory: Address,
+    pancakeswap_router: Address,
+    pancakeswap_validation: Option<UniV3ValidationConfig>,
+    pancakeswap_fee_tiers: Option<Arc<HashSet<u32>>>,
     edge_slippage_bps: u32,
     executor_max_slippage_bps: u32,
     edge_prune_max_slippage_bps: u32,
@@ -2980,6 +2954,7 @@ where
     risk_policy: Option<RuntimeRiskPolicy>,
     sim_quorum: Arc<SimQuorum>,
     block_head_rx: Option<Arc<Mutex<watch::Receiver<U64>>>>,
+    bf_skip_on_stable_graph: bool,
 }
 
 struct Runner<M, C>
@@ -3000,6 +2975,7 @@ where
     univ3_fee_tiers: Option<Arc<HashSet<u32>>>,
     bal_vault: Address,
     aave_pool: Option<Address>,
+    aave_fee_bps: u32,
     erc3156_lender: Option<Address>,
     erc3156_fee_bps: u32,
     bal_flashloan_tokens: Option<Arc<HashSet<Address>>>,
@@ -3015,6 +2991,8 @@ where
     pool_monitor: Option<Arc<ingestion::PoolMonitor<C>>>,
     hot_univ2_pools: Arc<tokio::sync::RwLock<Vec<ResolvedUniV2PoolCfg>>>,
     hot_univ3_pools: Arc<tokio::sync::RwLock<Vec<PoolRecord>>>,
+    hot_slipstream_pools: Arc<tokio::sync::RwLock<Vec<PoolRecord>>>,
+    hot_pancakeswap_pools: Arc<tokio::sync::RwLock<Vec<PoolRecord>>>,
     edge_slippage_bps: u32,
     executor_max_slippage_bps: u32,
     edge_prune_max_slippage_bps: u32,
@@ -3058,10 +3036,19 @@ where
     liquidations: Option<Arc<LiquidationMonitor<C>>>,
     hot_paths: Arc<HotPathCache>,
     quoter: Arc<UniQuoter<C>>,
+    slipstream_quoter: Option<Arc<SlipstreamQuoter<C>>>,
+    slipstream_router: Address,
+    slipstream_validation: Option<UniV3ValidationConfig>,
+    slipstream_tick_spacings: Option<Arc<HashSet<u32>>>,
+    pancakeswap_quoter: Option<Arc<UniQuoter<C>>>,
+    pancakeswap_validation: Option<UniV3ValidationConfig>,
+    pancakeswap_fee_tiers: Option<Arc<HashSet<u32>>>,
     bal_quote: Arc<BalQuote<C>>,
     curve_quote: Arc<CurveQuote<C>>,
     quote_semaphore: Arc<Semaphore>,
     univ3_validation_once: Arc<OnceCell<()>>,
+    slipstream_validation_once: Arc<OnceCell<()>>,
+    pancakeswap_validation_once: Arc<OnceCell<()>>,
     circuit_breaker: Arc<CircuitBreaker>,
     metrics: Option<Arc<Metrics>>,
     accounting: Option<Arc<Accounting>>,
@@ -3069,12 +3056,22 @@ where
     native_price_cache: Arc<Mutex<HashMap<Address, (NativePrice, Instant)>>>,
     fee_estimator: FeeEstimator<C>,
     last_graph_digest: Arc<Mutex<Option<GraphDigest>>>,
-    previous_cycle_seeds: Arc<Mutex<Vec<Vec<Address>>>>,
+    previous_cycle_seeds: Arc<Mutex<Vec<CycleSeed>>>,
+    bf_skip_on_stable_graph: bool,
     candidate_logger: Arc<CandidateDecisionLogger>,
     risk_policy: Option<RuntimeRiskPolicy>,
     sim_quorum: Arc<SimQuorum>,
     last_scanned_block: Arc<Mutex<Option<U64>>>,
     block_head_rx: Option<Arc<Mutex<watch::Receiver<U64>>>>,
+    populate_cache: Arc<Mutex<PopulateCacheState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PopulateCacheState {
+    cached_edges: Vec<Edge>,
+    last_digest: Option<EdgeDigest>,
+    last_gas_price: U256,
+    touched_pools: HashSet<Address>,
 }
 
 impl<M, C> Runner<M, C>
@@ -3106,6 +3103,7 @@ where
             univ3_fee_tiers,
             bal_vault,
             aave_pool,
+            aave_fee_bps,
             erc3156_lender,
             erc3156_fee_bps,
             bal_flashloan_tokens,
@@ -3115,12 +3113,25 @@ where
             univ3_flashloan_tokens,
             chain_env_prefix,
             tokens,
+            initial_token_decimals,
             wrapped_native,
             capital,
             pool_depth_cache,
             pool_monitor,
             hot_univ2_pools,
             hot_univ3_pools,
+            hot_slipstream_pools,
+            slipstream_quoter_addr,
+            slipstream_factory,
+            slipstream_router,
+            slipstream_validation,
+            slipstream_tick_spacings,
+            hot_pancakeswap_pools,
+            pancakeswap_quoter_addr,
+            pancakeswap_factory,
+            pancakeswap_router: _pancakeswap_router,
+            pancakeswap_validation,
+            pancakeswap_fee_tiers,
             edge_slippage_bps,
             executor_max_slippage_bps,
             edge_prune_max_slippage_bps,
@@ -3167,6 +3178,7 @@ where
             risk_policy,
             sim_quorum,
             block_head_rx,
+            bf_skip_on_stable_graph,
         } = config;
         let bal_flashloan_tokens = bal_flashloan_tokens.map(Arc::new);
         let aave_flashloan_tokens = aave_flashloan_tokens.map(Arc::new);
@@ -3177,6 +3189,28 @@ where
             .as_ref()
             .map(|wallet| Arc::new(NonceManager::new(provider.clone(), wallet.address())));
         let provider_for_quoter = provider.clone();
+        let slipstream_quoter = if slipstream_quoter_addr != Address::zero()
+            && slipstream_factory != Address::zero()
+        {
+            Some(Arc::new(SlipstreamQuoter::new(
+                provider.clone(),
+                slipstream_quoter_addr,
+                slipstream_factory,
+            )))
+        } else {
+            None
+        };
+        let pancakeswap_quoter = if pancakeswap_quoter_addr != Address::zero()
+            && pancakeswap_factory != Address::zero()
+        {
+            Some(Arc::new(UniQuoter::new(
+                provider.clone(),
+                pancakeswap_quoter_addr,
+                pancakeswap_factory,
+            )))
+        } else {
+            None
+        };
         let bal_quote = Arc::new(BalQuote::new(provider.clone(), bal_vault));
         let curve_quote = Arc::new(CurveQuote::new(provider.clone()));
         Self {
@@ -3190,6 +3224,7 @@ where
             univ3_fee_tiers,
             bal_vault,
             aave_pool,
+            aave_fee_bps,
             erc3156_lender,
             erc3156_fee_bps,
             bal_flashloan_tokens,
@@ -3205,6 +3240,8 @@ where
             pool_monitor,
             hot_univ2_pools,
             hot_univ3_pools,
+            hot_slipstream_pools,
+            hot_pancakeswap_pools,
             edge_slippage_bps,
             executor_max_slippage_bps,
             edge_prune_max_slippage_bps,
@@ -3258,23 +3295,34 @@ where
                 univ3_quoter,
                 univ3_factory,
             )),
+            slipstream_quoter,
+            slipstream_router,
+            slipstream_validation,
+            slipstream_tick_spacings,
+            pancakeswap_quoter,
+            pancakeswap_validation,
+            pancakeswap_fee_tiers,
             bal_quote,
             curve_quote,
             quote_semaphore: Arc::new(Semaphore::new(univ3_quote_concurrency())),
             univ3_validation_once: Arc::new(OnceCell::new()),
+            slipstream_validation_once: Arc::new(OnceCell::new()),
+            pancakeswap_validation_once: Arc::new(OnceCell::new()),
             circuit_breaker,
             metrics,
             accounting,
-            token_decimals: Arc::new(Mutex::new(HashMap::new())),
+            token_decimals: Arc::new(Mutex::new(initial_token_decimals)),
             native_price_cache: Arc::new(Mutex::new(HashMap::new())),
             fee_estimator,
             last_graph_digest: Arc::new(Mutex::new(None)),
             previous_cycle_seeds: Arc::new(Mutex::new(Vec::new())),
+            bf_skip_on_stable_graph,
             candidate_logger: Arc::new(CandidateDecisionLogger::from_env()),
             risk_policy,
             sim_quorum,
             last_scanned_block: Arc::new(Mutex::new(None)),
             block_head_rx,
+            populate_cache: Arc::new(Mutex::new(PopulateCacheState::default())),
         }
     }
 
@@ -3515,6 +3563,21 @@ where
         let max_quote_block_lag = self.max_quote_block_lag;
         let hot_univ2 = { self.hot_univ2_pools.read().await.clone() };
         let hot_univ3 = { self.hot_univ3_pools.read().await.clone() };
+        let hot_slipstream = { self.hot_slipstream_pools.read().await.clone() };
+        let hot_pancakeswap = { self.hot_pancakeswap_pools.read().await.clone() };
+        let slipstream_quoter = self.slipstream_quoter.clone();
+        let slipstream_router = self.slipstream_router;
+        let slipstream_validation = self.slipstream_validation.clone();
+        let slipstream_tick_spacings = self.slipstream_tick_spacings.clone();
+        let slipstream_validation_once = Arc::clone(&self.slipstream_validation_once);
+        let pancakeswap_quoter = self.pancakeswap_quoter.clone();
+        let pancakeswap_validation = self.pancakeswap_validation.clone();
+        let pancakeswap_fee_tiers = self.pancakeswap_fee_tiers.clone();
+        let pancakeswap_validation_once = Arc::clone(&self.pancakeswap_validation_once);
+        let populate_cache = Arc::clone(&self.populate_cache);
+        let hub_tokens = Arc::new(self.hub_tokens.clone());
+        let wrapped_native = self.wrapped_native;
+        let metrics = self.metrics.clone();
         let outcome = self
             .scan_once_with(
                 |graph,
@@ -3538,12 +3601,39 @@ where
                  block_number| {
                     let hot_univ2 = hot_univ2.clone();
                     let hot_univ3 = hot_univ3.clone();
+                    let hot_slipstream = hot_slipstream.clone();
+                    let hot_pancakeswap = hot_pancakeswap.clone();
                     let validation = univ3_validation.clone();
                     let fee_tiers = univ3_fee_tiers.clone();
                     let chain = chain_name.clone();
                     let once = validation_once.clone();
+                    let slipstream_quoter = slipstream_quoter.clone();
+                    let slipstream_validation = slipstream_validation.clone();
+                    let slipstream_tick_spacings = slipstream_tick_spacings.clone();
+                    let slipstream_once = slipstream_validation_once.clone();
+                    let pancakeswap_quoter = pancakeswap_quoter.clone();
+                    let pancakeswap_validation = pancakeswap_validation.clone();
+                    let pancakeswap_fee_tiers = pancakeswap_fee_tiers.clone();
+                    let pancakeswap_once = pancakeswap_validation_once.clone();
+                    let populate_cache = populate_cache.clone();
+                    let hub_tokens = hub_tokens.clone();
+                    let metrics = metrics.clone();
                     Box::pin(async move {
-                        populate_edges(
+                        let populate_options = {
+                            let guard = populate_cache.lock().await;
+                            PopulateOptions {
+                                touched_pools: guard.touched_pools.clone(),
+                                last_digest: guard.last_digest,
+                                last_gas_price: guard.last_gas_price,
+                                cached_edges: if guard.cached_edges.is_empty() {
+                                    None
+                                } else {
+                                    Some(guard.cached_edges.clone())
+                                },
+                                ..Default::default()
+                            }
+                        };
+                        let result = populate_edges(
                             graph,
                             provider,
                             pool_monitor,
@@ -3570,8 +3660,24 @@ where
                             block_number,
                             max_quote_block_lag,
                             once,
+                            slipstream_quoter,
+                            slipstream_router,
+                            slipstream_tick_spacings,
+                            slipstream_validation,
+                            slipstream_once,
+                            &hot_slipstream,
+                            pancakeswap_quoter,
+                            pancakeswap_fee_tiers,
+                            pancakeswap_validation,
+                            pancakeswap_once,
+                            &hot_pancakeswap,
+                            hub_tokens,
+                            wrapped_native,
+                            populate_options,
+                            metrics,
                         )
-                        .await
+                        .await?;
+                        Ok(result.edges)
                     })
                 },
             )
@@ -4073,7 +4179,7 @@ where
             quotes.push(FlashLoanQuote {
                 provider: FlashLoanProvider::AaveV3,
                 max_amount: capped_amount,
-                fee_bps: 9,
+                fee_bps: self.aave_fee_bps,
                 provider_addr: self.aave_pool,
             });
         }
@@ -4180,10 +4286,34 @@ where
     async fn prepare_candidate(
         &self,
         graph: &Graph,
-        cycle_ix: Vec<usize>,
+        indexed: IndexedCycle,
         ctx: &CandidatePrepCtx<'_>,
     ) -> CandidatePrep {
+        let cycle_ix = indexed.cycle;
+        let edge_indices = indexed.edge_indices;
         if cycle_ix.len() < 2 {
+            return CandidatePrep::Rejected { skip_detail: None };
+        }
+        let hops = cycle_ix.len().saturating_sub(1);
+        if edge_indices.len() != hops {
+            self.log_candidate_stage(
+                "candidate_rejected_pre_sim",
+                &self.chain_name,
+                None,
+                cycle_ix.first().and_then(|ix| graph.nodes.get(*ix).copied()),
+                Some(hops),
+                ctx.edges_scanned,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                Some("invalid_edge"),
+                None,
+                false,
+                false,
+            );
             return CandidatePrep::Rejected { skip_detail: None };
         }
         let cycle_start_ix = match cycle_ix.first() {
@@ -4264,20 +4394,21 @@ where
         let mut estimated_cycle_gas: u64 = 0;
         let mut cycle_max_input = cycle_base_amount;
         let cycle_latency_secs = self.estimate_cycle_latency(graph, &cycle_ix);
-        let mut cycle_edges_vec: Vec<Edge> = Vec::with_capacity(cycle_ix.len().saturating_sub(1));
+        let mut cycle_edges_vec: Vec<Edge> = Vec::with_capacity(hops);
         let mut backrun_hint: Option<BackrunHint> = None;
         let mut has_bridge_step = false;
-        for window in cycle_ix.windows(2) {
+        for (hop, window) in cycle_ix.windows(2).enumerate() {
             let u = graph.nodes[window[0]];
             let v = graph.nodes[window[1]];
-            let Some(edge) = graph.edge_between(u, v) else {
-                warn!(from = %u, to = %v, "Skipping cycle due to missing edge");
+            let edge_idx = edge_indices[hop];
+            let Some(edge) = graph.edge_by_index(edge_idx) else {
+                warn!(edge_idx, from = %u, to = %v, "Skipping cycle due to stale edge index");
                 self.log_candidate_stage(
                     "candidate_rejected_pre_sim",
                     &self.chain_name,
                     Some(candidate_id.clone()),
                     Some(cycle_start),
-                    Some(cycle_ix.len().saturating_sub(1)),
+                    Some(hops),
                     ctx.edges_scanned,
                     None,
                     None,
@@ -4293,9 +4424,36 @@ where
                 if let Some(metrics) = &self.metrics {
                     metrics.record_failure(U256::zero());
                 }
-                // Pre-execution graph/plan errors are zero-loss and must NOT trip
-                // the circuit breaker (former false-positive halt source). Only real
-                // execution reverts/losses count, recorded at dispatch time.
+                return CandidatePrep::Rejected { skip_detail: None };
+            };
+            if !edge.active || edge.from != u || edge.to != v {
+                warn!(
+                    edge_idx,
+                    from = %u,
+                    to = %v,
+                    "Skipping cycle due to stale or mismatched edge index"
+                );
+                self.log_candidate_stage(
+                    "candidate_rejected_pre_sim",
+                    &self.chain_name,
+                    Some(candidate_id.clone()),
+                    Some(cycle_start),
+                    Some(hops),
+                    ctx.edges_scanned,
+                    None,
+                    None,
+                    None,
+                    None,
+                    pricing_reliable,
+                    None,
+                    Some("invalid_edge"),
+                    None,
+                    false,
+                    false,
+                );
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_failure(U256::zero());
+                }
                 return CandidatePrep::Rejected { skip_detail: None };
             };
             estimated_cycle_gas = estimated_cycle_gas.saturating_add(edge.estimated_gas);
@@ -4504,6 +4662,14 @@ where
                 .saturating_add(jit_remove_steps.saturating_mul(JIT_LP_REMOVE_ESTIMATED_GAS));
         }
 
+        let pancakeswap_pool_set: HashSet<Address> = self
+            .hot_pancakeswap_pools
+            .read()
+            .await
+            .iter()
+            .map(|pool| pool.pool)
+            .collect();
+
         let Some(sizing) = optimize_trade_size(OptimizeTradeParams {
             edges: &cycle_edges_vec,
             quotes: &quotes,
@@ -4514,6 +4680,13 @@ where
             l1_data_fee: ctx.gas_parameters.l1_data_fee,
             native_price,
             quoter: self.quoter.as_ref(),
+            slipstream_quoter: self.slipstream_quoter.as_deref(),
+            pancakeswap_quoter: self.pancakeswap_quoter.as_deref(),
+            pancakeswap_pools: if pancakeswap_pool_set.is_empty() {
+                None
+            } else {
+                Some(&pancakeswap_pool_set)
+            },
             bal_quote: self.bal_quote.as_ref(),
             curve_quote: self.curve_quote.as_ref(),
             block_number: ctx.block_number,
@@ -4860,6 +5033,9 @@ where
         let base_token_whitelist = self.tokens.current_set();
         let hot_univ2_tokens = self.hot_univ2_pools.read().await.clone();
         let hot_univ3_tokens = self.hot_univ3_pools.read().await.clone();
+        let hot_pancake_tokens = self.hot_pancakeswap_pools.read().await.clone();
+        let mut hot_cl_tokens = hot_univ3_tokens;
+        hot_cl_tokens.extend(hot_pancake_tokens);
         let raw_token_whitelist_cap = std::env::var("TOKEN_WHITELIST_MAX")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
@@ -4875,13 +5051,40 @@ where
         }
         let token_whitelist = Arc::new(build_dynamic_token_whitelist(
             &hot_univ2_tokens,
-            &hot_univ3_tokens,
+            &hot_cl_tokens,
             base_token_whitelist.as_ref(),
             &self.mandatory_universe_tokens,
             self.dynamic_top_tokens_30d,
             token_whitelist_cap,
         ));
         let t_populate = Instant::now();
+        {
+            let mut touched = HashSet::new();
+            if let Some(monitor) = &self.pool_monitor {
+                touched.extend(monitor.drain_touched());
+            }
+            if let Some(monitor) = &self.backrun {
+                let hints = monitor.active_hints(Duration::from_secs(45)).await;
+                for hint in &hints {
+                    touched.insert(hint.from);
+                    touched.insert(hint.to);
+                }
+            }
+            {
+                let guard = self.populate_cache.lock().await;
+                for edge in guard.cached_edges.iter() {
+                    if let Some(quote_block) = edge.quote_block {
+                        if block_number.saturating_sub(quote_block) > self.max_quote_block_lag {
+                            if let Some(pool) = venues::edge_pool_address(edge) {
+                                touched.insert(pool);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut guard = self.populate_cache.lock().await;
+            guard.touched_pools = touched;
+        }
         let mut edges = populate(
             &mut graph,
             self.provider.clone(),
@@ -4905,6 +5108,13 @@ where
         )
         .await?;
         let populate_ms = t_populate.elapsed().as_millis() as u64;
+        {
+            let mut guard = self.populate_cache.lock().await;
+            guard.cached_edges = edges.clone();
+            guard.last_gas_price = gas_price_for_weights;
+            guard.last_digest = Some(venues::edge_digest(&edges));
+            guard.touched_pools.clear();
+        }
 
         let t_liq = Instant::now();
         if self.feature_gate.bridge {
@@ -4975,6 +5185,7 @@ where
                 slippage: self.edge_prune_slippage_weight,
             },
             &profitability,
+            &self.hub_tokens,
         )
         .await;
 
@@ -4982,6 +5193,14 @@ where
             self.metrics.as_deref(),
             Some(&self.chain_name),
         );
+
+        for edge in graph.edges.iter_mut() {
+            if let Some(quote_block) = edge.quote_block {
+                if block_number.saturating_sub(quote_block) > self.max_quote_block_lag {
+                    edge.active = false;
+                }
+            }
+        }
 
         let edges_scanned = graph.edges.iter().filter(|edge| edge.active).count();
         let current_digest = graph_digest(&graph);
@@ -5023,7 +5242,8 @@ where
             candidate_id: String,
         }
 
-        let mut best_candidate: Option<CandidatePlan> = None;
+        let mut ranked_candidates: Vec<CandidatePlan> = Vec::new();
+        let sim_cascade_cap = sim_cascade_depth();
         let executor_address = self.executor.address();
         let backrun_hints = if let Some(monitor) = &self.backrun {
             monitor.active_hints(Duration::from_secs(45)).await
@@ -5033,21 +5253,27 @@ where
 
         let start_priorities =
             self.compute_start_priorities(&graph, base_profiles_map.as_ref(), &backrun_hints);
-        let seed_cycles: Vec<Vec<usize>> = {
+        let seed_cycles: Vec<IndexedCycle> = {
             let guard = self.previous_cycle_seeds.lock().await;
             guard
                 .iter()
-                .filter_map(|cycle| map_cycle_addresses_to_indices(&graph, cycle))
+                .filter_map(|seed| {
+                    let cycle = map_cycle_addresses_to_indices(&graph, &seed.addresses)?;
+                    Some(IndexedCycle {
+                        cycle,
+                        edge_indices: seed.edge_indices.clone(),
+                    })
+                })
                 .collect()
         };
         let search_start = Instant::now();
-        let raw_cycles: Vec<Vec<usize>> = if significant_change {
-            // Bellman-Ford fans out across rayon worker threads. Running it
-            // inline on a tokio worker stalls the async runtime (timers, RPC
-            // polling, other chains) for the whole search. block_in_place
-            // moves this runtime thread out of the async pool for the
-            // duration so the executor keeps servicing tasks.
-            let mut cycles: Vec<Vec<usize>> = tokio::task::block_in_place(|| {
+        let run_full_bf = !self.bf_skip_on_stable_graph
+            || significant_change
+            || seed_cycles.is_empty()
+            || block_number.as_u64().is_multiple_of(8)
+            || !backrun_hints.is_empty();
+        let mut raw_cycles: Vec<IndexedCycle> = if run_full_bf {
+            let mut cycles: Vec<IndexedCycle> = tokio::task::block_in_place(|| {
                 graph.bellman_ford(
                     &start_priorities,
                     &self.cycle_limits,
@@ -5056,7 +5282,10 @@ where
                 )
             })
             .into_iter()
-            .map(|candidate| candidate.cycle)
+            .map(|candidate| IndexedCycle {
+                cycle: candidate.cycle,
+                edge_indices: candidate.edge_indices,
+            })
             .collect();
             if !seed_cycles.is_empty() {
                 cycles.splice(0..0, seed_cycles.clone());
@@ -5066,10 +5295,65 @@ where
             seed_cycles
         };
 
-        let mut canonical_order: Vec<Vec<usize>> = Vec::new();
-        let mut canonical_buckets: HashMap<Vec<usize>, Vec<(usize, Vec<usize>)>> = HashMap::new();
+        if !backrun_hints.is_empty()
+            && backrun_post_state_enabled()
+        {
+            let backrun_limits = targeted_bf_limits();
+            let state_hints: Vec<crate::backrun_state::BackrunHint> = backrun_hints
+                .iter()
+                .map(|h| crate::backrun_state::BackrunHint {
+                    from: h.from,
+                    to: h.to,
+                    amount_in: h.amount_in,
+                    price_impact_bps: h.price_impact_bps,
+                    source: h.source.clone(),
+                })
+                .collect();
+            let mut touched = HashSet::new();
+            apply_post_state_hints(&mut graph, &state_hints, &mut touched);
+            if let Some(monitor) = &self.pool_monitor {
+                for pool in touched {
+                    monitor.mark_touched(pool);
+                }
+            }
+            let backrun_cycles: Vec<IndexedCycle> = tokio::task::block_in_place(|| {
+                graph.bellman_ford(
+                    &start_priorities,
+                    &backrun_limits,
+                    10,
+                    self.metrics.as_deref(),
+                )
+            })
+            .into_iter()
+            .map(|candidate| IndexedCycle {
+                cycle: candidate.cycle,
+                edge_indices: candidate.edge_indices,
+            })
+            .collect();
+            log_backrun_opportunity(
+                backrun_hints[0].from,
+                backrun_hints[0].to,
+                backrun_hints[0].amount_in,
+                backrun_hints[0].price_impact_bps,
+                backrun_hints[0].source.as_str(),
+                &backrun_cycles,
+            );
+            for indexed in backrun_cycles {
+                if !raw_cycles.iter().any(|existing| {
+                    canonicalize_cycle(existing.cycle.clone())
+                        == canonicalize_cycle(indexed.cycle.clone())
+                }) {
+                    raw_cycles.push(indexed);
+                }
+            }
+        }
 
-        for mut cycle in raw_cycles {
+        let mut canonical_order: Vec<Vec<usize>> = Vec::new();
+        let mut canonical_buckets: HashMap<Vec<usize>, Vec<(usize, IndexedCycle)>> =
+            HashMap::new();
+
+        for mut indexed in raw_cycles {
+            let cycle = &mut indexed.cycle;
             if cycle.len() < 2 {
                 continue;
             }
@@ -5087,52 +5371,70 @@ where
 
             if let Some(entries) = canonical_buckets.get_mut(&signature) {
                 if !entries.iter().any(|(ix, _)| *ix == start_ix) {
-                    entries.push((start_ix, cycle));
+                    entries.push((start_ix, indexed));
                 }
             } else {
                 canonical_order.push(signature.clone());
-                canonical_buckets.insert(signature, vec![(start_ix, cycle)]);
+                canonical_buckets.insert(signature, vec![(start_ix, indexed)]);
             }
         }
 
-        let mut candidate_cycles: Vec<Vec<usize>> = Vec::new();
+        let mut candidate_cycles: Vec<IndexedCycle> = Vec::new();
         for signature in canonical_order {
             if let Some(mut entries) = canonical_buckets.remove(&signature) {
                 let mut added = false;
-                let mut fallback: Option<Vec<usize>> = None;
+                let mut fallback: Option<IndexedCycle> = None;
 
-                for (start_ix, cycle) in entries.drain(..) {
+                for (start_ix, indexed) in entries.drain(..) {
                     let start_token = graph.nodes[start_ix];
+                    let rotated = if indexed.edge_indices_valid() {
+                        rotate_indexed_cycle(
+                            &indexed.cycle,
+                            &indexed.edge_indices,
+                            start_ix,
+                        )
+                        .unwrap_or(indexed)
+                    } else {
+                        IndexedCycle {
+                            cycle: indexed.cycle,
+                            edge_indices: Vec::new(),
+                        }
+                    };
                     if !self
                         .flash_loan_quotes(start_token, capital_snapshot.max_flash_loan)
                         .is_empty()
                     {
-                        candidate_cycles.push(cycle);
+                        candidate_cycles.push(rotated);
                         added = true;
                     } else if fallback.is_none() {
-                        fallback = Some(cycle);
+                        fallback = Some(rotated);
                     }
                 }
 
                 if !added {
-                    if let Some(cycle) = fallback {
-                        candidate_cycles.push(cycle);
+                    if let Some(indexed) = fallback {
+                        candidate_cycles.push(indexed);
                     }
                 }
             }
         }
 
-        for cycle in candidate_cycles.iter() {
-            if cycle_rejected_by_hub_filter(cycle, &graph, &self.hub_tokens) {
-                let start_token = cycle.first().and_then(|ix| graph.nodes.get(*ix)).copied();
-                let candidate_id = start_token
-                    .map(|token| self.stage_candidate_id(token, cycle, &graph, block_number, &[]));
+        for indexed in candidate_cycles.iter() {
+            if cycle_rejected_by_hub_filter(&indexed.cycle, &graph, &self.hub_tokens) {
+                let start_token = indexed
+                    .cycle
+                    .first()
+                    .and_then(|ix| graph.nodes.get(*ix))
+                    .copied();
+                let candidate_id = start_token.map(|token| {
+                    self.stage_candidate_id(token, &indexed.cycle, &graph, block_number, &[])
+                });
                 self.log_candidate_stage(
                     "candidate_rejected_pre_sim",
                     &self.chain_name,
                     candidate_id,
                     start_token,
-                    Some(cycle.len().saturating_sub(1)),
+                    Some(indexed.cycle.len().saturating_sub(1)),
                     edges_scanned,
                     None,
                     None,
@@ -5157,7 +5459,10 @@ where
             let mut guard = self.previous_cycle_seeds.lock().await;
             *guard = candidate_cycles
                 .iter()
-                .map(|cycle| cycle_indices_to_addresses(&graph, cycle))
+                .map(|indexed| CycleSeed {
+                    addresses: cycle_indices_to_addresses(&graph, &indexed.cycle),
+                    edge_indices: indexed.edge_indices.clone(),
+                })
                 .collect();
         }
 
@@ -5196,11 +5501,12 @@ where
         let prep_ctx_ref = &prep_ctx;
         let graph_ref = &graph;
         let prepared_candidates: Vec<CandidatePrep> = stream::iter(
-            candidate_cycles.into_iter().map(|cycle_ix| async move {
+            candidate_cycles.into_iter().map(|indexed| async move {
                 if Instant::now() >= prep_deadline {
                     return CandidatePrep::Budgeted;
                 }
-                self.prepare_candidate(graph_ref, cycle_ix, prep_ctx_ref).await
+                self.prepare_candidate(graph_ref, indexed, prep_ctx_ref)
+                    .await
             }),
         )
         .buffered(candidate_prep_concurrency())
@@ -5553,7 +5859,7 @@ where
 
             let mut plan_args = ExecutorPlan {
                 loans,
-                cycle_slippage_bps: profit_floor_bps.min(u32::from(u16::MAX)) as u16,
+                cycle_slippage_bps: swap_slippage_bps.min(u32::from(u16::MAX)) as u16,
                 steps: ops,
                 min_profit: min_profit_requirement,
             };
@@ -5791,61 +6097,42 @@ where
                 continue;
             }
 
-            if best_candidate
-                .as_ref()
-                .map(|candidate| net_profit > candidate.net_profit)
-                .unwrap_or(true)
-            {
-                let mut liquidation_markets: Vec<String> = cycle_edges_vec
-                    .iter()
-                    .filter_map(|edge| match &edge.venue {
-                        VenueEdge::Liquidation { protocol, .. } => Some(protocol.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                liquidation_markets.sort();
-                liquidation_markets.dedup();
-                let strategy = if !liquidation_markets.is_empty() {
-                    Strategy::Liquidation
-                } else if backrun_hint.is_some() {
-                    Strategy::Backrun
-                } else {
-                    Strategy::Arb
-                };
-                let venue_path = build_venue_path(&cycle_edges_vec);
-                let fee_tiers: Vec<u32> = cycle_edges_vec
-                    .iter()
-                    .map(|edge| match &edge.venue {
-                        VenueEdge::UniV3 { fee, .. } => *fee,
-                        _ => 0,
-                    })
-                    .collect();
-                let candidate_id = self.stage_candidate_id(
-                    cycle_start,
-                    &cycle_ix,
-                    &graph,
-                    block_number,
-                    &fee_tiers,
-                );
-                self.log_candidate_stage(
-                    "candidate_selected",
-                    &self.chain_name,
-                    Some(candidate_id.clone()),
-                    Some(cycle_start),
-                    Some(cycle_ix.len().saturating_sub(1)),
-                    edges_scanned,
-                    Some(venue_path.clone()),
-                    Some(est_gross_after_fee),
-                    Some(gas_cost_native),
-                    Some(gas_cost),
-                    pricing_reliable,
-                    Some(min_profit_requirement),
-                    None,
-                    None,
-                    has_bridge_step,
-                    !liquidation_markets.is_empty(),
-                );
-                best_candidate = Some(CandidatePlan {
+            let mut liquidation_markets: Vec<String> = cycle_edges_vec
+                .iter()
+                .filter_map(|edge| match &edge.venue {
+                    VenueEdge::Liquidation { protocol, .. } => Some(protocol.clone()),
+                    _ => None,
+                })
+                .collect();
+            liquidation_markets.sort();
+            liquidation_markets.dedup();
+            let strategy = if !liquidation_markets.is_empty() {
+                Strategy::Liquidation
+            } else if backrun_hint.is_some() {
+                Strategy::Backrun
+            } else {
+                Strategy::Arb
+            };
+            let venue_path = build_venue_path(&cycle_edges_vec);
+            self.log_candidate_stage(
+                "candidate_selected",
+                &self.chain_name,
+                Some(candidate_id.clone()),
+                Some(cycle_start),
+                Some(cycle_ix.len().saturating_sub(1)),
+                edges_scanned,
+                Some(venue_path.clone()),
+                Some(est_gross_after_fee),
+                Some(gas_cost_native),
+                Some(gas_cost),
+                pricing_reliable,
+                Some(min_profit_requirement),
+                None,
+                None,
+                has_bridge_step,
+                !liquidation_markets.is_empty(),
+            );
+            let candidate_plan = CandidatePlan {
                     plan_args,
                     cycle_start,
                     amount_in: trade_amount,
@@ -5888,8 +6175,10 @@ where
                     strategy,
                     venue_path,
                     candidate_id,
-                });
-            }
+                };
+            ranked_candidates.push(candidate_plan);
+            ranked_candidates.sort_by(|a, b| b.net_profit.cmp(&a.net_profit));
+            ranked_candidates.truncate(sim_cascade_cap);
         }
 
         if let Some(metrics) = &self.metrics {
@@ -5897,10 +6186,27 @@ where
             metrics.record_stage_latency(&self.chain_name, "quote", latency_ms);
         }
 
-        if let Some(candidate) = best_candidate {
-            let mut candidate = candidate;
+        let attempt_limit = ranked_candidates.len();
+        let mut cascade_failures: Vec<String> = Vec::new();
+        let mut selected_candidate: Option<CandidatePlan> = None;
+
+        if let Some(first) = ranked_candidates.first() {
             if let Some(metrics) = &self.metrics {
-                metrics.record_opportunity_seen(&self.chain_name, candidate.strategy.as_str());
+                metrics.record_opportunity_seen(&self.chain_name, first.strategy.as_str());
+            }
+        }
+
+        'cascade: for (cascade_idx, mut candidate) in
+            ranked_candidates.into_iter().take(attempt_limit).enumerate()
+        {
+            if cascade_idx > 0 {
+                info!(
+                    chain = %self.chain_name,
+                    cascade_rank = cascade_idx,
+                    candidate_id = %candidate.candidate_id,
+                    net_profit = %candidate.net_profit,
+                    "simulation cascade: trying next ranked candidate"
+                );
             }
             let simulate_start = Instant::now();
             self.log_candidate_stage(
@@ -5925,7 +6231,7 @@ where
                 candidate.has_bridge_step,
                 !candidate.liquidation_markets.is_empty(),
             );
-            let (simulated_gas_used, simulated_profit) = match timeout(
+            let (simulated_gas_used, simulated_profit, simulated_l1_fee) = match timeout(
                 self.simulation_budget,
                 self.simulate_plan_execution(&candidate.plan_args, &candidate.fee_estimate),
             )
@@ -5973,15 +6279,12 @@ where
                             liquidations.record_revert(market).await;
                         }
                     }
-                    return Ok(ScanOutcome::NotProfitable {
-                        reason: format!(
-                            "cycle start=0x{} simulation failed: {}",
-                            hex::encode(candidate.cycle_start),
-                            err
-                        ),
-                        edges: edges_scanned,
-                        expected_univ3_edges,
-                    });
+                    cascade_failures.push(format!(
+                        "cycle start=0x{} simulation failed: {}",
+                        hex::encode(candidate.cycle_start),
+                        err
+                    ));
+                    continue 'cascade;
                 }
                 Err(_) => {
                     self.log_candidate_stage(
@@ -6019,14 +6322,11 @@ where
                             as u64;
                         metrics.record_stage_latency(&self.chain_name, "simulate", latency_ms);
                     }
-                    return Ok(ScanOutcome::NotProfitable {
-                        reason: format!(
-                            "cycle start=0x{} simulation budget exceeded",
-                            hex::encode(candidate.cycle_start)
-                        ),
-                        edges: edges_scanned,
-                        expected_univ3_edges,
-                    });
+                    cascade_failures.push(format!(
+                        "cycle start=0x{} simulation budget exceeded",
+                        hex::encode(candidate.cycle_start)
+                    ));
+                    continue 'cascade;
                 }
             };
             if let Some(metrics) = &self.metrics {
@@ -6060,16 +6360,16 @@ where
                     candidate.has_bridge_step,
                     !candidate.liquidation_markets.is_empty(),
                 );
-                return Ok(ScanOutcome::NotProfitable {
-                    reason: format!(
-                        "cycle start=0x{} simulation returned zero profit",
-                        hex::encode(candidate.cycle_start)
-                    ),
-                    edges: edges_scanned,
-                    expected_univ3_edges,
-                });
+                cascade_failures.push(format!(
+                    "cycle start=0x{} simulation returned zero profit",
+                    hex::encode(candidate.cycle_start)
+                ));
+                continue 'cascade;
             }
 
+            if !simulated_l1_fee.is_zero() {
+                candidate.fee_estimate.l1_data_fee = simulated_l1_fee;
+            }
             let buffered_sim_limit = simulated_gas_used
                 .saturating_mul(U256::from(12u64))
                 .checked_div(U256::from(10u64))
@@ -6115,16 +6415,13 @@ where
                     candidate.has_bridge_step,
                     !candidate.liquidation_markets.is_empty(),
                 );
-                return Ok(ScanOutcome::NotProfitable {
-                    reason: format!(
-                        "cycle start=0x{} rejected by risk policy after simulation: {} (gas_units={})",
-                        hex::encode(candidate.cycle_start),
-                        reason,
-                        gas_limit_u64
-                    ),
-                    edges: edges_scanned,
-                    expected_univ3_edges,
-                });
+                cascade_failures.push(format!(
+                    "cycle start=0x{} rejected by risk policy after simulation: {} (gas_units={})",
+                    hex::encode(candidate.cycle_start),
+                    reason,
+                    gas_limit_u64
+                ));
+                continue 'cascade;
             }
 
             // Post-simulation threshold MUST be derived from the exact same
@@ -6178,14 +6475,11 @@ where
                     candidate.has_bridge_step,
                     !candidate.liquidation_markets.is_empty(),
                 );
-                return Ok(ScanOutcome::NotProfitable {
-                    reason: format!(
-                        "cycle start=0x{} failed: unreliable native pricing after simulation",
-                        hex::encode(candidate.cycle_start)
-                    ),
-                    edges: edges_scanned,
-                    expected_univ3_edges,
-                });
+                cascade_failures.push(format!(
+                    "cycle start=0x{} failed: unreliable native pricing after simulation",
+                    hex::encode(candidate.cycle_start)
+                ));
+                continue 'cascade;
             };
             candidate.gas_cost = gas_cost_tokens;
             candidate.net_profit = candidate
@@ -6219,19 +6513,21 @@ where
                     candidate.has_bridge_step,
                     !candidate.liquidation_markets.is_empty(),
                 );
-                return Ok(ScanOutcome::NotProfitable {
-                    reason: format!(
-                        "cycle start=0x{} failed simulation profit check grossWei={} gasWei={} thresholdWei={}",
-                        hex::encode(candidate.cycle_start),
-                        candidate.est_gross_after_fee,
-                        candidate.gas_cost_native,
-                        candidate.plan_args.min_profit
-                    ),
-                    edges: edges_scanned,
-                    expected_univ3_edges,
-                });
+                cascade_failures.push(format!(
+                    "cycle start=0x{} failed simulation profit check grossWei={} gasWei={} thresholdWei={}",
+                    hex::encode(candidate.cycle_start),
+                    candidate.est_gross_after_fee,
+                    candidate.gas_cost_native,
+                    candidate.plan_args.min_profit
+                ));
+                continue 'cascade;
             }
 
+            selected_candidate = Some(candidate);
+            break 'cascade;
+        }
+
+        if let Some(mut candidate) = selected_candidate {
             let min_profit_target = candidate.plan_args.min_profit;
             self.log_candidate_stage(
                 "candidate_dispatch_eligible",
@@ -6507,6 +6803,18 @@ where
             );
 
             return Ok(ScanOutcome::Executed(Box::new(summary)));
+        }
+
+        if !cascade_failures.is_empty() {
+            return Ok(ScanOutcome::NotProfitable {
+                reason: format!(
+                    "simulation cascade exhausted ({} attempts): {}",
+                    cascade_failures.len(),
+                    cascade_failures.join("; ")
+                ),
+                edges: edges_scanned,
+                expected_univ3_edges,
+            });
         }
 
         if let Some(reason) = last_skip_reason {
@@ -6948,6 +7256,50 @@ where
                         "All private relay broadcasts failed; failing closed",
                     );
                 }
+
+                // OP Stack / Arbitrum / Linea have no bundle relay market. When
+                // relay RPC submission fails (auth, rate limits, bundle unsupported),
+                // fall back to a direct signed send on the primary provider — the
+                // same path live Base searchers use for sequencer inclusion.
+                if gas_model_uses_sequencer_submission_by_chain(&self.chain_name) {
+                    warn!(
+                        target: "broadcast",
+                        chain = %self.chain_name,
+                        "Relay submission exhausted; falling back to direct sequencer send"
+                    );
+                    let pending = match call.send().await {
+                        Ok(pending) => pending,
+                        Err(err) => {
+                            if let Some((manager, nonce)) = &nonce_record {
+                                manager.mark_failed(*nonce).await;
+                            }
+                            return Err(err.into());
+                        }
+                    };
+                    let tx_hash = pending.tx_hash();
+                    let receipt = match pending.await {
+                        Ok(receipt) => {
+                            if let Some((manager, nonce)) = &nonce_record {
+                                manager.mark_confirmed(*nonce).await;
+                            }
+                            receipt
+                        }
+                        Err(err) => {
+                            if let Some((manager, nonce)) = &nonce_record {
+                                manager.mark_failed(*nonce).await;
+                            }
+                            return Err(err.into());
+                        }
+                    };
+                    return Ok(DispatchResult {
+                        tx_hash,
+                        receipt,
+                        latency: start.elapsed(),
+                        private_relay_rejected: true,
+                        private_submission_method: Some(PrivateSubmissionMethod::PrivateRaw),
+                    });
+                }
+
                 if let Some((manager, nonce)) = &nonce_record {
                     manager.mark_failed(*nonce).await;
                 }
@@ -7131,7 +7483,7 @@ where
         &self,
         plan: &ExecutorPlan,
         gas: &FeeEstimate,
-    ) -> Result<(U256, U256)> {
+    ) -> Result<(U256, U256, U256)> {
         let mut call = self.executor.start_v2(plan.clone());
         if let Some(wallet) = &self.wallet {
             call.tx.set_from(wallet.address());
@@ -7139,6 +7491,95 @@ where
         apply_gas_parameters(&mut call.tx, gas);
         let tx = call.tx.clone();
         let client = self.executor.client();
+        let executor_address = self.executor.address();
+
+        if sim_revm_enabled() {
+            let block_number = client
+                .get_block_number()
+                .await
+                .context("revm fork block number")?
+                .as_u64();
+            let chain_id = client
+                .get_chainid()
+                .await
+                .context("revm fork chain id")?
+                .as_u64();
+            let timeout_ms = sim_revm_timeout_ms();
+            let mut prefetch_extra = Vec::new();
+            for loan in &plan.loans {
+                if !loan.token.is_zero() {
+                    prefetch_extra.push(loan.token);
+                }
+                if !loan.provider_addr.is_zero() {
+                    prefetch_extra.push(loan.provider_addr);
+                }
+            }
+            if !self.wrapped_native.is_zero() {
+                prefetch_extra.push(self.wrapped_native);
+            }
+            if !self.bal_vault.is_zero() {
+                prefetch_extra.push(self.bal_vault);
+            }
+            if let Some(pool) = self.aave_pool {
+                if !pool.is_zero() {
+                    prefetch_extra.push(pool);
+                }
+            }
+            let fork_req = SimForkRequest {
+                rpc_url: self.rpc_endpoint.clone(),
+                block_number,
+                chain_id,
+                executor_address,
+                executor_bytecode: None,
+                tx: tx.clone(),
+                prefetch_addresses: prefetch_extra,
+                metrics: self.metrics.clone(),
+            };
+            match timeout(
+                Duration::from_millis(timeout_ms),
+                simulate_via_revm(fork_req),
+            )
+            .await
+            {
+                Ok(Ok(result)) => {
+                    if let Some(metrics) = &self.metrics {
+                        if result.success {
+                            record_revm_metrics(metrics, RevmSimOutcome::Success);
+                        } else {
+                            record_revm_metrics(metrics, RevmSimOutcome::Failure);
+                        }
+                    }
+                    if result.profit < plan.min_profit {
+                        return Err(anyhow!("revm sim profit below min_profit"));
+                    }
+                    return Ok((
+                        U256::from(result.gas_used),
+                        result.profit,
+                        result.l1_fee_wei,
+                    ));
+                }
+                Ok(Err(err)) => {
+                    if let Some(metrics) = &self.metrics {
+                        record_revm_metrics(metrics, RevmSimOutcome::Fallback);
+                    }
+                    warn!(
+                        error = %err,
+                        block_number,
+                        "ARBOT_SIM_REVM=1 revm path failed; falling back to eth_call"
+                    );
+                }
+                Err(_) => {
+                    if let Some(metrics) = &self.metrics {
+                        record_revm_metrics(metrics, RevmSimOutcome::Fallback);
+                    }
+                    warn!(
+                        timeout_ms,
+                        block_number,
+                        "ARBOT_SIM_REVM=1 revm path timed out; falling back to eth_call"
+                    );
+                }
+            }
+        }
 
         let raw = client
             .call(&tx, Some(BlockId::Number(BlockNumber::Pending)))
@@ -7166,7 +7607,7 @@ where
             .estimate_gas(&tx, Some(BlockId::Number(BlockNumber::Pending)))
             .await
             .context("simulation gas estimate failed")?;
-        Ok((gas_used, profit))
+        Ok((gas_used, profit, gas.l1_data_fee))
     }
 
     async fn run(
@@ -7587,6 +8028,30 @@ async fn command_listener(txs: Vec<mpsc::Sender<Command>>) {
     }
 }
 
+/// Shadow and unattended runs should not block on stdin waiting for `start`.
+fn interactive_command_listener_enabled() -> bool {
+    if std::env::var("ARBOT_NONINTERACTIVE")
+        .ok()
+        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if std::env::var("SHADOW_MODE")
+        .ok()
+        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+        && !std::env::var("ARBOT_INTERACTIVE")
+            .ok()
+            .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
 async fn monitor_status(chain: String, mut rx: watch::Receiver<StatusSnapshot>) {
     display_status(&chain, rx.borrow().clone());
     while rx.changed().await.is_ok() {
@@ -7812,6 +8277,7 @@ mod runner_tests {
                 univ3_fee_tiers: None,
                 bal_vault: Address::zero(),
                 aave_pool: None,
+                aave_fee_bps: 9,
                 erc3156_lender: None,
                 erc3156_fee_bps: 9,
                 bal_flashloan_tokens: None,
@@ -7821,12 +8287,25 @@ mod runner_tests {
                 univ3_flashloan_tokens: None,
                 chain_env_prefix: "TEST".into(),
                 tokens,
+                initial_token_decimals: HashMap::new(),
                 wrapped_native: Address::zero(),
                 capital,
                 pool_depth_cache: pool_cache,
                 pool_monitor: None,
                 hot_univ2_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
                 hot_univ3_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                hot_slipstream_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                slipstream_quoter_addr: Address::zero(),
+                slipstream_factory: Address::zero(),
+                slipstream_router: Address::zero(),
+                slipstream_validation: None,
+                slipstream_tick_spacings: None,
+                hot_pancakeswap_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                pancakeswap_quoter_addr: Address::zero(),
+                pancakeswap_factory: Address::zero(),
+                pancakeswap_router: Address::zero(),
+                pancakeswap_validation: None,
+                pancakeswap_fee_tiers: None,
                 edge_slippage_bps: 0,
                 executor_max_slippage_bps: 0,
                 edge_prune_max_slippage_bps: 0,
@@ -7898,6 +8377,7 @@ mod runner_tests {
                 risk_policy: None,
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
                 block_head_rx: None,
+                bf_skip_on_stable_graph: false,
             },
             executor,
         );
@@ -8088,6 +8568,7 @@ mod runner_tests {
                 univ3_fee_tiers: None,
                 bal_vault: Address::zero(),
                 aave_pool: None,
+                aave_fee_bps: 9,
                 erc3156_lender: None,
                 erc3156_fee_bps: 9,
                 bal_flashloan_tokens: None,
@@ -8097,12 +8578,25 @@ mod runner_tests {
                 univ3_flashloan_tokens: None,
                 chain_env_prefix: "TEST".into(),
                 tokens: tokens.clone(),
+                initial_token_decimals: HashMap::new(),
                 wrapped_native: Address::zero(),
                 capital,
                 pool_depth_cache: pool_cache,
                 pool_monitor: None,
                 hot_univ2_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
                 hot_univ3_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                hot_slipstream_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                slipstream_quoter_addr: Address::zero(),
+                slipstream_factory: Address::zero(),
+                slipstream_router: Address::zero(),
+                slipstream_validation: None,
+                slipstream_tick_spacings: None,
+                hot_pancakeswap_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                pancakeswap_quoter_addr: Address::zero(),
+                pancakeswap_factory: Address::zero(),
+                pancakeswap_router: Address::zero(),
+                pancakeswap_validation: None,
+                pancakeswap_fee_tiers: None,
                 edge_slippage_bps: 0,
                 executor_max_slippage_bps: 0,
                 edge_prune_max_slippage_bps: 0,
@@ -8174,6 +8668,7 @@ mod runner_tests {
                 risk_policy: None,
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
                 block_head_rx: None,
+                bf_skip_on_stable_graph: false,
             },
             executor,
         );
@@ -8200,7 +8695,7 @@ mod runner_tests {
             total_fee_native: U256::zero(),
         };
 
-        let (gas_used, profit) = runner
+        let (gas_used, profit, _l1_fee) = runner
             .simulate_plan_execution(&plan_args, &fee)
             .await
             .expect("simulate plan execution");
@@ -8255,6 +8750,7 @@ mod runner_tests {
                 univ3_fee_tiers: None,
                 bal_vault: Address::zero(),
                 aave_pool: None,
+                aave_fee_bps: 9,
                 erc3156_lender: None,
                 erc3156_fee_bps: 9,
                 bal_flashloan_tokens: None,
@@ -8264,12 +8760,25 @@ mod runner_tests {
                 univ3_flashloan_tokens: None,
                 chain_env_prefix: "TEST".into(),
                 tokens,
+                initial_token_decimals: HashMap::new(),
                 wrapped_native: Address::zero(),
                 capital,
                 pool_depth_cache: pool_cache,
                 pool_monitor: None,
                 hot_univ2_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
                 hot_univ3_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                hot_slipstream_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                slipstream_quoter_addr: Address::zero(),
+                slipstream_factory: Address::zero(),
+                slipstream_router: Address::zero(),
+                slipstream_validation: None,
+                slipstream_tick_spacings: None,
+                hot_pancakeswap_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                pancakeswap_quoter_addr: Address::zero(),
+                pancakeswap_factory: Address::zero(),
+                pancakeswap_router: Address::zero(),
+                pancakeswap_validation: None,
+                pancakeswap_fee_tiers: None,
                 edge_slippage_bps: 0,
                 executor_max_slippage_bps: 0,
                 edge_prune_max_slippage_bps: 0,
@@ -8344,6 +8853,7 @@ mod runner_tests {
                 risk_policy: None,
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
                 block_head_rx: None,
+                bf_skip_on_stable_graph: false,
             },
             executor,
         );
@@ -8447,6 +8957,24 @@ mod runner_tests {
         let boosted_a = boosted.get(&a).copied().unwrap_or_default();
 
         assert!(boosted_a > baseline_a, "backrun hint should raise priority");
+    }
+
+    #[test]
+    fn sim_cascade_depth_defaults_and_respects_env() {
+        let prior = std::env::var("ARBOT_SIM_CASCADE_DEPTH").ok();
+        std::env::remove_var("ARBOT_SIM_CASCADE_DEPTH");
+        assert_eq!(sim_cascade_depth(), DEFAULT_SIM_CASCADE_DEPTH);
+
+        std::env::set_var("ARBOT_SIM_CASCADE_DEPTH", "5");
+        assert_eq!(sim_cascade_depth(), 5);
+
+        std::env::set_var("ARBOT_SIM_CASCADE_DEPTH", "0");
+        assert_eq!(sim_cascade_depth(), DEFAULT_SIM_CASCADE_DEPTH);
+
+        match prior {
+            Some(value) => std::env::set_var("ARBOT_SIM_CASCADE_DEPTH", value),
+            None => std::env::remove_var("ARBOT_SIM_CASCADE_DEPTH"),
+        }
     }
 }
 
@@ -8617,6 +9145,187 @@ fn resolve_erc3156_lender(
     }
 
     Ok(None)
+}
+
+fn resolve_aave_fee_bps(
+    chain_name: &str,
+    ops_inputs: &crate::ops_inputs::OpsInputs,
+) -> u32 {
+    const DEFAULT_AAVE_FEE_BPS: u32 = 9;
+    if let Some(chain) = ops_inputs
+        .chains
+        .iter()
+        .find(|chain| chain.chain_name.eq_ignore_ascii_case(chain_name))
+    {
+        if let Some(fee_bps) = chain.flashloans.iter().find_map(|fl| {
+            if matches!(fl.kind, Some(crate::ops_inputs::FlashloanKind::AaveV3Like)) {
+                fl.fee_bps
+            } else {
+                None
+            }
+        }) {
+            return fee_bps;
+        }
+    }
+
+    let prefixed = format!(
+        "{}_AAVE_FLASH_FEE_BPS",
+        chain_env_prefix_for_name(chain_name)
+    );
+    if let Ok(raw) = std::env::var(&prefixed) {
+        if let Ok(fee_bps) = raw.trim().parse::<u32>() {
+            if fee_bps <= 10_000 {
+                return fee_bps;
+            }
+        }
+    }
+    if let Ok(raw) = std::env::var("AAVE_FLASH_FEE_BPS") {
+        if let Ok(fee_bps) = raw.trim().parse::<u32>() {
+            if fee_bps <= 10_000 {
+                return fee_bps;
+            }
+        }
+    }
+    DEFAULT_AAVE_FEE_BPS
+}
+
+fn chain_env_prefix_for_name(chain_name: &str) -> &'static str {
+    match chain_name.to_ascii_lowercase().as_str() {
+        "ethereum" => "ETH",
+        "arbitrum" => "ARB",
+        "optimism" => "OPT",
+        "base" => "BASE",
+        "polygon" => "POLYGON",
+        "linea" => "LINEA",
+        "abstract" => "ABSTRACT",
+        "ink" => "INK",
+        "mantle" => "MANTLE",
+        "scroll" => "SCROLL",
+        _ => "CHAIN",
+    }
+}
+
+fn gas_model_uses_sequencer_submission(gas_model: &crate::ops_inputs::GasModel) -> bool {
+    matches!(
+        gas_model,
+        crate::ops_inputs::GasModel::OpStack
+            | crate::ops_inputs::GasModel::Arbitrum
+            | crate::ops_inputs::GasModel::LineaEstimateGas
+    )
+}
+
+fn gas_model_uses_sequencer_submission_by_chain(chain_name: &str) -> bool {
+    matches!(
+        chain_name.to_ascii_lowercase().as_str(),
+        "base" | "optimism" | "arbitrum" | "linea"
+    )
+}
+
+fn merge_sequencer_submission_relays(cfg: &ChainCfg, relays: Vec<String>) -> Vec<String> {
+    if !gas_model_uses_sequencer_submission(&cfg.gas_model) {
+        return relays;
+    }
+    let mut merged = relays;
+    for endpoint in cfg.rpc_endpoints() {
+        let trimmed = endpoint.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if merged
+            .iter()
+            .any(|existing| existing.trim().eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        info!(
+            target: "broadcast",
+            chain = %cfg.name,
+            endpoint = %trimmed,
+            "Injecting primary RPC as sequencer submission endpoint (L2 has no bundle relay market)"
+        );
+        merged.insert(0, trimmed.to_owned());
+    }
+    merged
+}
+
+async fn ensure_executor_ownership_chain<M: Middleware + 'static>(
+    executor: &MultiVenueArbExecutor<M>,
+    expected_operator_owner: Option<Address>,
+    chain: &str,
+) -> Result<Address>
+where
+    M::Error: 'static,
+{
+    let batch_router = executor
+        .owner()
+        .call()
+        .await
+        .with_context(|| format!("fetch executor.owner() (BatchRouter) on {chain}"))?;
+    if batch_router.is_zero() {
+        anyhow::bail!("executor.owner() is zero on {chain}; deployment is broken");
+    }
+
+    let router_admin = BatchRouterAdmin::new(batch_router, executor.client());
+    let operator_owner = router_admin
+        .owner()
+        .call()
+        .await
+        .with_context(|| format!("fetch BatchRouter.owner() on {chain}"))?;
+
+    info!(
+        chain = %chain,
+        executor = %format!("{:#x}", executor.address()),
+        batch_router = %format!("{batch_router:#x}"),
+        operator_owner = %format!("{operator_owner:#x}"),
+        "executor ownership chain: clone → BatchRouter → operator wallet"
+    );
+
+    if let Some(expected) = expected_operator_owner {
+        if operator_owner != expected {
+            anyhow::bail!(
+                "BatchRouter.owner() is {operator_owner:#x} but configured EXECUTOR_OWNER is {expected:#x} on {chain}; \
+fix ops/inputs.yaml and {}_EXECUTOR_OWNER to match the wallet that controls the router",
+                chain_env_prefix_for_name(chain)
+            );
+        }
+    } else {
+        warn!(
+            chain = %chain,
+            operator = %format!("{operator_owner:#x}"),
+            "EXECUTOR_OWNER not configured; set it to BatchRouter.owner() for startup validation"
+        );
+    }
+
+    Ok(batch_router)
+}
+
+async fn ensure_executor_allowlisted<M: Middleware + 'static>(
+    executor: &MultiVenueArbExecutor<M>,
+    signer: Address,
+    chain: &str,
+) -> Result<()>
+where
+    M::Error: 'static,
+{
+    let allowed = executor
+        .executors(signer)
+        .call()
+        .await
+        .with_context(|| format!("fetch executor allowlist for signer {signer:#x}"))?;
+    if allowed {
+        info!(
+            chain = %chain,
+            signer = %format!("{signer:#x}"),
+            "executor allowlist: hot wallet approved for startV2"
+        );
+        return Ok(());
+    }
+    anyhow::bail!(
+        "hot wallet {signer:#x} is NOT in the executor allowlist on {chain}; \
+every startV2 call (including simulation) reverts NotExecutor. \
+Approve the signer via BatchRouter.setExecutor(signer, true) from the router owner, \
+then verify with: cast call $EXECUTOR \"executors(address)(bool)\" {signer:#x} --rpc-url $RPC"
+    );
 }
 
 fn resolve_erc3156_fee_bps(
@@ -8868,6 +9577,7 @@ fn tokens_to_native(price: NativePrice, amount: U256) -> U256 {
 fn venue_label(edge: &Edge) -> String {
     match &edge.venue {
         VenueEdge::UniV3 { .. } => "univ3".to_string(),
+        VenueEdge::Slipstream { .. } => "slipstream".to_string(),
         VenueEdge::UniV2 { .. } => "univ2".to_string(),
         VenueEdge::SolidlyV2 { .. } => "solidly_v2".to_string(),
         VenueEdge::Univ4 { .. } => "univ4".to_string(),
@@ -8891,7 +9601,7 @@ fn is_rpc_error(err: &anyhow::Error) -> bool {
         || message.contains("http")
 }
 
-fn relay_env_endpoints(env_prefix: &str) -> Option<Vec<String>> {
+fn relay_env_endpoints(env_prefix: &str, chain_name: &str) -> Option<Vec<String>> {
     let prefixed_urls = format!("{env_prefix}_PRIVATE_RELAY_URLS");
     if let Ok(urls) = std::env::var(&prefixed_urls) {
         return Some(parse_endpoint_list(&urls));
@@ -8903,16 +9613,50 @@ fn relay_env_endpoints(env_prefix: &str) -> Option<Vec<String>> {
             return Some(vec![trimmed.to_string()]);
         }
     }
-    if let Ok(urls) = std::env::var("PRIVATE_RELAY_URLS") {
-        return Some(parse_endpoint_list(&urls));
-    }
-    if let Ok(url) = std::env::var("PRIVATE_RELAY_URL") {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return Some(vec![trimmed.to_string()]);
+    // Global Flashbots-style relays are Ethereum-only. Using them on L2 sequencers
+    // causes silent submission failures at live broadcast time.
+    if chain_name.eq_ignore_ascii_case("ethereum") {
+        if let Ok(urls) = std::env::var("PRIVATE_RELAY_URLS") {
+            return Some(parse_endpoint_list(&urls));
+        }
+        if let Ok(url) = std::env::var("PRIVATE_RELAY_URL") {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() {
+                return Some(vec![trimmed.to_string()]);
+            }
         }
     }
     None
+}
+
+fn is_ethereum_bundle_relay(endpoint: &str) -> bool {
+    let lower = endpoint.to_ascii_lowercase();
+    lower.contains("flashbots")
+        || lower.contains("titanbuilder")
+        || lower.contains("beaverbuild")
+        || lower.contains("builder0x69")
+        || DEFAULT_PRIVATE_RELAYS
+            .iter()
+            .any(|(_, url)| lower.starts_with(&url.to_ascii_lowercase()))
+}
+
+fn validate_broadcast_relays_for_chain(chain_name: &str, endpoints: &[String]) -> Result<()> {
+    if !gas_model_uses_sequencer_submission_by_chain(chain_name) {
+        return Ok(());
+    }
+    let bad: Vec<&str> = endpoints
+        .iter()
+        .filter(|ep| is_ethereum_bundle_relay(ep))
+        .map(|s| s.as_str())
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let prefix = chain_env_prefix_for_name(chain_name);
+    anyhow::bail!(
+        "chain {chain_name} is an L2 sequencer chain but broadcast relays include Ethereum bundle builders: {bad:?}. \
+Remove PRIVATE_RELAY_URL(S) from .env or set {prefix}_PRIVATE_RELAY_URLS to your sequencer RPC (see ops/inputs.yaml broadcast.private_relays)"
+    );
 }
 
 fn require_pool_inventory(
@@ -8948,7 +9692,7 @@ async fn select_broadcast_endpoint(
     let ops_relays = ops_chain
         .map(|chain| chain.broadcast_private_relays.clone())
         .filter(|relays| !relays.is_empty());
-    let env_relays = relay_env_endpoints(&cfg.env_prefix).filter(|relays| !relays.is_empty());
+    let env_relays = relay_env_endpoints(&cfg.env_prefix, &cfg.name).filter(|relays| !relays.is_empty());
     let relays = ops_relays.or(env_relays);
     let public_jitter_override = ops_chain.and_then(|chain| chain.broadcast_public_jitter_bps);
     let allow_private_raw_fallback = ops_chain
@@ -8963,6 +9707,8 @@ async fn select_broadcast_endpoint(
     }
 
     if let Some(endpoints) = relays {
+        validate_broadcast_relays_for_chain(&cfg.name, &endpoints)?;
+        let endpoints = merge_sequencer_submission_relays(cfg, endpoints);
         let providers = connect_private_relays(
             &endpoints,
             &cfg.name,
@@ -9165,9 +9911,9 @@ async fn launch_chain_runtime(
     let max_relaxations: usize = std::env::var("BELLMAN_MAX_RELAXATIONS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(bounded_max_hops)
+        .unwrap_or(bounded_max_hops.saturating_mul(4).max(24))
         .max(1)
-        .min(bounded_max_hops);
+        .min(256);
     let max_hops = bounded_max_hops;
     let edge_slippage_bps: u32 = std::env::var("EDGE_SLIPPAGE_BPS")
         .unwrap_or_else(|_| "30".into())
@@ -9529,6 +10275,9 @@ async fn launch_chain_runtime(
         },
     )
     .await?;
+    ensure_executor_allowlisted(&executor, wallet.address(), &cfg.name).await?;
+    let batch_router =
+        ensure_executor_ownership_chain(&executor, executor_owner, &cfg.name).await?;
     let (_, executor_max_slippage_bps_raw, _) = executor
         .get_config()
         .call()
@@ -9536,19 +10285,12 @@ async fn launch_chain_runtime(
         .context("fetch executor config")?;
     let executor_max_slippage_bps = u32::from(executor_max_slippage_bps_raw);
 
-    if let Ok(onchain_owner) = executor.owner().call().await {
-        if let Some(expected_owner) = executor_owner {
-            if onchain_owner != expected_owner {
-                warn!(
-                    chain = %cfg.name,
-                    env_prefix = %cfg.env_prefix,
-                    onchain = %format!("{:#x}", onchain_owner),
-                    expected = %format!("{:#x}", expected_owner),
-                    "executor owner mismatch; using on-chain owner"
-                );
-            }
-        }
-    }
+    info!(
+        chain = %cfg.name,
+        batch_router = %format!("{batch_router:#x}"),
+        signer = %format!("{:#x}", wallet.address()),
+        "live execution path: signer → executor.startV2 (allowlisted) or BatchRouter.startV2 (router owner)"
+    );
 
     if let Ok(onchain_permit2) = executor.permit_2().call().await {
         if onchain_permit2 != permit2_address {
@@ -9588,11 +10330,26 @@ async fn launch_chain_runtime(
     // tip. Default 50% — aggressive enough to win contested inclusion while
     // guaranteeing the trade keeps at least half its edge. Clamped to <=90% so
     // a bid can never erase the entire margin. Set 0 to disable.
-    let bid_profit_fraction_bps = std::env::var("ARBOT_BID_PROFIT_FRACTION_BPS")
+    let bid_profit_fraction_bps = std::env::var("ARBOT_TIP_BPS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .or_else(|| {
+            std::env::var("ARBOT_BID_PROFIT_FRACTION_BPS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u32>().ok())
+        })
         .unwrap_or(5_000)
         .min(9_000);
+
+    if cfg.chain_id == 8453 {
+        if matches!(broadcast_endpoint, BroadcastEndpoint::Private { .. }) {
+            warn!(
+                chain = %cfg.name,
+                chain_id = cfg.chain_id,
+                "Base (8453) uses public eth_sendRawTransaction for inclusion; Flashbots-style bundle relays are ignored on this chain"
+            );
+        }
+    }
 
     let broadcast = BroadcastConfig {
         endpoint: broadcast_endpoint,
@@ -9642,7 +10399,7 @@ async fn launch_chain_runtime(
         broadcast_delay_ms: chaos_broadcast_delay_ms,
     };
 
-    let feature_gate = FeatureGate::from_env();
+    let feature_gate = FeatureGate::from_env_for_chain(&ops_inputs, &cfg.name);
     info!(
         cycle_arb = feature_gate.cycle_arb,
         backrun = feature_gate.backrun,
@@ -9666,7 +10423,7 @@ async fn launch_chain_runtime(
     let backrun_requested = std::env::var("BACKRUN_MONITOR")
         .or_else(|_| std::env::var("BACKRUN_MONITOR_ENABLED"))
         .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+        .unwrap_or_else(|_| ops_inputs.backrun_enabled_for(&cfg.name));
     let backrun_enabled = if backrun_requested && !feature_gate.backrun {
         warn!("Backrun monitor requested but FEATURE_BACKRUN=0; forcing disabled");
         false
@@ -9693,16 +10450,13 @@ async fn launch_chain_runtime(
             min_price_impact_bps,
             token_list.clone(),
         ));
-        {
-            let monitor = monitor.clone();
-            let provider = provider.clone();
-            spawn_supervised(
-                "backrun_monitor",
-                cfg.name.clone(),
-                metrics.clone(),
-                move || monitor.clone().run(provider.clone(), poll_interval),
-            );
-        }
+        info!(
+            chain = %cfg.name,
+            min_amount_wei = %min_amount,
+            min_price_impact_bps,
+            poll_interval_ms = poll_interval.as_millis(),
+            "Backrun/mempool monitor enabled"
+        );
         Some(monitor)
     } else {
         None
@@ -9853,11 +10607,17 @@ async fn launch_chain_runtime(
 
     let mut cold_univ2_by_venue: HashMap<String, Vec<PoolRecord>> = HashMap::new();
     let mut cold_univ3_by_venue: HashMap<String, Vec<PoolRecord>> = HashMap::new();
+    let mut cold_pancakeswap_by_venue: HashMap<String, Vec<PoolRecord>> = HashMap::new();
+    let mut cold_slipstream_by_venue: HashMap<String, Vec<PoolRecord>> = HashMap::new();
     let mut hot_univ2_by_venue: HashMap<String, Vec<ResolvedUniV2PoolCfg>> = HashMap::new();
     let mut hot_univ3_by_venue: HashMap<String, Vec<PoolRecord>> = HashMap::new();
+    let mut hot_pancakeswap_by_venue: HashMap<String, Vec<PoolRecord>> = HashMap::new();
+    let mut hot_slipstream_by_venue: HashMap<String, Vec<PoolRecord>> = HashMap::new();
     let mut combined_univ2: Vec<ResolvedUniV2PoolCfg> = Vec::new();
     let mut combined_univ3: Vec<PoolRecord> = Vec::new();
-    let token_decimals_hint: HashMap<Address, u8> = HashMap::new();
+    let mut combined_pancakeswap: Vec<PoolRecord> = Vec::new();
+    let mut combined_slipstream: Vec<PoolRecord> = Vec::new();
+    let token_decimals_hint: HashMap<Address, u8> = load_token_decimals_map(&ops_inputs);
 
     for venue in venues.iter() {
         let Some(kind) = venue.kind.as_ref() else {
@@ -9907,6 +10667,41 @@ async fn launch_chain_runtime(
                 );
                 cold_univ2_by_venue.insert(venue.name.clone(), cold);
             }
+            crate::ops_inputs::VenueKind::Univ3Like if is_pancakeswap_univ3_venue(&venue.name) => {
+                let path = pool_data_path(&cfg.name, &venue.name);
+                info!(
+                    chain = %cfg.name,
+                    venue = %venue.name,
+                    kind = "univ3_like",
+                    pool_inventory_path = %path.display(),
+                    "loading cold pool inventory"
+                );
+                let mut cold = load_pool_records(&path).with_context(|| {
+                    format!(
+                        "failed to load cold pancakeswap pools for chain={} venue={} path={}",
+                        cfg.name,
+                        venue.name,
+                        path.display()
+                    )
+                })?;
+
+                if feature_gate.cycle_arb {
+                    require_pool_inventory(&cfg.name, &venue.name, &path, &cold)?;
+                }
+
+                if cold.len() > hot_pool_config.max_cold_pools {
+                    prioritize_cold_pool_inventory(&mut cold, hot_pool_config.max_cold_pools);
+                }
+                info!(
+                    chain = %cfg.name,
+                    venue = %venue.name,
+                    kind = "univ3_like",
+                    cold_pool_records = cold.len(),
+                    max_cold_pools = hot_pool_config.max_cold_pools,
+                    "loaded cold pool inventory"
+                );
+                cold_pancakeswap_by_venue.insert(venue.name.clone(), cold);
+            }
             crate::ops_inputs::VenueKind::Univ3Like => {
                 let path = pool_data_path(&cfg.name, &venue.name);
                 info!(
@@ -9942,6 +10737,41 @@ async fn launch_chain_runtime(
                 );
                 cold_univ3_by_venue.insert(venue.name.clone(), cold);
             }
+            crate::ops_inputs::VenueKind::SlipstreamLike => {
+                let path = pool_data_path(&cfg.name, &venue.name);
+                info!(
+                    chain = %cfg.name,
+                    venue = %venue.name,
+                    kind = "slipstream_like",
+                    pool_inventory_path = %path.display(),
+                    "loading cold pool inventory"
+                );
+                let mut cold = load_pool_records(&path).with_context(|| {
+                    format!(
+                        "failed to load cold slipstream pools for chain={} venue={} path={}",
+                        cfg.name,
+                        venue.name,
+                        path.display()
+                    )
+                })?;
+
+                if feature_gate.cycle_arb {
+                    require_pool_inventory(&cfg.name, &venue.name, &path, &cold)?;
+                }
+
+                if cold.len() > hot_pool_config.max_cold_pools {
+                    prioritize_cold_pool_inventory(&mut cold, hot_pool_config.max_cold_pools);
+                }
+                info!(
+                    chain = %cfg.name,
+                    venue = %venue.name,
+                    kind = "slipstream_like",
+                    cold_pool_records = cold.len(),
+                    max_cold_pools = hot_pool_config.max_cold_pools,
+                    "loaded cold pool inventory"
+                );
+                cold_slipstream_by_venue.insert(venue.name.clone(), cold);
+            }
             _ => {}
         }
     }
@@ -9954,15 +10784,34 @@ async fn launch_chain_runtime(
         .iter()
         .map(|(name, cold)| (name.clone(), cold.clone()))
         .collect();
+    let pancake_rank_inputs: Vec<(String, Vec<PoolRecord>)> = cold_pancakeswap_by_venue
+        .iter()
+        .map(|(name, cold)| (name.clone(), cold.clone()))
+        .collect();
+    let slipstream_rank_inputs: Vec<(String, Vec<PoolRecord>)> = cold_slipstream_by_venue
+        .iter()
+        .map(|(name, cold)| (name.clone(), cold.clone()))
+        .collect();
     let chain_for_rank = cfg.name.clone();
     let chain_for_rank_v3 = chain_for_rank.clone();
+    let chain_for_rank_slipstream = chain_for_rank.clone();
     let provider_v2 = provider.clone();
     let provider_v3 = provider.clone();
+    let provider_slipstream = provider.clone();
     let hot_config_v2 = hot_pool_config.clone();
     let hot_config_v3 = hot_pool_config.clone();
+    let hot_config_slipstream = hot_pool_config.clone();
     let decimals_for_rank = token_decimals_hint.clone();
+    let univ3_rank_ctx = Arc::new(build_univ3_rank_context(&ops_inputs, &cfg.env_prefix));
+    let univ3_rank_ctx_for_startup = Arc::clone(&univ3_rank_ctx);
+    let slipstream_rank_ctx = Arc::clone(&univ3_rank_ctx_for_startup);
 
-    let (v2_ranked, v3_ranked) = tokio::join!(
+    let chain_for_rank_pancake = chain_for_rank.clone();
+    let provider_pancake = provider.clone();
+    let hot_config_pancake = hot_pool_config.clone();
+    let pancake_rank_ctx = Arc::clone(&univ3_rank_ctx_for_startup);
+
+    let (v2_ranked, v3_ranked, pancake_ranked, slipstream_ranked) = tokio::join!(
         async move {
             let mut ranked = Vec::new();
             for (venue_name, cold) in v2_rank_inputs {
@@ -9981,11 +10830,13 @@ async fn launch_chain_runtime(
         },
         async move {
             let mut ranked = Vec::new();
+            let rank_ctx = univ3_rank_ctx_for_startup.clone();
             for (venue_name, cold) in v3_rank_inputs {
                 let hot = match rank_univ3_pools(
                     provider_v3.clone(),
                     cold.as_slice(),
                     &hot_config_v3,
+                    rank_ctx.as_ref(),
                 )
                 .await
                 {
@@ -10004,6 +10855,72 @@ async fn launch_chain_runtime(
                 ranked.push((venue_name, hot));
             }
             ranked
+        },
+        async move {
+            let mut ranked = Vec::new();
+            let rank_ctx = pancake_rank_ctx;
+            for (venue_name, cold) in pancake_rank_inputs {
+                let hot = match rank_univ3_pools(
+                    provider_pancake.clone(),
+                    cold.as_slice(),
+                    &hot_config_pancake,
+                    rank_ctx.as_ref(),
+                )
+                .await
+                {
+                    Ok(hot) => hot,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            chain = %chain_for_rank_pancake,
+                            venue = %venue_name,
+                            "failed to rank initial pancakeswap hot pools; continuing with empty set"
+                        );
+                        Vec::new()
+                    }
+                };
+                log_hot_pool_refresh(
+                    &chain_for_rank_pancake,
+                    &venue_name,
+                    "univ3_like",
+                    hot.len(),
+                );
+                ranked.push((venue_name, hot));
+            }
+            ranked
+        },
+        async move {
+            let mut ranked = Vec::new();
+            let rank_ctx = slipstream_rank_ctx;
+            for (venue_name, cold) in slipstream_rank_inputs {
+                let hot = match rank_univ3_pools(
+                    provider_slipstream.clone(),
+                    cold.as_slice(),
+                    &hot_config_slipstream,
+                    rank_ctx.as_ref(),
+                )
+                .await
+                {
+                    Ok(hot) => hot,
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            chain = %chain_for_rank_slipstream,
+                            venue = %venue_name,
+                            "failed to rank initial slipstream hot pools; continuing with empty set"
+                        );
+                        Vec::new()
+                    }
+                };
+                log_hot_pool_refresh(
+                    &chain_for_rank_slipstream,
+                    &venue_name,
+                    "slipstream_like",
+                    hot.len(),
+                );
+                ranked.push((venue_name, hot));
+            }
+            ranked
         }
     );
 
@@ -10015,11 +10932,23 @@ async fn launch_chain_runtime(
         combined_univ3.extend(hot.clone());
         hot_univ3_by_venue.insert(venue_name, hot);
     }
+    for (venue_name, hot) in pancake_ranked {
+        combined_pancakeswap.extend(hot.clone());
+        hot_pancakeswap_by_venue.insert(venue_name, hot);
+    }
+    for (venue_name, hot) in slipstream_ranked {
+        combined_slipstream.extend(hot.clone());
+        hot_slipstream_by_venue.insert(venue_name, hot);
+    }
 
     let hot_univ2_pools = Arc::new(tokio::sync::RwLock::new(combined_univ2));
     let hot_univ3_pools = Arc::new(tokio::sync::RwLock::new(combined_univ3));
+    let hot_pancakeswap_pools = Arc::new(tokio::sync::RwLock::new(combined_pancakeswap));
+    let hot_slipstream_pools = Arc::new(tokio::sync::RwLock::new(combined_slipstream));
     let hot_univ2_by_venue = Arc::new(tokio::sync::RwLock::new(hot_univ2_by_venue));
     let hot_univ3_by_venue = Arc::new(tokio::sync::RwLock::new(hot_univ3_by_venue));
+    let hot_pancakeswap_by_venue = Arc::new(tokio::sync::RwLock::new(hot_pancakeswap_by_venue));
+    let hot_slipstream_by_venue = Arc::new(tokio::sync::RwLock::new(hot_slipstream_by_venue));
 
     let pool_monitor = {
         let poll_ms = std::env::var("POOL_MONITOR_POLL_MS")
@@ -10031,12 +10960,15 @@ async fn launch_chain_runtime(
             .and_then(|raw| raw.parse::<u64>().ok())
             .unwrap_or_else(|| poll_ms.saturating_mul(3));
         let pools = hot_univ2_pools.read().await.clone();
+        let solidly_pools = solidly_monitored_pools(&cfg.env_prefix);
+        let monitored = venues::merge_monitored_pools(
+            monitored_pools_from_configs(&pools),
+            solidly_pools,
+        );
 
-        if pools.is_empty() {
+        if monitored.is_empty() {
             None
         } else {
-            let monitored = monitored_pools_from_configs(&pools);
-
             match PoolMonitor::new(
                 provider.clone(),
                 ws_provider.clone(),
@@ -10062,6 +10994,7 @@ async fn launch_chain_runtime(
         let provider = provider.clone();
         let venue = venue_name.clone();
         let chain = cfg.name.clone();
+        let chain_env_prefix = cfg.env_prefix.clone();
         let hot_config = hot_pool_config.clone();
         let hot_univ2_pools = Arc::clone(&hot_univ2_pools);
         let hot_univ2_by_venue = Arc::clone(&hot_univ2_by_venue);
@@ -10081,6 +11014,7 @@ async fn launch_chain_runtime(
                 let token_decimals_hint = token_decimals_hint.clone();
                 let pool_monitor = pool_monitor.clone();
                 let cold = cold.clone();
+                let chain_env_prefix = chain_env_prefix.clone();
                 async move {
                     info!(
                         chain = %chain,
@@ -10116,7 +11050,11 @@ async fn launch_chain_runtime(
                                     *guard = combined.clone();
                                 }
                                 if let Some(monitor) = pool_monitor.as_ref() {
-                                    let monitored = monitored_pools_from_configs(&combined);
+                                    let solidly = solidly_monitored_pools(&chain_env_prefix);
+                                    let monitored = venues::merge_monitored_pools(
+                                        monitored_pools_from_configs(&combined),
+                                        solidly,
+                                    );
                                     monitor.set_pools(monitored).await;
                                 }
                             }
@@ -10137,6 +11075,7 @@ async fn launch_chain_runtime(
         let hot_config = hot_pool_config.clone();
         let hot_univ3_pools = Arc::clone(&hot_univ3_pools);
         let hot_univ3_by_venue = Arc::clone(&hot_univ3_by_venue);
+        let univ3_rank_ctx = Arc::clone(&univ3_rank_ctx);
         spawn_supervised(
             "hot_pools_univ3",
             cfg.name.clone(),
@@ -10148,6 +11087,7 @@ async fn launch_chain_runtime(
                 let hot_config = hot_config.clone();
                 let hot_univ3_pools = Arc::clone(&hot_univ3_pools);
                 let hot_univ3_by_venue = Arc::clone(&hot_univ3_by_venue);
+                let rank_ctx = univ3_rank_ctx.clone();
                 let cold = cold.clone();
                 async move {
                     info!(
@@ -10160,7 +11100,12 @@ async fn launch_chain_runtime(
                     );
                     loop {
                         sleep(hot_config.refresh_interval).await;
-                        match rank_univ3_pools(provider.clone(), cold.as_slice(), &hot_config)
+                        match rank_univ3_pools(
+                            provider.clone(),
+                            cold.as_slice(),
+                            &hot_config,
+                            rank_ctx.as_ref(),
+                        )
                             .await
                         {
                             Ok(hot) => {
@@ -10186,6 +11131,137 @@ async fn launch_chain_runtime(
         );
     }
 
+    for (venue_name, cold) in cold_pancakeswap_by_venue.clone() {
+        let provider = provider.clone();
+        let venue = venue_name.clone();
+        let chain = cfg.name.clone();
+        let hot_config = hot_pool_config.clone();
+        let hot_pancakeswap_pools = Arc::clone(&hot_pancakeswap_pools);
+        let hot_pancakeswap_by_venue = Arc::clone(&hot_pancakeswap_by_venue);
+        let pancake_rank_ctx = Arc::clone(&univ3_rank_ctx);
+        spawn_supervised(
+            "hot_pools_pancakeswap",
+            cfg.name.clone(),
+            metrics.clone(),
+            move || {
+                let provider = provider.clone();
+                let venue = venue.clone();
+                let chain = chain.clone();
+                let hot_config = hot_config.clone();
+                let hot_pancakeswap_pools = Arc::clone(&hot_pancakeswap_pools);
+                let hot_pancakeswap_by_venue = Arc::clone(&hot_pancakeswap_by_venue);
+                let rank_ctx = pancake_rank_ctx.clone();
+                let cold = cold.clone();
+                async move {
+                    info!(
+                        chain = %chain,
+                        venue = %venue,
+                        kind = "univ3_like",
+                        cold_pool_records = cold.len(),
+                        refresh_secs = hot_config.refresh_interval.as_secs(),
+                        "spawned hot pool refresh worker"
+                    );
+                    loop {
+                        sleep(hot_config.refresh_interval).await;
+                        match rank_univ3_pools(
+                            provider.clone(),
+                            cold.as_slice(),
+                            &hot_config,
+                            rank_ctx.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(hot) => {
+                                log_hot_pool_refresh(&chain, &venue, "univ3_like", hot.len());
+                                {
+                                    let mut guard = hot_pancakeswap_by_venue.write().await;
+                                    guard.insert(venue.clone(), hot.clone());
+                                }
+                                let combined = {
+                                    let guard = hot_pancakeswap_by_venue.read().await;
+                                    guard.values().flat_map(|v| v.clone()).collect::<Vec<_>>()
+                                };
+                                let mut guard = hot_pancakeswap_pools.write().await;
+                                *guard = combined;
+                            }
+                            Err(err) => {
+                                warn!(error = %err, chain = %chain, venue = %venue, "failed to refresh pancakeswap hot pools");
+                            }
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    for (venue_name, cold) in cold_slipstream_by_venue.clone() {
+        let provider = provider.clone();
+        let venue = venue_name.clone();
+        let chain = cfg.name.clone();
+        let hot_config = hot_pool_config.clone();
+        let hot_slipstream_pools = Arc::clone(&hot_slipstream_pools);
+        let hot_slipstream_by_venue = Arc::clone(&hot_slipstream_by_venue);
+        let slipstream_rank_ctx = Arc::clone(&univ3_rank_ctx);
+        spawn_supervised(
+            "hot_pools_slipstream",
+            cfg.name.clone(),
+            metrics.clone(),
+            move || {
+                let provider = provider.clone();
+                let venue = venue.clone();
+                let chain = chain.clone();
+                let hot_config = hot_config.clone();
+                let hot_slipstream_pools = Arc::clone(&hot_slipstream_pools);
+                let hot_slipstream_by_venue = Arc::clone(&hot_slipstream_by_venue);
+                let rank_ctx = slipstream_rank_ctx.clone();
+                let cold = cold.clone();
+                async move {
+                    info!(
+                        chain = %chain,
+                        venue = %venue,
+                        kind = "slipstream_like",
+                        cold_pool_records = cold.len(),
+                        refresh_secs = hot_config.refresh_interval.as_secs(),
+                        "spawned hot pool refresh worker"
+                    );
+                    loop {
+                        sleep(hot_config.refresh_interval).await;
+                        match rank_univ3_pools(
+                            provider.clone(),
+                            cold.as_slice(),
+                            &hot_config,
+                            rank_ctx.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(hot) => {
+                                log_hot_pool_refresh(
+                                    &chain,
+                                    &venue,
+                                    "slipstream_like",
+                                    hot.len(),
+                                );
+                                {
+                                    let mut guard = hot_slipstream_by_venue.write().await;
+                                    guard.insert(venue.clone(), hot.clone());
+                                }
+                                let combined = {
+                                    let guard = hot_slipstream_by_venue.read().await;
+                                    guard.values().flat_map(|v| v.clone()).collect::<Vec<_>>()
+                                };
+                                let mut guard = hot_slipstream_pools.write().await;
+                                *guard = combined;
+                            }
+                            Err(err) => {
+                                warn!(error = %err, chain = %chain, venue = %venue, "failed to refresh slipstream hot pools");
+                            }
+                        }
+                    }
+                }
+            },
+        );
+    }
+
     let (block_head_tx, block_head_rx) = block_head_channel();
     let block_head_rx_for_runner = Some(Arc::new(Mutex::new(block_head_rx)));
 
@@ -10193,20 +11269,25 @@ async fn launch_chain_runtime(
         let pending_provider = provider.clone();
         let pending_ws = ws_provider.clone();
         let pending_endpoints = ws_endpoints.clone();
+        let mempool_backrun = backrun_monitor.clone();
+        let mempool_metrics = metrics.clone();
         spawn_supervised(
-            "pending_tx_monitor",
+            "mempool_monitor",
             cfg.name.clone(),
             metrics.clone(),
             move || {
                 let pending_provider = pending_provider.clone();
                 let pending_ws = pending_ws.clone();
                 let pending_endpoints = pending_endpoints.clone();
-                spawn_pending_tx_monitor(
+                let mempool_backrun = mempool_backrun.clone();
+                let mempool_metrics = mempool_metrics.clone();
+                spawn_live_mempool_monitor(
                     pending_provider,
                     pending_ws,
                     pending_endpoints,
                     ws_backoff,
-                    None,
+                    mempool_backrun,
+                    mempool_metrics,
                 )
             },
         );
@@ -10261,6 +11342,11 @@ async fn launch_chain_runtime(
     } else {
         0
     };
+    let aave_fee_bps = if cfg.aave_pool.is_some() {
+        resolve_aave_fee_bps(&cfg.name, ops_inputs)
+    } else {
+        0
+    };
 
     // Resolve the declared per-chain risk policy into enforceable runtime
     // limits. Fails closed when the declaration cannot be honored (e.g. USD
@@ -10286,6 +11372,49 @@ async fn launch_chain_runtime(
     }
     let sim_quorum = Arc::new(SimQuorum::from_endpoints(&cfg.name, &http_endpoints));
 
+    let bf_skip_on_stable_graph = std::env::var("ARBOT_BF_SKIP_ON_STABLE_GRAPH")
+        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    info!(
+        chain = %cfg.name,
+        bf_skip_enabled = bf_skip_on_stable_graph,
+        "Bellman-Ford stable-graph skip configuration"
+    );
+
+    let (slipstream_factory, slipstream_router, slipstream_quoter_addr) =
+        resolve_slipstream_venue(&ops_inputs, &cfg.name)
+            .unwrap_or((Address::zero(), Address::zero(), Address::zero()));
+    let slipstream_tick_spacings_set = collect_slipstream_tick_spacings(&ops_inputs, &cfg.name);
+    let slipstream_tick_spacings = if slipstream_tick_spacings_set.is_empty() {
+        None
+    } else {
+        Some(Arc::new(slipstream_tick_spacings_set))
+    };
+    let slipstream_validation = if slipstream_quoter_addr != Address::zero()
+        && cfg.name.eq_ignore_ascii_case("base")
+    {
+        Some(default_slipstream_validation_base())
+    } else {
+        None
+    };
+
+    let (pancakeswap_factory, pancakeswap_router, pancakeswap_quoter_addr) =
+        resolve_pancakeswap_venue(&ops_inputs, &cfg.name)
+            .unwrap_or((Address::zero(), Address::zero(), Address::zero()));
+    let pancakeswap_fee_tiers_set = collect_pancakeswap_fee_tiers(&ops_inputs, &cfg.name);
+    let pancakeswap_fee_tiers = if pancakeswap_fee_tiers_set.is_empty() {
+        None
+    } else {
+        Some(Arc::new(pancakeswap_fee_tiers_set))
+    };
+    let pancakeswap_validation = if pancakeswap_quoter_addr != Address::zero()
+        && cfg.name.eq_ignore_ascii_case("base")
+    {
+        Some(default_pancakeswap_validation_base())
+    } else {
+        None
+    };
+
     let runner_config = RunnerConfig {
         feature_gate,
         chain_name: cfg.name.clone(),
@@ -10298,6 +11427,7 @@ async fn launch_chain_runtime(
         univ3_fee_tiers: univ3_fee_tiers.clone(),
         bal_vault: cfg.bal_vault,
         aave_pool: cfg.aave_pool,
+        aave_fee_bps,
         erc3156_lender,
         erc3156_fee_bps,
         bal_flashloan_tokens: cfg
@@ -10322,12 +11452,25 @@ async fn launch_chain_runtime(
             .map(|tokens| tokens.iter().copied().collect::<HashSet<_>>()),
         chain_env_prefix: cfg.env_prefix.clone(),
         tokens: token_list.clone(),
+        initial_token_decimals: token_decimals_hint.clone(),
         wrapped_native,
         capital: capital_manager.clone(),
         pool_depth_cache: pool_depth_cache.clone(),
         pool_monitor: pool_monitor.clone(),
         hot_univ2_pools: Arc::clone(&hot_univ2_pools),
         hot_univ3_pools: Arc::clone(&hot_univ3_pools),
+        hot_slipstream_pools: Arc::clone(&hot_slipstream_pools),
+        slipstream_quoter_addr,
+        slipstream_factory,
+        slipstream_router,
+        slipstream_validation,
+        slipstream_tick_spacings,
+        hot_pancakeswap_pools: Arc::clone(&hot_pancakeswap_pools),
+        pancakeswap_quoter_addr,
+        pancakeswap_factory,
+        pancakeswap_router,
+        pancakeswap_validation,
+        pancakeswap_fee_tiers,
         edge_slippage_bps,
         executor_max_slippage_bps,
         edge_prune_max_slippage_bps,
@@ -10374,6 +11517,7 @@ async fn launch_chain_runtime(
         risk_policy,
         sim_quorum,
         block_head_rx: block_head_rx_for_runner,
+        bf_skip_on_stable_graph,
     };
 
     let runner = Runner::new(runner_config, executor);
@@ -10593,7 +11737,12 @@ async fn main() -> Result<()> {
 
     broadcast_command(&command_txs, Command::Start).await.ok();
 
-    let command_handle = tokio::spawn(command_listener(command_txs.clone()));
+    let command_handle = if interactive_command_listener_enabled() {
+        Some(tokio::spawn(command_listener(command_txs.clone())))
+    } else {
+        info!("Non-interactive mode: auto-started (set ARBOT_INTERACTIVE=1 for stdin commands)");
+        None
+    };
 
     let ctrl_handle = tokio::spawn({
         let txs = command_txs.clone();
@@ -10608,7 +11757,9 @@ async fn main() -> Result<()> {
         let _ = handle.join_handle.await;
     }
 
-    let _ = command_handle.await;
+    if let Some(command_handle) = command_handle {
+        let _ = command_handle.await;
+    }
     let _ = ctrl_handle.await;
     for monitor in status_monitors {
         let _ = monitor.await;
@@ -10953,6 +12104,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_aave_fee_bps_reads_ops_flashloan_fee() {
+        let ops_inputs = crate::ops_inputs::parse_ops_inputs(
+            r#"
+chains:
+  - chain_name: base
+    chain_id: 8453
+    env_prefix: BASE
+    flashloans:
+      - name: aave_v3
+        kind: aave_v3_like
+        pool: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
+        fee_bps: 5
+        allowlist_tokens: []
+"#,
+        )
+        .expect("parse ops yaml");
+        assert_eq!(resolve_aave_fee_bps("base", &ops_inputs), 5);
+    }
+
+    #[test]
     fn resolve_erc3156_fee_bps_accepts_valid_value() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let prior = env::var("ERC3156_FEE_BPS").ok();
@@ -11079,12 +12250,15 @@ mod tests {
 
     #[test]
     fn derive_chain_time_budget_base_allows_600ms_search() {
-        let (search, quote, sim) = derive_chain_time_budget_ms("base", 600, 150, 200);
+        let (search, quote, sim) = derive_chain_time_budget_ms("base", 600, 300, 350);
         assert_eq!(search, 600);
-        assert_eq!(quote, 150);
-        assert_eq!(sim, 200);
-        let (search_capped, _, _) = derive_chain_time_budget_ms("base", 1200, 300, 500);
-        assert_eq!(search_capped, 600);
+        assert_eq!(quote, 300);
+        assert_eq!(sim, 350);
+        let (search_capped, quote_capped, sim_capped) =
+            derive_chain_time_budget_ms("base", 1200, 400, 500);
+        assert_eq!(search_capped, 800);
+        assert_eq!(quote_capped, 350);
+        assert_eq!(sim_capped, 400);
     }
 
     #[test]
@@ -11310,7 +12484,10 @@ mod tests {
             active: true,
         });
 
-        let cycles = vec![vec![0, 1, 0], vec![0, 2, 0]];
+        let cycles = vec![
+            IndexedCycle::from_nodes(vec![0, 1, 0]),
+            IndexedCycle::from_nodes(vec![0, 2, 0]),
+        ];
         let capped = cap_cycles_per_start(cycles, &graph, 1);
         assert_eq!(capped.len(), 1);
     }
@@ -11328,7 +12505,7 @@ mod tests {
         let mut hubs = HashSet::new();
         hubs.insert(start);
 
-        let cycles = vec![vec![0, 1, 0]];
+        let cycles = vec![IndexedCycle::from_nodes(vec![0, 1, 0])];
         let filtered = filter_cycles_by_hubs(cycles, &graph, &hubs);
         assert_eq!(
             filtered.len(),
@@ -11355,7 +12532,7 @@ mod tests {
         let mut hubs = HashSet::new();
         hubs.insert(start);
 
-        let cycles = vec![vec![0, 1, 0]];
+        let cycles = vec![IndexedCycle::from_nodes(vec![0, 1, 0])];
         let filtered = filter_cycles_by_hubs(cycles, &graph, &hubs);
         assert!(
             filtered.is_empty(),
@@ -11379,7 +12556,7 @@ mod tests {
         let middle = Address::from_low_u64_be(32);
         graph.nodes = vec![start, middle];
         let hubs = HashSet::new();
-        let cycles = vec![vec![0, 1, 0]];
+        let cycles = vec![IndexedCycle::from_nodes(vec![0, 1, 0])];
         let filtered = filter_cycles_by_hubs(cycles, &graph, &hubs);
         assert!(
             filtered.is_empty(),
@@ -11527,6 +12704,7 @@ mod tests {
                 slippage: 0.1,
             },
             &profitability,
+            &HashSet::new(),
         )
         .await;
 
@@ -11845,6 +13023,9 @@ mod tests {
             l1_data_fee: U256::zero(),
             native_price: NativePrice::unit(),
             quoter: &quoter,
+            slipstream_quoter: None,
+            pancakeswap_quoter: None,
+            pancakeswap_pools: None,
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number,

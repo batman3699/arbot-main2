@@ -1,3 +1,6 @@
+pub mod backrun_state;
+pub mod cl_sim;
+pub mod sim_revm;
 pub mod abi;
 pub mod abi_fixture;
 pub mod capital;
@@ -15,6 +18,7 @@ pub mod quote_balancer;
 pub mod quote_curve;
 pub mod quote_solidly;
 pub mod quote_univ2;
+pub mod quote_slipstream;
 pub mod quote_univ3;
 pub mod quote_univ4;
 pub mod registry;

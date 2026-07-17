@@ -14,7 +14,7 @@ use ethers::abi::{ParamType, Token};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use std::str::FromStr;
 
-fn is_block_out_of_range_error(err: &impl std::fmt::Display) -> bool {
+pub(crate) fn is_block_out_of_range_error(err: &impl std::fmt::Display) -> bool {
     let message = err.to_string();
     let lower = message.to_ascii_lowercase();
     lower.contains("blockoutofrangeerror")
@@ -372,6 +372,17 @@ where
             "univ3 validation returned zero output"
         );
         Ok(amount_out)
+    }
+}
+
+/// Startup validation path for PancakeSwap V3 on Base (WETH/USDC 0.05%).
+pub fn default_pancakeswap_validation_base() -> UniV3ValidationConfig {
+    use hex_literal::hex;
+    UniV3ValidationConfig {
+        token_in: Address::from_slice(&hex!("4200000000000000000000000000000000000006")),
+        token_out: Address::from_slice(&hex!("833589fcd6edb6e08f4c7c32d4f71b54bda02913")),
+        fee: 500,
+        amount_in: U256::from(10u64).pow(U256::from(15u64)),
     }
 }
 

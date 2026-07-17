@@ -30,17 +30,57 @@ ID_GETPOOL = "0x79bc57d5"    # getPool(address,address,bool)
 ID_GETFEE = "0xcc56b2c5"     # getFee(address,bool)
 ID_BALANCEOF = "0x70a08231"  # balanceOf(address)
 
-WETH_USD = 1638.12
-HUBS = {
-    "0x4200000000000000000000000000000000000006": ("WETH", 18, WETH_USD),
-    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": ("USDC", 6, 1.0),
-    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": ("USDbC", 6, 1.0),
-    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb": ("DAI", 18, 1.0),
-    "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf": ("cbBTC", 8, 61601.79),
-    "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22": ("cbETH", 18, WETH_USD),
-    "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452": ("wstETH", 18, WETH_USD),
-    "0x940181a94a35a4569e4529a3cdfb74e38fd98631": ("AERO", 18, 0.332132),
-}
+WETH = "0x4200000000000000000000000000000000000006"
+USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+QUOTER = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"
+
+WETH_USD_FALLBACK = float(os.environ.get("RANK_WETH_USD", "2500"))
+
+
+def fetch_weth_usd(session: requests.Session) -> float:
+    """Live WETH/USDC quote from Base QuoterV2 (500 bps tier)."""
+    amount_in = 10**15
+    data = (
+        "0xcdca1753"
+        + WETH[2:].lower().rjust(64, "0")
+        + USDC[2:].lower().rjust(64, "0")
+        + format(amount_in, "064x")
+        + format(500, "064x")
+        + "0" * 64
+    )
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_call",
+        "params": [{"to": QUOTER, "data": data}, "latest"],
+    }
+    try:
+        r = session.post(RPC_URL, json=payload, timeout=20)
+        r.raise_for_status()
+        result = r.json().get("result")
+        if isinstance(result, str) and len(result) >= 66:
+            usdc_out = int(result[:66], 16)
+            return (usdc_out / 1e6) / (amount_in / 1e18)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  WARN: live WETH quote failed ({exc}); using fallback", file=sys.stderr)
+    return WETH_USD_FALLBACK
+
+
+def build_hubs(weth_usd: float) -> dict:
+    cbtc_usd = float(os.environ.get("RANK_CBTC_USD", "95000"))
+    aero_usd = float(os.environ.get("RANK_AERO_USD", "0.35"))
+    return {
+        "0x4200000000000000000000000000000000000006": ("WETH", 18, weth_usd),
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913": ("USDC", 6, 1.0),
+        "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca": ("USDbC", 6, 1.0),
+        "0x50c5725949a6f0c72e6c4a641f24049a917db0cb": ("DAI", 18, 1.0),
+        "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf": ("cbBTC", 8, cbtc_usd),
+        "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22": ("cbETH", 18, weth_usd),
+        "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452": ("wstETH", 18, weth_usd),
+        "0x940181a94a35a4569e4529a3cdfb74e38fd98631": ("AERO", 18, aero_usd),
+    }
+
+
 MAJORS = [
     "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",  # VIRTUAL
     "0x532f27101965dd16442e59d40670faf5ebb142e4",  # BRETT
@@ -51,7 +91,7 @@ MAJORS = [
     "0x9a26f5433671751c3276a065f57e5a02d2817973",  # KEYCAT
     "0x1bc0c42215582d5a085795f4badbac3ff36d1bcb",  # CLANKER
 ]
-MIN_USD = float(os.environ.get("AERO_MIN_USD", "25000"))
+MIN_USD = float(os.environ.get("AERO_MIN_USD", "10000"))
 OUT_PATH = os.environ.get("AERO_OUT", "config/base_aerodrome_pools.json")
 
 
@@ -99,8 +139,12 @@ def int_from_word(hexword):
         return 0
 
 
+
 def main():
     session = requests.Session()
+    weth_usd = fetch_weth_usd(session)
+    HUBS = build_hubs(weth_usd)
+    print(f"WETH/USD (live quoter): ${weth_usd:,.2f}")
     tokens = list(HUBS.keys()) + [m.lower() for m in MAJORS]
     hub_list = list(HUBS.keys())
 

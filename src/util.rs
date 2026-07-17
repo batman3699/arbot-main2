@@ -171,10 +171,13 @@ pub fn compute_edge_weight(
 
     let gas_cost_native = U256::from(estimated_gas).saturating_mul(gas_price);
     let base_dec = u256_to_decimal(base);
-    let gas_ratio = native_price
-        .tokens_for_native_if_reliable(gas_cost_native)
-        .and_then(|gas_cost_tokens| u256_to_decimal(gas_cost_tokens).checked_div(base_dec))
-        .unwrap_or(Decimal::ZERO);
+    let Some(gas_cost_tokens) = native_price.tokens_for_native_if_reliable(gas_cost_native) else {
+        // Unreliable native price: exclude edge from BF (prohibitive weight).
+        return i64::MAX;
+    };
+    let gas_ratio = u256_to_decimal(gas_cost_tokens)
+        .checked_div(base_dec)
+        .unwrap_or(Decimal::MAX);
 
     let composite = gas_ratio.checked_sub(rate_ln).unwrap_or_else(|| {
         if gas_ratio > rate_ln {
@@ -660,30 +663,18 @@ mod tests {
     }
 
     #[test]
-    fn compute_edge_weight_omits_gas_when_price_unreliable() {
+    fn compute_edge_weight_prohibitive_when_price_unreliable() {
         let rate_num = U256::from(105u64);
         let rate_den = U256::from(100u64);
-        let estimated_gas = 30_000u64;
-        let base_amount_in = U256::from(1_000_000u64);
-
-        let cheap_gas = compute_edge_weight(
+        let weight = compute_edge_weight(
             rate_num,
             rate_den,
-            estimated_gas,
-            U256::from(1u64),
-            base_amount_in,
-            NativePrice::unit(),
-        );
-        let expensive_gas = compute_edge_weight(
-            rate_num,
-            rate_den,
-            estimated_gas,
+            30_000,
             U256::from(200u64),
-            base_amount_in,
+            U256::from(1_000_000u64),
             NativePrice::unit(),
         );
-
-        assert_eq!(cheap_gas, expensive_gas);
+        assert_eq!(weight, i64::MAX);
     }
 
     #[test]

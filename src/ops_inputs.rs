@@ -147,6 +147,7 @@ pub enum VenueKind {
     CurveLike,
     BalancerLike,
     SolidlyV2Like,
+    SlipstreamLike,
     GenericRouter,
 }
 
@@ -666,6 +667,13 @@ impl OpsInputs {
         })
     }
 
+    pub fn backrun_enabled_for(&self, chain_name: &str) -> bool {
+        self.features
+            .enable_backrun
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(chain_name))
+    }
+
     pub fn liquidations_enabled_for(&self, chain_name: &str) -> bool {
         self.features
             .enable_liquidations
@@ -1079,6 +1087,41 @@ impl OpsInputs {
                         )?;
                     }
                     VenueKind::Univ3Like => {
+                        require_address(
+                            path,
+                            &venue_key,
+                            "factory",
+                            venue.factory.as_ref(),
+                            &mut missing,
+                            strict,
+                        )?;
+                        require_address(
+                            path,
+                            &venue_key,
+                            "router",
+                            venue.router.as_ref(),
+                            &mut missing,
+                            strict,
+                        )?;
+                        require_address(
+                            path,
+                            &venue_key,
+                            "quoter",
+                            venue.quoter.as_ref(),
+                            &mut missing,
+                            strict,
+                        )?;
+                        let tiers = venue.fee_tiers.as_ref().filter(|tiers| !tiers.is_empty());
+                        if tiers.is_none() {
+                            push_missing(
+                                path,
+                                &format!("{venue_key}.fee_tiers"),
+                                &mut missing,
+                                strict,
+                            );
+                        }
+                    }
+                    VenueKind::SlipstreamLike => {
                         require_address(
                             path,
                             &venue_key,

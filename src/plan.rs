@@ -300,6 +300,30 @@ pub async fn build_plan_for_cycle(
                     min_out,
                 });
             }
+            VenueEdge::Slipstream {
+                path,
+                router,
+                ..
+            } => {
+                let bytes = encode_univ3_path(path).context("encode slipstream path")?;
+                const EXACT_INPUT: [u8; 4] = [0xc0, 0x4b, 0x8d, 0x70];
+                let mut data = Vec::with_capacity(EXACT_INPUT.len() + 32 * 5);
+                data.extend_from_slice(&EXACT_INPUT);
+                data.extend(ethers::abi::encode(&[ethers::abi::Token::Tuple(vec![
+                    ethers::abi::Token::Bytes(bytes),
+                    ethers::abi::Token::Address(executor_address),
+                    ethers::abi::Token::Uint(current_amount),
+                    ethers::abi::Token::Uint(min_out),
+                ])]));
+                steps.push(StepData::Generic {
+                    target: *router,
+                    call: Bytes::from(data),
+                    pre_action: Some(GenericPreAction::Approve {
+                        token: from,
+                        amount: current_amount,
+                    }),
+                });
+            }
             VenueEdge::Balancer {
                 pool_id,
                 token_in,

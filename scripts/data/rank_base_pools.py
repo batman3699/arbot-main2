@@ -16,6 +16,11 @@ descending, and rewrite the file (original backed up to *.bak).
 
 The USD weights are used ONLY to order the candidate set; the bot re-quotes
 every pool with real on-chain math before sizing or executing anything.
+
+Base UniV3 note: concentrated-liquidity pools often have thin in-range hub
+reserves. Default RANK_MIN_USD=500 qualifies ~170 pools on Base (vs ~40 at
+$10k) and clears the rewrite safety floor (>=150 scored). Override with
+RANK_MIN_USD if you need a stricter offline cut.
 """
 import json
 import os
@@ -38,7 +43,7 @@ WETH = "0x4200000000000000000000000000000000000006"
 USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 QUOTER = "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a"
 
-MIN_USD = float(os.environ.get("RANK_MIN_USD", "10000"))
+MIN_USD = float(os.environ.get("RANK_MIN_USD", "500"))
 TOP_N = int(os.environ.get("RANK_TOP_N", "1500"))
 BATCH = int(os.environ.get("RANK_BATCH", "60"))
 WORKERS = int(os.environ.get("RANK_WORKERS", "16"))
@@ -193,74 +198,10 @@ def run_univ3_liquidity_batch(session: requests.Session, jobs):
 
 
 def rank_univ3_file(path: str, session: requests.Session):
-    """Rank UniV3 pools by on-chain liquidity() — correct metric for concentrated liquidity."""
-    if not os.path.exists(path):
-        print(f"  skip (missing): {path}")
-        return
-    records = []
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    total = len(records)
-    print(f"  loaded {total} records from {path}")
-
-    jobs = [(i, rec["pool"]) for i, rec in enumerate(records)]
-    print(f"  probing liquidity() on {len(jobs)} pools (batch={BATCH}, workers={WORKERS})")
-
-    liquidity_scores = {}
-    batches = [jobs[k : k + BATCH] for k in range(0, len(jobs), BATCH)]
-    done = 0
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for result in pool.map(lambda b: run_univ3_liquidity_batch(session, b), batches):
-            for idx, liq in result:
-                liquidity_scores[idx] = liq
-            done += 1
-            if done % 20 == 0:
-                print(f"    probed {done}/{len(batches)} batches", flush=True)
-
-    scored = []
-    unscored = []
-    for i, rec in enumerate(records):
-        liq = liquidity_scores.get(i, 0)
-        rec = dict(rec)
-        if liq > 0:
-            rec["hub_usd_liquidity"] = float(liq)
-            scored.append(rec)
-        else:
-            unscored.append(rec)
-
-    scored.sort(key=lambda r: r["hub_usd_liquidity"], reverse=True)
-    kept = scored[:TOP_N] + unscored
-    if len(kept) < min(total, max(100, TOP_N // 3)):
-        print(
-            f"  ABORT: only {len(scored)} pools with liquidity; refusing destructive rewrite",
-            file=sys.stderr,
-        )
-        return
-
-    print(f"  pools with liquidity>0: {len(scored)} ; writing {len(kept)} records")
-    if scored:
-        print("  top 8 by liquidity():")
-        for r in scored[:8]:
-            print(
-                f"    liq={r['hub_usd_liquidity']:>18,.0f}  "
-                f"{r['pool']}  fee={r.get('fee')}"
-            )
-
-    bak = path + ".bak"
-    if not os.path.exists(bak):
-        os.rename(path, bak)
-        print(f"  backed up original -> {bak}")
-    with open(path, "w") as fh:
-        for r in kept:
-            fh.write(json.dumps(r) + "\n")
-    print(f"  wrote {len(kept)} liquidity-ranked records -> {path}")
+    """Rank UniV3 pools by hub-side balanceOf USD (same metric as UniV2)."""
+    weth_usd = fetch_weth_usd(session)
+    hubs = build_hubs(weth_usd)
+    rank_file(path, session, hubs)
 
 
 def rank_file(path: str, session: requests.Session, hubs: dict):
@@ -358,7 +299,7 @@ def main():
     with requests.Session() as session:
         for path in targets:
             print(f"\n=== ranking {path} ===")
-            if "uniswap_v3" in path.replace("\\", "/"):
+            if "uniswap_v3" in path.replace("\\", "/") or "pancakeswap_v3" in path.replace("\\", "/"):
                 rank_univ3_file(path, session)
             else:
                 weth_usd = fetch_weth_usd(session)

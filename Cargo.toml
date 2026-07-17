@@ -23,7 +23,7 @@ hex-literal = "0.4"
 rayon = "1"
 rand = "0.8"
 arc-swap = "1"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 serde_json = "1.0"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 prometheus = "0.13"
@@ -36,6 +36,9 @@ lru = "0.12"
 serde_yaml = "0.9"
 async-trait = "0.1"
 dashmap = "6"
+# revm 20.x stack: in-process EVM fork simulation (sim_revm.rs)
+revm = { version = "20", features = ["std"] }
+rlp = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

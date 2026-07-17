@@ -20,7 +20,7 @@ use tokio::{
     task::JoinHandle,
     time::{interval, sleep, timeout},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     metrics::Metrics, quote_univ2::UniV2PairState, util::connect_ws_provider_with_fallbacks,
@@ -37,12 +37,21 @@ const TOPIC_SWAP: H256 = H256([
 ]);
 
 #[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolMonitorKind {
+    UniV2,
+    Solidly,
+}
+
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct MonitoredPool {
     pub pair: Address,
     pub token_in: Address,
     pub token_out: Address,
     pub fee_bps: u32,
+    pub stable: bool,
+    pub kind: PoolMonitorKind,
 }
 
 #[derive(Clone, Debug)]
@@ -69,6 +78,7 @@ where
     ws_connected: Arc<AtomicBool>,
     ws_warned: Arc<AtomicBool>,
     pool_updates: Arc<Notify>,
+    touched_pools: Arc<DashMap<Address, ()>>,
 }
 
 impl<C> PoolMonitor<C>
@@ -100,7 +110,18 @@ where
             ws_connected: Arc::new(AtomicBool::new(false)),
             ws_warned: Arc::new(AtomicBool::new(false)),
             pool_updates: Arc::new(Notify::new()),
+            touched_pools: Arc::new(DashMap::new()),
         })
+    }
+
+    pub fn mark_touched(&self, pool: Address) {
+        self.touched_pools.insert(pool, ());
+    }
+
+    pub fn drain_touched(&self) -> HashSet<Address> {
+        let touched: HashSet<Address> = self.touched_pools.iter().map(|entry| *entry.key()).collect();
+        self.touched_pools.clear();
+        touched
     }
 
     pub fn spawn(self: Arc<Self>) -> Vec<JoinHandle<()>> {
@@ -190,6 +211,7 @@ where
         if let Some(metrics) = &self.metrics {
             metrics.ingestion_ws_events.inc();
         }
+        self.touched_pools.insert(pair, ());
 
         let block_number = log.block_number;
         if let Some(mut entry) = self.cache.get_mut(&pair) {
@@ -283,6 +305,13 @@ where
 
         match crate::quote_univ2::load_pair_state(self.provider.clone(), pool.pair).await? {
             Some(state) => {
+                if pool.kind == PoolMonitorKind::Solidly {
+                    debug!(
+                        pair = %format!("0x{}", hex::encode(pool.pair)),
+                        stable = pool.stable,
+                        "refreshed Solidly pair state via getReserves"
+                    );
+                }
                 self.cache_state(pool.pair, state).await;
             }
             None => {
@@ -420,7 +449,7 @@ fn is_websocket_subscription_close(message: &str) -> bool {
         || (lower.contains("websocket") && lower.contains("closed"))
 }
 
-async fn poll_pending_block<C>(provider: &Provider<C>, metrics: &Option<Arc<Metrics>>) -> Result<()>
+pub async fn poll_pending_block<C>(provider: &Provider<C>, metrics: &Option<Arc<Metrics>>) -> Result<()>
 where
     C: JsonRpcClient + 'static,
 {
@@ -615,6 +644,8 @@ mod tests {
             token_in: Address::random(),
             token_out: Address::random(),
             fee_bps: 30,
+            stable: false,
+            kind: PoolMonitorKind::UniV2,
         };
 
         let monitor = PoolMonitor::new(

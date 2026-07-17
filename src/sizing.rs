@@ -1,7 +1,7 @@
 use ethers::providers::JsonRpcClient;
-use ethers::types::{U256, U64};
+use ethers::types::{Address, U256, U64};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     pin::Pin,
     sync::{
@@ -23,6 +23,7 @@ use crate::quote_solidly::{
     quote_exact_input_from_state as quote_solidly_exact_input, SolidlyPairState,
 };
 use crate::quote_univ2::{quote_exact_input_from_state, UniV2PairState};
+use crate::quote_slipstream::SlipstreamQuoter;
 use crate::quote_univ3::UniQuoter;
 use crate::quote_univ4::quote_fixed_price_exact_input;
 use crate::util::{apply_slippage, u256_to_f64, NativePrice};
@@ -188,6 +189,11 @@ fn pool_key_from_edge(edge: &Edge) -> [u8; 32] {
             out[12..].copy_from_slice(pool.as_bytes());
             out
         }
+        crate::graph::VenueEdge::Slipstream { pool, .. } => {
+            let mut out = [0u8; 32];
+            out[12..].copy_from_slice(pool.as_bytes());
+            out
+        }
         crate::graph::VenueEdge::Balancer { pool_id, .. } => *pool_id,
         crate::graph::VenueEdge::Curve { pool, .. } => {
             let mut out = [0u8; 32];
@@ -233,6 +239,9 @@ where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
 {
     quoter: &'a UniQuoter<C>,
+    slipstream_quoter: Option<&'a SlipstreamQuoter<C>>,
+    pancakeswap_quoter: Option<&'a UniQuoter<C>>,
+    pancakeswap_pools: Option<&'a HashSet<Address>>,
     bal_quote: &'a BalQuote<C>,
     curve_quote: &'a CurveQuote<C>,
     cache: &'a Mutex<HashMap<QuoteKey, QuoteValue>>,
@@ -293,10 +302,34 @@ where
                 block,
             }
         }
-        crate::graph::VenueEdge::UniV3 { path, .. } => {
+        crate::graph::VenueEdge::UniV3 { path, pool, .. } => {
             ctx.quote_count.fetch_add(1, Ordering::Relaxed);
-            let out = ctx
-                .quoter
+            let quoter = if let (Some(pq), Some(set)) =
+                (ctx.pancakeswap_quoter, ctx.pancakeswap_pools)
+            {
+                if set.contains(pool) {
+                    pq
+                } else {
+                    ctx.quoter
+                }
+            } else {
+                ctx.quoter
+            };
+            let out = quoter
+                .quote_path(path.clone(), amount_in, block)
+                .await
+                .ok()?;
+            let expected = mul_div(amount_in, edge.rate_num, edge.rate_den);
+            QuoteValue {
+                amount_out: out,
+                slippage_bps: slippage_bps(expected, out),
+                block,
+            }
+        }
+        crate::graph::VenueEdge::Slipstream { path, .. } => {
+            let slipstream = ctx.slipstream_quoter?;
+            ctx.quote_count.fetch_add(1, Ordering::Relaxed);
+            let out = slipstream
                 .quote_path(path.clone(), amount_in, block)
                 .await
                 .ok()?;
@@ -591,6 +624,9 @@ where
     pub l1_data_fee: U256,
     pub native_price: NativePrice,
     pub quoter: &'a UniQuoter<C>,
+    pub slipstream_quoter: Option<&'a SlipstreamQuoter<C>>,
+    pub pancakeswap_quoter: Option<&'a UniQuoter<C>>,
+    pub pancakeswap_pools: Option<&'a HashSet<Address>>,
     pub bal_quote: &'a BalQuote<C>,
     pub curve_quote: &'a CurveQuote<C>,
     pub block_number: U64,
@@ -650,6 +686,9 @@ where
                 params.block_number,
                 &QuoteContext {
                     quoter: params.quoter,
+                    slipstream_quoter: params.slipstream_quoter,
+                    pancakeswap_quoter: params.pancakeswap_quoter,
+                    pancakeswap_pools: params.pancakeswap_pools,
                     bal_quote: params.bal_quote,
                     curve_quote: params.curve_quote,
                     cache: cache.as_ref(),
@@ -719,6 +758,9 @@ where
                 params.block_number,
                 &QuoteContext {
                     quoter: params.quoter,
+                    slipstream_quoter: params.slipstream_quoter,
+                    pancakeswap_quoter: params.pancakeswap_quoter,
+                    pancakeswap_pools: params.pancakeswap_pools,
                     bal_quote: params.bal_quote,
                     curve_quote: params.curve_quote,
                     cache: cache.as_ref(),
@@ -844,6 +886,9 @@ mod tests {
             l1_data_fee: U256::zero(),
             native_price: NativePrice::unit(),
             quoter: &quoter,
+            slipstream_quoter: None,
+            pancakeswap_quoter: None,
+            pancakeswap_pools: None,
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number: U64::zero(),
@@ -894,6 +939,9 @@ mod tests {
             l1_data_fee: U256::zero(),
             native_price: NativePrice::unit(),
             quoter: &quoter,
+            slipstream_quoter: None,
+            pancakeswap_quoter: None,
+            pancakeswap_pools: None,
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number: U64::zero(),
@@ -935,6 +983,9 @@ mod tests {
             l1_data_fee: U256::zero(),
             native_price: NativePrice::unit(),
             quoter: &quoter,
+            slipstream_quoter: None,
+            pancakeswap_quoter: None,
+            pancakeswap_pools: None,
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number: U64::zero(),
@@ -981,6 +1032,9 @@ mod tests {
 
         let quote_ctx = QuoteContext {
             quoter: &quoter,
+            slipstream_quoter: None,
+            pancakeswap_quoter: None,
+            pancakeswap_pools: None,
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             cache: &cache,

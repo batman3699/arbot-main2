@@ -69,6 +69,12 @@ UNIV2_ROUTER=0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24
 # Aerodrome (Base's dominant DEX, Solidly-style AMM)
 AERO_FACTORY=0x420DD381b31aEf6683db6B902084cB0FFECe40Da
 AERO_ROUTER=0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43
+SLIPSTREAM_FACTORY=0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A
+SLIPSTREAM_ROUTER=0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5
+SLIPSTREAM_QUOTER=0x254cF9E1E6e233aa1AC962CB9B05b2cfeAaE15b0
+PANCAKE_V3_FACTORY=0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865
+PANCAKE_V3_ROUTER=0x1b81D678ffb9C0263b24A97847620C99d213eB14
+PANCAKE_V3_QUOTER=0xB048Bbc1Ee6b733FFfCFb9e9CeF7375518e25997
 WETH_TOKEN=0x4200000000000000000000000000000000000006
 USDC_TOKEN=0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913
 
@@ -214,6 +220,52 @@ else
   warn "Aerodrome pool list (BASE_SOLIDLY_V2_POOLS) missing — solidly edges will be empty"
 fi
 
+# --- 1c) Aerodrome Slipstream (CL) -------------------------------------------
+echo ""
+echo "[1c] Aerodrome Slipstream (CL)"
+check_code "Slipstream CL Factory" "$SLIPSTREAM_FACTORY"
+check_code "Slipstream Swap Router" "$SLIPSTREAM_ROUTER"
+check_code "Slipstream QuoterV2" "$SLIPSTREAM_QUOTER"
+SLIP_POOL="$(cast call "$SLIPSTREAM_FACTORY" "getPool(address,address,int24)(address)" "$WETH_TOKEN" "$USDC_TOKEN" 1 --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
+if [ -n "$SLIP_POOL" ] && [ "$(lc "$SLIP_POOL")" != "0x0000000000000000000000000000000000000000" ]; then
+  ok "Slipstream getPool(WETH,USDC,tickSpacing=1) -> $SLIP_POOL"
+  SLIP_LIQ="$(cast call "$SLIP_POOL" "liquidity()(uint128)" --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$SLIP_LIQ" ] && [ "$SLIP_LIQ" -gt 0 ] 2>/dev/null; then
+    ok "Slipstream WETH/USDC ts=1 pool liquidity() > 0"
+  else
+    warn "Slipstream WETH/USDC ts=1 pool liquidity() empty/zero"
+  fi
+else
+  bad "Slipstream getPool(WETH,USDC,1) returned empty/zero"
+fi
+SLIP_POOLS_FILE="data/base/aerodrome_slipstream/pools.jsonl"
+if [ -f "$SLIP_POOLS_FILE" ]; then
+  SLIP_COUNT="$(wc -l < "$SLIP_POOLS_FILE" | tr -d '[:space:]')"
+  ok "Slipstream pool inventory present: $SLIP_POOLS_FILE ($SLIP_COUNT pools)"
+else
+  warn "Slipstream pool inventory missing at $SLIP_POOLS_FILE — run scripts/data/build_slipstream_pools.py"
+fi
+
+# --- 1d) PancakeSwap V3 (CL) -------------------------------------------------
+echo ""
+echo "[1d] PancakeSwap V3 (CL)"
+check_code "PancakeSwap V3 Factory" "$PANCAKE_V3_FACTORY"
+check_code "PancakeSwap V3 Swap Router" "$PANCAKE_V3_ROUTER"
+check_code "PancakeSwap V3 QuoterV2" "$PANCAKE_V3_QUOTER"
+CAKE_POOL="$(cast call "$PANCAKE_V3_FACTORY" "getPool(address,address,uint24)(address)" "$WETH_TOKEN" "$USDC_TOKEN" 500 --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
+if [ -n "$CAKE_POOL" ] && [ "$(lc "$CAKE_POOL")" != "0x0000000000000000000000000000000000000000" ]; then
+  ok "PancakeSwap getPool(WETH,USDC,fee=500) -> $CAKE_POOL"
+else
+  bad "PancakeSwap getPool(WETH,USDC,500) returned empty/zero"
+fi
+CAKE_POOLS_FILE="data/base/pancakeswap_v3/pools.jsonl"
+if [ -f "$CAKE_POOLS_FILE" ]; then
+  CAKE_COUNT="$(wc -l < "$CAKE_POOLS_FILE" | tr -d '[:space:]')"
+  ok "PancakeSwap pool inventory present: $CAKE_POOLS_FILE ($CAKE_COUNT pools)"
+else
+  warn "PancakeSwap pool inventory missing at $CAKE_POOLS_FILE — run scripts/data/build_pancakeswap_pools.py"
+fi
+
 # --- 2) Flash-loan providers -------------------------------------------------
 echo ""
 echo "[2] Flash-loan providers"
@@ -272,12 +324,23 @@ else
 fi
 # CRITICAL: start/startV2 are onlyExecutor. The hot signer MUST be allowlisted or
 # every execution — including the shadow-mode eth_call simulation — reverts
-# NotExecutor. (In this deployment owner==signer; adjust if you split keys.)
-EXEC_ALLOWED="$(cast call "$EXECUTOR" "executors(address)(bool)" "$EXECUTOR_OWNER" --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
+# NotExecutor.
+HOT_SIGNER="${HOT_SIGNER:-}"
+if [ -z "$HOT_SIGNER" ] && [ -n "${PRIVATE_KEY:-}" ]; then
+  HOT_SIGNER="$(cast wallet address --private-key "$PRIVATE_KEY" 2>/dev/null | tr -d '[:space:]')"
+fi
+if [ -z "$HOT_SIGNER" ] && [ -f .env ]; then
+  PK="$(grep -E '^PRIVATE_KEY=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+  if [ -n "$PK" ]; then
+    HOT_SIGNER="$(cast wallet address --private-key "$PK" 2>/dev/null | tr -d '[:space:]')"
+  fi
+fi
+HOT_SIGNER="${HOT_SIGNER:-$EXECUTOR_OWNER}"
+EXEC_ALLOWED="$(cast call "$EXECUTOR" "executors(address)(bool)" "$HOT_SIGNER" --rpc-url "$RPC_URL" 2>/dev/null | tr -d '[:space:]')"
 if [ "$EXEC_ALLOWED" = "true" ]; then
-  ok "Executor allowlist: hot signer $EXECUTOR_OWNER is approved (startV2 callable)"
+  ok "Executor allowlist: hot signer $HOT_SIGNER is approved (startV2 callable)"
 else
-  bad "Executor allowlist: hot signer $EXECUTOR_OWNER NOT approved — startV2 reverts NotExecutor (run setExecutor via router.multicall)"
+  bad "Executor allowlist: hot signer $HOT_SIGNER NOT approved — startV2 reverts NotExecutor (run setExecutor via router.multicall)"
 fi
 
 # --- 5) Token identity + decimals -------------------------------------------

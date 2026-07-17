@@ -16,6 +16,13 @@ pub enum VenueEdge {
         pool: Address,
         fee: u32,
     },
+    /// Aerodrome Slipstream CL pools (tick spacing stored in `fee` field of path hops).
+    Slipstream {
+        path: Vec<(Address, Option<u32>)>,
+        pool: Address,
+        tick_spacing: u32,
+        router: Address,
+    },
     Balancer {
         pool_id: [u8; 32],
         token_in: Address,
@@ -113,7 +120,7 @@ impl BellmanFordLimits {
     pub fn sanitized(self) -> Self {
         let min_hops = self.min_hops.max(1);
         let max_hops = self.max_hops.max(1);
-        let max_relaxations = self.max_relaxations.max(1);
+        let max_relaxations = self.max_relaxations.max(1).min(256);
         let max_cycles = self.max_cycles.max(1);
         let timeout = if self.timeout.is_zero() {
             Duration::from_millis(1)
@@ -133,7 +140,7 @@ impl BellmanFordLimits {
     
 type NodeIx = usize;
 type EdgeWeight = i64;
-type AdjacentEdge = (NodeIx, EdgeWeight);
+type AdjacentEdge = (NodeIx, EdgeWeight, usize);
 type AdjacencyList = Arc<Vec<AdjacentEdge>>;
 type AdjacencyMap = DashMap<NodeIx, AdjacencyList>;
 
@@ -164,6 +171,10 @@ enum EdgeSignature {
     UniV3 {
         pool: Address,
         fee: u32,
+    },
+    Slipstream {
+        pool: Address,
+        tick_spacing: u32,
     },
     Balancer {
         pool_id: [u8; 32],
@@ -204,6 +215,7 @@ enum EdgeSignature {
 struct DetectedCycle {
     weight: i64,
     cycle: Vec<usize>,
+    edge_indices: Vec<usize>,
     estimated_profit_bps: i64,
 }
 
@@ -287,6 +299,14 @@ impl Graph {
                 pool: *pool,
                 fee: *fee,
             },
+            VenueEdge::Slipstream {
+                pool,
+                tick_spacing,
+                ..
+            } => EdgeSignature::Slipstream {
+                pool: *pool,
+                tick_spacing: *tick_spacing,
+            },
             VenueEdge::Balancer { pool_id, .. } => EdgeSignature::Balancer { pool_id: *pool_id },
             VenueEdge::Curve {
                 pool,
@@ -356,7 +376,7 @@ impl Graph {
                     continue;
                 }
                 if let Some(&to_idx) = self.ix.get(&edge.to) {
-                    slot.push((to_idx, edge.weight));
+                    slot.push((to_idx, edge.weight, edge_idx));
                 }
             }
         }
@@ -458,6 +478,10 @@ impl Graph {
     fn edges_from_index(&self, idx: usize) -> Option<&Vec<usize>> {
         let node = self.nodes.get(idx)?;
         self.edges_from.get(node)
+    }
+
+    pub fn edge_by_index(&self, idx: usize) -> Option<&Edge> {
+        self.edges.get(idx)
     }
 
     pub fn edge_between(&self, from: Address, to: Address) -> Option<&Edge> {
@@ -652,7 +676,7 @@ impl Graph {
             .max()
             .unwrap_or_default();
 
-        let discovered: Vec<(i64, Vec<usize>, i128, i64)> = filtered_starts
+        let discovered: Vec<(i64, Vec<usize>, Vec<usize>, i128, i64)> = filtered_starts
             .par_iter()
             .flat_map(|&(priority, start_idx)| {
                 if abort.load(AtomicOrdering::Relaxed) || timed_out.load(AtomicOrdering::Relaxed) {
@@ -667,10 +691,12 @@ impl Graph {
                 };
                 self.bellman_ford_from(start_idx, &limits, &adjacency, search_control)
                     .into_iter()
-                    .map(|(weight, cycle)| {
-                        let estimated_profit_bps =
-                            self.estimate_cycle_profit_bps(&cycle).unwrap_or(0);
-                        (weight, cycle, priority, estimated_profit_bps)
+                    .map(|(weight, cycle, edge_indices)| {
+                        let estimated_profit_bps = self
+                            .estimate_cycle_profit_bps_from_edges(&edge_indices)
+                            .or_else(|| self.estimate_cycle_profit_bps(&cycle))
+                            .unwrap_or(0);
+                        (weight, cycle, edge_indices, priority, estimated_profit_bps)
                     })
                     .collect::<Vec<_>>()
             })
@@ -696,7 +722,7 @@ impl Graph {
         let mut by_color: HashMap<u64, Vec<ScoredCycle>> = HashMap::new();
         let mut seen: HashSet<Vec<usize>> = HashSet::new();
 
-        for (weight, mut cycle, priority, estimated_profit_bps) in discovered {
+        for (weight, mut cycle, edge_indices, priority, estimated_profit_bps) in discovered {
             if cycle.len() < 2 {
                 continue;
             }
@@ -724,6 +750,7 @@ impl Graph {
             by_color.entry(color).or_default().push(ScoredCycle {
                 weight,
                 cycle,
+                edge_indices,
                 start,
                 priority,
                 estimated_profit_bps,
@@ -788,6 +815,7 @@ impl Graph {
             .into_iter()
             .map(|entry| CycleCandidate {
                 cycle: entry.cycle,
+                edge_indices: entry.edge_indices,
                 weight: entry.weight,
                 start: entry.start,
                 estimated_profit_bps: entry.estimated_profit_bps,
@@ -801,15 +829,74 @@ impl Graph {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CycleCandidate {
     pub cycle: Vec<usize>,
+    pub edge_indices: Vec<usize>,
     pub weight: i64,
     pub start: Address,
     pub estimated_profit_bps: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexedCycle {
+    pub cycle: Vec<usize>,
+    pub edge_indices: Vec<usize>,
+}
+
+impl IndexedCycle {
+    pub fn from_nodes(cycle: Vec<usize>) -> Self {
+        Self {
+            cycle,
+            edge_indices: Vec::new(),
+        }
+    }
+
+    pub fn hops(&self) -> usize {
+        self.cycle.len().saturating_sub(1)
+    }
+
+    pub fn edge_indices_valid(&self) -> bool {
+        self.edge_indices.len() == self.hops()
+    }
+}
+
+/// Rotate a closed cycle so it starts at `new_start_ix`, preserving hop edges.
+pub fn rotate_indexed_cycle(
+    cycle: &[usize],
+    edge_indices: &[usize],
+    new_start_ix: usize,
+) -> Option<IndexedCycle> {
+    if cycle.len() < 2 || edge_indices.len() != cycle.len().saturating_sub(1) {
+        return None;
+    }
+    let closed = cycle.first() == cycle.last();
+    let body: Vec<usize> = if closed {
+        cycle[..cycle.len().saturating_sub(1)].to_vec()
+    } else {
+        cycle.to_vec()
+    };
+    let start_pos = body.iter().position(|&ix| ix == new_start_ix)?;
+    let len = body.len();
+    let mut rotated_nodes = Vec::with_capacity(len + if closed { 1 } else { 0 });
+    for offset in 0..len {
+        rotated_nodes.push(body[(start_pos + offset) % len]);
+    }
+    if closed {
+        rotated_nodes.push(rotated_nodes[0]);
+    }
+    let mut rotated_edges = Vec::with_capacity(edge_indices.len());
+    for hop in 0..edge_indices.len() {
+        rotated_edges.push(edge_indices[(start_pos + hop) % len]);
+    }
+    Some(IndexedCycle {
+        cycle: rotated_nodes,
+        edge_indices: rotated_edges,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ScoredCycle {
     weight: i64,
     cycle: Vec<usize>,
+    edge_indices: Vec<usize>,
     start: Address,
     priority: i128,
     estimated_profit_bps: i64,
@@ -863,6 +950,7 @@ impl Graph {
             };
             let bit = match &edge.venue {
                 VenueEdge::UniV3 { .. } => 1u64 << 0,
+                VenueEdge::Slipstream { .. } => 1u64 << 8,
                 VenueEdge::Balancer { .. } => 1u64 << 1,
                 VenueEdge::Curve { .. } => 1u64 << 2,
                 VenueEdge::UniV2 { .. } => 1u64 << 3,
@@ -901,9 +989,9 @@ impl Graph {
         true
     }
 
-    fn build_adjacency(&self) -> Vec<Vec<(usize, i64)>> {
+    fn build_adjacency(&self) -> Vec<Vec<(usize, i64, usize)>> {
         let n = self.nodes.len();
-        let mut adjacency: Vec<Vec<(usize, i64)>> = vec![Vec::new(); n];
+        let mut adjacency: Vec<Vec<(usize, i64, usize)>> = vec![Vec::new(); n];
 
         for (from_idx, slot) in adjacency.iter_mut().enumerate() {
             if let Some(entry) = self.adjacency.get(&from_idx) {
@@ -914,13 +1002,52 @@ impl Graph {
         adjacency
     }
 
+    pub(crate) fn cycle_weight_from_edge_indices(&self, edge_indices: &[usize]) -> Option<i64> {
+        let mut total: i64 = 0;
+        for &idx in edge_indices {
+            let edge = self.edges.get(idx)?;
+            if !edge.active {
+                return None;
+            }
+            total = total.saturating_add(edge.weight);
+        }
+        Some(total)
+    }
+
+    fn cycle_weight_for_node_path(&self, cycle: &[usize]) -> Option<i64> {
+        if cycle.len() < 2 {
+            return None;
+        }
+        let mut edge_indices = Vec::with_capacity(cycle.len().saturating_sub(1));
+        for window in cycle.windows(2) {
+            let from_addr = self.nodes.get(window[0])?;
+            let to_addr = self.nodes.get(window[1])?;
+            let indices = self.edge_lookup.get(&(*from_addr, *to_addr))?;
+            let mut best_idx: Option<usize> = None;
+            let mut best_weight = i64::MAX;
+            for &idx in indices {
+                let Some(edge) = self.edges.get(idx) else {
+                    continue;
+                };
+                if !edge.active || edge.weight >= best_weight {
+                    continue;
+                }
+                best_weight = edge.weight;
+                best_idx = Some(idx);
+            }
+            best_idx?;
+            edge_indices.push(best_idx?);
+        }
+        self.cycle_weight_from_edge_indices(&edge_indices)
+    }
+
     fn bellman_ford_from(
         &self,
         source_idx: usize,
         limits: &BellmanFordLimits,
-        adjacency: &[Vec<(usize, i64)>],
+        adjacency: &[Vec<(usize, i64, usize)>],
         search_control: SearchControl<'_>,
-    ) -> Vec<(i64, Vec<usize>)> {
+    ) -> Vec<(i64, Vec<usize>, Vec<usize>)> {
         let limits = limits.sanitized();
         let n = self.nodes.len();
         if n == 0 || limits.max_hops == 0 {
@@ -950,6 +1077,7 @@ impl Graph {
 
         let mut dist = vec![i128::MAX / 4; n];
         let mut pred: Vec<Option<usize>> = vec![None; n];
+        let mut pred_edge: Vec<Option<usize>> = vec![None; n];
         dist[source_idx] = 0;
 
         // Preserve `max_relaxations` as an iteration budget (queue frontiers / passes),
@@ -958,7 +1086,8 @@ impl Graph {
         let mut cycles: Vec<DetectedCycle> = Vec::new();
         let mut seen: HashSet<Vec<usize>> = HashSet::new();
 
-        let mut record_cycle = |cycle: Vec<usize>, store: &mut Vec<DetectedCycle>| {
+        let mut record_cycle =
+            |cycle: Vec<usize>, edge_path: Vec<usize>, store: &mut Vec<DetectedCycle>| {
             if store.len() >= limits.max_cycles {
                 return;
             }
@@ -987,14 +1116,23 @@ impl Graph {
                 return;
             }
 
-            if let Some(weight) = self.cycle_weight(&cycle) {
+            let weight = if edge_path.len() == hops {
+                self.cycle_weight_from_edge_indices(&edge_path)
+            } else {
+                self.cycle_weight_for_node_path(&cycle)
+            };
+            if let Some(weight) = weight {
                 if weight >= 0 {
                     return;
                 }
-                let estimated_profit_bps = self.estimate_cycle_profit_bps(&cycle).unwrap_or(0);
+                let estimated_profit_bps = self
+                    .estimate_cycle_profit_bps_from_edges(&edge_path)
+                    .or_else(|| self.estimate_cycle_profit_bps(&cycle))
+                    .unwrap_or(0);
                 store.push(DetectedCycle {
                     weight,
                     cycle,
+                    edge_indices: edge_path,
                     estimated_profit_bps,
                 });
             }
@@ -1027,7 +1165,7 @@ impl Graph {
                     continue;
                 }
 
-                for &(v_id, weight) in &adjacency[u_id] {
+                for &(v_id, weight, edge_idx) in &adjacency[u_id] {
                     let candidate = dist[u_id].saturating_add(weight as i128);
                     if candidate >= dist[v_id] {
                         continue;
@@ -1035,21 +1173,23 @@ impl Graph {
 
                     dist[v_id] = candidate;
                     pred[v_id] = Some(u_id);
+                    pred_edge[v_id] = Some(edge_idx);
                     relax_count[v_id] = relax_count[v_id].saturating_add(1);
 
-                    if let Some(cycle) = self.extract_cycle(v_id, &pred, source_idx) {
-                        record_cycle(cycle, &mut cycles);
+                    if let Some((cycle, edges)) =
+                        self.extract_cycle_with_edges(v_id, &pred, &pred_edge, source_idx)
+                    {
+                        record_cycle(cycle, edges, &mut cycles);
                         if cycles.len() >= limits.max_cycles {
                             break;
                         }
                     }
 
-                    // SPFA-style negative cycle detection: a reachable vertex can only
-                    // be improved at most `n` times in a graph without a negative cycle.
-                    // If it is improved beyond that bound, reconstruct through `pred`.
                     if relax_count[v_id] > n {
-                        if let Some(cycle) = self.extract_cycle(v_id, &pred, source_idx) {
-                            record_cycle(cycle, &mut cycles);
+                        if let Some((cycle, edges)) =
+                            self.extract_cycle_with_edges(v_id, &pred, &pred_edge, source_idx)
+                        {
+                            record_cycle(cycle, edges, &mut cycles);
                         }
                     }
 
@@ -1082,49 +1222,135 @@ impl Graph {
         cycles
             .into_iter()
             .take(limits.max_cycles)
-            .map(|cycle| (cycle.weight, cycle.cycle))
+            .map(|cycle| (cycle.weight, cycle.cycle, cycle.edge_indices))
             .collect()
     }
 
-    fn extract_cycle(
+    fn resolve_edge_path_for_cycle(
+        &self,
+        cycle: &[usize],
+        pred_edge: &[Option<usize>],
+    ) -> Vec<usize> {
+        if cycle.len() < 2 {
+            return Vec::new();
+        }
+        let hops = cycle.len().saturating_sub(1);
+        let mut indices = Vec::with_capacity(hops);
+        for window in cycle.windows(2) {
+            let from_ix = window[0];
+            let to_ix = window[1];
+            let mut matched = false;
+            if let Some(idx) = pred_edge.get(to_ix).copied().flatten() {
+                if self.edges.get(idx).is_some_and(|edge| {
+                    edge.active
+                        && self.ix.get(&edge.from) == Some(&from_ix)
+                        && self.ix.get(&edge.to) == Some(&to_ix)
+                }) {
+                    indices.push(idx);
+                    matched = true;
+                }
+            }
+            if !matched {
+                let from_addr = self.nodes[from_ix];
+                let to_addr = self.nodes[to_ix];
+                let lookup = self.edge_lookup.get(&(from_addr, to_addr));
+                if let Some(candidates) = lookup {
+                    let mut best: Option<(i64, usize)> = None;
+                    for &idx in candidates {
+                        let Some(edge) = self.edges.get(idx) else {
+                            continue;
+                        };
+                        if !edge.active {
+                            continue;
+                        }
+                        match best {
+                            None => best = Some((edge.weight, idx)),
+                            Some((best_weight, _)) if edge.weight < best_weight => {
+                                best = Some((edge.weight, idx));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some((_, idx)) = best {
+                        indices.push(idx);
+                    }
+                }
+            }
+        }
+        indices
+    }
+
+    fn extract_cycle_with_edges(
         &self,
         mut v_id: usize,
         pred: &[Option<usize>],
+        pred_edge: &[Option<usize>],
         source_idx: usize,
-    ) -> Option<Vec<usize>> {
+    ) -> Option<(Vec<usize>, Vec<usize>)> {
         let n = self.nodes.len();
         for _ in 0..n {
             v_id = pred[v_id]?;
         }
 
+        let entry = v_id;
         let mut cycle = vec![v_id];
+        let mut edges = Vec::new();
         let mut current = pred[v_id]?;
         let mut guard = 0usize;
         while guard <= n {
+            if let Some(edge_idx) = pred_edge.get(v_id).copied().flatten() {
+                edges.push(edge_idx);
+            }
             cycle.push(current);
-            if current == v_id {
+            if current == entry {
                 break;
             }
+            v_id = current;
             current = pred[current]?;
             guard += 1;
         }
 
-        if *cycle.last()? != v_id {
+        if *cycle.last()? != entry {
             return None;
         }
 
         cycle.reverse();
+        edges.reverse();
         if cycle.len() < 2 {
             return None;
         }
-
-        if let Some(pos) = cycle.iter().position(|&ix| ix == source_idx) {
-            cycle.rotate_left(pos);
+        if cycle.first() != cycle.last() {
+            cycle.push(cycle[0]);
         }
 
-        Some(cycle)
+        let hops = cycle.len().saturating_sub(1);
+        if let Some(pos) = cycle[..hops].iter().position(|&ix| ix == source_idx) {
+            let mut rotated_nodes = Vec::with_capacity(hops + 1);
+            for offset in 0..hops {
+                rotated_nodes.push(cycle[(pos + offset) % hops]);
+            }
+            rotated_nodes.push(rotated_nodes[0]);
+
+            let rotated_edges = if edges.len() == hops {
+                (0..hops)
+                    .map(|offset| edges[(pos + offset) % hops])
+                    .collect()
+            } else {
+                self.resolve_edge_path_for_cycle(&rotated_nodes, pred_edge)
+            };
+
+            Some((rotated_nodes, rotated_edges))
+        } else {
+            let resolved_edges = if edges.len() == hops {
+                edges
+            } else {
+                self.resolve_edge_path_for_cycle(&cycle, pred_edge)
+            };
+            Some((cycle, resolved_edges))
+        }
     }
 
+    #[allow(dead_code)] // consumed by the `arb-exec` binary target
     pub(crate) fn cycle_weight(&self, cycle: &[usize]) -> Option<i64> {
         if cycle.len() < 2 {
             return None;
@@ -1146,6 +1372,34 @@ impl Graph {
         Some(total)
     }
 
+    fn estimate_cycle_profit_bps_from_edges(&self, edge_indices: &[usize]) -> Option<i64> {
+        if edge_indices.is_empty() {
+            return None;
+        }
+        let mut log_rate_sum = 0.0f64;
+        for &idx in edge_indices {
+            let edge = self.edges.get(idx)?;
+            if !edge.active {
+                return None;
+            }
+            let protected_num = crate::util::apply_slippage(edge.rate_num, edge.tolerance_bps);
+            if protected_num.is_zero() || edge.rate_den.is_zero() {
+                return None;
+            }
+            let rate = u256_to_f64(protected_num) / u256_to_f64(edge.rate_den);
+            if rate <= 0.0 {
+                return None;
+            }
+            log_rate_sum += rate.ln();
+        }
+        let profit_ratio = log_rate_sum.exp() - 1.0;
+        if !profit_ratio.is_finite() {
+            return None;
+        }
+        let scaled = (profit_ratio * 10_000.0).round();
+        Some(scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+    }
+
     fn estimate_cycle_profit_bps(&self, cycle: &[usize]) -> Option<i64> {
         if cycle.len() < 2 {
             return None;
@@ -1158,7 +1412,11 @@ impl Graph {
             let &from_addr = self.nodes.get(from_idx)?;
             let &to_addr = self.nodes.get(to_idx)?;
             let edge = self.edge_between(from_addr, to_addr)?;
-            let rate = u256_to_f64(edge.rate_num) / u256_to_f64(edge.rate_den);
+            let protected_num = crate::util::apply_slippage(edge.rate_num, edge.tolerance_bps);
+            if protected_num.is_zero() || edge.rate_den.is_zero() {
+                return None;
+            }
+            let rate = u256_to_f64(protected_num) / u256_to_f64(edge.rate_den);
             if rate <= 0.0 {
                 return None;
             }
@@ -1211,7 +1469,7 @@ mod tests {
             0,
             U256::zero(),
             U256::from(1u64),
-            NativePrice::unit(),
+            NativePrice::new(U256::exp10(18), U256::exp10(18), true),
         )
     }
 
@@ -2501,5 +2759,103 @@ mod tests {
         };
         assert_eq!(graph.edges.len(), 2);
         assert_eq!(best.weight, expected);
+    }
+
+    #[test]
+    fn bellman_ford_preserves_parallel_edge_path() {
+        let mut graph = Graph::default();
+        let a = addr(1);
+        let b = addr(2);
+
+        // Two parallel A→B edges: worse (weight 0) and better (weight -5).
+        graph.add_edge(Edge {
+            from: a,
+            to: b,
+            rate_num: U256::from(99u64),
+            rate_den: U256::from(100u64),
+            venue: VenueEdge::UniV2 {
+                pair: addr(100),
+                token_out: b,
+                token0: a,
+                token1: b,
+                reserve_in: U256::from(1_000_000u64),
+                reserve_out: U256::from(1_000_000u64),
+                fee_bps: 30,
+            },
+            estimated_gas: 100_000,
+            weight: 0,
+            max_input: U256::from(1_000u64),
+            tolerance_bps: 30,
+            observed_slippage_bps: 10,
+            quote_block: None,
+            active: true,
+        });
+        graph.add_edge(Edge {
+            from: a,
+            to: b,
+            rate_num: U256::from(101u64),
+            rate_den: U256::from(100u64),
+            venue: VenueEdge::UniV2 {
+                pair: addr(101),
+                token_out: b,
+                token0: a,
+                token1: b,
+                reserve_in: U256::from(2_000_000u64),
+                reserve_out: U256::from(2_000_000u64),
+                fee_bps: 30,
+            },
+            estimated_gas: 100_000,
+            weight: -5,
+            max_input: U256::from(1_000u64),
+            tolerance_bps: 30,
+            observed_slippage_bps: 10,
+            quote_block: None,
+            active: true,
+        });
+        graph.add_edge(Edge {
+            from: b,
+            to: a,
+            rate_num: U256::from(102u64),
+            rate_den: U256::from(100u64),
+            venue: VenueEdge::UniV2 {
+                pair: addr(102),
+                token_out: a,
+                token0: a,
+                token1: b,
+                reserve_in: U256::from(1_000_000u64),
+                reserve_out: U256::from(1_000_000u64),
+                fee_bps: 30,
+            },
+            estimated_gas: 100_000,
+            weight: -5,
+            max_input: U256::from(1_000u64),
+            tolerance_bps: 30,
+            observed_slippage_bps: 10,
+            quote_block: None,
+            active: true,
+        });
+
+        let priorities = HashMap::new();
+        let limits = BellmanFordLimits {
+            min_hops: 2,
+            max_hops: 2,
+            max_relaxations: 8,
+            max_cycles: 4,
+            timeout: Duration::from_millis(200),
+        };
+        let cycles = graph.bellman_ford(&priorities, &limits, 4, None);
+        assert!(!cycles.is_empty(), "should detect 2-hop arb");
+        let candidate = cycles
+            .iter()
+            .find(|c| c.edge_indices.len() == 2)
+            .or_else(|| cycles.first())
+            .expect("cycle with edges");
+        assert_eq!(candidate.edge_indices.len(), 2);
+        // First hop must be the better parallel A→B edge (index 1), not edge_between pick.
+        assert_eq!(candidate.edge_indices[0], 1);
+        let edge = graph
+            .edge_by_index(candidate.edge_indices[0])
+            .expect("edge index must resolve");
+        assert_eq!(edge.weight, -5);
     }
 }

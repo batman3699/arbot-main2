@@ -1008,6 +1008,29 @@ pub fn validate_chain_cfg(
                         &mut missing,
                     )?;
                 }
+                VenueKind::SlipstreamLike => {
+                    require_ops_address(
+                        cfg,
+                        &venue.name,
+                        "factory",
+                        venue.factory.as_ref(),
+                        &mut missing,
+                    )?;
+                    require_ops_address(
+                        cfg,
+                        &venue.name,
+                        "router",
+                        venue.router.as_ref(),
+                        &mut missing,
+                    )?;
+                    require_ops_address(
+                        cfg,
+                        &venue.name,
+                        "quoter",
+                        venue.quoter.as_ref(),
+                        &mut missing,
+                    )?;
+                }
                 VenueKind::GenericRouter => {
                     require_ops_address(
                         cfg,

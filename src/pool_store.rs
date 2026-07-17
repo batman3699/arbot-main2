@@ -135,15 +135,26 @@ pub fn write_pool_records(path: impl AsRef<Path>, records: &[PoolRecord]) -> Res
     Ok(())
 }
 
+/// Values above this are almost certainly raw UniV3 `liquidity()` scores, not USD.
+const MAX_SANE_HUB_USD_LIQUIDITY: f64 = 1e12;
+
+fn sanitize_hub_usd_liquidity(value: Option<f64>) -> Option<f64> {
+    value.filter(|usd| usd.is_finite() && *usd > 0.0 && *usd <= MAX_SANE_HUB_USD_LIQUIDITY)
+}
+
 /// Keep the most liquid cold-pool candidates when inventory exceeds the cap.
 /// Prefers `hub_usd_liquidity` from offline ranking; falls back to newest
 /// `created_block` when liquidity metadata is absent.
+#[allow(dead_code)]
 pub fn prioritize_cold_pool_inventory(records: &mut Vec<PoolRecord>, max_cold: usize) {
     if records.len() <= max_cold {
         return;
     }
     records.sort_by(|left, right| {
-        match (left.hub_usd_liquidity, right.hub_usd_liquidity) {
+        match (
+            sanitize_hub_usd_liquidity(left.hub_usd_liquidity),
+            sanitize_hub_usd_liquidity(right.hub_usd_liquidity),
+        ) {
             (Some(l), Some(r)) => r
                 .partial_cmp(&l)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -260,6 +271,31 @@ mod tests {
                 fee: 500,
                 created_block: 99,
                 hub_usd_liquidity: Some(10_000.0),
+            },
+            PoolRecord {
+                pool: Address::from_low_u64_be(4),
+                token0: Address::from_low_u64_be(5),
+                token1: Address::from_low_u64_be(6),
+                fee: 500,
+                created_block: 1,
+                hub_usd_liquidity: Some(5_000_000.0),
+            },
+        ];
+        prioritize_cold_pool_inventory(&mut pools, 1);
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].pool, Address::from_low_u64_be(4));
+    }
+
+    #[test]
+    fn prioritize_ignores_corrupt_hub_liquidity() {
+        let mut pools = vec![
+            PoolRecord {
+                pool: Address::from_low_u64_be(1),
+                token0: Address::from_low_u64_be(2),
+                token1: Address::from_low_u64_be(3),
+                fee: 500,
+                created_block: 99,
+                hub_usd_liquidity: Some(1e33),
             },
             PoolRecord {
                 pool: Address::from_low_u64_be(4),

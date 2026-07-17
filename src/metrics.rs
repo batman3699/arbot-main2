@@ -54,6 +54,14 @@ pub struct Metrics {
     pub liquidity_cache_misses: CounterVec,
     pub liquidity_cache_evictions: CounterVec,
     pub worker_restarts: CounterVec,
+    pub populate_full_total: CounterVec,
+    pub populate_incremental_total: CounterVec,
+    pub populate_skipped_total: CounterVec,
+    pub sim_revm_success_total: Counter,
+    pub sim_revm_failure_total: Counter,
+    pub sim_revm_fallback_total: Counter,
+    pub sim_revm_prefetch_accounts_total: Counter,
+    pub sim_revm_prefetch_ms: Histogram,
 }
 
 impl Metrics {
@@ -407,6 +415,79 @@ impl Metrics {
             .register(Box::new(worker_restarts.clone()))
             .context("register worker_restarts_total counter")?;
 
+        let populate_full_total = CounterVec::new(
+            Opts::new(
+                "populate_full_total",
+                "Full edge populate runs (all pools re-quoted)",
+            ),
+            &["chain"],
+        )?;
+        registry
+            .register(Box::new(populate_full_total.clone()))
+            .context("register populate_full_total counter")?;
+
+        let populate_incremental_total = CounterVec::new(
+            Opts::new(
+                "populate_incremental_total",
+                "Incremental edge populate runs (touched pools only)",
+            ),
+            &["chain"],
+        )?;
+        registry
+            .register(Box::new(populate_incremental_total.clone()))
+            .context("register populate_incremental_total counter")?;
+
+        let populate_skipped_total = CounterVec::new(
+            Opts::new(
+                "populate_skipped_total",
+                "Populate runs skipped (digest unchanged, no touched pools)",
+            ),
+            &["chain"],
+        )?;
+        registry
+            .register(Box::new(populate_skipped_total.clone()))
+            .context("register populate_skipped_total counter")?;
+
+        let sim_revm_success_total = Counter::with_opts(Opts::new(
+            "sim_revm_success_total",
+            "Successful revm fork simulations",
+        ))?;
+        registry
+            .register(Box::new(sim_revm_success_total.clone()))
+            .context("register sim_revm_success_total counter")?;
+
+        let sim_revm_failure_total = Counter::with_opts(Opts::new(
+            "sim_revm_failure_total",
+            "Failed revm fork simulations (revert/halt/error)",
+        ))?;
+        registry
+            .register(Box::new(sim_revm_failure_total.clone()))
+            .context("register sim_revm_failure_total counter")?;
+
+        let sim_revm_fallback_total = Counter::with_opts(Opts::new(
+            "sim_revm_fallback_total",
+            "Revm sim skipped; eth_call fallback used",
+        ))?;
+        registry
+            .register(Box::new(sim_revm_fallback_total.clone()))
+            .context("register sim_revm_fallback_total counter")?;
+
+        let sim_revm_prefetch_accounts_total = Counter::with_opts(Opts::new(
+            "sim_revm_prefetch_accounts_total",
+            "Accounts prefetched before revm fork simulation",
+        ))?;
+        registry
+            .register(Box::new(sim_revm_prefetch_accounts_total.clone()))
+            .context("register sim_revm_prefetch_accounts_total counter")?;
+
+        let sim_revm_prefetch_ms = Histogram::with_opts(HistogramOpts::new(
+            "sim_revm_prefetch_ms",
+            "Latency of revm account prefetch in milliseconds",
+        ))?;
+        registry
+            .register(Box::new(sim_revm_prefetch_ms.clone()))
+            .context("register sim_revm_prefetch_ms histogram")?;
+
         Ok(Self {
             registry,
             opportunities_detected,
@@ -446,6 +527,14 @@ impl Metrics {
             liquidity_cache_misses,
             liquidity_cache_evictions,
             worker_restarts,
+            populate_full_total,
+            populate_incremental_total,
+            populate_skipped_total,
+            sim_revm_success_total,
+            sim_revm_failure_total,
+            sim_revm_fallback_total,
+            sim_revm_prefetch_accounts_total,
+            sim_revm_prefetch_ms,
         })
     }
 

@@ -21,6 +21,7 @@ use tokio::{
 use crate::discovery::LowLiquidityPool;
 use crate::graph::{Edge, Graph, VenueEdge};
 use crate::hot_path::HotPathCache;
+use crate::metrics::Metrics;
 use crate::pool_store::{PoolRecord, ResolvedUniV2PoolCfg};
 use crate::quote_balancer::BalQuote;
 use crate::quote_curve::CurveQuote;
@@ -28,6 +29,7 @@ use crate::quote_solidly::{
     quote_exact_input_from_state as quote_solidly_exact_input, SolidlyPairState,
 };
 use crate::quote_univ2::{load_pair_state, quote_exact_input_from_state, UniV2PairState};
+use crate::quote_slipstream::SlipstreamQuoter;
 use crate::quote_univ3::{UniQuoter, UniV3ValidationConfig, FEE_TIERS};
 use futures_util::{stream, StreamExt};
 use crate::quote_univ4::quote_fixed_price_exact_input;
@@ -107,6 +109,90 @@ fn native_price_for(token: Address, prices: &HashMap<Address, NativePrice>) -> N
         .get(&token)
         .copied()
         .unwrap_or_else(NativePrice::unit)
+}
+
+/// Hub-aware native pricing: WETH peg, stable 1:1 via WETH, reliable map entries first.
+fn hub_native_price_for(
+    token: Address,
+    prices: &HashMap<Address, NativePrice>,
+    hub_tokens: &HashSet<Address>,
+    wrapped_native: Address,
+    stable_decimals: u8,
+) -> NativePrice {
+    if token == wrapped_native && !wrapped_native.is_zero() {
+        let amount = U256::exp10(18);
+        return NativePrice::new(amount, amount, true);
+    }
+    if let Some(price) = prices.get(&token) {
+        if price.is_reliable() {
+            return *price;
+        }
+    }
+    if hub_tokens.contains(&token) {
+        let weth_price = if wrapped_native.is_zero() {
+            None
+        } else {
+            prices.get(&wrapped_native).copied().filter(NativePrice::is_reliable)
+        };
+        if let Some(weth) = weth_price {
+            // Stable hub (USDC etc.): $1 notional pegged through WETH native price.
+            let token_unit = U256::exp10(stable_decimals.min(18) as usize);
+            let native_per_usd = weth.tokens_for_native_if_reliable(weth.native_amount);
+            if let Some(native_for_unit) = native_per_usd {
+                return NativePrice::new(token_unit, native_for_unit, true);
+            }
+        }
+    }
+    native_price_for(token, prices)
+}
+
+fn cl_grid_quote(
+    state: &crate::cl_sim::ClPoolState,
+    base_amount: U256,
+    tolerance_bps: u32,
+    zero_for_one: bool,
+) -> Result<Option<QuoteComputation>> {
+    let grid = univ3_size_grid(base_amount);
+    if grid.is_empty() {
+        return Ok(None);
+    }
+    let mut outs = Vec::with_capacity(grid.len());
+    for amount in &grid {
+        outs.push(crate::cl_sim::quote_exact_input_single_tick(
+            state,
+            *amount,
+            zero_for_one,
+            state.fee_ppm,
+        )?);
+    }
+    Ok(best_from_grid(&grid, &outs, tolerance_bps))
+}
+
+fn edge_native_price(token: Address, ctx: &EdgeBuildContext) -> NativePrice {
+    hub_native_price_for(
+        token,
+        ctx.native_token_prices.as_ref(),
+        ctx.hub_tokens.as_ref(),
+        ctx.wrapped_native,
+        ctx.stable_hub_decimals,
+    )
+}
+
+fn refresh_edge_gas_weights(edges: &mut [Edge], gas_price: U256, ctx: &EdgeBuildContext) {
+    for edge in edges.iter_mut() {
+        if !edge.active {
+            continue;
+        }
+        let protected_out = apply_slippage(edge.rate_num, edge.tolerance_bps);
+        edge.weight = compute_edge_weight(
+            protected_out,
+            edge.rate_den,
+            edge.estimated_gas,
+            gas_price,
+            edge.max_input,
+            edge_native_price(edge.from, ctx),
+        );
+    }
 }
 
 fn edge_health_score_bps(edge: &Edge, current_block: U64, max_block_lag: U64) -> u32 {
@@ -1098,6 +1184,39 @@ fn resolve_solidly_pools(raw: &str, source: &str) -> Result<Vec<ResolvedSolidlyV
         .collect()
 }
 
+/// Build deduplicated Solidly pair monitor entries from chain env config.
+pub fn solidly_monitored_pools(chain_env_prefix: &str) -> Vec<crate::ingestion::MonitoredPool> {
+    use crate::ingestion::{MonitoredPool, PoolMonitorKind};
+    let env_key = format!("{chain_env_prefix}_SOLIDLY_V2_POOLS");
+    let Some((raw, source)) = env_var_with_fallback(&env_key, "SOLIDLY_V2_POOLS") else {
+        return Vec::new();
+    };
+    let pools = resolve_solidly_pools(&raw, &source).unwrap_or_default();
+    let mut unique: HashMap<Address, MonitoredPool> = HashMap::new();
+    for pool in pools {
+        unique.entry(pool.pair).or_insert(MonitoredPool {
+            pair: pool.pair,
+            token_in: pool.token_in,
+            token_out: pool.token_out,
+            fee_bps: pool.fee_bps,
+            stable: pool.stable,
+            kind: PoolMonitorKind::Solidly,
+        });
+    }
+    unique.into_values().collect()
+}
+
+pub fn merge_monitored_pools(
+    univ2: Vec<crate::ingestion::MonitoredPool>,
+    solidly: Vec<crate::ingestion::MonitoredPool>,
+) -> Vec<crate::ingestion::MonitoredPool> {
+    let mut unique: HashMap<Address, crate::ingestion::MonitoredPool> = HashMap::new();
+    for pool in univ2.into_iter().chain(solidly) {
+        unique.insert(pool.pair, pool);
+    }
+    unique.into_values().collect()
+}
+
 fn resolve_univ4_pools(raw: &str, source: &str) -> Result<Vec<ResolvedUniv4PoolCfg>> {
     let pools: Vec<Univ4PoolCfg> = parse_pool_configs(raw, source)?;
     pools
@@ -1168,6 +1287,66 @@ fn is_liquid(reserve: U256, decimals: u8, min_tokens: f64) -> bool {
     tokens >= min_tokens_dec
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EdgeDigest {
+    pub edges: usize,
+    pub active_edges: usize,
+    pub weight_sum: i128,
+    pub weight_abs_sum: i128,
+}
+
+pub fn edge_digest(edges: &[Edge]) -> EdgeDigest {
+    let mut digest = EdgeDigest {
+        edges: edges.len(),
+        ..Default::default()
+    };
+    for edge in edges.iter() {
+        if edge.active {
+            digest.active_edges = digest.active_edges.saturating_add(1);
+            let weight = i128::from(edge.weight);
+            digest.weight_sum = digest.weight_sum.saturating_add(weight);
+            let abs = if weight == i128::MIN {
+                i128::MAX
+            } else {
+                weight.abs()
+            };
+            digest.weight_abs_sum = digest.weight_abs_sum.saturating_add(abs);
+        }
+    }
+    digest
+}
+
+pub fn edge_digest_changed_significantly(previous: Option<EdgeDigest>, current: EdgeDigest) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    if previous.edges != current.edges || previous.active_edges != current.active_edges {
+        return true;
+    }
+    if previous.weight_abs_sum == 0 {
+        return current.weight_abs_sum != 0;
+    }
+    let delta = (current.weight_abs_sum - previous.weight_abs_sum).abs();
+    let threshold = previous.weight_abs_sum / 20;
+    delta > threshold
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopulateMode {
+    Full,
+    Incremental,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PopulateOptions {
+    pub touched_pools: HashSet<Address>,
+    pub last_digest: Option<EdgeDigest>,
+    pub last_gas_price: U256,
+    pub cached_edges: Option<Vec<Edge>>,
+    pub gas_refresh_threshold_bps: u32,
+}
+
 #[derive(Clone)]
 struct EdgeBuildContext {
     base_profiles: Arc<HashMap<Address, TradeSizing>>,
@@ -1175,6 +1354,9 @@ struct EdgeBuildContext {
     gas_price: U256,
     native_token_prices: Arc<HashMap<Address, NativePrice>>,
     block_number: U64,
+    hub_tokens: Arc<HashSet<Address>>,
+    wrapped_native: Address,
+    stable_hub_decimals: u8,
 }
 
 struct Univ3EdgeContext<C>
@@ -1184,12 +1366,144 @@ where
     edge_ctx: EdgeBuildContext,
     allowed_fee_tiers: Option<Arc<HashSet<u32>>>,
     quoter: Arc<UniQuoter<C>>,
+    provider: Arc<Provider<C>>,
     hot_paths: Arc<HotPathCache>,
     quote_semaphore: Arc<Semaphore>,
     quote_concurrency_limit: usize,
     token_whitelist: Arc<HashSet<Address>>,
     chain_env_prefix: String,
+    pool_filter: Option<HashSet<Address>>,
 }
+
+const ESTIMATED_GAS_SLIPSTREAM: u64 = ESTIMATED_GAS_UNIV3;
+
+struct SlipstreamEdgeContext<C>
+where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    edge_ctx: EdgeBuildContext,
+    allowed_tick_spacings: Option<Arc<HashSet<u32>>>,
+    quoter: Arc<SlipstreamQuoter<C>>,
+    provider: Arc<Provider<C>>,
+    router: Address,
+    hot_paths: Arc<HotPathCache>,
+    quote_semaphore: Arc<Semaphore>,
+    quote_concurrency_limit: usize,
+    token_whitelist: Arc<HashSet<Address>>,
+    chain_env_prefix: String,
+    pool_filter: Option<HashSet<Address>>,
+}
+
+async fn slipstream_grid_quote<C>(
+    quoter: &SlipstreamQuoter<C>,
+    path: Vec<(Address, Option<u32>)>,
+    base_amount: U256,
+    tolerance_bps: u32,
+    block: U64,
+    quote_semaphore: &Arc<Semaphore>,
+) -> Result<Option<QuoteComputation>>
+where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    let grid = univ3_size_grid(base_amount);
+    if grid.is_empty() {
+        return Ok(None);
+    }
+    let permit = match timeout(queue_wait_timeout(), quote_semaphore.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return Err(anyhow!("slipstream quote semaphore closed")),
+        Err(_) => return Err(anyhow!("slipstream grid quote semaphore wait timed out")),
+    };
+    let result = timeout(rpc_quote_timeout(), quoter.quote_path_grid(path, &grid, block)).await;
+    drop(permit);
+    match result {
+        Ok(Ok(outs)) => Ok(best_from_grid(&grid, &outs, tolerance_bps)),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(anyhow!("slipstream grid quote timed out")),
+    }
+}
+
+async fn bootstrap_slipstream_pools_from_tokens<C>(ctx: &SlipstreamEdgeContext<C>) -> Vec<PoolRecord>
+where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    let mut tokens: Vec<Address> = ctx.token_whitelist.iter().copied().collect();
+    tokens.sort_unstable();
+    if tokens.len() < 2 {
+        return Vec::new();
+    }
+
+    let fees: Vec<u32> = ctx
+        .allowed_tick_spacings
+        .as_ref()
+        .map(|tiers| {
+            let mut v: Vec<u32> = tiers.iter().copied().collect();
+            v.sort_unstable();
+            v
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| crate::quote_slipstream::TICK_SPACINGS.to_vec());
+
+    let max_pairs = std::env::var("SLIPSTREAM_BOOTSTRAP_MAX_PAIRS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(256);
+    let max_pools = std::env::var("SLIPSTREAM_BOOTSTRAP_MAX_POOLS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(512);
+
+    let mut discovered = Vec::new();
+    let mut pair_checks = 0usize;
+    'outer: for i in 0..tokens.len() {
+        for j in (i + 1)..tokens.len() {
+            if pair_checks >= max_pairs || discovered.len() >= max_pools {
+                break 'outer;
+            }
+            pair_checks = pair_checks.saturating_add(1);
+            let token_a = tokens[i];
+            let token_b = tokens[j];
+            for fee in &fees {
+                if discovered.len() >= max_pools {
+                    break 'outer;
+                }
+                match ctx.quoter.pool_address(token_a, token_b, *fee).await {
+                    Ok(Some(pool)) => discovered.push(PoolRecord {
+                        pool,
+                        token0: token_a,
+                        token1: token_b,
+                        fee: *fee,
+                        created_block: 0,
+                        hub_usd_liquidity: None,
+                    }),
+                    Ok(None) => {}
+                    Err(err) => {
+                        debug!(
+                            target: "venue::slipstream",
+                            error = %err,
+                            token0 = %format!("0x{}", hex::encode(token_a)),
+                            token1 = %format!("0x{}", hex::encode(token_b)),
+                            tick_spacing = *fee,
+                            "Slipstream bootstrap pool discovery failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if !discovered.is_empty() {
+        info!(
+            target: "venue::slipstream",
+            pair_checks,
+            discovered_pools = discovered.len(),
+            "Bootstrapped Slipstream pools from token whitelist"
+        );
+    }
+
+    discovered
+}
+
 
 fn semaphore_inflight(concurrency_limit: usize, semaphore: &Semaphore) -> usize {
     concurrency_limit.saturating_sub(semaphore.available_permits())
@@ -1382,6 +1696,18 @@ where
     } else {
         hot_pools.to_vec()
     };
+    let source_pools: Vec<PoolRecord> = if let Some(filter) = &ctx.pool_filter {
+        if filter.is_empty() {
+            source_pools
+        } else {
+            source_pools
+                .into_iter()
+                .filter(|p| filter.contains(&p.pool))
+                .collect()
+        }
+    } else {
+        source_pools
+    };
     if source_pools.is_empty() {
         return Ok(Vec::new());
     }
@@ -1438,9 +1764,13 @@ where
             .copied()
             .unwrap_or(ctx.edge_ctx.default_profile);
         let quoter = Arc::clone(&ctx.quoter);
+        let provider = Arc::clone(&ctx.provider);
         let hot_paths = Arc::clone(&ctx.hot_paths);
         let stats = Arc::clone(&stats);
         let native_token_prices = Arc::clone(&ctx.edge_ctx.native_token_prices);
+        let hub_tokens = Arc::clone(&ctx.edge_ctx.hub_tokens);
+        let wrapped_native = ctx.edge_ctx.wrapped_native;
+        let stable_hub_decimals = ctx.edge_ctx.stable_hub_decimals;
         let quote_semaphore = Arc::clone(&ctx.quote_semaphore);
         let block_number = ctx.edge_ctx.block_number;
         let forced_discovery_quotes_used = Arc::clone(&forced_discovery_quotes_used);
@@ -1448,6 +1778,29 @@ where
         let quote_concurrency_limit = ctx.quote_concurrency_limit;
         join_set.spawn(async move {
             let mut local_edges = Vec::new();
+            let cl_state = if crate::cl_sim::local_cl_quotes_enabled() {
+                match crate::cl_sim::load_cl_pool_state(
+                    provider.clone(),
+                    pool.pool,
+                    block_number,
+                    Some(pool.fee),
+                )
+                .await
+                {
+                    Ok(state) => state,
+                    Err(err) => {
+                        debug!(
+                            target: "venue::univ3",
+                            error = %err,
+                            pool = %format!("0x{}", hex::encode(pool.pool)),
+                            "CL pool state load failed; quoter fallback"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let directions = [
                 (pool.token0, pool.token1, profile_in),
                 (pool.token1, pool.token0, profile_out),
@@ -1474,20 +1827,43 @@ where
                 let path = vec![(token_in, None), (token_out, Some(pool.fee))];
                 let hot_paths_quote = Arc::clone(&hot_paths);
                 let quote_semaphore_fee = Arc::clone(&quote_semaphore);
-                // FAST PATH: batch the whole size grid into ONE Multicall3 call
-                // (one RTT for all sizes). Fall back to the sequential adaptive
-                // search only on transport failure; Ok(None) means "quoted, nothing
-                // profitable within tolerance" and needs no fallback.
-                let quote = match univ3_grid_quote(
-                    quoter.as_ref(),
-                    path.clone(),
-                    base_amount_in,
-                    tolerance_bps,
-                    block_number,
-                    &quote_semaphore_fee,
-                )
-                .await
-                {
+                // FAST PATH: local CL sim grid when state is loaded; else batched
+                // QuoterV2 multicall. Fall back to quoter on local sim errors.
+                let quote = if let Some(ref cl_state) = cl_state {
+                    let zero_for_one = token_in == pool.token0;
+                    match cl_grid_quote(cl_state, base_amount_in, tolerance_bps, zero_for_one) {
+                        Ok(Some(q)) => Ok(Some(q)),
+                        Ok(None) => Ok(None),
+                        Err(err) => {
+                            debug!(
+                                target: "venue::univ3",
+                                error = %err,
+                                pool = %format!("0x{}", hex::encode(pool.pool)),
+                                "local CL grid failed; falling back to quoter"
+                            );
+                            univ3_grid_quote(
+                                quoter.as_ref(),
+                                path.clone(),
+                                base_amount_in,
+                                tolerance_bps,
+                                block_number,
+                                &quote_semaphore_fee,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    univ3_grid_quote(
+                        quoter.as_ref(),
+                        path.clone(),
+                        base_amount_in,
+                        tolerance_bps,
+                        block_number,
+                        &quote_semaphore_fee,
+                    )
+                    .await
+                };
+                let quote = match quote {
                     Ok(opt) => {
                         stats.quote_attempts.fetch_add(1, Ordering::Relaxed);
                         if opt.is_some() {
@@ -1801,7 +2177,13 @@ where
                     ESTIMATED_GAS_UNIV3,
                     gas_price,
                     quote.amount_in,
-                    native_price_for(token_in, &native_token_prices),
+                    hub_native_price_for(
+                        token_in,
+                        native_token_prices.as_ref(),
+                        hub_tokens.as_ref(),
+                        wrapped_native,
+                        stable_hub_decimals,
+                    ),
                 );
                 let edge = Edge {
                     from: token_in,
@@ -1855,6 +2237,603 @@ where
         pool_tasks_spawned,
         elapsed_ms = collector_started_at.elapsed().as_millis() as u64,
         "UniV3 hot pool summary",
+    );
+    Ok(edges)
+}
+
+async fn collect_slipstream_edges<C>(
+    hot_pools: &[PoolRecord],
+    ctx: &SlipstreamEdgeContext<C>,
+) -> Result<Vec<Edge>>
+where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    struct SlipstreamStats {
+        hot_path_skips: AtomicUsize,
+        forced_discovery_quotes: AtomicUsize,
+        fee_tier_skips: AtomicUsize,
+        quote_attempts: AtomicUsize,
+        quote_success: AtomicUsize,
+        quote_failures: AtomicUsize,
+        quote_timeouts: AtomicUsize,
+        queue_wait_timeouts: AtomicUsize,
+        semaphore_acquire_attempts: AtomicUsize,
+        semaphore_acquired: AtomicUsize,
+        semaphore_releases: AtomicUsize,
+        total_deadline_timeouts: AtomicUsize,
+        max_inflight_quotes: AtomicUsize,
+        max_queue_wait_ms: AtomicUsize,
+        max_permit_hold_ms: AtomicUsize,
+    }
+
+    impl Default for SlipstreamStats {
+        fn default() -> Self {
+            Self {
+                hot_path_skips: AtomicUsize::new(0),
+                forced_discovery_quotes: AtomicUsize::new(0),
+                fee_tier_skips: AtomicUsize::new(0),
+                quote_attempts: AtomicUsize::new(0),
+                quote_success: AtomicUsize::new(0),
+                quote_failures: AtomicUsize::new(0),
+                quote_timeouts: AtomicUsize::new(0),
+                queue_wait_timeouts: AtomicUsize::new(0),
+                semaphore_acquire_attempts: AtomicUsize::new(0),
+                semaphore_acquired: AtomicUsize::new(0),
+                semaphore_releases: AtomicUsize::new(0),
+                total_deadline_timeouts: AtomicUsize::new(0),
+                max_inflight_quotes: AtomicUsize::new(0),
+                max_queue_wait_ms: AtomicUsize::new(0),
+                max_permit_hold_ms: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    let source_pools: Vec<PoolRecord> = if hot_pools.is_empty() {
+        bootstrap_slipstream_pools_from_tokens(ctx).await
+    } else {
+        hot_pools.to_vec()
+    };
+    let source_pools: Vec<PoolRecord> = if let Some(filter) = &ctx.pool_filter {
+        if filter.is_empty() {
+            source_pools
+        } else {
+            source_pools
+                .into_iter()
+                .filter(|p| filter.contains(&p.pool))
+                .collect()
+        }
+    } else {
+        source_pools
+    };
+    if source_pools.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let stats = Arc::new(SlipstreamStats::default());
+    let collector_started_at = Instant::now();
+    let gas_price = ctx.edge_ctx.gas_price;
+    let allowed_fee_tiers = ctx.allowed_tick_spacings.as_ref().and_then(|tiers| {
+        if tiers.is_empty() {
+            None
+        } else {
+            Some(Arc::clone(tiers))
+        }
+    });
+    let min_forced_discovery_quotes = std::env::var("SLIPSTREAM_MIN_FORCED_QUOTES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(8);
+    let forced_discovery_quotes_used = Arc::new(AtomicUsize::new(0));
+    let provider_class = classify_provider_for_chain(&ctx.chain_env_prefix);
+    let max_pool_tasks = std::env::var("SLIPSTREAM_MAX_CONCURRENT_POOL_TASKS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(ctx.quote_concurrency_limit.max(1));
+
+    let mut join_set: JoinSet<Result<Vec<Edge>>> = JoinSet::new();
+    let mut edges = Vec::new();
+    let mut pool_tasks_spawned = 0usize;
+    let slipstream_router = ctx.router;
+    for pool in source_pools.iter().cloned() {
+        while join_set.len() >= max_pool_tasks {
+            if let Some(res) = join_set.join_next().await {
+                edges.extend(res??);
+            }
+        }
+        if let Some(tiers) = &allowed_fee_tiers {
+            if !tiers.contains(&pool.fee) {
+                stats.fee_tier_skips.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
+        let profile_in = ctx
+            .edge_ctx
+            .base_profiles
+            .as_ref()
+            .get(&pool.token0)
+            .copied()
+            .unwrap_or(ctx.edge_ctx.default_profile);
+        let profile_out = ctx
+            .edge_ctx
+            .base_profiles
+            .as_ref()
+            .get(&pool.token1)
+            .copied()
+            .unwrap_or(ctx.edge_ctx.default_profile);
+        let quoter = Arc::clone(&ctx.quoter);
+        let provider = Arc::clone(&ctx.provider);
+        let hot_paths = Arc::clone(&ctx.hot_paths);
+        let stats = Arc::clone(&stats);
+        let native_token_prices = Arc::clone(&ctx.edge_ctx.native_token_prices);
+        let hub_tokens = Arc::clone(&ctx.edge_ctx.hub_tokens);
+        let wrapped_native = ctx.edge_ctx.wrapped_native;
+        let stable_hub_decimals = ctx.edge_ctx.stable_hub_decimals;
+        let quote_semaphore = Arc::clone(&ctx.quote_semaphore);
+        let block_number = ctx.edge_ctx.block_number;
+        let forced_discovery_quotes_used = Arc::clone(&forced_discovery_quotes_used);
+        let chain_env_prefix = ctx.chain_env_prefix.clone();
+        let quote_concurrency_limit = ctx.quote_concurrency_limit;
+        join_set.spawn(async move {
+            let mut local_edges = Vec::new();
+            let cl_state = if crate::cl_sim::local_cl_quotes_enabled() {
+                match crate::cl_sim::load_cl_pool_state(
+                    provider.clone(),
+                    pool.pool,
+                    block_number,
+                    None,
+                )
+                .await
+                {
+                    Ok(state) => state,
+                    Err(err) => {
+                        debug!(
+                            target: "venue::slipstream",
+                            error = %err,
+                            pool = %format!("0x{}", hex::encode(pool.pool)),
+                            "CL pool state load failed; quoter fallback"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let directions = [
+                (pool.token0, pool.token1, profile_in),
+                (pool.token1, pool.token0, profile_out),
+            ];
+            for (token_in, token_out, profile) in directions {
+                let chain_env_prefix_for_direction = chain_env_prefix.clone();
+                let should_quote = hot_paths.should_quote(token_in, token_out, pool.fee).await;
+                let quote_allowed = reserve_forced_discovery_quote(
+                    should_quote,
+                    forced_discovery_quotes_used.as_ref(),
+                    min_forced_discovery_quotes,
+                );
+                if !quote_allowed {
+                    stats.hot_path_skips.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                if !should_quote {
+                    stats
+                        .forced_discovery_quotes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let base_amount_in = profile.base_amount;
+                let tolerance_bps = profile.slippage_tolerance_bps;
+                let path = vec![(token_in, None), (token_out, Some(pool.fee))];
+                let hot_paths_quote = Arc::clone(&hot_paths);
+                let quote_semaphore_fee = Arc::clone(&quote_semaphore);
+                let quote = if let Some(ref cl_state) = cl_state {
+                    let zero_for_one = token_in == pool.token0;
+                    match cl_grid_quote(cl_state, base_amount_in, tolerance_bps, zero_for_one) {
+                        Ok(Some(q)) => Ok(Some(q)),
+                        Ok(None) => Ok(None),
+                        Err(err) => {
+                            debug!(
+                                target: "venue::slipstream",
+                                error = %err,
+                                pool = %format!("0x{}", hex::encode(pool.pool)),
+                                "local CL grid failed; falling back to quoter"
+                            );
+                            slipstream_grid_quote(
+                                quoter.as_ref(),
+                                path.clone(),
+                                base_amount_in,
+                                tolerance_bps,
+                                block_number,
+                                &quote_semaphore_fee,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    slipstream_grid_quote(
+                        quoter.as_ref(),
+                        path.clone(),
+                        base_amount_in,
+                        tolerance_bps,
+                        block_number,
+                        &quote_semaphore_fee,
+                    )
+                    .await
+                };
+                let quote = match quote {
+                    Ok(opt) => {
+                        stats.quote_attempts.fetch_add(1, Ordering::Relaxed);
+                        if opt.is_some() {
+                            stats.quote_success.fetch_add(1, Ordering::Relaxed);
+                        }
+                        opt
+                    }
+                    Err(_) => adjust_trade_size_async(base_amount_in, tolerance_bps, {
+                    let quoter = quoter.clone();
+                    let path_clone = path.clone();
+                    let stats = Arc::clone(&stats);
+                    move |amount: U256| {
+                        let quoter = quoter.clone();
+                        let path_inner = path_clone.clone();
+                        let stats = Arc::clone(&stats);
+                        let quote_semaphore = Arc::clone(&quote_semaphore_fee);
+                        let provider_class = provider_class;
+                        let chain_env_prefix = chain_env_prefix_for_direction.clone();
+                        async move {
+                            if amount.is_zero() {
+                                return Ok(None);
+                            }
+                            stats.quote_attempts.fetch_add(1, Ordering::Relaxed);
+                            let quote_started_at = Instant::now();
+                            let queue_wait_window = queue_wait_timeout();
+                            let rpc_timeout_window = rpc_quote_timeout();
+                            let total_deadline_window = univ3_total_deadline_timeout();
+                            let quote_eval = async {
+                                let wait_started_at = Instant::now();
+                                let permits_before = quote_semaphore.available_permits();
+                                stats
+                                    .semaphore_acquire_attempts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let permit = match timeout(
+                                    queue_wait_window,
+                                    quote_semaphore.clone().acquire_owned(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(permit)) => permit,
+                                    Ok(Err(_)) => {
+                                        return Err(anyhow!("slipstream quote semaphore closed"));
+                                    }
+                                    Err(_) => {
+                                        stats.queue_wait_timeouts.fetch_add(1, Ordering::Relaxed);
+                                        warn!(
+                                            target: "venue::slipstream",
+                                            chain = %chain_env_prefix,
+                                            venue = "aerodrome_slipstream",
+                                            token_in = %format!("0x{}", hex::encode(token_in)),
+                                            token_out = %format!("0x{}", hex::encode(token_out)),
+                                            fee = pool.fee,
+                                            amount = %amount,
+                                            timeout_secs = queue_wait_window.as_secs(),
+                                            queue_wait_ms = wait_started_at.elapsed().as_millis() as u64,
+                                            permits_available_before = permits_before,
+                                            provider_class,
+                                            "Slipstream quote stalled before network submission (semaphore wait timeout)"
+                                        );
+                                        return Ok(None);
+                                    }
+                                };
+                                let queue_wait_ms = wait_started_at.elapsed().as_millis() as usize;
+                                stats
+                                    .max_queue_wait_ms
+                                    .fetch_max(queue_wait_ms, Ordering::Relaxed);
+                                stats.semaphore_acquired.fetch_add(1, Ordering::Relaxed);
+                                let permits_available_after_acquire =
+                                    quote_semaphore.available_permits();
+                                let inflight_quotes = semaphore_inflight(
+                                    quote_concurrency_limit,
+                                    quote_semaphore.as_ref(),
+                                );
+                                stats
+                                    .max_inflight_quotes
+                                    .fetch_max(inflight_quotes, Ordering::Relaxed);
+
+                                let hold_started_at = Instant::now();
+                                let rpc_started_at = Instant::now();
+                                let result = timeout(
+                                    rpc_timeout_window,
+                                    quoter.quote_path(path_inner.clone(), amount, block_number),
+                                )
+                                .await;
+                                let hold_elapsed_ms = hold_started_at.elapsed().as_millis() as usize;
+                                stats
+                                    .max_permit_hold_ms
+                                    .fetch_max(hold_elapsed_ms, Ordering::Relaxed);
+                                drop(permit);
+                                stats.semaphore_releases.fetch_add(1, Ordering::Relaxed);
+                                debug!(
+                                    target: "venue::slipstream",
+                                    chain = %chain_env_prefix,
+                                    venue = "aerodrome_slipstream",
+                                    token_in = %format!("0x{}", hex::encode(token_in)),
+                                    token_out = %format!("0x{}", hex::encode(token_out)),
+                                    fee = pool.fee,
+                                    amount = %amount,
+                                    queue_wait_ms,
+                                    hold_ms = hold_elapsed_ms,
+                                    inflight_quotes,
+                                    permits_available_after_release = quote_semaphore.available_permits(),
+                                    "Slipstream quote permit released"
+                                );
+
+                                let rpc_elapsed_ms = rpc_started_at.elapsed().as_millis() as u64;
+                                let total_elapsed_ms = quote_started_at.elapsed().as_millis() as u64;
+
+                                match result {
+                                    Ok(Ok(out)) if out > U256::zero() => Ok(Some(out)),
+                                    Ok(Ok(_)) => {
+                                        stats.quote_failures.fetch_add(1, Ordering::Relaxed);
+                                        Ok(None)
+                                    }
+                                    Ok(Err(err)) => {
+                                        stats.quote_failures.fetch_add(1, Ordering::Relaxed);
+                                        warn!(
+                                            target: "venue::slipstream",
+                                            chain = %chain_env_prefix,
+                                            venue = "aerodrome_slipstream",
+                                            provider_class,
+                                            error = %err,
+                                            token_in = %format!("0x{}", hex::encode(token_in)),
+                                            token_out = %format!("0x{}", hex::encode(token_out)),
+                                            fee = pool.fee,
+                                            amount = %amount,
+                                            queue_wait_ms,
+                                            rpc_elapsed_ms,
+                                            elapsed_ms = total_elapsed_ms,
+                                            permits_available_after_acquire,
+                                            "Slipstream quote failed"
+                                        );
+                                        Ok(None)
+                                    }
+                                    Err(_) => {
+                                        stats.quote_timeouts.fetch_add(1, Ordering::Relaxed);
+                                        warn!(
+                                            target: "venue::slipstream",
+                                            chain = %chain_env_prefix,
+                                            venue = "aerodrome_slipstream",
+                                            provider_class,
+                                            token_in = %format!("0x{}", hex::encode(token_in)),
+                                            token_out = %format!("0x{}", hex::encode(token_out)),
+                                            fee = pool.fee,
+                                            amount = %amount,
+                                            timeout_secs = rpc_timeout_window.as_secs(),
+                                            queue_wait_ms = queue_wait_ms as u64,
+                                            rpc_elapsed_ms,
+                                            elapsed_ms = total_elapsed_ms,
+                                            permits_available_after_acquire,
+                                            "Slipstream quote timed out"
+                                        );
+                                        Ok(None)
+                                    }
+                                }
+                            };
+                            let out = match timeout(total_deadline_window, quote_eval).await {
+                                Ok(result) => match result? {
+                                    Some(value) => value,
+                                    None => return Ok(None),
+                                },
+                                Err(_) => {
+                                    stats.total_deadline_timeouts.fetch_add(1, Ordering::Relaxed);
+                                    warn!(
+                                        target: "venue::slipstream",
+                                        chain = %chain_env_prefix,
+                                        venue = "aerodrome_slipstream",
+                                        token_in = %format!("0x{}", hex::encode(token_in)),
+                                        token_out = %format!("0x{}", hex::encode(token_out)),
+                                        fee = pool.fee,
+                                        amount = %amount,
+                                        timeout_secs = total_deadline_window.as_secs(),
+                                        elapsed_ms = quote_started_at.elapsed().as_millis() as u64,
+                                        provider_class,
+                                        "Slipstream quote exceeded total request deadline"
+                                    );
+                                    return Ok(None);
+                                }
+                            };
+                            let probe_in = probe_amount(amount);
+                            let probe_out = if probe_in == amount {
+                                out
+                            } else {
+                                let probe_wait_started_at = Instant::now();
+                                stats
+                                    .semaphore_acquire_attempts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let permits_before = quote_semaphore.available_permits();
+                                let permit = match timeout(
+                                    queue_wait_window,
+                                    quote_semaphore.clone().acquire_owned(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(permit)) => permit,
+                                    Ok(Err(_)) => {
+                                        return Err(anyhow!("slipstream quote semaphore closed"));
+                                    }
+                                    Err(_) => {
+                                        stats.queue_wait_timeouts.fetch_add(1, Ordering::Relaxed);
+                                        warn!(
+                                            target: "venue::slipstream",
+                                            chain = %chain_env_prefix,
+                                            venue = "aerodrome_slipstream",
+                                            token_in = %format!("0x{}", hex::encode(token_in)),
+                                            token_out = %format!("0x{}", hex::encode(token_out)),
+                                            fee = pool.fee,
+                                            amount = %probe_in,
+                                            timeout_secs = queue_wait_window.as_secs(),
+                                            queue_wait_ms = probe_wait_started_at.elapsed().as_millis() as u64,
+                                            permits_available_before = permits_before,
+                                            provider_class,
+                                            "Slipstream probe quote stalled before network submission (semaphore wait timeout)"
+                                        );
+                                        return Ok(None);
+                                    }
+                                };
+                                stats.semaphore_acquired.fetch_add(1, Ordering::Relaxed);
+                                let probe_queue_wait_ms =
+                                    probe_wait_started_at.elapsed().as_millis() as usize;
+                                stats
+                                    .max_queue_wait_ms
+                                    .fetch_max(probe_queue_wait_ms, Ordering::Relaxed);
+                                let probe_result = timeout(
+                                    rpc_quote_timeout(),
+                                    quoter.quote_path(path_inner.clone(), probe_in, block_number),
+                                )
+                                .await;
+                                let probe_hold_ms = probe_wait_started_at.elapsed().as_millis() as usize;
+                                stats
+                                    .max_permit_hold_ms
+                                    .fetch_max(probe_hold_ms, Ordering::Relaxed);
+                                drop(permit);
+                                stats.semaphore_releases.fetch_add(1, Ordering::Relaxed);
+
+                                match probe_result {
+                                    Ok(Ok(value)) => value,
+                                    Ok(Err(err)) => {
+                                        stats.quote_failures.fetch_add(1, Ordering::Relaxed);
+                                        warn!(
+                                            target: "venue::slipstream",
+                                            error = %err,
+                                            token_in = %format!("0x{}", hex::encode(token_in)),
+                                            token_out = %format!("0x{}", hex::encode(token_out)),
+                                            fee = pool.fee,
+                                            amount = %probe_in,
+                                            "Slipstream probe quote failed"
+                                        );
+                                        U256::zero()
+                                    }
+                                    Err(_) => {
+                                        stats.quote_timeouts.fetch_add(1, Ordering::Relaxed);
+                                        warn!(
+                                            target: "venue::slipstream",
+                                            token_in = %format!("0x{}", hex::encode(token_in)),
+                                            token_out = %format!("0x{}", hex::encode(token_out)),
+                                            fee = pool.fee,
+                                            amount = %probe_in,
+                                            timeout_secs = rpc_quote_timeout().as_secs(),
+                                            "Slipstream probe quote timed out"
+                                        );
+                                        U256::zero()
+                                    }
+                                }
+                            };
+                            if probe_out.is_zero() {
+                                return Ok(None);
+                            }
+                            let slippage_bps =
+                                slippage_from_samples(amount, out, probe_in, probe_out);
+                            stats.quote_success.fetch_add(1, Ordering::Relaxed);
+                            Ok(Some(QuoteComputation {
+                                amount_in: amount,
+                                amount_out: out,
+                                slippage_bps,
+                            }))
+                        }
+                    }
+                })
+                .await?,
+                };
+
+                let Some(quote) = quote else {
+                    hot_paths_quote
+                        .as_ref()
+                        .record_failure(token_in, token_out, pool.fee)
+                        .await;
+                    continue;
+                };
+
+                if quote.slippage_bps > tolerance_bps {
+                    hot_paths_quote
+                        .as_ref()
+                        .record_failure(token_in, token_out, pool.fee)
+                        .await;
+                    continue;
+                }
+
+                let protected_out = apply_slippage(quote.amount_out, tolerance_bps);
+                if protected_out.is_zero() {
+                    hot_paths_quote
+                        .as_ref()
+                        .record_failure(token_in, token_out, pool.fee)
+                        .await;
+                    continue;
+                }
+
+                let weight = compute_edge_weight(
+                    protected_out,
+                    quote.amount_in,
+                    ESTIMATED_GAS_SLIPSTREAM,
+                    gas_price,
+                    quote.amount_in,
+                    hub_native_price_for(
+                        token_in,
+                        native_token_prices.as_ref(),
+                        hub_tokens.as_ref(),
+                        wrapped_native,
+                        stable_hub_decimals,
+                    ),
+                );
+                let edge = Edge {
+                    from: token_in,
+                    to: token_out,
+                    rate_num: quote.amount_out,
+                    rate_den: quote.amount_in,
+                    venue: VenueEdge::Slipstream {
+                        path: path.clone(),
+                        pool: pool.pool,
+                        tick_spacing: pool.fee,
+                        router: slipstream_router,
+                    },
+                    estimated_gas: ESTIMATED_GAS_SLIPSTREAM,
+                    weight,
+                    max_input: quote.amount_in,
+                    tolerance_bps,
+                    observed_slippage_bps: quote.slippage_bps,
+                    quote_block: Some(block_number),
+                    active: true,
+                };
+                local_edges.push(edge);
+            }
+            Ok(local_edges)
+        });
+        pool_tasks_spawned = pool_tasks_spawned.saturating_add(1);
+    }
+
+    while let Some(res) = join_set.join_next().await {
+        edges.extend(res??);
+    }
+
+    info!(
+        target: "venue::slipstream",
+        pools = source_pools.len(),
+        built_edges = edges.len(),
+        hot_path_skips = stats.hot_path_skips.load(Ordering::Relaxed),
+        forced_discovery_quotes = stats.forced_discovery_quotes.load(Ordering::Relaxed),
+        fee_tier_skips = stats.fee_tier_skips.load(Ordering::Relaxed),
+        quote_attempts = stats.quote_attempts.load(Ordering::Relaxed),
+        quote_success = stats.quote_success.load(Ordering::Relaxed),
+        quote_failures = stats.quote_failures.load(Ordering::Relaxed),
+        quote_timeouts = stats.quote_timeouts.load(Ordering::Relaxed),
+        queue_wait_timeouts = stats.queue_wait_timeouts.load(Ordering::Relaxed),
+        semaphore_acquire_attempts = stats.semaphore_acquire_attempts.load(Ordering::Relaxed),
+        semaphore_acquired = stats.semaphore_acquired.load(Ordering::Relaxed),
+        semaphore_releases = stats.semaphore_releases.load(Ordering::Relaxed),
+        total_deadline_timeouts = stats.total_deadline_timeouts.load(Ordering::Relaxed),
+        max_inflight_quotes = stats.max_inflight_quotes.load(Ordering::Relaxed),
+        max_queue_wait_ms = stats.max_queue_wait_ms.load(Ordering::Relaxed),
+        max_permit_hold_ms = stats.max_permit_hold_ms.load(Ordering::Relaxed),
+        max_pool_tasks,
+        pool_tasks_spawned,
+        elapsed_ms = collector_started_at.elapsed().as_millis() as u64,
+        "Slipstream hot pool summary",
     );
     Ok(edges)
 }
@@ -2393,12 +3372,14 @@ where
 
 async fn collect_solidly_edges<C>(
     provider: Arc<Provider<C>>,
+    pool_monitor: Option<Arc<crate::ingestion::PoolMonitor<C>>>,
     chain_env_prefix: &str,
     base_profiles: Arc<HashMap<Address, TradeSizing>>,
     default_profile: TradeSizing,
     gas_price: U256,
     native_token_prices: Arc<HashMap<Address, NativePrice>>,
     token_decimals: Arc<HashMap<Address, u8>>,
+    block_number: U64,
 ) -> Result<Vec<Edge>>
 where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
@@ -2418,23 +3399,38 @@ where
         unique_pairs.sort_unstable();
         unique_pairs.dedup();
         let state_concurrency = solidly_state_concurrency();
-        let loaded_states: Vec<(Address, Option<UniV2PairState>)> =
+        let pool_monitor_ref = pool_monitor.clone();
+        let block_for_quotes = block_number;
+        let loaded_states: Vec<(Address, Option<UniV2PairState>, Option<U64>)> =
             stream::iter(unique_pairs.into_iter().map(|pair| {
                 let provider = provider.clone();
-                async move { (pair, load_pair_state(provider, pair).await.unwrap_or(None)) }
+                let pool_monitor = pool_monitor_ref.clone();
+                async move {
+                    if let Some(monitor) = &pool_monitor {
+                        if let Some((state, last_block)) = monitor.state_with_block(pair).await {
+                            return (pair, Some(state), last_block);
+                        }
+                    }
+                    (
+                        pair,
+                        load_pair_state(provider, pair).await.unwrap_or(None),
+                        Some(block_for_quotes),
+                    )
+                }
             }))
             .buffer_unordered(state_concurrency)
             .collect()
             .await;
-        let pair_states: HashMap<Address, UniV2PairState> = loaded_states
+        let pair_states: HashMap<Address, (UniV2PairState, Option<U64>)> = loaded_states
             .into_iter()
-            .filter_map(|(pair, state)| state.map(|state| (pair, state)))
+            .filter_map(|(pair, state, block)| state.map(|state| (pair, (state, block))))
             .collect();
 
         for pool in pools {
-            let Some(state) = pair_states.get(&pool.pair).cloned() else {
+            let Some((state, quote_block)) = pair_states.get(&pool.pair).cloned() else {
                 continue;
             };
+            let quote_block = quote_block.or(Some(block_number));
             let profile = base_profiles
                 .as_ref()
                 .get(&pool.token_in)
@@ -2518,7 +3514,7 @@ where
                     max_input: quote.amount_in,
                     tolerance_bps,
                     observed_slippage_bps: quote.slippage_bps,
-                    quote_block: None,
+                    quote_block,
                     active: true,
                 };
                 edges.push(edge);
@@ -2633,6 +3629,40 @@ async fn collect_univ4_edges(
     Ok(edges)
 }
 
+pub fn edge_pool_address(edge: &Edge) -> Option<Address> {
+    match &edge.venue {
+        VenueEdge::UniV3 { pool, .. } => Some(*pool),
+        VenueEdge::Slipstream { pool, .. } => Some(*pool),
+        VenueEdge::UniV2 { pair, .. } => Some(*pair),
+        VenueEdge::SolidlyV2 { pair, .. } => Some(*pair),
+        _ => None,
+    }
+}
+
+fn edge_touches_pools(edge: &Edge, touched: &HashSet<Address>) -> bool {
+    edge_pool_address(edge)
+        .map(|pool| touched.contains(&pool))
+        .unwrap_or(false)
+}
+
+fn gas_price_moved_bps(previous: U256, current: U256, threshold_bps: u32) -> bool {
+    if previous.is_zero() {
+        return true;
+    }
+    let delta = if current > previous {
+        current - previous
+    } else {
+        previous - current
+    };
+    delta.saturating_mul(U256::from(10_000u64)) > previous * U256::from(threshold_bps as u64)
+}
+
+pub struct PopulateResult {
+    pub edges: Vec<Edge>,
+    pub mode: PopulateMode,
+    pub digest: EdgeDigest,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn populate_edges<C>(
     g: &mut Graph,
@@ -2661,7 +3691,22 @@ pub async fn populate_edges<C>(
     block_number: U64,
     max_quote_block_lag: U64,
     quoter_validation_once: Arc<OnceCell<()>>,
-) -> Result<Vec<Edge>>
+    slipstream_quoter: Option<Arc<SlipstreamQuoter<C>>>,
+    slipstream_router: Address,
+    slipstream_tick_spacings: Option<Arc<HashSet<u32>>>,
+    slipstream_validation: Option<UniV3ValidationConfig>,
+    slipstream_validation_once: Arc<OnceCell<()>>,
+    hot_slipstream_pools: &[PoolRecord],
+    pancakeswap_quoter: Option<Arc<UniQuoter<C>>>,
+    pancakeswap_fee_tiers: Option<Arc<HashSet<u32>>>,
+    pancakeswap_validation: Option<UniV3ValidationConfig>,
+    pancakeswap_validation_once: Arc<OnceCell<()>>,
+    hot_pancakeswap_pools: &[PoolRecord],
+    hub_tokens: Arc<HashSet<Address>>,
+    wrapped_native: Address,
+    populate_options: PopulateOptions,
+    metrics: Option<Arc<Metrics>>,
+) -> Result<PopulateResult>
 where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
 {
@@ -2670,8 +3715,68 @@ where
         "EDGE_SLIPPAGE_BPS must be less than or equal to 10_000 (100%). Got {max_slippage_bps}."
     );
 
-    let mut edges = Vec::new();
     let default_profile = TradeSizing::new(default_base_amount, max_slippage_bps);
+    let stable_hub_decimals = hub_tokens
+        .iter()
+        .filter_map(|token| token_decimals.get(token).copied())
+        .min()
+        .unwrap_or(6);
+    let gas_refresh_threshold_bps = if populate_options.gas_refresh_threshold_bps > 0 {
+        populate_options.gas_refresh_threshold_bps
+    } else {
+        500
+    };
+    let edge_ctx_template = EdgeBuildContext {
+        base_profiles: base_profiles.clone(),
+        default_profile,
+        gas_price,
+        native_token_prices: Arc::clone(&native_token_prices),
+        block_number,
+        hub_tokens: Arc::clone(&hub_tokens),
+        wrapped_native,
+        stable_hub_decimals,
+    };
+
+    if populate_options.touched_pools.is_empty() {
+        if let Some(cached) = populate_options.cached_edges.clone() {
+            if let Some(last_digest) = populate_options.last_digest {
+                let cached_digest = edge_digest(&cached);
+                if !edge_digest_changed_significantly(Some(last_digest), cached_digest) {
+                    let mut reused = cached;
+                    if gas_price_moved_bps(
+                        populate_options.last_gas_price,
+                        gas_price,
+                        gas_refresh_threshold_bps,
+                    ) {
+                        refresh_edge_gas_weights(&mut reused, gas_price, &edge_ctx_template);
+                    }
+                    for edge in reused.iter() {
+                        g.add_edge(edge.clone());
+                    }
+                    if let Some(metrics) = &metrics {
+                        metrics
+                            .populate_skipped_total
+                            .with_label_values(&[chain_name.as_str()])
+                            .inc();
+                    }
+                    return Ok(PopulateResult {
+                        digest: edge_digest(&reused),
+                        edges: reused,
+                        mode: PopulateMode::Skipped,
+                    });
+                }
+            }
+        }
+    }
+
+    let incremental = !populate_options.touched_pools.is_empty();
+    let pool_filter = if incremental {
+        Some(populate_options.touched_pools.clone())
+    } else {
+        None
+    };
+
+    let mut edges = Vec::new();
     let min_edge_health_score_bps = std::env::var("EDGE_MIN_HEALTH_SCORE_BPS")
         .ok()
         .and_then(|raw| raw.parse::<u32>().ok())
@@ -2740,22 +3845,18 @@ where
             }
         }
     }
-    let edge_ctx = EdgeBuildContext {
-        base_profiles: base_profiles.clone(),
-        default_profile,
-        gas_price,
-        native_token_prices: Arc::clone(&native_token_prices),
-        block_number,
-    };
+    let edge_ctx = edge_ctx_template.clone();
     let univ3_ctx = Univ3EdgeContext {
         edge_ctx: edge_ctx.clone(),
         allowed_fee_tiers: univ3_fee_tiers,
         quoter: Arc::clone(&quoter),
+        provider: Arc::clone(&provider),
         hot_paths: Arc::clone(&hot_paths),
         quote_semaphore: Arc::clone(&quote_semaphore),
         quote_concurrency_limit: quote_semaphore.available_permits(),
         token_whitelist: Arc::new(token_whitelist.clone()),
         chain_env_prefix: chain_env_prefix.to_string(),
+        pool_filter: pool_filter.clone(),
     };
     let hot_univ3_filtered = filter_hot_univ3_pools(hot_univ3_pools, token_whitelist);
     let hot_univ2_filtered = filter_hot_univ2_pools(hot_univ2_pools, token_whitelist);
@@ -2779,7 +3880,166 @@ where
         );
     }
 
+    let hot_slipstream_filtered = filter_hot_univ3_pools(hot_slipstream_pools, token_whitelist);
+    let slipstream_enabled = slipstream_quoter.is_some()
+        && slipstream_router != Address::zero()
+        && !hot_slipstream_filtered.is_empty();
+    if slipstream_enabled {
+        if let Some(validation) = slipstream_validation.clone() {
+            if slipstream_validation_once.get().is_none() {
+                let quoter = slipstream_quoter.as_ref().expect("slipstream quoter").clone();
+                let chain = chain_name.clone();
+                let env_prefix = chain_env_prefix.to_string();
+                if let Err(err) = slipstream_validation_once
+                    .get_or_try_init(|| {
+                        let quoter = quoter.clone();
+                        let chain = chain.clone();
+                        let env_prefix = env_prefix.clone();
+                        let validation = validation.clone();
+                        async move {
+                            match quoter.validate(&validation).await {
+                                Ok(amount_out) => {
+                                    info!(
+                                        chain = %chain,
+                                        env = %env_prefix,
+                                        token_in = %format!("0x{}", hex::encode(validation.token_in)),
+                                        token_out = %format!("0x{}", hex::encode(validation.token_out)),
+                                        tick_spacing = validation.fee,
+                                        amount_in = %validation.amount_in,
+                                        amount_out = %amount_out,
+                                        "Validated Slipstream quoter"
+                                    );
+                                    Ok::<(), anyhow::Error>(())
+                                }
+                                Err(err) => {
+                                    let err_msg = err.to_string();
+                                    error!(
+                                        chain = %chain,
+                                        env = %env_prefix,
+                                        token_in = %format!("0x{}", hex::encode(validation.token_in)),
+                                        token_out = %format!("0x{}", hex::encode(validation.token_out)),
+                                        tick_spacing = validation.fee,
+                                        amount_in = %validation.amount_in,
+                                        error = %err,
+                                        "Slipstream quoter validation failed"
+                                    );
+                                    Err(anyhow::anyhow!(
+                                        "Slipstream quoter validation failed for chain {chain} ({env_prefix}): {err_msg}"
+                                    ))
+                                }
+                            }
+                        }
+                    })
+                    .await
+                {
+                    return Err(err.context(format!(
+                        "Slipstream quoter validation initialization failed for chain {chain_name} ({chain_env_prefix})"
+                    )));
+                }
+            }
+        }
+    }
+
+    let slipstream_ctx = slipstream_enabled.then(|| SlipstreamEdgeContext {
+        edge_ctx: edge_ctx.clone(),
+        allowed_tick_spacings: slipstream_tick_spacings.clone(),
+        quoter: Arc::clone(slipstream_quoter.as_ref().expect("slipstream quoter")),
+        provider: Arc::clone(&provider),
+        router: slipstream_router,
+        hot_paths: Arc::clone(&hot_paths),
+        quote_semaphore: Arc::clone(&quote_semaphore),
+        quote_concurrency_limit: quote_semaphore.available_permits(),
+        token_whitelist: Arc::new(token_whitelist.clone()),
+        chain_env_prefix: chain_env_prefix.to_string(),
+        pool_filter: pool_filter.clone(),
+    });
+    let slipstream_collect = async {
+        if let Some(ctx) = slipstream_ctx.as_ref() {
+            collect_slipstream_edges(&hot_slipstream_filtered, ctx).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+
+    let hot_pancakeswap_filtered = filter_hot_univ3_pools(hot_pancakeswap_pools, token_whitelist);
+    let pancakeswap_enabled = pancakeswap_quoter.is_some() && !hot_pancakeswap_filtered.is_empty();
+    if pancakeswap_enabled {
+        if let Some(validation) = pancakeswap_validation.clone() {
+            if pancakeswap_validation_once.get().is_none() {
+                let quoter = pancakeswap_quoter.as_ref().expect("pancakeswap quoter").clone();
+                let chain = chain_name.clone();
+                let env_prefix = chain_env_prefix.to_string();
+                let validation_for_init = validation.clone();
+                if let Err(err) = pancakeswap_validation_once
+                    .get_or_try_init(|| {
+                        let quoter = Arc::clone(&quoter);
+                        let chain = chain.clone();
+                        let env_prefix = env_prefix.clone();
+                        let validation = validation_for_init.clone();
+                        async move {
+                            match quoter.validate(&validation).await {
+                                Ok(amount_out) => {
+                                    info!(
+                                        chain = %chain,
+                                        env = %env_prefix,
+                                        venue = "pancakeswap_v3",
+                                        token_in = %format!("0x{}", hex::encode(validation.token_in)),
+                                        token_out = %format!("0x{}", hex::encode(validation.token_out)),
+                                        fee_bps = validation.fee,
+                                        amount_in = %validation.amount_in,
+                                        amount_out = %amount_out,
+                                        "Validated PancakeSwap V3 quoter"
+                                    );
+                                    Ok::<(), anyhow::Error>(())
+                                }
+                                Err(err) => {
+                                    let err_msg = err.to_string();
+                                    error!(
+                                        chain = %chain,
+                                        env = %env_prefix,
+                                        venue = "pancakeswap_v3",
+                                        error = %err,
+                                        "PancakeSwap V3 quoter validation failed"
+                                    );
+                                    Err(anyhow::anyhow!(
+                                        "PancakeSwap V3 quoter validation failed for chain {chain} ({env_prefix}): {err_msg}"
+                                    ))
+                                }
+                            }
+                        }
+                    })
+                    .await
+                {
+                    return Err(err.context(format!(
+                        "PancakeSwap V3 quoter validation initialization failed for chain {chain_name} ({chain_env_prefix})"
+                    )));
+                }
+            }
+        }
+    }
+    let pancakeswap_ctx = pancakeswap_enabled.then(|| Univ3EdgeContext {
+        edge_ctx: edge_ctx.clone(),
+        allowed_fee_tiers: pancakeswap_fee_tiers.clone(),
+        quoter: Arc::clone(pancakeswap_quoter.as_ref().expect("pancakeswap quoter")),
+        provider: Arc::clone(&provider),
+        hot_paths: Arc::clone(&hot_paths),
+        quote_semaphore: Arc::clone(&quote_semaphore),
+        quote_concurrency_limit: quote_semaphore.available_permits(),
+        token_whitelist: Arc::new(token_whitelist.clone()),
+        chain_env_prefix: chain_env_prefix.to_string(),
+        pool_filter: pool_filter.clone(),
+    });
+    let pancakeswap_collect = async {
+        if let Some(ctx) = pancakeswap_ctx.as_ref() {
+            collect_univ3_edges(&hot_pancakeswap_filtered, ctx).await
+        } else {
+            Ok(Vec::new())
+        }
+    };
+
     type EdgeJoinResult = (
+        Vec<Edge>,
+        Vec<Edge>,
         Vec<Edge>,
         Vec<Edge>,
         Vec<Edge>,
@@ -2789,6 +4049,8 @@ where
     );
     let (
         mut univ3_edges,
+        mut slipstream_edges,
+        mut pancakeswap_edges,
         mut bal_edges,
         mut curve_edges,
         mut univ2_edges,
@@ -2796,6 +4058,8 @@ where
         mut univ4_edges,
     ): EdgeJoinResult = tokio::try_join!(
         collect_univ3_edges(&hot_univ3_filtered, &univ3_ctx),
+        slipstream_collect,
+        pancakeswap_collect,
         collect_balancer_edges(provider.clone(), bal_vault, chain_env_prefix, &edge_ctx),
         collect_curve_edges(
             provider.clone(),
@@ -2820,12 +4084,14 @@ where
         ),
         collect_solidly_edges(
             provider.clone(),
+            pool_monitor.clone(),
             chain_env_prefix,
             base_profiles.clone(),
             default_profile,
             gas_price,
             Arc::clone(&native_token_prices),
             token_decimals.clone(),
+            block_number,
         ),
         collect_univ4_edges(
             chain_env_prefix,
@@ -2838,6 +4104,8 @@ where
 
     for edges in [
         &mut univ3_edges,
+        &mut slipstream_edges,
+        &mut pancakeswap_edges,
         &mut bal_edges,
         &mut curve_edges,
         &mut univ2_edges,
@@ -2859,6 +4127,8 @@ where
     let mut stale_edges = 0usize;
     for edges in [
         &mut univ3_edges,
+        &mut slipstream_edges,
+        &mut pancakeswap_edges,
         &mut bal_edges,
         &mut curve_edges,
         &mut univ2_edges,
@@ -2875,7 +4145,26 @@ where
         );
     }
 
+    if incremental {
+        if let Some(cached) = populate_options.cached_edges {
+            for edge in cached {
+                if !edge_touches_pools(&edge, &populate_options.touched_pools) {
+                    g.add_edge(edge.clone());
+                    edges.push(edge);
+                }
+            }
+        }
+    }
+
     for edge in univ3_edges.drain(..) {
+        g.add_edge(edge.clone());
+        edges.push(edge);
+    }
+    for edge in slipstream_edges.drain(..) {
+        g.add_edge(edge.clone());
+        edges.push(edge);
+    }
+    for edge in pancakeswap_edges.drain(..) {
         g.add_edge(edge.clone());
         edges.push(edge);
     }
@@ -2996,7 +4285,29 @@ where
         }
     }
 
-    Ok(edges)
+    let mode = if incremental {
+        if let Some(metrics) = &metrics {
+            metrics
+                .populate_incremental_total
+                .with_label_values(&[chain_name.as_str()])
+                .inc();
+        }
+        PopulateMode::Incremental
+    } else {
+        if let Some(metrics) = &metrics {
+            metrics
+                .populate_full_total
+                .with_label_values(&[chain_name.as_str()])
+                .inc();
+        }
+        PopulateMode::Full
+    };
+
+    Ok(PopulateResult {
+        digest: edge_digest(&edges),
+        edges,
+        mode,
+    })
 }
 
 #[cfg(test)]
@@ -3078,6 +4389,49 @@ mod tests {
 
         std::env::remove_var("RPC_URLS");
         assert_eq!(class, "local_fork");
+    }
+
+    #[test]
+    fn hub_native_price_weth_is_reliable_unit() {
+        let weth = Address::from_low_u64_be(1);
+        let mut hubs = HashSet::new();
+        hubs.insert(weth);
+        let price = hub_native_price_for(weth, &HashMap::new(), &hubs, weth, 6);
+        assert!(price.is_reliable());
+        assert_ne!(compute_edge_weight(
+            U256::from(105u64),
+            U256::from(100u64),
+            30_000,
+            U256::from(200u64),
+            U256::from(1_000_000u64),
+            price,
+        ), i64::MAX);
+    }
+
+    #[test]
+    fn hub_native_price_usdc_pegs_via_weth() {
+        let weth = Address::from_low_u64_be(1);
+        let usdc = Address::from_low_u64_be(2);
+        let mut hubs = HashSet::new();
+        hubs.insert(weth);
+        hubs.insert(usdc);
+        let mut prices = HashMap::new();
+        let weth_unit = U256::exp10(18);
+        prices.insert(
+            weth,
+            NativePrice::new(weth_unit, weth_unit, true),
+        );
+        let usdc_price = hub_native_price_for(usdc, &prices, &hubs, weth, 6);
+        assert!(usdc_price.is_reliable());
+        let weight = compute_edge_weight(
+            U256::from(105u64),
+            U256::from(100u64),
+            30_000,
+            U256::from(200u64),
+            U256::from(1_000_000u64),
+            usdc_price,
+        );
+        assert_ne!(weight, i64::MAX);
     }
 
     #[test]
