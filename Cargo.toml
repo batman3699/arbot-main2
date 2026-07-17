@@ -43,3 +43,20 @@ rlp = "0.5"
 [dev-dependencies]
 tempfile = "3"
 httpmock = "0.7"
+
+# Latency-critical: this binary races other searchers for block inclusion.
+# The deployed artifact is built with `cargo build --release`, so the release
+# profile must be fully optimized rather than relying on cargo defaults
+# (which omit LTO and use 16 codegen units).
+#
+# panic strategy is intentionally left at the default (unwind): spawn_supervised
+# relies on JoinError::is_panic() to catch and restart a panicking background
+# worker. `panic = "abort"` would turn any worker panic into a full process
+# abort and defeat that supervision, so it must NOT be set here.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Keep symbol names so production panic backtraces stay readable while still
+# dropping the bulk of debug info from the shipped binary.
+strip = "debuginfo"

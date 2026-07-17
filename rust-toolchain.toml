@@ -1,0 +1,7 @@
+# Pin the toolchain for reproducible production builds. The codebase requires
+# Rust 1.92+ (docs/VALIDATION_RUN.md); this is the version validated against the
+# current tree. Bump deliberately and re-run the full test suite when upgrading.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
