@@ -219,36 +219,6 @@ struct DetectedCycle {
     estimated_profit_bps: i64,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-struct PathState {
-    score: i128,
-    nodes: Vec<usize>,
-}
-
-impl PartialEq for PathState {
-    fn eq(&self, other: &Self) -> bool {
-        self.score == other.score && self.nodes == other.nodes
-    }
-}
-
-impl Eq for PathState {}
-
-impl Ord for PathState {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match self.score.cmp(&other.score) {
-            Ordering::Equal => self.nodes.cmp(&other.nodes),
-            ord => ord,
-        }
-    }
-}
-
-impl PartialOrd for PathState {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 pub(crate) fn canonicalize_cycle(mut cycle: Vec<usize>) -> Vec<usize> {
     if cycle.len() <= 1 {
         return cycle;
@@ -474,12 +444,6 @@ impl Graph {
         self.update_adjacency_for_from(from);
     }
 
-    #[allow(dead_code)]
-    fn edges_from_index(&self, idx: usize) -> Option<&Vec<usize>> {
-        let node = self.nodes.get(idx)?;
-        self.edges_from.get(node)
-    }
-
     pub fn edge_by_index(&self, idx: usize) -> Option<&Edge> {
         self.edges.get(idx)
     }
@@ -506,132 +470,6 @@ impl Graph {
         }
 
         best
-    }
-
-    #[allow(dead_code)]
-    pub fn k_best_cycles(&self, start: Address, max_hops: usize, k: usize) -> Vec<Vec<usize>> {
-        const DEFAULT_MAX_STATES: usize = 100_000;
-        const DEFAULT_TIMEOUT: Duration = Duration::from_millis(200);
-
-        self.k_best_cycles_with_limits(start, max_hops, k, DEFAULT_MAX_STATES, DEFAULT_TIMEOUT)
-    }
-
-    pub(crate) fn k_best_cycles_with_limits(
-        &self,
-        start: Address,
-        max_hops: usize,
-        k: usize,
-        max_states: usize,
-        max_duration: Duration,
-    ) -> Vec<Vec<usize>> {
-        if k == 0 || max_hops == 0 || max_states == 0 {
-            return Vec::new();
-        }
-
-        let Some(&start_idx) = self.ix.get(&start) else {
-            return Vec::new();
-        };
-
-        let deadline = Instant::now().checked_add(max_duration);
-        let mut heap = BinaryHeap::new();
-        let mut visited_paths: HashSet<Vec<usize>> = HashSet::new();
-        let mut cycles: Vec<(i128, Vec<usize>)> = Vec::new();
-        let mut canonical_starts: HashMap<Vec<usize>, HashSet<usize>> = HashMap::new();
-
-        let initial = vec![start_idx];
-        visited_paths.insert(initial.clone());
-        heap.push(PathState {
-            score: 0,
-            nodes: initial,
-        });
-
-        let mut expansions = 0usize;
-
-        while let Some(state) = heap.pop() {
-            if let Some(deadline) = deadline {
-                if Instant::now() >= deadline {
-                    break;
-                }
-            }
-
-            expansions = expansions.saturating_add(1);
-            if expansions > max_states || visited_paths.len() > max_states {
-                break;
-            }
-
-            let Some(&last) = state.nodes.last() else {
-                warn!("Skipping empty path while searching for cycles");
-                continue;
-            };
-            if last == start_idx && state.nodes.len() > 1 {
-                let canonical = canonicalize_cycle(state.nodes.clone());
-                let cycle_start = *state.nodes.first().unwrap_or(&start_idx);
-                let starts = canonical_starts.entry(canonical).or_default();
-                if starts.insert(cycle_start) {
-                    if cycles.len() < k {
-                        cycles.push((state.score, state.nodes.clone()));
-                    } else if let Some((worst_idx, _)) = cycles
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|(_, (score, _))| *score)
-                    {
-                        if state.score < cycles[worst_idx].0 {
-                            cycles[worst_idx] = (state.score, state.nodes.clone());
-                        }
-                    }
-                }
-                continue;
-            }
-
-            let current_hops = state.nodes.len().saturating_sub(1);
-            if current_hops >= max_hops {
-                continue;
-            }
-
-            let Some(edge_indices) = self.edges_from_index(last) else {
-                continue;
-            };
-
-            for &edge_idx in edge_indices {
-                if visited_paths.len() >= max_states {
-                    break;
-                }
-
-                let edge = &self.edges[edge_idx];
-                if !edge.active {
-                    continue;
-                }
-                if matches!(&edge.venue, VenueEdge::Bridge { .. }) {
-                    continue;
-                }
-                let Some(&to_idx) = self.ix.get(&edge.to) else {
-                    continue;
-                };
-
-                if to_idx != start_idx && state.nodes.contains(&to_idx) {
-                    continue;
-                }
-
-                let mut next_nodes = state.nodes.clone();
-                next_nodes.push(to_idx);
-                if !visited_paths.insert(next_nodes.clone()) {
-                    continue;
-                }
-
-                let next_hops = next_nodes.len().saturating_sub(1);
-                if next_hops > max_hops {
-                    continue;
-                }
-
-                let next_score = state.score + i128::from(edge.weight);
-                heap.push(PathState {
-                    score: next_score,
-                    nodes: next_nodes,
-                });
-            }
-        }
-
-        cycles.into_iter().map(|(_, cycle)| cycle).collect()
     }
 
     pub fn bellman_ford(
@@ -1455,7 +1293,7 @@ fn is_better(candidate: &Edge, current: &Edge) -> bool {
 mod tests {
     use super::*;
     use crate::util::{compute_edge_weight, NativePrice};
-    use std::collections::{BinaryHeap, HashSet};
+    use std::collections::HashSet;
     use std::time::Duration;
 
     fn addr(id: u64) -> Address {
@@ -2248,50 +2086,6 @@ mod tests {
     }
 
     #[test]
-    fn path_state_heap_orders_by_score_with_deterministic_fallback() {
-        let mut heap: BinaryHeap<PathState> = BinaryHeap::new();
-
-        heap.push(PathState {
-            score: 1,
-            nodes: vec![1, 0],
-        });
-        heap.push(PathState {
-            score: 25,
-            nodes: vec![2, 0],
-        });
-        heap.push(PathState {
-            score: 25,
-            nodes: vec![1, 1],
-        });
-        heap.push(PathState {
-            score: 0,
-            nodes: vec![3, 0],
-        });
-        heap.push(PathState {
-            score: 0,
-            nodes: vec![4, 0],
-        });
-
-        let mut popped = Vec::new();
-        while let Some(state) = heap.pop() {
-            popped.push(state);
-        }
-
-        assert_eq!(popped.len(), 5);
-
-        assert_eq!(popped[0].score, 25);
-        assert_eq!(popped[0].nodes, vec![2, 0]);
-        assert_eq!(popped[1].score, 25);
-        assert_eq!(popped[1].nodes, vec![1, 1]);
-        assert_eq!(popped[2].score, 1);
-        assert_eq!(popped[2].nodes, vec![1, 0]);
-        assert_eq!(popped[3].score, 0);
-        assert_eq!(popped[3].nodes, vec![4, 0]);
-        assert_eq!(popped[4].score, 0);
-        assert_eq!(popped[4].nodes, vec![3, 0]);
-    }
-
-    #[test]
     fn high_out_degree_node_does_not_exhaust_relax_budget_mid_scan() {
         let mut graph = Graph::default();
 
@@ -2528,95 +2322,6 @@ mod tests {
         let expensive_graph = build_graph(U256::from(20_000u64));
         let expensive_cycles = expensive_graph.bellman_ford(&priorities, &limits(3), 1, None);
         assert!(expensive_cycles.is_empty());
-    }
-
-    #[test]
-    fn k_best_cycles_retains_flash_loanable_rotations() {
-        let mut graph = Graph::default();
-
-        let a = addr(1);
-        let b = addr(2);
-        let c = addr(3);
-
-        let edges = [(a, b, 2u64, 1u64), (b, c, 3u64, 2u64), (c, a, 4u64, 3u64)];
-
-        for (from, to, num, den) in edges {
-            graph.add_edge(Edge {
-                from,
-                to,
-                rate_num: U256::from(num),
-                rate_den: U256::from(den),
-                venue: VenueEdge::Balancer {
-                    pool_id: [0u8; 32],
-                    token_in: from,
-                    token_out: to,
-                },
-                estimated_gas: 0,
-                weight: fp_weight(num, den),
-                max_input: U256::from(1u64),
-                tolerance_bps: 0,
-                observed_slippage_bps: 0,
-                quote_block: None,
-
-                active: true,
-            });
-        }
-
-        let all_cycles: Vec<Vec<usize>> = graph
-            .nodes
-            .iter()
-            .flat_map(|start| graph.k_best_cycles(*start, 4, 4))
-            .collect();
-
-        let mut starts = HashSet::new();
-        for cycle in &all_cycles {
-            assert!(cycle.len() >= 2);
-            assert_eq!(cycle.first(), cycle.last());
-            starts.insert(*cycle.first().expect("cycle should have a start"));
-        }
-
-        assert_eq!(starts.len(), 3, "all rotations should be preserved");
-    }
-
-    #[test]
-    fn k_best_cycles_respects_limits_and_timeouts() {
-        let mut graph = Graph::default();
-
-        let nodes: Vec<Address> = (1..=6).map(addr).collect();
-        for &from in &nodes {
-            for &to in &nodes {
-                if from == to {
-                    continue;
-                }
-
-                graph.add_edge(Edge {
-                    from,
-                    to,
-                    rate_num: U256::from(1u64),
-                    rate_den: U256::from(1u64),
-                    venue: VenueEdge::Balancer {
-                        pool_id: [0u8; 32],
-                        token_in: from,
-                        token_out: to,
-                    },
-                    estimated_gas: 0,
-                    weight: fp_weight(1, 1),
-                    max_input: U256::from(1u64),
-                    tolerance_bps: 0,
-                    observed_slippage_bps: 0,
-                    quote_block: None,
-
-                    active: true,
-                });
-            }
-        }
-
-        let start = nodes[0];
-        let no_time = graph.k_best_cycles_with_limits(start, 4, 3, 10, Duration::from_millis(0));
-        assert!(no_time.is_empty());
-
-        let capped = graph.k_best_cycles_with_limits(start, 3, 2, 20, Duration::from_millis(5));
-        assert!(capped.len() <= 2);
     }
 
     #[test]
