@@ -55,6 +55,37 @@ where
     Ok(decimals)
 }
 
+/// Read an env var and parse it as `T`, returning `None` if unset or unparseable.
+///
+/// Exactly the `std::env::var(name).ok().and_then(|v| v.parse::<T>().ok())` idiom
+/// that was hand-written across the startup config path. Callers apply their own
+/// default (`.unwrap_or(..)` / `.unwrap_or_else(..)`) and any clamping, so the
+/// per-call semantics (including "unparseable falls back to default") are
+/// preserved. Does not trim — a value with surrounding whitespace falls back,
+/// matching the original inline reads.
+pub fn env_parse_opt<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok().and_then(|raw| raw.parse::<T>().ok())
+}
+
+/// Read an env var as a decimal `U256`, returning `None` if unset or unparseable.
+/// Mirrors the `env::var(name).ok().and_then(|v| U256::from_dec_str(&v).ok())`
+/// idiom (decimal, not hex).
+pub fn env_u256_opt(name: &str) -> Option<U256> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| U256::from_dec_str(&raw).ok())
+}
+
+/// Boolean flag: `true` for `1`/`true`/`yes` (case-insensitive), `false` for any
+/// other set value, and `default` when unset. Same semantics as the
+/// `matches!(raw.to_ascii_lowercase().as_str(), "1"|"true"|"yes")` idiom.
+pub fn env_flag(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(default)
+}
+
 /// Parse a 4-byte function selector from a hex string (with or without `0x`).
 /// Accepts inputs of at least 4 bytes and takes the leading 4. Shared by the
 /// bridge and liquidation config parsers.
@@ -596,6 +627,44 @@ mod tests {
 
     fn addr(n: u64) -> Address {
         Address::from_low_u64_be(n)
+    }
+
+    #[test]
+    fn env_helpers_match_inline_idioms() {
+        // Unique names so these don't race other tests over shared process env.
+        let pk = "ARBOT_TEST_ENV_PARSE_9f3a";
+        std::env::remove_var(pk);
+        assert_eq!(env_parse_opt::<u32>(pk), None);
+        std::env::set_var(pk, "42");
+        assert_eq!(env_parse_opt::<u32>(pk), Some(42));
+        std::env::set_var(pk, "notanumber");
+        assert_eq!(env_parse_opt::<u32>(pk), None);
+        std::env::set_var(pk, " 42 "); // no trimming: whitespace -> None (falls back)
+        assert_eq!(env_parse_opt::<u32>(pk), None);
+        std::env::remove_var(pk);
+
+        let uk = "ARBOT_TEST_ENV_U256_9f3a";
+        std::env::remove_var(uk);
+        assert_eq!(env_u256_opt(uk), None);
+        std::env::set_var(uk, "1000000000000000000");
+        assert_eq!(env_u256_opt(uk), Some(U256::from(1_000_000_000_000_000_000u64)));
+        std::env::set_var(uk, "0x10"); // from_dec_str rejects hex
+        assert_eq!(env_u256_opt(uk), None);
+        std::env::remove_var(uk);
+
+        let fk = "ARBOT_TEST_ENV_FLAG_9f3a";
+        std::env::remove_var(fk);
+        assert!(env_flag(fk, true));
+        assert!(!env_flag(fk, false));
+        for truthy in ["1", "true", "YES", "Yes"] {
+            std::env::set_var(fk, truthy);
+            assert!(env_flag(fk, false), "{truthy} should be truthy");
+        }
+        for falsy in ["0", "false", "no", "banana"] {
+            std::env::set_var(fk, falsy);
+            assert!(!env_flag(fk, true), "{falsy} should be falsy");
+        }
+        std::env::remove_var(fk);
     }
 
     #[test]
