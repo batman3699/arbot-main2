@@ -55,6 +55,65 @@ where
     Ok(decimals)
 }
 
+/// Parse a 4-byte function selector from a hex string (with or without `0x`).
+/// Accepts inputs of at least 4 bytes and takes the leading 4. Shared by the
+/// bridge and liquidation config parsers.
+pub fn parse_selector(raw: &str) -> Result<[u8; 4]> {
+    use anyhow::Context;
+    let trimmed = raw.trim();
+    let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    let bytes = hex::decode(trimmed)
+        .with_context(|| format!("selector `{raw}` is not valid hexadecimal"))?;
+    anyhow::ensure!(
+        bytes.len() >= 4,
+        "selector `{raw}` must decode to at least 4 bytes (8 hex characters)"
+    );
+    let mut selector = [0u8; 4];
+    selector.copy_from_slice(&bytes[..4]);
+    Ok(selector)
+}
+
+/// Expand `${VAR}` references in a config string from the process environment.
+/// Unset or empty-named references are left verbatim (`${VAR}` / `${}`) so a
+/// missing variable surfaces downstream instead of silently becoming empty.
+/// Shared by the registry and ops-inputs config loaders so their substitution
+/// behaviour stays identical.
+pub fn expand_env_vars(raw: &str) -> String {
+    let mut result = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '$' && matches!(chars.peek(), Some('{')) {
+            chars.next();
+            let mut key = String::new();
+            for next in chars.by_ref() {
+                if next == '}' {
+                    break;
+                }
+                key.push(next);
+            }
+
+            if key.is_empty() {
+                result.push_str("${}");
+                continue;
+            }
+
+            match std::env::var(&key) {
+                Ok(value) => result.push_str(&value),
+                Err(_) => {
+                    result.push_str("${");
+                    result.push_str(&key);
+                    result.push('}');
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 pub fn u256_to_f64(x: U256) -> f64 {
     u256_to_decimal(x)
         .to_f64()

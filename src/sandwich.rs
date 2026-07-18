@@ -1,7 +1,5 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs,
-    path::PathBuf,
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -18,6 +16,7 @@ use tokio::{sync::Mutex, time::sleep};
 use tracing::{info, warn};
 
 use crate::quote_univ2::{load_pair_state, UniV2PairState};
+use crate::venues::{env_var_with_fallback, parse_pool_configs};
 
 const SANDWICH_ESTIMATED_GAS: u64 = 320_000;
 const SEEN_TX_TTL: Duration = Duration::from_secs(300);
@@ -404,76 +403,6 @@ fn load_univ2_pools(chain_env_prefix: &str) -> Result<HashMap<(Address, Address)
     Ok(map)
 }
 
-fn env_var_with_fallback(primary: &str, fallback: &str) -> Option<(String, String)> {
-    std::env::var(primary)
-        .map(|value| (value, primary.to_string()))
-        .or_else(|_| std::env::var(fallback).map(|value| (value, fallback.to_string())))
-        .ok()
-}
-
-fn parse_pool_configs<T>(raw: &str, source: &str) -> Result<Vec<T>>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    match try_parse_pool_configs(raw, source) {
-        Ok(pools) => Ok(pools),
-        Err(initial_error) => {
-            if let Some((contents, derived_source)) = maybe_load_config_file(raw, source)? {
-                try_parse_pool_configs(&contents, &derived_source)
-            } else {
-                Err(initial_error)
-            }
-        }
-    }
-}
-
-fn try_parse_pool_configs<T>(raw: &str, source: &str) -> Result<Vec<T>>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    json5::from_str(raw).with_context(|| {
-        format!(
-            r#"failed to parse {source} as JSON/JSON5. Ensure pool addresses and token addresses are quoted strings."#
-        )
-    })
-}
-
-fn maybe_load_config_file(raw: &str, source: &str) -> Result<Option<(String, String)>> {
-    let mut trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    if let Some(stripped) = trimmed
-        .strip_prefix('"')
-        .and_then(|inner| inner.strip_suffix('"'))
-    {
-        trimmed = stripped;
-    } else if trimmed.len() >= 2
-        && trimmed.as_bytes().first() == Some(&39)
-        && trimmed.as_bytes().last() == Some(&39)
-    {
-        trimmed = &trimmed[1..trimmed.len() - 1];
-    }
-    let trimmed = trimmed.strip_prefix('@').unwrap_or(trimmed);
-    let path = if let Some(stripped) = trimmed.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(stripped)
-        } else {
-            PathBuf::from(trimmed)
-        }
-    } else {
-        PathBuf::from(trimmed)
-    };
-    if path.is_file() {
-        let contents = fs::read_to_string(&path).with_context(|| {
-            format!(
-                "failed to read config file `{}` referenced by {source}",
-                path.display()
-            )
-        })?;
-        let derived_source = format!("config file `{}` referenced by {source}", path.display());
-        Ok(Some((contents, derived_source)))
-    } else {
-        Ok(None)
-    }
-}
+// Config loading (env-with-fallback + JSON5/file parsing) is shared with the
+// venue config path — see crate::venues. Reused here rather than duplicated so
+// the two cannot drift.

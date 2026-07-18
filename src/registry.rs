@@ -11,6 +11,7 @@ use std::{
 };
 use tracing::{info, warn};
 
+use crate::util::expand_env_vars;
 use crate::venues::{BalPoolCfg, CurvePoolCfg, UniV2PoolCfg};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -117,42 +118,6 @@ fn parse_registry_bytes(raw: &[u8], source: impl std::fmt::Display) -> Result<Re
     let expanded = expand_env_vars(raw);
     serde_json::from_str(&expanded)
         .with_context(|| format!("failed to parse registry json from `{}`", source))
-}
-
-fn expand_env_vars(raw: &str) -> String {
-    let mut result = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '$' && matches!(chars.peek(), Some('{')) {
-            chars.next();
-            let mut key = String::new();
-            for next in chars.by_ref() {
-                if next == '}' {
-                    break;
-                }
-                key.push(next);
-            }
-
-            if key.is_empty() {
-                result.push_str("${}");
-                continue;
-            }
-
-            match std::env::var(&key) {
-                Ok(value) => result.push_str(&value),
-                Err(_) => {
-                    result.push_str("${");
-                    result.push_str(&key);
-                    result.push('}');
-                }
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-
-    result
 }
 
 fn load_registry_from_file(path: &Path) -> Result<RegistryBlob> {

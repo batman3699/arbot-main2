@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::util::expand_env_vars;
 use anyhow::{anyhow, Context, Result};
 use ethers::types::Address;
 use serde::Deserialize;
@@ -488,42 +489,6 @@ fn active_chain_names_from_env() -> Option<Vec<String>> {
 
 pub fn parse_ops_inputs(raw: &str) -> Result<OpsInputs> {
     serde_yaml::from_str(raw).context("parse ops inputs yaml")
-}
-
-fn expand_env_vars(raw: &str) -> String {
-    let mut result = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '$' && matches!(chars.peek(), Some('{')) {
-            chars.next();
-            let mut key = String::new();
-            for next in chars.by_ref() {
-                if next == '}' {
-                    break;
-                }
-                key.push(next);
-            }
-
-            if key.is_empty() {
-                result.push_str("${}");
-                continue;
-            }
-
-            match std::env::var(&key) {
-                Ok(value) => result.push_str(&value),
-                Err(_) => {
-                    result.push_str("${");
-                    result.push_str(&key);
-                    result.push('}');
-                }
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-
-    result
 }
 
 impl OpsInputs {
@@ -2267,7 +2232,8 @@ fn ensure_positive(value: f64, field: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_env_vars, load_ops_inputs, parse_ops_inputs};
+    use super::{load_ops_inputs, parse_ops_inputs};
+    use crate::util::expand_env_vars;
 
     #[test]
     fn expands_env_vars_in_yaml() {

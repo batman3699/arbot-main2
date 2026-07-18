@@ -8,7 +8,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::graph::{Edge, Graph, VenueEdge};
-use crate::util::{compute_edge_weight, NativePrice, TradeSizing, WEIGHT_SCALE};
+use crate::util::{compute_edge_weight, parse_selector, NativePrice, TradeSizing, WEIGHT_SCALE};
 use tracing::info;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -59,20 +59,6 @@ pub struct BridgePlanner {
 
 fn parse_address(raw: &str, field: &str) -> Result<Address> {
     Address::from_str(raw).with_context(|| format!("invalid address `{raw}` for {field}"))
-}
-
-fn parse_selector(raw: &str) -> Result<[u8; 4]> {
-    let trimmed = raw.trim();
-    let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    let bytes = hex::decode(trimmed)
-        .with_context(|| format!("selector `{raw}` is not valid hexadecimal"))?;
-    anyhow::ensure!(
-        bytes.len() >= 4,
-        "selector `{raw}` must decode to at least 4 bytes (8 hex characters)"
-    );
-    let mut selector = [0u8; 4];
-    selector.copy_from_slice(&bytes[..4]);
-    Ok(selector)
 }
 
 fn parse_u256(raw: &str, field: &str) -> Result<U256> {

@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::graph::{Edge, VenueEdge};
 use crate::math::mul_div;
+use crate::util::parse_selector;
 use crate::ops_inputs::{LiquidationMarketKind, LiquidationMarketSpec, OpsInputs};
 use crate::util::{compute_edge_weight, NativePrice};
 
@@ -1052,20 +1053,6 @@ fn decode_health_factor(data: &[u8]) -> Option<U256> {
     )
     .ok()?;
     decoded.last()?.clone().into_uint()
-}
-
-fn parse_selector(raw: &str) -> Result<[u8; 4]> {
-    let trimmed = raw.trim();
-    let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    let bytes = hex::decode(trimmed)
-        .with_context(|| format!("selector `{raw}` is not valid hexadecimal"))?;
-    anyhow::ensure!(
-        bytes.len() >= 4,
-        "selector `{raw}` must decode to at least 4 bytes (8 hex characters)"
-    );
-    let mut selector = [0u8; 4];
-    selector.copy_from_slice(&bytes[..4]);
-    Ok(selector)
 }
 
 #[cfg(test)]
