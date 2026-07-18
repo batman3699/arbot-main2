@@ -4909,23 +4909,40 @@ where
         // the head has not advanced since the previous scan, poll cheaply for a
         // new block instead of re-running the populate/quote pipeline, unless a
         // live mempool backrun hint justifies a same-block rescan.
-        let rescan_same_block = std::env::var("ARBOT_RESCAN_SAME_BLOCK")
-            .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        let block_poll_interval = Duration::from_millis(
-            std::env::var("ARBOT_BLOCK_POLL_MS")
-                .ok()
-                .and_then(|raw| raw.parse::<u64>().ok())
-                .filter(|ms| *ms > 0)
-                .unwrap_or(150),
-        );
-        let new_block_wait = Duration::from_millis(
-            std::env::var("ARBOT_NEW_BLOCK_WAIT_MS")
-                .ok()
-                .and_then(|raw| raw.parse::<u64>().ok())
-                .filter(|ms| *ms > 0)
-                .unwrap_or(4_000),
-        );
+        // These scan-cadence tunables are fixed at startup; resolve each once
+        // instead of re-reading the environment on every scan.
+        let rescan_same_block = {
+            static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("ARBOT_RESCAN_SAME_BLOCK")
+                    .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(false)
+            })
+        };
+        let block_poll_interval = {
+            static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+            *V.get_or_init(|| {
+                Duration::from_millis(
+                    std::env::var("ARBOT_BLOCK_POLL_MS")
+                        .ok()
+                        .and_then(|raw| raw.parse::<u64>().ok())
+                        .filter(|ms| *ms > 0)
+                        .unwrap_or(150),
+                )
+            })
+        };
+        let new_block_wait = {
+            static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+            *V.get_or_init(|| {
+                Duration::from_millis(
+                    std::env::var("ARBOT_NEW_BLOCK_WAIT_MS")
+                        .ok()
+                        .and_then(|raw| raw.parse::<u64>().ok())
+                        .filter(|ms| *ms > 0)
+                        .unwrap_or(4_000),
+                )
+            })
+        };
         let block_wait_start = Instant::now();
         // The last block this runner scanned is stable for the duration of this
         // call (only written after the loop), so read it once. It drives both
@@ -5099,10 +5116,15 @@ where
         let hot_pancake_tokens = self.hot_pancakeswap_pools.read().await.clone();
         let mut hot_cl_tokens = hot_univ3_tokens;
         hot_cl_tokens.extend(hot_pancake_tokens);
-        let raw_token_whitelist_cap = std::env::var("TOKEN_WHITELIST_MAX")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .unwrap_or(512);
+        let raw_token_whitelist_cap = {
+            static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("TOKEN_WHITELIST_MAX")
+                    .ok()
+                    .and_then(|raw| raw.parse::<usize>().ok())
+                    .unwrap_or(512)
+            })
+        };
         let token_whitelist_cap = sanitize_token_whitelist_cap(raw_token_whitelist_cap);
         if raw_token_whitelist_cap < 64 {
             warn!(

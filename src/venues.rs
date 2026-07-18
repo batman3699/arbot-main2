@@ -49,11 +49,14 @@ const ESTIMATED_GAS_SOLIDLYV2: u64 = 135_000;
 const ESTIMATED_GAS_UNIV4: u64 = 160_000;
 
 fn univ2_load_concurrency() -> usize {
-    std::env::var("UNIV2_LOAD_CONCURRENCY")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .unwrap_or(32)
-        .clamp(4, 128)
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("UNIV2_LOAD_CONCURRENCY")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(32)
+            .clamp(4, 128)
+    })
 }
 // Production scan budgets run 150-250ms; a hung quote must never be able to
 // pin a pool for multiple seconds. 2s matches the validated Base shadow
@@ -78,23 +81,32 @@ fn parse_timeout_secs(raw: Option<&str>, default_secs: u64) -> u64 {
 }
 
 fn rpc_quote_timeout() -> Duration {
-    Duration::from_secs(parse_rpc_quote_timeout_secs(
-        std::env::var(RPC_QUOTE_TIMEOUT_ENV).ok().as_deref(),
-    ))
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        Duration::from_secs(parse_rpc_quote_timeout_secs(
+            std::env::var(RPC_QUOTE_TIMEOUT_ENV).ok().as_deref(),
+        ))
+    })
 }
 
 fn queue_wait_timeout() -> Duration {
-    Duration::from_secs(parse_timeout_secs(
-        std::env::var(QUEUE_WAIT_TIMEOUT_ENV).ok().as_deref(),
-        DEFAULT_QUEUE_WAIT_TIMEOUT_SECS,
-    ))
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        Duration::from_secs(parse_timeout_secs(
+            std::env::var(QUEUE_WAIT_TIMEOUT_ENV).ok().as_deref(),
+            DEFAULT_QUEUE_WAIT_TIMEOUT_SECS,
+        ))
+    })
 }
 
 fn univ3_total_deadline_timeout() -> Duration {
-    Duration::from_secs(parse_timeout_secs(
-        std::env::var(UNIV3_TOTAL_DEADLINE_ENV).ok().as_deref(),
-        DEFAULT_UNIV3_TOTAL_DEADLINE_SECS,
-    ))
+    static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        Duration::from_secs(parse_timeout_secs(
+            std::env::var(UNIV3_TOTAL_DEADLINE_ENV).ok().as_deref(),
+            DEFAULT_UNIV3_TOTAL_DEADLINE_SECS,
+        ))
+    })
 }
 
 abigen!(
@@ -621,11 +633,14 @@ fn size_search_refine_iters() -> usize {
 /// 3 RPCs (getReserves + token0 + token1); loading them concurrently (instead of
 /// sequentially per directional entry) is the dominant solidly latency win.
 fn solidly_state_concurrency() -> usize {
-    std::env::var("SOLIDLY_STATE_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .unwrap_or(32)
-        .clamp(1, 128)
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("SOLIDLY_STATE_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(32)
+            .clamp(1, 128)
+    })
 }
 
 fn adjust_trade_size_sync<F>(
@@ -1722,17 +1737,27 @@ where
             Some(Arc::clone(tiers))
         }
     });
-    let min_forced_discovery_quotes = std::env::var("UNIV3_MIN_FORCED_QUOTES")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(8);
+    let min_forced_discovery_quotes = {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("UNIV3_MIN_FORCED_QUOTES")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .unwrap_or(8)
+        })
+    };
     let forced_discovery_quotes_used = Arc::new(AtomicUsize::new(0));
     let provider_class = classify_provider_for_chain(&ctx.chain_env_prefix);
-    let max_pool_tasks = std::env::var("UNIV3_MAX_CONCURRENT_POOL_TASKS")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(ctx.quote_concurrency_limit.max(1));
+    let max_pool_tasks = {
+        static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        (*V.get_or_init(|| {
+            std::env::var("UNIV3_MAX_CONCURRENT_POOL_TASKS")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+        }))
+        .unwrap_or(ctx.quote_concurrency_limit.max(1))
+    };
 
     let mut join_set: JoinSet<Result<Vec<Edge>>> = JoinSet::new();
     let mut edges = Vec::new();
@@ -2319,17 +2344,27 @@ where
             Some(Arc::clone(tiers))
         }
     });
-    let min_forced_discovery_quotes = std::env::var("SLIPSTREAM_MIN_FORCED_QUOTES")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(8);
+    let min_forced_discovery_quotes = {
+        static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("SLIPSTREAM_MIN_FORCED_QUOTES")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .unwrap_or(8)
+        })
+    };
     let forced_discovery_quotes_used = Arc::new(AtomicUsize::new(0));
     let provider_class = classify_provider_for_chain(&ctx.chain_env_prefix);
-    let max_pool_tasks = std::env::var("SLIPSTREAM_MAX_CONCURRENT_POOL_TASKS")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(ctx.quote_concurrency_limit.max(1));
+    let max_pool_tasks = {
+        static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        (*V.get_or_init(|| {
+            std::env::var("SLIPSTREAM_MAX_CONCURRENT_POOL_TASKS")
+                .ok()
+                .and_then(|raw| raw.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+        }))
+        .unwrap_or(ctx.quote_concurrency_limit.max(1))
+    };
 
     let mut join_set: JoinSet<Result<Vec<Edge>>> = JoinSet::new();
     let mut edges = Vec::new();
@@ -3548,9 +3583,14 @@ async fn collect_univ4_edges(
         // non-trivial size. A correct V4 quote needs concentrated-liquidity tick
         // crossing (on-chain Quoter/StateView). Until that exists, these edges are
         // OFF by default and must be explicitly opted into.
-        let allow_fixed_price = std::env::var("ENABLE_UNIV4_FIXED_PRICE_QUOTES")
-            .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let allow_fixed_price = {
+            static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *V.get_or_init(|| {
+                std::env::var("ENABLE_UNIV4_FIXED_PRICE_QUOTES")
+                    .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                    .unwrap_or(false)
+            })
+        };
         if !allow_fixed_price {
             warn!(
                 target: "venue::univ4",
@@ -3780,11 +3820,16 @@ where
     };
 
     let mut edges = Vec::new();
-    let min_edge_health_score_bps = std::env::var("EDGE_MIN_HEALTH_SCORE_BPS")
-        .ok()
-        .and_then(|raw| raw.parse::<u32>().ok())
-        .unwrap_or(0)
-        .min(10_000);
+    let min_edge_health_score_bps = {
+        static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("EDGE_MIN_HEALTH_SCORE_BPS")
+                .ok()
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .unwrap_or(0)
+                .min(10_000)
+        })
+    };
 
     if let Some(validation) = univ3_validation {
         if quoter_validation_once.get().is_none() {
