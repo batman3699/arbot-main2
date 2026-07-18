@@ -36,12 +36,17 @@ Done (each its own commit; full suite green after each):
   per product direction (`b7dddb5`)
 - **P2-6 (hot-path slice)** per-block env tunables cached via OnceLock so the scan
   path no longer reads `std::env` each block — `0bae681`
+- **P2-6 (env-helper migration)** typed helpers `env_parse_opt`/`env_u256_opt`/`env_flag`
+  in util (`3a46e95`); 67 scattered inline env-read idioms in main.rs migrated onto them
+  (`98d1d08`), verified behavior-preserving (env-var name set identical 116==116, build
+  warning-free, full suite green). main.rs env reads: ~130 → 61.
 
 Remaining:
-- **P2-6 (rest)** a typed `Config` struct for the ~130 startup env reads in
-  `launch_chain_runtime` (readability/validation, not perf — these are already
-  effectively read-once at startup), and a per-prefix-keyed cache for
-  `classify_provider_for_chain` (the one param-dependent per-block reader left). Large.
+- **P2-6 (optional)** the 61 remaining main.rs reads are intentional `.context()?`
+  fail-fast validation + four dynamic-name reads. A further step could group the parsed
+  values into one typed `Config` struct passed by reference (organizational — startup
+  reads are already read-once), plus a per-prefix-keyed cache for
+  `classify_provider_for_chain` (the one param-dependent per-block reader left).
 - **P2-7** split the 13k-line `main.rs` — large, not started.
 - **P3** items (junk-file purge, chain-config trim, token-universe trim, profit-funnel
   metrics) — not started.
