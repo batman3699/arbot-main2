@@ -214,10 +214,7 @@ impl FeatureGate {
 }
 
 fn read_feature_flag(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(default)
+    crate::util::env_flag(name, default)
 }
 
 #[derive(Clone, Debug)]
@@ -440,9 +437,7 @@ fn derive_chain_time_budget_ms(
 }
 
 fn univ3_quote_concurrency() -> usize {
-    std::env::var("UNIV3_QUOTE_CONCURRENCY")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
+    crate::util::env_parse_opt::<usize>("UNIV3_QUOTE_CONCURRENCY")
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_UNIV3_QUOTE_CONCURRENCY)
 }
@@ -570,13 +565,9 @@ fn build_univ3_rank_context(
         let price = match symbol.as_str() {
             "WETH" | "CBETH" | "WSTETH" => Some(native_usd),
             "USDC" | "USDBC" | "DAI" | "USDT" | "EURC" => Some(1.0),
-            "CBBTC" | "WBTC" => std::env::var("RANK_CBTC_USD")
-                .ok()
-                .and_then(|raw| raw.parse::<f64>().ok())
+            "CBBTC" | "WBTC" => crate::util::env_parse_opt::<f64>("RANK_CBTC_USD")
                 .or(Some(95_000.0)),
-            "AERO" => std::env::var("RANK_AERO_USD")
-                .ok()
-                .and_then(|raw| raw.parse::<f64>().ok())
+            "AERO" => crate::util::env_parse_opt::<f64>("RANK_AERO_USD")
                 .or(Some(0.35)),
             _ => None,
         };
@@ -705,9 +696,7 @@ fn sanitize_dynamic_top_tokens_30d(configured: usize) -> usize {
 }
 
 fn scan_idle_sleep_ms() -> u64 {
-    std::env::var("ARBOT_SCAN_IDLE_SLEEP_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
+    crate::util::env_parse_opt::<u64>("ARBOT_SCAN_IDLE_SLEEP_MS")
         .unwrap_or(50)
 }
 
@@ -1235,9 +1224,7 @@ struct ProfitThresholdParams<'a> {
 const DEFAULT_CANDIDATE_PREP_CONCURRENCY: usize = 4;
 
 fn candidate_prep_concurrency() -> usize {
-    std::env::var("ARBOT_CANDIDATE_CONCURRENCY")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
+    crate::util::env_parse_opt::<usize>("ARBOT_CANDIDATE_CONCURRENCY")
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_CANDIDATE_PREP_CONCURRENCY)
 }
@@ -1247,9 +1234,7 @@ fn candidate_prep_concurrency() -> usize {
 const DEFAULT_SIM_CASCADE_DEPTH: usize = 3;
 
 fn sim_cascade_depth() -> usize {
-    std::env::var("ARBOT_SIM_CASCADE_DEPTH")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
+    crate::util::env_parse_opt::<usize>("ARBOT_SIM_CASCADE_DEPTH")
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_SIM_CASCADE_DEPTH)
 }
@@ -1599,9 +1584,7 @@ where
 /// Runtime kill-switch for the private raw-transaction fallback. Lets ops
 /// force bundle-only submission without editing ops/inputs.yaml.
 fn private_raw_fallback_disabled() -> bool {
-    std::env::var("ARBOT_DISABLE_PRIVATE_RAW_FALLBACK")
-        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    read_feature_flag("ARBOT_DISABLE_PRIVATE_RAW_FALLBACK", false)
 }
 
 /// Only relay errors that mean "this endpoint does not implement
@@ -2294,33 +2277,23 @@ impl CircuitBreaker {
 
     /// Override health-trigger thresholds from environment (production only).
     fn configure_health_from_env(mut self) -> Self {
-        if let Some(v) = std::env::var("CB_REVERT_RATE_LIMIT")
-            .ok()
-            .and_then(|raw| raw.parse::<f64>().ok())
+        if let Some(v) = crate::util::env_parse_opt::<f64>("CB_REVERT_RATE_LIMIT")
         {
             self.revert_rate_limit = v;
         }
-        if let Some(v) = std::env::var("CB_REVERT_MIN_SAMPLES")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
+        if let Some(v) = crate::util::env_parse_opt::<usize>("CB_REVERT_MIN_SAMPLES")
         {
             self.revert_min_samples = v.max(1);
         }
-        if let Some(v) = std::env::var("CB_REVERT_WINDOW_SECS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
+        if let Some(v) = crate::util::env_parse_opt::<u64>("CB_REVERT_WINDOW_SECS")
         {
             self.revert_window_dur = Duration::from_secs(v.max(1));
         }
-        if let Some(v) = std::env::var("CB_RPC_ERROR_LIMIT")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
+        if let Some(v) = crate::util::env_parse_opt::<usize>("CB_RPC_ERROR_LIMIT")
         {
             self.rpc_error_limit = v;
         }
-        if let Some(v) = std::env::var("CB_RPC_ERROR_WINDOW_SECS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
+        if let Some(v) = crate::util::env_parse_opt::<u64>("CB_RPC_ERROR_WINDOW_SECS")
         {
             self.rpc_error_window = Duration::from_secs(v.max(1));
         }
@@ -4914,18 +4887,14 @@ where
         let rescan_same_block = {
             static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             *V.get_or_init(|| {
-                std::env::var("ARBOT_RESCAN_SAME_BLOCK")
-                    .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-                    .unwrap_or(false)
+                read_feature_flag("ARBOT_RESCAN_SAME_BLOCK", false)
             })
         };
         let block_poll_interval = {
             static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
             *V.get_or_init(|| {
                 Duration::from_millis(
-                    std::env::var("ARBOT_BLOCK_POLL_MS")
-                        .ok()
-                        .and_then(|raw| raw.parse::<u64>().ok())
+                    crate::util::env_parse_opt::<u64>("ARBOT_BLOCK_POLL_MS")
                         .filter(|ms| *ms > 0)
                         .unwrap_or(150),
                 )
@@ -4935,9 +4904,7 @@ where
             static V: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
             *V.get_or_init(|| {
                 Duration::from_millis(
-                    std::env::var("ARBOT_NEW_BLOCK_WAIT_MS")
-                        .ok()
-                        .and_then(|raw| raw.parse::<u64>().ok())
+                    crate::util::env_parse_opt::<u64>("ARBOT_NEW_BLOCK_WAIT_MS")
                         .filter(|ms| *ms > 0)
                         .unwrap_or(4_000),
                 )
@@ -5119,9 +5086,7 @@ where
         let raw_token_whitelist_cap = {
             static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
             *V.get_or_init(|| {
-                std::env::var("TOKEN_WHITELIST_MAX")
-                    .ok()
-                    .and_then(|raw| raw.parse::<usize>().ok())
+                crate::util::env_parse_opt::<usize>("TOKEN_WHITELIST_MAX")
                     .unwrap_or(512)
             })
         };
@@ -9586,9 +9551,7 @@ fn resolve_public_jitter_bps(env_prefix: &str) -> Option<u32> {
         .ok()
         .and_then(|raw| raw.parse::<u32>().ok())
         .or_else(|| {
-            std::env::var("PUBLIC_MEMPOOL_JITTER_BPS")
-                .ok()
-                .and_then(|raw| raw.parse::<u32>().ok())
+            crate::util::env_parse_opt::<u32>("PUBLIC_MEMPOOL_JITTER_BPS")
         })
 }
 
@@ -9647,9 +9610,7 @@ fn native_usd_price(env_prefix: &str) -> Option<f64> {
         .ok()
         .and_then(|raw| raw.parse::<f64>().ok())
         .or_else(|| {
-            std::env::var("NATIVE_USD_PRICE")
-                .ok()
-                .and_then(|raw| raw.parse::<f64>().ok())
+            crate::util::env_parse_opt::<f64>("NATIVE_USD_PRICE")
         })
 }
 
@@ -9818,9 +9779,7 @@ async fn select_broadcast_endpoint(
         ));
     }
 
-    let allow_default = std::env::var("ENABLE_DEFAULT_PRIVATE_RELAYS")
-        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(true);
+    let allow_default = read_feature_flag("ENABLE_DEFAULT_PRIVATE_RELAYS", true);
     if cfg.name == "ethereum" && allow_default {
         let default_relays: Vec<String> = DEFAULT_PRIVATE_RELAYS
             .iter()
@@ -9873,16 +9832,12 @@ async fn launch_chain_runtime(
     } else {
         base_amount_wei / U256::from(5u64)
     };
-    let min_flash_loan_wei = std::env::var("MIN_FLASH_LOAN_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let min_flash_loan_wei = crate::util::env_u256_opt("MIN_FLASH_LOAN_WEI")
         .unwrap_or_else(|| default_min_flash.max(U256::one()));
     let default_max_flash = base_amount_wei
         .checked_mul(U256::from(5u64))
         .unwrap_or(U256::MAX);
-    let mut max_flash_loan_wei = std::env::var("MAX_FLASH_LOAN_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let mut max_flash_loan_wei = crate::util::env_u256_opt("MAX_FLASH_LOAN_WEI")
         .unwrap_or(default_max_flash);
     if max_flash_loan_wei < min_flash_loan_wei {
         max_flash_loan_wei = min_flash_loan_wei;
@@ -9896,25 +9851,17 @@ async fn launch_chain_runtime(
         .unwrap_or_else(|_| "0".into())
         .parse()
         .context("parse SIPHON_BPS")?;
-    let growth_unit = std::env::var("COMPOUND_GROWTH_UNIT_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let growth_unit = crate::util::env_u256_opt("COMPOUND_GROWTH_UNIT_WEI")
         .unwrap_or_else(|| base_amount_wei.max(U256::one()));
-    let max_base_cap = std::env::var("COMPOUND_MAX_BASE_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let max_base_cap = crate::util::env_u256_opt("COMPOUND_MAX_BASE_WEI")
         .unwrap_or_else(|| {
             max_flash_loan_wei
                 .checked_mul(U256::from(10u64))
                 .unwrap_or(U256::MAX)
         });
-    let siphon_threshold = std::env::var("SIPHON_THRESHOLD_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let siphon_threshold = crate::util::env_u256_opt("SIPHON_THRESHOLD_WEI")
         .unwrap_or_else(|| default_min_flash.max(U256::one()));
-    let siphon_target = std::env::var("SIPHON_TARGET_ADDRESS")
-        .ok()
-        .and_then(|raw| raw.parse::<Address>().ok());
+    let siphon_target = crate::util::env_parse_opt::<Address>("SIPHON_TARGET_ADDRESS");
     let capital_manager = Arc::new(CapitalManager::new(
         base_amount_wei,
         min_flash_loan_wei,
@@ -9929,9 +9876,7 @@ async fn launch_chain_runtime(
 
     // Metrics are created before any background workers so every supervised
     // worker can report restarts via worker_restarts_total.
-    let metrics_port = std::env::var("PROMETHEUS_PORT")
-        .ok()
-        .and_then(|raw| raw.parse::<u16>().ok());
+    let metrics_port = crate::util::env_parse_opt::<u16>("PROMETHEUS_PORT");
     let metrics: Option<Arc<Metrics>> = if let Some(port) = metrics_port {
         let metrics = Arc::new(Metrics::new()?);
         let exporter = metrics.clone();
@@ -9953,9 +9898,7 @@ async fn launch_chain_runtime(
         None
     };
 
-    let pool_depth_refresh_secs = std::env::var("POOL_DEPTH_REFRESH_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
+    let pool_depth_refresh_secs = crate::util::env_parse_opt::<u64>("POOL_DEPTH_REFRESH_SECS")
         .unwrap_or(300);
     let pool_depth_refresh = Duration::from_secs(pool_depth_refresh_secs.max(60));
     let pool_depth_cache = Arc::new(PoolDepthCache::new(
@@ -9987,20 +9930,14 @@ async fn launch_chain_runtime(
     let max_hops: usize = universe_cfg
         .max_hops
         .or_else(|| {
-            std::env::var("MAX_HOPS")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
+            crate::util::env_parse_opt("MAX_HOPS")
         })
         .unwrap_or(6);
-    let max_hops_cap: usize = std::env::var("MAX_HOPS_CAP")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
+    let max_hops_cap: usize = crate::util::env_parse_opt::<usize>("MAX_HOPS_CAP")
         .unwrap_or(8)
         .max(1);
     let bounded_max_hops = max_hops.min(max_hops_cap);
-    let max_relaxations: usize = std::env::var("BELLMAN_MAX_RELAXATIONS")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
+    let max_relaxations: usize = crate::util::env_parse_opt::<usize>("BELLMAN_MAX_RELAXATIONS")
         .unwrap_or(bounded_max_hops.saturating_mul(4).max(24))
         .max(1)
         .min(256);
@@ -10012,46 +9949,34 @@ async fn launch_chain_runtime(
     let edge_prune_max_slippage_bps: u32 = universe_cfg
         .edge_prune_max_slippage_bps
         .or_else(|| {
-            std::env::var("EDGE_PRUNE_MAX_SLIPPAGE_BPS")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
+            crate::util::env_parse_opt("EDGE_PRUNE_MAX_SLIPPAGE_BPS")
         })
         .unwrap_or(edge_slippage_bps);
     let edge_prune_min_score: f64 = universe_cfg
         .edge_prune_min_score
         .or_else(|| {
-            std::env::var("EDGE_PRUNE_MIN_SCORE")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
+            crate::util::env_parse_opt("EDGE_PRUNE_MIN_SCORE")
         })
         .unwrap_or(0.0);
     let edge_prune_liquidity_weight: f64 = universe_cfg
         .edge_prune_liquidity_weight
         .or_else(|| {
-            std::env::var("EDGE_PRUNE_LIQUIDITY_WEIGHT")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
+            crate::util::env_parse_opt("EDGE_PRUNE_LIQUIDITY_WEIGHT")
         })
         .unwrap_or(1.0);
     let edge_prune_profit_weight: f64 = universe_cfg
         .edge_prune_profit_weight
         .or_else(|| {
-            std::env::var("EDGE_PRUNE_PROFIT_WEIGHT")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
+            crate::util::env_parse_opt("EDGE_PRUNE_PROFIT_WEIGHT")
         })
         .unwrap_or(1.5);
     let edge_prune_slippage_weight: f64 = universe_cfg
         .edge_prune_slippage_weight
         .or_else(|| {
-            std::env::var("EDGE_PRUNE_SLIPPAGE_WEIGHT")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
+            crate::util::env_parse_opt("EDGE_PRUNE_SLIPPAGE_WEIGHT")
         })
         .unwrap_or(0.05);
-    let max_gas_price_wei = std::env::var("MAX_GAS_PRICE_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let max_gas_price_wei = crate::util::env_u256_opt("MAX_GAS_PRICE_WEI")
         .unwrap_or_else(|| U256::from(150_000_000_000u64));
     let max_gas_price_congestion_bps: u32 = std::env::var("MAX_GAS_PRICE_CONGESTION_BPS")
         .unwrap_or_else(|_| "12000".into())
@@ -10061,24 +9986,18 @@ async fn launch_chain_runtime(
         .unwrap_or_else(|_| "200".into())
         .parse()
         .context("parse PROFIT_MARGIN_BPS")?;
-    let opportunity_cost_wei = std::env::var("OPPORTUNITY_COST_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let opportunity_cost_wei = crate::util::env_u256_opt("OPPORTUNITY_COST_WEI")
         .unwrap_or_else(U256::zero);
     let cross_chain_profit_bps: u32 = std::env::var("CROSS_CHAIN_PROFIT_BPS")
         .unwrap_or_else(|_| "175".into())
         .parse()
         .context("parse CROSS_CHAIN_PROFIT_BPS")?;
-    let cross_chain_min_profit_wei = std::env::var("CROSS_CHAIN_MIN_PROFIT_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let cross_chain_min_profit_wei = crate::util::env_u256_opt("CROSS_CHAIN_MIN_PROFIT_WEI")
         .unwrap_or_else(U256::zero);
     let max_candidate_paths: usize = universe_cfg
         .cycle_candidate_cap_per_block
         .or_else(|| {
-            std::env::var("MAX_CANDIDATE_PATHS")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
+            crate::util::env_parse_opt("MAX_CANDIDATE_PATHS")
         })
         .unwrap_or(8)
         .max(1);
@@ -10086,27 +10005,21 @@ async fn launch_chain_runtime(
         .time_budget_ms
         .search
         .or_else(|| {
-            std::env::var("CYCLE_SEARCH_TIMEOUT_MS")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
+            crate::util::env_parse_opt("CYCLE_SEARCH_TIMEOUT_MS")
         })
         .unwrap_or(250);
     let quote_budget_ms: u64 = universe_cfg
         .time_budget_ms
         .quoting
         .or_else(|| {
-            std::env::var("QUOTE_BUDGET_MS")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
+            crate::util::env_parse_opt("QUOTE_BUDGET_MS")
         })
         .unwrap_or(250);
     let simulation_budget_ms: u64 = universe_cfg
         .time_budget_ms
         .simulation
         .or_else(|| {
-            std::env::var("SIMULATION_BUDGET_MS")
-                .ok()
-                .and_then(|raw| raw.parse().ok())
+            crate::util::env_parse_opt("SIMULATION_BUDGET_MS")
         })
         .unwrap_or(400);
     let (cycle_search_timeout_ms, quote_budget_ms, simulation_budget_ms) =
@@ -10117,18 +10030,14 @@ async fn launch_chain_runtime(
             simulation_budget_ms,
         );
     let cycle_search_timeout = Duration::from_millis(cycle_search_timeout_ms.max(1));
-    let max_bellman_cycles: usize = std::env::var("MAX_BELLMAN_CYCLES")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
+    let max_bellman_cycles: usize = crate::util::env_parse_opt::<usize>("MAX_BELLMAN_CYCLES")
         .unwrap_or_else(|| {
             max_candidate_paths
                 .saturating_mul(4)
                 .max(max_candidate_paths)
                 .max(1)
         });
-    let min_edge_max_input = std::env::var("MIN_EDGE_MAX_INPUT_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let min_edge_max_input = crate::util::env_u256_opt("MIN_EDGE_MAX_INPUT_WEI")
         .unwrap_or_else(U256::zero);
     let mut min_liquidity_tokens: f64 = std::env::var("MIN_LIQUIDITY_TOKENS")
         .unwrap_or_else(|_| "0".into())
@@ -10137,9 +10046,7 @@ async fn launch_chain_runtime(
     if let Some(value) = ops_inputs.universe.min_pool_liquidity_tokens {
         min_liquidity_tokens = value;
     }
-    let max_quote_block_lag = std::env::var("MAX_QUOTE_BLOCK_LAG")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
+    let max_quote_block_lag = crate::util::env_parse_opt::<u64>("MAX_QUOTE_BLOCK_LAG")
         .map(U64::from)
         .unwrap_or_else(|| U64::from(2u64));
     let jit_enabled = read_feature_flag("JIT_LP_ENABLED", false);
@@ -10155,9 +10062,7 @@ async fn launch_chain_runtime(
         .unwrap_or_else(|_| "2".to_string())
         .parse()
         .unwrap_or(2);
-    let jit_disable_on_quote_failure = std::env::var("JIT_DISABLE_ON_MIN_OUT_FAIL")
-        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(true);
+    let jit_disable_on_quote_failure = read_feature_flag("JIT_DISABLE_ON_MIN_OUT_FAIL", true);
     let congestion_alpha: f64 = std::env::var("CONGESTION_EMA_ALPHA")
         .unwrap_or_else(|_| "0.3".into())
         .parse()
@@ -10172,9 +10077,7 @@ async fn launch_chain_runtime(
     // resolves the best edge per direction, so same-pool round-trips self-reject
     // (weight >= 0) and only genuine cross-venue spreads survive. A min_hops of
     // 3 silently excluded this entire opportunity class; 2 is the correct floor.
-    let min_hops: usize = std::env::var("MIN_HOPS")
-        .ok()
-        .and_then(|raw| raw.parse().ok())
+    let min_hops: usize = crate::util::env_parse_opt("MIN_HOPS")
         .unwrap_or(2);
     let cycle_limits = BellmanFordLimits {
         min_hops: min_hops.min(max_hops.max(1)),
@@ -10193,9 +10096,7 @@ async fn launch_chain_runtime(
         .unwrap_or(auto_max_edges_hot)
         .max(1);
     let topk_per_token = universe_cfg.topk_per_token.unwrap_or(3).max(1);
-    let raw_dynamic_top_tokens_30d = std::env::var("DYNAMIC_TOP_TOKENS_30D")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
+    let raw_dynamic_top_tokens_30d = crate::util::env_parse_opt::<usize>("DYNAMIC_TOP_TOKENS_30D")
         .or(universe_cfg.dynamic_top_tokens_30d)
         .unwrap_or(200);
     let dynamic_top_tokens_30d = sanitize_dynamic_top_tokens_30d(raw_dynamic_top_tokens_30d);
@@ -10216,17 +10117,11 @@ async fn launch_chain_runtime(
         disable_on_quote_failure: jit_disable_on_quote_failure,
     });
 
-    let cb_hourly_loss_limit = std::env::var("CB_HOURLY_LOSS_LIMIT_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let cb_hourly_loss_limit = crate::util::env_u256_opt("CB_HOURLY_LOSS_LIMIT_WEI")
         .unwrap_or_else(U256::zero);
-    let cb_daily_loss_limit = std::env::var("CB_DAILY_LOSS_LIMIT_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let cb_daily_loss_limit = crate::util::env_u256_opt("CB_DAILY_LOSS_LIMIT_WEI")
         .unwrap_or_else(U256::zero);
-    let cb_max_consecutive_failures = std::env::var("CB_MAX_CONSECUTIVE_FAILURES")
-        .ok()
-        .and_then(|raw| raw.parse::<u32>().ok())
+    let cb_max_consecutive_failures = crate::util::env_parse_opt::<u32>("CB_MAX_CONSECUTIVE_FAILURES")
         .unwrap_or(3);
 
     let rpc_backoff_max_secs: u64 = std::env::var("RPC_MAX_BACKOFF_SECS")
@@ -10247,9 +10142,7 @@ async fn launch_chain_runtime(
         health_settings.ema_alpha,
         health_settings.thresholds,
     )));
-    let chaos_disable_ws = std::env::var("CHAOS_DISABLE_WS")
-        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    let chaos_disable_ws = read_feature_flag("CHAOS_DISABLE_WS", false);
     let rpc_endpoints = cfg.rpc_endpoints();
     let http_endpoints: Vec<String> = rpc_endpoints
         .iter()
@@ -10400,14 +10293,10 @@ async fn launch_chain_runtime(
         .transpose()?
         .unwrap_or_default();
 
-    let filler_priority_fee = std::env::var("FILLER_PRIORITY_FEE_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let filler_priority_fee = crate::util::env_u256_opt("FILLER_PRIORITY_FEE_WEI")
         .or_else(|| Some(U256::from(2_000_000_000u64)));
 
-    let searcher_priority_fee = std::env::var("SEARCHER_PRIORITY_FEE_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok());
+    let searcher_priority_fee = crate::util::env_u256_opt("SEARCHER_PRIORITY_FEE_WEI");
 
     let public_jitter_bps = public_jitter_override
         .or_else(|| resolve_public_jitter_bps(&cfg.env_prefix))
@@ -10444,18 +10333,14 @@ async fn launch_chain_runtime(
         filler_priority_fee,
         searcher_priority_fee,
         public_jitter_bps,
-        private_inclusion_timeout: std::env::var("PRIVATE_RELAY_TIMEOUT_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
+        private_inclusion_timeout: crate::util::env_parse_opt::<u64>("PRIVATE_RELAY_TIMEOUT_MS")
             .map(Duration::from_millis)
             .unwrap_or_else(|| Duration::from_millis(4500)),
         relay_health: relay_health.clone(),
         bid_profit_fraction_bps,
     };
 
-    let shadow_enabled = std::env::var("SHADOW_MODE")
-        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    let shadow_enabled = read_feature_flag("SHADOW_MODE", false);
     let shadow_log_path = std::env::var("SHADOW_LOG_PATH").ok().map(PathBuf::from);
     let shadow_tag = std::env::var("SHADOW_TAG").ok();
     let shadow = if shadow_enabled {
@@ -10468,17 +10353,11 @@ async fn launch_chain_runtime(
         ShadowConfig::disabled()
     };
 
-    let chaos_relay_reject_bps = std::env::var("CHAOS_RELAY_REJECT_BPS")
-        .ok()
-        .and_then(|raw| raw.parse::<u32>().ok())
+    let chaos_relay_reject_bps = crate::util::env_parse_opt::<u32>("CHAOS_RELAY_REJECT_BPS")
         .unwrap_or(0);
-    let chaos_public_reject_bps = std::env::var("CHAOS_PUBLIC_REJECT_BPS")
-        .ok()
-        .and_then(|raw| raw.parse::<u32>().ok())
+    let chaos_public_reject_bps = crate::util::env_parse_opt::<u32>("CHAOS_PUBLIC_REJECT_BPS")
         .unwrap_or(0);
-    let chaos_broadcast_delay_ms = std::env::var("CHAOS_BROADCAST_DELAY_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
+    let chaos_broadcast_delay_ms = crate::util::env_parse_opt::<u64>("CHAOS_BROADCAST_DELAY_MS")
         .unwrap_or(0);
     let chaos = ChaosConfig {
         relay_reject_bps: chaos_relay_reject_bps,
@@ -10519,17 +10398,11 @@ async fn launch_chain_runtime(
     };
 
     let backrun_monitor = if backrun_enabled {
-        let min_amount = std::env::var("BACKRUN_MIN_AMOUNT_WEI")
-            .ok()
-            .and_then(|raw| U256::from_dec_str(&raw).ok())
+        let min_amount = crate::util::env_u256_opt("BACKRUN_MIN_AMOUNT_WEI")
             .unwrap_or(base_amount_wei);
-        let min_price_impact_bps = std::env::var("BACKRUN_MIN_PRICE_IMPACT_BPS")
-            .ok()
-            .and_then(|raw| raw.parse::<u32>().ok())
+        let min_price_impact_bps = crate::util::env_parse_opt::<u32>("BACKRUN_MIN_PRICE_IMPACT_BPS")
             .unwrap_or(75);
-        let poll_interval = std::env::var("BACKRUN_POLL_INTERVAL_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
+        let poll_interval = crate::util::env_parse_opt::<u64>("BACKRUN_POLL_INTERVAL_MS")
             .map(Duration::from_millis)
             .unwrap_or_else(|| Duration::from_millis(400));
         let monitor = Arc::new(BackrunMonitor::new(
@@ -10559,9 +10432,7 @@ async fn launch_chain_runtime(
     } else {
         sandwich_requested && feature_gate.sandwich
     };
-    let sandwich_min_profit = std::env::var("SANDWICH_MIN_PROFIT_WEI")
-        .ok()
-        .and_then(|raw| U256::from_dec_str(&raw).ok())
+    let sandwich_min_profit = crate::util::env_u256_opt("SANDWICH_MIN_PROFIT_WEI")
         .unwrap_or_else(|| U256::from(100_000_000_000_000u64));
     let sandwich_monitor = if sandwich_enabled {
         match SandwichMonitor::new(provider.clone(), &cfg.env_prefix, sandwich_min_profit) {
@@ -10591,9 +10462,7 @@ async fn launch_chain_runtime(
     };
 
     let bridge_planner = if feature_gate.bridge {
-        let bridge_max_time_secs = std::env::var("BRIDGE_MAX_TIME_SECS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
+        let bridge_max_time_secs = crate::util::env_parse_opt::<u64>("BRIDGE_MAX_TIME_SECS")
             .unwrap_or(300);
         BridgePlanner::from_env(bridge_max_time_secs)?.map(Arc::new)
     } else {
@@ -11038,13 +10907,9 @@ async fn launch_chain_runtime(
     let hot_slipstream_by_venue = Arc::new(tokio::sync::RwLock::new(hot_slipstream_by_venue));
 
     let pool_monitor = {
-        let poll_ms = std::env::var("POOL_MONITOR_POLL_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
+        let poll_ms = crate::util::env_parse_opt::<u64>("POOL_MONITOR_POLL_MS")
             .unwrap_or(1_200);
-        let stale_ms = std::env::var("POOL_MONITOR_STALE_MS")
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
+        let stale_ms = crate::util::env_parse_opt::<u64>("POOL_MONITOR_STALE_MS")
             .unwrap_or_else(|| poll_ms.saturating_mul(3));
         let pools = hot_univ2_pools.read().await.clone();
         let solidly_pools = solidly_monitored_pools(&cfg.env_prefix);
@@ -11459,9 +11324,7 @@ async fn launch_chain_runtime(
     }
     let sim_quorum = Arc::new(SimQuorum::from_endpoints(&cfg.name, &http_endpoints));
 
-    let bf_skip_on_stable_graph = std::env::var("ARBOT_BF_SKIP_ON_STABLE_GRAPH")
-        .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    let bf_skip_on_stable_graph = read_feature_flag("ARBOT_BF_SKIP_ON_STABLE_GRAPH", false);
     info!(
         chain = %cfg.name,
         bf_skip_enabled = bf_skip_on_stable_graph,
