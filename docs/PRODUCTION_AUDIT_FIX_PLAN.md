@@ -17,6 +17,34 @@ mainnet. Base is the only production-wired chain today. Target: **$25k net/month
 
 ---
 
+## Implementation status
+
+Done (each its own commit; full suite green after each):
+- **P0-1** JIT_LP_ENABLED flag parsing — `d68bcc3`
+- **P0-2** unified block-out-of-range classifier — `58cd2ae`
+- **P1-1** release profile + toolchain pin — `d9bbbba`
+- **P1-2** concurrent load_token_decimals — `d66e58c`
+- **P1-3** websocket-fed block head (+ `4332976` liveness guard from adversarial review) — `e102974`
+- **P1-4** static chain_id + scan block number into sim — `bfd9494`
+- **P1-5** grid retry-at-Latest — folded into **P2-2a** `4ebcb6e`
+- **P2-1** config-loader + parse-helper dedup — `dc7cbde`
+- **P2-2a/b** shared quote cores (CL + constant-product) — `4ebcb6e`, `fbb777c`
+- **P2-3** graph cycle-economics dedup — `b5985c6`
+- **P2-4** deleted dead k_best_cycles — `5f8a23f`
+- **P2-8 (partial)** removed warning noise + superseded Fjord L1 model — `851e782`
+
+Remaining:
+- **P2-8 (rest)** ~20 build warnings are half-wired feature scaffolding (backrun
+  post-state helpers, cl_sim parity checker, mempool/pending-tx entry points, revm
+  builder/test helpers, IndexedCycle::from_nodes, PopulateResult mode/digest fields).
+  Delete-vs-keep is a product decision — pending direction.
+- **P2-6** typed `Config` (remove 130+ scattered env reads) — large, not started.
+- **P2-7** split the 13k-line `main.rs` — large, not started.
+- **P3** items (junk-file purge, chain-config trim, token-universe trim, profit-funnel
+  metrics) — not started.
+
+---
+
 ## P0 — Correctness & safety (money-losing or unsafe; fix before any funded run)
 
 ### P0-1 — `JIT_LP_ENABLED` flag uses a stricter parser than every other flag
