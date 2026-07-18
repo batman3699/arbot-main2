@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use ethers::{prelude::*, providers::JsonRpcClient};
 use std::sync::Arc;
 
-use crate::math::mul_div;
+use crate::quote_common::{apply_swap_fee, constant_product_out, constant_product_price_impact_bps};
 
 abigen!(
     IUniswapV2Pair,
@@ -95,35 +95,12 @@ pub fn quote_exact_input_from_state(
         return Ok(None);
     }
 
-    let fee_den = U256::from(10_000u64);
-    let fee_num = U256::from(10_000u64.saturating_sub(fee_bps as u64));
-    if fee_num.is_zero() {
-        return Err(anyhow!("fee basis points must be less than 10_000"));
-    }
-
-    let amount_in_with_fee = amount_in * fee_num / fee_den;
-    if amount_in_with_fee.is_zero() {
-        return Ok(None);
-    }
-
-    let numerator = amount_in_with_fee * reserve_out;
-    let denominator = reserve_in + amount_in_with_fee;
-    if denominator.is_zero() {
-        return Ok(None);
-    }
-
-    let amount_out = numerator / denominator;
-    if amount_out.is_zero() {
-        return Ok(None);
-    }
-
-    let price_impact_denom = reserve_in.saturating_add(amount_in);
-    let price_impact_bps_u256 = if price_impact_denom.is_zero() {
-        U256::zero()
-    } else {
-        mul_div(amount_in, U256::from(10_000u64), price_impact_denom)
+    let amount_in_with_fee = apply_swap_fee(amount_in, fee_bps)?;
+    let amount_out = match constant_product_out(amount_in_with_fee, reserve_in, reserve_out) {
+        Some(amount_out) => amount_out,
+        None => return Ok(None),
     };
-    let price_impact_bps = u32::try_from(price_impact_bps_u256.as_u64()).unwrap_or(u32::MAX);
+    let price_impact_bps = constant_product_price_impact_bps(amount_in, reserve_in);
 
     Ok(Some(UniV2Quote {
         amount_out,
