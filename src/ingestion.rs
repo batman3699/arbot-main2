@@ -364,6 +364,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 pub async fn spawn_pending_tx_monitor<C>(
     http_provider: Arc<Provider<C>>,
     initial_ws_provider: Option<Arc<Provider<Ws>>>,

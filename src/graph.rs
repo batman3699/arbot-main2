@@ -702,6 +702,7 @@ pub struct IndexedCycle {
 }
 
 impl IndexedCycle {
+    #[allow(dead_code)]
     pub fn from_nodes(cycle: Vec<usize>) -> Self {
         Self {
             cycle,

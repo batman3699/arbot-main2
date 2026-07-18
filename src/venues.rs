@@ -931,7 +931,7 @@ where
 {
     json5::from_str(raw).with_context(|| {
         format!(
-            "failed to parse {} as JSON/JSON5. Ensure pool addresses, token addresses, and selectors are quoted strings (e.g. \"0xabc...\").",
+            "failed to parse {} as JSON/JSON5. Ensure addresses and hex fields are quoted strings (e.g. \"0xabc...\").",
             source
         )
     })
@@ -3659,7 +3659,10 @@ fn gas_price_moved_bps(previous: U256, current: U256, threshold_bps: u32) -> boo
 
 pub struct PopulateResult {
     pub edges: Vec<Edge>,
+    // Diagnostics returned by populate_edges but not yet consumed by callers.
+    #[allow(dead_code)]
     pub mode: PopulateMode,
+    #[allow(dead_code)]
     pub digest: EdgeDigest,
 }
 

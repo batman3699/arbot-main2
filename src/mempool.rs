@@ -73,6 +73,7 @@ impl BackrunMonitor {
         }
     }
 
+    #[allow(dead_code)]
     pub fn decoded_swap_count(&self) -> u64 {
         self.decoded_total
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -240,6 +241,7 @@ impl BackrunMonitor {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn run<C>(self: Arc<Self>, provider: Arc<Provider<C>>, interval: Duration)
     where
         C: JsonRpcClient + Clone + Send + Sync + 'static,

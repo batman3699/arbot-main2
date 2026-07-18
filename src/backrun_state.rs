@@ -8,6 +8,9 @@ use tracing::debug;
 use crate::cl_sim::{quote_exact_input_single_tick, ClPoolState};
 use crate::graph::{Graph, IndexedCycle};
 
+// Retained scaffolding for the in-progress backrun post-state simulation
+// feature; some fields/helpers below are not wired into the scan path yet.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct BackrunHint {
     pub from: Address,
@@ -17,6 +20,7 @@ pub struct BackrunHint {
     pub source: String,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct PostSwapPoolState {
     pub pool: Address,
@@ -33,6 +37,7 @@ pub fn backrun_post_state_enabled() -> bool {
 }
 
 /// Apply a simplified reserve update for V2-style pools after a victim swap.
+#[allow(dead_code)]
 pub fn advance_v2_reserves(
     reserve_in: U256,
     reserve_out: U256,
@@ -49,6 +54,7 @@ pub fn advance_v2_reserves(
 }
 
 /// Advance CL pool spot state after a victim exact-input swap (single-tick band).
+#[allow(dead_code)]
 pub fn advance_cl_state(
     state: &ClPoolState,
     amount_in: U256,
@@ -81,6 +87,7 @@ pub fn advance_cl_state(
     })
 }
 
+#[allow(dead_code)]
 pub fn post_state_from_hint(hint: &BackrunHint) -> PostSwapPoolState {
     PostSwapPoolState {
         pool: Address::zero(),
@@ -91,6 +98,7 @@ pub fn post_state_from_hint(hint: &BackrunHint) -> PostSwapPoolState {
     }
 }
 
+#[allow(dead_code)]
 pub fn touched_pools_from_hints(hints: &[BackrunHint]) -> HashSet<Address> {
     let mut touched = HashSet::new();
     for hint in hints {

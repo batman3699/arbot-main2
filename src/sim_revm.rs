@@ -52,11 +52,13 @@ pub struct SimForkRequest {
 }
 
 impl SimForkRequest {
+    #[allow(dead_code)]
     pub fn prefetch_addresses(mut self, addrs: impl IntoIterator<Item = EthAddress>) -> Self {
         self.prefetch_addresses.extend(addrs);
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_metrics(mut self, metrics: Option<Arc<crate::metrics::Metrics>>) -> Self {
         self.metrics = metrics;
         self
@@ -72,6 +74,7 @@ pub struct RevmSimResult {
     pub l1_fee_wei: EthU256,
     /// L2 execution fee = gas_used * effective gas price (wei).
     pub l2_gas_cost_wei: EthU256,
+    #[allow(dead_code)]
     pub revert_reason: Option<String>,
 }
 
@@ -88,6 +91,7 @@ pub fn sim_revm_enabled() -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 pub fn sim_revm_live_tests_enabled() -> bool {
     std::env::var("ARBOT_SIM_REVM_LIVE")
         .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -141,6 +145,7 @@ pub fn record_revm_metrics(metrics: &crate::metrics::Metrics, outcome: RevmSimOu
 }
 
 /// Backward-compatible metric helper.
+#[allow(dead_code)]
 pub fn record_revm_metric(metrics: &crate::metrics::Metrics, success: bool) {
     if success {
         record_revm_metrics(metrics, RevmSimOutcome::Success);
@@ -229,6 +234,7 @@ pub async fn simulate_via_revm(request: SimForkRequest) -> Result<RevmSimResult>
 }
 
 /// Convenience wrapper used by legacy call sites.
+#[allow(dead_code)]
 pub async fn simulate_typed_tx_revm(
     rpc_url: &str,
     tx: &TypedTransaction,

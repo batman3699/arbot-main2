@@ -25,7 +25,11 @@ abigen!(
 pub struct ClPoolState {
     pub sqrt_price_x96: U256,
     pub liquidity: u128,
+    // Populated from chain but not yet consumed (single-tick sim doesn't cross
+    // ticks); retained for the planned multi-tick simulation.
+    #[allow(dead_code)]
     pub tick: i32,
+    #[allow(dead_code)]
     pub tick_spacing: i32,
     /// Swap fee in hundredths of a bip (UniV3 fee tier or on-chain fee()).
     pub fee_ppm: u32,
@@ -37,6 +41,7 @@ pub fn local_cl_quotes_enabled() -> bool {
         .unwrap_or(true)
 }
 
+#[allow(dead_code)]
 pub fn cl_quote_parity_enabled() -> bool {
     std::env::var("ARBOT_CL_QUOTE_PARITY")
         .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -171,6 +176,7 @@ pub fn quote_exact_input_single_tick(
     Ok(Some(amount_out))
 }
 
+#[allow(dead_code)]
 pub fn validate_pool(_pool: Address, state: &ClPoolState) -> Result<()> {
     if state.sqrt_price_x96.is_zero() {
         return Err(anyhow!("CL pool sqrt_price_x96 is zero"));
@@ -179,6 +185,7 @@ pub fn validate_pool(_pool: Address, state: &ClPoolState) -> Result<()> {
 }
 
 /// Compare local single-tick quotes against quoter for parity logging (live pools).
+#[allow(dead_code)]
 pub async fn log_cl_quote_parity<C>(
     provider: Arc<Provider<C>>,
     quoter: &crate::quote_univ3::UniQuoter<C>,
