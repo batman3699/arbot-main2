@@ -31,14 +31,17 @@ Done (each its own commit; full suite green after each):
 - **P2-2a/b** shared quote cores (CL + constant-product) — `4ebcb6e`, `fbb777c`
 - **P2-3** graph cycle-economics dedup — `b5985c6`
 - **P2-4** deleted dead k_best_cycles — `5f8a23f`
-- **P2-8 (partial)** removed warning noise + superseded Fjord L1 model — `851e782`
+- **P2-8** build is now warning-free: superseded Fjord L1 model + import/lint noise
+  removed (`851e782`), remaining scaffolding kept and `#[allow(dead_code)]`-annotated
+  per product direction (`b7dddb5`)
+- **P2-6 (hot-path slice)** per-block env tunables cached via OnceLock so the scan
+  path no longer reads `std::env` each block — `0bae681`
 
 Remaining:
-- **P2-8 (rest)** ~20 build warnings are half-wired feature scaffolding (backrun
-  post-state helpers, cl_sim parity checker, mempool/pending-tx entry points, revm
-  builder/test helpers, IndexedCycle::from_nodes, PopulateResult mode/digest fields).
-  Delete-vs-keep is a product decision — pending direction.
-- **P2-6** typed `Config` (remove 130+ scattered env reads) — large, not started.
+- **P2-6 (rest)** a typed `Config` struct for the ~130 startup env reads in
+  `launch_chain_runtime` (readability/validation, not perf — these are already
+  effectively read-once at startup), and a per-prefix-keyed cache for
+  `classify_provider_for_chain` (the one param-dependent per-block reader left). Large.
 - **P2-7** split the 13k-line `main.rs` — large, not started.
 - **P3** items (junk-file purge, chain-config trim, token-universe trim, profit-funnel
   metrics) — not started.
