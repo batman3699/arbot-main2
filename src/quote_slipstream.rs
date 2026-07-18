@@ -1,15 +1,10 @@
-use crate::quote_common::is_block_out_of_range_error;
+use crate::quote_cl::{cl_quote_path, cl_quote_path_grid, ClQuoteCache};
 use crate::quote_univ3::UniV3ValidationConfig;
 use crate::util::encode_univ3_path;
 use anyhow::{ensure, Result};
-use ethers::abi::{ParamType, Token};
 use ethers::prelude::*;
 use ethers::providers::JsonRpcClient;
-use ethers::types::transaction::eip2718::TypedTransaction;
-use lru::LruCache;
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroUsize;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
@@ -39,9 +34,7 @@ abigen!(
     ]"#,
 );
 
-const SLIPSTREAM_QUOTE_CACHE_TTL: Duration = Duration::from_secs(30);
 const SLIPSTREAM_POOL_CACHE_TTL: Duration = Duration::from_secs(300);
-const SLIPSTREAM_QUOTE_CACHE_SIZE: usize = 2048;
 
 pub struct SlipstreamQuoter<C>
 where
@@ -50,16 +43,9 @@ where
     pub quoter: ISlipstreamQuoterV2<Provider<C>>,
     factory: ISlipstreamClFactory<Provider<C>>,
     provider: Arc<Provider<C>>,
-    cache: Mutex<LruCache<SlipstreamCacheKey, CachedQuote>>,
+    cache: ClQuoteCache,
     pool_cache: Mutex<HashMap<SlipstreamPoolKey, CachedPoolAddress>>,
     zero_liquidity_logged: Mutex<HashSet<SlipstreamPoolKey>>,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct SlipstreamCacheKey {
-    path: Bytes,
-    amount_in: U256,
-    block: U64,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -67,11 +53,6 @@ struct SlipstreamPoolKey {
     token0: Address,
     token1: Address,
     tick_spacing: u32,
-}
-
-struct CachedQuote {
-    inserted: Instant,
-    value: U256,
 }
 
 #[derive(Clone, Copy)]
@@ -89,9 +70,7 @@ where
             quoter: ISlipstreamQuoterV2::new(quoter, Arc::clone(&provider)),
             factory: ISlipstreamClFactory::new(factory, Arc::clone(&provider)),
             provider,
-            cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(SLIPSTREAM_QUOTE_CACHE_SIZE).unwrap_or(NonZeroUsize::MIN),
-            )),
+            cache: ClQuoteCache::new(),
             pool_cache: Mutex::new(HashMap::new()),
             zero_liquidity_logged: Mutex::new(HashSet::new()),
         }
@@ -103,132 +82,26 @@ where
         amount_in: U256,
         block: U64,
     ) -> Result<U256> {
-        let path_bytes = Bytes::from(encode_univ3_path(&path)?);
-        let cache_key = SlipstreamCacheKey {
-            path: path_bytes.clone(),
+        cl_quote_path(
+            &self.provider,
+            self.quoter.address(),
+            &self.cache,
+            path,
             amount_in,
             block,
-        };
-
-        let block_id = if block.is_zero() {
-            BlockId::Number(BlockNumber::Latest)
-        } else {
-            BlockId::Number(BlockNumber::Number(block))
-        };
-
-        {
-            let mut cache = self.cache.lock().await;
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.inserted.elapsed() <= SLIPSTREAM_QUOTE_CACHE_TTL {
-                    return Ok(cached.value);
-                }
-                cache.pop(&cache_key);
-            }
-        }
-
-        let raw = match self
-            .quoter
-            .quote_exact_input(path_bytes.clone(), amount_in)
-            .call_raw_bytes()
-            .block(block_id)
-            .await
-        {
-            Ok(value) => value,
-            Err(err) if !block.is_zero() && is_block_out_of_range_error(&err) => {
-                self.quoter
-                    .quote_exact_input(path_bytes.clone(), amount_in)
-                    .call_raw_bytes()
-                    .await?
-            }
-            Err(err) => return Err(err.into()),
-        };
-        let raw_bytes = raw.as_ref();
-        ensure!(
-            raw_bytes.len() >= 32,
-            "slipstream quoter returned insufficient data: expected at least 32 bytes got {}",
-            raw_bytes.len()
-        );
-        let out = U256::from_big_endian(&raw_bytes[..32]);
-
-        let mut cache = self.cache.lock().await;
-        cache.put(
-            cache_key,
-            CachedQuote {
-                inserted: Instant::now(),
-                value: out,
-            },
-        );
-        Ok(out)
+            "slipstream quoter",
+        )
+        .await
     }
 
+    /// See [`crate::quote_cl::cl_quote_path_grid`].
     pub async fn quote_path_grid(
         &self,
         path: Vec<(Address, Option<u32>)>,
         amounts: &[U256],
         block: U64,
     ) -> Result<Vec<Option<U256>>> {
-        if amounts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let path_bytes = Bytes::from(encode_univ3_path(&path)?);
-        let quoter_addr = self.quoter.address();
-        let multicall3 = Address::from_str("0xcA11bde05977b3631167028862bE2a173976CA11")
-            .map_err(|err| anyhow::anyhow!("invalid multicall3 address: {err}"))?;
-
-        let mut call_tokens = Vec::with_capacity(amounts.len());
-        for &amount in amounts {
-            let inner = self
-                .quoter
-                .quote_exact_input(path_bytes.clone(), amount)
-                .calldata()
-                .ok_or_else(|| anyhow::anyhow!("failed to encode quoteExactInput calldata"))?;
-            call_tokens.push(Token::Tuple(vec![
-                Token::Address(quoter_addr),
-                Token::Bool(true),
-                Token::Bytes(inner.to_vec()),
-            ]));
-        }
-        let mut data = vec![0x82u8, 0xad, 0x56, 0xcb];
-        data.extend(ethers::abi::encode(&[Token::Array(call_tokens)]));
-
-        let block_id = if block.is_zero() {
-            BlockId::Number(BlockNumber::Latest)
-        } else {
-            BlockId::Number(BlockNumber::Number(block))
-        };
-        let tx: TypedTransaction = TransactionRequest::new()
-            .to(multicall3)
-            .data(Bytes::from(data))
-            .into();
-        let raw = self.provider.call(&tx, Some(block_id)).await?;
-
-        let decoded = ethers::abi::decode(
-            &[ParamType::Array(Box::new(ParamType::Tuple(vec![
-                ParamType::Bool,
-                ParamType::Bytes,
-            ])))],
-            raw.as_ref(),
-        )?;
-
-        let mut out = vec![None; amounts.len()];
-        if let Some(Token::Array(results)) = decoded.into_iter().next() {
-            for (i, result) in results.into_iter().enumerate() {
-                if i >= out.len() {
-                    break;
-                }
-                if let Token::Tuple(fields) = result {
-                    let success = matches!(fields.first(), Some(Token::Bool(true)));
-                    if success {
-                        if let Some(Token::Bytes(return_data)) = fields.get(1) {
-                            if return_data.len() >= 32 {
-                                out[i] = Some(U256::from_big_endian(&return_data[..32]));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(out)
+        cl_quote_path_grid(&self.provider, self.quoter.address(), path, amounts, block).await
     }
 
     pub async fn pool_address(

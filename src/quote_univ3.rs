@@ -1,20 +1,14 @@
+use crate::quote_cl::{cl_quote_path, cl_quote_path_grid, ClQuoteCache};
 use crate::util::encode_univ3_path;
 use anyhow::{ensure, Result};
 use ethers::{prelude::*, providers::JsonRpcClient};
-use lru::LruCache;
 use std::{
     collections::{HashMap, HashSet},
-    num::NonZeroUsize,
     sync::Arc,
 };
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 use tracing::warn;
-use ethers::abi::{ParamType, Token};
-use ethers::types::transaction::eip2718::TypedTransaction;
-use std::str::FromStr;
-
-pub(crate) use crate::quote_common::is_block_out_of_range_error;
 
 #[derive(Clone, Debug)]
 pub struct UniV3ValidationConfig {
@@ -53,9 +47,7 @@ pub fn is_supported_univ3_fee(fee: u32) -> bool {
     FEE_TIERS.contains(&fee)
 }
 
-const UNIV3_QUOTE_CACHE_TTL: Duration = Duration::from_secs(30);
 const UNIV3_POOL_CACHE_TTL: Duration = Duration::from_secs(300);
-const UNIV3_QUOTE_CACHE_SIZE: usize = 2048;
 
 pub struct UniQuoter<C>
 where
@@ -64,16 +56,9 @@ where
     pub quoter: IQuoterV2<Provider<C>>,
     factory: IUniswapV3Factory<Provider<C>>,
     provider: Arc<Provider<C>>,
-    cache: Mutex<LruCache<UniV3CacheKey, CachedQuote>>,
+    cache: ClQuoteCache,
     pool_cache: Mutex<HashMap<UniV3PoolKey, CachedPoolAddress>>,
     zero_liquidity_logged: Mutex<HashSet<UniV3PoolKey>>,
-}
-
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct UniV3CacheKey {
-    path: Bytes,
-    amount_in: U256,
-    block: U64,
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -81,11 +66,6 @@ struct UniV3PoolKey {
     token0: Address,
     token1: Address,
     fee: u32,
-}
-
-struct CachedQuote {
-    inserted: Instant,
-    value: U256,
 }
 
 #[derive(Clone, Copy)]
@@ -103,9 +83,7 @@ where
             quoter: IQuoterV2::new(quoter, Arc::clone(&provider)),
             factory: IUniswapV3Factory::new(factory, Arc::clone(&provider)),
             provider,
-            cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(UNIV3_QUOTE_CACHE_SIZE).unwrap_or(NonZeroUsize::MIN),
-            )),
+            cache: ClQuoteCache::new(),
             pool_cache: Mutex::new(HashMap::new()),
             zero_liquidity_logged: Mutex::new(HashSet::new()),
         }
@@ -117,139 +95,28 @@ where
         amount_in: U256,
         block: U64,
     ) -> Result<U256> {
-        let path_bytes = Bytes::from(encode_univ3_path(&path)?);
-        let cache_key = UniV3CacheKey {
-            path: path_bytes.clone(),
+        cl_quote_path(
+            &self.provider,
+            self.quoter.address(),
+            &self.cache,
+            path,
             amount_in,
             block,
-        };
-
-        let block_id = if block.is_zero() {
-            BlockId::Number(BlockNumber::Latest)
-        } else {
-            BlockId::Number(BlockNumber::Number(block))
-        };
-
-        {
-            let mut cache = self.cache.lock().await;
-            if let Some(cached) = cache.get(&cache_key) {
-                if cached.inserted.elapsed() <= UNIV3_QUOTE_CACHE_TTL {
-                    return Ok(cached.value);
-                }
-                cache.pop(&cache_key);
-            }
-        }
-
-        let raw = match self
-            .quoter
-            .quote_exact_input(path_bytes.clone(), amount_in)
-            .call_raw_bytes()
-            .block(block_id)
-            .await
-        {
-            Ok(value) => value,
-            Err(err) if !block.is_zero() && is_block_out_of_range_error(&err) => {
-                self.quoter
-                    .quote_exact_input(path_bytes.clone(), amount_in)
-                    .call_raw_bytes()
-                    .await?
-            }
-            Err(err) => return Err(err.into()),
-        };
-        let raw_bytes = raw.as_ref();
-        ensure!(
-            raw_bytes.len() >= 32,
-            "quoter returned insufficient data: expected at least 32 bytes got {}",
-            raw_bytes.len()
-        );
-        let out = U256::from_big_endian(&raw_bytes[..32]);
-
-        let mut cache = self.cache.lock().await;
-        cache.put(
-            cache_key,
-            CachedQuote {
-                inserted: Instant::now(),
-                value: out,
-            },
-        );
-        Ok(out)
+            "quoter",
+        )
+        .await
     }
 
     /// Quote a fixed set of input amounts for ONE path in a SINGLE eth_call by
-    /// batching `quoteExactInput` through Multicall3.aggregate3. Returns one
-    /// optional `amountOut` per input amount (None when that sub-call failed or
-    /// returned empty). This collapses N sequential quote round-trips into one
-    /// RTT — the dominant scan-latency cost is per-quote network RTT, so this is
-    /// the decisive latency lever.
+    /// batching `quoteExactInput` through Multicall3.aggregate3. See
+    /// [`crate::quote_cl::cl_quote_path_grid`].
     pub async fn quote_path_grid(
         &self,
         path: Vec<(Address, Option<u32>)>,
         amounts: &[U256],
         block: U64,
     ) -> Result<Vec<Option<U256>>> {
-        if amounts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let path_bytes = Bytes::from(encode_univ3_path(&path)?);
-        let quoter_addr = self.quoter.address();
-        let multicall3 = Address::from_str("0xcA11bde05977b3631167028862bE2a173976CA11")
-            .map_err(|err| anyhow::anyhow!("invalid multicall3 address: {err}"))?;
-
-        let mut call_tokens = Vec::with_capacity(amounts.len());
-        for &amount in amounts {
-            let inner = self
-                .quoter
-                .quote_exact_input(path_bytes.clone(), amount)
-                .calldata()
-                .ok_or_else(|| anyhow::anyhow!("failed to encode quoteExactInput calldata"))?;
-            call_tokens.push(Token::Tuple(vec![
-                Token::Address(quoter_addr),
-                Token::Bool(true), // allowFailure: a bad size must not fail the batch
-                Token::Bytes(inner.to_vec()),
-            ]));
-        }
-        // aggregate3((address,bool,bytes)[]) selector = 0x82ad56cb
-        let mut data = vec![0x82u8, 0xad, 0x56, 0xcb];
-        data.extend(ethers::abi::encode(&[Token::Array(call_tokens)]));
-
-        let block_id = if block.is_zero() {
-            BlockId::Number(BlockNumber::Latest)
-        } else {
-            BlockId::Number(BlockNumber::Number(block))
-        };
-        let tx: TypedTransaction = TransactionRequest::new()
-            .to(multicall3)
-            .data(Bytes::from(data))
-            .into();
-        let raw = self.provider.call(&tx, Some(block_id)).await?;
-
-        let decoded = ethers::abi::decode(
-            &[ParamType::Array(Box::new(ParamType::Tuple(vec![
-                ParamType::Bool,
-                ParamType::Bytes,
-            ])))],
-            raw.as_ref(),
-        )?;
-
-        let mut out = vec![None; amounts.len()];
-        if let Some(Token::Array(results)) = decoded.into_iter().next() {
-            for (i, result) in results.into_iter().enumerate() {
-                if i >= out.len() {
-                    break;
-                }
-                if let Token::Tuple(fields) = result {
-                    let success = matches!(fields.first(), Some(Token::Bool(true)));
-                    if success {
-                        if let Some(Token::Bytes(return_data)) = fields.get(1) {
-                            if return_data.len() >= 32 {
-                                out[i] = Some(U256::from_big_endian(&return_data[..32]));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(out)
+        cl_quote_path_grid(&self.provider, self.quoter.address(), path, amounts, block).await
     }
 
     pub async fn pool_address(
@@ -381,7 +248,7 @@ pub fn default_pancakeswap_validation_base() -> UniV3ValidationConfig {
 
 #[cfg(test)]
 mod block_range_tests {
-    use super::is_block_out_of_range_error;
+    use crate::quote_common::is_block_out_of_range_error;
 
     #[test]
     fn detects_block_out_of_range_messages() {
@@ -436,7 +303,7 @@ mod tests {
             .unwrap();
         assert_eq!(cached, first);
 
-        advance(UNIV3_QUOTE_CACHE_TTL + Duration::from_secs(1)).await;
+        advance(crate::quote_cl::QUOTE_CACHE_TTL + Duration::from_secs(1)).await;
 
         mock.push::<Bytes, _>(amount_bytes(U256::from(2_000u64)))
             .unwrap();
@@ -513,6 +380,29 @@ mod tests {
 
         let refreshed = quoter.pool_address(token_a, token_b, fee).await;
         assert!(refreshed.is_err());
+    }
+
+    #[test]
+    fn shared_core_calldata_matches_abigen() {
+        // The shared CL quote core builds quoteExactInput calldata by hand
+        // instead of via the abigen contract wrapper. Pin the two together so a
+        // future ABI/selector drift is caught here rather than on-chain.
+        let provider = Arc::new(Provider::<Http>::try_from("http://localhost:8545").unwrap());
+        let quoter = IQuoterV2::new(Address::zero(), provider);
+        let path = encode_univ3_path(&[
+            (Address::repeat_byte(1), None),
+            (Address::repeat_byte(2), Some(500)),
+        ])
+        .unwrap();
+        let path_bytes = Bytes::from(path);
+        let amount = U256::from(123_456_789u64);
+
+        let abigen_calldata = quoter
+            .quote_exact_input(path_bytes.clone(), amount)
+            .calldata()
+            .expect("abigen calldata");
+        let core_calldata = crate::quote_cl::quote_exact_input_calldata(&path_bytes, amount);
+        assert_eq!(abigen_calldata, core_calldata);
     }
 
     #[test]
