@@ -4814,18 +4814,24 @@ where
 
     /// Current canonical head as `(base_fee, number)`.
     ///
-    /// Prefers the websocket-fed head from `block_head_rx`, which already
-    /// carries the block number and its base fee — this removes a synchronous
-    /// `get_block(Latest)` HTTP round-trip from the front of every scan (the
-    /// most latency-sensitive point in the block race). Falls back to a single
-    /// `get_block(Latest)` when no websocket head has been delivered yet (the
-    /// channel still holds the zero default, e.g. WS disabled or not yet
-    /// connected), failing closed on a missing/zero head exactly as the direct
-    /// fetch did.
-    async fn current_block_head(&self) -> Result<(Option<U256>, U64)> {
+    /// Fast path: when the websocket-fed head in `block_head_rx` is strictly
+    /// ahead of the last block we scanned, trust it directly — it already
+    /// carries the block number and base fee, removing a synchronous
+    /// `get_block(Latest)` HTTP round-trip from the most latency-sensitive point
+    /// of the block race (the instant a new head lands and we sprint to submit).
+    ///
+    /// Liveness guard: if the websocket head is NOT ahead of `last_scanned`
+    /// (channel still at the zero default, WS disabled, or — critically — the
+    /// feed has gone zombie/laggy and frozen at an old head), fall back to an
+    /// authoritative `get_block(Latest)`. This preserves the pre-websocket
+    /// behaviour of reading the true tip every idle turn, so a silently stalled
+    /// newHeads subscription can never freeze the head and make the bot stop
+    /// trading. Fails closed on a missing/zero head exactly as the direct fetch
+    /// did.
+    async fn current_block_head(&self, last_scanned: Option<U64>) -> Result<(Option<U256>, U64)> {
         if let Some(rx) = &self.block_head_rx {
             let head = *rx.lock().await.borrow();
-            if !head.number.is_zero() {
+            if !head.number.is_zero() && last_scanned.map_or(true, |ls| head.number > ls) {
                 return Ok((head.base_fee_per_gas, head.number));
             }
         }
@@ -4921,18 +4927,22 @@ where
                 .unwrap_or(4_000),
         );
         let block_wait_start = Instant::now();
+        // The last block this runner scanned is stable for the duration of this
+        // call (only written after the loop), so read it once. It drives both
+        // the "already scanned" cadence gate and the websocket-head freshness
+        // guard in current_block_head (a head at/behind this is treated as
+        // stale and forces an authoritative get_block(Latest)).
+        let last_scanned = { *self.last_scanned_block.lock().await };
         let (base_fee, block_number) = loop {
-            // Prefer the websocket-fed head (number + base fee) instead of a
-            // fresh get_block(Latest) on every loop turn; fail closed on a
+            // Prefer the websocket-fed head (number + base fee) when it is ahead
+            // of the last scanned block; otherwise fall back to get_block(Latest)
+            // so a frozen/laggy feed can never stall trading. Fail closed on a
             // missing/zero head. See current_block_head.
-            let fetched = self.current_block_head().await?;
+            let fetched = self.current_block_head(last_scanned).await?;
             if rescan_same_block {
                 break fetched;
             }
-            let already_scanned = {
-                let guard = self.last_scanned_block.lock().await;
-                *guard == Some(fetched.1)
-            };
+            let already_scanned = last_scanned == Some(fetched.1);
             if !already_scanned {
                 break fetched;
             }
