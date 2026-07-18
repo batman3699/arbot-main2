@@ -448,10 +448,14 @@ impl Graph {
         self.edges.get(idx)
     }
 
-    pub fn edge_between(&self, from: Address, to: Address) -> Option<&Edge> {
-        let mut best: Option<&Edge> = None;
+    /// Index of the best active edge from `from` to `to` (by `is_better`:
+    /// lowest weight, then higher max_input, then better rate). Single source of
+    /// truth for per-hop edge selection — `edge_between` and the cycle
+    /// weight/profit helpers all resolve through this so their tie-breaking
+    /// cannot diverge.
+    fn best_edge_index(&self, from: Address, to: Address) -> Option<usize> {
         let indices = self.edge_lookup.get(&(from, to))?;
-
+        let mut best: Option<usize> = None;
         for &idx in indices {
             let Some(edge) = self.edges.get(idx) else {
                 continue;
@@ -460,16 +464,34 @@ impl Graph {
                 continue;
             }
             match best {
-                None => best = Some(edge),
-                Some(current) => {
-                    if is_better(edge, current) {
-                        best = Some(edge);
+                None => best = Some(idx),
+                Some(current_idx) => {
+                    if is_better(edge, &self.edges[current_idx]) {
+                        best = Some(idx);
                     }
                 }
             }
         }
-
         best
+    }
+
+    /// Resolve a node-index cycle to the best active edge index per hop. Returns
+    /// `None` if the cycle has fewer than 2 nodes or any hop has no active edge.
+    fn best_edge_indices_for_node_path(&self, cycle: &[usize]) -> Option<Vec<usize>> {
+        if cycle.len() < 2 {
+            return None;
+        }
+        let mut edge_indices = Vec::with_capacity(cycle.len().saturating_sub(1));
+        for window in cycle.windows(2) {
+            let &from_addr = self.nodes.get(window[0])?;
+            let &to_addr = self.nodes.get(window[1])?;
+            edge_indices.push(self.best_edge_index(from_addr, to_addr)?);
+        }
+        Some(edge_indices)
+    }
+
+    pub fn edge_between(&self, from: Address, to: Address) -> Option<&Edge> {
+        self.best_edge_index(from, to).map(|idx| &self.edges[idx])
     }
 
     pub fn bellman_ford(
@@ -852,33 +874,6 @@ impl Graph {
         Some(total)
     }
 
-    fn cycle_weight_for_node_path(&self, cycle: &[usize]) -> Option<i64> {
-        if cycle.len() < 2 {
-            return None;
-        }
-        let mut edge_indices = Vec::with_capacity(cycle.len().saturating_sub(1));
-        for window in cycle.windows(2) {
-            let from_addr = self.nodes.get(window[0])?;
-            let to_addr = self.nodes.get(window[1])?;
-            let indices = self.edge_lookup.get(&(*from_addr, *to_addr))?;
-            let mut best_idx: Option<usize> = None;
-            let mut best_weight = i64::MAX;
-            for &idx in indices {
-                let Some(edge) = self.edges.get(idx) else {
-                    continue;
-                };
-                if !edge.active || edge.weight >= best_weight {
-                    continue;
-                }
-                best_weight = edge.weight;
-                best_idx = Some(idx);
-            }
-            best_idx?;
-            edge_indices.push(best_idx?);
-        }
-        self.cycle_weight_from_edge_indices(&edge_indices)
-    }
-
     fn bellman_ford_from(
         &self,
         source_idx: usize,
@@ -957,7 +952,7 @@ impl Graph {
             let weight = if edge_path.len() == hops {
                 self.cycle_weight_from_edge_indices(&edge_path)
             } else {
-                self.cycle_weight_for_node_path(&cycle)
+                self.cycle_weight(&cycle)
             };
             if let Some(weight) = weight {
                 if weight >= 0 {
@@ -1190,24 +1185,8 @@ impl Graph {
 
     #[allow(dead_code)] // consumed by the `arb-exec` binary target
     pub(crate) fn cycle_weight(&self, cycle: &[usize]) -> Option<i64> {
-        if cycle.len() < 2 {
-            return None;
-        }
-
-        let mut total: i64 = 0;
-        for window in cycle.windows(2) {
-            let from_idx = window[0];
-            let to_idx = window[1];
-            let &from_addr = self.nodes.get(from_idx)?;
-            let &to_addr = self.nodes.get(to_idx)?;
-            let edge = self.edge_between(from_addr, to_addr)?;
-            if !edge.active {
-                return None;
-            }
-            total = total.saturating_add(edge.weight);
-        }
-
-        Some(total)
+        let edge_indices = self.best_edge_indices_for_node_path(cycle)?;
+        self.cycle_weight_from_edge_indices(&edge_indices)
     }
 
     fn estimate_cycle_profit_bps_from_edges(&self, edge_indices: &[usize]) -> Option<i64> {
@@ -1238,36 +1217,12 @@ impl Graph {
         Some(scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64)
     }
 
+    /// Node-path fallback for [`Self::estimate_cycle_profit_bps_from_edges`],
+    /// used when the search did not carry explicit edge indices: resolve each
+    /// hop to its best edge, then run the identical log-rate profit math.
     fn estimate_cycle_profit_bps(&self, cycle: &[usize]) -> Option<i64> {
-        if cycle.len() < 2 {
-            return None;
-        }
-
-        let mut log_rate_sum = 0.0f64;
-        for window in cycle.windows(2) {
-            let from_idx = window[0];
-            let to_idx = window[1];
-            let &from_addr = self.nodes.get(from_idx)?;
-            let &to_addr = self.nodes.get(to_idx)?;
-            let edge = self.edge_between(from_addr, to_addr)?;
-            let protected_num = crate::util::apply_slippage(edge.rate_num, edge.tolerance_bps);
-            if protected_num.is_zero() || edge.rate_den.is_zero() {
-                return None;
-            }
-            let rate = u256_to_f64(protected_num) / u256_to_f64(edge.rate_den);
-            if rate <= 0.0 {
-                return None;
-            }
-            log_rate_sum += rate.ln();
-        }
-
-        let profit_ratio = log_rate_sum.exp() - 1.0;
-        if !profit_ratio.is_finite() {
-            return None;
-        }
-
-        let scaled = (profit_ratio * 10_000.0).round();
-        Some(scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+        let edge_indices = self.best_edge_indices_for_node_path(cycle)?;
+        self.estimate_cycle_profit_bps_from_edges(&edge_indices)
     }
 }
 
