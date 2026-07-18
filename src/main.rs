@@ -50,7 +50,6 @@ use chain::{
     load_chain_from_sources, probe_aave_pool_interface, production_mode_enabled,
     secret_looks_placeholder, validate_chain_cfg, ChainCfg,
 };
-use ethers::abi::{decode, ParamType};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::{
@@ -82,7 +81,7 @@ use tokio::{
 };
 
 use graph::{
-    canonicalize_cycle, rotate_indexed_cycle, BellmanFordLimits, CycleCandidate, Edge, Graph,
+    canonicalize_cycle, rotate_indexed_cycle, BellmanFordLimits, Edge, Graph,
     IndexedCycle, VenueEdge,
 };
 use hot_path::{HotPathCache, ProfitabilitySnapshot};
@@ -6595,7 +6594,7 @@ where
             break 'cascade;
         }
 
-        if let Some(mut candidate) = selected_candidate {
+        if let Some(candidate) = selected_candidate {
             let min_profit_target = candidate.plan_args.min_profit;
             self.log_candidate_stage(
                 "candidate_dispatch_eligible",

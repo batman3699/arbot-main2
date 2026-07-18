@@ -28,11 +28,6 @@ use std::time::{Duration, Instant};
 const SIM_FUND_WEI: u128 = 1_000_000_000_000_000_000_000; // 1000 ETH
 /// OP-Stack GasPriceOracle predeploy (Base, Optimism, etc.).
 const GAS_PRICE_ORACLE: &str = "0x420000000000000000000000000000000000000F";
-/// Fjord L1 fee regression constants (OP Stack spec).
-const FJORD_INTERCEPT: i64 = -42_585_600;
-const FJORD_FASTLZ_COEF: u64 = 836_500;
-const FJORD_MIN_TX_SIZE: u64 = 100;
-
 #[derive(Debug, Clone)]
 pub struct ForkBlockHeader {
     pub number: u64,
@@ -716,38 +711,6 @@ pub fn collect_prefetch_addresses(
     out
 }
 
-/// Fjord-era OP-Stack L1 fee from compressed tx size and oracle scalars.
-///
-/// `fastlz_size` = FastLZ-compressed unsigned RLP tx length (oracle adds +68 for sig).
-/// Formula (OP Stack Fjord spec):
-///   estimatedSizeScaled = max(100 * 1e6, intercept + fastlzCoef * (fastlz_size + 68))
-///   l1FeeScaled = baseFeeScalar * l1BaseFee * 16 + blobBaseFeeScalar * l1BlobBaseFee
-///   l1Fee = estimatedSizeScaled * l1FeeScaled / 1e12
-pub fn fjord_l1_fee_from_fastlz_size(
-    fastlz_size: u64,
-    l1_base_fee: u64,
-    base_fee_scalar: u32,
-    l1_blob_base_fee: u64,
-    blob_base_fee_scalar: u32,
-) -> U256 {
-    let size_with_sig = fastlz_size.saturating_add(68);
-    let linear = (FJORD_INTERCEPT as i128)
-        .saturating_add((FJORD_FASTLZ_COEF as i128).saturating_mul(size_with_sig as i128));
-    let min_scaled = (FJORD_MIN_TX_SIZE as i128).saturating_mul(1_000_000);
-    let estimated_size_scaled = min_scaled.max(linear).max(0) as u128;
-    let l1_fee_scaled = (base_fee_scalar as u128)
-        .saturating_mul(l1_base_fee as u128)
-        .saturating_mul(16)
-        .saturating_add(
-            (blob_base_fee_scalar as u128).saturating_mul(l1_blob_base_fee as u128),
-        );
-    let fee = estimated_size_scaled
-        .saturating_mul(l1_fee_scaled)
-        .checked_div(1_000_000_000_000)
-        .unwrap_or(0);
-    U256::from(fee)
-}
-
 fn rlp_append_bytes(stream: &mut RlpStream, data: &[u8]) {
     stream.append(&data);
 }
@@ -1296,14 +1259,6 @@ mod tests {
         std::env::set_var("ARBOT_SIM_L1_FEE", "0");
         assert!(!sim_l1_fee_enabled(8453));
         std::env::remove_var("ARBOT_SIM_L1_FEE");
-    }
-
-    #[test]
-    fn fjord_l1_fee_known_scalars() {
-        let fee = fjord_l1_fee_from_fastlz_size(200, 10_000_000_000, 5227, 1, 1_014_213);
-        assert!(fee > U256::ZERO);
-        let fee_large = fjord_l1_fee_from_fastlz_size(2_000, 10_000_000_000, 5227, 1, 1_014_213);
-        assert!(fee_large > fee);
     }
 
     #[test]
