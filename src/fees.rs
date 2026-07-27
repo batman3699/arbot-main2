@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Context, Result};
-use ethers::abi::{decode, ParamType, Token};
+use ethers::abi::{decode, ParamType};
 use ethers::providers::{JsonRpcClient, Middleware};
 use ethers::types::transaction::eip2718::TypedTransaction;
 use ethers::types::{Address, Bytes, TransactionRequest, U256};
@@ -117,14 +117,9 @@ where
     }
 
     async fn estimate_op_stack_l1_fee(&self, tx: &TypedTransaction) -> Result<U256> {
-        const GAS_PRICE_ORACLE: &str = "0x420000000000000000000000000000000000000F";
-        let oracle = Address::from_str(GAS_PRICE_ORACLE)?;
-        let selector = &keccak256("getL1Fee(bytes)")[..4];
+        let oracle = Address::from_str(crate::sim_revm::GAS_PRICE_ORACLE)?;
         let calldata = tx.data().cloned().unwrap_or_default();
-        let encoded_args = ethers::abi::encode(&[Token::Bytes(calldata.to_vec())]);
-        let mut data = Vec::with_capacity(selector.len() + encoded_args.len());
-        data.extend_from_slice(selector);
-        data.extend_from_slice(&encoded_args);
+        let data = crate::sim_revm::encode_get_l1_fee_calldata(calldata.as_ref());
         let req = TransactionRequest::new().to(oracle).data(Bytes::from(data));
         let raw_fee = self.provider.call(&req.into(), None).await?;
         let decoded = decode(&[ParamType::Uint(256)], &raw_fee)?;

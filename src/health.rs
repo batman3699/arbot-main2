@@ -100,23 +100,23 @@ impl HealthTracker {
     pub fn record_success(&mut self, endpoint: &str, latency: Option<Duration>) {
         let alpha = self.alpha;
         let entry = self.entry_mut(endpoint);
-        Self::update_float_ema(&mut entry.ema_success_rate, alpha, 1.0);
-        Self::update_float_ema(&mut entry.ema_reject_rate, alpha, 0.0);
+        crate::util::update_float_ema(&mut entry.ema_success_rate, alpha, 1.0);
+        crate::util::update_float_ema(&mut entry.ema_reject_rate, alpha, 0.0);
         if let Some(latency) = latency {
             let millis = latency.as_secs_f64() * 1_000.0;
-            Self::update_float_ema(&mut entry.ema_latency_ms, alpha, millis);
+            crate::util::update_float_ema(&mut entry.ema_latency_ms, alpha, millis);
         }
     }
 
     pub fn record_failure(&mut self, endpoint: &str, rejected: bool, latency: Option<Duration>) {
         let alpha = self.alpha;
         let entry = self.entry_mut(endpoint);
-        Self::update_float_ema(&mut entry.ema_success_rate, alpha, 0.0);
+        crate::util::update_float_ema(&mut entry.ema_success_rate, alpha, 0.0);
         let reject_value = if rejected { 1.0 } else { 0.0 };
-        Self::update_float_ema(&mut entry.ema_reject_rate, alpha, reject_value);
+        crate::util::update_float_ema(&mut entry.ema_reject_rate, alpha, reject_value);
         if let Some(latency) = latency {
             let millis = latency.as_secs_f64() * 1_000.0;
-            Self::update_float_ema(&mut entry.ema_latency_ms, alpha, millis);
+            crate::util::update_float_ema(&mut entry.ema_latency_ms, alpha, millis);
         }
     }
 
@@ -124,19 +124,6 @@ impl HealthTracker {
         self.endpoints.entry(endpoint.to_string()).or_default()
     }
 
-    fn update_float_ema(target: &mut Option<f64>, alpha: f64, value: f64) {
-        if value.is_nan() {
-            return;
-        }
-        match target {
-            Some(current) => {
-                *current = alpha * value + (1.0 - alpha) * *current;
-            }
-            None => {
-                *target = Some(value);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

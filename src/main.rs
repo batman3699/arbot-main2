@@ -2660,17 +2660,17 @@ impl CompetitionTracker {
     }
 
     fn update_win_rate(&mut self, outcome: f64) {
-        Self::update_float_ema(&mut self.ema_win_rate, self.alpha, outcome);
+        crate::util::update_float_ema(&mut self.ema_win_rate, self.alpha, outcome);
     }
 
     fn update_rejection_rate(&mut self, rejected: bool) {
         let value = if rejected { 1.0 } else { 0.0 };
-        Self::update_float_ema(&mut self.ema_rejection_rate, self.alpha, value);
+        crate::util::update_float_ema(&mut self.ema_rejection_rate, self.alpha, value);
     }
 
     fn update_latency(&mut self, latency: std::time::Duration) {
         let millis = latency.as_secs_f64() * 1_000.0;
-        Self::update_float_ema(&mut self.ema_latency_ms, self.alpha, millis);
+        crate::util::update_float_ema(&mut self.ema_latency_ms, self.alpha, millis);
     }
 
     fn update_slack(&mut self, slack: U256) {
@@ -2689,19 +2689,6 @@ impl CompetitionTracker {
         }
     }
 
-    fn update_float_ema(target: &mut Option<f64>, alpha: f64, value: f64) {
-        if value.is_nan() {
-            return;
-        }
-        match target {
-            Some(current) => {
-                *current = alpha * value + (1.0 - alpha) * *current;
-            }
-            None => {
-                *target = Some(value);
-            }
-        }
-    }
 }
 
 fn compute_start_priorities_inner(

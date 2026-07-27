@@ -55,6 +55,24 @@ where
     Ok(decimals)
 }
 
+/// In-place exponential moving average update: `target = alpha*value +
+/// (1-alpha)*target`, seeding with `value` on the first observation. NaN inputs
+/// are ignored. Shared by the RPC/relay health tracker and the competition
+/// tracker so the smoothing is defined once.
+pub fn update_float_ema(target: &mut Option<f64>, alpha: f64, value: f64) {
+    if value.is_nan() {
+        return;
+    }
+    match target {
+        Some(current) => {
+            *current = alpha * value + (1.0 - alpha) * *current;
+        }
+        None => {
+            *target = Some(value);
+        }
+    }
+}
+
 /// Read an env var and parse it as `T`, returning `None` if unset or unparseable.
 ///
 /// Exactly the `std::env::var(name).ok().and_then(|v| v.parse::<T>().ok())` idiom

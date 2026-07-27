@@ -27,7 +27,20 @@ use std::time::{Duration, Instant};
 
 const SIM_FUND_WEI: u128 = 1_000_000_000_000_000_000_000; // 1000 ETH
 /// OP-Stack GasPriceOracle predeploy (Base, Optimism, etc.).
-const GAS_PRICE_ORACLE: &str = "0x420000000000000000000000000000000000000F";
+pub(crate) const GAS_PRICE_ORACLE: &str = "0x420000000000000000000000000000000000000F";
+
+/// ABI-encoded calldata for `GasPriceOracle.getL1Fee(bytes)`. Shared by the
+/// async (fees.rs) and blocking (this module) OP-stack L1-fee estimators so the
+/// selector and argument encoding are defined in exactly one place.
+pub(crate) fn encode_get_l1_fee_calldata(payload: &[u8]) -> Vec<u8> {
+    let selector = &keccak256("getL1Fee(bytes)")[..4];
+    let encoded_args = encode(&[Token::Bytes(payload.to_vec())]);
+    let mut data = Vec::with_capacity(selector.len() + encoded_args.len());
+    data.extend_from_slice(selector);
+    data.extend_from_slice(&encoded_args);
+    data
+}
+
 #[derive(Debug, Clone)]
 pub struct ForkBlockHeader {
     pub number: u64,
@@ -808,15 +821,11 @@ fn estimate_op_stack_l1_fee_blocking(
     let block_param = block_tag(block_number);
     let oracle = GAS_PRICE_ORACLE;
 
-    let selector = &keccak256("getL1Fee(bytes)")[..4];
     for payload in [unsigned_tx_rlp, tx_calldata] {
         if payload.is_empty() {
             continue;
         }
-        let encoded_args = encode(&[Token::Bytes(payload.to_vec())]);
-        let mut data = Vec::with_capacity(selector.len() + encoded_args.len());
-        data.extend_from_slice(selector);
-        data.extend_from_slice(&encoded_args);
+        let data = encode_get_l1_fee_calldata(payload);
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
