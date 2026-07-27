@@ -39,14 +39,18 @@ Done (each its own commit; full suite green after each):
 - **P2-6 (env-helper migration)** typed helpers `env_parse_opt`/`env_u256_opt`/`env_flag`
   in util (`3a46e95`); 67 scattered inline env-read idioms in main.rs migrated onto them
   (`98d1d08`), verified behavior-preserving (env-var name set identical 116==116, build
-  warning-free, full suite green). main.rs env reads: ~130 → 61.
+  warning-free, full suite green).
+- **P2-6 (Config struct)** the ~197-line tuning-resolution block extracted from
+  launch_chain_runtime into a typed `RuntimeTuning` struct + `from_env(ops_inputs,
+  chain_name)`, destructured back into the same local names (`1c1ac28`). Verified
+  behavior-preserving by diff (moved block byte-identical bar `&cfg.name`→`chain_name`),
+  env-var name set, build, and full suite. **P2-6 complete.**
 
 Remaining:
-- **P2-6 (optional)** the 61 remaining main.rs reads are intentional `.context()?`
-  fail-fast validation + four dynamic-name reads. A further step could group the parsed
-  values into one typed `Config` struct passed by reference (organizational — startup
-  reads are already read-once), plus a per-prefix-keyed cache for
-  `classify_provider_for_chain` (the one param-dependent per-block reader left).
+- **P2-6 (nice-to-have)** the reads still inline in launch_chain_runtime are intentional
+  `.context()?` fail-fast validation + four dynamic-name reads; a per-prefix-keyed cache
+  for `classify_provider_for_chain` (the one param-dependent per-block reader left) is a
+  minor follow-up.
 - **P2-7** split the 13k-line `main.rs` — large, not started.
 - **P3** items (junk-file purge, chain-config trim, token-universe trim, profit-funnel
   metrics) — not started.
