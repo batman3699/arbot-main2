@@ -1249,7 +1249,6 @@ fn is_better(candidate: &Edge, current: &Edge) -> bool {
 mod tests {
     use super::*;
     use crate::util::{compute_edge_weight, NativePrice};
-    use std::collections::HashSet;
     use std::time::Duration;
 
     fn addr(id: u64) -> Address {

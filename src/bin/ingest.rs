@@ -6,12 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
-#[path = "../ops_inputs.rs"]
-mod ops_inputs;
+// ops_inputs is a public library module (src/lib.rs), so consume it from the
+// crate rather than re-compiling it here — a `#[path]` copy would be a separate
+// module without access to the lib's `util` (which ops_inputs now depends on).
 #[path = "../pool_store.rs"]
 mod pool_store;
 
-use ops_inputs::{load_ops_inputs, VenueKind};
+use arb_exec::ops_inputs::{load_ops_inputs, VenueKind};
 use pool_store::{merge_pool_records, pool_data_path, write_pool_records, PoolRecord};
 
 mod events {
