@@ -45,6 +45,11 @@ Done (each its own commit; full suite green after each):
   chain_name)`, destructured back into the same local names (`1c1ac28`). Verified
   behavior-preserving by diff (moved block byte-identical bar `&cfg.name`→`chain_name`),
   env-var name set, build, and full suite. **P2-6 complete.**
+- **P2-5** `update_float_ema` deduped into util (was copied in health.rs + main.rs); the
+  OP-stack getL1Fee oracle address + calldata encoding shared between fees.rs and
+  sim_revm.rs (`33a7cde`). No economics change.
+- **P3-1** deleted 25 zero-byte paste-debris files from the repo root and added
+  `__pycache__/`/`*.pyc` to .gitignore (`57d4d2d`).
 
 Remaining:
 - **P2-6 (nice-to-have)** the reads still inline in launch_chain_runtime are intentional
