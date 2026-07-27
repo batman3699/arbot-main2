@@ -37,3 +37,7 @@ prometheus-*.tar.gz
 .vscode/
 *.swp
 .DS_Store
+
+# Python tooling caches (scripts/data/*.py)
+__pycache__/
+*.pyc
