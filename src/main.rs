@@ -7739,6 +7739,15 @@ where
                                 summary.net_native,
                                 net_usd,
                             );
+                            // Relay rejected but a fallback path still landed the
+                            // tx: count it so the funnel reflects private-relay
+                            // market losses even on eventual success.
+                            if summary.private_relay_rejected {
+                                metrics.record_relay_rejected(
+                                    &self.chain_name,
+                                    summary.strategy.as_str(),
+                                );
+                            }
                         }
                         if let Some(update) = self.capital.apply_profit(summary.net) {
                             if let Some(metrics) = &self.metrics {
@@ -7843,6 +7852,12 @@ where
                         if let Some(metrics) = &self.metrics {
                             metrics.record_detection();
                             metrics.record_failure(estimated_loss_wei);
+                            // Failed dispatch that the private relay refused (no
+                            // successful fallback). Strategy isn't carried on the
+                            // Failed outcome, so label it "unknown".
+                            if private_relay_rejected {
+                                metrics.record_relay_rejected(&self.chain_name, "unknown");
+                            }
                         }
                         println!(
                             "EXEC FAILED tx={:#x} reason={} relayReject={} edges_scanned={} expected_uniV3_max={} estLossWei={}",

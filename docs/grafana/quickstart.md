@@ -147,6 +147,22 @@ You now have **three** terminals running services. Do not close any of them unti
    - **Execution Win Rate:** share of detected opportunities that execute successfully.
    - **Gas Efficiency:** ratio of profit velocity to gas spend velocity.
    - **Opportunity Funnel:** detected vs executed vs failed opportunities.
+
+### Also import the Profit Funnel dashboard
+
+Repeat the import steps but choose **`arbot-funnel.json`** ("Arbot — Profit Funnel").
+This is the diagnostic view for the $833/day ($25k/mo) target: it shows the full
+funnel (Detected → Seen → Sim-passed → Broadcast → Included → Executed), the
+conversion rates between stages (sim-pass %, inclusion %, revert %, relay-reject %),
+a **Projected $/day** stat against the $833 line, loss/failure signals (RPC errors,
+reverts, relay rejects, search timeouts), and per-stage latency. The panel header
+explains how to read the funnel to localise the bottleneck (edge-limited vs
+RPC/latency-limited vs capital-limited).
+
+New metric backing the funnel: `tx_relay_rejected_total{chain,strategy}` counts
+private-relay rejections (a distinct loss stage). Not yet instrumented:
+realised-vs-simulated net, which needs on-chain profit extraction from the executor
+receipt — until then the funnel measures inclusion, not slippage/L1-fee truth.
    - **Circuit Control Mode:** reminder that breaker controls are manual-only (`tripCircuit` / `resetCircuit`).
 
 If the panels stay empty, re-check Steps 1–5. Most issues come from Prometheus or Arbot not running.

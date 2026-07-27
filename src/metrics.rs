@@ -41,6 +41,7 @@ pub struct Metrics {
     pub tx_sent: CounterVec,
     pub tx_confirmed: CounterVec,
     pub tx_reverted: CounterVec,
+    pub tx_relay_rejected: CounterVec,
     pub rpc_errors: CounterVec,
     pub gross_profit_native: GaugeVec,
     pub fees_native: GaugeVec,
@@ -281,6 +282,18 @@ impl Metrics {
             .register(Box::new(tx_reverted.clone()))
             .context("register tx_reverted_total counter")?;
 
+        let tx_relay_rejected = CounterVec::new(
+            Opts::new(
+                "tx_relay_rejected_total",
+                "Total private-relay rejections (per chain/strategy) — the tx was \
+                 refused by the private relay/builder before inclusion",
+            ),
+            &["chain", "strategy"],
+        )?;
+        registry
+            .register(Box::new(tx_relay_rejected.clone()))
+            .context("register tx_relay_rejected_total counter")?;
+
         let rpc_errors = CounterVec::new(
             Opts::new("rpc_errors_total", "Total RPC errors observed (per chain)"),
             &["chain"],
@@ -514,6 +527,7 @@ impl Metrics {
             tx_sent,
             tx_confirmed,
             tx_reverted,
+            tx_relay_rejected,
             rpc_errors,
             gross_profit_native,
             fees_native,
@@ -590,6 +604,12 @@ impl Metrics {
 
     pub fn record_tx_confirmed(&self, chain: &str, strategy: &str) {
         self.tx_confirmed
+            .with_label_values(&[chain, strategy])
+            .inc();
+    }
+
+    pub fn record_relay_rejected(&self, chain: &str, strategy: &str) {
+        self.tx_relay_rejected
             .with_label_values(&[chain, strategy])
             .inc();
     }
@@ -741,5 +761,37 @@ impl Metrics {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Registration smoke test: every counter/gauge/histogram (including the new
+    // tx_relay_rejected funnel counter) must register without a name collision,
+    // and the funnel recorders must accept their labels and gather cleanly.
+    #[test]
+    fn metrics_register_and_record_funnel_stages() {
+        let metrics = Metrics::new().expect("metrics register without collision");
+
+        metrics.record_detection();
+        metrics.record_opportunity_seen("base", "cycle");
+        metrics.record_simulation("base", "cycle", true);
+        metrics.record_simulation("base", "cycle", false);
+        metrics.record_tx_sent("base", "cycle");
+        metrics.record_tx_confirmed("base", "cycle");
+        metrics.record_tx_reverted("base", "cycle");
+        metrics.record_relay_rejected("base", "cycle");
+        metrics.record_relay_rejected("base", "unknown");
+
+        // The relay-reject counter is exported under its Prometheus name.
+        let families = metrics.registry.gather();
+        assert!(
+            families
+                .iter()
+                .any(|f| f.get_name() == "tx_relay_rejected_total"),
+            "tx_relay_rejected_total must be registered and gatherable"
+        );
     }
 }

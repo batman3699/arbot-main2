@@ -50,6 +50,13 @@ Done (each its own commit; full suite green after each):
   sim_revm.rs (`33a7cde`). No economics change.
 - **P3-1** deleted 25 zero-byte paste-debris files from the repo root and added
   `__pycache__/`/`*.pyc` to .gitignore (`57d4d2d`).
+- **P3-4** profit-funnel instrumentation: added `tx_relay_rejected_total` counter +
+  wiring, and a dedicated Grafana funnel dashboard (`docs/grafana/arbot-funnel.json`)
+  showing the full funnel, conversion rates, projected $/day vs the $833 target, loss
+  signals, and per-stage latency, with a read-the-funnel diagnosis guide. Most funnel
+  stage counters already existed; this ties them into a steerable view. Not done:
+  realised-vs-simulated net (needs on-chain profit extraction from the executor
+  receipt — documented as a follow-up).
 
 Remaining:
 - **P2-6 (nice-to-have)** the reads still inline in launch_chain_runtime are intentional
