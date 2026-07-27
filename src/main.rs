@@ -9812,6 +9812,285 @@ async fn select_broadcast_endpoint(
     ))
 }
 
+/// Env- and ops-inputs-derived runtime tuning knobs, resolved once at startup
+/// (RuntimeTuning::from_env) and destructured into launch_chain_runtime so the
+/// per-knob resolution lives in one place instead of inline in the launcher.
+struct RuntimeTuning {
+    edge_slippage_bps: u32,
+    edge_prune_max_slippage_bps: u32,
+    edge_prune_min_score: f64,
+    edge_prune_liquidity_weight: f64,
+    edge_prune_profit_weight: f64,
+    edge_prune_slippage_weight: f64,
+    max_gas_price_wei: U256,
+    max_gas_price_congestion_bps: u32,
+    profit_margin_bps: u32,
+    opportunity_cost_wei: U256,
+    cross_chain_profit_bps: u32,
+    cross_chain_min_profit_wei: U256,
+    max_candidate_paths: usize,
+    quote_budget_ms: u64,
+    min_edge_max_input: U256,
+    min_liquidity_tokens: f64,
+    max_quote_block_lag: U64,
+    congestion_alpha: f64,
+    competition_alpha: f64,
+    cycle_limits: BellmanFordLimits,
+    search_budget: Duration,
+    quote_budget: Duration,
+    simulation_budget: Duration,
+    auto_hot_pool_cap: usize,
+    max_edges_hot: usize,
+    topk_per_token: usize,
+    dynamic_top_tokens_30d: usize,
+    mandatory_universe_tokens: HashSet<Address>,
+    hub_tokens: HashSet<Address>,
+    jit_config: Option<JitConfig>,
+    cb_hourly_loss_limit: U256,
+    cb_daily_loss_limit: U256,
+    cb_max_consecutive_failures: u32,
+}
+
+impl RuntimeTuning {
+    fn from_env(
+        ops_inputs: &crate::ops_inputs::OpsInputs,
+        chain_name: &str,
+    ) -> Result<RuntimeTuning> {
+    let universe_cfg = &ops_inputs.universe;
+    let max_hops: usize = universe_cfg
+        .max_hops
+        .or_else(|| {
+            crate::util::env_parse_opt("MAX_HOPS")
+        })
+        .unwrap_or(6);
+    let max_hops_cap: usize = crate::util::env_parse_opt::<usize>("MAX_HOPS_CAP")
+        .unwrap_or(8)
+        .max(1);
+    let bounded_max_hops = max_hops.min(max_hops_cap);
+    let max_relaxations: usize = crate::util::env_parse_opt::<usize>("BELLMAN_MAX_RELAXATIONS")
+        .unwrap_or(bounded_max_hops.saturating_mul(4).max(24))
+        .max(1)
+        .min(256);
+    let max_hops = bounded_max_hops;
+    let edge_slippage_bps: u32 = std::env::var("EDGE_SLIPPAGE_BPS")
+        .unwrap_or_else(|_| "30".into())
+        .parse()
+        .context("parse EDGE_SLIPPAGE_BPS")?;
+    let edge_prune_max_slippage_bps: u32 = universe_cfg
+        .edge_prune_max_slippage_bps
+        .or_else(|| {
+            crate::util::env_parse_opt("EDGE_PRUNE_MAX_SLIPPAGE_BPS")
+        })
+        .unwrap_or(edge_slippage_bps);
+    let edge_prune_min_score: f64 = universe_cfg
+        .edge_prune_min_score
+        .or_else(|| {
+            crate::util::env_parse_opt("EDGE_PRUNE_MIN_SCORE")
+        })
+        .unwrap_or(0.0);
+    let edge_prune_liquidity_weight: f64 = universe_cfg
+        .edge_prune_liquidity_weight
+        .or_else(|| {
+            crate::util::env_parse_opt("EDGE_PRUNE_LIQUIDITY_WEIGHT")
+        })
+        .unwrap_or(1.0);
+    let edge_prune_profit_weight: f64 = universe_cfg
+        .edge_prune_profit_weight
+        .or_else(|| {
+            crate::util::env_parse_opt("EDGE_PRUNE_PROFIT_WEIGHT")
+        })
+        .unwrap_or(1.5);
+    let edge_prune_slippage_weight: f64 = universe_cfg
+        .edge_prune_slippage_weight
+        .or_else(|| {
+            crate::util::env_parse_opt("EDGE_PRUNE_SLIPPAGE_WEIGHT")
+        })
+        .unwrap_or(0.05);
+    let max_gas_price_wei = crate::util::env_u256_opt("MAX_GAS_PRICE_WEI")
+        .unwrap_or_else(|| U256::from(150_000_000_000u64));
+    let max_gas_price_congestion_bps: u32 = std::env::var("MAX_GAS_PRICE_CONGESTION_BPS")
+        .unwrap_or_else(|_| "12000".into())
+        .parse()
+        .context("parse MAX_GAS_PRICE_CONGESTION_BPS")?;
+    let profit_margin_bps: u32 = std::env::var("PROFIT_MARGIN_BPS")
+        .unwrap_or_else(|_| "200".into())
+        .parse()
+        .context("parse PROFIT_MARGIN_BPS")?;
+    let opportunity_cost_wei = crate::util::env_u256_opt("OPPORTUNITY_COST_WEI")
+        .unwrap_or_else(U256::zero);
+    let cross_chain_profit_bps: u32 = std::env::var("CROSS_CHAIN_PROFIT_BPS")
+        .unwrap_or_else(|_| "175".into())
+        .parse()
+        .context("parse CROSS_CHAIN_PROFIT_BPS")?;
+    let cross_chain_min_profit_wei = crate::util::env_u256_opt("CROSS_CHAIN_MIN_PROFIT_WEI")
+        .unwrap_or_else(U256::zero);
+    let max_candidate_paths: usize = universe_cfg
+        .cycle_candidate_cap_per_block
+        .or_else(|| {
+            crate::util::env_parse_opt("MAX_CANDIDATE_PATHS")
+        })
+        .unwrap_or(8)
+        .max(1);
+    let cycle_search_timeout_ms: u64 = universe_cfg
+        .time_budget_ms
+        .search
+        .or_else(|| {
+            crate::util::env_parse_opt("CYCLE_SEARCH_TIMEOUT_MS")
+        })
+        .unwrap_or(250);
+    let quote_budget_ms: u64 = universe_cfg
+        .time_budget_ms
+        .quoting
+        .or_else(|| {
+            crate::util::env_parse_opt("QUOTE_BUDGET_MS")
+        })
+        .unwrap_or(250);
+    let simulation_budget_ms: u64 = universe_cfg
+        .time_budget_ms
+        .simulation
+        .or_else(|| {
+            crate::util::env_parse_opt("SIMULATION_BUDGET_MS")
+        })
+        .unwrap_or(400);
+    let (cycle_search_timeout_ms, quote_budget_ms, simulation_budget_ms) =
+        derive_chain_time_budget_ms(
+            chain_name,
+            cycle_search_timeout_ms,
+            quote_budget_ms,
+            simulation_budget_ms,
+        );
+    let cycle_search_timeout = Duration::from_millis(cycle_search_timeout_ms.max(1));
+    let max_bellman_cycles: usize = crate::util::env_parse_opt::<usize>("MAX_BELLMAN_CYCLES")
+        .unwrap_or_else(|| {
+            max_candidate_paths
+                .saturating_mul(4)
+                .max(max_candidate_paths)
+                .max(1)
+        });
+    let min_edge_max_input = crate::util::env_u256_opt("MIN_EDGE_MAX_INPUT_WEI")
+        .unwrap_or_else(U256::zero);
+    let mut min_liquidity_tokens: f64 = std::env::var("MIN_LIQUIDITY_TOKENS")
+        .unwrap_or_else(|_| "0".into())
+        .parse()
+        .unwrap_or(0.0);
+    if let Some(value) = ops_inputs.universe.min_pool_liquidity_tokens {
+        min_liquidity_tokens = value;
+    }
+    let max_quote_block_lag = crate::util::env_parse_opt::<u64>("MAX_QUOTE_BLOCK_LAG")
+        .map(U64::from)
+        .unwrap_or_else(|| U64::from(2u64));
+    let jit_enabled = read_feature_flag("JIT_LP_ENABLED", false);
+    let jit_min_amount_in = std::env::var("JIT_MIN_AMOUNT_WEI")
+        .ok()
+        .and_then(|v| U256::from_dec_str(&v).ok())
+        .unwrap_or_else(U256::zero);
+    let jit_seed_bps: u32 = std::env::var("JIT_SEED_BPS")
+        .unwrap_or_else(|_| "750".to_string())
+        .parse()
+        .unwrap_or(750);
+    let jit_tick_range: u16 = std::env::var("JIT_TICK_RANGE")
+        .unwrap_or_else(|_| "2".to_string())
+        .parse()
+        .unwrap_or(2);
+    let jit_disable_on_quote_failure = read_feature_flag("JIT_DISABLE_ON_MIN_OUT_FAIL", true);
+    let congestion_alpha: f64 = std::env::var("CONGESTION_EMA_ALPHA")
+        .unwrap_or_else(|_| "0.3".into())
+        .parse()
+        .unwrap_or(0.3);
+    let competition_alpha: f64 = std::env::var("COMPETITION_EMA_ALPHA")
+        .unwrap_or_else(|_| "0.45".into())
+        .parse()
+        .unwrap_or(0.45);
+    // Two-pool arbs (a single token pair priced differently across two venues,
+    // e.g. WETH/USDC on Uniswap vs Aerodrome) are 2-hop cycles and are the most
+    // frequent, highest-turnover opportunity on every chain. The token graph
+    // resolves the best edge per direction, so same-pool round-trips self-reject
+    // (weight >= 0) and only genuine cross-venue spreads survive. A min_hops of
+    // 3 silently excluded this entire opportunity class; 2 is the correct floor.
+    let min_hops: usize = crate::util::env_parse_opt("MIN_HOPS")
+        .unwrap_or(2);
+    let cycle_limits = BellmanFordLimits {
+        min_hops: min_hops.min(max_hops.max(1)),
+        max_hops,
+        max_relaxations,
+        max_cycles: max_bellman_cycles,
+        timeout: cycle_search_timeout,
+    };
+    let search_budget = cycle_search_timeout;
+    let quote_budget = Duration::from_millis(quote_budget_ms.max(1));
+    let simulation_budget = Duration::from_millis(simulation_budget_ms.max(1));
+    let auto_hot_pool_cap = derive_chain_hot_pool_cap(chain_name, quote_budget_ms);
+    let auto_max_edges_hot = derive_chain_max_edges_hot(chain_name, quote_budget_ms);
+    let max_edges_hot = universe_cfg
+        .max_edges_hot
+        .unwrap_or(auto_max_edges_hot)
+        .max(1);
+    let topk_per_token = universe_cfg.topk_per_token.unwrap_or(3).max(1);
+    let raw_dynamic_top_tokens_30d = crate::util::env_parse_opt::<usize>("DYNAMIC_TOP_TOKENS_30D")
+        .or(universe_cfg.dynamic_top_tokens_30d)
+        .unwrap_or(200);
+    let dynamic_top_tokens_30d = sanitize_dynamic_top_tokens_30d(raw_dynamic_top_tokens_30d);
+    if raw_dynamic_top_tokens_30d < 60 {
+        warn!(
+            configured = raw_dynamic_top_tokens_30d,
+            effective = dynamic_top_tokens_30d,
+            "universe.dynamic_top_tokens_30d below 60 reduces search breadth; clamping to top-60"
+        );
+    }
+    let mandatory_universe_tokens = build_mandatory_universe_tokens(ops_inputs);
+    let hub_tokens = build_hub_tokens(ops_inputs);
+    let jit_config = jit_enabled.then_some(JitConfig {
+        enabled: true,
+        min_amount_in: jit_min_amount_in,
+        seed_bps: jit_seed_bps,
+        tick_range: jit_tick_range,
+        disable_on_quote_failure: jit_disable_on_quote_failure,
+    });
+
+    let cb_hourly_loss_limit = crate::util::env_u256_opt("CB_HOURLY_LOSS_LIMIT_WEI")
+        .unwrap_or_else(U256::zero);
+    let cb_daily_loss_limit = crate::util::env_u256_opt("CB_DAILY_LOSS_LIMIT_WEI")
+        .unwrap_or_else(U256::zero);
+    let cb_max_consecutive_failures = crate::util::env_parse_opt::<u32>("CB_MAX_CONSECUTIVE_FAILURES")
+        .unwrap_or(3);
+        Ok(RuntimeTuning {
+            edge_slippage_bps,
+            edge_prune_max_slippage_bps,
+            edge_prune_min_score,
+            edge_prune_liquidity_weight,
+            edge_prune_profit_weight,
+            edge_prune_slippage_weight,
+            max_gas_price_wei,
+            max_gas_price_congestion_bps,
+            profit_margin_bps,
+            opportunity_cost_wei,
+            cross_chain_profit_bps,
+            cross_chain_min_profit_wei,
+            max_candidate_paths,
+            quote_budget_ms,
+            min_edge_max_input,
+            min_liquidity_tokens,
+            max_quote_block_lag,
+            congestion_alpha,
+            competition_alpha,
+            cycle_limits,
+            search_budget,
+            quote_budget,
+            simulation_budget,
+            auto_hot_pool_cap,
+            max_edges_hot,
+            topk_per_token,
+            dynamic_top_tokens_30d,
+            mandatory_universe_tokens,
+            hub_tokens,
+            jit_config,
+            cb_hourly_loss_limit,
+            cb_daily_loss_limit,
+            cb_max_consecutive_failures,
+        })
+    }
+}
+
 async fn launch_chain_runtime(
     cfg: ChainCfg,
     registry_chain: Option<RegistryChain>,
@@ -9926,203 +10205,42 @@ async fn launch_chain_runtime(
         );
     }
 
+    let RuntimeTuning {
+        edge_slippage_bps,
+        edge_prune_max_slippage_bps,
+        edge_prune_min_score,
+        edge_prune_liquidity_weight,
+        edge_prune_profit_weight,
+        edge_prune_slippage_weight,
+        max_gas_price_wei,
+        max_gas_price_congestion_bps,
+        profit_margin_bps,
+        opportunity_cost_wei,
+        cross_chain_profit_bps,
+        cross_chain_min_profit_wei,
+        max_candidate_paths,
+        quote_budget_ms,
+        min_edge_max_input,
+        min_liquidity_tokens,
+        max_quote_block_lag,
+        congestion_alpha,
+        competition_alpha,
+        cycle_limits,
+        search_budget,
+        quote_budget,
+        simulation_budget,
+        auto_hot_pool_cap,
+        max_edges_hot,
+        topk_per_token,
+        dynamic_top_tokens_30d,
+        mandatory_universe_tokens,
+        hub_tokens,
+        jit_config,
+        cb_hourly_loss_limit,
+        cb_daily_loss_limit,
+        cb_max_consecutive_failures,
+    } = RuntimeTuning::from_env(ops_inputs, &cfg.name)?;
     let universe_cfg = &ops_inputs.universe;
-    let max_hops: usize = universe_cfg
-        .max_hops
-        .or_else(|| {
-            crate::util::env_parse_opt("MAX_HOPS")
-        })
-        .unwrap_or(6);
-    let max_hops_cap: usize = crate::util::env_parse_opt::<usize>("MAX_HOPS_CAP")
-        .unwrap_or(8)
-        .max(1);
-    let bounded_max_hops = max_hops.min(max_hops_cap);
-    let max_relaxations: usize = crate::util::env_parse_opt::<usize>("BELLMAN_MAX_RELAXATIONS")
-        .unwrap_or(bounded_max_hops.saturating_mul(4).max(24))
-        .max(1)
-        .min(256);
-    let max_hops = bounded_max_hops;
-    let edge_slippage_bps: u32 = std::env::var("EDGE_SLIPPAGE_BPS")
-        .unwrap_or_else(|_| "30".into())
-        .parse()
-        .context("parse EDGE_SLIPPAGE_BPS")?;
-    let edge_prune_max_slippage_bps: u32 = universe_cfg
-        .edge_prune_max_slippage_bps
-        .or_else(|| {
-            crate::util::env_parse_opt("EDGE_PRUNE_MAX_SLIPPAGE_BPS")
-        })
-        .unwrap_or(edge_slippage_bps);
-    let edge_prune_min_score: f64 = universe_cfg
-        .edge_prune_min_score
-        .or_else(|| {
-            crate::util::env_parse_opt("EDGE_PRUNE_MIN_SCORE")
-        })
-        .unwrap_or(0.0);
-    let edge_prune_liquidity_weight: f64 = universe_cfg
-        .edge_prune_liquidity_weight
-        .or_else(|| {
-            crate::util::env_parse_opt("EDGE_PRUNE_LIQUIDITY_WEIGHT")
-        })
-        .unwrap_or(1.0);
-    let edge_prune_profit_weight: f64 = universe_cfg
-        .edge_prune_profit_weight
-        .or_else(|| {
-            crate::util::env_parse_opt("EDGE_PRUNE_PROFIT_WEIGHT")
-        })
-        .unwrap_or(1.5);
-    let edge_prune_slippage_weight: f64 = universe_cfg
-        .edge_prune_slippage_weight
-        .or_else(|| {
-            crate::util::env_parse_opt("EDGE_PRUNE_SLIPPAGE_WEIGHT")
-        })
-        .unwrap_or(0.05);
-    let max_gas_price_wei = crate::util::env_u256_opt("MAX_GAS_PRICE_WEI")
-        .unwrap_or_else(|| U256::from(150_000_000_000u64));
-    let max_gas_price_congestion_bps: u32 = std::env::var("MAX_GAS_PRICE_CONGESTION_BPS")
-        .unwrap_or_else(|_| "12000".into())
-        .parse()
-        .context("parse MAX_GAS_PRICE_CONGESTION_BPS")?;
-    let profit_margin_bps: u32 = std::env::var("PROFIT_MARGIN_BPS")
-        .unwrap_or_else(|_| "200".into())
-        .parse()
-        .context("parse PROFIT_MARGIN_BPS")?;
-    let opportunity_cost_wei = crate::util::env_u256_opt("OPPORTUNITY_COST_WEI")
-        .unwrap_or_else(U256::zero);
-    let cross_chain_profit_bps: u32 = std::env::var("CROSS_CHAIN_PROFIT_BPS")
-        .unwrap_or_else(|_| "175".into())
-        .parse()
-        .context("parse CROSS_CHAIN_PROFIT_BPS")?;
-    let cross_chain_min_profit_wei = crate::util::env_u256_opt("CROSS_CHAIN_MIN_PROFIT_WEI")
-        .unwrap_or_else(U256::zero);
-    let max_candidate_paths: usize = universe_cfg
-        .cycle_candidate_cap_per_block
-        .or_else(|| {
-            crate::util::env_parse_opt("MAX_CANDIDATE_PATHS")
-        })
-        .unwrap_or(8)
-        .max(1);
-    let cycle_search_timeout_ms: u64 = universe_cfg
-        .time_budget_ms
-        .search
-        .or_else(|| {
-            crate::util::env_parse_opt("CYCLE_SEARCH_TIMEOUT_MS")
-        })
-        .unwrap_or(250);
-    let quote_budget_ms: u64 = universe_cfg
-        .time_budget_ms
-        .quoting
-        .or_else(|| {
-            crate::util::env_parse_opt("QUOTE_BUDGET_MS")
-        })
-        .unwrap_or(250);
-    let simulation_budget_ms: u64 = universe_cfg
-        .time_budget_ms
-        .simulation
-        .or_else(|| {
-            crate::util::env_parse_opt("SIMULATION_BUDGET_MS")
-        })
-        .unwrap_or(400);
-    let (cycle_search_timeout_ms, quote_budget_ms, simulation_budget_ms) =
-        derive_chain_time_budget_ms(
-            &cfg.name,
-            cycle_search_timeout_ms,
-            quote_budget_ms,
-            simulation_budget_ms,
-        );
-    let cycle_search_timeout = Duration::from_millis(cycle_search_timeout_ms.max(1));
-    let max_bellman_cycles: usize = crate::util::env_parse_opt::<usize>("MAX_BELLMAN_CYCLES")
-        .unwrap_or_else(|| {
-            max_candidate_paths
-                .saturating_mul(4)
-                .max(max_candidate_paths)
-                .max(1)
-        });
-    let min_edge_max_input = crate::util::env_u256_opt("MIN_EDGE_MAX_INPUT_WEI")
-        .unwrap_or_else(U256::zero);
-    let mut min_liquidity_tokens: f64 = std::env::var("MIN_LIQUIDITY_TOKENS")
-        .unwrap_or_else(|_| "0".into())
-        .parse()
-        .unwrap_or(0.0);
-    if let Some(value) = ops_inputs.universe.min_pool_liquidity_tokens {
-        min_liquidity_tokens = value;
-    }
-    let max_quote_block_lag = crate::util::env_parse_opt::<u64>("MAX_QUOTE_BLOCK_LAG")
-        .map(U64::from)
-        .unwrap_or_else(|| U64::from(2u64));
-    let jit_enabled = read_feature_flag("JIT_LP_ENABLED", false);
-    let jit_min_amount_in = std::env::var("JIT_MIN_AMOUNT_WEI")
-        .ok()
-        .and_then(|v| U256::from_dec_str(&v).ok())
-        .unwrap_or_else(U256::zero);
-    let jit_seed_bps: u32 = std::env::var("JIT_SEED_BPS")
-        .unwrap_or_else(|_| "750".to_string())
-        .parse()
-        .unwrap_or(750);
-    let jit_tick_range: u16 = std::env::var("JIT_TICK_RANGE")
-        .unwrap_or_else(|_| "2".to_string())
-        .parse()
-        .unwrap_or(2);
-    let jit_disable_on_quote_failure = read_feature_flag("JIT_DISABLE_ON_MIN_OUT_FAIL", true);
-    let congestion_alpha: f64 = std::env::var("CONGESTION_EMA_ALPHA")
-        .unwrap_or_else(|_| "0.3".into())
-        .parse()
-        .unwrap_or(0.3);
-    let competition_alpha: f64 = std::env::var("COMPETITION_EMA_ALPHA")
-        .unwrap_or_else(|_| "0.45".into())
-        .parse()
-        .unwrap_or(0.45);
-    // Two-pool arbs (a single token pair priced differently across two venues,
-    // e.g. WETH/USDC on Uniswap vs Aerodrome) are 2-hop cycles and are the most
-    // frequent, highest-turnover opportunity on every chain. The token graph
-    // resolves the best edge per direction, so same-pool round-trips self-reject
-    // (weight >= 0) and only genuine cross-venue spreads survive. A min_hops of
-    // 3 silently excluded this entire opportunity class; 2 is the correct floor.
-    let min_hops: usize = crate::util::env_parse_opt("MIN_HOPS")
-        .unwrap_or(2);
-    let cycle_limits = BellmanFordLimits {
-        min_hops: min_hops.min(max_hops.max(1)),
-        max_hops,
-        max_relaxations,
-        max_cycles: max_bellman_cycles,
-        timeout: cycle_search_timeout,
-    };
-    let search_budget = cycle_search_timeout;
-    let quote_budget = Duration::from_millis(quote_budget_ms.max(1));
-    let simulation_budget = Duration::from_millis(simulation_budget_ms.max(1));
-    let auto_hot_pool_cap = derive_chain_hot_pool_cap(&cfg.name, quote_budget_ms);
-    let auto_max_edges_hot = derive_chain_max_edges_hot(&cfg.name, quote_budget_ms);
-    let max_edges_hot = universe_cfg
-        .max_edges_hot
-        .unwrap_or(auto_max_edges_hot)
-        .max(1);
-    let topk_per_token = universe_cfg.topk_per_token.unwrap_or(3).max(1);
-    let raw_dynamic_top_tokens_30d = crate::util::env_parse_opt::<usize>("DYNAMIC_TOP_TOKENS_30D")
-        .or(universe_cfg.dynamic_top_tokens_30d)
-        .unwrap_or(200);
-    let dynamic_top_tokens_30d = sanitize_dynamic_top_tokens_30d(raw_dynamic_top_tokens_30d);
-    if raw_dynamic_top_tokens_30d < 60 {
-        warn!(
-            configured = raw_dynamic_top_tokens_30d,
-            effective = dynamic_top_tokens_30d,
-            "universe.dynamic_top_tokens_30d below 60 reduces search breadth; clamping to top-60"
-        );
-    }
-    let mandatory_universe_tokens = build_mandatory_universe_tokens(ops_inputs);
-    let hub_tokens = build_hub_tokens(ops_inputs);
-    let jit_config = jit_enabled.then_some(JitConfig {
-        enabled: true,
-        min_amount_in: jit_min_amount_in,
-        seed_bps: jit_seed_bps,
-        tick_range: jit_tick_range,
-        disable_on_quote_failure: jit_disable_on_quote_failure,
-    });
-
-    let cb_hourly_loss_limit = crate::util::env_u256_opt("CB_HOURLY_LOSS_LIMIT_WEI")
-        .unwrap_or_else(U256::zero);
-    let cb_daily_loss_limit = crate::util::env_u256_opt("CB_DAILY_LOSS_LIMIT_WEI")
-        .unwrap_or_else(U256::zero);
-    let cb_max_consecutive_failures = crate::util::env_parse_opt::<u32>("CB_MAX_CONSECUTIVE_FAILURES")
-        .unwrap_or(3);
 
     let rpc_backoff_max_secs: u64 = std::env::var("RPC_MAX_BACKOFF_SECS")
         .unwrap_or_else(|_| "30".into())
