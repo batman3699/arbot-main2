@@ -134,8 +134,8 @@ impl BridgePlanner {
         graph: &mut Graph,
         base_profiles: &HashMap<Address, TradeSizing>,
         default_base: U256,
-        gas_price: U256,
-        native_prices: &HashMap<Address, NativePrice>,
+        _gas_price: U256,
+        _native_prices: &HashMap<Address, NativePrice>,
     ) -> Result<Vec<Edge>> {
         let mut edges = Vec::new();
         for route in &self.routes {
@@ -158,17 +158,7 @@ impl BridgePlanner {
             }
             let rate_num = fee_num;
             let rate_den = fee_den;
-            let mut weight = compute_edge_weight(
-                rate_num,
-                rate_den,
-                route.estimated_gas,
-                gas_price,
-                base_amount,
-                native_prices
-                    .get(&route.token_in)
-                    .copied()
-                    .unwrap_or_else(NativePrice::unit),
-            );
+            let mut weight = compute_edge_weight(rate_num, rate_den);
             let latency_penalty = (route.estimated_time.as_secs_f64()
                 / self.max_duration.as_secs_f64().max(1.0))
             .min(10.0)

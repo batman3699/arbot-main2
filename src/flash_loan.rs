@@ -97,25 +97,91 @@ pub fn flash_fee(amount: U256, fee_bps: u32) -> U256 {
     mul_div(amount, U256::from(fee_bps as u64), U256::from(10_000u64))
 }
 
+/// Default constant-product swap fee, in bps. UniV2's immutable 0.30%, and also
+/// Aerodrome's current volatile-pool default — but Aerodrome's is factory-set
+/// per pool, so callers that know the pool's real fee must pass it.
+pub const DEFAULT_UNIV2_FLASH_FEE_BPS: u32 = 30;
+
 pub fn flash_fee_for_provider(provider: FlashLoanProvider, amount: U256, fee_bps: u32) -> U256 {
     match provider {
-        FlashLoanProvider::Univ2Flashswap => univ2_flash_fee(amount),
+        // A flash swap is repaid through the pool's own swap curve, so the cost
+        // is the pool fee grossed up — not a flat percentage of the principal.
+        FlashLoanProvider::Univ2Flashswap => univ2_flash_fee_bps(amount, fee_bps),
         _ => flash_fee(amount, fee_bps),
     }
 }
 
-pub fn univ2_flash_fee(amount: U256) -> U256 {
+/// Repayment premium for a constant-product flash swap.
+///
+/// Borrowing `amount` requires returning `amount * 10000 / (10000 - fee_bps)`,
+/// rounded up. `fee_bps == 0` means "unspecified", not "free": a flash swap is
+/// never free, so it falls back to the 0.30% default rather than pricing the
+/// loan at zero, which would mark losing trades profitable.
+pub fn univ2_flash_fee_bps(amount: U256, fee_bps: u32) -> U256 {
     if amount.is_zero() {
         return U256::zero();
     }
-    let repay =
-        mul_div(amount, U256::from(1000u64), U256::from(997u64)).saturating_add(U256::one());
+    let fee_bps = if fee_bps == 0 {
+        DEFAULT_UNIV2_FLASH_FEE_BPS
+    } else {
+        fee_bps
+    };
+    // Guard a pathological config: a >=100% fee has no finite repayment.
+    let denom = 10_000u64.saturating_sub(fee_bps.min(9_999) as u64);
+    let repay = mul_div(amount, U256::from(10_000u64), U256::from(denom)).saturating_add(U256::one());
     repay.saturating_sub(amount)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flash_swap_is_never_free_even_when_fee_is_unset() {
+        // `fee_bps: 0` on a flash-swap quote means "unspecified", not "free".
+        // Pricing the loan at zero would make losing trades look profitable.
+        let amount = U256::from(1_000_000_000u64);
+        let fee = flash_fee_for_provider(FlashLoanProvider::Univ2Flashswap, amount, 0);
+        assert!(!fee.is_zero(), "a flash swap always costs the pool fee");
+        assert_eq!(
+            fee,
+            univ2_flash_fee_bps(amount, DEFAULT_UNIV2_FLASH_FEE_BPS),
+            "unset must fall back to the 0.30% default"
+        );
+    }
+
+    #[test]
+    fn flash_swap_fee_tracks_the_pool_fee() {
+        // Aerodrome sets its fee per pool via the factory, so a hardcoded 0.30%
+        // would misprice any pool that is not at the default.
+        let amount = U256::from(1_000_000_000u64);
+        let cheap = univ2_flash_fee_bps(amount, 5);
+        let default = univ2_flash_fee_bps(amount, 30);
+        let dear = univ2_flash_fee_bps(amount, 100);
+        assert!(cheap < default && default < dear, "fee must be monotone in bps");
+        // 30bps on 1e9 => 1e9*10000/9970 - 1e9 ~= 3_009_027
+        assert_eq!(default, U256::from(3_009_028u64));
+    }
+
+    #[test]
+    fn flash_swap_fee_survives_a_pathological_fee() {
+        // A >=100% fee has no finite repayment; it must clamp, not overflow.
+        let amount = U256::from(1_000u64);
+        assert!(!univ2_flash_fee_bps(amount, 10_000).is_zero());
+        assert!(!univ2_flash_fee_bps(amount, 50_000).is_zero());
+        assert!(univ2_flash_fee_bps(U256::zero(), 30).is_zero());
+    }
+
+    #[test]
+    fn univ3_flash_is_priced_flat_on_principal() {
+        // UniV3 flash charges the tier fee as a flat share of principal — and it
+        // is NOT routed through the flash-swap curve.
+        let amount = U256::from(1_000_000u64);
+        assert_eq!(
+            flash_fee_for_provider(FlashLoanProvider::Univ3Flash, amount, 30),
+            U256::from(3_000u64)
+        );
+    }
 
     #[test]
     fn selects_best_provider_by_fee_then_capacity() {
@@ -172,8 +238,9 @@ mod tests {
 
     #[test]
     fn computes_univ2_flash_fee() {
+        // Unchanged from the 997/1000 form: the default is still 0.30%.
         let amount = U256::from(1_000_000u64);
-        let fee = univ2_flash_fee(amount);
+        let fee = univ2_flash_fee_bps(amount, DEFAULT_UNIV2_FLASH_FEE_BPS);
         assert_eq!(fee, U256::from(3_010u64));
     }
 }

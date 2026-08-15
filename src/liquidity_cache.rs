@@ -200,23 +200,17 @@ impl PoolDepthCache {
                 }
             }
 
-            if let Some(order) = pair.liquidity.usd().and_then(Decimal::from_f64) {
-                if order.is_sign_negative() || order.is_zero() {
-                    continue;
-                }
-                pair.truncate_tokens();
-                if let Some(price) = pair.price_for(&addr_lower).and_then(Decimal::from_f64) {
-                    if price.is_sign_negative() || price.is_zero() {
-                        continue;
-                    }
-                    if let Some(value) = order
-                        .checked_div(Decimal::from(2u64))
-                        .and_then(|half| half.checked_div(price))
-                    {
-                        total_tokens = total_tokens.checked_add(value).unwrap_or(Decimal::MAX);
-                    }
-                }
+            pair.truncate_tokens();
+            let Some(depth) = pair
+                .depth_tokens_for(&addr_lower)
+                .and_then(Decimal::from_f64)
+            else {
+                continue;
+            };
+            if depth.is_sign_negative() || depth.is_zero() {
+                continue;
             }
+            total_tokens = total_tokens.checked_add(depth).unwrap_or(Decimal::MAX);
         }
 
         if total_tokens.is_zero() || total_tokens.is_sign_negative() {
@@ -233,6 +227,82 @@ mod tests {
 
     fn addr(value: u64) -> Address {
         Address::from_low_u64_be(value)
+    }
+
+    /// Verbatim shape of a live `api.dexscreener.com/latest/dex/tokens/<addr>`
+    /// pair: `priceUsd` is a STRING on the pair, and the token objects carry no
+    /// price at all. Parsing it must yield real depth, not zero.
+    const LIVE_PAIR: &str = r#"{
+      "pairs": [{
+        "chainId": "base",
+        "priceUsd": "1915.79",
+        "liquidity": { "usd": 95343.46, "base": 36.279, "quote": 25840 },
+        "baseToken": { "address": "0x4200000000000000000000000000000000000006", "name": "Wrapped Ether", "symbol": "WETH" },
+        "quoteToken": { "address": "0xbA9986D2381edf1DA03B0B9c1f8b00dc4AacC369", "name": "USDC.e", "symbol": "USDC.e" }
+      }]
+    }"#;
+
+    fn only_pair() -> DexScreenerPair {
+        let mut parsed: DexScreenerResponse = serde_json::from_str(LIVE_PAIR).expect("parses");
+        let mut pair = parsed.pairs.remove(0);
+        pair.truncate_tokens();
+        pair
+    }
+
+    #[test]
+    fn pair_level_price_and_token_depths_are_parsed() {
+        let pair = only_pair();
+        assert_eq!(pair.chain_id, "base");
+        assert_eq!(pair.price_usd, Some(1915.79));
+        assert_eq!(pair.liquidity.usd(), Some(95343.46));
+        assert_eq!(pair.liquidity.base, Some(36.279));
+        assert_eq!(pair.liquidity.quote, Some(25840.0));
+    }
+
+    #[test]
+    fn depth_uses_the_side_the_token_sits_on() {
+        let pair = only_pair();
+        let weth = "0x4200000000000000000000000000000000000006";
+        let usdce = "0xba9986d2381edf1da03b0b9c1f8b00dc4aacc369";
+
+        assert_eq!(pair.depth_tokens_for(weth), Some(36.279));
+        assert_eq!(pair.depth_tokens_for(usdce), Some(25840.0));
+        // A token that is not in the pair contributes nothing.
+        assert_eq!(pair.depth_tokens_for("0x00000000000000000000000000000000deadbeef"), None);
+    }
+
+    /// The regression: previously depth came from `baseToken.priceUsd`, which
+    /// this payload does not contain, so every token cached zero.
+    #[test]
+    fn depth_is_non_zero_for_a_real_payload() {
+        let pair = only_pair();
+        let weth = "0x4200000000000000000000000000000000000006";
+        assert!(pair.depth_tokens_for(weth).unwrap_or(0.0) > 0.0);
+    }
+
+    #[test]
+    fn base_side_falls_back_to_usd_over_pair_price() {
+        // Same pair with the token-denominated amounts stripped.
+        let json = r#"{"pairs":[{
+            "chainId":"base","priceUsd":"2000",
+            "liquidity":{"usd":100000},
+            "baseToken":{"address":"0x4200000000000000000000000000000000000006"},
+            "quoteToken":{"address":"0xbA9986D2381edf1DA03B0B9c1f8b00dc4AacC369"}
+        }]}"#;
+        let mut parsed: DexScreenerResponse = serde_json::from_str(json).expect("parses");
+        let mut pair = parsed.pairs.remove(0);
+        pair.truncate_tokens();
+
+        // (100000 / 2) / 2000 = 25 WETH
+        assert_eq!(
+            pair.depth_tokens_for("0x4200000000000000000000000000000000000006"),
+            Some(25.0)
+        );
+        // The quote side has no sound fallback — priceUsd prices the base token.
+        assert_eq!(
+            pair.depth_tokens_for("0xba9986d2381edf1da03b0b9c1f8b00dc4aacc369"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -287,6 +357,14 @@ struct DexScreenerResponse {
 struct DexScreenerPair {
     #[serde(rename = "chainId")]
     chain_id: String,
+    /// Pair-level USD price of the BASE token. DexScreener reports it here as a
+    /// string, NOT inside `baseToken`/`quoteToken` — those objects carry only
+    /// address/name/symbol. Reading `priceUsd` off the token objects therefore
+    /// always yielded `None`, `price_for` always failed, and every token cached
+    /// zero depth. That floored `compute_base_amounts` at `MIN_FLASH_LOAN_WEI`,
+    /// so every trade was sized at 0.001 WETH.
+    #[serde(default, rename = "priceUsd", deserialize_with = "deserialize_opt_f64")]
+    price_usd: Option<f64>,
     #[serde(default)]
     liquidity: DexScreenerLiquidity,
     #[serde(rename = "baseToken")]
@@ -295,30 +373,52 @@ struct DexScreenerPair {
     quote_token: DexScreenerToken,
 }
 
+/// Which side of a pair a queried token sits on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PairSide {
+    Base,
+    Quote,
+}
+
 impl DexScreenerPair {
     fn truncate_tokens(&mut self) {
         self.base_token.normalize();
         self.quote_token.normalize();
     }
 
-    fn price_for(&self, addr_lower: &str) -> Option<f64> {
-        if self
-            .base_token
-            .address
-            .as_deref()
-            .map(|addr| addr == addr_lower)
-            .unwrap_or(false)
-        {
-            return self.base_token.price_usd;
+    fn side_of(&self, addr_lower: &str) -> Option<PairSide> {
+        if self.base_token.address.as_deref() == Some(addr_lower) {
+            return Some(PairSide::Base);
         }
-        if self
-            .quote_token
-            .address
-            .as_deref()
-            .map(|addr| addr == addr_lower)
-            .unwrap_or(false)
-        {
-            return self.quote_token.price_usd;
+        if self.quote_token.address.as_deref() == Some(addr_lower) {
+            return Some(PairSide::Quote);
+        }
+        None
+    }
+
+    /// Depth attributable to `addr_lower` in that token's own units.
+    ///
+    /// `liquidity.base` / `liquidity.quote` are already token-denominated, so
+    /// they are used directly. Only when they are absent do we fall back to
+    /// converting half the USD liquidity through the pair price — and that
+    /// fallback is only sound on the base side, since `priceUsd` prices the
+    /// base token.
+    fn depth_tokens_for(&self, addr_lower: &str) -> Option<f64> {
+        let side = self.side_of(addr_lower)?;
+        let reported = match side {
+            PairSide::Base => self.liquidity.base,
+            PairSide::Quote => self.liquidity.quote,
+        };
+        if let Some(amount) = reported.filter(|v| v.is_finite() && *v > 0.0) {
+            return Some(amount);
+        }
+        if side == PairSide::Base {
+            let usd = self.liquidity.usd()?;
+            let price = self.price_usd.filter(|p| p.is_finite() && *p > 0.0)?;
+            let derived = (usd / 2.0) / price;
+            if derived.is_finite() && derived > 0.0 {
+                return Some(derived);
+            }
         }
         None
     }
@@ -327,6 +427,10 @@ impl DexScreenerPair {
 #[derive(Debug, Default)]
 struct DexScreenerLiquidity {
     usd: Option<f64>,
+    /// Token-denominated depth of each side, as reported by DexScreener. These
+    /// are what we actually want — no price conversion needed.
+    base: Option<f64>,
+    quote: Option<f64>,
 }
 
 impl DexScreenerLiquidity {
@@ -340,21 +444,29 @@ impl<'de> Deserialize<'de> for DexScreenerLiquidity {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = Value::deserialize(deserializer)?;
-
-        let usd = match value {
-            Value::Object(mut map) => map.remove("usd").and_then(|val| match val {
+        fn as_f64(val: Value) -> Option<f64> {
+            match val {
                 Value::Number(num) => num.as_f64(),
                 Value::String(s) => s.parse::<f64>().ok(),
-                Value::Null => None,
                 _ => None,
-            }),
-            Value::Number(num) => num.as_f64(),
-            Value::String(s) => s.parse::<f64>().ok(),
-            Value::Null | Value::Bool(_) | Value::Array(_) => None,
+            }
+        }
+
+        let value = Value::deserialize(deserializer)?;
+
+        // A bare scalar is treated as the USD figure, preserving the previous
+        // tolerance for non-object payloads.
+        let (usd, base, quote) = match value {
+            Value::Object(mut map) => (
+                map.remove("usd").and_then(as_f64),
+                map.remove("base").and_then(as_f64),
+                map.remove("quote").and_then(as_f64),
+            ),
+            other @ (Value::Number(_) | Value::String(_)) => (as_f64(other), None, None),
+            Value::Null | Value::Bool(_) | Value::Array(_) => (None, None, None),
         };
 
-        Ok(Self { usd })
+        Ok(Self { usd, base, quote })
     }
 }
 
@@ -362,8 +474,8 @@ impl<'de> Deserialize<'de> for DexScreenerLiquidity {
 struct DexScreenerToken {
     #[serde(default, deserialize_with = "deserialize_opt_string")]
     address: Option<String>,
-    #[serde(default, rename = "priceUsd", deserialize_with = "deserialize_opt_f64")]
-    price_usd: Option<f64>,
+    // No `priceUsd` here on purpose: DexScreener does not put one inside the
+    // token objects. It lives on the pair (`DexScreenerPair::price_usd`).
 }
 
 impl DexScreenerToken {

@@ -11,11 +11,30 @@ import sys
 
 import requests
 
-ALCHEMY_KEY = os.environ.get("ALCHEMY_KEY", "").strip()
-if not ALCHEMY_KEY:
-    print("FATAL: ALCHEMY_KEY not set", file=sys.stderr)
+# RPC endpoint. Prefer an explicit BASE_RPC_URL (or the first entry of
+# BASE_RPC_URLS, which is what the bot itself uses), and only fall back to
+# Alchemy. The hardcoded Alchemy URL made these builders unrunnable once that
+# key hit its monthly quota, which is why the pool inventories went stale.
+def _resolve_rpc_url():
+    explicit = os.environ.get("BASE_RPC_URL", "").strip()
+    if explicit:
+        return explicit
+    urls = os.environ.get("BASE_RPC_URLS", "").strip()
+    if urls:
+        first = urls.split(",")[0].strip()
+        if first:
+            return first
+    key = os.environ.get("ALCHEMY_KEY", "").strip()
+    if key:
+        return f"https://base-mainnet.g.alchemy.com/v2/{key}"
+    print(
+        "FATAL: set BASE_RPC_URL (or BASE_RPC_URLS, or ALCHEMY_KEY) to a Base RPC endpoint",
+        file=sys.stderr,
+    )
     sys.exit(2)
-RPC_URL = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_KEY}"
+
+
+RPC_URL = _resolve_rpc_url()
 
 FACTORY = "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"
 ID_GETPOOL = "0x28af8d0b"  # getPool(address,address,int24)
@@ -81,6 +100,36 @@ def build_hubs(weth_usd: float) -> dict:
     }
 
 
+def _extra_majors() -> list:
+    """Extra non-hub tokens to pair against, comma-separated in EXTRA_MAJORS.
+
+    These builders shipped with tiny hardcoded token sets, which is what kept
+    the Base inventories at 15-17 pools. Entries are validated as 20-byte hex so
+    a malformed address fails loudly here rather than silently yielding a pool
+    that never resolves.
+    """
+    raw = os.environ.get("EXTRA_MAJORS", "").strip()
+    if not raw:
+        return []
+    out, seen = [], set()
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if not (token.startswith("0x") and len(token) == 42):
+            print(f"FATAL: malformed EXTRA_MAJORS entry {token!r}", file=sys.stderr)
+            sys.exit(2)
+        try:
+            int(token, 16)
+        except ValueError:
+            print(f"FATAL: non-hex EXTRA_MAJORS entry {token!r}", file=sys.stderr)
+            sys.exit(2)
+        if token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
 def get_pool(session: requests.Session, token_a: str, token_b: str, tick_spacing: int) -> str | None:
     a = token_a.lower().replace("0x", "").rjust(64, "0")
     b = token_b.lower().replace("0x", "").rjust(64, "0")
@@ -139,8 +188,20 @@ def main() -> int:
     records: list[dict] = []
     seen: set[tuple[str, str, int]] = set()
 
-    for i, token0 in enumerate(hub_addrs):
-        for token1 in hub_addrs[i + 1 :]:
+    # Hub x hub alone is only C(8,2)=28 pairs, which capped this builder at 15
+    # pools. Pair the hubs against additional tokens too, but keep at least one
+    # hub on every pair: `hub_side_liquidity_usd` prices the pool from its hub
+    # side, so a major/major pool has no measurable USD value here and would be
+    # admitted unranked.
+    hub_set = {a.lower() for a in hub_addrs}
+    extra = _extra_majors()
+    scan_addrs = hub_addrs + [a for a in extra if a.lower() not in hub_set]
+    if extra:
+        print(f"scanning {len(hub_addrs)} hubs + {len(scan_addrs) - len(hub_addrs)} extra tokens")
+    for i, token0 in enumerate(scan_addrs):
+        for token1 in scan_addrs[i + 1 :]:
+            if token0.lower() not in hub_set and token1.lower() not in hub_set:
+                continue
             t0, t1 = (
                 (token0, token1)
                 if int(token0, 16) < int(token1, 16)
@@ -170,8 +231,14 @@ def main() -> int:
                         "hub_usd_liquidity": round(hub_usd, 2),
                     }
                 )
+                # Only one side is guaranteed to be a hub now that non-hub
+                # tokens are scanned, so label by address when unknown.
+                def _label(addr: str) -> str:
+                    entry = hubs.get(addr.lower())
+                    return entry[0] if entry else addr[:10]
+
                 print(
-                    f"  pool={pool} {hubs[t0][0]}/{hubs[t1][0]} ts={ts} liq={liq} hub_usd={hub_usd:.0f}",
+                    f"  pool={pool} {_label(t0)}/{_label(t1)} ts={ts} liq={liq} hub_usd={hub_usd:.0f}",
                     file=sys.stderr,
                 )
 

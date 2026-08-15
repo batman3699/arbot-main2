@@ -10,6 +10,7 @@ use ethers::{
     types::{Address, BlockId, BlockNumber, U256, U64},
 };
 use std::sync::Arc;
+use tracing::debug;
 
 abigen!(
     IClPoolState,
@@ -35,6 +36,13 @@ pub struct ClPoolState {
     pub fee_ppm: u32,
 }
 
+/// Serialises tests that mutate `ARBOT_LOCAL_CL_QUOTES`. The env is process
+/// global, so a test flipping it races any concurrent test that reads it.
+/// Lives here (not in main.rs's test module) because `cl_sim` compiles into both
+/// the lib and bin targets, and the lib cannot see bin-only items.
+#[cfg(test)]
+pub(crate) static CL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn local_cl_quotes_enabled() -> bool {
     std::env::var("ARBOT_LOCAL_CL_QUOTES")
         .map(|raw| !matches!(raw.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
@@ -46,6 +54,138 @@ pub fn cl_quote_parity_enabled() -> bool {
     std::env::var("ARBOT_CL_QUOTE_PARITY")
         .map(|raw| matches!(raw.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
+}
+
+/// Selectors for the four CL pool state reads, derived rather than hardcoded so
+/// a typo cannot silently produce a batch of reverting sub-calls.
+fn cl_state_selectors() -> [[u8; 4]; 4] {
+    let sel = |sig: &str| {
+        let h = ethers::utils::keccak256(sig.as_bytes());
+        [h[0], h[1], h[2], h[3]]
+    };
+    [
+        sel("slot0()"),
+        sel("liquidity()"),
+        sel("tickSpacing()"),
+        sel("fee()"),
+    ]
+}
+
+/// Decode a 32-byte big-endian word holding a signed int24 (two's complement).
+fn decode_int24(word: &[u8]) -> i32 {
+    if word.len() < 32 {
+        return 0;
+    }
+    // int24 occupies the low 3 bytes, sign-extended across the full word.
+    let raw = ((word[29] as u32) << 16) | ((word[30] as u32) << 8) | (word[31] as u32);
+    if raw & 0x80_0000 != 0 {
+        (raw | 0xff00_0000) as i32
+    } else {
+        raw as i32
+    }
+}
+
+/// Load CL pool state for MANY pools in one Multicall3 round-trip.
+///
+/// The per-pool [`load_cl_pool_state`] issues four SEQUENTIAL `eth_call`s
+/// (slot0, liquidity, tickSpacing, fee). Across a hot-pool set that is the
+/// dominant scan cost and the exact pattern spec §3.4 forbids: a 64-pool venue
+/// cost 256 round-trips, which at a 15 req/s provider limit is ~17s of pure
+/// network wait — measured populate times were 43-48s against a 200ms budget.
+///
+/// This issues `4 * pools` sub-calls inside a single `aggregate3`, chunked so
+/// one batch stays within node `eth_call` gas limits. Pools whose sub-calls
+/// revert or return zero liquidity are simply absent from the result, and the
+/// caller falls back to the per-pool path for those.
+pub async fn load_cl_pool_states_batched<C>(
+    provider: Arc<Provider<C>>,
+    pools: &[(Address, Option<u32>)],
+    block: U64,
+) -> std::collections::HashMap<Address, ClPoolState>
+where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    use std::collections::HashMap;
+    let mut out: HashMap<Address, ClPoolState> = HashMap::new();
+    if pools.is_empty() {
+        return out;
+    }
+    let [slot0_sel, liq_sel, spacing_sel, fee_sel] = cl_state_selectors();
+
+    // 4 sub-calls per pool; 32 pools => 128 sub-calls per batch.
+    const POOLS_PER_BATCH: usize = 32;
+    for chunk in pools.chunks(POOLS_PER_BATCH) {
+        let mut calls: Vec<(Address, Vec<u8>)> = Vec::with_capacity(chunk.len() * 4);
+        for (pool, _) in chunk {
+            calls.push((*pool, slot0_sel.to_vec()));
+            calls.push((*pool, liq_sel.to_vec()));
+            calls.push((*pool, spacing_sel.to_vec()));
+            calls.push((*pool, fee_sel.to_vec()));
+        }
+
+        let results =
+            match crate::quote_cl::multicall3_aggregate3(&provider, &calls, block).await {
+                Ok(r) => r,
+                Err(err) => {
+                    debug!(
+                        target: "cl_sim",
+                        error = %err,
+                        pools = chunk.len(),
+                        "batched CL state read failed; callers fall back per-pool"
+                    );
+                    continue;
+                }
+            };
+
+        for (i, (pool, fee_hint)) in chunk.iter().enumerate() {
+            let base = i * 4;
+            let Some(Some(slot0)) = results.get(base) else {
+                continue;
+            };
+            if slot0.len() < 64 {
+                continue;
+            }
+            let sqrt_price_x96 = U256::from_big_endian(&slot0[..32]);
+            if sqrt_price_x96.is_zero() {
+                continue;
+            }
+            let tick = decode_int24(&slot0[32..64]);
+
+            let Some(Some(liq_raw)) = results.get(base + 1) else {
+                continue;
+            };
+            if liq_raw.len() < 32 {
+                continue;
+            }
+            let liquidity = U256::from_big_endian(&liq_raw[..32]).low_u128();
+            if liquidity == 0 {
+                continue;
+            }
+
+            let tick_spacing = match results.get(base + 2) {
+                Some(Some(b)) if b.len() >= 32 => decode_int24(&b[..32]),
+                _ => 60,
+            };
+            let fee_on_chain = match results.get(base + 3) {
+                Some(Some(b)) if b.len() >= 32 => {
+                    Some(U256::from_big_endian(&b[..32]).low_u32())
+                }
+                _ => None,
+            };
+
+            out.insert(
+                *pool,
+                ClPoolState {
+                    sqrt_price_x96,
+                    liquidity,
+                    tick,
+                    tick_spacing,
+                    fee_ppm: fee_hint.or(fee_on_chain).unwrap_or(3_000),
+                },
+            );
+        }
+    }
+    out
 }
 
 /// Load slot0 + liquidity once per pool per block (tick spacing + fee from chain).
@@ -239,10 +379,58 @@ mod tests {
 
     #[test]
     fn local_cl_quotes_default_enabled() {
+        // Mutating a process-global env var races any other test that reads it
+        // (plan::tests exercises the CL curve path gated on this flag), so both
+        // sides must take the same lock.
+        let _guard = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("ARBOT_LOCAL_CL_QUOTES");
         assert!(local_cl_quotes_enabled());
         std::env::set_var("ARBOT_LOCAL_CL_QUOTES", "0");
         assert!(!local_cl_quotes_enabled());
         std::env::remove_var("ARBOT_LOCAL_CL_QUOTES");
+    }
+
+    #[test]
+    fn cl_state_selectors_match_signatures() {
+        // Derived, not hardcoded — a wrong selector would make every batched
+        // sub-call revert and silently degrade to the per-pool fallback.
+        let [slot0, liquidity, spacing, fee] = cl_state_selectors();
+        assert_eq!(slot0, &ethers::utils::id("slot0()")[..4]);
+        assert_eq!(liquidity, &ethers::utils::id("liquidity()")[..4]);
+        assert_eq!(spacing, &ethers::utils::id("tickSpacing()")[..4]);
+        assert_eq!(fee, &ethers::utils::id("fee()")[..4]);
+        // Canonical UniV3 values, as a second independent check.
+        assert_eq!(slot0, [0x38, 0x50, 0xc7, 0xbd]);
+        assert_eq!(liquidity, [0x1a, 0x68, 0x65, 0x02]);
+    }
+
+    #[test]
+    fn decode_int24_handles_negative_ticks() {
+        // Ticks are int24 two's complement inside a 32-byte word. Treating a
+        // negative tick as unsigned would place the pool at an absurd price.
+        let mut word = [0u8; 32];
+
+        word[29..32].copy_from_slice(&[0x00, 0x00, 0x0a]);
+        assert_eq!(decode_int24(&word), 10);
+
+        // -1 => 0xFFFFFF in the low three bytes, sign-extended above.
+        for b in word.iter_mut() {
+            *b = 0xff;
+        }
+        assert_eq!(decode_int24(&word), -1);
+
+        // -887272 (UniV3 MIN_TICK): 2^24 - 887272 = 15889944 = 0xF27618
+        let mut w2 = [0xffu8; 32];
+        w2[29..32].copy_from_slice(&[0xf2, 0x76, 0x18]);
+        assert_eq!(decode_int24(&w2), -887_272);
+
+        // 887272 (UniV3 MAX_TICK) = 0x0D89E8
+        let mut w3 = [0u8; 32];
+        w3[29..32].copy_from_slice(&[0x0d, 0x89, 0xe8]);
+        assert_eq!(decode_int24(&w3), 887_272);
+
+        // Short/empty returndata must not panic.
+        assert_eq!(decode_int24(&[0u8; 8]), 0);
+        assert_eq!(decode_int24(&[]), 0);
     }
 }

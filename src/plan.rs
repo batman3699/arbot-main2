@@ -20,9 +20,110 @@ use tracing::{info, warn};
 /// and makes exact-output UniV2/Solidly swaps revert on-chain. Other venues
 /// (UniV3/Curve/Balancer) keep the linear estimate, where min_out is only a floor
 /// and is validated by pre-broadcast simulation.
+/// Haircut applied to single-tick CL quotes, in bps, covering liquidity the
+/// simulator cannot see because it does not cross ticks. Set 0 once the
+/// simulator is multi-tick.
+fn cl_tick_buffer_bps() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        crate::util::env_parse_opt::<u32>("ARBOT_CL_TICK_BUFFER_BPS")
+            .unwrap_or(50)
+            .min(2_000)
+    })
+}
+
+/// Low-cardinality venue label for diagnostics.
+fn venue_kind_label(venue: &VenueEdge) -> &'static str {
+    match venue {
+        VenueEdge::UniV3 { .. } => "univ3",
+        VenueEdge::Slipstream { .. } => "slipstream",
+        VenueEdge::UniV2 { .. } => "univ2",
+        VenueEdge::SolidlyV2 { .. } => "solidly_v2",
+        VenueEdge::Balancer { .. } => "balancer",
+        VenueEdge::Curve { .. } => "curve",
+        VenueEdge::Univ4 { .. } => "univ4",
+        VenueEdge::Bridge { .. } => "bridge",
+        VenueEdge::Liquidation { .. } => "liquidation",
+    }
+}
+
+/// How far `floor` sits below `expected`, in bps. The quantity that decides
+/// whether a hop reverts: if the pool pays less than this haircut allows for,
+/// the router's `min_out` check fails.
+fn bps_below(expected: U256, floor: U256) -> u64 {
+    if expected.is_zero() || floor >= expected {
+        return 0;
+    }
+    let diff = expected.saturating_sub(floor);
+    mul_div(diff, U256::from(10_000u64), expected).as_u64()
+}
+
 fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
     let linear = mul_div(current_amount, edge.rate_num, edge.rate_den);
     match &edge.venue {
+        // Concentrated-liquidity hops carry their pool state on the edge, so the
+        // true curve output is computable locally — the same `cl_sim` call the
+        // size search already uses to price these hops.
+        //
+        // These kept the LINEAR estimate while UniV2/Solidly moved to real curve
+        // math, and that asymmetry is what made every CL cycle revert. A secant
+        // lies above a convex curve, so the linear rate OVERSTATES output; the
+        // resulting `min_out` floor sits above what the pool can actually pay and
+        // the swap reverts with `Too little received`. Measured on Base: 50/50
+        // candidates, all `venue_path: [univ3, slipstream]`, reverted on exactly
+        // this. Sizing said the cycle was profitable because sizing quoted the
+        // real curve; only the plan disagreed.
+        //
+        // Mirrors sizing's guard: `state` describes ONE pool, so this is valid
+        // only for a single-pool hop. Multi-hop encoded paths keep the linear
+        // estimate and remain covered by pre-broadcast simulation.
+        VenueEdge::UniV3 {
+            path,
+            state: Some(cl_state),
+            ..
+        }
+        | VenueEdge::Slipstream {
+            path,
+            state: Some(cl_state),
+            ..
+        } if crate::cl_sim::local_cl_quotes_enabled() && path.len() <= 2 => {
+            // UniV3-family pools order tokens by address, so `from` is token0
+            // exactly when it sorts below `to`.
+            let zero_for_one = edge.from < edge.to;
+            match crate::cl_sim::quote_exact_input_single_tick(
+                cl_state,
+                current_amount,
+                zero_for_one,
+                cl_state.fee_ppm,
+            ) {
+                Ok(Some(out)) if !out.is_zero() => {
+                    // `quote_exact_input_single_tick` holds liquidity CONSTANT —
+                    // it does not cross ticks (`tick`/`tick_spacing` are carried
+                    // but unused, pending multi-tick simulation). Real liquidity
+                    // can fall past a tick boundary, so this estimate is
+                    // systematically OPTIMISTIC for any swap large enough to
+                    // cross one, and a `min_out` built from it sits above what
+                    // the pool pays -> `Too little received`.
+                    //
+                    // Discount it to cover that unmodelled crossing. This is a
+                    // correction for a KNOWN bias, not a loosening of slippage
+                    // protection: without it min_out is simply wrong. Tune with
+                    // ARBOT_CL_TICK_BUFFER_BPS; it can be removed once the
+                    // simulator crosses ticks properly.
+                    let discounted = crate::util::apply_slippage(out, cl_tick_buffer_bps());
+                    tracing::debug!(
+                        target: "minout",
+                        curve_out = %out,
+                        linear_out = %linear,
+                        discounted = %discounted,
+                        buffer_bps = cl_tick_buffer_bps(),
+                        "CL hop priced on the curve"
+                    );
+                    discounted
+                }
+                _ => linear,
+            }
+        }
         VenueEdge::UniV2 {
             token0,
             token1,
@@ -81,11 +182,13 @@ fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
     }
 }
 
+#[derive(Clone)]
 pub enum GenericPreAction {
     Approve { token: Address, amount: U256 },
     Transfer { token: Address, amount: U256 },
 }
 
+#[derive(Clone)]
 pub enum StepData {
     Uniswap {
         path: Bytes,
@@ -131,6 +234,67 @@ pub enum StepData {
 pub struct Plan {
     pub steps: Vec<StepData>,
     pub cycle_slippage_bps: u32,
+}
+
+impl Plan {
+    /// Copy of this plan with every per-hop `min_out` floor removed.
+    ///
+    /// Diagnostic only, and NEVER for dispatch: a plan with no floor has no
+    /// slippage protection and would execute at any price. Its purpose is to
+    /// answer the one question a `Too little received` revert refuses to —
+    /// what the pools ACTUALLY pay. Simulating this variant succeeds where the
+    /// real plan reverts, so the achieved output can be compared against the
+    /// demanded floor and the gap measured instead of guessed.
+    ///
+    /// Floors are set to 1 rather than 0 because several venue adapters treat a
+    /// zero `min_out` as "unset" and reject the step.
+    #[allow(dead_code)]
+    pub fn with_relaxed_min_outs(&self) -> Plan {
+        let one = U256::one();
+        let steps = self
+            .steps
+            .iter()
+            .cloned()
+            .map(|step| match step {
+                StepData::Uniswap {
+                    path, amount_in, ..
+                } => StepData::Uniswap {
+                    path,
+                    amount_in,
+                    min_out: one,
+                },
+                StepData::JitLiquidityRemove {
+                    pool,
+                    target_token,
+                    fee,
+                    ..
+                } => StepData::JitLiquidityRemove {
+                    pool,
+                    target_token,
+                    fee,
+                    min_out: one,
+                },
+                StepData::Balancer {
+                    pool_id,
+                    token_in,
+                    token_out,
+                    amount_in,
+                    ..
+                } => StepData::Balancer {
+                    pool_id,
+                    token_in,
+                    token_out,
+                    amount_in,
+                    min_out: one,
+                },
+                other => other,
+            })
+            .collect();
+        Plan {
+            steps,
+            cycle_slippage_bps: self.cycle_slippage_bps,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -195,6 +359,12 @@ pub async fn build_plan_for_cycle(
             warn!(from = %from, to = %to, "Skipping plan build for missing edge");
             return Err(anyhow!("missing edge between {from:?} and {to:?}"));
         };
+        if matches!(
+            &edge.venue,
+            VenueEdge::UniV3 { state: None, .. } | VenueEdge::Slipstream { state: None, .. }
+        ) {
+            tracing::debug!(target: "minout", "CL hop has NO pool state; using linear estimate");
+        }
         let expected_out = hop_expected_out(edge, from, current_amount);
         let min_out = apply_slippage(expected_out, edge.tolerance_bps);
         if min_out.is_zero() {
@@ -202,7 +372,7 @@ pub async fn build_plan_for_cycle(
         }
         max_slippage_bps = max_slippage_bps.max(edge.observed_slippage_bps);
         match &edge.venue {
-            VenueEdge::UniV3 { path, pool, fee } => {
+            VenueEdge::UniV3 { path, pool, fee, .. } => {
                 if let Some(cfg) = jit {
                     if cfg.enabled && current_amount >= cfg.min_amount_in && path.len() == 2 {
                         let token_in = path[0].0;
@@ -306,12 +476,36 @@ pub async fn build_plan_for_cycle(
                 ..
             } => {
                 let bytes = encode_univ3_path(path).context("encode slipstream path")?;
-                const EXACT_INPUT: [u8; 4] = [0xc0, 0x4b, 0x8d, 0x70];
-                let mut data = Vec::with_capacity(EXACT_INPUT.len() + 32 * 5);
+                // Aerodrome Slipstream's router is a UniV3 SwapRouter (v1) fork:
+                //
+                //   exactInput((bytes,address,uint256,uint256,uint256))  0xc04b8d59
+                //   struct ExactInputParams { path, recipient, deadline, amountIn, amountOutMinimum }
+                //
+                // The previous encoding was wrong twice over. It emitted
+                // 0xc04b8d70 — not a real selector, a transposition of
+                // 0xc04b8d59 — and it packed only FOUR fields (SwapRouter02's
+                // deadline-less shape, which is 0xb858183f). Verified against the
+                // deployed router's bytecode: 0xc04b8d59 is present; neither
+                // 0xc04b8d70 nor 0xb858183f is.
+                //
+                // An unknown selector matches no function, so the router reverted
+                // with EMPTY return data, which the executor surfaces as the
+                // catch-all `InvalidGenericAction()`. Every Slipstream hop failed
+                // this way, which is why no cycle touching Slipstream could ever
+                // execute regardless of price.
+                const EXACT_INPUT: [u8; 4] = [0xc0, 0x4b, 0x8d, 0x59];
+                // Deadline is the router's own staleness guard. `U256::MAX`
+                // disables it deliberately: the executor already enforces a
+                // plan-level deadline in `_executePlan`, and a second, tighter
+                // one derived here — with no access to block.timestamp — could
+                // only reject otherwise-valid plans.
+                let deadline = U256::MAX;
+                let mut data = Vec::with_capacity(EXACT_INPUT.len() + 32 * 6);
                 data.extend_from_slice(&EXACT_INPUT);
                 data.extend(ethers::abi::encode(&[ethers::abi::Token::Tuple(vec![
                     ethers::abi::Token::Bytes(bytes),
                     ethers::abi::Token::Address(executor_address),
+                    ethers::abi::Token::Uint(deadline),
                     ethers::abi::Token::Uint(current_amount),
                     ethers::abi::Token::Uint(min_out),
                 ])]));
@@ -522,6 +716,22 @@ pub async fn build_plan_for_cycle(
                 });
             }
         }
+        // Per-hop record of exactly what floor this plan demands, and from what.
+        // A `Too little received` revert names no amounts, so without this the
+        // only way to reason about a failure is to guess which hop was too
+        // tight. Pair it with `Plan::with_relaxed_min_outs` to get the achieved
+        // output and turn the guess into a measurement.
+        tracing::debug!(
+            target: "minout",
+            hop = steps.len().saturating_sub(1),
+            venue = venue_kind_label(&edge.venue),
+            amount_in = %current_amount,
+            expected_out = %expected_out,
+            min_out = %min_out,
+            tolerance_bps = edge.tolerance_bps,
+            haircut_bps = %bps_below(expected_out, min_out),
+            "plan hop min_out"
+        );
         current_amount = min_out;
     }
 
@@ -535,7 +745,7 @@ pub async fn build_plan_for_cycle(
 mod tests {
     use super::*;
     use crate::graph::{Edge, Graph, VenueEdge};
-    use crate::util::{compute_edge_weight, NativePrice};
+    use crate::util::compute_edge_weight;
     use ethers::abi::{decode, ParamType, Token};
     use ethers::types::Address;
 
@@ -543,15 +753,267 @@ mod tests {
         Address::from_low_u64_be(n)
     }
 
-    fn fp_weight(num: u64, den: u64) -> i64 {
-        compute_edge_weight(
-            U256::from(num),
-            U256::from(den),
-            0,
-            U256::zero(),
-            U256::from(1u64),
-            NativePrice::unit(),
+    /// The `Too little received` bug: a linear rate is a SECANT, and a secant
+    /// lies above a convex AMM curve. Deriving `min_out` from it sets a floor the
+    /// pool cannot pay, so the swap reverts on-chain even though sizing — which
+    /// quotes the real curve — called the cycle profitable.
+    #[test]
+    fn cl_hop_expected_out_uses_the_curve_not_the_secant() {
+        let _guard = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ARBOT_LOCAL_CL_QUOTES", "1");
+        let state = crate::cl_sim::ClPoolState {
+            sqrt_price_x96: U256::from(1u64) << 96, // price = 1
+            liquidity: 1_000_000_000_000_000u128,
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 3000,
+        };
+        let state_for_raw = state.clone();
+        // rate_num/rate_den = 1:1 => the linear estimate ignores both fee and
+        // price impact, so it is strictly optimistic.
+        let edge = Edge {
+            from: addr(1),
+            to: addr(2),
+            rate_num: U256::from(1u64),
+            rate_den: U256::from(1u64),
+            venue: VenueEdge::UniV3 {
+                path: vec![(addr(1), Some(3000))],
+                pool: addr(99),
+                fee: 3000,
+                state: Some(state),
+            },
+            estimated_gas: 0,
+            weight: compute_edge_weight(U256::from(1u64), U256::from(1u64)),
+            max_input: U256::zero(),
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+        };
+
+        let amount_in = U256::from(1_000_000_000u64);
+        let linear = mul_div(amount_in, edge.rate_num, edge.rate_den);
+        let actual = hop_expected_out(&edge, addr(1), amount_in);
+
+        assert!(!actual.is_zero(), "curve quote must resolve");
+        assert!(
+            actual < linear,
+            "curve output {actual} must be BELOW the linear secant {linear};              a floor above the curve is what reverts on-chain"
+        );
+
+        // And below the raw single-tick quote too: that quote holds liquidity
+        // constant, so it over-reads any swap that crosses a tick.
+        let raw = crate::cl_sim::quote_exact_input_single_tick(
+            &state_for_raw,
+            amount_in,
+            true,
+            state_for_raw.fee_ppm,
         )
+        .unwrap()
+        .unwrap();
+        assert!(
+            actual < raw,
+            "min_out basis {actual} must sit under the un-buffered single-tick quote {raw}"
+        );
+    }
+
+    /// The relaxed plan exists to measure what pools actually pay when the real
+    /// plan reverts. It is diagnostic ONLY — it carries no slippage protection,
+    /// so the invariant that matters is that it differs from the dispatchable
+    /// plan in exactly one way: the floors are gone.
+    /// A wrong selector reverts with EMPTY data, which the executor reports as
+    /// the catch-all `InvalidGenericAction()` — indistinguishable from a dozen
+    /// other faults. Pin the exact bytes and the exact arity so this can never
+    /// silently regress into that black hole again.
+    #[tokio::test]
+    async fn slipstream_step_targets_the_routers_real_exact_input() {
+        let mut graph = Graph::default();
+        let a = addr(1);
+        let b = addr(2);
+        let router = addr(77);
+        let ai = graph.add_node(a);
+        let bi = graph.add_node(b);
+        graph.add_edge(Edge {
+            from: a,
+            to: b,
+            rate_num: U256::from(101u64),
+            rate_den: U256::from(100u64),
+            venue: VenueEdge::Slipstream {
+                path: vec![(a, Some(100))],
+                pool: addr(88),
+                tick_spacing: 100,
+                router,
+                state: None,
+            },
+            estimated_gas: 0,
+            weight: fp_weight(101, 100),
+            max_input: U256::zero(),
+            tolerance_bps: 50,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+        });
+        graph.add_edge(Edge {
+            from: b,
+            to: a,
+            rate_num: U256::from(101u64),
+            rate_den: U256::from(100u64),
+            venue: VenueEdge::UniV2 {
+                pair: addr(99),
+                token_out: a,
+                token0: a,
+                token1: b,
+                reserve_in: U256::from(1_000_000u64),
+                reserve_out: U256::from(1_000_000u64),
+                fee_bps: 30,
+            },
+            estimated_gas: 0,
+            weight: fp_weight(101, 100),
+            max_input: U256::zero(),
+            tolerance_bps: 50,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+        });
+
+        let plan = build_plan_for_cycle(
+            &graph,
+            &[ai, bi, ai],
+            U256::from(1_000u64),
+            addr(5),
+            None,
+            None,
+            U64::zero(),
+        )
+        .await
+        .expect("plan builds");
+
+        let generic = plan
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                StepData::Generic { target, call, .. } if *target == router => Some(call.clone()),
+                _ => None,
+            })
+            .expect("slipstream emits a generic router call");
+
+        // exactInput((bytes,address,uint256,uint256,uint256)) on the deployed
+        // Slipstream router. NOT 0xc04b8d70 (nonexistent) and NOT 0xb858183f
+        // (SwapRouter02's deadline-less 4-field form).
+        assert_eq!(&generic[..4], &[0xc0, 0x4b, 0x8d, 0x59], "wrong selector");
+
+        // Five fields: head offset + recipient + deadline + amountIn + minOut,
+        // then the dynamic `path` tail. A 4-field body would be 32 bytes shorter.
+        let body = &generic[4..];
+        let decoded = ethers::abi::decode(
+            &[ethers::abi::ParamType::Tuple(vec![
+                ethers::abi::ParamType::Bytes,
+                ethers::abi::ParamType::Address,
+                ethers::abi::ParamType::Uint(256),
+                ethers::abi::ParamType::Uint(256),
+                ethers::abi::ParamType::Uint(256),
+            ])],
+            body,
+        )
+        .expect("params decode as the router's 5-field tuple");
+        let ethers::abi::Token::Tuple(fields) = &decoded[0] else {
+            panic!("expected tuple");
+        };
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields[1], ethers::abi::Token::Address(addr(5)), "recipient");
+        assert_eq!(
+            fields[2],
+            ethers::abi::Token::Uint(U256::MAX),
+            "deadline field must be present and third"
+        );
+        assert_eq!(
+            fields[3],
+            ethers::abi::Token::Uint(U256::from(1_000u64)),
+            "amountIn"
+        );
+    }
+
+    #[test]
+    fn relaxed_plan_strips_every_min_out_floor() {
+        let plan = Plan {
+            steps: vec![
+                StepData::Uniswap {
+                    path: Bytes::from(vec![1u8, 2, 3]),
+                    amount_in: U256::from(1_000u64),
+                    min_out: U256::from(990u64),
+                },
+                StepData::Balancer {
+                    pool_id: [7u8; 32],
+                    token_in: addr(1),
+                    token_out: addr(2),
+                    amount_in: U256::from(500u64),
+                    min_out: U256::from(495u64),
+                },
+            ],
+            cycle_slippage_bps: 50,
+        };
+        let relaxed = plan.with_relaxed_min_outs();
+
+        assert_eq!(relaxed.steps.len(), plan.steps.len(), "no step may be lost");
+        assert_eq!(
+            relaxed.cycle_slippage_bps, plan.cycle_slippage_bps,
+            "only per-hop floors change"
+        );
+        for step in &relaxed.steps {
+            match step {
+                // 1, not 0: several adapters reject a zero min_out as "unset".
+                StepData::Uniswap { min_out, amount_in, .. } => {
+                    assert_eq!(*min_out, U256::one());
+                    assert_eq!(*amount_in, U256::from(1_000u64), "amounts preserved");
+                }
+                StepData::Balancer { min_out, amount_in, .. } => {
+                    assert_eq!(*min_out, U256::one());
+                    assert_eq!(*amount_in, U256::from(500u64), "amounts preserved");
+                }
+                _ => panic!("unexpected step kind"),
+            }
+        }
+    }
+
+    #[test]
+    fn bps_below_measures_the_haircut() {
+        assert_eq!(bps_below(U256::from(10_000u64), U256::from(9_900u64)), 100);
+        assert_eq!(bps_below(U256::from(10_000u64), U256::from(10_000u64)), 0);
+        // A floor ABOVE expected is the reverting case; report 0 rather than
+        // underflowing into a nonsense value.
+        assert_eq!(bps_below(U256::from(10_000u64), U256::from(10_500u64)), 0);
+        assert_eq!(bps_below(U256::zero(), U256::from(1u64)), 0);
+    }
+
+    #[test]
+    fn cl_hop_falls_back_to_linear_without_pool_state() {
+        // No `state` => the curve is not computable locally, so the linear
+        // estimate stands and pre-broadcast simulation remains the guard.
+        let edge = Edge {
+            from: addr(1),
+            to: addr(2),
+            rate_num: U256::from(2u64),
+            rate_den: U256::from(1u64),
+            venue: VenueEdge::UniV3 {
+                path: vec![(addr(1), Some(3000))],
+                pool: addr(99),
+                fee: 3000,
+                state: None,
+            },
+            estimated_gas: 0,
+            weight: compute_edge_weight(U256::from(2u64), U256::from(1u64)),
+            max_input: U256::zero(),
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+        };
+        let amount_in = U256::from(1_000u64);
+        assert_eq!(hop_expected_out(&edge, addr(1), amount_in), U256::from(2_000u64));
+    }
+
+    fn fp_weight(num: u64, den: u64) -> i64 {
+        compute_edge_weight(U256::from(num), U256::from(den))
     }
 
     #[tokio::test]
@@ -1158,6 +1620,7 @@ mod tests {
                 path: vec![(a, None), (b, Some(3000))],
                 pool,
                 fee: 3000,
+                state: None,
             },
             estimated_gas: 0,
             weight: 0,

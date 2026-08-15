@@ -58,17 +58,10 @@ pub struct LiquidationCall {
 }
 
 impl LiquidationOpportunity {
-    pub fn to_edge(&self, gas_price: U256, base_amount: U256, native_price: NativePrice) -> Edge {
+    pub fn to_edge(&self, _gas_price: U256, _base_amount: U256, _native_price: NativePrice) -> Edge {
         let rate_num = self.expected_collateral;
         let rate_den = self.repay_amount;
-        let weight = compute_edge_weight(
-            rate_num,
-            rate_den,
-            self.estimated_gas,
-            gas_price,
-            base_amount,
-            native_price,
-        );
+        let weight = compute_edge_weight(rate_num, rate_den);
         info!(
             protocol = %self.protocol,
             debt = %format!("{:#x}", self.debt_token),

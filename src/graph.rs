@@ -1,10 +1,10 @@
-use crate::{metrics::Metrics, util::u256_to_f64};
+use crate::{metrics::Metrics, util::u256_to_f64, util::WEIGHT_SCALE};
 use dashmap::DashMap;
 use ethers::types::{Address, U256, U512, U64};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -15,6 +15,11 @@ pub enum VenueEdge {
         path: Vec<(Address, Option<u32>)>,
         pool: Address,
         fee: u32,
+        /// Pool state captured when the edge was built, so the size search can
+        /// re-quote this hop locally instead of paying an `eth_call` per probe.
+        /// `None` falls back to the RPC quoter (state unavailable, or
+        /// `ARBOT_LOCAL_CL_QUOTES=0`).
+        state: Option<crate::cl_sim::ClPoolState>,
     },
     /// Aerodrome Slipstream CL pools (tick spacing stored in `fee` field of path hops).
     Slipstream {
@@ -22,6 +27,8 @@ pub enum VenueEdge {
         pool: Address,
         tick_spacing: u32,
         router: Address,
+        /// See `UniV3::state`.
+        state: Option<crate::cl_sim::ClPoolState>,
     },
     Balancer {
         pool_id: [u8; 32],
@@ -105,6 +112,425 @@ pub struct Edge {
     pub observed_slippage_bps: u32,
     pub quote_block: Option<U64>,
     pub active: bool,
+}
+
+/// `a * b / d`, evaluated in 512 bits so the intermediate product cannot wrap.
+/// Saturates instead of panicking; a zero divisor yields zero.
+fn mul_div_floor(a: U256, b: U256, d: U256) -> U256 {
+    if d.is_zero() {
+        return U256::zero();
+    }
+    let wide = U512::from(a) * U512::from(b) / U512::from(d);
+    if wide > U512::from(U256::MAX) {
+        return U256::MAX;
+    }
+    let mut buf = [0u8; 64];
+    wide.to_little_endian(&mut buf);
+    U256::from_little_endian(&buf[..32])
+}
+
+/// Largest cycle input, in the START token's raw units, that respects every
+/// hop's `max_input` capacity.
+///
+/// `Edge::max_input` is denominated in that edge's own `from` token, so the
+/// per-hop caps are not comparable to each other. The scanner used to fold them
+/// with a plain `min()`, which mixed WETH wei with USDC's 6-decimal units and
+/// with AERO, then handed the winner to the sizer as a start-token ceiling: a
+/// 19 USDC cap arrived as 1.9e-11 WETH and every candidate died with
+/// `upper_cap < min_amount`.
+///
+/// Each cap is instead pulled back to the start token along the cycle's own
+/// quoted rates. If `probe` units of the start token reach hop `i` as `amt_i`,
+/// that hop binds at `probe * cap_i / amt_i` start-token units. The tightest
+/// such bound is the cycle capacity.
+///
+/// `probe` must be the notional the edge rates were observed at: `rate_num /
+/// rate_den` is an average price at that size, so the projection is exact at
+/// `probe` and approximate away from it. That is sufficient here — this only
+/// bounds the sizer's search range, and the sizer re-quotes for real at every
+/// candidate size it evaluates.
+pub fn cycle_input_capacity(edges: &[Edge], probe: U256) -> U256 {
+    if edges.is_empty() || probe.is_zero() {
+        return U256::zero();
+    }
+    let mut capacity = U256::MAX;
+    let mut amount = probe;
+    for edge in edges {
+        // A hop that receives nothing cannot be scaled into; the cycle is dead.
+        if amount.is_zero() {
+            return U256::zero();
+        }
+        capacity = capacity.min(mul_div_floor(probe, edge.max_input, amount));
+        amount = mul_div_floor(amount, edge.rate_num, edge.rate_den);
+    }
+    capacity
+}
+
+/// Bounds for [`Graph::hub_anchored_cycles`].
+#[derive(Clone, Copy, Debug)]
+pub struct HubSearchLimits {
+    pub min_hops: usize,
+    pub max_hops: usize,
+    pub max_cycles: usize,
+    pub timeout: Duration,
+    /// Parallel edges retained per `(from, to)` pair after dominance pruning.
+    /// 1 keeps only the best-rate pool, which loses the deeper-but-slightly-worse
+    /// pool that often sizes better; 3 is a reasonable default.
+    pub parallel_edges_per_pair: usize,
+}
+
+impl HubSearchLimits {
+    pub fn sanitized(self) -> Self {
+        let max_hops = self.max_hops.max(2);
+        Self {
+            min_hops: self.min_hops.max(2).min(max_hops),
+            max_hops,
+            max_cycles: self.max_cycles.max(1),
+            timeout: if self.timeout.is_zero() {
+                Duration::from_millis(1)
+            } else {
+                self.timeout
+            },
+            parallel_edges_per_pair: self.parallel_edges_per_pair.clamp(1, 8),
+        }
+    }
+}
+
+/// Natural-log of an edge's post-haircut exchange rate, or `None` if the edge
+/// is unusable. This is the quantity cycles accumulate: a cycle is profitable
+/// exactly when the sum over its hops is positive.
+fn edge_log_rate(edge: &Edge) -> Option<f64> {
+    if !edge.active || edge.rate_den.is_zero() {
+        return None;
+    }
+    let protected_num =
+        crate::util::apply_slippage(edge.rate_num, crate::util::detection_haircut_bps());
+    if protected_num.is_zero() {
+        return None;
+    }
+    let rate = u256_to_f64(protected_num) / u256_to_f64(edge.rate_den);
+    if rate <= 0.0 {
+        return None;
+    }
+    let log_rate = rate.ln();
+    log_rate.is_finite().then_some(log_rate)
+}
+
+impl Graph {
+    /// Enumerate profitable cycles that start and end at a hub token.
+    ///
+    /// Bellman-Ford is built to find negative cycles of unknown length anywhere
+    /// in a large graph. That is not this problem. Every executable cycle must
+    /// start and end at a flash-loan asset, `max_hops` is 2-3, and the token
+    /// universe is small — so the candidate set can be enumerated exhaustively
+    /// and exactly, for less work than BF's relaxation sweeps, with none of its
+    /// costs: no fixed-point log-weight precision loss, no relaxation budget
+    /// silently truncating the search, no rotated duplicates to canonicalise
+    /// afterwards, and no need to bolt "must start at a hub" on as a priority
+    /// heuristic.
+    ///
+    /// Three things keep it cheap:
+    ///   * **Dominance pruning** — among parallel pools on the same token pair
+    ///     only the best few rates can start a winning cycle, so the rest are
+    ///     dropped before the walk (`parallel_edges_per_pair`).
+    ///   * **Branch and bound** — a partial path is abandoned as soon as even
+    ///     the most optimistic completion cannot turn a profit. The bound is
+    ///     admissible: it credits every remaining hop the best log-rate any
+    ///     edge in the graph offers, and the closing hop the best rate back to
+    ///     this specific hub, so it can never prune a genuinely winning cycle.
+    ///   * **Canonical keys** — cycles are keyed by their ordered pool sequence
+    ///     anchored at the hub, so the same economic path is only ever emitted
+    ///     once.
+    ///
+    /// Returns candidates sorted by estimated profit, best first.
+    pub fn hub_anchored_cycles(
+        &self,
+        hubs: &[Address],
+        limits: &HubSearchLimits,
+        k: usize,
+    ) -> Vec<CycleCandidate> {
+        let limits = limits.sanitized();
+        if self.nodes.is_empty() || hubs.is_empty() || k == 0 {
+            return Vec::new();
+        }
+        let started = Instant::now();
+
+        // Dominance pruning, done once for the whole walk.
+        let pruned = self.dominant_edges_by_source(limits.parallel_edges_per_pair);
+
+        // Admissible bound inputs. `global_max_log` is the most any single hop
+        // can contribute; `best_return_log` is the most the closing hop into
+        // this hub can contribute from a given token.
+        let global_max_log = pruned
+            .values()
+            .flatten()
+            .map(|(_, _, log_rate)| *log_rate)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !global_max_log.is_finite() {
+            return Vec::new();
+        }
+
+        let mut out: Vec<CycleCandidate> = Vec::new();
+        let mut seen: HashSet<Vec<[u8; 32]>> = HashSet::new();
+
+        for &hub in hubs {
+            if self.ix.get(&hub).is_none() {
+                continue;
+            }
+            let reach = self.best_reach_hub_log(&pruned, hub, limits.max_hops);
+            let mut path_edges: Vec<usize> = Vec::with_capacity(limits.max_hops);
+            let mut visited: HashSet<Address> = HashSet::new();
+            visited.insert(hub);
+            self.walk_from(
+                hub,
+                hub,
+                0.0,
+                &pruned,
+                &reach,
+                &limits,
+                started,
+                &mut visited,
+                &mut path_edges,
+                &mut seen,
+                &mut out,
+            );
+            if out.len() >= limits.max_cycles || started.elapsed() >= limits.timeout {
+                break;
+            }
+        }
+
+        out.sort_by(|a, b| b.estimated_profit_bps.cmp(&a.estimated_profit_bps));
+        out.truncate(k);
+        out
+    }
+
+    /// Outgoing edges per token, keeping only the top-rate few per destination.
+    /// Values are `(edge_index, to, log_rate)`, sorted by log-rate descending so
+    /// the walk explores the most promising branch first and the bound bites
+    /// sooner.
+    fn dominant_edges_by_source(
+        &self,
+        per_pair: usize,
+    ) -> HashMap<Address, Vec<(usize, Address, f64)>> {
+        let mut by_pair: HashMap<(Address, Address), Vec<(usize, f64)>> = HashMap::new();
+        for (idx, edge) in self.edges.iter().enumerate() {
+            if let Some(log_rate) = edge_log_rate(edge) {
+                by_pair
+                    .entry((edge.from, edge.to))
+                    .or_default()
+                    .push((idx, log_rate));
+            }
+        }
+        let mut by_source: HashMap<Address, Vec<(usize, Address, f64)>> = HashMap::new();
+        for ((from, to), mut candidates) in by_pair {
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            candidates.truncate(per_pair);
+            let bucket = by_source.entry(from).or_default();
+            for (idx, log_rate) in candidates {
+                bucket.push((idx, to, log_rate));
+            }
+        }
+        for bucket in by_source.values_mut() {
+            bucket.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
+        }
+        by_source
+    }
+
+    /// `reach[h][token]` = best achievable log-rate getting from `token` back to
+    /// `hub` in at most `h` hops.
+    ///
+    /// This is the branch-and-bound heuristic. Because it relaxes the
+    /// simple-path constraint (it may reuse a token the real walk could not),
+    /// it can only ever be optimistic — which is exactly what makes pruning on
+    /// it safe. An earlier version used the best *single* return hop, which
+    /// wrongly discarded every token that reaches the hub in two hops and made
+    /// 3-hop cycles unfindable.
+    fn best_reach_hub_log(
+        &self,
+        pruned: &HashMap<Address, Vec<(usize, Address, f64)>>,
+        hub: Address,
+        max_hops: usize,
+    ) -> Vec<HashMap<Address, f64>> {
+        // Index by hop budget; slot 0 is unusable (no hops, cannot reach).
+        let mut reach: Vec<HashMap<Address, f64>> = vec![HashMap::new(); max_hops + 1];
+        if max_hops == 0 {
+            return reach;
+        }
+        // One hop: a direct edge into the hub.
+        for (from, bucket) in pruned {
+            for (_, to, log_rate) in bucket {
+                if *to == hub {
+                    let slot = reach[1].entry(*from).or_insert(f64::NEG_INFINITY);
+                    if *log_rate > *slot {
+                        *slot = *log_rate;
+                    }
+                }
+            }
+        }
+        for h in 2..=max_hops {
+            let prev = reach[h - 1].clone();
+            let mut cur = prev.clone(); // "at most h" includes "at most h-1"
+            for (from, bucket) in pruned {
+                for (_, to, log_rate) in bucket {
+                    if *to == hub {
+                        continue; // already covered by the 1-hop seed
+                    }
+                    if let Some(rest) = prev.get(to) {
+                        let total = log_rate + rest;
+                        let slot = cur.entry(*from).or_insert(f64::NEG_INFINITY);
+                        if total > *slot {
+                            *slot = total;
+                        }
+                    }
+                }
+            }
+            reach[h] = cur;
+        }
+        reach
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_from(
+        &self,
+        hub: Address,
+        current: Address,
+        acc_log: f64,
+        pruned: &HashMap<Address, Vec<(usize, Address, f64)>>,
+        reach: &[HashMap<Address, f64>],
+        limits: &HubSearchLimits,
+        started: Instant,
+        visited: &mut HashSet<Address>,
+        path_edges: &mut Vec<usize>,
+        seen: &mut HashSet<Vec<[u8; 32]>>,
+        out: &mut Vec<CycleCandidate>,
+    ) {
+        if out.len() >= limits.max_cycles || started.elapsed() >= limits.timeout {
+            return;
+        }
+        let hops = path_edges.len();
+        if hops >= limits.max_hops {
+            return;
+        }
+        let Some(bucket) = pruned.get(&current) else {
+            return;
+        };
+
+        for &(edge_idx, to, log_rate) in bucket {
+            if out.len() >= limits.max_cycles || started.elapsed() >= limits.timeout {
+                return;
+            }
+            let next_acc = acc_log + log_rate;
+            let next_hops = hops + 1;
+
+            if to == hub {
+                // Closing the cycle.
+                if next_hops >= limits.min_hops && next_acc > 0.0 {
+                    path_edges.push(edge_idx);
+                    self.emit_cycle(hub, path_edges, seen, out);
+                    path_edges.pop();
+                }
+                continue;
+            }
+
+            // Simple cycles only: an intermediate token is visited at most once.
+            if visited.contains(&to) || next_hops >= limits.max_hops {
+                // `next_hops == max_hops` with `to != hub` cannot close in time.
+                continue;
+            }
+
+            // Branch and bound: `to` must still get back to the hub within the
+            // remaining budget. `reach` gives the most optimistic log-rate for
+            // doing so, so if even that cannot clear zero, no completion of this
+            // prefix can profit.
+            let budget = limits.max_hops.saturating_sub(next_hops);
+            let Some(best_rest) = reach.get(budget).and_then(|m| m.get(&to)).copied() else {
+                continue; // `to` cannot reach the hub within the remaining hops
+            };
+            if next_acc + best_rest <= 0.0 {
+                continue;
+            }
+
+            visited.insert(to);
+            path_edges.push(edge_idx);
+            self.walk_from(
+                hub,
+                to,
+                next_acc,
+                pruned,
+                reach,
+                limits,
+                started,
+                visited,
+                path_edges,
+                seen,
+                out,
+            );
+            path_edges.pop();
+            visited.remove(&to);
+        }
+    }
+
+    /// Canonicalise and record a closed cycle.
+    fn emit_cycle(
+        &self,
+        hub: Address,
+        path_edges: &[usize],
+        seen: &mut HashSet<Vec<[u8; 32]>>,
+        out: &mut Vec<CycleCandidate>,
+    ) {
+        // A round trip through a single pool pays that pool's fee twice against
+        // its own curve and can never profit. These used to surface as the
+        // scanner's "best two-hop" and produced absurd headline spreads.
+        let pool_keys: Option<Vec<[u8; 32]>> = path_edges
+            .iter()
+            .map(|&idx| self.edges.get(idx).and_then(edge_pool_key))
+            .collect();
+        let Some(pool_keys) = pool_keys else {
+            return;
+        };
+        if pool_keys.len() >= 2 {
+            let unique: HashSet<&[u8; 32]> = pool_keys.iter().collect();
+            if unique.len() < pool_keys.len() {
+                return;
+            }
+        }
+        // Anchored at the hub, so the pool sequence is already canonical: the
+        // same economic path can only be walked one way from one hub.
+        if !seen.insert(pool_keys) {
+            return;
+        }
+
+        let Some(estimated_profit_bps) = self.estimate_cycle_profit_bps_from_edges(path_edges)
+        else {
+            return;
+        };
+        let mut cycle: Vec<usize> = Vec::with_capacity(path_edges.len() + 1);
+        let Some(&hub_ix) = self.ix.get(&hub) else {
+            return;
+        };
+        cycle.push(hub_ix);
+        for &idx in path_edges {
+            let Some(edge) = self.edges.get(idx) else {
+                return;
+            };
+            let Some(&to_ix) = self.ix.get(&edge.to) else {
+                return;
+            };
+            cycle.push(to_ix);
+        }
+        let weight = path_edges
+            .iter()
+            .filter_map(|&idx| self.edges.get(idx))
+            .fold(0i64, |acc, edge| acc.saturating_add(edge.weight));
+
+        out.push(CycleCandidate {
+            cycle,
+            edge_indices: path_edges.to_vec(),
+            weight,
+            start: hub,
+            estimated_profit_bps,
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -477,7 +903,13 @@ impl Graph {
 
     /// Resolve a node-index cycle to the best active edge index per hop. Returns
     /// `None` if the cycle has fewer than 2 nodes or any hop has no active edge.
-    fn best_edge_indices_for_node_path(&self, cycle: &[usize]) -> Option<Vec<usize>> {
+    /// Resolve a node path to concrete edge indices IN THIS GRAPH.
+    ///
+    /// Edge indices are positions in `self.edges` and are only meaningful for
+    /// the graph that produced them. Anything that survives a graph rebuild
+    /// (e.g. cross-scan cycle seeds) must carry the node path and re-resolve
+    /// through here, never carry indices forward.
+    pub(crate) fn best_edge_indices_for_node_path(&self, cycle: &[usize]) -> Option<Vec<usize>> {
         if cycle.len() < 2 {
             return None;
         }
@@ -500,6 +932,37 @@ impl Graph {
         limits: &BellmanFordLimits,
         k: usize,
         metrics: Option<&Metrics>,
+    ) -> Vec<CycleCandidate> {
+        self.bellman_ford_diagnostic(start_priorities, limits, k, metrics)
+            .0
+    }
+
+    /// As [`Self::bellman_ford`], plus the best gross edge observed across all
+    /// candidates INCLUDING rejected ones, as `ln(prod rate)` scaled by
+    /// `WEIGHT_SCALE`. `None` when no cycle was even evaluated (an empty or
+    /// disconnected graph), which is a different diagnosis from "every cycle
+    /// lost to fees".
+    pub fn bellman_ford_diagnostic(
+        &self,
+        start_priorities: &HashMap<Address, i128>,
+        limits: &BellmanFordLimits,
+        k: usize,
+        metrics: Option<&Metrics>,
+    ) -> (Vec<CycleCandidate>, Option<i64>) {
+        let best_gross_scaled = AtomicI64::new(i64::MIN);
+        let cycles =
+            self.bellman_ford_inner(start_priorities, limits, k, metrics, &best_gross_scaled);
+        let best = best_gross_scaled.load(AtomicOrdering::Relaxed);
+        (cycles, (best != i64::MIN).then_some(best))
+    }
+
+    fn bellman_ford_inner(
+        &self,
+        start_priorities: &HashMap<Address, i128>,
+        limits: &BellmanFordLimits,
+        k: usize,
+        metrics: Option<&Metrics>,
+        best_gross_scaled: &AtomicI64,
     ) -> Vec<CycleCandidate> {
         let limits = limits.sanitized();
         if self.nodes.is_empty() || limits.max_hops == 0 || k == 0 {
@@ -548,6 +1011,7 @@ impl Graph {
                     timed_out: &timed_out,
                     deadline,
                     allow_abort,
+                    best_gross_scaled: &best_gross_scaled,
                 };
                 self.bellman_ford_from(start_idx, &limits, &adjacency, search_control)
                     .into_iter()
@@ -770,6 +1234,14 @@ struct SearchControl<'a> {
     timed_out: &'a AtomicBool,
     deadline: Option<Instant>,
     allow_abort: bool,
+    /// Best (largest) `ln(prod rate)` seen across every cycle CONSIDERED this
+    /// search, scaled by `WEIGHT_SCALE`, including cycles that were rejected.
+    ///
+    /// Without this the engine reports only "no viable cycles", which cannot
+    /// distinguish "we were 2 bps short" from "we were 500 bps short" — two
+    /// situations demanding completely different responses. Recording the best
+    /// REJECTED candidate turns a bare negative into a distance-to-profit.
+    best_gross_scaled: &'a AtomicI64,
 }
 
 impl Ord for ScoredCycle {
@@ -893,6 +1365,7 @@ impl Graph {
             timed_out,
             deadline,
             allow_abort,
+            best_gross_scaled,
         } = search_control;
 
         let deadline_exceeded =
@@ -955,21 +1428,62 @@ impl Graph {
             } else {
                 self.cycle_weight(&cycle)
             };
-            if let Some(weight) = weight {
-                if weight >= 0 {
-                    return;
-                }
-                let estimated_profit_bps = self
-                    .estimate_cycle_profit_bps_from_edges(&edge_path)
-                    .or_else(|| self.estimate_cycle_profit_bps(&cycle))
-                    .unwrap_or(0);
-                store.push(DetectedCycle {
-                    weight,
-                    cycle,
-                    edge_indices: edge_path,
-                    estimated_profit_bps,
-                });
+            let Some(weight) = weight else {
+                return;
+            };
+
+            // Stage-1 admission tests the SIZE-INDEPENDENT gross edge, never
+            // profit. Profit is Stage 2's decision (spec §1: detection "never
+            // computes final profit, never decides money").
+            //
+            // This used to reject on `weight >= 0`. That weight is
+            // `sum(gas_ratio_i) - ln(prod rate_i)`, where each `gas_ratio_i` is
+            // gas divided by ONE fixed probe notional. Gas is a fixed cost while
+            // gross scales with size, so `gas_ratio` shrinks as size grows: a
+            // cycle can be unprofitable at the probe notional and clearly
+            // profitable at the size Stage 2 would actually choose. Rejecting on
+            // it discarded real money at a size nobody had chosen yet — the unit
+            // test covering this was even named
+            // `gas_penalties_can_remove_profitable_cycles`.
+            //
+            // `prod rate_i <= 1` is the sound test: the cycle loses value before
+            // gas is considered at all, so NO size can rescue it. That is a
+            // statement about the rates alone and holds at every notional.
+            //
+            // `weight` is still carried and is still what cycles are RANKED by,
+            // so the gas toll continues to order candidates cheapest-first
+            // (spec §Phase 2 keeps the toll "baked in" to the weight) — it just
+            // no longer decides admission.
+            //
+            // Fails closed when the rate product cannot be established: an
+            // unquotable cycle is not a candidate.
+            let Some(log_rate_sum) = self
+                .cycle_log_rate_sum_from_edges(&edge_path)
+                .or_else(|| self.cycle_log_rate_sum(&cycle))
+            else {
+                return;
+            };
+            // Track the best gross edge seen even when it loses, so the
+            // operator learns how far from profitable the market actually was.
+            let scaled = (log_rate_sum * WEIGHT_SCALE as f64).round();
+            if scaled.is_finite() {
+                best_gross_scaled.fetch_max(
+                    scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64,
+                    AtomicOrdering::Relaxed,
+                );
             }
+
+            if log_rate_sum <= 0.0 {
+                return;
+            }
+            let estimated_profit_bps = log_rate_sum_to_bps(log_rate_sum).unwrap_or(0);
+
+            store.push(DetectedCycle {
+                weight,
+                cycle,
+                edge_indices: edge_path,
+                estimated_profit_bps,
+            });
         };
 
         let mut in_queue = vec![false; n];
@@ -1190,7 +1704,15 @@ impl Graph {
         self.cycle_weight_from_edge_indices(&edge_indices)
     }
 
-    fn estimate_cycle_profit_bps_from_edges(&self, edge_indices: &[usize]) -> Option<i64> {
+    /// `sum(ln(post-fee rate))` over a cycle's edges — i.e. `ln(prod rate_i)`.
+    ///
+    /// This is the SIZE-INDEPENDENT gross edge of the cycle: `> 0` means the
+    /// rates alone compound to a gain before any cost is considered, and `<= 0`
+    /// means no trade size can ever make the cycle profitable. Admission uses
+    /// this raw value rather than the bps figure below, because rounding to
+    /// whole basis points floors any gross edge under 0.5 bps to zero and would
+    /// silently drop cycles the fixed-point weights were built to detect.
+    fn cycle_log_rate_sum_from_edges(&self, edge_indices: &[usize]) -> Option<f64> {
         if edge_indices.is_empty() {
             return None;
         }
@@ -1200,7 +1722,8 @@ impl Graph {
             if !edge.active {
                 return None;
             }
-            let protected_num = crate::util::apply_slippage(edge.rate_num, edge.tolerance_bps);
+            let protected_num =
+                crate::util::apply_slippage(edge.rate_num, crate::util::detection_haircut_bps());
             if protected_num.is_zero() || edge.rate_den.is_zero() {
                 return None;
             }
@@ -1210,12 +1733,21 @@ impl Graph {
             }
             log_rate_sum += rate.ln();
         }
-        let profit_ratio = log_rate_sum.exp() - 1.0;
-        if !profit_ratio.is_finite() {
+        if !log_rate_sum.is_finite() {
             return None;
         }
-        let scaled = (profit_ratio * 10_000.0).round();
-        Some(scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64)
+        Some(log_rate_sum)
+    }
+
+    /// Node-path sibling of [`Self::cycle_log_rate_sum_from_edges`].
+    fn cycle_log_rate_sum(&self, cycle: &[usize]) -> Option<f64> {
+        let edge_indices = self.best_edge_indices_for_node_path(cycle)?;
+        self.cycle_log_rate_sum_from_edges(&edge_indices)
+    }
+
+    fn estimate_cycle_profit_bps_from_edges(&self, edge_indices: &[usize]) -> Option<i64> {
+        let log_rate_sum = self.cycle_log_rate_sum_from_edges(edge_indices)?;
+        log_rate_sum_to_bps(log_rate_sum)
     }
 
     /// Node-path fallback for [`Self::estimate_cycle_profit_bps_from_edges`],
@@ -1225,6 +1757,129 @@ impl Graph {
         let edge_indices = self.best_edge_indices_for_node_path(cycle)?;
         self.estimate_cycle_profit_bps_from_edges(&edge_indices)
     }
+}
+
+/// Identity of the pool an edge trades through, for telling a same-pool
+/// round trip apart from a genuine cross-venue one.
+fn edge_pool_key(edge: &Edge) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    match &edge.venue {
+        VenueEdge::UniV3 { pool, .. }
+        | VenueEdge::Slipstream { pool, .. }
+        | VenueEdge::Curve { pool, .. } => out[12..].copy_from_slice(pool.as_bytes()),
+        VenueEdge::UniV2 { pair, .. } | VenueEdge::SolidlyV2 { pair, .. } => {
+            out[12..].copy_from_slice(pair.as_bytes())
+        }
+        VenueEdge::Balancer { pool_id, .. } => out = *pool_id,
+        VenueEdge::Univ4 { pool_manager, .. } => out[12..].copy_from_slice(pool_manager.as_bytes()),
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Best closed two-hop round trip in the graph, measured regardless of sign.
+#[derive(Clone, Copy, Debug)]
+pub struct TwoHopProbe {
+    /// `(prod rate - 1) * 10_000`, i.e. gross edge in basis points. Negative
+    /// means the best available round trip still loses to fees.
+    pub best_bps: f64,
+    pub token_a: Address,
+    pub token_b: Address,
+    /// True when the two legs use DIFFERENT pools — a genuine cross-venue
+    /// round trip. A same-pool best means the graph contains no pair quoted by
+    /// two venues, which is a structural finding in its own right.
+    pub cross_pool: bool,
+}
+
+impl Graph {
+    /// Enumerate every closed two-hop route and return the best one BY SIGN-FREE
+    /// gross edge.
+    ///
+    /// This exists because `bellman_ford_diagnostic` can only report on cycles
+    /// the negative-cycle search actually surfaces — it reports `None` whenever
+    /// no cycle clears `prod rate > 1`, which cannot distinguish "closed cycles
+    /// exist but all lose to fees" from "the search is not surfacing cycles that
+    /// exist". Those demand opposite responses, and 580 scans of "none" could
+    /// not separate them.
+    ///
+    /// This pass needs no search: it groups active edges by ordered token pair,
+    /// keeps the best rate per pair, and pairs `(A,B)` with `(B,A)`. O(E) in the
+    /// edge count, so it is cheap enough to run every scan.
+    ///
+    /// Rates use the same post-fee, slippage-adjusted definition the detector
+    /// uses, so the number is directly comparable to `best_gross_bps`.
+    pub fn best_two_hop_roundtrip(&self) -> Option<TwoHopProbe> {
+        // Best rate per ordered node pair (parallel edges collapse to the best).
+        let mut best: HashMap<(usize, usize), (f64, usize)> = HashMap::new();
+        for (idx, edge) in self.edges.iter().enumerate() {
+            if !edge.active {
+                continue;
+            }
+            let (Some(&from_ix), Some(&to_ix)) = (self.ix.get(&edge.from), self.ix.get(&edge.to))
+            else {
+                continue;
+            };
+            let protected =
+                crate::util::apply_slippage(edge.rate_num, crate::util::detection_haircut_bps());
+            if protected.is_zero() || edge.rate_den.is_zero() {
+                continue;
+            }
+            let rate = u256_to_f64(protected) / u256_to_f64(edge.rate_den);
+            if !(rate > 0.0) || !rate.is_finite() {
+                continue;
+            }
+            best.entry((from_ix, to_ix))
+                .and_modify(|slot| {
+                    if rate > slot.0 {
+                        *slot = (rate, idx);
+                    }
+                })
+                .or_insert((rate, idx));
+        }
+
+        let mut winner: Option<TwoHopProbe> = None;
+        for (&(a, b), &(rate_ab, idx_ab)) in best.iter() {
+            if a >= b {
+                continue; // consider each unordered pair once
+            }
+            let Some(&(rate_ba, idx_ba)) = best.get(&(b, a)) else {
+                continue;
+            };
+            let product = rate_ab * rate_ba;
+            if !product.is_finite() {
+                continue;
+            }
+            let bps = (product - 1.0) * 10_000.0;
+            if winner.map(|w| bps > w.best_bps).unwrap_or(true) {
+                let cross_pool = match (
+                    self.edges.get(idx_ab).and_then(edge_pool_key),
+                    self.edges.get(idx_ba).and_then(edge_pool_key),
+                ) {
+                    (Some(x), Some(y)) => x != y,
+                    _ => false,
+                };
+                winner = Some(TwoHopProbe {
+                    best_bps: bps,
+                    token_a: self.nodes[a],
+                    token_b: self.nodes[b],
+                    cross_pool,
+                });
+            }
+        }
+        winner
+    }
+}
+
+/// Convert a cycle's log-rate sum into whole basis points of gross edge.
+/// Quantizing loses sub-0.5bps detail, so this is for reporting and ranking
+/// only — never for admission (see [`Graph::cycle_log_rate_sum_from_edges`]).
+fn log_rate_sum_to_bps(log_rate_sum: f64) -> Option<i64> {
+    let profit_ratio = log_rate_sum.exp() - 1.0;
+    if !profit_ratio.is_finite() {
+        return None;
+    }
+    let scaled = (profit_ratio * 10_000.0).round();
+    Some(scaled.clamp(i64::MIN as f64, i64::MAX as f64) as i64)
 }
 
 fn is_better(candidate: &Edge, current: &Edge) -> bool {
@@ -1248,22 +1903,53 @@ fn is_better(candidate: &Edge, current: &Edge) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::{compute_edge_weight, NativePrice};
+    use crate::util::compute_edge_weight;
     use std::time::Duration;
 
     fn addr(id: u64) -> Address {
         Address::from_low_u64_be(id)
     }
 
+    /// The rescue path in `main.rs` re-anchors an unfundable cycle onto a
+    /// fundable node in the same loop. It relies on rotation preserving the
+    /// trade exactly — same hops, same edges, same order — so a rotated cycle
+    /// must be the identical trade entered at a different point.
+    #[test]
+    fn rotation_preserves_the_trade_when_re_anchoring() {
+        // closed 3-cycle 10 -> 11 -> 12 -> 10, edges [0,1,2]
+        let cycle = vec![10usize, 11, 12, 10];
+        let edges = vec![0usize, 1, 2];
+
+        let at_11 = rotate_indexed_cycle(&cycle, &edges, 11).expect("rotate to 11");
+        assert_eq!(at_11.cycle, vec![11, 12, 10, 11], "loop re-entered at 11");
+        assert_eq!(at_11.edge_indices, vec![1, 2, 0], "edges follow the nodes");
+
+        let at_12 = rotate_indexed_cycle(&cycle, &edges, 12).expect("rotate to 12");
+        assert_eq!(at_12.cycle, vec![12, 10, 11, 12]);
+        assert_eq!(at_12.edge_indices, vec![2, 0, 1]);
+
+        // Hop count and edge multiset are invariant — it is the same trade.
+        for rotated in [&at_11, &at_12] {
+            assert_eq!(rotated.cycle.len(), cycle.len());
+            let mut got = rotated.edge_indices.clone();
+            got.sort();
+            assert_eq!(got, edges, "rotation must not add or drop a hop");
+        }
+    }
+
+    #[test]
+    fn rotation_refuses_a_node_outside_the_cycle() {
+        // Guards the rescue loop: a start that is not in the loop must yield
+        // None rather than a silently malformed path.
+        let cycle = vec![10usize, 11, 12, 10];
+        let edges = vec![0usize, 1, 2];
+        assert!(rotate_indexed_cycle(&cycle, &edges, 99).is_none());
+        // Arity mismatch between nodes and edges is likewise unrecoverable.
+        assert!(rotate_indexed_cycle(&cycle, &[0usize, 1], 11).is_none());
+    }
+
     fn fp_weight(num: u64, den: u64) -> i64 {
-        compute_edge_weight(
-            U256::from(num),
-            U256::from(den),
-            0,
-            U256::zero(),
-            U256::from(1u64),
-            NativePrice::new(U256::exp10(18), U256::exp10(18), true),
-        )
+        compute_edge_weight(U256::from(num), U256::from(den))
     }
 
     fn limits(max_hops: usize) -> BellmanFordLimits {
@@ -1274,6 +1960,307 @@ mod tests {
             max_cycles: 16,
             timeout: Duration::from_millis(250),
         }
+    }
+
+    /// Edge carrying only what `cycle_input_capacity` reads: a rate and a cap.
+    fn cap_edge(from: Address, to: Address, num: u64, den: u64, max_input: U256) -> Edge {
+        Edge {
+            from,
+            to,
+            rate_num: U256::from(num),
+            rate_den: U256::from(den),
+            venue: VenueEdge::Balancer {
+                pool_id: [0u8; 32],
+                token_in: from,
+                token_out: to,
+            },
+            estimated_gas: 0,
+            weight: fp_weight(num, den),
+            max_input,
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+        }
+    }
+
+    /// The regression this whole function exists for. WETH(18dp) -> USDC(6dp) ->
+    /// WETH: the USDC hop's cap is ~19.2 USDC (1.92e7 raw), which the old
+    /// `min()` fold compared directly against a 1e15 wei probe and "won",
+    /// yielding a 1.9e-11 WETH ceiling. Projected through the rate it is worth
+    /// ~0.0096 WETH — nine orders of magnitude apart.
+    #[test]
+    fn cycle_capacity_projects_caps_across_token_decimals() {
+        let weth = addr(1);
+        let usdc = addr(2);
+        let probe = U256::from(1_000_000_000_000_000u64); // 0.001 WETH
+
+        // 0.001 WETH -> 2 USDC, so the pair trades at 2000 USDC/WETH.
+        let hop0 = cap_edge(weth, usdc, 2_000_000, 1_000_000_000_000_000, U256::MAX);
+        // Cap of 19.226910 USDC on the return leg.
+        let hop1 = cap_edge(usdc, weth, 1_000_000_000_000_000, 2_000_000, U256::from(19_226_910u64));
+
+        let capacity = cycle_input_capacity(&[hop0, hop1], probe);
+
+        // 19.22691 USDC / 2000 USDC-per-WETH = 0.009613455 WETH.
+        assert_eq!(capacity, U256::from(9_613_455_000_000_000u64));
+        // The bug produced the raw USDC integer as if it were wei.
+        assert_ne!(capacity, U256::from(19_226_910u64));
+        // And it must clear the 0.001 WETH minimum that used to reject it.
+        assert!(capacity > probe);
+    }
+
+    #[test]
+    fn cycle_capacity_takes_the_tightest_projected_hop() {
+        let a = addr(1);
+        let b = addr(2);
+        // Identity rates keep the projection 1:1 so the tightest cap wins outright.
+        let loose = cap_edge(a, b, 1, 1, U256::from(900u64));
+        let tight = cap_edge(b, a, 1, 1, U256::from(100u64));
+        let probe = U256::from(50u64);
+
+        assert_eq!(
+            cycle_input_capacity(&[loose, tight], probe),
+            U256::from(100u64)
+        );
+    }
+
+    #[test]
+    fn cycle_capacity_first_hop_cap_is_used_verbatim() {
+        let a = addr(1);
+        let b = addr(2);
+        // Hop 0 is already in start-token units: no projection should occur,
+        // regardless of how extreme the rate on that hop is.
+        let hop0 = cap_edge(a, b, 1_000_000, 1, U256::from(7u64));
+        let hop1 = cap_edge(b, a, 1, 1_000_000, U256::MAX);
+
+        assert_eq!(cycle_input_capacity(&[hop0, hop1], U256::from(5u64)), U256::from(7u64));
+    }
+
+    #[test]
+    fn cycle_capacity_degenerate_inputs_are_zero() {
+        let a = addr(1);
+        let b = addr(2);
+        let edge = cap_edge(a, b, 1, 1, U256::from(10u64));
+
+        assert!(cycle_input_capacity(&[], U256::from(5u64)).is_zero());
+        assert!(cycle_input_capacity(&[edge.clone()], U256::zero()).is_zero());
+
+        // A hop that outputs nothing kills the cycle rather than dividing by zero.
+        let dead = cap_edge(b, a, 0, 1, U256::MAX);
+        assert!(cycle_input_capacity(&[edge, dead, cap_edge(a, b, 1, 1, U256::MAX)], U256::from(5u64)).is_zero());
+    }
+
+    #[test]
+    fn mul_div_floor_saturates_instead_of_wrapping() {
+        assert_eq!(mul_div_floor(U256::MAX, U256::from(2u64), U256::one()), U256::MAX);
+        assert_eq!(mul_div_floor(U256::from(10u64), U256::from(3u64), U256::from(4u64)), U256::from(7u64));
+        assert!(mul_div_floor(U256::from(1u64), U256::from(1u64), U256::zero()).is_zero());
+    }
+
+    fn hub_limits(max_hops: usize) -> HubSearchLimits {
+        HubSearchLimits {
+            min_hops: 2,
+            max_hops,
+            max_cycles: 64,
+            timeout: Duration::from_secs(5),
+            parallel_edges_per_pair: 3,
+        }
+    }
+
+    /// Edge on an identifiable pool, so `edge_pool_key` distinguishes parallel pools.
+    fn pool_edge(from: Address, to: Address, num: u64, den: u64, pool: u64) -> Edge {
+        Edge {
+            from,
+            to,
+            rate_num: U256::from(num),
+            rate_den: U256::from(den),
+            venue: VenueEdge::UniV3 {
+                path: vec![(from, None), (to, Some(500))],
+                pool: addr(pool),
+                fee: 500,
+                state: None,
+            },
+            estimated_gas: 0,
+            weight: fp_weight(num, den),
+            max_input: U256::MAX,
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+        }
+    }
+
+    fn graph_with(edges: Vec<Edge>) -> Graph {
+        let mut graph = Graph::default();
+        for edge in edges {
+            graph.add_node(edge.from);
+            graph.add_node(edge.to);
+            graph.add_edge(edge);
+        }
+        graph
+    }
+
+    #[test]
+    fn hub_search_finds_a_profitable_two_hop_cycle() {
+        let hub = addr(1);
+        let mid = addr(2);
+        // 1 hub -> 3 mid, then 1 mid -> 0.5 hub  =>  1 -> 1.5 hub. Profitable.
+        let graph = graph_with(vec![
+            pool_edge(hub, mid, 3, 1, 901),
+            pool_edge(mid, hub, 1, 2, 902),
+        ]);
+
+        let found = graph.hub_anchored_cycles(&[hub], &hub_limits(3), 10);
+
+        assert_eq!(found.len(), 1, "expected exactly one canonical cycle");
+        assert_eq!(found[0].start, hub);
+        assert_eq!(found[0].edge_indices.len(), 2);
+        assert!(found[0].estimated_profit_bps > 0);
+    }
+
+    #[test]
+    fn hub_search_rejects_a_same_pool_round_trip() {
+        let hub = addr(1);
+        let mid = addr(2);
+        // Both legs on pool 901: a round trip through one pool cannot profit,
+        // however good the quoted rates look.
+        let graph = graph_with(vec![
+            pool_edge(hub, mid, 3, 1, 901),
+            pool_edge(mid, hub, 3, 1, 901),
+        ]);
+
+        assert!(graph
+            .hub_anchored_cycles(&[hub], &hub_limits(3), 10)
+            .is_empty());
+    }
+
+    #[test]
+    fn hub_search_ignores_losing_cycles() {
+        let hub = addr(1);
+        let mid = addr(2);
+        // 1 -> 0.5 -> 0.5: round trip loses.
+        let graph = graph_with(vec![
+            pool_edge(hub, mid, 1, 2, 901),
+            pool_edge(mid, hub, 1, 1, 902),
+        ]);
+
+        assert!(graph
+            .hub_anchored_cycles(&[hub], &hub_limits(3), 10)
+            .is_empty());
+    }
+
+    #[test]
+    fn hub_search_emits_each_pool_combination_once() {
+        let hub = addr(1);
+        let mid = addr(2);
+        // Two parallel return pools => two distinct, legitimate cycles.
+        let graph = graph_with(vec![
+            pool_edge(hub, mid, 3, 1, 901),
+            pool_edge(mid, hub, 1, 2, 902),
+            pool_edge(mid, hub, 2, 3, 903),
+        ]);
+
+        let found = graph.hub_anchored_cycles(&[hub], &hub_limits(3), 10);
+
+        assert_eq!(found.len(), 2);
+        let mut keys: Vec<Vec<usize>> = found.iter().map(|c| c.edge_indices.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), 2, "cycles must be distinct, not duplicates");
+        // Sorted best-first.
+        assert!(found[0].estimated_profit_bps >= found[1].estimated_profit_bps);
+    }
+
+    #[test]
+    fn hub_search_dominance_pruning_keeps_only_the_best_parallel_edges() {
+        let hub = addr(1);
+        let mid = addr(2);
+        let mut edges = vec![pool_edge(hub, mid, 3, 1, 901)];
+        // Five parallel return pools with descending rates.
+        for i in 0..5u64 {
+            edges.push(pool_edge(mid, hub, 10 - i, 20, 910 + i));
+        }
+        let graph = graph_with(edges);
+
+        let mut limits = hub_limits(3);
+        limits.parallel_edges_per_pair = 2;
+        let found = graph.hub_anchored_cycles(&[hub], &limits, 10);
+
+        assert_eq!(found.len(), 2, "only the top 2 parallel pools survive");
+    }
+
+    #[test]
+    fn hub_search_finds_three_hop_cycles_and_respects_max_hops() {
+        let hub = addr(1);
+        let a = addr(2);
+        let b = addr(3);
+        // hub -> a -> b -> hub, each leg 2x: strongly profitable, 3 hops.
+        let edges = vec![
+            pool_edge(hub, a, 2, 1, 901),
+            pool_edge(a, b, 2, 1, 902),
+            pool_edge(b, hub, 2, 1, 903),
+        ];
+        let graph = graph_with(edges);
+
+        assert_eq!(graph.hub_anchored_cycles(&[hub], &hub_limits(3), 10).len(), 1);
+        // With max_hops = 2 the same cycle is out of reach.
+        assert!(graph
+            .hub_anchored_cycles(&[hub], &hub_limits(2), 10)
+            .is_empty());
+    }
+
+    /// Branch-and-bound must never discard a genuinely winning cycle. Here the
+    /// first hop is a heavy loss and only the final hop recovers it, which is
+    /// exactly the shape a too-tight bound would prune.
+    #[test]
+    fn hub_search_bound_does_not_prune_a_late_winning_cycle() {
+        let hub = addr(1);
+        let a = addr(2);
+        let b = addr(3);
+        let graph = graph_with(vec![
+            pool_edge(hub, a, 1, 10, 901), // 0.1x
+            pool_edge(a, b, 1, 1, 902),    // 1.0x
+            pool_edge(b, hub, 30, 1, 903), // 30x  => net 3x
+        ]);
+
+        let found = graph.hub_anchored_cycles(&[hub], &hub_limits(3), 10);
+        assert_eq!(found.len(), 1, "profitable cycle must survive the bound");
+        assert!(found[0].estimated_profit_bps > 0);
+    }
+
+    #[test]
+    fn hub_search_walks_every_hub() {
+        let hub_a = addr(1);
+        let hub_b = addr(2);
+        let mid = addr(3);
+        let graph = graph_with(vec![
+            pool_edge(hub_a, mid, 3, 1, 901),
+            pool_edge(mid, hub_a, 1, 2, 902),
+            pool_edge(hub_b, mid, 3, 1, 903),
+            pool_edge(mid, hub_b, 1, 2, 904),
+        ]);
+
+        let found = graph.hub_anchored_cycles(&[hub_a, hub_b], &hub_limits(3), 10);
+        let starts: HashSet<Address> = found.iter().map(|c| c.start).collect();
+        assert_eq!(starts.len(), 2, "both hubs should yield a cycle");
+    }
+
+    #[test]
+    fn hub_search_degenerate_inputs_are_empty() {
+        let hub = addr(1);
+        let mid = addr(2);
+        let graph = graph_with(vec![
+            pool_edge(hub, mid, 3, 1, 901),
+            pool_edge(mid, hub, 1, 2, 902),
+        ]);
+
+        assert!(graph.hub_anchored_cycles(&[], &hub_limits(3), 10).is_empty());
+        assert!(graph.hub_anchored_cycles(&[hub], &hub_limits(3), 0).is_empty());
+        // A hub that is not a graph node yields nothing rather than panicking.
+        assert!(graph
+            .hub_anchored_cycles(&[addr(99)], &hub_limits(3), 10)
+            .is_empty());
     }
 
     #[test]
@@ -1676,6 +2663,7 @@ mod tests {
                 path: vec![(a, None), (b, None)],
                 pool: addr(901),
                 fee: 500,
+                state: None,
             },
             estimated_gas: 0,
             weight: 0,
@@ -1694,6 +2682,7 @@ mod tests {
                 path: vec![(b, None), (a, None)],
                 pool: addr(902),
                 fee: 500,
+                state: None,
             },
             estimated_gas: 0,
             weight: -1,
@@ -2224,59 +3213,426 @@ mod tests {
     }
 
     #[test]
-    fn gas_penalties_can_remove_profitable_cycles() {
-        fn build_graph(gas_price: U256) -> Graph {
-            let mut graph = Graph::default();
-            let estimated_gas = 50_000u64;
-            let base_amount = U256::from(100_000_000u64);
-            let native_price = NativePrice::new(U256::exp10(18), U256::exp10(18), true);
+    fn cycles_are_found_by_rate_alone_regardless_of_gas() {
+        // The regression this locks in. Previously the edge weight folded in
+        // `gas_cost / base_amount_in`, so a cycle whose gas exceeded its gross
+        // edge at one arbitrary probe notional produced all-positive weights —
+        // no negative cycle existed and the search never proposed it at ANY
+        // size. The test covering that was literally named
+        // `gas_penalties_can_remove_profitable_cycles`.
+        //
+        // Weights are rate-only now, so discovery depends solely on
+        // `prod rate_i > 1`, which is size-independent and true or false at
+        // every notional. Gas is charged once, exactly, by Stage 2.
+        let mut graph = Graph::default();
+        let a = addr(100);
+        let b = addr(101);
+        let c = addr(102);
 
-            let a = addr(100);
-            let b = addr(101);
-            let c = addr(102);
-
-            for (from, to) in [(a, b), (b, c), (c, a)] {
-                let weight = compute_edge_weight(
-                    U256::from(105u64),
+        for (from, to) in [(a, b), (b, c), (c, a)] {
+            graph.add_edge(Edge {
+                from,
+                to,
+                rate_num: U256::from(105u64),
+                rate_den: U256::from(100u64),
+                venue: VenueEdge::Balancer {
+                    pool_id: [3u8; 32],
+                    token_in: from,
+                    token_out: to,
+                },
+                // A deliberately huge per-swap gas figure: it must have NO
+                // bearing on whether the cycle is discoverable.
+                estimated_gas: 5_000_000,
+                weight: compute_edge_weight(
+                    crate::util::apply_slippage(U256::from(105u64), 10),
                     U256::from(100u64),
-                    estimated_gas,
-                    gas_price,
-                    base_amount,
-                    native_price,
-                );
+                ),
+                max_input: U256::from(2_000_000u64),
+                tolerance_bps: 10,
+                observed_slippage_bps: 10,
+                quote_block: None,
+                active: true,
+            });
+        }
 
-                graph.add_edge(Edge {
-                    from,
-                    to,
-                    rate_num: U256::from(105u64),
+        let priorities = HashMap::new();
+        let cycles = graph.bellman_ford(&priorities, &limits(3), 1, None);
+        assert!(
+            !cycles.is_empty(),
+            "a cycle with a positive gross edge must be discoverable no matter \
+             how large the gas estimate is"
+        );
+        assert!(
+            cycles.iter().any(|c| c.weight < 0),
+            "the gaining cycle must carry negative summed weight"
+        );
+        assert!(
+            cycles.iter().all(|c| c.estimated_profit_bps > 0),
+            "every admitted cycle must have a positive size-independent gross edge"
+        );
+    }
+
+    #[test]
+    fn diagnostic_reports_distance_to_profit_for_rejected_cycles() {
+        // The point of the diagnostic: a losing cycle is REJECTED, but the
+        // search still reports how far from profitable it was. Three hops at
+        // 0.99 compound to ~-2.97%, i.e. roughly -297 bps of gross edge.
+        let mut graph = Graph::default();
+        let a = addr(300);
+        let b = addr(301);
+        let c = addr(302);
+        for (from, to) in [(a, b), (b, c), (c, a)] {
+            graph.add_edge(Edge {
+                from,
+                to,
+                rate_num: U256::from(99u64),
+                rate_den: U256::from(100u64),
+                venue: VenueEdge::Balancer {
+                    pool_id: [9u8; 32],
+                    token_in: from,
+                    token_out: to,
+                },
+                estimated_gas: 0,
+                weight: compute_edge_weight(U256::from(99u64), U256::from(100u64)),
+                max_input: U256::from(2_000_000u64),
+                tolerance_bps: 0,
+                observed_slippage_bps: 0,
+                quote_block: None,
+                active: true,
+            });
+        }
+
+        let priorities = HashMap::new();
+        let (cycles, best) = graph.bellman_ford_diagnostic(&priorities, &limits(3), 1, None);
+        assert!(cycles.is_empty(), "a losing cycle must still be rejected");
+
+        // A losing cycle may or may not be reached by the negative-cycle search;
+        // when it is, the reported distance must be negative and sane.
+        if let Some(scaled) = best {
+            let bps = (((scaled as f64) / WEIGHT_SCALE as f64).exp() - 1.0) * 10_000.0;
+            assert!(
+                bps < 0.0,
+                "a rejected cycle must report a negative gross edge, got {bps}"
+            );
+            assert!(
+                bps > -10_000.0,
+                "distance must be a sane bps figure, got {bps}"
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_reports_positive_distance_for_a_winning_cycle() {
+        let mut graph = Graph::default();
+        let a = addr(400);
+        let b = addr(401);
+        let c = addr(402);
+        for (from, to) in [(a, b), (b, c), (c, a)] {
+            graph.add_edge(Edge {
+                from,
+                to,
+                rate_num: U256::from(105u64),
+                rate_den: U256::from(100u64),
+                venue: VenueEdge::Balancer {
+                    pool_id: [4u8; 32],
+                    token_in: from,
+                    token_out: to,
+                },
+                estimated_gas: 0,
+                weight: compute_edge_weight(U256::from(105u64), U256::from(100u64)),
+                max_input: U256::from(2_000_000u64),
+                tolerance_bps: 0,
+                observed_slippage_bps: 0,
+                quote_block: None,
+                active: true,
+            });
+        }
+        let priorities = HashMap::new();
+        let (cycles, best) = graph.bellman_ford_diagnostic(&priorities, &limits(3), 1, None);
+        assert!(!cycles.is_empty(), "a gaining cycle must be found");
+        let scaled = best.expect("a considered cycle must report a gross edge");
+        let bps = (((scaled as f64) / WEIGHT_SCALE as f64).exp() - 1.0) * 10_000.0;
+        // 1.05^3 - 1 = 15.76% = ~1576 bps
+        assert!(
+            bps > 1_000.0,
+            "1.05^3 should report ~1576 bps of gross edge, got {bps}"
+        );
+    }
+
+    #[test]
+    fn edge_indices_do_not_survive_a_graph_rebuild() {
+        // The bug this guards: a cycle seed carried across scans kept its
+        // edge_indices, but those are positions in a specific Graph::edges. The
+        // graph is rebuilt every scan and repopulated in a different order, so
+        // the stored index denoted a DIFFERENT edge — failing the
+        // `edge.from != u` check in candidate prep and silently discarding a
+        // profitable cycle. Seeds must re-resolve from the node path.
+        fn build(order: &[(u64, u64)]) -> Graph {
+            let mut g = Graph::default();
+            for (from, to) in order {
+                g.add_edge(Edge {
+                    from: addr(*from),
+                    to: addr(*to),
+                    rate_num: U256::from(101u64),
                     rate_den: U256::from(100u64),
                     venue: VenueEdge::Balancer {
-                        pool_id: [3u8; 32],
-                        token_in: from,
-                        token_out: to,
+                        pool_id: [(*from as u8); 32],
+                        token_in: addr(*from),
+                        token_out: addr(*to),
                     },
-                    estimated_gas,
-                    weight,
-                    max_input: U256::from(2_000_000u64),
-                    tolerance_bps: 10,
-                    observed_slippage_bps: 10,
+                    estimated_gas: 0,
+                    weight: compute_edge_weight(U256::from(101u64), U256::from(100u64)),
+                    max_input: U256::from(1_000_000u64),
+                    tolerance_bps: 0,
+                    observed_slippage_bps: 0,
                     quote_block: None,
-
                     active: true,
                 });
             }
-
-            graph
+            g
         }
 
-        let cheap_graph = build_graph(U256::zero());
-        let priorities = HashMap::new();
-        let cheap_cycles = cheap_graph.bellman_ford(&priorities, &limits(3), 1, None);
-        assert!(cheap_cycles.iter().any(|c| c.weight < 0));
+        // Same three hops, inserted in two different orders — as concurrent
+        // venue collectors genuinely do between scans.
+        let g1 = build(&[(1, 2), (2, 3), (3, 1)]);
+        let g2 = build(&[(3, 1), (1, 2), (2, 3)]);
 
-        let expensive_graph = build_graph(U256::from(20_000u64));
-        let expensive_cycles = expensive_graph.bellman_ford(&priorities, &limits(3), 1, None);
-        assert!(expensive_cycles.is_empty());
+        let path: Vec<usize> = [1u64, 2, 3, 1]
+            .iter()
+            .map(|t| g1.ix[&addr(*t)])
+            .collect();
+
+        let idx1 = g1
+            .best_edge_indices_for_node_path(&path)
+            .expect("resolvable in g1");
+        let path2: Vec<usize> = [1u64, 2, 3, 1]
+            .iter()
+            .map(|t| g2.ix[&addr(*t)])
+            .collect();
+        let idx2 = g2
+            .best_edge_indices_for_node_path(&path2)
+            .expect("resolvable in g2");
+
+        // The indices genuinely differ between graphs — this is what made
+        // carrying them forward unsound.
+        assert_ne!(
+            idx1, idx2,
+            "insertion order must change edge indices, else this test proves nothing"
+        );
+
+        // Re-resolved indices must match the hops they claim to represent.
+        for (hop, window) in path2.windows(2).enumerate() {
+            let edge = g2.edge_by_index(idx2[hop]).expect("edge exists");
+            assert_eq!(edge.from, g2.nodes[window[0]], "hop {hop} from-token");
+            assert_eq!(edge.to, g2.nodes[window[1]], "hop {hop} to-token");
+        }
+
+        // And the stale indices would NOT have matched — the actual failure.
+        let mut stale_mismatch = false;
+        for (hop, window) in path2.windows(2).enumerate() {
+            if let Some(edge) = g2.edge_by_index(idx1[hop]) {
+                if edge.from != g2.nodes[window[0]] || edge.to != g2.nodes[window[1]] {
+                    stale_mismatch = true;
+                }
+            }
+        }
+        assert!(
+            stale_mismatch,
+            "carrying g1's indices into g2 must mismatch at least one hop"
+        );
+    }
+
+    fn two_hop_edge(from: u64, to: u64, num: u64, den: u64, pool: u8) -> Edge {
+        Edge {
+            from: addr(from),
+            to: addr(to),
+            rate_num: U256::from(num),
+            rate_den: U256::from(den),
+            venue: VenueEdge::UniV3 {
+                path: Vec::new(),
+                pool: Address::from_low_u64_be(pool as u64),
+                fee: 500,
+                state: None,
+            },
+            estimated_gas: 0,
+            weight: compute_edge_weight(U256::from(num), U256::from(den)),
+            max_input: U256::from(1_000_000u64),
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn two_hop_probe_reports_a_losing_round_trip() {
+        // THE point of this diagnostic: report distance to profit even when the
+        // negative-cycle search surfaces nothing. 0.999 * 0.999 = 0.998001,
+        // i.e. -19.99 bps.
+        let mut g = Graph::default();
+        g.add_edge(two_hop_edge(1, 2, 999, 1000, 1));
+        g.add_edge(two_hop_edge(2, 1, 999, 1000, 2));
+
+        let probe = g.best_two_hop_roundtrip().expect("a closed 2-hop exists");
+        assert!(
+            (probe.best_bps - (-19.99)).abs() < 0.1,
+            "expected ~-19.99 bps, got {}",
+            probe.best_bps
+        );
+        assert!(probe.cross_pool, "different pools must read as cross-pool");
+
+        // And the search itself surfaces nothing, which is exactly the blind
+        // spot this probe covers.
+        let (cycles, best) = g.bellman_ford_diagnostic(&HashMap::new(), &limits(2), 4, None);
+        assert!(cycles.is_empty());
+        assert!(best.is_none(), "search reports nothing; the probe must not");
+    }
+
+    #[test]
+    fn two_hop_probe_reports_a_winning_round_trip_and_picks_the_best_pool() {
+        // 1.01 * 1.00 = +100 bps. A worse parallel edge must not win.
+        let mut g = Graph::default();
+        g.add_edge(two_hop_edge(1, 2, 101, 100, 1));
+        g.add_edge(two_hop_edge(1, 2, 90, 100, 3)); // worse parallel edge
+        g.add_edge(two_hop_edge(2, 1, 100, 100, 2));
+
+        let probe = g.best_two_hop_roundtrip().expect("closed 2-hop exists");
+        assert!(
+            (probe.best_bps - 100.0).abs() < 0.5,
+            "expected ~+100 bps from the BEST parallel edge, got {}",
+            probe.best_bps
+        );
+    }
+
+    #[test]
+    fn two_hop_probe_flags_a_same_pool_round_trip() {
+        // Both legs on one pool is not a real arbitrage route; the caller needs
+        // to know the "best" route was degenerate.
+        let mut g = Graph::default();
+        g.add_edge(two_hop_edge(1, 2, 999, 1000, 7));
+        g.add_edge(two_hop_edge(2, 1, 999, 1000, 7));
+        let probe = g.best_two_hop_roundtrip().expect("closed 2-hop exists");
+        assert!(!probe.cross_pool, "same pool on both legs must be flagged");
+    }
+
+    #[test]
+    fn two_hop_probe_returns_none_without_a_return_leg() {
+        // One-way edges only: no closed route exists at all. Distinct from
+        // "a route exists and loses".
+        let mut g = Graph::default();
+        g.add_edge(two_hop_edge(1, 2, 101, 100, 1));
+        g.add_edge(two_hop_edge(2, 3, 101, 100, 2));
+        assert!(g.best_two_hop_roundtrip().is_none());
+    }
+
+    #[test]
+    fn two_hop_probe_ignores_inactive_edges() {
+        let mut g = Graph::default();
+        g.add_edge(two_hop_edge(1, 2, 101, 100, 1));
+        let mut back = two_hop_edge(2, 1, 101, 100, 2);
+        back.active = false;
+        g.add_edge(back);
+        assert!(
+            g.best_two_hop_roundtrip().is_none(),
+            "a deactivated return leg is not a tradable route"
+        );
+    }
+
+    #[test]
+    fn detection_haircut_is_independent_of_execution_tolerance() {
+        // The separation this guards. `tolerance_bps` is the EXECUTION min_out
+        // margin (plan.rs); it must no longer shrink the rate the DETECTOR sees.
+        // Previously both read the same field, so raising revert protection
+        // silently raised the bar detection had to clear — 30bps per leg became
+        // a ~60bps bar on a 2-hop round trip, measured as -61.3bps of apparent
+        // loss on a market that was really about -11bps.
+        std::env::remove_var("DETECTION_HAIRCUT_BPS"); // default 0
+
+        let mut a = Graph::default();
+        a.add_edge(two_hop_edge(1, 2, 1000, 1000, 1));
+        a.add_edge(two_hop_edge(2, 1, 1000, 1000, 2));
+
+        // Same rates, but a large EXECUTION tolerance on every edge.
+        let mut b = Graph::default();
+        for (f, t, pool) in [(1u64, 2u64, 1u8), (2, 1, 2)] {
+            let mut e = two_hop_edge(f, t, 1000, 1000, pool);
+            e.tolerance_bps = 300; // 3% execution margin
+            b.add_edge(e);
+        }
+
+        let pa = a.best_two_hop_roundtrip().expect("route exists");
+        let pb = b.best_two_hop_roundtrip().expect("route exists");
+        assert!(
+            (pa.best_bps - pb.best_bps).abs() < 1e-6,
+            "execution tolerance must not move the detection measurement: {} vs {}",
+            pa.best_bps,
+            pb.best_bps
+        );
+        assert!(
+            pa.best_bps.abs() < 1e-6,
+            "rate 1.0 both legs with a zero detection haircut is exactly break-even, got {}",
+            pa.best_bps
+        );
+    }
+
+    #[test]
+    fn detection_haircut_still_applies_when_configured() {
+        // Opting in must still work — it is a recall/cost dial, just no longer
+        // welded to the execution margin.
+        std::env::set_var("DETECTION_HAIRCUT_BPS", "25");
+        // OnceLock means the value may already be fixed by another test in this
+        // binary; only assert when this process actually observes 25.
+        if crate::util::detection_haircut_bps() == 25 {
+            let mut g = Graph::default();
+            g.add_edge(two_hop_edge(1, 2, 1000, 1000, 1));
+            g.add_edge(two_hop_edge(2, 1, 1000, 1000, 2));
+            let p = g.best_two_hop_roundtrip().expect("route exists");
+            // Two legs haircut 25bps each => ~-50bps.
+            assert!(
+                (p.best_bps - (-49.94)).abs() < 1.0,
+                "expected ~-50bps from 2x25bps haircut, got {}",
+                p.best_bps
+            );
+        }
+        std::env::remove_var("DETECTION_HAIRCUT_BPS");
+    }
+
+    #[test]
+    fn losing_cycles_are_still_rejected() {
+        // The other half: admission must still reject `prod rate_i <= 1`, where
+        // no trade size can ever help.
+        let mut graph = Graph::default();
+        let a = addr(200);
+        let b = addr(201);
+        let c = addr(202);
+
+        for (from, to) in [(a, b), (b, c), (c, a)] {
+            graph.add_edge(Edge {
+                from,
+                to,
+                rate_num: U256::from(99u64),
+                rate_den: U256::from(100u64),
+                venue: VenueEdge::Balancer {
+                    pool_id: [7u8; 32],
+                    token_in: from,
+                    token_out: to,
+                },
+                estimated_gas: 0,
+                weight: compute_edge_weight(U256::from(99u64), U256::from(100u64)),
+                max_input: U256::from(2_000_000u64),
+                tolerance_bps: 0,
+                observed_slippage_bps: 0,
+                quote_block: None,
+                active: true,
+            });
+        }
+
+        let priorities = HashMap::new();
+        let cycles = graph.bellman_ford(&priorities, &limits(3), 1, None);
+        assert!(
+            cycles.is_empty(),
+            "a cycle that loses value on rates alone must never be admitted"
+        );
     }
 
     #[test]
@@ -2388,6 +3744,7 @@ mod tests {
                 path: vec![(a, None), (b, Some(500))],
                 pool: Address::zero(),
                 fee: 500,
+                state: None,
             },
             estimated_gas: 0,
             weight: fp_weight(2, 1),
@@ -2403,6 +3760,7 @@ mod tests {
             path: vec![(a, None), (b, Some(3000))],
             pool: Address::from_low_u64_be(1),
             fee: 3000,
+            state: None,
         };
         better.weight = fp_weight(1, 1);
 

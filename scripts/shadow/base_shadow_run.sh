@@ -36,16 +36,24 @@ for arg in "$@"; do
   esac
 done
 
-# --- Require an Alchemy key (paid tier strongly recommended) -----------------
-KEY="${ALCHEMY_KEY:-}"
-if [ -z "$KEY" ] && [ -f .env ]; then
-  KEY="$(grep -E '^ALCHEMY_KEY=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+# --- Require a Base RPC endpoint ---------------------------------------------
+# Base runs on BASE_RPC_URLS (drpc today); Alchemy is NOT in the runtime path.
+# This used to hard-require ALCHEMY_KEY, so an exhausted Alchemy quota aborted
+# the run before it started — on a provider the system never calls.
+RPC_URLS="${BASE_RPC_URLS:-}"
+if [ -z "$RPC_URLS" ] && [ -f .env ]; then
+  RPC_URLS="$(grep -E '^BASE_RPC_URLS=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]')"
 fi
-if [ -z "$KEY" ]; then
-  echo "FATAL: ALCHEMY_KEY is not set (env or .env). A Base archive/RPC endpoint is required." >&2
+if [ -z "$RPC_URLS" ] && [ -z "${ALCHEMY_KEY:-}" ]; then
+  echo "FATAL: no Base RPC configured. Set BASE_RPC_URLS (env or .env)." >&2
   exit 2
 fi
-export ALCHEMY_KEY="$KEY"
+# Keep ALCHEMY_KEY exported when present so registry entries that still
+# reference ${ALCHEMY_KEY} continue to expand.
+if [ -z "${ALCHEMY_KEY:-}" ] && [ -f .env ]; then
+  _ak="$(grep -E '^ALCHEMY_KEY=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+  [ -n "$_ak" ] && export ALCHEMY_KEY="$_ak"
+fi
 
 # --- Preflight on-chain address validation -----------------------------------
 if [ "$SKIP_PREFLIGHT" -eq 0 ]; then
@@ -109,18 +117,36 @@ export HOT_POOL_RPC_TIMEOUT_MS="${HOT_POOL_RPC_TIMEOUT_MS:-2000}"
 export UNIV3_MAX_CONCURRENT_POOL_TASKS="${UNIV3_MAX_CONCURRENT_POOL_TASKS:-32}"
 export UNIV3_QUOTE_CONCURRENCY="${UNIV3_QUOTE_CONCURRENCY:-24}"
 export ARBOT_LOCAL_CL_QUOTES="${ARBOT_LOCAL_CL_QUOTES:-1}"
-export ARBOT_SIM_REVM="${ARBOT_SIM_REVM:-1}"
+# NOT exported: ARBOT_SIM_REVM. Same reasoning as FEATURE_BACKRUN/RUST_LOG
+# below — dotenvy does not overwrite variables already in the process env, so
+# `${ARBOT_SIM_REVM:-1}` here did not "default" anything, it OVERRODE .env
+# unconditionally and forced the REVM path on every shadow run.
+#
+# That matters now that the choice is measured: REVM forks state over remote
+# RPC one storage slot per round trip, which at BlockPI's ~240ms RTT costs
+# >8000ms per simulation and never completes. The eth_call path is a single
+# round trip: p50 ~2750ms, 31/31 completed. Which simulator to use is a
+# deployment decision (it flips with RPC latency — a local node reverses it),
+# so it belongs in .env, not hardcoded here.
 export ARBOT_SIM_L1_FEE="${ARBOT_SIM_L1_FEE:-1}"
 export ARBOT_SIM_PREFETCH="${ARBOT_SIM_PREFETCH:-1}"
 export ARBOT_SCAN_IDLE_SLEEP_MS="${ARBOT_SCAN_IDLE_SLEEP_MS:-200}"
 
-# Mempool + backrun: decode pending swaps and trigger same-block rescans.
 export ARBOT_BF_SKIP_ON_STABLE_GRAPH="${ARBOT_BF_SKIP_ON_STABLE_GRAPH:-0}"
 export BACKRUN_POST_STATE="${BACKRUN_POST_STATE:-1}"
-export FEATURE_BACKRUN="${FEATURE_BACKRUN:-true}"
-export BACKRUN_MONITOR="${BACKRUN_MONITOR:-true}"
-export BACKRUN_MONITOR_ENABLED="${BACKRUN_MONITOR_ENABLED:-true}"
-export RUST_LOG="${RUST_LOG:-info,arb_exec=info,arb_exec::venues=info,venue::univ3=warn,mempool=info}"
+
+# NOT exported here on purpose: FEATURE_BACKRUN, BACKRUN_MONITOR,
+# BACKRUN_MONITOR_ENABLED and RUST_LOG.
+#
+# dotenvy does not overwrite variables already present in the process env, so a
+# `${VAR:-default}` here does not "default" anything — it OVERRIDES .env
+# unconditionally. These four are policy, not run-scoping: hardcoding them meant
+# `FEATURE_BACKRUN=false` in .env still ran the backrun/mempool monitor (which
+# cannot work on Base — no public mempool), and `arb_exec=debug` in .env was
+# silently downgraded to `info`, hiding the scanner's own diagnostics.
+#
+# They now come from .env / ops-inputs, which is where they belong. Export them
+# in your shell before invoking this script if you want a one-off override.
 
 # --- Hard safety assertion ---------------------------------------------------
 if [ "${SHADOW_MODE}" != "1" ]; then
@@ -138,7 +164,7 @@ echo "   shadow log     : $SHADOW_LOG_PATH"
 echo "   console log    : $SHADOW_CONSOLE_LOG"
 echo "   shadow tag     : $SHADOW_TAG"
 echo "   prometheus     : http://127.0.0.1:${PROMETHEUS_PORT}/metrics"
-echo "   RUST_LOG       : $RUST_LOG"
+echo "   RUST_LOG       : ${RUST_LOG:-<from .env>}"
 echo "   auto-stop      : ${RUN_SECS:-<none, Ctrl+C to stop>}"
 echo "=============================================================="
 echo ">>> Building release binary (one-time; startup ranks hot pools ~30-60s)..."

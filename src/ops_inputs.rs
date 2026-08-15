@@ -38,6 +38,11 @@ pub struct OpsChainOverrides {
     pub erc3156_flashloan_tokens: Vec<String>,
     pub univ2_flashloan_tokens: Vec<String>,
     pub univ3_flashloan_tokens: Vec<String>,
+    /// Pool a flash swap borrows from, plus that pool's swap fee in bps.
+    pub univ2_flash_pool: Option<String>,
+    pub univ2_flash_fee_bps: Option<u32>,
+    pub univ3_flash_pool: Option<String>,
+    pub univ3_flash_fee_bps: Option<u32>,
     pub executor_address: Option<String>,
     pub executor_owner: Option<String>,
     pub permit2_address: Option<String>,
@@ -599,6 +604,10 @@ impl OpsInputs {
             univ3_flashloan_tokens: univ3_loan
                 .map(|loan| loan.allowlist_tokens.clone())
                 .unwrap_or_default(),
+            univ2_flash_pool: univ2.and_then(|loan| loan.pool.clone()),
+            univ2_flash_fee_bps: univ2.and_then(|loan| loan.fee_bps),
+            univ3_flash_pool: univ3_loan.and_then(|loan| loan.pool.clone()),
+            univ3_flash_fee_bps: univ3_loan.and_then(|loan| loan.fee_bps),
             executor_address: executor_address_override,
             executor_owner: executor_owner_override,
             permit2_address: permit2_override,
@@ -1488,9 +1497,18 @@ impl OpsInputs {
             &mut missing,
             strict,
         )?;
+        // Bounded, not pinned. This used to demand exactly 6 with no recorded
+        // reason, which made the search depth unadjustable while the runtime's
+        // own `MAX_HOPS_CAP` already allowed up to 8 (main.rs) — the config
+        // rejected values the engine was built to accept. The ceiling stays,
+        // because cycle gas is budgeted as `210_000 * max_hops` and deeper
+        // cycles also pay one swap fee per hop, so depth is not free.
+        const MAX_HOPS_CEILING: usize = 8;
         if let Some(max_hops) = self.universe.max_hops {
-            if max_hops != 6 {
-                return Err(anyhow!("universe.max_hops must be set to 6"));
+            if max_hops < 2 || max_hops > MAX_HOPS_CEILING {
+                return Err(anyhow!(
+                    "universe.max_hops must be between 2 and {MAX_HOPS_CEILING} (got {max_hops})"
+                ));
             }
         } else {
             push_missing(path, "universe.max_hops", &mut missing, strict);

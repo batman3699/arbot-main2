@@ -140,16 +140,19 @@ async fn load_registry_from_url(url: &str) -> Result<RegistryBlob> {
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .context("build registry http client")?;
+    // The registry URL may carry an access token; error context propagates into
+    // logs and alerts, so redact before it can escape.
+    let safe_url = crate::util::redact_endpoint(url);
     let res = client
         .get(url)
         .send()
         .await
-        .with_context(|| format!("fetch registry from {url}"))?;
+        .with_context(|| format!("fetch registry from {safe_url}"))?;
     let status = res.status();
     let bytes = res
         .bytes()
         .await
-        .with_context(|| format!("read registry body from {url}"))?
+        .with_context(|| format!("read registry body from {safe_url}"))?
         .to_vec();
     if !status.is_success() {
         anyhow::bail!("registry fetch failed with status {status}");

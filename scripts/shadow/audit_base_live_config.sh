@@ -21,13 +21,20 @@ if [ -n "$_preserve_shadow" ]; then
   export SHADOW_MODE="$_preserve_shadow"
 fi
 
-KEY="${ALCHEMY_KEY:-}"
-[ -z "$KEY" ] && fail "ALCHEMY_KEY not set"
-
+# Audit the endpoint the RUNTIME uses. This previously hard-required
+# ALCHEMY_KEY and built an Alchemy URL, so an exhausted Alchemy quota failed the
+# audit — and blocked the run — even though Base runs on BASE_RPC_URLS (drpc)
+# and never calls Alchemy. Same bug as validate_base_addresses.sh had.
 RPC="${BASE_RPC_URL:-}"
 if [ -z "$RPC" ]; then
-  RPC="https://base-mainnet.g.alchemy.com/v2/${KEY}"
+  RPC="${BASE_RPC_URLS%%,*}"
 fi
+if [ -z "$RPC" ] && [ -n "${ALCHEMY_KEY:-}" ]; then
+  RPC="https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+fi
+[ -z "$RPC" ] && fail "no Base RPC configured (set BASE_RPC_URLS)"
+# Expand any ${VAR} placeholders carried in from config.
+RPC="$(eval "printf '%s' \"$RPC\"")"
 
 EXEC="${BASE_EXECUTOR_ADDRESS:-0x9445f7d3E1aA38bC9A9B373dc905D9fde7B9B852}"
 OWNER_CFG="${BASE_EXECUTOR_OWNER:-0xD7A4D612E572B5877b0E2fC7cE8683e36360f04c}"

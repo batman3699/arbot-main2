@@ -14,7 +14,7 @@
 //!   * returns an error only when every endpoint has failed.
 
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use ethers::providers::{Http, JsonRpcClient, ProviderError};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 
 #[derive(Debug)]
 struct Endpoint {
@@ -40,6 +40,20 @@ struct Inner {
     /// Additional full cycles attempted (with backoff) after the first pass.
     extra_passes: usize,
     base_backoff: Duration,
+}
+
+/// Process-wide count of logical JSON-RPC requests issued through any
+/// `FailoverClient` (counted once per request, not once per failover attempt).
+///
+/// The engine had no request counter at all — only `rpc_errors` — so its actual
+/// RPC demand could not be measured. That number is precisely what is needed to
+/// size a provider plan, and to tell "no arbitrage exists" apart from "we are
+/// rate-limited into blindness".
+static RPC_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Logical RPC requests issued since process start.
+pub fn total_rpc_requests() -> u64 {
+    RPC_REQUESTS.load(Ordering::Relaxed)
 }
 
 /// A cloneable, multi-endpoint HTTP JSON-RPC client with per-request failover.
@@ -102,11 +116,16 @@ impl FailoverClient {
     }
 
     /// Comma-joined endpoint list, for logging/metrics labels.
+    /// Human-readable identifier for this transport's endpoint set.
+    ///
+    /// Redacted: this label is logged AND used as a `HealthTracker` key, so a
+    /// raw URL here would leak the provider credential into both the log stream
+    /// and the health/metrics surface.
     pub fn endpoint_label(&self) -> String {
         self.inner
             .endpoints
             .iter()
-            .map(|ep| ep.url.as_str())
+            .map(|ep| crate::util::redact_endpoint(&ep.url))
             .collect::<Vec<_>>()
             .join(",")
     }
@@ -129,6 +148,7 @@ impl JsonRpcClient for FailoverClient {
         // endpoints (the trait's `T` is not `Clone`, but `serde_json::Value` is).
         let value = serde_json::to_value(&params)
             .map_err(|err| ProviderError::CustomError(format!("serialize rpc params: {err}")))?;
+        RPC_REQUESTS.fetch_add(1, Ordering::Relaxed);
 
         let n = self.inner.endpoints.len();
         let start = self.inner.cursor.load(Ordering::Relaxed) % n;
@@ -146,11 +166,33 @@ impl JsonRpcClient for FailoverClient {
                     return Ok(res);
                 }
                 Err(err) => {
+                    // A revert is the CONTRACT's answer, not an endpoint fault:
+                    // every endpoint replays the same call against the same state
+                    // and returns the same revert. Rotating is guaranteed waste —
+                    // a measured 3-minute run burned 2,543 of 3,378 rotations
+                    // (75%) on reverts, each dragging the caller through the full
+                    // endpoint cycle plus exponential backoff for an answer that
+                    // could not change. It also inflated `failures` on perfectly
+                    // healthy endpoints, corrupting the health signal.
+                    //
+                    // Return it verbatim so callers keep classifying it as they
+                    // already do (quote paths treat a revert as "no quote").
+                    if crate::quote_common::is_execution_revert(&err) {
+                        debug!(
+                            target: "rpc",
+                            endpoint = %crate::util::redact_endpoint(&ep.url),
+                            method,
+                            attempt,
+                            error = %err,
+                            "rpc call reverted; deterministic, not rotating"
+                        );
+                        return Err(ProviderError::CustomError(err.to_string()));
+                    }
                     ep.failures.fetch_add(1, Ordering::Relaxed);
                     last_err = Some(err.to_string());
                     warn!(
                         target: "rpc",
-                        endpoint = %ep.url,
+                        endpoint = %crate::util::redact_endpoint(&ep.url),
                         method,
                         attempt,
                         error = %err,
@@ -183,6 +225,44 @@ mod tests {
     fn rejects_empty_endpoint_set() {
         assert!(FailoverClient::new(&[]).is_err());
         assert!(FailoverClient::new(&["   ".to_string()]).is_err());
+    }
+
+    /// The failover loop rotates on everything `is_execution_revert` rejects, so
+    /// these two lists define exactly what does and does not burn the endpoint
+    /// cycle. Getting the second list wrong is the dangerous direction: treating
+    /// a transient transport fault as deterministic would surface it to the
+    /// caller as a hard failure and disable failover — the outage this module
+    /// exists to prevent.
+    #[test]
+    fn reverts_are_deterministic_and_must_not_rotate() {
+        for msg in [
+            "(code: 3, message: execution reverted, data: None)",
+            "execution reverted: SPL",
+            "execution reverted: STF",
+            "invalid opcode",
+        ] {
+            assert!(
+                crate::quote_common::is_execution_revert(&msg),
+                "{msg:?} is the contract's answer; rotating cannot change it"
+            );
+        }
+    }
+
+    #[test]
+    fn transport_faults_still_rotate() {
+        for msg in [
+            "Monthly capacity limit exceeded",
+            "account limited to 15/sec",
+            "error sending request for url",
+            "connection closed before message completed",
+            "operation timed out",
+            "503 Service Unavailable",
+        ] {
+            assert!(
+                !crate::quote_common::is_execution_revert(&msg),
+                "{msg:?} is transient; failover MUST still rotate"
+            );
+        }
     }
 
     #[test]

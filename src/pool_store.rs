@@ -138,7 +138,7 @@ pub fn write_pool_records(path: impl AsRef<Path>, records: &[PoolRecord]) -> Res
 /// Values above this are almost certainly raw UniV3 `liquidity()` scores, not USD.
 const MAX_SANE_HUB_USD_LIQUIDITY: f64 = 1e12;
 
-fn sanitize_hub_usd_liquidity(value: Option<f64>) -> Option<f64> {
+pub(crate) fn sanitize_hub_usd_liquidity(value: Option<f64>) -> Option<f64> {
     value.filter(|usd| usd.is_finite() && *usd > 0.0 && *usd <= MAX_SANE_HUB_USD_LIQUIDITY)
 }
 

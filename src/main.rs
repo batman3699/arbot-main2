@@ -415,6 +415,17 @@ fn derive_chain_event_sampling_rate(chain_name: &str, configured_rate: f64) -> f
 }
 
 /// Ethereum needs wider execution windows; L2s stay tight for sub-block latency.
+/// Upper bound on the L2 simulation budget, in ms. Override with
+/// `ARBOT_L2_SIM_CEILING_MS` to fit measured simulation cost.
+fn l2_simulation_ceiling_ms() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        crate::util::env_parse_opt::<u64>("ARBOT_L2_SIM_CEILING_MS")
+            .unwrap_or(1_500)
+            .clamp(100, 10_000)
+    })
+}
+
 fn derive_chain_time_budget_ms(
     chain_name: &str,
     search_ms: u64,
@@ -430,7 +441,14 @@ fn derive_chain_time_budget_ms(
         "base" | "arbitrum" | "optimism" => (
             search_ms.min(800),
             quoting_ms.min(350),
-            simulation_ms.min(400),
+            // The L2 simulation ceiling was a bare `.min(400)`, so no config
+            // value could ever raise it. Measured on Base, EVERY simulation
+            // exceeded it (50/50 timed out at 400-402ms) — a budget that always
+            // expires does not protect block cadence, it silently deletes the
+            // simulation stage and with it any chance of verifying a trade.
+            // Still capped, because this sits on the hot path, but the ceiling
+            // is now tunable so it can be set from measured cost.
+            simulation_ms.min(l2_simulation_ceiling_ms()),
         ),
         _ => (search_ms, quoting_ms, simulation_ms),
     }
@@ -606,6 +624,177 @@ fn build_hub_tokens(ops_inputs: &crate::ops_inputs::OpsInputs) -> HashSet<Addres
     hubs
 }
 
+/// Total fee owed to traverse a cycle, in bps, summed across hops.
+///
+/// This is the bar every candidate must clear before it can earn anything, and
+/// nothing in the pipeline used to compute it. On Base it dominates: 53% of the
+/// UniV3 inventory is the 100bps tier and 27% is 30bps, so a 3-hop cycle
+/// routinely owes 90-300bps up front. Measured across five shadow runs, the best
+/// candidate sat ~99.5bps underwater — the fee stack of exactly such a path, not
+/// a lost race. Venues whose edges carry no explicit fee (bridge, liquidation)
+/// contribute nothing here and are priced downstream.
+fn cycle_fee_stack_bps(edges: &[Edge]) -> u32 {
+    edges
+        .iter()
+        .map(|edge| match &edge.venue {
+            VenueEdge::UniV3 { fee, .. } => fee / 100,
+            VenueEdge::UniV2 { fee_bps, .. } => *fee_bps,
+            VenueEdge::SolidlyV2 { fee_bps, .. } => *fee_bps,
+            // Fee not carried on the edge (Slipstream is tick-spacing based and
+            // charges a dynamic per-pool fee; Curve/Balancer/UniV4 encode theirs
+            // in pool state). Count them as zero so an unknown fee can only make
+            // this prune more permissive, never wrongly discard a live cycle.
+            VenueEdge::Slipstream { .. }
+            | VenueEdge::Curve { .. }
+            | VenueEdge::Balancer { .. }
+            | VenueEdge::Univ4 { .. }
+            | VenueEdge::Bridge { .. }
+            | VenueEdge::Liquidation { .. } => 0,
+        })
+        .sum()
+}
+
+/// Ceiling on the fee stack a cycle may carry, in bps. Above this the path
+/// cannot realistically clear its own cost plus gas, so quoting it is wasted
+/// budget on the hot path. `ARBOT_MAX_CYCLE_FEE_BPS=0` disables the prune.
+fn max_cycle_fee_bps() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::util::env_parse_opt::<u32>("ARBOT_MAX_CYCLE_FEE_BPS").unwrap_or(60))
+}
+
+/// Encode planner steps into executor calldata.
+///
+/// Extracted so the SAME encoding can produce both the dispatchable plan and
+/// the floor-free diagnostic variant. Re-implementing it for the diagnostic
+/// would let the two drift, and a diagnostic that encodes differently from the
+/// real plan measures the wrong thing.
+fn encode_plan_steps(steps: Vec<StepData>) -> Vec<ExecutorStep> {
+    let mut ops: Vec<ExecutorStep> = Vec::with_capacity(steps.len());
+    for step in steps {
+            match step {
+                StepData::Uniswap {
+                    path,
+                    amount_in,
+                    min_out,
+                } => {
+                    let data = ethers::abi::encode(&[
+                        Token::Bytes(path.to_vec()),
+                        Token::Uint(amount_in),
+                        Token::Uint(min_out),
+                    ]);
+                    ops.push(ExecutorStep {
+                        op: EXECUTOR_OP_UNIV3,
+                        data: Bytes::from(data),
+                    });
+                }
+                StepData::JitLiquidityAdd {
+                    pool,
+                    token0,
+                    token1,
+                    amount0,
+                    amount1,
+                    tick_range,
+                } => {
+                    let data = ethers::abi::encode(&[
+                        Token::Address(pool),
+                        Token::Address(token0),
+                        Token::Address(token1),
+                        Token::Uint(amount0),
+                        Token::Uint(amount1),
+                        Token::Uint(U256::from(tick_range)),
+                    ]);
+                    ops.push(ExecutorStep {
+                        op: EXECUTOR_OP_JIT_LP_ADD,
+                        data: Bytes::from(data),
+                    });
+                }
+                StepData::JitLiquidityRemove {
+                    pool,
+                    target_token,
+                    fee,
+                    min_out,
+                } => {
+                    let data = ethers::abi::encode(&[
+                        Token::Address(pool),
+                        Token::Address(target_token),
+                        Token::Uint(U256::from(fee)),
+                        Token::Uint(min_out),
+                    ]);
+                    ops.push(ExecutorStep {
+                        op: EXECUTOR_OP_JIT_LP_REMOVE,
+                        data: Bytes::from(data),
+                    });
+                }
+                StepData::Balancer {
+                    pool_id,
+                    token_in,
+                    token_out,
+                    amount_in,
+                    min_out,
+                } => {
+                    let data = ethers::abi::encode(&[
+                        Token::FixedBytes(pool_id.to_vec()),
+                        Token::Address(token_in),
+                        Token::Address(token_out),
+                        Token::Uint(amount_in),
+                        Token::Uint(min_out),
+                    ]);
+                    ops.push(ExecutorStep {
+                        op: EXECUTOR_OP_BALANCER,
+                        data: Bytes::from(data),
+                    });
+                }
+                StepData::Bridge {
+                    adapter,
+                    token_in,
+                    amount_in,
+                    dst_chain_id,
+                    max_bridge_time_secs,
+                    call,
+                } => {
+                    let data = ethers::abi::encode(&[
+                        Token::Address(adapter),
+                        Token::Address(token_in),
+                        Token::Uint(amount_in),
+                        Token::Uint(U256::from(dst_chain_id)),
+                        Token::Uint(U256::from(max_bridge_time_secs)),
+                        Token::Bytes(call.to_vec()),
+                    ]);
+                    ops.push(ExecutorStep {
+                        op: EXECUTOR_OP_BRIDGE,
+                        data: Bytes::from(data),
+                    });
+                }
+                StepData::Generic {
+                    target,
+                    call,
+                    pre_action,
+                } => {
+                    let (action, token, amount) = match pre_action {
+                        Some(GenericPreAction::Approve { token, amount }) => {
+                            (U256::from(1u64), token, amount)
+                        }
+                        Some(GenericPreAction::Transfer { token, amount }) => {
+                            (U256::from(2u64), token, amount)
+                        }
+                        None => (U256::zero(), Address::zero(), U256::zero()),
+                    };
+                    let data = ethers::abi::encode(&[
+                        Token::Address(target),
+                        Token::Bytes(call.to_vec()),
+                        Token::Uint(action),
+                        Token::Address(token),
+                        Token::Uint(amount),
+                    ]);
+                    ops.push(ExecutorStep {
+                        op: EXECUTOR_OP_GENERIC,
+                        data: Bytes::from(data),
+                    });
+                }
+            }
+    }
+    ops
+}
 fn pool_liquidity_weight(pool: &PoolRecord, rank_index: usize, total: usize) -> u64 {
     pool.hub_usd_liquidity
         .map(|usd| ((usd.max(1.0)) as u64).saturating_mul(1_000))
@@ -951,9 +1140,13 @@ fn cycle_indices_to_addresses(graph: &Graph, cycle: &[usize]) -> Vec<Address> {
 }
 
 #[derive(Clone, Debug)]
+/// A cycle carried across scans as its ROUTE only.
+///
+/// Deliberately does not store edge indices: those are positions in a specific
+/// `Graph::edges` and are invalid the moment the graph is rebuilt. The hop edges
+/// are re-resolved from `addresses` on each scan.
 struct CycleSeed {
     addresses: Vec<Address>,
-    edge_indices: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1016,6 +1209,51 @@ fn edge_fee_bps(edge: &Edge) -> Option<u32> {
                 .find_map(|(_, maybe_spacing)| maybe_spacing.as_ref().copied())
         }
         _ => None,
+    }
+}
+
+/// Outcome of probing one token's native price.
+///
+/// `NoRoute` and `Unknown` must stay distinct all the way to the cache. Only
+/// `NoRoute` is a statement about the chain; `Unknown` is a statement about our
+/// connectivity, and recording it as a price verdict is what let a provider
+/// rate-limit blind the engine to a token for the whole cache TTL — rejecting
+/// every cycle that started there, with no log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativePriceProbe {
+    /// The quoter returned a usable price.
+    Priced(NativePrice),
+    /// Every fee tier executed and reverted: genuinely no route to native.
+    NoRoute,
+    /// At least one tier failed for a non-execution reason (rate limit,
+    /// timeout, dead endpoint). The price is unknown; do not cache.
+    Unknown,
+}
+
+impl NativePriceProbe {
+    /// Stable metric label. Kept next to the variants so a new variant cannot
+    /// silently inherit another's label.
+    fn label(&self) -> &'static str {
+        match self {
+            NativePriceProbe::Priced(_) => "priced",
+            NativePriceProbe::NoRoute => "no_route",
+            NativePriceProbe::Unknown => "unknown",
+        }
+    }
+
+    /// What this probe may be written into the price cache as, if anything.
+    ///
+    /// `None` means "do not touch the cache" — the load-bearing case. Returning
+    /// an unreliable price here instead of `None` is precisely the regression
+    /// that caused the zero-fill outage, so this is asserted in tests.
+    fn cache_entry(&self) -> Option<NativePrice> {
+        match self {
+            NativePriceProbe::Priced(price) => Some(*price),
+            NativePriceProbe::NoRoute => {
+                Some(NativePrice::new(U256::zero(), U256::zero(), false))
+            }
+            NativePriceProbe::Unknown => None,
+        }
     }
 }
 
@@ -1953,7 +2191,20 @@ fn apply_public_mempool_jitter(tx: &mut TypedTransaction, jitter_bps: u32) {
     }
 }
 
+/// Apply fee AND gas-limit parameters from a `FeeEstimate` to a transaction.
+///
+/// The gas limit used to be dropped on the floor: only the fee fields were
+/// applied, so the tx reached simulation with no `gas` set. The primary provider
+/// tolerated that (it substitutes a default), but every quorum verifier rejected
+/// it outright with `intrinsic gas too low` — so cross-endpoint verification
+/// could never confirm a single simulation, and the safety check it represents
+/// was silently inert while still costing a round trip per endpoint.
 fn apply_gas_parameters(tx: &mut TypedTransaction, gas: &FeeEstimate) {
+    // Zero would be worse than absent: it guarantees an intrinsic-gas failure
+    // instead of letting the node fall back to its own default.
+    if !gas.gas_limit.is_zero() {
+        tx.set_gas(gas.gas_limit);
+    }
     match tx {
         TypedTransaction::Eip1559(inner) => {
             if let Some(max_fee) = gas.max_fee_per_gas {
@@ -1971,6 +2222,13 @@ fn apply_gas_parameters(tx: &mut TypedTransaction, gas: &FeeEstimate) {
             tx.set_gas_price(gas.gas_price);
         }
     }
+}
+
+/// Worst-case transactions the wallet must be able to fund before LIVE dispatch
+/// is allowed. `0` removes the floor.
+fn gas_reserve_txs() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| crate::util::env_parse_opt::<u64>("ARBOT_GAS_RESERVE_TXS").unwrap_or(20))
 }
 
 fn lock_unpoison<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
@@ -2077,10 +2335,16 @@ async fn connect_private_relays(
                         None
                     }
                 })
-                .unwrap_or_else(|| endpoint.to_string());
+                // A relay with no known name falls back to its URL — which on
+                // Base is the sequencer RPC, carrying an embedded provider key.
+                // This label is logged AND stored on RelayEndpoint, from where
+                // it reaches trade JSON and execution metrics, so it must be
+                // redacted at the point of construction rather than at each use.
+                .unwrap_or_else(|| crate::util::redact_endpoint(endpoint));
+            let safe_endpoint = crate::util::redact_endpoint(endpoint);
             info!(
                 target: "broadcast",
-                endpoint = %endpoint,
+                endpoint = %safe_endpoint,
                 relay = %relay_label,
                 "Connecting private relay endpoint"
             );
@@ -2089,7 +2353,7 @@ async fn connect_private_relays(
                 Ok(provider) => {
                     info!(
                         target: "broadcast",
-                        endpoint = %endpoint,
+                        endpoint = %safe_endpoint,
                         relay = %relay_label,
                         "Private relay endpoint connected"
                     );
@@ -2103,7 +2367,7 @@ async fn connect_private_relays(
                 Err(err) => {
                     warn!(
                         target: "broadcast",
-                        endpoint = %endpoint,
+                        endpoint = %safe_endpoint,
                         error = %err,
                         "Failed to connect private relay endpoint"
                     );
@@ -2263,12 +2527,29 @@ impl CircuitBreaker {
             hourly_losses: Mutex::new(VecDeque::new()),
             daily_losses: Mutex::new(VecDeque::new()),
             consecutive_failures: Mutex::new(0),
-            // Safe defaults: revert/RPC triggers require a minimum sample so they
-            // never trip on the empty windows used in unit tests.
+            // Calibrated for a BACKRUNNING workload, where a 55-65% revert rate
+            // is the normal steady state, not a fault. Losing the race and
+            // reverting is the executor working correctly — it costs gas instead
+            // of filling at a loss — so the breaker must tolerate that band and
+            // still catch a genuinely broken deploy.
+            //
+            // The previous defaults were not merely tight, they were INVERTED:
+            // a 0.5 rate limit sits BELOW the expected 0.55-0.65 band, so normal
+            // operation tripped the breaker permanently.
+            //
+            // rate limit 0.90 with 50 samples: at p=0.65 the sampling sigma is
+            // sqrt(0.65*0.35/50) = 0.0675, so 0.90 is 3.7 sigma out — a false
+            // trip roughly once in 9,000 windows. A broken deploy reverting
+            // 100% trips as soon as 50 samples accumulate.
+            //
+            // A 1800s window (was 600s) is needed for 50 samples to accumulate
+            // at realistic fill rates; without that the rate trigger would never
+            // arm, which is a fail-OPEN. Fast detection is the consecutive-
+            // failure trigger's job, not this one's.
             revert_window: Mutex::new(VecDeque::new()),
-            revert_window_dur: Duration::from_secs(600),
-            revert_rate_limit: 0.5,
-            revert_min_samples: 8,
+            revert_window_dur: Duration::from_secs(1800),
+            revert_rate_limit: 0.90,
+            revert_min_samples: 50,
             rpc_errors: Mutex::new(VecDeque::new()),
             rpc_error_window: Duration::from_secs(120),
             rpc_error_limit: 30,
@@ -2833,6 +3114,18 @@ where
     chain_name: String,
     provider: Arc<Provider<C>>,
     rpc_endpoint: String,
+    /// A REAL, single, un-redacted http endpoint for components that must issue
+    /// their own JSON-RPC (REVM forking).
+    ///
+    /// `rpc_endpoint` above is `FailoverClient::endpoint_label()` — deliberately
+    /// REDACTED and comma-joined, because it doubles as a log line and a
+    /// HealthTracker key. It is not a URL and cannot be POSTed to. Passing it to
+    /// the REVM fork made `eth_getBlockByNumber` fail on every single
+    /// simulation, silently degrading to the slow `eth_call` path, which then
+    /// exceeded the simulation budget — so REVM simulation had never once
+    /// succeeded on any provider. Keep this field out of logs: it carries the
+    /// provider credential.
+    sim_rpc_url: String,
     rpc_health: Arc<StdMutex<HealthTracker>>,
     univ3_quoter: Address,
     univ3_factory: Address,
@@ -2848,6 +3141,12 @@ where
     erc3156_flashloan_tokens: Option<HashSet<Address>>,
     univ2_flashloan_tokens: Option<HashSet<Address>>,
     univ3_flashloan_tokens: Option<HashSet<Address>>,
+    /// Pool a univ2-style flash swap borrows from, and that pool's swap fee.
+    /// Required: without an address the loan is rejected as unfundable.
+    univ2_flash_pool: Option<Address>,
+    univ2_flash_fee_bps: u32,
+    univ3_flash_pool: Option<Address>,
+    univ3_flash_fee_bps: u32,
     chain_env_prefix: String,
     tokens: TokenList,
     initial_token_decimals: HashMap<Address, u8>,
@@ -2917,6 +3216,10 @@ where
     chain_id: u64,
     block_head_rx: Option<Arc<Mutex<watch::Receiver<BlockHead>>>>,
     bf_skip_on_stable_graph: bool,
+    /// A/B switch for the hub-anchored cycle search (`ARBOT_HUB_SEARCH`).
+    hub_search_enabled: bool,
+    /// Parallel pools retained per token pair by the hub search.
+    hub_search_parallel_edges: usize,
 }
 
 struct Runner<M, C>
@@ -2927,6 +3230,18 @@ where
     feature_gate: FeatureGate,
     provider: Arc<Provider<C>>,
     rpc_endpoint: String,
+    /// A REAL, single, un-redacted http endpoint for components that must issue
+    /// their own JSON-RPC (REVM forking).
+    ///
+    /// `rpc_endpoint` above is `FailoverClient::endpoint_label()` — deliberately
+    /// REDACTED and comma-joined, because it doubles as a log line and a
+    /// HealthTracker key. It is not a URL and cannot be POSTed to. Passing it to
+    /// the REVM fork made `eth_getBlockByNumber` fail on every single
+    /// simulation, silently degrading to the slow `eth_call` path, which then
+    /// exceeded the simulation budget — so REVM simulation had never once
+    /// succeeded on any provider. Keep this field out of logs: it carries the
+    /// provider credential.
+    sim_rpc_url: String,
     rpc_health: Arc<StdMutex<HealthTracker>>,
     chain_name: String,
     #[allow(dead_code)]
@@ -2945,6 +3260,10 @@ where
     erc3156_flashloan_tokens: Option<Arc<HashSet<Address>>>,
     univ2_flashloan_tokens: Option<Arc<HashSet<Address>>>,
     univ3_flashloan_tokens: Option<Arc<HashSet<Address>>>,
+    univ2_flash_pool: Option<Address>,
+    univ2_flash_fee_bps: u32,
+    univ3_flash_pool: Option<Address>,
+    univ3_flash_fee_bps: u32,
     chain_env_prefix: String,
     tokens: TokenList,
     wrapped_native: Address,
@@ -3016,10 +3335,14 @@ where
     accounting: Option<Arc<Accounting>>,
     token_decimals: Arc<Mutex<HashMap<Address, u8>>>,
     native_price_cache: Arc<Mutex<HashMap<Address, (NativePrice, Instant)>>>,
+    /// RPC request total at the end of the previous scan, for per-scan deltas.
+    last_scan_rpc_total: Arc<std::sync::atomic::AtomicU64>,
     fee_estimator: FeeEstimator<C>,
     last_graph_digest: Arc<Mutex<Option<GraphDigest>>>,
     previous_cycle_seeds: Arc<Mutex<Vec<CycleSeed>>>,
     bf_skip_on_stable_graph: bool,
+    hub_search_enabled: bool,
+    hub_search_parallel_edges: usize,
     candidate_logger: Arc<CandidateDecisionLogger>,
     risk_policy: Option<RuntimeRiskPolicy>,
     sim_quorum: Arc<SimQuorum>,
@@ -3033,7 +3356,6 @@ where
 struct PopulateCacheState {
     cached_edges: Vec<Edge>,
     last_digest: Option<EdgeDigest>,
-    last_gas_price: U256,
     touched_pools: HashSet<Address>,
 }
 
@@ -3059,6 +3381,7 @@ where
             chain_name,
             provider,
             rpc_endpoint,
+            sim_rpc_url,
             rpc_health,
             univ3_quoter,
             univ3_factory,
@@ -3074,6 +3397,10 @@ where
             erc3156_flashloan_tokens,
             univ2_flashloan_tokens,
             univ3_flashloan_tokens,
+            univ2_flash_pool,
+            univ2_flash_fee_bps,
+            univ3_flash_pool,
+            univ3_flash_fee_bps,
             chain_env_prefix,
             tokens,
             initial_token_decimals,
@@ -3143,6 +3470,8 @@ where
             chain_id,
             block_head_rx,
             bf_skip_on_stable_graph,
+            hub_search_enabled,
+            hub_search_parallel_edges,
         } = config;
         let bal_flashloan_tokens = bal_flashloan_tokens.map(Arc::new);
         let aave_flashloan_tokens = aave_flashloan_tokens.map(Arc::new);
@@ -3181,6 +3510,7 @@ where
             feature_gate,
             provider,
             rpc_endpoint,
+            sim_rpc_url,
             rpc_health,
             univ3_quoter,
             univ3_factory,
@@ -3196,6 +3526,10 @@ where
             erc3156_flashloan_tokens,
             univ2_flashloan_tokens,
             univ3_flashloan_tokens,
+            univ2_flash_pool,
+            univ2_flash_fee_bps,
+            univ3_flash_pool,
+            univ3_flash_fee_bps,
             chain_env_prefix,
             tokens,
             wrapped_native,
@@ -3277,10 +3611,13 @@ where
             accounting,
             token_decimals: Arc::new(Mutex::new(initial_token_decimals)),
             native_price_cache: Arc::new(Mutex::new(HashMap::new())),
+            last_scan_rpc_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fee_estimator,
             last_graph_digest: Arc::new(Mutex::new(None)),
             previous_cycle_seeds: Arc::new(Mutex::new(Vec::new())),
             bf_skip_on_stable_graph,
+            hub_search_enabled,
+            hub_search_parallel_edges,
             candidate_logger: Arc::new(CandidateDecisionLogger::from_env()),
             risk_policy,
             sim_quorum,
@@ -3469,10 +3806,16 @@ where
         let gas_per_tx = self
             .max_gas_price_wei
             .saturating_mul(U256::from(500_000u64));
+        // Shadow mode requires nothing: no broadcast happens, so no gas is spent
+        // and the balance is irrelevant. In LIVE mode the reserve is how many
+        // worst-case transactions the wallet can still pay for — dispatching
+        // without it produces failed sends, not savings. The 20x multiple was
+        // hardcoded; it is now tunable via ARBOT_GAS_RESERVE_TXS (0 disables the
+        // floor entirely) so the trade-off is an explicit operator decision.
         let min_balance = if self.shadow.enabled {
             U256::zero()
         } else {
-            gas_per_tx.saturating_mul(U256::from(20u64))
+            gas_per_tx.saturating_mul(U256::from(gas_reserve_txs()))
         };
 
         if !self.shadow.enabled && balance < min_balance {
@@ -3555,9 +3898,9 @@ where
                  base_amount_wei,
                  base_profiles,
                  edge_slippage_bps,
-                 gas_price,
+                 _gas_price,
                  token_decimals,
-                 native_prices,
+                 _native_prices,
                  min_liquidity_tokens,
                  min_edge_max_input,
                  low_liquidity,
@@ -3589,7 +3932,6 @@ where
                             PopulateOptions {
                                 touched_pools: guard.touched_pools.clone(),
                                 last_digest: guard.last_digest,
-                                last_gas_price: guard.last_gas_price,
                                 cached_edges: if guard.cached_edges.is_empty() {
                                     None
                                 } else {
@@ -3612,9 +3954,10 @@ where
                             base_amount_wei,
                             base_profiles.clone(),
                             edge_slippage_bps,
-                            gas_price,
+                            // gas_price / native_prices are no longer passed:
+                            // Stage-1 edge weights are rate-only, so detection
+                            // needs neither gas nor a native price oracle.
                             token_decimals.clone(),
-                            native_prices.clone(),
                             min_liquidity_tokens,
                             min_edge_max_input,
                             low_liquidity,
@@ -3678,6 +4021,31 @@ where
         //    the per-token 3-attempt retry with exponential backoff. A token
         //    whose fetch fails is left absent so callers fall back to 18, exactly
         //    as before.
+        // Batch the cold-start decimals read first (spec §3.4): one Multicall3
+        // instead of one eth_call per token before any quoting can begin. Only
+        // tokens the batch could not resolve fall through to the retrying
+        // per-token path below.
+        let to_fetch: Vec<Address> = if to_fetch.is_empty() {
+            to_fetch
+        } else {
+            let batched = crate::util::erc20_decimals_batched(
+                self.provider.clone(),
+                &to_fetch,
+                U64::zero(),
+            )
+            .await;
+            if !batched.is_empty() {
+                let mut cache = self.token_decimals.lock().await;
+                for (token, decimals) in &batched {
+                    cache.insert(*token, *decimals);
+                }
+            }
+            to_fetch
+                .into_iter()
+                .filter(|token| !batched.contains_key(token))
+                .collect()
+        };
+
         if !to_fetch.is_empty() {
             let concurrency = native_price_concurrency();
             let fetched: Vec<(Address, Option<u8>)> = stream::iter(to_fetch.into_iter().map(
@@ -3737,28 +4105,48 @@ where
             .unwrap_or_else(|| NativePrice::new(U256::zero(), U256::zero(), false))
     }
 
+    /// Probe a token's native price against the UniV3 quoter.
+    ///
+    /// Returns a tri-state rather than `Option` because the caller must not
+    /// treat "no route exists" and "the RPC call failed" the same way. Only the
+    /// former is a fact about the chain that may be cached; conflating them is
+    /// what let a provider rate-limit silently zero out fills for months.
     async fn fetch_native_price(
         &self,
         token: Address,
         decimals: u8,
         block_number: U64,
-    ) -> Option<NativePrice> {
+    ) -> NativePriceProbe {
         if token == self.wrapped_native || self.wrapped_native.is_zero() {
             let amount = U256::exp10(decimals.min(18) as usize);
-            return Some(NativePrice::new(amount, amount, true));
+            return NativePriceProbe::Priced(NativePrice::new(amount, amount, true));
         }
 
         let amount_in = U256::exp10(decimals.min(18) as usize);
+        let mut transport_failed = false;
         for fee in FEE_TIERS {
             let path = build_univ3_price_path(token, self.wrapped_native, fee);
-            if let Ok(out) = self.quoter.quote_path(path, amount_in, block_number).await {
-                if !out.is_zero() {
-                    return Some(NativePrice::new(amount_in, out, true));
+            match self.quoter.quote_path(path, amount_in, block_number).await {
+                Ok(out) if !out.is_zero() => {
+                    return NativePriceProbe::Priced(NativePrice::new(amount_in, out, true));
+                }
+                // Executed and returned zero: a real answer for this tier.
+                Ok(_) => {}
+                Err(err) => {
+                    if !crate::quote_common::is_execution_revert(&err) {
+                        transport_failed = true;
+                    }
                 }
             }
         }
 
-        None
+        // A tier we never got an answer for could have held the price, so the
+        // "no route" conclusion is only sound when every tier truly answered.
+        if transport_failed {
+            NativePriceProbe::Unknown
+        } else {
+            NativePriceProbe::NoRoute
+        }
     }
 
     async fn load_native_prices(
@@ -3793,20 +4181,12 @@ where
         //    sequential refresh was a ~20s blind spike every TTL window.
         if !to_fetch.is_empty() {
             let concurrency = native_price_concurrency();
-            let fetched: Vec<(Address, NativePrice)> = stream::iter(to_fetch.into_iter().map(
+            let fetched: Vec<(Address, NativePriceProbe)> = stream::iter(to_fetch.into_iter().map(
                 |(token, decimals)| async move {
-                    let price = self
-                        .fetch_native_price(token, decimals, block_number)
-                        .await
-                        .unwrap_or_else(|| {
-                            if token == self.wrapped_native {
-                                let amount = U256::exp10(decimals.min(18) as usize);
-                                NativePrice::new(amount, amount, true)
-                            } else {
-                                NativePrice::new(U256::zero(), U256::zero(), false)
-                            }
-                        });
-                    (token, price)
+                    (
+                        token,
+                        self.fetch_native_price(token, decimals, block_number).await,
+                    )
                 },
             ))
             .buffer_unordered(concurrency)
@@ -3815,8 +4195,29 @@ where
 
             let mut cache = self.native_price_cache.lock().await;
             let now = Instant::now();
-            for (token, price) in fetched {
-                cache.insert(token, (price, now));
+            let mut unknown = 0usize;
+            for (token, probe) in fetched {
+                if let Some(metrics) = self.metrics.as_deref() {
+                    metrics.record_native_price_probe(&self.chain_name, probe.label());
+                }
+                // `None` => leave the cache entry stale (or absent) so the next
+                // scan retries, instead of recording an RPC outage as a
+                // permanent verdict about the token.
+                match probe.cache_entry() {
+                    Some(price) => {
+                        cache.insert(token, (price, now));
+                    }
+                    None => unknown += 1,
+                }
+            }
+            if unknown > 0 {
+                warn!(
+                    target: "pricing",
+                    chain = %self.chain_name,
+                    unknown,
+                    "native price probes inconclusive (transport failures); \
+                     leaving cache stale to retry rather than marking unpriceable"
+                );
             }
         }
 
@@ -3828,14 +4229,38 @@ where
             .collect()
     }
 
+    /// Per-token trade notionals, in each token's own raw units.
+    ///
+    /// The capital bounds (`MIN_FLASH_LOAN_WEI` / `MAX_FLASH_LOAN_WEI`) are
+    /// NATIVE-denominated, so they must be converted into the target token
+    /// before they can bound it. Clamping a token's raw units directly against
+    /// a wei constant is a decimals bug: with `MIN_FLASH_LOAN_WEI = 1e18`, a
+    /// 6-decimal token like USDC was floored at 1e18 raw units — one trillion
+    /// USDC. That propagates two ways, both fatal:
+    ///   1. it becomes `base_amount_in`, the denominator of `gas_ratio` in
+    ///      `compute_edge_weight`, so hops in one cycle are normalised against
+    ///      wildly different economic values and the summed gas toll is
+    ///      meaningless (see `cycle_weight_from_edge_indices`);
+    ///   2. it reaches `optimize_trade_size` as `min_amount`, where
+    ///      `upper_cap < min_amount` rejects EVERY cycle starting at a
+    ///      sub-18-decimal token, unconditionally.
+    ///
+    /// The depth-derived amount is already value-coherent — `estimate_liquidity`
+    /// returns `(liquidity_usd / 2) / price_usd` scaled by the token's own
+    /// decimals — so the clamp is the only thing that breaks coherence. When the
+    /// token has no reliable native price we cannot express the bounds in its
+    /// units at all, so we skip the clamp rather than apply a wrong one, and a
+    /// token with no depth stays at zero (fail closed) instead of being floored
+    /// up to an arbitrary notional.
     async fn compute_base_amounts(
         &self,
         token_decimals: &HashMap<Address, u8>,
         capital: &CapitalSnapshot,
+        native_prices: &HashMap<Address, NativePrice>,
     ) -> HashMap<Address, TradeSizing> {
         let tokens = self.tokens.current();
-        let min_flash = capital.min_flash_loan;
-        let max_flash = capital.max_flash_loan.max(min_flash);
+        let min_flash_native = capital.min_flash_loan;
+        let max_flash_native = capital.max_flash_loan.max(min_flash_native);
         let divisor = U256::from(5u64);
         let mut map = HashMap::new();
         for &token in tokens.iter() {
@@ -3849,11 +4274,18 @@ where
             } else {
                 depth / divisor
             };
-            if sized < min_flash {
-                sized = min_flash;
-            }
-            if sized > max_flash {
-                sized = max_flash;
+            // Bounds in THIS token's units, or `None` when it cannot be priced.
+            let price = self.native_price_for(token, native_prices);
+            let bounds = price
+                .tokens_for_native_strict(min_flash_native)
+                .zip(price.tokens_for_native_strict(max_flash_native));
+            if let Some((min_in_token, max_in_token)) = bounds {
+                if sized < min_in_token {
+                    sized = min_in_token;
+                }
+                if sized > max_in_token.max(min_in_token) {
+                    sized = max_in_token.max(min_in_token);
+                }
             }
             let tolerance = if depth.is_zero() {
                 self.edge_slippage_bps
@@ -3884,19 +4316,34 @@ where
         map
     }
 
+    /// Gas price used for Stage-1 edge weights.
+    ///
+    /// This is the L2 execution price only. The Base L1 data fee is deliberately
+    /// NOT folded in here.
+    ///
+    /// The L1 data fee is a per-TRANSACTION constant, and a per-edge additive
+    /// weight cannot represent a constant — only quantities proportional to that
+    /// edge's gas. The previous attempt spread it as
+    /// `l1_data_fee / (210_000 * max_hops)` per gas unit, which recovers the
+    /// true fee only for a cycle whose total gas happens to equal
+    /// `210_000 * max_hops`. For the 2-hop cycles Phase 1 targets it recovered
+    /// 280_000 / 1_260_000 = 22% of the fee at `max_hops = 6` — and the error
+    /// scales with the graph's configured hop limit, so changing an unrelated
+    /// search knob silently repriced every edge.
+    ///
+    /// Rather than replace one wrong constant with another, the split of
+    /// responsibility is made explicit: Stage 1 models the size-proportional
+    /// execution cost, and Stage 2 owns the per-transaction constant. Stage 2
+    /// already charges the full `l1_data_fee` exactly once, from the raw gas
+    /// price, in `optimize_trade_size` — it never consults this function.
+    ///
+    /// Direction of the residual error is deliberate. `record_cycle` treats the
+    /// summed weight as a hard reject, so under-charging gas at Stage 1 lets a
+    /// few extra candidates through for Stage 2 to kill (wasted work, no loss),
+    /// whereas over-charging would silently discard genuinely profitable cycles.
+    /// Omitting a constant we cannot apportion errs on the safe side.
     fn gas_price_for_weights(&self, gas: &FeeEstimate) -> U256 {
-        if gas.l1_data_fee.is_zero() {
-            return gas.gas_price;
-        }
-
-        const AVG_EDGE_GAS: u64 = 210_000;
-        let hops = self.cycle_limits.max_hops.max(1) as u64;
-        let denom = U256::from(AVG_EDGE_GAS).saturating_mul(U256::from(hops));
-        let per_unit_overhead = gas
-            .l1_data_fee
-            .checked_div(denom)
-            .unwrap_or_else(U256::zero);
-        gas.gas_price.saturating_add(per_unit_overhead)
+        gas.gas_price
     }
 
     fn dynamic_min_profit(&self, params: DynamicProfitParams<'_>) -> U256 {
@@ -4136,6 +4583,60 @@ where
         );
     }
 
+    /// Tokens a cycle may start at: the union of every flash-loan provider's
+    /// allowlist, restricted to tokens that are actually in the graph.
+    ///
+    /// This is the hub set for [`Graph::hub_anchored_cycles`]. Anything outside
+    /// it cannot be borrowed, so a cycle anchored there could never execute.
+    /// Can this token be borrowed from ANY configured flash-loan provider?
+    ///
+    /// Same union as [`Self::flash_loan_hub_tokens`], asked per token. The
+    /// hub-anchored search already restricts starts to that set, but the
+    /// Bellman-Ford path did not — so every cycle it anchored at an unfundable
+    /// token was generated, quoted, sized and only then rejected as
+    /// `no_flashloan_provider`. Measured on Base that was 100% of one run's
+    /// candidate budget (61/61, all one token), crowding real candidates out of
+    /// the funnel entirely.
+    ///
+    /// A `None` set means "no allowlist configured", which the quote path treats
+    /// as unrestricted for Balancer; mirror that here so this filter can never
+    /// be stricter than the funding logic it is predicting.
+    fn can_flash_fund(&self, token: Address) -> bool {
+        if self.bal_flashloan_tokens.is_none() {
+            return true;
+        }
+        [
+            self.bal_flashloan_tokens.as_deref(),
+            self.aave_flashloan_tokens.as_deref(),
+            self.erc3156_flashloan_tokens.as_deref(),
+            self.univ2_flashloan_tokens.as_deref(),
+            self.univ3_flashloan_tokens.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|set| set.contains(&token))
+    }
+
+    fn flash_loan_hub_tokens(&self, graph: &Graph) -> Vec<Address> {
+        let mut hubs: Vec<Address> = Vec::new();
+        let mut seen: HashSet<Address> = HashSet::new();
+        let sets = [
+            self.bal_flashloan_tokens.as_deref(),
+            self.aave_flashloan_tokens.as_deref(),
+            self.erc3156_flashloan_tokens.as_deref(),
+            self.univ2_flashloan_tokens.as_deref(),
+            self.univ3_flashloan_tokens.as_deref(),
+        ];
+        for set in sets.into_iter().flatten() {
+            for token in set {
+                if graph.ix.contains_key(token) && seen.insert(*token) {
+                    hubs.push(*token);
+                }
+            }
+        }
+        hubs
+    }
+
     fn flash_loan_quotes(&self, token: Address, max_cycle_input: U256) -> Vec<FlashLoanQuote> {
         let capital = self.capital.snapshot();
         let mut quotes = Vec::new();
@@ -4197,13 +4698,25 @@ where
             .as_ref()
             .map(|set| set.contains(&token))
             .unwrap_or(false);
+        // A flash swap borrows from a specific pool, so it needs that pool's
+        // address. Without one the plan builder substitutes `Address::zero()`
+        // and the candidate is rejected as `no_flashloan_provider` — which is
+        // why every univ2-flashswap token was structurally unfundable.
         if univ2_supported {
-            quotes.push(FlashLoanQuote {
-                provider: FlashLoanProvider::Univ2Flashswap,
-                max_amount: capped_amount,
-                fee_bps: 0,
-                provider_addr: None,
-            });
+            if let Some(pool) = self.univ2_flash_pool {
+                quotes.push(FlashLoanQuote {
+                    provider: FlashLoanProvider::Univ2Flashswap,
+                    max_amount: capped_amount,
+                    fee_bps: self.univ2_flash_fee_bps,
+                    provider_addr: Some(pool),
+                });
+            } else {
+                warn!(
+                    token = %format!("0x{}", hex::encode(token)),
+                    "token is univ2-flashswap allowlisted but no flash pool is configured; \
+                     set flashloans[kind=univ2_flashswap].pool"
+                );
+            }
         }
 
         let univ3_supported = self
@@ -4211,13 +4724,24 @@ where
             .as_ref()
             .map(|set| set.contains(&token))
             .unwrap_or(false);
+        // Same address requirement as univ2 above. The fee here is a flat bps of
+        // principal (the pool's tier), and it must not be zero: `flash_fee` takes
+        // `fee_bps == 0` literally and would price the loan as free.
         if univ3_supported {
-            quotes.push(FlashLoanQuote {
-                provider: FlashLoanProvider::Univ3Flash,
-                max_amount: capped_amount,
-                fee_bps: 0,
-                provider_addr: None,
-            });
+            if let Some(pool) = self.univ3_flash_pool {
+                quotes.push(FlashLoanQuote {
+                    provider: FlashLoanProvider::Univ3Flash,
+                    max_amount: capped_amount,
+                    fee_bps: self.univ3_flash_fee_bps,
+                    provider_addr: Some(pool),
+                });
+            } else {
+                warn!(
+                    token = %format!("0x{}", hex::encode(token)),
+                    "token is univ3-flash allowlisted but no flash pool is configured; \
+                     set flashloans[kind=univ3_flash].pool"
+                );
+            }
         }
 
         quotes
@@ -4301,7 +4825,7 @@ where
                 None,
                 false,
                 None,
-                Some("invalid_edge"),
+                Some("edge_arity_mismatch"),
                 None,
                 false,
                 false,
@@ -4384,7 +4908,6 @@ where
             .map(|profile| profile.base_amount)
             .unwrap_or(ctx.capital_snapshot.base_amount);
         let mut estimated_cycle_gas: u64 = 0;
-        let mut cycle_max_input = cycle_base_amount;
         let cycle_latency_secs = self.estimate_cycle_latency(graph, &cycle_ix);
         let mut cycle_edges_vec: Vec<Edge> = Vec::with_capacity(hops);
         let mut backrun_hint: Option<BackrunHint> = None;
@@ -4408,7 +4931,7 @@ where
                     None,
                     pricing_reliable,
                     None,
-                    Some("invalid_edge"),
+                    Some("edge_index_out_of_range"),
                     None,
                     false,
                     false,
@@ -4418,11 +4941,30 @@ where
                 }
                 return CandidatePrep::Rejected { skip_detail: None };
             };
-            if !edge.active || edge.from != u || edge.to != v {
+            // These two were one `invalid_edge` bucket, which made 67 rejections
+            // undiagnosable. They are completely different events:
+            //   * `edge_inactive` — the edge was deactivated (e.g. quarantined on
+            //     block lag) between cycle discovery and prep. Routine churn.
+            //   * `edge_endpoint_mismatch` — the index resolves to an edge
+            //     connecting different tokens, i.e. it came from a DIFFERENT
+            //     graph. That is the stale-index bug `best_edge_indices_for_node_path`
+            //     exists to prevent, and it means a profitable cycle was silently
+            //     discarded. Never routine; always worth investigating.
+            let endpoint_mismatch = edge.from != u || edge.to != v;
+            if !edge.active || endpoint_mismatch {
+                let reason = if endpoint_mismatch {
+                    "edge_endpoint_mismatch"
+                } else {
+                    "edge_inactive"
+                };
                 warn!(
                     edge_idx,
                     from = %u,
                     to = %v,
+                    edge_from = %edge.from,
+                    edge_to = %edge.to,
+                    active = edge.active,
+                    reason,
                     "Skipping cycle due to stale or mismatched edge index"
                 );
                 self.log_candidate_stage(
@@ -4438,7 +4980,7 @@ where
                     None,
                     pricing_reliable,
                     None,
-                    Some("invalid_edge"),
+                    Some(reason),
                     None,
                     false,
                     false,
@@ -4449,11 +4991,57 @@ where
                 return CandidatePrep::Rejected { skip_detail: None };
             };
             estimated_cycle_gas = estimated_cycle_gas.saturating_add(edge.estimated_gas);
-            cycle_max_input = cycle_max_input.min(edge.max_input);
             if matches!(edge.venue, VenueEdge::Bridge { .. }) {
                 has_bridge_step = true;
             }
             cycle_edges_vec.push(edge.clone());
+        }
+
+        // Per-hop capacities live in each hop's own input token, so they are
+        // projected back to the start token along the cycle's quoted rates
+        // before the tightest one is taken. Folding them with a bare `min()`
+        // compared WETH wei against USDC's 6-decimal units and pinned every
+        // cycle to a dust ceiling.
+        let cycle_max_input =
+            crate::graph::cycle_input_capacity(&cycle_edges_vec, cycle_base_amount)
+                .min(cycle_base_amount);
+
+        // Reject on arithmetic before spending a quote. The fee stack is known
+        // from the graph alone, so a path that owes more than it could plausibly
+        // earn never needs an RPC round-trip to be rejected.
+        let fee_stack_bps = cycle_fee_stack_bps(&cycle_edges_vec);
+        let fee_cap = max_cycle_fee_bps();
+        if fee_cap > 0 && fee_stack_bps > fee_cap && !has_bridge_step {
+            debug!(
+                fee_stack_bps,
+                fee_cap,
+                hops,
+                start = %format!("0x{}", hex::encode(cycle_start)),
+                "pruned cycle: fee stack exceeds cap"
+            );
+            self.log_candidate_stage(
+                "candidate_rejected_pre_sim",
+                &self.chain_name,
+                Some(candidate_id.clone()),
+                Some(cycle_start),
+                Some(hops),
+                ctx.edges_scanned,
+                None,
+                None,
+                None,
+                None,
+                pricing_reliable,
+                None,
+                Some("fee_stack_too_high"),
+                None,
+                has_bridge_step,
+                false,
+            );
+            return CandidatePrep::Rejected {
+                skip_detail: Some(format!(
+                    "cycle fee stack {fee_stack_bps}bps exceeds {fee_cap}bps cap"
+                )),
+            };
         }
 
         if has_bridge_step && !self.feature_gate.bridge {
@@ -4548,7 +5136,7 @@ where
                 None,
                 pricing_reliable,
                 None,
-                Some("no_quote_available"),
+                Some("trade_cap_zero"),
                 None,
                 has_bridge_step,
                 false,
@@ -4662,10 +5250,26 @@ where
             .map(|pool| pool.pool)
             .collect();
 
+        // `min_flash_loan` is NATIVE-denominated; `min_amount` is compared
+        // against `upper_cap` in start-token raw units (src/sizing.rs). Passing
+        // it unconverted floored a 6-decimal start token at 1e18 raw units — a
+        // trillion USDC — so `upper_cap < min_amount` held for every USDC-start
+        // cycle and sizing returned None 100% of the time. Convert into the
+        // start token; fail closed if it cannot be priced.
+        let Some(min_amount_in_start_token) = native_price
+            .tokens_for_native_strict(ctx.capital_snapshot.min_flash_loan)
+        else {
+            return CandidatePrep::Rejected {
+                skip_detail: Some(
+                    "unreliable native price for start token: cannot convert min flash-loan bound"
+                        .to_string(),
+                ),
+            };
+        };
         let Some(sizing) = optimize_trade_size(OptimizeTradeParams {
             edges: &cycle_edges_vec,
             quotes: &quotes,
-            min_amount: ctx.capital_snapshot.min_flash_loan,
+            min_amount: min_amount_in_start_token,
             max_amount: trade_cap,
             gas_price: ctx.gas_parameters.gas_price,
             estimated_gas: adjusted_cycle_gas,
@@ -4698,7 +5302,7 @@ where
                 None,
                 pricing_reliable,
                 None,
-                Some("no_quote_available"),
+                Some("no_profitable_size"),
                 None,
                 has_bridge_step,
                 false,
@@ -5044,8 +5648,12 @@ where
         );
         let native_ms = t_native.elapsed().as_millis() as u64;
         let base_profiles_map = Arc::new(
-            self.compute_base_amounts(token_decimals_map.as_ref(), &capital_snapshot)
-                .await,
+            self.compute_base_amounts(
+                token_decimals_map.as_ref(),
+                &capital_snapshot,
+                native_prices_map.as_ref(),
+            )
+            .await,
         );
         self.hot_paths
             .update_top_tokens(base_profiles_map.as_ref())
@@ -5148,7 +5756,6 @@ where
         {
             let mut guard = self.populate_cache.lock().await;
             guard.cached_edges = edges.clone();
-            guard.last_gas_price = gas_price_for_weights;
             guard.last_digest = Some(venues::edge_digest(&edges));
             guard.touched_pools.clear();
         }
@@ -5200,6 +5807,15 @@ where
             warn!("Liquidation monitor present but FEATURE_LIQUIDATIONS=0; skipping liquidation edges");
         }
         let liq_ms = t_liq.elapsed().as_millis() as u64;
+        // RPC calls consumed by THIS scan. This is the number that decides what
+        // provider throughput the engine needs: rpc_calls / target_scan_seconds.
+        let rpc_calls = {
+            let now = crate::rpc_failover::total_rpc_requests();
+            let prev = self
+                .last_scan_rpc_total
+                .swap(now, std::sync::atomic::Ordering::Relaxed);
+            now.saturating_sub(prev)
+        };
         info!(
             target: "arb_exec",
             chain = %self.chain_name,
@@ -5207,6 +5823,7 @@ where
             lowliq_ms,
             populate_ms,
             liq_ms,
+            rpc_calls,
             "scan phase timing breakdown"
         );
 
@@ -5251,6 +5868,12 @@ where
 
         struct CandidatePlan {
             plan_args: ExecutorPlan,
+            /// Same plan with every per-hop `min_out` removed. DIAGNOSTIC ONLY —
+            /// never dispatched. When the real plan reverts with `Too little
+            /// received` the router reports no amounts, so this variant is
+            /// simulated to observe what the pools actually pay and measure the
+            /// shortfall instead of guessing at it.
+            relaxed_plan_args: ExecutorPlan,
             cycle_start: Address,
             amount_in: U256,
             est_gross_after_fee: U256,
@@ -5296,9 +5919,20 @@ where
                 .iter()
                 .filter_map(|seed| {
                     let cycle = map_cycle_addresses_to_indices(&graph, &seed.addresses)?;
+                    // Re-resolve the hop edges against THIS scan's graph. The
+                    // graph is rebuilt from scratch every scan and its edge
+                    // vector is repopulated in a different order (concurrent
+                    // venue collectors, varying pool counts), so an edge index
+                    // from the previous scan almost never denotes the same edge.
+                    // Carrying them forward made every seeded candidate fail the
+                    // `edge.from != u` check in candidate prep and get dropped
+                    // SILENTLY (skip_detail: None) — which is why a cycle with a
+                    // positive gross edge was discarded on 67 of 68 scans while
+                    // the log only ever said "found no viable cycles".
+                    let edge_indices = graph.best_edge_indices_for_node_path(&cycle)?;
                     Some(IndexedCycle {
                         cycle,
-                        edge_indices: seed.edge_indices.clone(),
+                        edge_indices,
                     })
                 })
                 .collect()
@@ -5309,21 +5943,112 @@ where
             || seed_cycles.is_empty()
             || block_number.as_u64().is_multiple_of(8)
             || !backrun_hints.is_empty();
+        let mut best_gross_scaled: Option<i64> = None;
         let mut raw_cycles: Vec<IndexedCycle> = if run_full_bf {
-            let mut cycles: Vec<IndexedCycle> = tokio::task::block_in_place(|| {
-                graph.bellman_ford(
-                    &start_priorities,
-                    &self.cycle_limits,
-                    self.max_candidate_paths,
-                    self.metrics.as_deref(),
-                )
-            })
+            let (found, best) = tokio::task::block_in_place(|| {
+                // A/B switch (`ARBOT_HUB_SEARCH=1`). Every executable cycle has
+                // to start and end at a flash-loan asset, so the hub-anchored
+                // walk enumerates exactly that set instead of asking
+                // Bellman-Ford to rediscover it from generic negative-cycle
+                // detection. Both paths return the same candidate type, so the
+                // rest of the scan is untouched and the two can be compared on
+                // identical graph state.
+                if self.hub_search_enabled {
+                    let hubs = self.flash_loan_hub_tokens(&graph);
+                    let limits = crate::graph::HubSearchLimits {
+                        min_hops: self.cycle_limits.min_hops,
+                        max_hops: self.cycle_limits.max_hops,
+                        max_cycles: self.cycle_limits.max_cycles,
+                        timeout: self.cycle_limits.timeout,
+                        parallel_edges_per_pair: self.hub_search_parallel_edges,
+                    };
+                    let found =
+                        graph.hub_anchored_cycles(&hubs, &limits, self.max_candidate_paths);
+                    let best = found.first().map(|c| c.estimated_profit_bps);
+                    debug!(
+                        hubs = hubs.len(),
+                        cycles = found.len(),
+                        best_bps = ?best,
+                        "hub-anchored search complete"
+                    );
+                    (found, best)
+                } else {
+                    graph.bellman_ford_diagnostic(
+                        &start_priorities,
+                        &self.cycle_limits,
+                        self.max_candidate_paths,
+                        self.metrics.as_deref(),
+                    )
+                }
+            });
+            best_gross_scaled = best;
+            let found_total = found.len();
+            let filter_unfundable = crate::util::env_parse_opt::<u8>("ARBOT_FILTER_UNFUNDABLE")
+                .map(|v| v != 0)
+                .unwrap_or(true);
+            let mut unfundable_anchors: HashMap<Address, usize> = HashMap::new();
+            for candidate in found.iter() {
+                if let Some(start) = candidate
+                    .cycle
+                    .first()
+                    .and_then(|ix| graph.nodes.get(*ix).copied())
+                {
+                    let any_fundable = candidate
+                        .cycle
+                        .iter()
+                        .filter_map(|ix| graph.nodes.get(*ix).copied())
+                        .any(|token| self.can_flash_fund(token));
+                    if !any_fundable {
+                        *unfundable_anchors.entry(start).or_insert(0) += 1;
+                    }
+                }
+            }
+            if !unfundable_anchors.is_empty() {
+                let mut top: Vec<_> = unfundable_anchors.iter().collect();
+                top.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+                debug!(
+                    found_total,
+                    distinct_unfundable_anchors = top.len(),
+                    top_anchor = %format!("0x{}", hex::encode(top[0].0)),
+                    top_anchor_cycles = top[0].1,
+                    "unfundable anchor census"
+                );
+            }
+            let mut cycles: Vec<IndexedCycle> = found
             .into_iter()
+            .filter(|candidate| {
+                if !filter_unfundable {
+                    return true;
+                }
+                // A cycle is a LOOP: its Bellman-Ford anchor is arbitrary, and
+                // `rotate_indexed_cycle` downstream already re-anchors it at a
+                // fundable token. Testing only `cycle.first()` therefore threw
+                // away cycles that were perfectly fundable from another node —
+                // measured live, it discarded a WETH/0xcb327b99 two-hop showing
+                // 332bps gross, because BF happened to anchor it at the token
+                // without a flash-loan route rather than at WETH.
+                //
+                // Keep the cycle if ANY node in it can be funded; rotation picks
+                // the viable start. This is the weakest correct form of the
+                // filter, which is the only safe direction for a predictive one.
+                candidate
+                    .cycle
+                    .iter()
+                    .filter_map(|ix| graph.nodes.get(*ix).copied())
+                    .any(|token| self.can_flash_fund(token))
+            })
             .map(|candidate| IndexedCycle {
                 cycle: candidate.cycle,
                 edge_indices: candidate.edge_indices,
             })
             .collect();
+            if found_total > cycles.len() {
+                debug!(
+                    dropped = found_total - cycles.len(),
+                    kept = cycles.len(),
+                    "filtered cycles anchored at unfundable start tokens"
+                );
+            }
             if !seed_cycles.is_empty() {
                 cycles.splice(0..0, seed_cycles.clone());
             }
@@ -5450,7 +6175,62 @@ where
 
                 if !added {
                     if let Some(indexed) = fallback {
-                        candidate_cycles.push(indexed);
+                        // Bellman-Ford emits a cycle anchored wherever its
+                        // relaxation happened to close the loop, and the loop
+                        // above can only try the anchors BF chose to emit. When
+                        // none of them is fundable the cycle used to be pushed
+                        // as-is and rejected downstream as
+                        // `no_flashloan_provider` — even when another node in
+                        // the very same loop was borrowable.
+                        //
+                        // Measured live on Base: a WETH/0xcb327b99 two-hop
+                        // showing 332bps gross (vs a ~60bps fee stack) was
+                        // discarded on every scan purely because BF anchored it
+                        // at the token without a flash-loan route instead of at
+                        // WETH. A cycle is a loop; the anchor is a detail of how
+                        // it was discovered, not a property of the trade.
+                        //
+                        // So rotate it ourselves to the first fundable node
+                        // before giving up. Rotation needs valid edge indices;
+                        // without them the shape cannot be re-derived and the
+                        // original is kept so behaviour is never worse.
+                        let rescued = if indexed.edge_indices_valid() {
+                            indexed
+                                .cycle
+                                .iter()
+                                .filter_map(|node_ix| {
+                                    let token = *graph.nodes.get(*node_ix)?;
+                                    if self
+                                        .flash_loan_quotes(
+                                            token,
+                                            capital_snapshot.max_flash_loan,
+                                        )
+                                        .is_empty()
+                                    {
+                                        return None;
+                                    }
+                                    rotate_indexed_cycle(
+                                        &indexed.cycle,
+                                        &indexed.edge_indices,
+                                        *node_ix,
+                                    )
+                                    .map(|rotated| (rotated, token))
+                                })
+                                .next()
+                        } else {
+                            None
+                        };
+                        match rescued {
+                            Some((rotated, token)) => {
+                                debug!(
+                                    start = %format!("0x{}", hex::encode(token)),
+                                    hops = rotated.cycle.len().saturating_sub(1),
+                                    "re-anchored cycle at a fundable token"
+                                );
+                                candidate_cycles.push(rotated);
+                            }
+                            None => candidate_cycles.push(indexed),
+                        }
                     }
                 }
             }
@@ -5498,7 +6278,6 @@ where
                 .iter()
                 .map(|indexed| CycleSeed {
                     addresses: cycle_indices_to_addresses(&graph, &indexed.cycle),
-                    edge_indices: indexed.edge_indices.clone(),
                 })
                 .collect();
         }
@@ -5724,130 +6503,9 @@ where
                 ));
                 continue;
             }
-            let mut ops: Vec<ExecutorStep> = Vec::with_capacity(plan.steps.len());
-            for step in plan.steps {
-                match step {
-                    StepData::Uniswap {
-                        path,
-                        amount_in,
-                        min_out,
-                    } => {
-                        let data = ethers::abi::encode(&[
-                            Token::Bytes(path.to_vec()),
-                            Token::Uint(amount_in),
-                            Token::Uint(min_out),
-                        ]);
-                        ops.push(ExecutorStep {
-                            op: EXECUTOR_OP_UNIV3,
-                            data: Bytes::from(data),
-                        });
-                    }
-                    StepData::JitLiquidityAdd {
-                        pool,
-                        token0,
-                        token1,
-                        amount0,
-                        amount1,
-                        tick_range,
-                    } => {
-                        let data = ethers::abi::encode(&[
-                            Token::Address(pool),
-                            Token::Address(token0),
-                            Token::Address(token1),
-                            Token::Uint(amount0),
-                            Token::Uint(amount1),
-                            Token::Uint(U256::from(tick_range)),
-                        ]);
-                        ops.push(ExecutorStep {
-                            op: EXECUTOR_OP_JIT_LP_ADD,
-                            data: Bytes::from(data),
-                        });
-                    }
-                    StepData::JitLiquidityRemove {
-                        pool,
-                        target_token,
-                        fee,
-                        min_out,
-                    } => {
-                        let data = ethers::abi::encode(&[
-                            Token::Address(pool),
-                            Token::Address(target_token),
-                            Token::Uint(U256::from(fee)),
-                            Token::Uint(min_out),
-                        ]);
-                        ops.push(ExecutorStep {
-                            op: EXECUTOR_OP_JIT_LP_REMOVE,
-                            data: Bytes::from(data),
-                        });
-                    }
-                    StepData::Balancer {
-                        pool_id,
-                        token_in,
-                        token_out,
-                        amount_in,
-                        min_out,
-                    } => {
-                        let data = ethers::abi::encode(&[
-                            Token::FixedBytes(pool_id.to_vec()),
-                            Token::Address(token_in),
-                            Token::Address(token_out),
-                            Token::Uint(amount_in),
-                            Token::Uint(min_out),
-                        ]);
-                        ops.push(ExecutorStep {
-                            op: EXECUTOR_OP_BALANCER,
-                            data: Bytes::from(data),
-                        });
-                    }
-                    StepData::Bridge {
-                        adapter,
-                        token_in,
-                        amount_in,
-                        dst_chain_id,
-                        max_bridge_time_secs,
-                        call,
-                    } => {
-                        let data = ethers::abi::encode(&[
-                            Token::Address(adapter),
-                            Token::Address(token_in),
-                            Token::Uint(amount_in),
-                            Token::Uint(U256::from(dst_chain_id)),
-                            Token::Uint(U256::from(max_bridge_time_secs)),
-                            Token::Bytes(call.to_vec()),
-                        ]);
-                        ops.push(ExecutorStep {
-                            op: EXECUTOR_OP_BRIDGE,
-                            data: Bytes::from(data),
-                        });
-                    }
-                    StepData::Generic {
-                        target,
-                        call,
-                        pre_action,
-                    } => {
-                        let (action, token, amount) = match pre_action {
-                            Some(GenericPreAction::Approve { token, amount }) => {
-                                (U256::from(1u64), token, amount)
-                            }
-                            Some(GenericPreAction::Transfer { token, amount }) => {
-                                (U256::from(2u64), token, amount)
-                            }
-                            None => (U256::zero(), Address::zero(), U256::zero()),
-                        };
-                        let data = ethers::abi::encode(&[
-                            Token::Address(target),
-                            Token::Bytes(call.to_vec()),
-                            Token::Uint(action),
-                            Token::Address(token),
-                            Token::Uint(amount),
-                        ]);
-                        ops.push(ExecutorStep {
-                            op: EXECUTOR_OP_GENERIC,
-                            data: Bytes::from(data),
-                        });
-                    }
-                }
-            }
+            let relaxed_plan = plan.with_relaxed_min_outs();
+            let ops = encode_plan_steps(plan.steps);
+            let relaxed_ops = encode_plan_steps(relaxed_plan.steps);
 
             let loans: Vec<ExecutorLoan> = sizing
                 .allocations
@@ -5895,10 +6553,19 @@ where
             }
 
             let mut plan_args = ExecutorPlan {
-                loans,
+                loans: loans.clone(),
                 cycle_slippage_bps: swap_slippage_bps.min(u32::from(u16::MAX)) as u16,
                 steps: ops,
                 min_profit: min_profit_requirement,
+            };
+            // `min_profit` is zeroed too: the executor enforces it on top of the
+            // per-hop floors, and leaving it would make the diagnostic revert for
+            // a different reason than the one being measured.
+            let relaxed_plan_args = ExecutorPlan {
+                loans,
+                cycle_slippage_bps: swap_slippage_bps.min(u32::from(u16::MAX)) as u16,
+                steps: relaxed_ops,
+                min_profit: U256::zero(),
             };
 
             let Some(call) = self.build_executor_call(&plan_args) else {
@@ -6171,6 +6838,7 @@ where
             );
             let candidate_plan = CandidatePlan {
                     plan_args,
+                    relaxed_plan_args,
                     cycle_start,
                     amount_in: trade_amount,
                     est_gross_after_fee,
@@ -6268,6 +6936,17 @@ where
                 candidate.has_bridge_step,
                 !candidate.liquidation_markets.is_empty(),
             );
+            // Time every simulation, including the ones that blow the budget.
+            // The budget is a hard `timeout`, so an over-budget sim is recorded
+            // only as `simulation_timeout` with no duration — which makes the
+            // right budget unknowable: measured on Base, 49/49 candidates timed
+            // out at 380ms and nothing said whether the true cost was 400ms or
+            // 40s. Log the elapsed either way so the budget can be set from data.
+            let sim_started = Instant::now();
+            // Round-trip count, not just wall time: at a fixed RTT the only way
+            // to make simulation faster is to make fewer calls, so the call
+            // count is the number that has to move.
+            let sim_rpc_before = crate::rpc_failover::total_rpc_requests();
             let (simulated_gas_used, simulated_profit, simulated_l1_fee) = match timeout(
                 self.simulation_budget,
                 self.simulate_plan_execution(
@@ -6277,9 +6956,92 @@ where
                 ),
             )
             .await
+            .inspect(|_| {
+                debug!(
+                    target: "sim_timing",
+                    elapsed_ms = sim_started.elapsed().as_millis() as u64,
+                    rpc_calls = crate::rpc_failover::total_rpc_requests()
+                        .saturating_sub(sim_rpc_before),
+                    budget_ms = self.simulation_budget.as_millis() as u64,
+                    outcome = "completed",
+                    "plan simulation finished"
+                );
+            })
+            .inspect_err(|_| {
+                warn!(
+                    target: "sim_timing",
+                    elapsed_ms = sim_started.elapsed().as_millis() as u64,
+                    budget_ms = self.simulation_budget.as_millis() as u64,
+                    outcome = "timeout",
+                    hops = candidate.hops,
+                    "plan simulation exceeded its budget"
+                );
+            })
             {
                 Ok(Ok(result)) => result,
                 Ok(Err(err)) => {
+                    // A `Too little received` revert names no amounts: the router
+                    // only reports that `amountOut >= amountOutMinimum` failed,
+                    // never by how much. Re-simulate the SAME plan with the
+                    // per-hop floors removed — that variant cannot trip the check,
+                    // so it returns what the pools actually pay. The difference is
+                    // the shortfall, which is the number needed to size
+                    // `tolerance_bps` from evidence instead of guesswork.
+                    //
+                    // Only on this specific revert, so a healthy run never pays
+                    // for it, and only ever simulated: `relaxed_plan_args` has no
+                    // slippage protection and must never reach dispatch.
+                    // `{:#}` renders anyhow's full cause chain. Plain Display
+                    // shows only the outermost context ("pre-broadcast
+                    // simulation reverted"), which does not contain the revert
+                    // string — so matching on it silently never fired.
+                    let err_chain = format!("{err:#}");
+                    if crate::quote_common::is_execution_revert(&err_chain) {
+                        let demanded = candidate.plan_args.min_profit;
+                        match self
+                            .simulate_plan_execution(
+                                &candidate.relaxed_plan_args,
+                                &candidate.fee_estimate,
+                                block_number,
+                            )
+                            .await
+                        {
+                            Ok((_, achieved, _)) => {
+                                let shortfall_bps = if demanded.is_zero() {
+                                    0u64
+                                } else if achieved >= demanded {
+                                    0u64
+                                } else {
+                                    mul_div(
+                                        demanded.saturating_sub(achieved),
+                                        U256::from(10_000u64),
+                                        demanded,
+                                    )
+                                    .as_u64()
+                                };
+                                warn!(
+                                    target: "minout",
+                                    venue_path = ?candidate.venue_path,
+                                    hops = candidate.hops,
+                                    demanded_min_profit = %demanded,
+                                    achieved_unfloored = %achieved,
+                                    shortfall_bps,
+                                    "reverted plan re-simulated without floors"
+                                );
+                            }
+                            Err(diag_err) => {
+                                // Still reverting with NO floor means the failure
+                                // is not a min_out sizing problem at all.
+                                warn!(
+                                    target: "minout",
+                                    error = %format!("{diag_err:#}"),
+                                    venue_path = ?candidate.venue_path,
+                                    "floor-free re-simulation ALSO failed; \
+                                     cause is not min_out sizing"
+                                );
+                            }
+                        }
+                    }
                     self.log_candidate_stage(
                         "candidate_rejected_post_sim",
                         &self.chain_name,
@@ -6858,11 +7620,32 @@ where
             });
         }
 
+        // Distance to profit, computed once and reported on BOTH terminal
+        // branches. It previously lived only on the "no viable cycles" path, so
+        // the moment detection started producing candidates the number went
+        // invisible — exactly when it became most useful.
+        let two_hop = graph.best_two_hop_roundtrip();
+        let two_hop_bps = two_hop
+            .map(|p| format!("{:.3}", p.best_bps))
+            .unwrap_or_else(|| "no closed 2-hop route".to_string());
+        let two_hop_pair = two_hop
+            .map(|p| {
+                format!(
+                    "{}/{}{}",
+                    hex::encode(&p.token_a.as_bytes()[..4]),
+                    hex::encode(&p.token_b.as_bytes()[..4]),
+                    if p.cross_pool { "" } else { " (same-pool)" }
+                )
+            })
+            .unwrap_or_else(|| "-".to_string());
+
         if let Some(reason) = last_skip_reason {
             debug!(
                 edges = edges_scanned,
                 expected_univ3_edges,
                 %reason,
+                best_two_hop_bps = %two_hop_bps,
+                best_two_hop_pair = %two_hop_pair,
                 "Opportunity scanner filtered all candidates"
             );
             Ok(ScanOutcome::NotProfitable {
@@ -6871,9 +7654,27 @@ where
                 expected_univ3_edges,
             })
         } else {
+            // Report DISTANCE TO PROFIT, not just absence. `best_gross_bps` is
+            // the best gross edge (prod rate - 1, post-fee) across every cycle
+            // considered, including rejected ones. -2 bps means the market was
+            // nearly there and a fee tier or an extra venue might close it;
+            // -500 bps means nothing in this graph is remotely close and the
+            // universe or the pool set is the problem. A bare "no cycles" cannot
+            // tell those apart, which is why this run reported nothing useful
+            // for months.
+            let best_gross_bps = best_gross_scaled.map(|scaled| {
+                let log_rate_sum = scaled as f64 / crate::util::WEIGHT_SCALE as f64;
+                (log_rate_sum.exp() - 1.0) * 10_000.0
+            });
             debug!(
                 edges = edges_scanned,
-                expected_univ3_edges, "Opportunity scanner found no viable cycles"
+                expected_univ3_edges,
+                best_gross_bps = best_gross_bps
+                    .map(|bps| format!("{bps:.3}"))
+                    .unwrap_or_else(|| "none (no cycle surfaced)".to_string()),
+                best_two_hop_bps = %two_hop_bps,
+                best_two_hop_pair = %two_hop_pair,
+                "Opportunity scanner found no viable cycles"
             );
             Ok(ScanOutcome::NoOpportunity {
                 edges: edges_scanned,
@@ -7480,17 +8281,31 @@ where
         call: &ContractCall<M, U256>,
         hops: usize,
     ) -> Result<U256> {
-        match call.estimate_gas().await {
+        let first_err = match call.estimate_gas().await {
             Ok(limit) => return Ok(limit),
             Err(err) => {
                 warn!(error = %err, "Gas estimation failed, applying fallbacks");
+                err.to_string()
             }
-        }
+        };
+
+        // A revert is deterministic: the same calldata against the same state
+        // reverts identically on the pending block, so the retry below is a
+        // guaranteed-failing round trip. Measured on Base this fired 48 times in
+        // one 200s run, burning ~240ms of RTT each on candidates whose primary
+        // simulation had already reverted. Transport errors still retry, because
+        // those genuinely can succeed on a second attempt.
+        let deterministic = crate::quote_common::is_execution_revert(&first_err);
 
         let base_gas = U256::from(200_000u64);
         let per_hop_gas = U256::from(50_000u64);
         let hop_count = U256::from(hops as u64);
         let heuristic = base_gas.saturating_add(per_hop_gas.saturating_mul(hop_count));
+
+        if deterministic {
+            let buffered = heuristic.saturating_mul(U256::from(15u64));
+            return Ok(buffered.checked_div(U256::from(10u64)).unwrap_or(heuristic));
+        }
 
         match self.estimate_gas_pending(call).await {
             Ok(sim_gas) => {
@@ -7565,7 +8380,7 @@ where
                 }
             }
             let fork_req = SimForkRequest {
-                rpc_url: self.rpc_endpoint.clone(),
+                rpc_url: self.sim_rpc_url.clone(),
                 block_number,
                 chain_id,
                 executor_address,
@@ -7620,6 +8435,12 @@ where
             }
         }
 
+        // Sequential BY DESIGN. Parallelising these three was measured and did
+        // NOT help: simulation stayed at p50 ~2.8s (2808 vs 2802ms) because the
+        // cost is ~17 RPC round trips per simulation, not these three. It was
+        // strictly worse in practice — with the primary reverting on every
+        // candidate today, running quorum and gas estimation concurrently pays
+        // for both on a tx already known to be doomed.
         let raw = client
             .call(&tx, Some(BlockId::Number(BlockNumber::Pending)))
             .await
@@ -8158,15 +8979,38 @@ mod runner_tests {
     use tokio::time::{sleep, Duration};
 
     #[tokio::test]
-    async fn circuit_breaker_trips_on_high_revert_rate() {
-        // consecutive/loss limits effectively disabled so only the revert trigger is active.
+    async fn circuit_breaker_tolerates_expected_backrun_revert_rate() {
+        // THE calibration requirement. Backrunning loses most races, and losing
+        // means the executor reverts rather than filling at a loss — a 55-65%
+        // revert rate is the healthy steady state. A breaker that halts on it is
+        // not protection, it is an outage.
+        //
+        // This previously asserted the opposite: a 62.5% rate was expected to
+        // TRIP, because the default limit (0.5) sat below the normal operating
+        // band. Normal operation tripped the breaker permanently.
         let breaker = CircuitBreaker::new(U256::zero(), U256::zero(), 100);
-        // 8 samples (>= default min 8), 5 reverts => 62.5% > 50% default limit.
-        for reverted in [true, true, true, false, true, false, true, false] {
-            breaker.record_execution_outcome(reverted).await;
+        // 200 samples at exactly 65% reverts.
+        for i in 0..200 {
+            breaker.record_execution_outcome(i % 20 < 13).await;
         }
         let status = breaker.current_status().await;
-        assert!(status.is_tripped, "high revert rate should trip the breaker");
+        assert!(
+            !status.is_tripped,
+            "a 65% revert rate is expected operation and must not trip: {}",
+            status.active_reason()
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_trips_on_abnormal_revert_rate() {
+        // What the trigger is actually for: a broken deploy reverting on
+        // essentially every attempt, well clear of the expected band.
+        let breaker = CircuitBreaker::new(U256::zero(), U256::zero(), 100);
+        for i in 0..200 {
+            breaker.record_execution_outcome(i % 50 != 0).await; // 98% reverts
+        }
+        let status = breaker.current_status().await;
+        assert!(status.is_tripped, "98% reverts must trip the breaker");
         assert!(
             status.active_reason().contains("revert rate"),
             "reason was: {}",
@@ -8177,11 +9021,37 @@ mod runner_tests {
     #[tokio::test]
     async fn circuit_breaker_ignores_revert_rate_below_min_samples() {
         let breaker = CircuitBreaker::new(U256::zero(), U256::zero(), 100);
-        // Only 4 samples (< default min 8): even 100% reverts must not trip yet.
-        for _ in 0..4 {
+        // Below the 50-sample minimum: even 100% reverts must not trip yet,
+        // because a handful of losses says nothing about the true rate.
+        for _ in 0..40 {
             breaker.record_execution_outcome(true).await;
         }
         assert!(!breaker.current_status().await.is_tripped);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_consecutive_limit_survives_a_realistic_losing_streak() {
+        // At a 65% revert rate the longest run seen in a 20-trade cycle is 13.
+        // The limit must sit above that; the old default of 3 tripped every few
+        // fills. A success resets the counter, as a real fill would.
+        // NOTE the boundary: the trip test is `failures > limit`, so a limit of
+        // 15 halts on the SIXTEENTH consecutive revert, not the fifteenth.
+        let breaker = CircuitBreaker::new(U256::max_value(), U256::max_value(), 15);
+        for _ in 0..15 {
+            breaker.record_failure(U256::zero()).await;
+        }
+        assert!(
+            !breaker.current_status().await.is_tripped,
+            "15 consecutive reverts is still normal variance at a 65% revert rate"
+        );
+        breaker.record_success().await;
+        for _ in 0..16 {
+            breaker.record_failure(U256::zero()).await;
+        }
+        assert!(
+            breaker.current_status().await.is_tripped,
+            "16 consecutive reverts must trip: that is a broken deploy, not variance"
+        );
     }
 
     #[tokio::test]
@@ -8314,6 +9184,10 @@ mod runner_tests {
 
         let runner = Runner::new(
             RunnerConfig {
+                univ2_flash_pool: None,
+                univ2_flash_fee_bps: 0,
+                univ3_flash_pool: None,
+                univ3_flash_fee_bps: 0,
                 feature_gate: FeatureGate {
                     cycle_arb: true,
                     backrun: false,
@@ -8324,6 +9198,7 @@ mod runner_tests {
                 chain_name: "test".into(),
                 provider: provider_arc.clone(),
                 rpc_endpoint: "http://test".into(),
+                sim_rpc_url: "http://test".into(),
                 rpc_health,
                 univ3_quoter: Address::zero(),
                 univ3_factory: Address::zero(),
@@ -8432,6 +9307,8 @@ mod runner_tests {
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
                 chain_id: 8453,
                 block_head_rx: None,
+                hub_search_enabled: false,
+                hub_search_parallel_edges: 3,
                 bf_skip_on_stable_graph: false,
             },
             executor,
@@ -8603,6 +9480,10 @@ mod runner_tests {
 
         let runner = Runner::new(
             RunnerConfig {
+                univ2_flash_pool: None,
+                univ2_flash_fee_bps: 0,
+                univ3_flash_pool: None,
+                univ3_flash_fee_bps: 0,
                 feature_gate: FeatureGate {
                     cycle_arb: true,
                     backrun: false,
@@ -8613,6 +9494,7 @@ mod runner_tests {
                 chain_name: "test".into(),
                 provider: provider_arc.clone(),
                 rpc_endpoint: "http://test".into(),
+                sim_rpc_url: "http://test".into(),
                 rpc_health: Arc::new(StdMutex::new(HealthTracker::new(
                     0.5,
                     HealthThresholds::default(),
@@ -8724,6 +9606,8 @@ mod runner_tests {
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
                 chain_id: 8453,
                 block_head_rx: None,
+                hub_search_enabled: false,
+                hub_search_parallel_edges: 3,
                 bf_skip_on_stable_graph: false,
             },
             executor,
@@ -8786,6 +9670,10 @@ mod runner_tests {
         );
         let runner = Runner::new(
             RunnerConfig {
+                univ2_flash_pool: None,
+                univ2_flash_fee_bps: 0,
+                univ3_flash_pool: None,
+                univ3_flash_fee_bps: 0,
                 feature_gate: FeatureGate {
                     cycle_arb: true,
                     backrun: false,
@@ -8796,6 +9684,7 @@ mod runner_tests {
                 chain_name: "test".into(),
                 provider: provider_arc.clone(),
                 rpc_endpoint: "http://test".into(),
+                sim_rpc_url: "http://test".into(),
                 rpc_health: Arc::new(StdMutex::new(HealthTracker::new(
                     0.5,
                     HealthThresholds::default(),
@@ -8910,6 +9799,8 @@ mod runner_tests {
                 sim_quorum: Arc::new(SimQuorum::disabled("test")),
                 chain_id: 8453,
                 block_head_rx: None,
+                hub_search_enabled: false,
+                hub_search_parallel_edges: 3,
                 bf_skip_on_stable_graph: false,
             },
             executor,
@@ -9297,7 +10188,7 @@ fn merge_sequencer_submission_relays(cfg: &ChainCfg, relays: Vec<String>) -> Vec
         info!(
             target: "broadcast",
             chain = %cfg.name,
-            endpoint = %trimmed,
+            endpoint = %crate::util::redact_endpoint(trimmed),
             "Injecting primary RPC as sequencer submission endpoint (L2 has no bundle relay market)"
         );
         merged.insert(0, trimmed.to_owned());
@@ -10053,8 +10944,18 @@ impl RuntimeTuning {
         .unwrap_or_else(U256::zero);
     let cb_daily_loss_limit = crate::util::env_u256_opt("CB_DAILY_LOSS_LIMIT_WEI")
         .unwrap_or_else(U256::zero);
+    // Expected trades until k consecutive reverts at revert rate p is
+    // (1 - p^k) / (p^k * (1 - p)). At the old default of 3-4, a normal 60-65%
+    // revert rate trips the breaker every ~13-17 fills, which makes it noise
+    // rather than protection:
+    //   k=4,  p=0.65 -> ~13 trades between false trips
+    //   k=15, p=0.65 -> ~1,800 trades;  k=15, p=0.55 -> ~17,400 trades
+    // Note the boundary: the check is `failures > limit`, so 15 halts on the
+    // SIXTEENTH consecutive revert. At p=0.65 that is a false trip roughly every
+    // 2,800 trades, while still catching a 100%-reverting deploy within 16
+    // transactions — on Base that costs well under a dollar in gas.
     let cb_max_consecutive_failures = crate::util::env_parse_opt::<u32>("CB_MAX_CONSECUTIVE_FAILURES")
-        .unwrap_or(3);
+        .unwrap_or(15);
         Ok(RuntimeTuning {
             edge_slippage_bps,
             edge_prune_max_slippage_bps,
@@ -11337,7 +12238,15 @@ async fn launch_chain_runtime(
     let (block_head_tx, block_head_rx) = block_head_channel();
     let block_head_rx_for_runner = Some(Arc::new(Mutex::new(block_head_rx)));
 
-    if ws_provider.is_some() || !ws_endpoints.is_empty() {
+    // The mempool monitor exists ONLY to feed the backrun monitor, so it must
+    // follow the same gate. It previously spawned whenever a websocket was
+    // configured, ignoring BACKRUN_MONITOR entirely — which made it impossible
+    // to turn off. On Base that is a loop that cannot succeed: the chain has no
+    // public mempool (spec §1), so `eth_subscribe` for pending transactions is
+    // answered with `-32616 invalid subscription type` and retried forever,
+    // burning websocket connections and RPC budget against a rate limit the
+    // engine is already pinned against.
+    if backrun_monitor.is_some() && (ws_provider.is_some() || !ws_endpoints.is_empty()) {
         let pending_provider = provider.clone();
         let pending_ws = ws_provider.clone();
         let pending_endpoints = ws_endpoints.clone();
@@ -11364,6 +12273,18 @@ async fn launch_chain_runtime(
             },
         );
 
+    }
+
+    // The `newHeads` monitor was spawned inside the backrun guard above, so
+    // disabling backrun disabled it too. Those are unrelated subsystems: backrun
+    // needs a public mempool (Base has none, so it is correctly off here), while
+    // newHeads is the engine's PRIMARY latency path. With it off, head discovery
+    // silently degraded to `spawn_block_head_monitor`'s 1s HTTP fallback poll —
+    // ~500ms average staleness before a single quote is issued, on a chain with
+    // ~200ms flashblocks. `current_block_head`'s websocket fast path could never
+    // engage, and its liveness guard masked the regression by quietly serving
+    // correct-but-late heads.
+    if ws_provider.is_some() || !ws_endpoints.is_empty() {
         let head_provider = provider.clone();
         let head_ws = ws_provider.clone();
         let head_endpoints = ws_endpoints.clone();
@@ -11445,6 +12366,12 @@ async fn launch_chain_runtime(
     let sim_quorum = Arc::new(SimQuorum::from_endpoints(&cfg.name, &http_endpoints));
 
     let bf_skip_on_stable_graph = read_feature_flag("ARBOT_BF_SKIP_ON_STABLE_GRAPH", false);
+    // Hub-anchored cycle search. Off by default so it can be A/B'd against
+    // Bellman-Ford on identical graph state before it takes over.
+    let hub_search_enabled = read_feature_flag("ARBOT_HUB_SEARCH", false);
+    let hub_search_parallel_edges = crate::util::env_parse_opt::<usize>("ARBOT_HUB_SEARCH_PARALLEL_EDGES")
+        .unwrap_or(3)
+        .clamp(1, 8);
     info!(
         chain = %cfg.name,
         bf_skip_enabled = bf_skip_on_stable_graph,
@@ -11485,11 +12412,53 @@ async fn launch_chain_runtime(
         None
     };
 
+    // Flash-swap borrow pools. A flash swap draws from one specific pool, so the
+    // allowlist alone is not enough — without the address the plan builder falls
+    // back to `Address::zero()` and every candidate is rejected as unfundable.
+    let (univ2_flash_pool, univ2_flash_fee_bps, univ3_flash_pool, univ3_flash_fee_bps) = {
+        let find = |kind: &str| -> (Option<Address>, u32) {
+            let loan = ops_inputs
+                .chain_inputs(&cfg.name)
+                .and_then(|chain| {
+                    chain.flashloans.iter().find(|loan| {
+                        loan.kind
+                            .as_ref()
+                            .map(|k| format!("{k:?}").eq_ignore_ascii_case(kind))
+                            .unwrap_or(false)
+                    })
+                });
+            let addr = loan
+                .and_then(|loan| loan.pool.as_deref())
+                .and_then(|raw| parse_address(raw, "flashloan pool").ok())
+                .filter(|addr| !addr.is_zero());
+            let fee = loan.and_then(|loan| loan.fee_bps).unwrap_or(0);
+            (addr, fee)
+        };
+        let (u2, u2_fee) = find("Univ2Flashswap");
+        let (u3, u3_fee) = find("Univ3Flash");
+        (u2, u2_fee, u3, u3_fee)
+    };
+    info!(
+        chain = %cfg.name,
+        univ2_flash_pool = ?univ2_flash_pool.map(|a| format!("0x{}", hex::encode(a))),
+        univ2_flash_fee_bps,
+        univ3_flash_pool = ?univ3_flash_pool.map(|a| format!("0x{}", hex::encode(a))),
+        univ3_flash_fee_bps,
+        "resolved flash-swap borrow pools"
+    );
+
     let runner_config = RunnerConfig {
+        univ2_flash_pool,
+        univ2_flash_fee_bps,
+        univ3_flash_pool,
+        univ3_flash_fee_bps,
         feature_gate,
+        hub_search_enabled,
+        hub_search_parallel_edges,
         chain_name: cfg.name.clone(),
         provider,
         rpc_endpoint,
+        sim_rpc_url: http_endpoints.first().cloned().unwrap_or_default(),
         rpc_health: rpc_health.clone(),
         univ3_quoter: cfg.univ3_quoter,
         univ3_factory: cfg.univ3_factory,
@@ -11846,6 +12815,71 @@ mod tests {
     use std::sync::Mutex;
 
     pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// The quorum bug: a tx reaching simulation with no gas limit is rejected by
+    /// every verifier as `intrinsic gas too low`, so cross-endpoint verification
+    /// silently never confirms. The limit must actually be applied.
+    #[test]
+    fn apply_gas_parameters_sets_the_gas_limit() {
+        let gas = crate::fees::FeeEstimate {
+            gas_limit: U256::from(450_000u64),
+            gas_price: U256::from(1_000_000u64),
+            base_fee_per_gas: None,
+            priority_fee_per_gas: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            l1_data_fee: U256::zero(),
+            total_fee_native: U256::zero(),
+        };
+        let mut tx: TypedTransaction = TransactionRequest::new().into();
+        assert!(tx.gas().is_none(), "precondition: no limit set");
+        apply_gas_parameters(&mut tx, &gas);
+        assert_eq!(tx.gas(), Some(&U256::from(450_000u64)));
+    }
+
+    #[test]
+    fn apply_gas_parameters_leaves_a_zero_limit_unset() {
+        // Zero is worse than absent: it guarantees intrinsic-gas failure, where
+        // absent lets the node substitute its own default.
+        let gas = crate::fees::FeeEstimate {
+            gas_limit: U256::zero(),
+            gas_price: U256::from(1_000_000u64),
+            base_fee_per_gas: None,
+            priority_fee_per_gas: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            l1_data_fee: U256::zero(),
+            total_fee_native: U256::zero(),
+        };
+        let mut tx: TypedTransaction = TransactionRequest::new().into();
+        apply_gas_parameters(&mut tx, &gas);
+        assert!(tx.gas().is_none(), "zero must not be applied");
+    }
+
+    /// Guards the retry-skip: only deterministic reverts may short-circuit the
+    /// pending-block retry. Misclassifying a transport blip would throw away a
+    /// gas estimate that would have succeeded.
+    #[test]
+    fn only_reverts_short_circuit_the_gas_retry() {
+        for revert in [
+            "execution reverted: Too little received",
+            "execution reverted",
+            "invalid opcode",
+        ] {
+            assert!(crate::quote_common::is_execution_revert(&revert), "{revert:?}");
+        }
+        for transient in [
+            "error sending request for url",
+            "operation timed out",
+            "503 Service Unavailable",
+            "intrinsic gas too low",
+        ] {
+            assert!(
+                !crate::quote_common::is_execution_revert(&transient),
+                "{transient:?} must still retry"
+            );
+        }
+    }
 
     #[test]
     fn default_private_relays_match_bundle_pipeline_targets() {
@@ -12353,11 +13387,21 @@ chains:
         assert_eq!(search, 600);
         assert_eq!(quote, 300);
         assert_eq!(sim, 350);
+        // The L2 simulation ceiling was 400ms, which nothing could ever meet:
+        // simulation cost p50 2802ms over 17 RPC calls, so every candidate timed
+        // out. The gas-limit and revert-retry fixes cut that to p50 ~180ms over
+        // 2 calls; then allowlisting the signer made simulation EXECUTE the full
+        // plan rather than revert early at NotExecutor, raising it to p50 670ms /
+        // max 924ms. The ceiling is 1500ms: clear of the observed max with
+        // headroom, still inside a 2s block.
         let (search_capped, quote_capped, sim_capped) =
-            derive_chain_time_budget_ms("base", 1200, 400, 500);
+            derive_chain_time_budget_ms("base", 1200, 400, 5_000);
         assert_eq!(search_capped, 800);
         assert_eq!(quote_capped, 350);
-        assert_eq!(sim_capped, 400);
+        assert_eq!(sim_capped, 1_500, "sim budget must still be capped");
+        // Below the ceiling, the configured value is honoured unchanged.
+        let (_, _, sim_uncapped) = derive_chain_time_budget_ms("base", 600, 300, 500);
+        assert_eq!(sim_uncapped, 500);
     }
 
     #[test]
@@ -12479,6 +13523,104 @@ chains:
         assert_eq!(path[0].1, None);
         assert_eq!(path[1].0, token_out);
         assert_eq!(path[1].1, Some(fee));
+    }
+
+    #[test]
+    fn inconclusive_native_price_probe_is_never_cached() {
+        // THE regression guard. Caching an `Unknown` (transport failure) as a
+        // price verdict poisons the token for the whole cache TTL: every cycle
+        // starting there is rejected pre-simulation and every edge touching it
+        // is silently dropped from the search graph. That single behaviour
+        // accounted for 94.6% of all candidate rejections ever recorded here.
+        assert_eq!(
+            NativePriceProbe::Unknown.cache_entry(),
+            None,
+            "an inconclusive probe must never be written to the price cache"
+        );
+    }
+
+    #[test]
+    fn definitive_no_route_is_cached_as_unreliable() {
+        // The legitimate suppression case: every fee tier answered, and the
+        // answer was "no pool". Worth caching so we stop re-quoting it.
+        let entry = NativePriceProbe::NoRoute
+            .cache_entry()
+            .expect("a definitive no-route verdict should be cached");
+        assert!(
+            !entry.is_reliable(),
+            "no-route must cache as unreliable, never as a usable price"
+        );
+    }
+
+    #[test]
+    fn priced_probe_round_trips_through_the_cache_entry() {
+        let price = NativePrice::new(U256::exp10(6), U256::from(532_286_096_352_062u64), true);
+        let entry = NativePriceProbe::Priced(price)
+            .cache_entry()
+            .expect("a priced probe should be cached");
+        assert_eq!(entry, price);
+        assert!(entry.is_reliable());
+    }
+
+    #[test]
+    fn native_price_probe_labels_are_distinct() {
+        // Labels become Prometheus label values; collisions would merge
+        // distinct outcomes into one series and hide the failure mode.
+        let labels = [
+            NativePriceProbe::Priced(NativePrice::unit()).label(),
+            NativePriceProbe::NoRoute.label(),
+            NativePriceProbe::Unknown.label(),
+        ];
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "probe labels must be distinct");
+    }
+
+    #[test]
+    fn native_flash_bounds_convert_into_six_decimal_tokens() {
+        // Regression guard for the decimals bug that made every USDC-start
+        // cycle unsizable. MIN_FLASH_LOAN_WEI is native-denominated (1e18 =
+        // 1 ETH). Passed unconverted into sizing it meant 1e18 RAW USDC units —
+        // one trillion USDC — so `upper_cap < min_amount` held for every cycle
+        // and `optimize_trade_size` returned None 100% of the time.
+        let min_flash_native = U256::exp10(18); // 1 ETH
+
+        // Measured live on Base: 1 USDC (1e6 raw) = 532_286_096_352_062 wei.
+        let usdc = NativePrice::new(U256::exp10(6), U256::from(532_286_096_352_062u64), true);
+        let min_in_usdc = usdc
+            .tokens_for_native_strict(min_flash_native)
+            .expect("a reliable price must convert");
+
+        // 1 ETH ~= $1880, so ~1.88e9 raw units at 6 decimals.
+        assert!(
+            min_in_usdc > U256::from(1_000_000_000u64)
+                && min_in_usdc < U256::from(10_000_000_000u64),
+            "1 ETH should convert to ~1.88e9 raw USDC, got {min_in_usdc}"
+        );
+        // And it must be nowhere near the raw wei value that caused the bug.
+        assert!(
+            min_in_usdc < min_flash_native / U256::exp10(8),
+            "converted bound must not remain wei-scaled"
+        );
+    }
+
+    #[test]
+    fn native_flash_bounds_are_identity_for_wrapped_native() {
+        // The 18-decimal path must be unchanged: a 1 ETH bound stays 1 WETH.
+        let weth = NativePrice::new(U256::exp10(18), U256::exp10(18), true);
+        let min_flash_native = U256::exp10(18);
+        assert_eq!(
+            weth.tokens_for_native_strict(min_flash_native),
+            Some(min_flash_native)
+        );
+    }
+
+    #[test]
+    fn unpriceable_token_yields_no_flash_bounds() {
+        // Fail closed: with no price we cannot express the bound in the token's
+        // units, so we must decline rather than clamp against a wei constant.
+        let poison = NativePrice::new(U256::zero(), U256::zero(), false);
+        assert_eq!(poison.tokens_for_native_strict(U256::exp10(18)), None);
+        assert_eq!(NativePrice::unit().tokens_for_native_strict(U256::exp10(18)), None);
     }
 
     #[test]
@@ -12755,6 +13897,7 @@ chains:
                 path: vec![(a, None), (b, Some(fee))],
                 pool: Address::from_low_u64_be(9),
                 fee,
+                state: None,
             },
             estimated_gas: 70_000,
             weight: -2,
@@ -12773,6 +13916,7 @@ chains:
                 path: vec![(a, None), (c, Some(fee))],
                 pool: Address::from_low_u64_be(10),
                 fee,
+                state: None,
             },
             estimated_gas: 70_000,
             weight: -2,

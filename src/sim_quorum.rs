@@ -200,13 +200,16 @@ independently cross-checked (single-RPC trust). Add fallback RPC URLs to enable 
         let mut confirmations = 0usize;
         let mut unavailable = 0usize;
         for (url, verdict) in results {
+            // Verifier URLs are provider endpoints with embedded credentials;
+            // this value reaches both the log stream and a returned error.
+            let safe_url = crate::util::redact_endpoint(&url);
             match verdict {
                 VerifierVerdict::Confirmed { profit } => {
                     confirmations += 1;
                     info!(
                         target: "sim_quorum",
                         chain = %self.chain,
-                        endpoint = %url,
+                        endpoint = %safe_url,
                         profit = %profit,
                         "independent endpoint confirmed simulation profit"
                     );
@@ -215,12 +218,12 @@ independently cross-checked (single-RPC trust). Add fallback RPC URLs to enable 
                     warn!(
                         target: "sim_quorum",
                         chain = %self.chain,
-                        endpoint = %url,
+                        endpoint = %safe_url,
                         detail = %detail,
                         "independent endpoint CONTRADICTED primary simulation; vetoing dispatch"
                     );
                     return Err(anyhow!(
-                        "simulation quorum veto: endpoint {url} contradicted primary result ({detail})"
+                        "simulation quorum veto: endpoint {safe_url} contradicted primary result ({detail})"
                     ));
                 }
                 VerifierVerdict::Unavailable { detail } => {
@@ -228,7 +231,7 @@ independently cross-checked (single-RPC trust). Add fallback RPC URLs to enable 
                     warn!(
                         target: "sim_quorum",
                         chain = %self.chain,
-                        endpoint = %url,
+                        endpoint = %safe_url,
                         detail = %detail,
                         "simulation quorum verifier unavailable"
                     );

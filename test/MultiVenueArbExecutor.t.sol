@@ -1262,7 +1262,20 @@ contract MultiVenueArbExecutorErc3156Test is Test {
         MultiVenueArbImplementation.PlanV2 memory plan =
             _singleLoanPlan(address(loanToken), 20 ether, address(lender), steps, 0);
 
-        vm.expectRevert();
+        // Assert the SPECIFIC invariant, not merely "something reverted". A bare
+        // expectRevert() passes whether the executor rejected this for being
+        // insolvent or for malformed calldata — which is exactly how an
+        // unprofitable cycle stayed indistinguishable from an encoding bug.
+        // With no steps the plan swaps nothing, so it must repay 20 ether plus
+        // the 5% fee out of a balance that never grew.
+        uint256 repay = 20 ether + (20 ether * feeBps) / 10_000;
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                MultiVenueArbImplementation.InsufficientFinalBalance.selector,
+                20 ether,
+                repay
+            )
+        );
         executor.startV2(plan);
     }
 

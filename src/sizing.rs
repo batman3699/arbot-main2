@@ -10,12 +10,12 @@ use std::{
     },
 };
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::flash_loan::{
     best_single_provider, flash_fee_for_provider, FlashLoanQuote, FlashLoanSelection,
 };
-use crate::graph::Edge;
+use crate::graph::{Edge, VenueEdge};
 use crate::math::mul_div;
 use crate::quote_balancer::BalQuote;
 use crate::quote_curve::CurveQuote;
@@ -302,6 +302,56 @@ where
                 block,
             }
         }
+        // Local first: the size search evaluates up to 25 candidate amounts and
+        // used to pay one `eth_call` per hop per amount, i.e. ~50 round trips to
+        // size a single 2-hop cycle. With `cycle_candidate_cap_per_block` at 500
+        // that is far more RPC than a 2s Base block can carry, so the time
+        // budgets silently truncated the candidate set. Quoting from the pool
+        // state captured at edge-build time removes the network entirely from
+        // the search; the exact pre-broadcast revm simulation still gates the
+        // one size we actually choose.
+        crate::graph::VenueEdge::UniV3 {
+            path,
+            pool,
+            state: Some(cl_state),
+            ..
+        }
+        | crate::graph::VenueEdge::Slipstream {
+            path,
+            pool,
+            state: Some(cl_state),
+            ..
+        } if crate::cl_sim::local_cl_quotes_enabled() && path.len() <= 2 => {
+            // `state` describes ONE pool, so this path is only valid for a
+            // single-pool hop; multi-hop encoded paths fall through to the
+            // router quoter below. UniV3-family pools order tokens by address,
+            // so `from` is token0 exactly when it sorts below `to`.
+            let zero_for_one = edge.from < edge.to;
+            let out = crate::cl_sim::quote_exact_input_single_tick(
+                cl_state,
+                amount_in,
+                zero_for_one,
+                cl_state.fee_ppm,
+            )
+            .ok()??;
+            if out.is_zero() {
+                return None;
+            }
+            // Deliberately does NOT touch `ctx.quote_count` — that counter
+            // tracks RPC quotes, and the point of this arm is that it issues
+            // none. The split between the two is the P1 win made observable.
+            debug!(
+                pool = %format!("0x{}", hex::encode(pool)),
+                ?amount_in,
+                "sized hop locally from cached CL state (no RPC)"
+            );
+            let expected = mul_div(amount_in, edge.rate_num, edge.rate_den);
+            QuoteValue {
+                amount_out: out,
+                slippage_bps: slippage_bps(expected, out),
+                block,
+            }
+        }
         crate::graph::VenueEdge::UniV3 { path, pool, .. } => {
             ctx.quote_count.fetch_add(1, Ordering::Relaxed);
             let quoter = if let (Some(pq), Some(set)) =
@@ -466,6 +516,24 @@ where
     Some((quote, curvature_bps))
 }
 
+/// Stable, low-cardinality venue label for diagnostics. Deliberately the venue
+/// KIND, not the pool address: the useful question when quoting fails is "which
+/// integration is failing", and pool addresses would explode the cardinality of
+/// any aggregation built on this.
+fn venue_kind(edge: &Edge) -> &'static str {
+    match &edge.venue {
+        VenueEdge::UniV3 { .. } => "univ3",
+        VenueEdge::Slipstream { .. } => "slipstream",
+        VenueEdge::Balancer { .. } => "balancer",
+        VenueEdge::Curve { .. } => "curve",
+        VenueEdge::UniV2 { .. } => "univ2",
+        VenueEdge::SolidlyV2 { .. } => "solidly_v2",
+        VenueEdge::Univ4 { .. } => "univ4",
+        VenueEdge::Bridge { .. } => "bridge",
+        VenueEdge::Liquidation { .. } => "liquidation",
+    }
+}
+
 async fn simulate_cycle_with_quotes<'a, C>(
     amount: U256,
     edges: &[Edge],
@@ -478,12 +546,16 @@ where
     let mut current = amount;
     let mut max_slippage = 0u32;
 
-    for edge in edges {
+    let hops = edges.len();
+    for (hop, edge) in edges.iter().enumerate() {
         if !edge.max_input.is_zero() && current > edge.max_input {
             debug!(
                 ?amount,
                 ?current,
                 ?edge.max_input,
+                hop,
+                hops,
+                venue = venue_kind(edge),
                 from = ?edge.from,
                 to = ?edge.to,
                 "rejecting candidate: edge max_input exceeded"
@@ -491,7 +563,26 @@ where
             return None;
         }
 
-        let (quote, curvature_bps) = quote_edge_with_curve(edge, current, block, ctx).await?;
+        // The `?` here used to discard WHICH hop failed and on WHAT venue, so
+        // every quote failure in the cycle collapsed into one undifferentiated
+        // `no_quote_available`. A cycle is only as quotable as its worst hop —
+        // naming that hop and venue is the difference between "quoting is
+        // broken" and "this one venue cannot quote".
+        let Some((quote, curvature_bps)) = quote_edge_with_curve(edge, current, block, ctx).await
+        else {
+            warn!(
+                target: "sizing",
+                ?amount,
+                ?current,
+                hop,
+                hops,
+                venue = venue_kind(edge),
+                from = ?edge.from,
+                to = ?edge.to,
+                "no quote for hop; cycle unquotable"
+            );
+            return None;
+        };
         let curvature_buffer = curvature_bps / 2;
         let base_buffer_bps = edge
             .tolerance_bps
@@ -640,15 +731,57 @@ where
         .gas_price
         .saturating_mul(U256::from(params.estimated_gas))
         .saturating_add(params.l1_data_fee);
-    let gas_cost = params.native_price.tokens_for_native(gas_cost_native);
+    // Fail closed on an unreliable price rather than fabricating a gas cost.
+    //
+    // The non-strict `tokens_for_native` silently returns `native_cost`
+    // UNCHANGED when `native_amount == 0`, i.e. it reinterprets wei as raw
+    // token units. For a 6-decimal token that misreads ~1e14 wei of gas as
+    // ~1e8 USDC, and every candidate reads unprofitable forever. Gas is a
+    // fixed cost the optimal size must clear (spec §3.3), so sizing on a price
+    // we do not trust is never correct — decline to size instead.
+    let Some(gas_cost) = params
+        .native_price
+        .tokens_for_native_strict(gas_cost_native)
+    else {
+        debug!(
+
+            reason = "unpriceable_start_token",
+            ?gas_cost_native,
+            "declined to size: no reliable native price for the start token"
+        );
+        return None;
+    };
     let upper_cap = params
         .quotes
         .iter()
         .fold(U256::zero(), |acc, q| acc.saturating_add(q.max_amount))
         .min(params.max_amount);
+    // These two early exits were SILENT. They fire before any profitability
+    // math, so a candidate rejected here never reaches the `net_after_fee <=
+    // gas_cost` logs further down — the caller then reports the catch-all
+    // "had no profitable sizing", which wrongly reads as an economics verdict
+    // when it is really "the tradable range is empty".
     if upper_cap < params.min_amount {
+        debug!(
+
+            reason = "range_empty",
+            ?upper_cap,
+            min_amount = ?params.min_amount,
+            max_amount = ?params.max_amount,
+            quote_legs = params.quotes.len(),
+            ?gas_cost,
+            "declined to size: tradable range is empty (upper_cap < min_amount)"
+        );
         return None;
     }
+    debug!(
+
+        ?upper_cap,
+        min_amount = ?params.min_amount,
+        ?gas_cost,
+        estimated_gas = params.estimated_gas,
+        "sizing search entered"
+    );
 
     let quote_cache: Arc<Mutex<HashMap<QuoteKey, QuoteValue>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -884,7 +1017,7 @@ mod tests {
             gas_price: U256::zero(),
             estimated_gas: 0,
             l1_data_fee: U256::zero(),
-            native_price: NativePrice::unit(),
+            native_price: NativePrice::new(U256::exp10(18), U256::exp10(18), true),
             quoter: &quoter,
             slipstream_quoter: None,
             pancakeswap_quoter: None,
@@ -937,7 +1070,7 @@ mod tests {
             gas_price: U256::zero(),
             estimated_gas: 0,
             l1_data_fee: U256::zero(),
-            native_price: NativePrice::unit(),
+            native_price: NativePrice::new(U256::exp10(18), U256::exp10(18), true),
             quoter: &quoter,
             slipstream_quoter: None,
             pancakeswap_quoter: None,
@@ -981,7 +1114,7 @@ mod tests {
             gas_price: U256::from(1u64),
             estimated_gas: 50_000,
             l1_data_fee: U256::zero(),
-            native_price: NativePrice::unit(),
+            native_price: NativePrice::new(U256::exp10(18), U256::exp10(18), true),
             quoter: &quoter,
             slipstream_quoter: None,
             pancakeswap_quoter: None,

@@ -390,7 +390,7 @@ impl Accounting {
             }
 
             if let Err(err) = request.send().await {
-                warn!(error = %err, endpoint = %endpoint, "Failed to submit tax reserve swap request");
+                warn!(error = %err, endpoint = %crate::util::redact_endpoint(endpoint), "Failed to submit tax reserve swap request");
             }
         }
     }
@@ -730,8 +730,9 @@ impl Accounting {
             }
         });
         let client = Client::new();
+        // A Slack/Discord webhook URL is itself a bearer credential.
         if let Err(err) = client.post(webhook).json(&payload).send().await {
-            warn!(error = %err, endpoint = %webhook, "Failed to send daily rollup alert");
+            warn!(error = %err, endpoint = %crate::util::redact_endpoint(webhook), "Failed to send daily rollup alert");
         }
     }
 
@@ -757,7 +758,7 @@ impl Accounting {
         });
         let client = Client::new();
         if let Err(err) = client.post(webhook).json(&payload).send().await {
-            warn!(error = %err, endpoint = %webhook, "Failed to send rolling net alert");
+            warn!(error = %err, endpoint = %crate::util::redact_endpoint(webhook), "Failed to send rolling net alert");
         }
     }
 

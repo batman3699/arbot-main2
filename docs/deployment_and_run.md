@@ -8,6 +8,7 @@ use `ops/inputs.yaml` as the canonical non-secret runtime config (RPC, venues, f
 1. Use a Linux box (Ubuntu 22.04 or similar). Install Git and Rust (`rustup`).
 2. Install Foundry binaries (`foundryup` + `forge/cast/anvil/chisel`) from the
    official installer:
+   
    ```bash
    curl -L https://foundry.paradigm.xyz | bash
    source ~/.bashrc
@@ -15,6 +16,7 @@ use `ops/inputs.yaml` as the canonical non-secret runtime config (RPC, venues, f
    ```
 3. Confirm `cargo`, `forge`, and `cast` all report versions without errors.
 4. Verify Solidity compilation from repo root before any deploy step:
+   
    ```bash
    forge build
    ```
@@ -24,20 +26,22 @@ use `ops/inputs.yaml` as the canonical non-secret runtime config (RPC, venues, f
 ## 1. Configure `.env`
 
 1. From the repo root, copy the template:
+   
    ```bash
    cp .env.example .env
    ```
+   
    The template intentionally focuses on secrets and deployment-only settings. Canonical chain addresses and venue metadata belong in `ops/inputs.yaml`.
 2. Point at your registry (choose one):
    - `REGISTRY_FILE=config/registry.json` for a local copy, or
    - `REGISTRY_IPFS_CID=<cid>` (plus optional `REGISTRY_IPFS_GATEWAY`), or
    - `REGISTRY_IPNS=<ipns-name>`.
-   Add `REGISTRY_EXPECTED_HASH` if you know the SHA-256 to enforce integrity.
+     Add `REGISTRY_EXPECTED_HASH` if you know the SHA-256 to enforce integrity.
 3. Config precedence (highest → lowest):
    1. `ops/inputs.yaml` (explicit per-chain overrides + venues/flashloans)
    2. Registry (file/IPFS/IPNS)
    3. Environment variables (`.env`, secrets + deployment-local addresses)
-   Secrets (like `PRIVATE_KEY`) are **env-only** and are never pulled from the registry.
+      Secrets (like `PRIVATE_KEY`) are **env-only** and are never pulled from the registry.
 4. Pick your working chain and base size:
    - Set `CHAIN=` to match a key in the registry (e.g. `arbitrum`, `optimism`,
      `base`, `ethereum`, `abstract`, `ink`, `linea`).
@@ -48,6 +52,7 @@ use `ops/inputs.yaml` as the canonical non-secret runtime config (RPC, venues, f
 6. Put non-secret runtime knobs (search/time/risk/universe) in `ops/inputs.yaml` under `universe`/`risk`; reserve `.env` for secrets, relays, and deployment-local addresses only.
 7. Optional extras in `.env`: relays (`PRIVATE_RELAY_URLS` or `<ENV_PREFIX>_PRIVATE_RELAY_URLS`) and external API keys. Keep canonical protocol addresses and performance knobs in `ops/inputs.yaml`.
 8. Source the file into your shell:
+   
    ```bash
    set -a && source .env && set +a
    ```
@@ -57,17 +62,16 @@ use `ops/inputs.yaml` as the canonical non-secret runtime config (RPC, venues, f
 See `docs/environment_generation.md` for a concrete walkthrough of the manual
 address entry process.
 
-
 ## Canonical flash-loan provider addresses (Aave V3 Pool)
 
 Use these exact addresses in both `ops/inputs.yaml` (`chains[].flashloans[].pool`, `features.liquidation_markets[].aave_v3.pool`, and each `markets[].flash_loan_pool`) and `config/registry.json` (`chains.<chain>.aave_pool`). Keeping them identical avoids startup probe failures and liquidation misroutes.
 
-| Chain | Canonical Aave V3 Pool |
-| --- | --- |
+| Chain    | Canonical Aave V3 Pool                       |
+| -------- | -------------------------------------------- |
 | Ethereum | `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2` |
 | Arbitrum | `0x794a61358D6845594F94dc1DB02A252b5b4814aD` |
 | Optimism | `0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb` |
-| Base | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5` |
+| Base     | `0xA238Dd80C259a72e81d7e4664a9801593F98d1c5` |
 
 Chains without Aave support in this stack should keep `aave_pool: null` in the registry and omit `aave_v3_like` flashloan entries.
 
@@ -78,41 +82,51 @@ Chains without Aave support in this stack should keep `aave_pool: null` in the r
    not a profit floor. If a submitted plan sets `cycleSlippageBps` above the on-chain
    configured `maxSlippageBps`, execution reverts with `InvalidMaxSlippage()` before
    any flash-loan side-effects are attempted.
-
+   
    `minProfit` is intentionally independent from notional-size percentages. Keep
    `minProfit` as a pure economic threshold managed off-chain (gas costs, inclusion
    probability, relay competition, expected adverse selection), while per-hop swap
    slippage protection remains encoded in step-level `min_out` values from the planner.
-
+   
    Access control is now role-separated on-chain:
+   
    - `executors`: allowed to call `start`, `startLegacy`, and `startV2`.
    - `configAdmins`: allowed to modify runtime risk/config parameters (fee recipient,
      profit recipient, slippage/deadline config, circuit breaker controls, approvals).
    - `owner`: manages role assignment (`setExecutor`, `setConfigAdmin`) and ownership.
-
+   
    For canonical profit accounting, optionally set `canonicalProfitToken` to force
    execution plans to borrow/settle in a single treasury asset. If unset (`address(0)`),
    profit accounting defaults to the borrowed token.
-
+   
    Uniswap V3 step-level slippage is strict on-chain: `min_out` must be non-zero and
    is enforced via router `amountOutMinimum`.
+
 2. Choose an HTTPS RPC endpoint that supports broadcasting transactions.
+
 3. (Optional) Dry-run the script:
+   
    ```bash
    forge script script/Deploy.s.sol:Deploy --rpc-url https://your-rpc --slow -vvvv
    ```
+
 4. Deploy for real:
+   
    ```bash
    forge script script/Deploy.s.sol:Deploy \
      --rpc-url https://your-rpc \
      --broadcast \
      --slow -vvvv
    ```
+
 5. Run preflight env validation before broadcasting:
+   
    ```bash
    bash scripts/check_deploy_env.sh
    ```
+   
    The deploy script consumes these env keys exactly (prefixed and global forms):
+   
    - Prefix derivation: `ENV_PREFIX` or `CHAIN`
    - Owner/signer: `PRIVATE_KEY`, `<PREFIX>_EXECUTOR_OWNER` (fallback `EXECUTOR_OWNER`)
      - Deploy flow is `clone -> router -> initialise(clone owner = router) -> transfer router ownership to configured executor owner`.
@@ -126,7 +140,9 @@ Chains without Aave support in this stack should keep `aave_pool: null` in the r
      - Ethereum mainnet hard fallback is built-in: if Aave pool env values are unset on chain id `1`, Deploy uses Aave V3 Pool `0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2`.
    - Permit2 canonical first: `<PREFIX>_PERMIT2_ADDRESS` (legacy fallback `<PREFIX>_PERMIT2`)
      - Ethereum mainnet hard fallback is built-in: if permit2 env values are unset on chain id `1`, Deploy uses canonical Permit2 `0x000000000022D473030F116dDEE9F6B43aC78BA3`.
+
 6. The deployment path is atomic: factory `deployAndInit(...)` now deploys the clone and calls `initialise(...)` in the same transaction, eliminating mempool front-run windows where an external account could seize ownership between transactions.
+
 7. Note the emitted executor clone address and store it in `.env` (`<ENV_PREFIX>_EXECUTOR_ADDRESS`) or ops if you intentionally centralize non-secret addresses there.
    Re-source `.env` afterwards.
 
@@ -135,6 +151,7 @@ Chains without Aave support in this stack should keep `aave_pool: null` in the r
 1. Ensure your websocket RPC URLs are hot and low-latency. Stale endpoints are
    foregone profit.
 2. Start the executor:
+   
    ```bash
    cargo run --release
    ```
@@ -144,7 +161,6 @@ Chains without Aave support in this stack should keep `aave_pool: null` in the r
 
 The registry stays as the single source of truth; the cache keeps the bot alive
 through short network hiccups.
-
 
 ## Dynamic token whitelist behavior (edge-scan coverage)
 
@@ -183,7 +199,6 @@ This keeps pruning safety while allowing discovered venues/pools to contribute e
 - Balancer quotes now auto-fallback to `latest` when pinned-block `queryBatchSwap` calls hit block-out-of-range RPC drift, preventing transient pool disablement from provider lag.
 - Startup now permits baseline UniV3 quoting before any historical profitable pairs are learned, preventing all-edge hot-path skips during cold start.
 
-
 ### Edge-scan resilience knobs (Ethereum)
 
 - `UNIV3_BOOTSTRAP_MAX_PAIRS` (default `256`): when hot UniV3 pool store is empty, runtime probes token-whitelist pairs (across configured fee tiers) up to this many token-pair checks to bootstrap tradable UniV3 pools directly from factory discovery.
@@ -193,6 +208,7 @@ This keeps pruning safety while allowing discovered venues/pools to contribute e
 ### Balancer poolId compatibility
 
 `<CHAIN>_BAL_POOLS` entries now accept either:
+
 - canonical 32-byte Balancer `poolId`, or
 - a Balancer pool contract address in the `poolId` field.
 

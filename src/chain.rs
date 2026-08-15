@@ -2359,6 +2359,10 @@ mod tests {
         };
 
         let ops_chain = OpsChainOverrides {
+            univ2_flash_pool: None,
+            univ2_flash_fee_bps: None,
+            univ3_flash_pool: None,
+            univ3_flash_fee_bps: None,
             chain_name: "arbitrum".into(),
             chain_id: Some(42_161),
             env_prefix: Some("ARB".into()),
@@ -2425,6 +2429,10 @@ mod tests {
         };
 
         let ops_chain = OpsChainOverrides {
+            univ2_flash_pool: None,
+            univ2_flash_fee_bps: None,
+            univ3_flash_pool: None,
+            univ3_flash_fee_bps: None,
             chain_name: "arbitrum".into(),
             chain_id: Some(42_161),
             env_prefix: Some("ARB".into()),

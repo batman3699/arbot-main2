@@ -313,6 +313,14 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
     error InvalidRouter();
     error InvalidAavePool();
     error InvalidGenericAction();
+    /// The cycle ended holding LESS of the start token than it began with.
+    ///
+    /// Previously this reverted as `InvalidGenericAction()`, which the contract
+    /// raises at ~40 unrelated sites — so a plan that simply lost money was
+    /// indistinguishable from malformed calldata, a bad adapter, or a failed
+    /// approval. Carries both balances so the shortfall is readable directly
+    /// from the revert instead of being inferred.
+    error InsufficientFinalBalance(uint256 finalBalance, uint256 requiredBalance);
     error InvalidPermit2();
     error Permit2AmountOverflow();
     error CircuitOpen();
@@ -1143,7 +1151,9 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         uint256 balanceAfterPlan = IERC20(token).balanceOf(address(this));
 
         if (loan.provider == LoanProvider.ERC3156) {
-            if (balanceAfterPlan < startBalance + repay) revert InvalidGenericAction();
+            if (balanceAfterPlan < startBalance + repay) {
+                revert InsufficientFinalBalance(balanceAfterPlan, startBalance + repay);
+            }
 
             uint256 profitDelta = balanceAfterPlan - startBalance - repay;
             lastGrossProfit = profitDelta;
@@ -1154,7 +1164,9 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
             _repay(loan.provider, token, repay, providerAddr);
 
             uint256 finalBalance = IERC20(token).balanceOf(address(this));
-            if (finalBalance < startBalance) revert InvalidGenericAction();
+            if (finalBalance < startBalance) {
+                revert InsufficientFinalBalance(finalBalance, startBalance);
+            }
 
             uint256 profitDelta = finalBalance - startBalance;
             lastGrossProfit = profitDelta;

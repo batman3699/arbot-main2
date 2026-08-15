@@ -183,18 +183,64 @@ where
         return Ok(Vec::new());
     }
     let path_bytes = Bytes::from(crate::util::encode_univ3_path(&path)?);
+    let calls: Vec<(Address, Vec<u8>)> = amounts
+        .iter()
+        .map(|&amount| {
+            (
+                quoter_addr,
+                quote_exact_input_calldata(&path_bytes, amount).to_vec(),
+            )
+        })
+        .collect();
+
+    let results = multicall3_aggregate3(provider, &calls, block).await?;
+    Ok(results
+        .into_iter()
+        .map(|ret| match ret {
+            Some(bytes) if bytes.len() >= 32 => Some(U256::from_big_endian(&bytes[..32])),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Execute many independent `eth_call`s in ONE round-trip via
+/// `Multicall3.aggregate3`, returning each sub-call's raw return data (`None`
+/// when that sub-call reverted or returned nothing).
+///
+/// Per-sub-call failure is tolerated (`allowFailure: true`), so one dead pool
+/// cannot poison the batch. This is the primitive that spec §3.4 requires —
+/// "All pool-state reads via Multicall3. Never N sequential RPC round-trips per
+/// scan" — and it is the decisive latency lever, because scan cost is dominated
+/// by per-call network RTT rather than by node execution time.
+///
+/// The batch is pinned to `block` and retried once at `Latest` on a
+/// block-out-of-range error, matching [`cl_quote_path`]; without that a
+/// websocket head leading the quoting node would fail the whole batch.
+pub(crate) async fn multicall3_aggregate3<C>(
+    provider: &Arc<Provider<C>>,
+    calls: &[(Address, Vec<u8>)],
+    block: U64,
+) -> Result<Vec<Option<Vec<u8>>>>
+where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    if calls.is_empty() {
+        return Ok(Vec::new());
+    }
     let multicall3 = Address::from_str(MULTICALL3)
         .map_err(|err| anyhow::anyhow!("invalid multicall3 address: {err}"))?;
 
-    let mut call_tokens = Vec::with_capacity(amounts.len());
-    for &amount in amounts {
-        let inner = quote_exact_input_calldata(&path_bytes, amount);
-        call_tokens.push(Token::Tuple(vec![
-            Token::Address(quoter_addr),
-            Token::Bool(true), // allowFailure: a bad size must not fail the batch
-            Token::Bytes(inner.to_vec()),
-        ]));
-    }
+    let call_tokens: Vec<Token> = calls
+        .iter()
+        .map(|(target, data)| {
+            Token::Tuple(vec![
+                Token::Address(*target),
+                Token::Bool(true), // allowFailure: one bad sub-call must not fail the batch
+                Token::Bytes(data.clone()),
+            ])
+        })
+        .collect();
+
     // aggregate3((address,bool,bytes)[]) selector = 0x82ad56cb
     let mut data = vec![0x82u8, 0xad, 0x56, 0xcb];
     data.extend(ethers::abi::encode(&[Token::Array(call_tokens)]));
@@ -221,7 +267,7 @@ where
         raw.as_ref(),
     )?;
 
-    let mut out = vec![None; amounts.len()];
+    let mut out = vec![None; calls.len()];
     if let Some(Token::Array(results)) = decoded.into_iter().next() {
         for (i, result) in results.into_iter().enumerate() {
             if i >= out.len() {
@@ -231,8 +277,8 @@ where
                 let success = matches!(fields.first(), Some(Token::Bool(true)));
                 if success {
                     if let Some(Token::Bytes(return_data)) = fields.get(1) {
-                        if return_data.len() >= 32 {
-                            out[i] = Some(U256::from_big_endian(&return_data[..32]));
+                        if !return_data.is_empty() {
+                            out[i] = Some(return_data.clone());
                         }
                     }
                 }

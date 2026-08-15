@@ -865,6 +865,74 @@ impl std::error::Error for RpcDbError {}
 impl revm::database_interface::DBErrorMarker for RpcDbError {}
 
 #[derive(Debug, Clone)]
+/// Cross-simulation storage cache, keyed by block.
+///
+/// `storage_ref` issued ONE synchronous `eth_getStorageAt` per storage slot. A
+/// UniV3 swap touches dozens of slots (slot0, tick bitmaps, liquidity, token
+/// balances), and `RpcForkDb` is constructed fresh per simulation, so nothing
+/// was reused — not within a simulation, and not across the many candidates a
+/// single scan simulates at the SAME block. Measured on Base that made one
+/// simulation cost ~3.2s, far past any budget a 2s-block chain can allow.
+///
+/// Storage at a fixed block is immutable, so sharing it is sound. The cache is
+/// scoped to one block and dropped wholesale when the head advances, which also
+/// bounds memory without any eviction policy.
+struct StorageCache {
+    block: u64,
+    slots: std::collections::HashMap<(Address, U256), U256>,
+}
+
+/// Hard bound so a pathological scan cannot grow the map without limit inside a
+/// single block. Far above the working set of a normal scan (~tens of pools x
+/// tens of slots); hitting it means something is wrong, so it resets rather
+/// than evicting cleverly.
+const STORAGE_CACHE_MAX_SLOTS: usize = 250_000;
+
+fn storage_cache() -> &'static std::sync::Mutex<StorageCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<StorageCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::sync::Mutex::new(StorageCache::empty())
+    })
+}
+
+impl StorageCache {
+    fn empty() -> Self {
+        Self {
+            block: 0,
+            slots: std::collections::HashMap::new(),
+        }
+    }
+
+    fn get(&self, block: u64, address: Address, index: U256) -> Option<U256> {
+        if self.block != block {
+            return None;
+        }
+        self.slots.get(&(address, index)).copied()
+    }
+
+    fn put(&mut self, block: u64, address: Address, index: U256, value: U256) {
+        if self.block != block {
+            // Head advanced: prior-block state is worthless and must not be served.
+            self.slots.clear();
+            self.block = block;
+        }
+        if self.slots.len() >= STORAGE_CACHE_MAX_SLOTS {
+            self.slots.clear();
+        }
+        self.slots.insert((address, index), value);
+    }
+}
+
+fn cached_storage(block: u64, address: Address, index: U256) -> Option<U256> {
+    storage_cache().lock().ok()?.get(block, address, index)
+}
+
+fn store_storage(block: u64, address: Address, index: U256, value: U256) {
+    if let Ok(mut guard) = storage_cache().lock() {
+        guard.put(block, address, index, value);
+    }
+}
+
 struct RpcForkDb {
     rpc_url: Arc<String>,
     block_number: u64,
@@ -1064,6 +1132,9 @@ impl DatabaseRef for RpcForkDb {
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        if let Some(hit) = cached_storage(self.block_number, address, index) {
+            return Ok(hit);
+        }
         let addr = format!("{address:#x}");
         let slot = format!("{index:#x}");
         let response = self.call(
@@ -1074,7 +1145,9 @@ impl DatabaseRef for RpcForkDb {
             .get("result")
             .and_then(|v| v.as_str())
             .unwrap_or("0x0");
-        parse_u256_hex(result)
+        let value = parse_u256_hex(result)?;
+        store_storage(self.block_number, address, index, value);
+        Ok(value)
     }
 
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
@@ -1105,6 +1178,41 @@ mod tests {
     use ethers::types::{Bytes as EthBytes, TransactionRequest, H160};
     use revm::database::EmptyDB;
     use revm::primitives::keccak256;
+
+    /// The cache is only sound because storage at a FIXED block is immutable.
+    /// Serving a slot from a previous block would feed REVM stale state and
+    /// produce a confidently wrong simulation — worse than no cache at all.
+    #[test]
+    fn storage_cache_never_serves_a_stale_block() {
+        let addr = Address::from(EthAddress::from_low_u64_be(0xabc).0);
+        let slot = U256::from(7u64);
+
+        let mut c = StorageCache::empty();
+        c.put(100, addr, slot, U256::from(42u64));
+        assert_eq!(c.get(100, addr, slot), Some(U256::from(42u64)));
+
+        // Same slot, different block => MISS, never the old value.
+        assert_eq!(c.get(101, addr, slot), None);
+
+        // Writing at the new block drops everything cached for the old one.
+        c.put(101, addr, slot, U256::from(99u64));
+        assert_eq!(c.get(101, addr, slot), Some(U256::from(99u64)));
+        assert_eq!(c.get(100, addr, slot), None);
+    }
+
+    #[test]
+    fn storage_cache_distinguishes_addresses_and_slots() {
+        let a = Address::from(EthAddress::from_low_u64_be(1).0);
+        let b = Address::from(EthAddress::from_low_u64_be(2).0);
+        let mut c = StorageCache::empty();
+        c.put(200, a, U256::from(1u64), U256::from(11u64));
+        c.put(200, a, U256::from(2u64), U256::from(22u64));
+        c.put(200, b, U256::from(1u64), U256::from(33u64));
+        assert_eq!(c.get(200, a, U256::from(1u64)), Some(U256::from(11u64)));
+        assert_eq!(c.get(200, a, U256::from(2u64)), Some(U256::from(22u64)));
+        assert_eq!(c.get(200, b, U256::from(1u64)), Some(U256::from(33u64)));
+        assert_eq!(c.get(200, b, U256::from(2u64)), None);
+    }
 
     #[test]
     fn decode_error_string_revert() {

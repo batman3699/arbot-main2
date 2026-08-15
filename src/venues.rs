@@ -34,7 +34,7 @@ use crate::quote_univ3::{UniQuoter, UniV3ValidationConfig, FEE_TIERS};
 use futures_util::{stream, StreamExt};
 use crate::quote_univ4::quote_fixed_price_exact_input;
 use crate::util::{
-    apply_slippage, compute_edge_weight, decimal_ratio, u256_to_decimal, NativePrice, TradeSizing,
+    apply_slippage, compute_edge_weight, decimal_ratio, u256_to_decimal, TradeSizing,
 };
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, MathematicalOps};
@@ -116,48 +116,6 @@ abigen!(
     ]"#,
 );
 
-fn native_price_for(token: Address, prices: &HashMap<Address, NativePrice>) -> NativePrice {
-    prices
-        .get(&token)
-        .copied()
-        .unwrap_or_else(NativePrice::unit)
-}
-
-/// Hub-aware native pricing: WETH peg, stable 1:1 via WETH, reliable map entries first.
-fn hub_native_price_for(
-    token: Address,
-    prices: &HashMap<Address, NativePrice>,
-    hub_tokens: &HashSet<Address>,
-    wrapped_native: Address,
-    stable_decimals: u8,
-) -> NativePrice {
-    if token == wrapped_native && !wrapped_native.is_zero() {
-        let amount = U256::exp10(18);
-        return NativePrice::new(amount, amount, true);
-    }
-    if let Some(price) = prices.get(&token) {
-        if price.is_reliable() {
-            return *price;
-        }
-    }
-    if hub_tokens.contains(&token) {
-        let weth_price = if wrapped_native.is_zero() {
-            None
-        } else {
-            prices.get(&wrapped_native).copied().filter(NativePrice::is_reliable)
-        };
-        if let Some(weth) = weth_price {
-            // Stable hub (USDC etc.): $1 notional pegged through WETH native price.
-            let token_unit = U256::exp10(stable_decimals.min(18) as usize);
-            let native_per_usd = weth.tokens_for_native_if_reliable(weth.native_amount);
-            if let Some(native_for_unit) = native_per_usd {
-                return NativePrice::new(token_unit, native_for_unit, true);
-            }
-        }
-    }
-    native_price_for(token, prices)
-}
-
 fn cl_grid_quote(
     state: &crate::cl_sim::ClPoolState,
     base_amount: U256,
@@ -178,33 +136,6 @@ fn cl_grid_quote(
         )?);
     }
     Ok(best_from_grid(&grid, &outs, tolerance_bps))
-}
-
-fn edge_native_price(token: Address, ctx: &EdgeBuildContext) -> NativePrice {
-    hub_native_price_for(
-        token,
-        ctx.native_token_prices.as_ref(),
-        ctx.hub_tokens.as_ref(),
-        ctx.wrapped_native,
-        ctx.stable_hub_decimals,
-    )
-}
-
-fn refresh_edge_gas_weights(edges: &mut [Edge], gas_price: U256, ctx: &EdgeBuildContext) {
-    for edge in edges.iter_mut() {
-        if !edge.active {
-            continue;
-        }
-        let protected_out = apply_slippage(edge.rate_num, edge.tolerance_bps);
-        edge.weight = compute_edge_weight(
-            protected_out,
-            edge.rate_den,
-            edge.estimated_gas,
-            gas_price,
-            edge.max_input,
-            edge_native_price(edge.from, ctx),
-        );
-    }
 }
 
 fn edge_health_score_bps(edge: &Edge, current_block: U64, max_block_lag: U64) -> u32 {
@@ -276,6 +207,14 @@ fn apply_pruning(
         return;
     }
 
+    // WARNING — `min_edge_max_input` (env `MIN_EDGE_MAX_INPUT_WEI`) is compared
+    // against `edge.max_input`, which is in the edge's INPUT TOKEN raw units,
+    // not wei. The name and default (zero, i.e. filter disabled) hide this. Set
+    // it to a native-denominated value like 1e18 and every 6-decimal token edge
+    // is silently deactivated — real USDC depth is ~1e12-1e13 raw units, so the
+    // comparison is true for all of them and USDC disappears from the graph
+    // with no log line. Same decimals-vs-units class as the flash-loan bounds
+    // fixed in `compute_base_amounts`. Convert per-token before enabling this.
     if edge.max_input < min_edge_max_input {
         edge.active = false;
         return;
@@ -437,6 +376,47 @@ struct QuoteComputation {
     amount_in: U256,
     amount_out: U256,
     slippage_bps: u32,
+}
+
+/// Share of a constant-product reserve treated as usable input. Beyond roughly a
+/// third of the reserve the marginal rate collapses and the sizer rejects the
+/// candidate anyway, so this bounds the search without deciding economics.
+const EDGE_CAPACITY_RESERVE_BPS: u32 = 3_333;
+
+/// How far past the probe size a quote-backed edge may be scaled when the probe
+/// registered no measurable price impact. Deep pools are common on Base majors;
+/// pinning capacity to the probe is what broke sizing in the first place.
+const EDGE_CAPACITY_PROBE_MULTIPLIER: u64 = 256;
+
+/// Capacity of a reserve-backed edge (UniV2 / Solidly), in `from`-token units.
+fn edge_capacity_from_reserve(reserve_in: U256) -> U256 {
+    reserve_in.saturating_mul(U256::from(EDGE_CAPACITY_RESERVE_BPS)) / U256::from(10_000u32)
+}
+
+/// Capacity of a quote-backed edge (UniV3 / Slipstream / Balancer / Curve / V4),
+/// in `from`-token units.
+///
+/// These `VenueEdge` variants carry no reserve or tick-liquidity state, so depth
+/// has to be inferred from the probe itself. Price impact is locally linear in
+/// size, so a probe of `amount_in` that moved the price `s` bps can absorb about
+/// `amount_in * tolerance / s` before it moves `tolerance` bps. A probe with no
+/// measurable impact says the pool is deep relative to the probe, not that the
+/// probe is the limit — fall back to a generous multiple there.
+///
+/// Never returns less than the probe: an amount we already quoted successfully
+/// is by construction within capacity.
+fn edge_capacity_from_quote(quote: &QuoteComputation, tolerance_bps: u32) -> U256 {
+    let probe = quote.amount_in;
+    if probe.is_zero() {
+        return U256::zero();
+    }
+    let ceiling = probe.saturating_mul(U256::from(EDGE_CAPACITY_PROBE_MULTIPLIER));
+    if quote.slippage_bps == 0 || tolerance_bps == 0 {
+        return ceiling;
+    }
+    let scaled =
+        probe.saturating_mul(U256::from(tolerance_bps)) / U256::from(quote.slippage_bps);
+    scaled.max(probe).min(ceiling)
 }
 
 fn profit_value(quote: &QuoteComputation) -> Decimal {
@@ -1357,21 +1337,14 @@ pub enum PopulateMode {
 pub struct PopulateOptions {
     pub touched_pools: HashSet<Address>,
     pub last_digest: Option<EdgeDigest>,
-    pub last_gas_price: U256,
     pub cached_edges: Option<Vec<Edge>>,
-    pub gas_refresh_threshold_bps: u32,
 }
 
 #[derive(Clone)]
 struct EdgeBuildContext {
     base_profiles: Arc<HashMap<Address, TradeSizing>>,
     default_profile: TradeSizing,
-    gas_price: U256,
-    native_token_prices: Arc<HashMap<Address, NativePrice>>,
     block_number: U64,
-    hub_tokens: Arc<HashSet<Address>>,
-    wrapped_native: Address,
-    stable_hub_decimals: u8,
 }
 
 struct Univ3EdgeContext<C>
@@ -1729,7 +1702,6 @@ where
 
     let stats = Arc::new(Univ3Stats::default());
     let collector_started_at = Instant::now();
-    let gas_price = ctx.edge_ctx.gas_price;
     let allowed_fee_tiers = ctx.allowed_fee_tiers.as_ref().and_then(|tiers| {
         if tiers.is_empty() {
             None
@@ -1757,6 +1729,34 @@ where
                 .filter(|value| *value > 0)
         }))
         .unwrap_or(ctx.quote_concurrency_limit.max(1))
+    };
+
+    // Spec §3.4: "All pool-state reads via Multicall3. Never N sequential RPC
+    // round-trips per scan." Prefetch every pool's slot0/liquidity/tickSpacing/
+    // fee in one batched call instead of letting each spawned task issue its own
+    // four sequential reads. At 64 pools that is 256 round-trips collapsed to 2.
+    let prefetched_cl_state = if crate::cl_sim::local_cl_quotes_enabled() {
+        let targets: Vec<(Address, Option<u32>)> = source_pools
+            .iter()
+            .map(|p| (p.pool, Some(p.fee)))
+            .collect();
+        let started = Instant::now();
+        let states = crate::cl_sim::load_cl_pool_states_batched(
+            Arc::clone(&ctx.provider),
+            &targets,
+            ctx.edge_ctx.block_number,
+        )
+        .await;
+        info!(
+            target: "venue::univ3",
+            pools = targets.len(),
+            loaded = states.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "prefetched CL pool state via Multicall3"
+        );
+        Arc::new(states)
+    } else {
+        Arc::new(std::collections::HashMap::new())
     };
 
     let mut join_set: JoinSet<Result<Vec<Edge>>> = JoinSet::new();
@@ -1792,18 +1792,21 @@ where
         let provider = Arc::clone(&ctx.provider);
         let hot_paths = Arc::clone(&ctx.hot_paths);
         let stats = Arc::clone(&stats);
-        let native_token_prices = Arc::clone(&ctx.edge_ctx.native_token_prices);
-        let hub_tokens = Arc::clone(&ctx.edge_ctx.hub_tokens);
-        let wrapped_native = ctx.edge_ctx.wrapped_native;
-        let stable_hub_decimals = ctx.edge_ctx.stable_hub_decimals;
         let quote_semaphore = Arc::clone(&ctx.quote_semaphore);
         let block_number = ctx.edge_ctx.block_number;
         let forced_discovery_quotes_used = Arc::clone(&forced_discovery_quotes_used);
         let chain_env_prefix = ctx.chain_env_prefix.clone();
         let quote_concurrency_limit = ctx.quote_concurrency_limit;
+        let prefetched_cl_state = Arc::clone(&prefetched_cl_state);
         join_set.spawn(async move {
             let mut local_edges = Vec::new();
-            let cl_state = if crate::cl_sim::local_cl_quotes_enabled() {
+            // Prefer the Multicall3-prefetched state; only fall back to the
+            // four sequential per-pool reads when this pool missed the batch.
+            let cl_state = if !crate::cl_sim::local_cl_quotes_enabled() {
+                None
+            } else if let Some(state) = prefetched_cl_state.get(&pool.pool) {
+                Some(state.clone())
+            } else {
                 match crate::cl_sim::load_cl_pool_state(
                     provider.clone(),
                     pool.pool,
@@ -1823,8 +1826,6 @@ where
                         None
                     }
                 }
-            } else {
-                None
             };
             let directions = [
                 (pool.token0, pool.token1, profile_in),
@@ -2187,7 +2188,9 @@ where
                     continue;
                 }
 
-                let protected_out = apply_slippage(quote.amount_out, tolerance_bps);
+                // Detection-only haircut; `tolerance_bps` remains the execution min_out margin.
+                let protected_out =
+                    apply_slippage(quote.amount_out, crate::util::detection_haircut_bps());
                 if protected_out.is_zero() {
                     hot_paths_quote
                         .as_ref()
@@ -2196,20 +2199,7 @@ where
                     continue;
                 }
 
-                let weight = compute_edge_weight(
-                    protected_out,
-                    quote.amount_in,
-                    ESTIMATED_GAS_UNIV3,
-                    gas_price,
-                    quote.amount_in,
-                    hub_native_price_for(
-                        token_in,
-                        native_token_prices.as_ref(),
-                        hub_tokens.as_ref(),
-                        wrapped_native,
-                        stable_hub_decimals,
-                    ),
-                );
+                let weight = compute_edge_weight(protected_out, quote.amount_in);
                 let edge = Edge {
                     from: token_in,
                     to: token_out,
@@ -2219,10 +2209,11 @@ where
                         path: path.clone(),
                         pool: pool.pool,
                         fee: pool.fee,
+                        state: cl_state.clone(),
                     },
                     estimated_gas: ESTIMATED_GAS_UNIV3,
                     weight,
-                    max_input: quote.amount_in,
+                    max_input: edge_capacity_from_quote(&quote, tolerance_bps),
                     tolerance_bps,
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
@@ -2336,7 +2327,6 @@ where
 
     let stats = Arc::new(SlipstreamStats::default());
     let collector_started_at = Instant::now();
-    let gas_price = ctx.edge_ctx.gas_price;
     let allowed_fee_tiers = ctx.allowed_tick_spacings.as_ref().and_then(|tiers| {
         if tiers.is_empty() {
             None
@@ -2364,6 +2354,33 @@ where
                 .filter(|value| *value > 0)
         }))
         .unwrap_or(ctx.quote_concurrency_limit.max(1))
+    };
+
+    // Same Multicall3 prefetch as the UniV3 collector (spec §3.4). Slipstream
+    // pools expose the identical slot0/liquidity/tickSpacing/fee surface, so a
+    // single batched read replaces four sequential calls per pool.
+    // `fee` is read from chain here (no hint) because Slipstream keys pools by
+    // tick spacing rather than a fee tier.
+    let prefetched_cl_state = if crate::cl_sim::local_cl_quotes_enabled() {
+        let targets: Vec<(Address, Option<u32>)> =
+            source_pools.iter().map(|p| (p.pool, None)).collect();
+        let started = Instant::now();
+        let states = crate::cl_sim::load_cl_pool_states_batched(
+            Arc::clone(&ctx.provider),
+            &targets,
+            ctx.edge_ctx.block_number,
+        )
+        .await;
+        info!(
+            target: "venue::slipstream",
+            pools = targets.len(),
+            loaded = states.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "prefetched CL pool state via Multicall3"
+        );
+        Arc::new(states)
+    } else {
+        Arc::new(std::collections::HashMap::new())
     };
 
     let mut join_set: JoinSet<Result<Vec<Edge>>> = JoinSet::new();
@@ -2400,18 +2417,19 @@ where
         let provider = Arc::clone(&ctx.provider);
         let hot_paths = Arc::clone(&ctx.hot_paths);
         let stats = Arc::clone(&stats);
-        let native_token_prices = Arc::clone(&ctx.edge_ctx.native_token_prices);
-        let hub_tokens = Arc::clone(&ctx.edge_ctx.hub_tokens);
-        let wrapped_native = ctx.edge_ctx.wrapped_native;
-        let stable_hub_decimals = ctx.edge_ctx.stable_hub_decimals;
         let quote_semaphore = Arc::clone(&ctx.quote_semaphore);
         let block_number = ctx.edge_ctx.block_number;
         let forced_discovery_quotes_used = Arc::clone(&forced_discovery_quotes_used);
         let chain_env_prefix = ctx.chain_env_prefix.clone();
         let quote_concurrency_limit = ctx.quote_concurrency_limit;
+        let prefetched_cl_state = Arc::clone(&prefetched_cl_state);
         join_set.spawn(async move {
             let mut local_edges = Vec::new();
-            let cl_state = if crate::cl_sim::local_cl_quotes_enabled() {
+            let cl_state = if !crate::cl_sim::local_cl_quotes_enabled() {
+                None
+            } else if let Some(state) = prefetched_cl_state.get(&pool.pool) {
+                Some(state.clone())
+            } else {
                 match crate::cl_sim::load_cl_pool_state(
                     provider.clone(),
                     pool.pool,
@@ -2431,8 +2449,6 @@ where
                         None
                     }
                 }
-            } else {
-                None
             };
             let directions = [
                 (pool.token0, pool.token1, profile_in),
@@ -2793,7 +2809,9 @@ where
                     continue;
                 }
 
-                let protected_out = apply_slippage(quote.amount_out, tolerance_bps);
+                // Detection-only haircut; `tolerance_bps` remains the execution min_out margin.
+                let protected_out =
+                    apply_slippage(quote.amount_out, crate::util::detection_haircut_bps());
                 if protected_out.is_zero() {
                     hot_paths_quote
                         .as_ref()
@@ -2802,20 +2820,7 @@ where
                     continue;
                 }
 
-                let weight = compute_edge_weight(
-                    protected_out,
-                    quote.amount_in,
-                    ESTIMATED_GAS_SLIPSTREAM,
-                    gas_price,
-                    quote.amount_in,
-                    hub_native_price_for(
-                        token_in,
-                        native_token_prices.as_ref(),
-                        hub_tokens.as_ref(),
-                        wrapped_native,
-                        stable_hub_decimals,
-                    ),
-                );
+                let weight = compute_edge_weight(protected_out, quote.amount_in);
                 let edge = Edge {
                     from: token_in,
                     to: token_out,
@@ -2826,10 +2831,11 @@ where
                         pool: pool.pool,
                         tick_spacing: pool.fee,
                         router: slipstream_router,
+                        state: cl_state.clone(),
                     },
                     estimated_gas: ESTIMATED_GAS_SLIPSTREAM,
                     weight,
-                    max_input: quote.amount_in,
+                    max_input: edge_capacity_from_quote(&quote, tolerance_bps),
                     tolerance_bps,
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
@@ -3045,18 +3051,13 @@ where
                 if quote.slippage_bps > tolerance_bps {
                     continue;
                 }
-                let protected_out = apply_slippage(quote.amount_out, tolerance_bps);
+                // Detection-only haircut; `tolerance_bps` remains the execution min_out margin.
+                let protected_out =
+                    apply_slippage(quote.amount_out, crate::util::detection_haircut_bps());
                 if protected_out.is_zero() {
                     continue;
                 }
-                let weight = compute_edge_weight(
-                    protected_out,
-                    quote.amount_in,
-                    ESTIMATED_GAS_BAL,
-                    ctx.gas_price,
-                    quote.amount_in,
-                    native_price_for(pool.token_in, &ctx.native_token_prices),
-                );
+                let weight = compute_edge_weight(protected_out, quote.amount_in);
                 let edge = Edge {
                     from: pool.token_in,
                     to: pool.token_out,
@@ -3069,7 +3070,7 @@ where
                     },
                     estimated_gas: ESTIMATED_GAS_BAL,
                     weight,
-                    max_input: quote.amount_in,
+                    max_input: edge_capacity_from_quote(&quote, tolerance_bps),
                     tolerance_bps,
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(ctx.block_number),
@@ -3087,8 +3088,6 @@ async fn collect_curve_edges<C>(
     chain_env_prefix: &str,
     base_profiles: Arc<HashMap<Address, TradeSizing>>,
     default_profile: TradeSizing,
-    gas_price: U256,
-    native_token_prices: Arc<HashMap<Address, NativePrice>>,
     block_number: U64,
 ) -> Result<Vec<Edge>>
 where
@@ -3208,18 +3207,13 @@ where
                 if quote.slippage_bps > tolerance_bps {
                     continue;
                 }
-                let protected_out = apply_slippage(quote.amount_out, tolerance_bps);
+                // Detection-only haircut; `tolerance_bps` remains the execution min_out margin.
+                let protected_out =
+                    apply_slippage(quote.amount_out, crate::util::detection_haircut_bps());
                 if protected_out.is_zero() {
                     continue;
                 }
-                let weight = compute_edge_weight(
-                    protected_out,
-                    quote.amount_in,
-                    ESTIMATED_GAS_CURVE,
-                    gas_price,
-                    quote.amount_in,
-                    native_price_for(pool_cfg.token_in, &native_token_prices),
-                );
+                let weight = compute_edge_weight(protected_out, quote.amount_in);
                 let edge = Edge {
                     from: pool_cfg.token_in,
                     to: pool_cfg.token_out,
@@ -3233,7 +3227,7 @@ where
                     },
                     estimated_gas: ESTIMATED_GAS_CURVE,
                     weight,
-                    max_input: quote.amount_in,
+                    max_input: edge_capacity_from_quote(&quote, tolerance_bps),
                     tolerance_bps,
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
@@ -3253,8 +3247,6 @@ async fn collect_univ2_edges<C>(
     hot_pools: &[ResolvedUniV2PoolCfg],
     base_profiles: Arc<HashMap<Address, TradeSizing>>,
     default_profile: TradeSizing,
-    gas_price: U256,
-    native_token_prices: Arc<HashMap<Address, NativePrice>>,
     token_decimals: Arc<HashMap<Address, u8>>,
     min_liquidity_tokens: f64,
     block_number: U64,
@@ -3270,16 +3262,50 @@ where
     let mut cached_states: Vec<(ResolvedUniV2PoolCfg, UniV2PairState, Option<U64>)> = Vec::new();
     let concurrency = univ2_load_concurrency();
     let pool_monitor = pool_monitor.clone();
+
+    // Same Multicall3 prefetch as the Solidly collector (spec §3.4): one batched
+    // read for every pair, block-pinned, instead of 3 sequential RPCs per pool.
+    let univ2_batched = {
+        let mut pairs: Vec<Address> = hot_pools.iter().map(|p| p.pair).collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        if pairs.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let started = Instant::now();
+            let states =
+                crate::quote_univ2::load_pair_states_batched(provider.clone(), &pairs, block_number)
+                    .await;
+            info!(
+                target: "venue::univ2",
+                pairs = pairs.len(),
+                loaded = states.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "prefetched pair reserves via Multicall3"
+            );
+            states
+        }
+    };
+    let univ2_batched = Arc::new(univ2_batched);
+
     let load_outcomes: Vec<Option<(ResolvedUniV2PoolCfg, UniV2PairState, Option<U64>)>> =
         stream::iter(hot_pools.iter().cloned().map(|pool| {
             let provider = provider.clone();
             let pool_monitor = pool_monitor.clone();
+            let univ2_batched = Arc::clone(&univ2_batched);
             async move {
                 let snapshot = if let Some(monitor) = &pool_monitor {
                     monitor.state_with_block(pool.pair).await
                 } else {
                     None
                 };
+                // Prefer the monitor, then the batch, then the per-pair read.
+                let snapshot = snapshot.or_else(|| {
+                    univ2_batched
+                        .get(&pool.pair)
+                        .cloned()
+                        .map(|state| (state, Some(block_number)))
+                });
 
                 match snapshot {
                     Some((state, last_block)) => Some((pool, state, last_block)),
@@ -3365,18 +3391,13 @@ where
             if quote.slippage_bps > tolerance_bps {
                 continue;
             }
-            let protected_out = apply_slippage(quote.amount_out, tolerance_bps);
+            // Detection-only haircut; `tolerance_bps` remains the execution min_out margin.
+                let protected_out =
+                    apply_slippage(quote.amount_out, crate::util::detection_haircut_bps());
             if protected_out.is_zero() {
                 continue;
             }
-            let weight = compute_edge_weight(
-                protected_out,
-                quote.amount_in,
-                ESTIMATED_GAS_UNIV2,
-                gas_price,
-                quote.amount_in,
-                native_price_for(pool.token_in, &native_token_prices),
-            );
+            let weight = compute_edge_weight(protected_out, quote.amount_in);
             let edge = Edge {
                 from: pool.token_in,
                 to: pool.token_out,
@@ -3393,7 +3414,7 @@ where
                 },
                 estimated_gas: ESTIMATED_GAS_UNIV2,
                 weight,
-                max_input: quote.amount_in,
+                max_input: edge_capacity_from_reserve(reserve_in),
                 tolerance_bps,
                 observed_slippage_bps: quote.slippage_bps,
                 quote_block,
@@ -3411,8 +3432,6 @@ async fn collect_solidly_edges<C>(
     chain_env_prefix: &str,
     base_profiles: Arc<HashMap<Address, TradeSizing>>,
     default_profile: TradeSizing,
-    gas_price: U256,
-    native_token_prices: Arc<HashMap<Address, NativePrice>>,
     token_decimals: Arc<HashMap<Address, u8>>,
     block_number: U64,
 ) -> Result<Vec<Edge>>
@@ -3436,16 +3455,56 @@ where
         let state_concurrency = solidly_state_concurrency();
         let pool_monitor_ref = pool_monitor.clone();
         let block_for_quotes = block_number;
-        let loaded_states: Vec<(Address, Option<UniV2PairState>, Option<U64>)> =
-            stream::iter(unique_pairs.into_iter().map(|pair| {
+
+        // Take whatever the pool monitor already has, then batch-load ONLY the
+        // misses in one Multicall3 round-trip (spec §3.4). The previous fan-out
+        // issued 3 sequential RPCs per pair — 102 calls for 34 Aerodrome pools —
+        // and under rate limiting silently dropped 24-59% of pools per scan,
+        // making edge coverage non-deterministic.
+        let mut cached: Vec<(Address, UniV2PairState, Option<U64>)> = Vec::new();
+        let mut misses: Vec<Address> = Vec::new();
+        for pair in unique_pairs {
+            let hit = match &pool_monitor_ref {
+                Some(monitor) => monitor.state_with_block(pair).await,
+                None => None,
+            };
+            match hit {
+                Some((state, last_block)) => cached.push((pair, state, last_block)),
+                None => misses.push(pair),
+            }
+        }
+
+        let batched = if misses.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let started = Instant::now();
+            let states = crate::quote_univ2::load_pair_states_batched(
+                provider.clone(),
+                &misses,
+                block_for_quotes,
+            )
+            .await;
+            info!(
+                target: "venue::solidly",
+                pairs = misses.len(),
+                loaded = states.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "prefetched pair reserves via Multicall3"
+            );
+            states
+        };
+
+        // Anything the batch could not resolve falls back to the per-pair path,
+        // so a partial batch degrades rather than dropping the pool outright.
+        let still_missing: Vec<Address> = misses
+            .iter()
+            .copied()
+            .filter(|pair| !batched.contains_key(pair))
+            .collect();
+        let fallback: Vec<(Address, Option<UniV2PairState>, Option<U64>)> =
+            stream::iter(still_missing.into_iter().map(|pair| {
                 let provider = provider.clone();
-                let pool_monitor = pool_monitor_ref.clone();
                 async move {
-                    if let Some(monitor) = &pool_monitor {
-                        if let Some((state, last_block)) = monitor.state_with_block(pair).await {
-                            return (pair, Some(state), last_block);
-                        }
-                    }
                     (
                         pair,
                         load_pair_state(provider, pair).await.unwrap_or(None),
@@ -3456,6 +3515,17 @@ where
             .buffer_unordered(state_concurrency)
             .collect()
             .await;
+
+        let loaded_states: Vec<(Address, Option<UniV2PairState>, Option<U64>)> = cached
+            .into_iter()
+            .map(|(pair, state, blk)| (pair, Some(state), blk))
+            .chain(
+                batched
+                    .into_iter()
+                    .map(|(pair, state)| (pair, Some(state), Some(block_for_quotes))),
+            )
+            .chain(fallback)
+            .collect();
         let pair_states: HashMap<Address, (UniV2PairState, Option<U64>)> = loaded_states
             .into_iter()
             .filter_map(|(pair, state, block)| state.map(|state| (pair, (state, block))))
@@ -3511,18 +3581,13 @@ where
                 if quote.slippage_bps > tolerance_bps {
                     continue;
                 }
-                let protected_out = apply_slippage(quote.amount_out, tolerance_bps);
+                // Detection-only haircut; `tolerance_bps` remains the execution min_out margin.
+                let protected_out =
+                    apply_slippage(quote.amount_out, crate::util::detection_haircut_bps());
                 if protected_out.is_zero() {
                     continue;
                 }
-                let weight = compute_edge_weight(
-                    protected_out,
-                    quote.amount_in,
-                    ESTIMATED_GAS_SOLIDLYV2,
-                    gas_price,
-                    quote.amount_in,
-                    native_price_for(pool.token_in, &native_token_prices),
-                );
+                let weight = compute_edge_weight(protected_out, quote.amount_in);
                 let (reserve_in, reserve_out) = match solidly_state.reserves_for(pool.token_in) {
                     Some(reserves) => reserves,
                     None => continue,
@@ -3546,7 +3611,7 @@ where
                     },
                     estimated_gas: ESTIMATED_GAS_SOLIDLYV2,
                     weight,
-                    max_input: quote.amount_in,
+                    max_input: edge_capacity_from_reserve(reserve_in),
                     tolerance_bps,
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block,
@@ -3572,8 +3637,6 @@ async fn collect_univ4_edges(
     chain_env_prefix: &str,
     base_profiles: Arc<HashMap<Address, TradeSizing>>,
     default_profile: TradeSizing,
-    gas_price: U256,
-    native_token_prices: Arc<HashMap<Address, NativePrice>>,
 ) -> Result<Vec<Edge>> {
     let mut edges = Vec::new();
     let env_key = format!("{chain_env_prefix}_UNIV4_POOLS");
@@ -3628,18 +3691,13 @@ async fn collect_univ4_edges(
                 if quote.slippage_bps > tolerance_bps {
                     continue;
                 }
-                let protected_out = apply_slippage(quote.amount_out, tolerance_bps);
+                // Detection-only haircut; `tolerance_bps` remains the execution min_out margin.
+                let protected_out =
+                    apply_slippage(quote.amount_out, crate::util::detection_haircut_bps());
                 if protected_out.is_zero() {
                     continue;
                 }
-                let weight = compute_edge_weight(
-                    protected_out,
-                    quote.amount_in,
-                    ESTIMATED_GAS_UNIV4,
-                    gas_price,
-                    quote.amount_in,
-                    native_price_for(pool.token_in, &native_token_prices),
-                );
+                let weight = compute_edge_weight(protected_out, quote.amount_in);
                 let edge = Edge {
                     from: pool.token_in,
                     to: pool.token_out,
@@ -3656,7 +3714,7 @@ async fn collect_univ4_edges(
                     },
                     estimated_gas: ESTIMATED_GAS_UNIV4,
                     weight,
-                    max_input: quote.amount_in,
+                    max_input: edge_capacity_from_quote(&quote, tolerance_bps),
                     tolerance_bps,
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: None,
@@ -3685,18 +3743,6 @@ fn edge_touches_pools(edge: &Edge, touched: &HashSet<Address>) -> bool {
         .unwrap_or(false)
 }
 
-fn gas_price_moved_bps(previous: U256, current: U256, threshold_bps: u32) -> bool {
-    if previous.is_zero() {
-        return true;
-    }
-    let delta = if current > previous {
-        current - previous
-    } else {
-        previous - current
-    };
-    delta.saturating_mul(U256::from(10_000u64)) > previous * U256::from(threshold_bps as u64)
-}
-
 pub struct PopulateResult {
     pub edges: Vec<Edge>,
     // Diagnostics returned by populate_edges but not yet consumed by callers.
@@ -3721,9 +3767,7 @@ pub async fn populate_edges<C>(
     default_base_amount: U256,
     base_profiles: Arc<HashMap<Address, TradeSizing>>,
     max_slippage_bps: u32,
-    gas_price: U256,
     token_decimals: Arc<HashMap<Address, u8>>,
-    native_token_prices: Arc<HashMap<Address, NativePrice>>,
     min_liquidity_tokens: f64,
     min_edge_max_input: U256,
     low_liquidity: &[LowLiquidityPool],
@@ -3745,8 +3789,9 @@ pub async fn populate_edges<C>(
     pancakeswap_validation: Option<UniV3ValidationConfig>,
     pancakeswap_validation_once: Arc<OnceCell<()>>,
     hot_pancakeswap_pools: &[PoolRecord],
-    hub_tokens: Arc<HashSet<Address>>,
-    wrapped_native: Address,
+    _hub_tokens: Arc<HashSet<Address>>,
+    // Retained for caller signature stability; detection no longer prices.
+    _wrapped_native: Address,
     populate_options: PopulateOptions,
     metrics: Option<Arc<Metrics>>,
 ) -> Result<PopulateResult>
@@ -3759,25 +3804,10 @@ where
     );
 
     let default_profile = TradeSizing::new(default_base_amount, max_slippage_bps);
-    let stable_hub_decimals = hub_tokens
-        .iter()
-        .filter_map(|token| token_decimals.get(token).copied())
-        .min()
-        .unwrap_or(6);
-    let gas_refresh_threshold_bps = if populate_options.gas_refresh_threshold_bps > 0 {
-        populate_options.gas_refresh_threshold_bps
-    } else {
-        500
-    };
     let edge_ctx_template = EdgeBuildContext {
         base_profiles: base_profiles.clone(),
         default_profile,
-        gas_price,
-        native_token_prices: Arc::clone(&native_token_prices),
         block_number,
-        hub_tokens: Arc::clone(&hub_tokens),
-        wrapped_native,
-        stable_hub_decimals,
     };
 
     if populate_options.touched_pools.is_empty() {
@@ -3785,14 +3815,9 @@ where
             if let Some(last_digest) = populate_options.last_digest {
                 let cached_digest = edge_digest(&cached);
                 if !edge_digest_changed_significantly(Some(last_digest), cached_digest) {
-                    let mut reused = cached;
-                    if gas_price_moved_bps(
-                        populate_options.last_gas_price,
-                        gas_price,
-                        gas_refresh_threshold_bps,
-                    ) {
-                        refresh_edge_gas_weights(&mut reused, gas_price, &edge_ctx_template);
-                    }
+                    // Edge weights are rate-only, so a gas-price move cannot
+                    // invalidate a cached edge set. Reuse it verbatim.
+                    let reused = cached;
                     for edge in reused.iter() {
                         g.add_edge(edge.clone());
                     }
@@ -4114,8 +4139,6 @@ where
             chain_env_prefix,
             base_profiles.clone(),
             default_profile,
-            gas_price,
-            Arc::clone(&native_token_prices),
             block_number,
         ),
         collect_univ2_edges(
@@ -4124,8 +4147,6 @@ where
             &hot_univ2_filtered,
             base_profiles.clone(),
             default_profile,
-            gas_price,
-            Arc::clone(&native_token_prices),
             token_decimals.clone(),
             min_liquidity_tokens,
             block_number,
@@ -4136,8 +4157,6 @@ where
             chain_env_prefix,
             base_profiles.clone(),
             default_profile,
-            gas_price,
-            Arc::clone(&native_token_prices),
             token_decimals.clone(),
             block_number,
         ),
@@ -4145,8 +4164,6 @@ where
             chain_env_prefix,
             base_profiles.clone(),
             default_profile,
-            gas_price,
-            Arc::clone(&native_token_prices),
         ),
     )?;
 
@@ -4273,18 +4290,13 @@ where
                     if quote.slippage_bps > tolerance_bps {
                         continue;
                     }
-                    let protected_out = apply_slippage(quote.amount_out, tolerance_bps);
+                    // Detection-only haircut; `tolerance_bps` remains the execution min_out margin.
+                let protected_out =
+                    apply_slippage(quote.amount_out, crate::util::detection_haircut_bps());
                     if protected_out.is_zero() {
                         continue;
                     }
-                    let weight = compute_edge_weight(
-                        protected_out,
-                        quote.amount_in,
-                        ESTIMATED_GAS_UNIV2,
-                        gas_price,
-                        quote.amount_in,
-                        native_price_for(token_in, &native_token_prices),
-                    );
+                    let weight = compute_edge_weight(protected_out, quote.amount_in);
                     let (reserve_in, reserve_out) = match pool.state.reserves_for(token_in) {
                         Some(reserves) => reserves,
                         None => continue,
@@ -4305,7 +4317,7 @@ where
                         },
                         estimated_gas: ESTIMATED_GAS_UNIV2,
                         weight,
-                        max_input: quote.amount_in,
+                        max_input: edge_capacity_from_reserve(reserve_in),
                         tolerance_bps,
                         observed_slippage_bps: quote.slippage_bps,
                         quote_block: Some(block_number),
@@ -4437,49 +4449,6 @@ mod tests {
 
         std::env::remove_var("RPC_URLS");
         assert_eq!(class, "local_fork");
-    }
-
-    #[test]
-    fn hub_native_price_weth_is_reliable_unit() {
-        let weth = Address::from_low_u64_be(1);
-        let mut hubs = HashSet::new();
-        hubs.insert(weth);
-        let price = hub_native_price_for(weth, &HashMap::new(), &hubs, weth, 6);
-        assert!(price.is_reliable());
-        assert_ne!(compute_edge_weight(
-            U256::from(105u64),
-            U256::from(100u64),
-            30_000,
-            U256::from(200u64),
-            U256::from(1_000_000u64),
-            price,
-        ), i64::MAX);
-    }
-
-    #[test]
-    fn hub_native_price_usdc_pegs_via_weth() {
-        let weth = Address::from_low_u64_be(1);
-        let usdc = Address::from_low_u64_be(2);
-        let mut hubs = HashSet::new();
-        hubs.insert(weth);
-        hubs.insert(usdc);
-        let mut prices = HashMap::new();
-        let weth_unit = U256::exp10(18);
-        prices.insert(
-            weth,
-            NativePrice::new(weth_unit, weth_unit, true),
-        );
-        let usdc_price = hub_native_price_for(usdc, &prices, &hubs, weth, 6);
-        assert!(usdc_price.is_reliable());
-        let weight = compute_edge_weight(
-            U256::from(105u64),
-            U256::from(100u64),
-            30_000,
-            U256::from(200u64),
-            U256::from(1_000_000u64),
-            usdc_price,
-        );
-        assert_ne!(weight, i64::MAX);
     }
 
     #[test]

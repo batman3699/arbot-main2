@@ -12,11 +12,30 @@ import sys
 
 import requests
 
-ALCHEMY_KEY = os.environ.get("ALCHEMY_KEY", "").strip()
-if not ALCHEMY_KEY:
-    print("FATAL: ALCHEMY_KEY not set", file=sys.stderr)
+# RPC endpoint. Prefer an explicit BASE_RPC_URL (or the first entry of
+# BASE_RPC_URLS, which is what the bot itself uses), and only fall back to
+# Alchemy. The hardcoded Alchemy URL made these builders unrunnable once that
+# key hit its monthly quota, which is why the pool inventories went stale.
+def _resolve_rpc_url():
+    explicit = os.environ.get("BASE_RPC_URL", "").strip()
+    if explicit:
+        return explicit
+    urls = os.environ.get("BASE_RPC_URLS", "").strip()
+    if urls:
+        first = urls.split(",")[0].strip()
+        if first:
+            return first
+    key = os.environ.get("ALCHEMY_KEY", "").strip()
+    if key:
+        return f"https://base-mainnet.g.alchemy.com/v2/{key}"
+    print(
+        "FATAL: set BASE_RPC_URL (or BASE_RPC_URLS, or ALCHEMY_KEY) to a Base RPC endpoint",
+        file=sys.stderr,
+    )
     sys.exit(2)
-RPC_URL = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_KEY}"
+
+
+RPC_URL = _resolve_rpc_url()
 
 # PancakeSwap V3 on Base (canonical per PancakeSwap developer docs)
 V3_FACTORY = "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865"
@@ -41,6 +60,38 @@ MAJORS = [
     "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",  # EURC
     "0x1bc0c42215582d5a085795f4badbac3ff36d1bcb",  # CLANKER
 ]
+
+def _extra_majors() -> list:
+    """Extra non-hub tokens to pair against, comma-separated in EXTRA_MAJORS.
+
+    These builders shipped with tiny hardcoded token sets, which is what kept
+    the Base inventories at 15-17 pools. Entries are validated as 20-byte hex so
+    a malformed address fails loudly here rather than silently yielding a pool
+    that never resolves.
+    """
+    raw = os.environ.get("EXTRA_MAJORS", "").strip()
+    if not raw:
+        return []
+    out, seen = [], set()
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if not (token.startswith("0x") and len(token) == 42):
+            print(f"FATAL: malformed EXTRA_MAJORS entry {token!r}", file=sys.stderr)
+            sys.exit(2)
+        try:
+            int(token, 16)
+        except ValueError:
+            print(f"FATAL: non-hex EXTRA_MAJORS entry {token!r}", file=sys.stderr)
+            sys.exit(2)
+        if token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+MAJORS = MAJORS + [m for m in _extra_majors() if m not in {x.lower() for x in MAJORS}]
 
 ID_GETPOOL = "0x1698ee82"
 ID_BALANCEOF = "0x70a08231"

@@ -71,9 +71,68 @@ pub fn is_block_out_of_range_error(err: &impl std::fmt::Display) -> bool {
         || lower.contains("requested was")
 }
 
+/// Distinguishes a definitive on-chain verdict (the call reached the EVM and
+/// reverted) from a transport failure (rate limit, timeout, dead endpoint).
+///
+/// Callers use this to decide whether a FAILED quote may be cached as a fact
+/// about the chain. A revert means "no pool / no liquidity on this path" and
+/// stays true until the pool set changes. A transport failure means "we do not
+/// know" — and caching that as a verdict is what turned a provider rate-limit
+/// into a multi-month zero-fill outage: every cycle whose start token got
+/// poisoned was rejected pre-simulation for the full cache TTL, silently.
+///
+/// Fail-safe direction is deliberate: anything unrecognised returns `false`
+/// (not a verdict), so an unknown error string causes a retry next scan rather
+/// than a cached lie. Over-retrying costs RPC budget; over-caching costs fills.
+pub fn is_execution_revert(err: &impl std::fmt::Display) -> bool {
+    let lower = err.to_string().to_ascii_lowercase();
+    // "execution reverted" covers the plain revert and the `: SPL` /
+    // `: STF` Uniswap variants. Invalid-opcode is how a QuoterV2 surfaces a
+    // missing pool on some nodes.
+    lower.contains("execution reverted")
+        || lower.contains("invalidfeopcode")
+        || lower.contains("invalid opcode")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_block_out_of_range_error;
+    use super::{is_block_out_of_range_error, is_execution_revert};
+
+    #[test]
+    fn classifies_reverts_as_definitive_verdicts() {
+        // Observed against Base QuoterV2 for tokens with no route.
+        for message in [
+            "execution reverted",
+            "execution reverted: SPL",
+            "execution reverted: STF",
+            "JSON-RPC error: EVM error: InvalidFEOpcode (code -32003)",
+        ] {
+            assert!(
+                is_execution_revert(&message),
+                "must classify as definitive revert: {message}",
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_to_treat_transport_failures_as_verdicts() {
+        // These MUST NOT be cached as "unpriceable" — they say nothing about
+        // the chain, only about our connection to it.
+        for message in [
+            "429 Too Many Requests",
+            "Monthly capacity limit exceeded",
+            "request timed out",
+            "connection reset by peer",
+            "all endpoints failed",
+            "error sending request for url",
+            "some new error string nobody has seen before",
+        ] {
+            assert!(
+                !is_execution_revert(&message),
+                "must NOT classify as revert (fail-safe to retry): {message}",
+            );
+        }
+    }
 
     #[test]
     fn detects_all_block_out_of_range_variants() {

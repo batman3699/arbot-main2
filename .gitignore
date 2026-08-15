@@ -41,3 +41,13 @@ prometheus-*.tar.gz
 # Python tooling caches (scripts/data/*.py)
 __pycache__/
 *.pyc
+
+# --- added: external clones and local artefacts ---
+# external: eth node clone, has its own .git
+node/
+# external: eth-docker clone, has its own .git
+eth-docker/
+# local config backups
+*.bak-preexpand
+# large binary docs
+*.pdf

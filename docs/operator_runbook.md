@@ -5,36 +5,43 @@ This guide walks a first-time operator from a clean machine to a running, monito
 ## 1) Prepare the machine
 
 1. Use Ubuntu 22.04 (server or WSL). Install base tools:
+   
    ```bash
    sudo apt update
    sudo apt install -y build-essential pkg-config libssl-dev curl git
    ```
 2. Install Rust toolchain:
+   
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
    source "$HOME/.cargo/env"
    ```
 3. Install Foundry (for contract deploys):
+   
    ```bash
    curl -L https://foundry.paradigm.xyz | bash
    source "$HOME/.foundry/bin/foundryup"
    ```
 4. Verify binaries:
+   
    ```bash
    cargo --version
    forge --version
    cast --version
    ```
+   
    All commands should print versions without errors.
 
 ## 2) Get the code
 
 1. Clone the repo and enter it:
+   
    ```bash
    git clone https://github.com/your-org/arbot.git
    cd arbot
    ```
 2. Build once to fetch dependencies and confirm the toolchain works:
+   
    ```bash
    cargo build --release
    ```
@@ -44,6 +51,7 @@ This guide walks a first-time operator from a clean machine to a running, monito
 Arbot resolves runtime config in this order: `ops/inputs.yaml` -> registry -> `.env`. Use `ops/inputs.yaml` for non-secret runtime config (chain RPC, venues, flashloans, universe/risk). Use `.env` for secrets and deployment-local addresses only.
 
 1. Copy the template:
+   
    ```bash
    cp .env.example .env
    ```
@@ -63,13 +71,16 @@ Arbot resolves runtime config in this order: `ops/inputs.yaml` -> registry -> `.
      - `FEATURE_BRIDGE=0`
    - Optional modules (only effective if their feature gate is enabled): ERC-3156 lender (`ERC3156_LENDER`/`ERC3156_FEE_BPS`). `ERC3156_FEE_BPS` must be an integer in `0..=10000`; malformed or out-of-range values fail startup validation before runners launch. JIT LP toggles, bridge planner paths, and accounting/tax fields.
 4. Load the variables into your shell:
+   
    ```bash
    set -a && source .env && set +a
    ```
 5. Dry-run the binary offline to validate config ownership and that secrets/addresses are complete:
+   
    ```bash
    OFFLINE_MODE=1 cargo run --release
    ```
+   
    Fix any missing/typo’d variable before proceeding.
 
 For detailed address entry examples, see [`docs/environment_generation.md`](./environment_generation.md).
@@ -79,10 +90,12 @@ For detailed address entry examples, see [`docs/environment_generation.md`](./en
 1. Inspect `script/Deploy.s.sol` and adjust fee/slippage defaults if needed.
 2. Choose a reliable HTTPS RPC for the target chain.
 3. Optional simulation (no broadcast):
+   
    ```bash
    forge script script/Deploy.s.sol:Deploy --rpc-url https://your-rpc --slow -vvvv
    ```
 4. Real deployment:
+   
    ```bash
    forge script script/Deploy.s.sol:Deploy \
      --rpc-url https://your-rpc \
@@ -90,6 +103,7 @@ For detailed address entry examples, see [`docs/environment_generation.md`](./en
      --slow -vvvv
    ```
 5. Copy the emitted executor clone address into `<ENV_PREFIX>_EXECUTOR_ADDRESS` inside `.env` (or `ops/inputs.yaml`), then re-source the file:
+   
    ```bash
    set -a && source .env && set +a
    ```
@@ -98,6 +112,7 @@ For detailed address entry examples, see [`docs/environment_generation.md`](./en
 
 1. Ensure fast WebSocket RPC endpoints are set for live data.
 2. Start the runtime with informative logs:
+   
    ```bash
    RUST_LOG=info,rpc=info cargo run --release
    ```

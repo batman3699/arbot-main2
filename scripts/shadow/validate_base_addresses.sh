@@ -30,8 +30,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
+# Preflight must validate against the SAME endpoint the runtime will use.
+# It previously hardcoded Alchemy, so a dead ALCHEMY_KEY aborted the run even
+# though the runtime reads BASE_RPC_URLS (drpc) and never touches Alchemy — the
+# preflight failed on a provider the system does not use.
 RPC_URL="${BASE_SHADOW_RPC_URL:-}"
 if [ -z "$RPC_URL" ]; then
+  # 1) the runtime's own list, first entry (BASE_RPC_URLS is comma-separated)
+  URLS="${BASE_RPC_URLS:-}"
+  if [ -z "$URLS" ] && [ -f .env ]; then
+    URLS="$(grep -E '^BASE_RPC_URLS=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]')"
+  fi
+  RPC_URL="${URLS%%,*}"
+fi
+if [ -z "$RPC_URL" ]; then
+  # 2) legacy Alchemy path, kept for setups still keyed that way
   KEY="${ALCHEMY_KEY:-}"
   if [ -z "$KEY" ] && [ -f .env ]; then
     KEY="$(grep -E '^ALCHEMY_KEY=' .env | head -1 | cut -d= -f2- | tr -d '[:space:]')"
@@ -42,9 +55,12 @@ if [ -z "$RPC_URL" ]; then
 fi
 
 if [ -z "$RPC_URL" ]; then
-  echo "FATAL: no RPC URL. Set BASE_SHADOW_RPC_URL or ALCHEMY_KEY." >&2
+  echo "FATAL: no RPC URL. Set BASE_SHADOW_RPC_URL or BASE_RPC_URLS." >&2
   exit 2
 fi
+
+# Expand ${VAR} placeholders (BASE_RPC_URLS may carry them, as registry.json does).
+RPC_URL="$(eval "printf '%s' \"$RPC_URL\"")"
 
 if ! command -v cast >/dev/null 2>&1; then
   echo "FATAL: foundry 'cast' not found. Install foundry (https://getfoundry.sh)." >&2
@@ -155,9 +171,31 @@ check_call_addr() {
   fi
 }
 
+# Keep scheme + host, drop the ENTIRE path, query and fragment — mirroring
+# `util::redact_endpoint`. The previous form (`${RPC_URL%%/v2/*}/v2/****`)
+# assumed Alchemy's `/v2/<key>` layout: with a drpc URL there is no `/v2/`, the
+# prefix strip matched nothing, and the banner printed the full API key into
+# logs/. A provider that puts its key anywhere other than after `/v2/` must not
+# be able to defeat this.
+redact_url() {
+  local url="$1" scheme rest host
+  case "$url" in
+    *://*) scheme="${url%%://*}"; rest="${url#*://}" ;;
+    *) printf '***'; return ;;
+  esac
+  rest="${rest%%\?*}"
+  rest="${rest%%#*}"
+  host="${rest%%/*}"
+  if [ "$rest" = "$host" ]; then
+    printf '%s://%s' "$scheme" "$host"
+  else
+    printf '%s://%s/***' "$scheme" "$host"
+  fi
+}
+
 echo "=============================================================="
 echo " Base shadow-mode preflight — on-chain address validation"
-echo " RPC: ${RPC_URL%%/v2/*}/v2/****"
+echo " RPC: $(redact_url "$RPC_URL")"
 echo "=============================================================="
 
 # --- 0) Chain id sanity ------------------------------------------------------

@@ -489,6 +489,28 @@ pub fn block_head_channel() -> (watch::Sender<BlockHead>, watch::Receiver<BlockH
     watch::channel(BlockHead::default())
 }
 
+/// Age of a block, in milliseconds, at the moment we learned about it.
+///
+/// This is the top of the latency funnel: every quote, sizing decision and
+/// simulation downstream is at least this stale. Base produces flashblock
+/// preconfirmations every ~200ms and full blocks every ~2s, so an observation
+/// age materially above ~200ms means the engine is reasoning about state that
+/// faster searchers have already acted on — which looks identical to "no
+/// arbitrage exists" from inside the funnel.
+///
+/// Returns `None` if the block timestamp is unusable (zero, or ahead of us).
+fn block_age_ms(block_timestamp: U256) -> Option<i64> {
+    let ts = block_timestamp.as_u64();
+    if ts == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some(now - (ts as i64) * 1000)
+}
+
 async fn poll_block_head<C>(provider: &Provider<C>, head_tx: &watch::Sender<BlockHead>)
 where
     C: JsonRpcClient + 'static,
@@ -496,6 +518,15 @@ where
     if let Ok(Some(block)) = provider.get_block(BlockNumber::Latest).await {
         if let Some(number) = block.number {
             if head_tx.borrow().number.as_u64() != number.as_u64() {
+                if let Some(age_ms) = block_age_ms(block.timestamp) {
+                    info!(
+                        target: "latency",
+                        block = number.as_u64(),
+                        age_ms,
+                        source = "http_poll",
+                        "block head observed"
+                    );
+                }
                 let _ = head_tx.send(BlockHead {
                     number,
                     base_fee_per_gas: block.base_fee_per_gas,
@@ -563,6 +594,15 @@ pub async fn spawn_block_head_monitor<C>(
                 info!(chain = %chain_name, "newHeads block monitor connected");
                 while let Some(block) = stream.next().await {
                     if let Some(number) = block.number {
+                        if let Some(age_ms) = block_age_ms(block.timestamp) {
+                            info!(
+                                target: "latency",
+                                block = number.as_u64(),
+                                age_ms,
+                                source = "ws_newheads",
+                                "block head observed"
+                            );
+                        }
                         let _ = head_tx.send(BlockHead {
                             number,
                             base_fee_per_gas: block.base_fee_per_gas,

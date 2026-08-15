@@ -45,6 +45,56 @@ impl TradeSizing {
     }
 }
 
+/// Read `decimals()` for MANY tokens in one Multicall3 round-trip.
+///
+/// The per-token path costs one `eth_call` each (plus up to 3 retries), which on
+/// a cold start is one call per configured token before a single quote is made.
+/// Tokens whose sub-call reverts or returns malformed data are absent from the
+/// result; callers fall back to the per-token read.
+pub async fn erc20_decimals_batched<C>(
+    provider: Arc<Provider<C>>,
+    tokens: &[Address],
+    block: U64,
+) -> std::collections::HashMap<Address, u8>
+where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    use std::collections::HashMap;
+    let mut out: HashMap<Address, u8> = HashMap::new();
+    if tokens.is_empty() {
+        return out;
+    }
+    let sel = {
+        let h = ethers::utils::keccak256(b"decimals()");
+        vec![h[0], h[1], h[2], h[3]]
+    };
+
+    const TOKENS_PER_BATCH: usize = 150;
+    for chunk in tokens.chunks(TOKENS_PER_BATCH) {
+        let calls: Vec<(Address, Vec<u8>)> =
+            chunk.iter().map(|t| (*t, sel.clone())).collect();
+        let Ok(results) = crate::quote_cl::multicall3_aggregate3(&provider, &calls, block).await
+        else {
+            continue;
+        };
+        for (i, token) in chunk.iter().enumerate() {
+            let Some(Some(bytes)) = results.get(i) else {
+                continue;
+            };
+            if bytes.len() < 32 {
+                continue;
+            }
+            // decimals() is uint8, right-aligned in the word.
+            let value = U256::from_big_endian(&bytes[..32]);
+            if value > U256::from(36u64) {
+                continue; // implausible; treat as unusable rather than trusting it
+            }
+            out.insert(*token, value.low_u32() as u8);
+        }
+    }
+    out
+}
+
 #[allow(dead_code)]
 pub async fn erc20_decimals<C>(provider: Arc<Provider<C>>, token: Address) -> Result<u8>
 where
@@ -187,6 +237,9 @@ impl NativePrice {
         }
     }
 
+    /// A deliberately UNRELIABLE 1:1 price — a "no information" sentinel.
+    /// Every accessor is strict, so this can never be mistaken for a real rate.
+    #[allow(dead_code)]
     pub fn unit() -> Self {
         let amount = U256::exp10(18);
         Self::new(amount, amount, false)
@@ -194,30 +247,6 @@ impl NativePrice {
 
     pub fn is_reliable(&self) -> bool {
         self.reliable && !self.token_amount.is_zero() && !self.native_amount.is_zero()
-    }
-
-    pub fn tokens_for_native(&self, native_cost: U256) -> U256 {
-        if self.native_amount.is_zero() {
-            return native_cost;
-        }
-
-        mul_div(
-            native_cost,
-            self.token_amount.max(U256::one()),
-            self.native_amount,
-        )
-    }
-
-    pub fn tokens_for_native_if_reliable(&self, native_cost: U256) -> Option<U256> {
-        if !self.is_reliable() {
-            return None;
-        }
-
-        if self.native_amount.is_zero() {
-            return None;
-        }
-
-        Some(self.tokens_for_native(native_cost))
     }
 
     pub fn tokens_for_native_strict(&self, native_cost: U256) -> Option<U256> {
@@ -256,65 +285,58 @@ impl NativePrice {
     }
 }
 
-pub fn compute_edge_weight(
-    rate_num: U256,
-    rate_den: U256,
-    estimated_gas: u64,
-    gas_price: U256,
-    base_amount_in: U256,
-    native_price: NativePrice,
-) -> i64 {
-    let base = if base_amount_in.is_zero() {
-        U256::one()
-    } else {
-        base_amount_in
-    };
-
-    let rate = decimal_ratio(rate_num, rate_den).unwrap_or(Decimal::MAX);
-    let rate_ln = if rate.is_zero() || rate.is_sign_negative() {
-        Decimal::MAX
-    } else {
-        rate.ln()
-    };
-
-    let gas_cost_native = U256::from(estimated_gas).saturating_mul(gas_price);
-    let base_dec = u256_to_decimal(base);
-    let Some(gas_cost_tokens) = native_price.tokens_for_native_if_reliable(gas_cost_native) else {
-        // Unreliable native price: exclude edge from BF (prohibitive weight).
+/// Stage-1 search weight for one edge: `-ln(post-fee rate) * WEIGHT_SCALE`.
+///
+/// **This must stay rate-only.** The negative-cycle search relaxes on this
+/// value, so a cycle is discoverable only when its weights sum negative — i.e.
+/// only when `prod rate_i > 1`. That is precisely the size-independent
+/// profitability test, and it is what makes detection sound.
+///
+/// Gas used to be folded in here as `gas_cost / base_amount_in`. That broke
+/// three ways at once:
+///   * it let a SIZE-DEPENDENT quantity govern a size-independent search. A
+///     cycle whose gas exceeded its gross edge at one arbitrary probe notional
+///     produced positive weights, so no negative cycle existed and the search
+///     never proposed it — at any size. Spec §1: Stage 1 must never decide money.
+///   * each edge divided by ITS OWN input notional in ITS OWN token, so the
+///     per-hop ratios shared no denominator and their sum was not a meaningful
+///     fraction of any trade.
+///   * it required a native price per edge, and an unreliable price returned
+///     `i64::MAX` — silently deleting the edge from the graph with no log line.
+///
+/// Gas is a per-transaction cost, charged once and exactly by Stage 2 in
+/// `optimize_trade_size`. Detection finds cycles that gain value on rates
+/// alone; sizing decides whether that gain clears the cost.
+///
+/// Returns `i64::MAX` (prohibitive — edge excluded) when the rate is unusable.
+/// That is the OPPOSITE of the previous behaviour: a zero or negative rate used
+/// to land in the `Decimal::MIN` branch and yield `i64::MIN`, the most
+/// attractive weight possible, making a broken edge look like infinite
+/// arbitrage.
+pub fn compute_edge_weight(rate_num: U256, rate_den: U256) -> i64 {
+    let Some(rate) = decimal_ratio(rate_num, rate_den) else {
         return i64::MAX;
     };
-    let gas_ratio = u256_to_decimal(gas_cost_tokens)
-        .checked_div(base_dec)
-        .unwrap_or(Decimal::MAX);
+    if rate.is_zero() || rate.is_sign_negative() {
+        return i64::MAX;
+    }
 
-    let composite = gas_ratio.checked_sub(rate_ln).unwrap_or_else(|| {
-        if gas_ratio > rate_ln {
-            Decimal::MAX
-        } else {
-            Decimal::MIN
-        }
-    });
-    let scaled = composite
+    // weight = -ln(rate), so a profitable hop (rate > 1) carries negative weight.
+    let Some(scaled) = rate
+        .ln()
         .checked_mul(Decimal::from_i128_with_scale(WEIGHT_SCALE as i128, 0))
-        .unwrap_or_else(|| {
-            if composite.is_sign_negative() {
-                Decimal::MIN
-            } else {
-                Decimal::MAX
-            }
-        })
-        .round();
+        .map(|v| -v)
+    else {
+        // Overflow implies an absurd rate. Exclude rather than guess a sign —
+        // guessing negative would fabricate an arbitrage out of a broken quote.
+        return i64::MAX;
+    };
 
     scaled
+        .round()
         .to_i128()
         .map(|v| v.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
-        .unwrap_or_else(|| {
-            if scaled.is_sign_negative() {
-                i64::MIN
-            } else {
-                i64::MAX
-            }
-        })
+        .unwrap_or(i64::MAX)
 }
 
 pub fn u256_to_decimal(value: U256) -> Decimal {
@@ -353,6 +375,34 @@ pub fn encode_univ3_path(path: &[(Address, Option<u32>)]) -> Result<Vec<u8>> {
         bytes.extend_from_slice(token.as_bytes());
     }
     Ok(bytes)
+}
+
+/// Haircut applied to a quoted rate when DISCOVERING cycles (Stage 1), in bps.
+///
+/// Distinct from the execution slippage tolerance (`EDGE_SLIPPAGE_BPS` ->
+/// `Edge::tolerance_bps`), which sets the on-chain `min_out` floor. The two want
+/// opposite values and were previously the SAME number:
+///
+///   * Detection wants it SMALL. The haircut is applied per leg to the rate the
+///     detector compares, so a 2-hop round trip pays it twice. At the old shared
+///     default of 30 that imposed a ~60bps bar before any real edge could show —
+///     measured: the best round trip read -61.3bps, of which ~50bps was the
+///     haircut itself. Dropping it moved the same market to -11.4bps.
+///   * Execution wants it LARGE. It is the revert protection: a tight `min_out`
+///     turns a lost race into an on-chain revert instead of a safe no-fill.
+///
+/// Defaults to 0: spec §1 puts profit decisions in Stage 2, so Stage 1 should
+/// rank on raw post-fee rates and let sizing apply exact slippage. Raise it only
+/// to trade recall for fewer Stage-2 evaluations.
+pub fn detection_haircut_bps() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("DETECTION_HAIRCUT_BPS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(10_000)
+    })
 }
 
 pub fn apply_slippage(amount: U256, slippage_bps: u32) -> U256 {
@@ -548,6 +598,73 @@ pub fn coerce_ws_url(endpoint: &str) -> Option<String> {
     }
 }
 
+/// Strip credentials out of an RPC endpoint URL so it is safe to log.
+///
+/// Every major provider embeds the API key directly in the URL — Alchemy and
+/// Infura in the path (`/v2/<key>`, `/v3/<key>`), QuickNode in both the
+/// subdomain and the path, others in a `?apikey=` query parameter. Logging a
+/// raw endpoint therefore logs a live credential. This happened here: a shadow
+/// run wrote a provider key to `logs/` over 1.5 million times.
+///
+/// Policy is **fail closed**. Scheme and host are preserved because failover
+/// logs are useless without them; everything else is replaced. Anything that
+/// does not parse as `scheme://host` returns `***` outright rather than risk
+/// echoing a bare secret that reached this function by mistake.
+///
+/// A short fingerprint of the full endpoint is appended so two endpoints on the
+/// same host stay distinguishable in failover logs without revealing the key.
+pub fn redact_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return "***".to_string();
+    };
+
+    let scheme_ok = !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !scheme_ok {
+        return "***".to_string();
+    }
+
+    // Drop query and fragment before splitting the authority: a key can live in
+    // either, and neither is ever safe to keep.
+    let had_query = rest.contains('?') || rest.contains('#');
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, path)) => (authority, path),
+        None => (rest, ""),
+    };
+
+    // `user:password@host` — the userinfo is a credential too.
+    let had_userinfo = authority.contains('@');
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+
+    if host.is_empty() {
+        return "***".to_string();
+    }
+
+    let redacted_something = had_query || had_userinfo || !path.trim_matches('/').is_empty();
+    if redacted_something {
+        format!("{scheme}://{host}/***#{}", endpoint_fingerprint(trimmed))
+    } else {
+        format!("{scheme}://{host}")
+    }
+}
+
+/// Short, stable, non-reversible tag for an endpoint, so operators can tell two
+/// redacted endpoints apart in a log without seeing either credential.
+fn endpoint_fingerprint(endpoint: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(endpoint.as_bytes());
+    hex::encode(&digest[..3])
+}
+
 #[allow(dead_code)]
 pub async fn connect_http_provider_with_fallbacks(
     label: &str,
@@ -561,17 +678,18 @@ pub async fn connect_http_provider_with_fallbacks(
     let mut attempt: u32 = 0;
     loop {
         for endpoint in endpoints {
-            info!(target: "rpc", %label, endpoint = %endpoint, "connecting http endpoint");
+            let safe_endpoint = redact_endpoint(endpoint);
+            info!(target: "rpc", %label, endpoint = %safe_endpoint, "connecting http endpoint");
             match Provider::<Http>::try_from(endpoint.as_str()) {
                 Ok(provider) => {
-                    info!(target: "rpc", %label, endpoint = %endpoint, "http endpoint connected");
+                    info!(target: "rpc", %label, endpoint = %safe_endpoint, "http endpoint connected");
                     return Ok(provider);
                 }
                 Err(err) => {
                     warn!(
                         target: "rpc",
                         %label,
-                        endpoint = %endpoint,
+                        endpoint = %safe_endpoint,
                         error = ?err,
                         "http endpoint connection failed"
                     );
@@ -605,17 +723,18 @@ pub async fn connect_ws_provider_with_fallbacks(
     let mut attempt: u32 = 0;
     loop {
         for endpoint in endpoints {
-            info!(target: "rpc", %label, endpoint = %endpoint, "connecting websocket endpoint");
+            let safe_endpoint = redact_endpoint(endpoint);
+            info!(target: "rpc", %label, endpoint = %safe_endpoint, "connecting websocket endpoint");
             match Provider::<Ws>::connect(endpoint).await {
                 Ok(provider) => {
-                    info!(target: "rpc", %label, endpoint = %endpoint, "websocket endpoint connected");
+                    info!(target: "rpc", %label, endpoint = %safe_endpoint, "websocket endpoint connected");
                     return Ok(provider);
                 }
                 Err(err) => {
                     warn!(
                         target: "rpc",
                         %label,
-                        endpoint = %endpoint,
+                        endpoint = %safe_endpoint,
                         error = ?err,
                         "websocket endpoint connection failed"
                     );
@@ -645,6 +764,69 @@ mod tests {
 
     fn addr(n: u64) -> Address {
         Address::from_low_u64_be(n)
+    }
+
+    /// Credential-shaped secrets used only to prove they never survive
+    /// redaction. Not real keys.
+    const FAKE_KEY: &str = "aaaaaaaabbbbbbbbccccccccdddddddd";
+
+    #[test]
+    fn redact_endpoint_strips_provider_api_keys() {
+        // Every shape a provider actually ships: key in path (Alchemy, Infura,
+        // QuickNode), key in query string, credentials in userinfo.
+        let cases = [
+            format!("https://base-mainnet.g.alchemy.com/v2/{FAKE_KEY}"),
+            format!("https://base-mainnet.infura.io/v3/{FAKE_KEY}"),
+            format!("https://snowy-cold-panorama.base-mainnet.quiknode.pro/{FAKE_KEY}/"),
+            format!("wss://base-mainnet.g.alchemy.com/v2/{FAKE_KEY}"),
+            format!("https://rpc.example.com/?apikey={FAKE_KEY}"),
+            format!("https://user:{FAKE_KEY}@rpc.example.com/"),
+            format!("https://hooks.slack.com/services/T00/B00/{FAKE_KEY}"),
+        ];
+
+        for raw in &cases {
+            let redacted = redact_endpoint(raw);
+            assert!(
+                !redacted.contains(FAKE_KEY),
+                "credential survived redaction of {raw}: {redacted}"
+            );
+            // Host must survive, or failover logs become undebuggable.
+            assert!(
+                redacted.starts_with("https://") || redacted.starts_with("wss://"),
+                "scheme lost for {raw}: {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_endpoint_keeps_host_and_distinguishes_endpoints() {
+        let a = redact_endpoint(&format!("https://base-mainnet.g.alchemy.com/v2/{FAKE_KEY}"));
+        let b = redact_endpoint("https://base-mainnet.g.alchemy.com/v2/adifferentkeyentirely");
+
+        assert!(a.starts_with("https://base-mainnet.g.alchemy.com/"));
+        // Same host, different keys must not collapse to the same label, or
+        // failover logs cannot tell two endpoints apart.
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn redact_endpoint_fails_closed_on_unparseable_input() {
+        // If a bare secret ever reaches this function, echo nothing.
+        for raw in ["", "   ", FAKE_KEY, "not a url", "://nohost/x", "https://"] {
+            assert_eq!(
+                redact_endpoint(raw),
+                "***",
+                "expected fail-closed redaction for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_endpoint_preserves_bare_hosts() {
+        // No credential material means nothing to hide; keep it fully readable.
+        assert_eq!(redact_endpoint("http://127.0.0.1:8545"), "http://127.0.0.1:8545");
+        assert_eq!(redact_endpoint("https://mainnet.base.org"), "https://mainnet.base.org");
+        assert_eq!(redact_endpoint("https://mainnet.base.org/"), "https://mainnet.base.org");
     }
 
     #[test]
@@ -774,53 +956,50 @@ mod tests {
     }
 
     #[test]
-    fn compute_edge_weight_accounts_for_gas_costs() {
-        let rate_num = U256::from(105u64);
-        let rate_den = U256::from(100u64);
-        let estimated_gas = 30_000u64;
-        let base_amount_in = U256::from(1_000_000u64);
-        let reliable_price = NativePrice::new(U256::exp10(18), U256::exp10(18), true);
+    fn compute_edge_weight_signs_by_rate_alone() {
+        // A gaining hop is negative (findable as part of a negative cycle);
+        // a losing hop is positive. Nothing else may influence the sign — this
+        // is what makes the negative-cycle search a sound, SIZE-INDEPENDENT
+        // profitability test.
+        let gaining = compute_edge_weight(U256::from(105u64), U256::from(100u64));
+        let losing = compute_edge_weight(U256::from(95u64), U256::from(100u64));
+        let neutral = compute_edge_weight(U256::from(100u64), U256::from(100u64));
 
-        let cheap_gas = compute_edge_weight(
-            rate_num,
-            rate_den,
-            estimated_gas,
-            U256::from(1u64),
-            base_amount_in,
-            reliable_price,
-        );
-        let expensive_gas = compute_edge_weight(
-            rate_num,
-            rate_den,
-            estimated_gas,
-            U256::from(200u64),
-            base_amount_in,
-            reliable_price,
-        );
-
-        assert!(
-            cheap_gas < 0,
-            "profitable trade with low gas should be negative weight"
-        );
-        assert!(
-            expensive_gas > 0,
-            "high gas should flip edge weight positive"
-        );
+        assert!(gaining < 0, "rate > 1 must be negative, got {gaining}");
+        assert!(losing > 0, "rate < 1 must be positive, got {losing}");
+        assert_eq!(neutral, 0, "rate == 1 must be exactly zero");
     }
 
     #[test]
-    fn compute_edge_weight_prohibitive_when_price_unreliable() {
-        let rate_num = U256::from(105u64);
-        let rate_den = U256::from(100u64);
-        let weight = compute_edge_weight(
-            rate_num,
-            rate_den,
-            30_000,
-            U256::from(200u64),
-            U256::from(1_000_000u64),
-            NativePrice::unit(),
+    fn compute_edge_weight_is_additive_across_a_cycle() {
+        // Summing edge weights must equal -ln(prod rate), so the search's
+        // "sum < 0" test is exactly "prod rate > 1".
+        let a = compute_edge_weight(U256::from(105u64), U256::from(100u64));
+        let b = compute_edge_weight(U256::from(100u64), U256::from(104u64));
+        // 1.05 * (100/104) = 1.0096... > 1 => the cycle must sum negative.
+        assert!(a + b < 0, "gaining cycle must sum negative, got {}", a + b);
+
+        let c = compute_edge_weight(U256::from(100u64), U256::from(106u64));
+        // 1.05 * (100/106) = 0.9906... < 1 => must sum positive.
+        assert!(a + c > 0, "losing cycle must sum positive, got {}", a + c);
+    }
+
+    #[test]
+    fn compute_edge_weight_excludes_unusable_rates() {
+        // A broken quote must be PROHIBITIVE, never attractive. The previous
+        // implementation sent a zero rate through a `Decimal::MIN` branch and
+        // returned i64::MIN — the most attractive weight possible — which made
+        // a dead edge look like infinite arbitrage.
+        assert_eq!(
+            compute_edge_weight(U256::zero(), U256::from(100u64)),
+            i64::MAX,
+            "zero output rate must be excluded, not treated as free money"
         );
-        assert_eq!(weight, i64::MAX);
+        assert_eq!(
+            compute_edge_weight(U256::from(100u64), U256::zero()),
+            i64::MAX,
+            "zero denominator must be excluded"
+        );
     }
 
     #[test]
@@ -832,12 +1011,20 @@ mod tests {
     }
 
     fn temp_candidate_log_path(name: &str) -> PathBuf {
+        // A millisecond timestamp is not unique enough: the lib and bin test
+        // binaries each contain a copy of these tests and run concurrently, so
+        // two of them can land in the same millisecond and clobber each other's
+        // file. Observed as an intermittent triple failure. The counter makes
+        // the path unique regardless of timing.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut path = std::env::temp_dir();
         path.push(format!(
-            "arbot_candidate_log_{}_{}_{}.jsonl",
+            "arbot_candidate_log_{}_{}_{}_{}.jsonl",
             name,
             std::process::id(),
-            CandidateDecisionRecord::now_ms()
+            CandidateDecisionRecord::now_ms(),
+            seq
         ));
         path
     }

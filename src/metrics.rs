@@ -43,6 +43,7 @@ pub struct Metrics {
     pub tx_reverted: CounterVec,
     pub tx_relay_rejected: CounterVec,
     pub rpc_errors: CounterVec,
+    pub native_price_probes: CounterVec,
     pub gross_profit_native: GaugeVec,
     pub fees_native: GaugeVec,
     pub net_profit_native: GaugeVec,
@@ -302,6 +303,21 @@ impl Metrics {
             .register(Box::new(rpc_errors.clone()))
             .context("register rpc_errors_total counter")?;
 
+        // Splits native-price probes by outcome. `unknown` rising means the
+        // engine is flying blind on pricing (transport failures), which
+        // silently starves both cycle detection and candidate evaluation —
+        // previously the single most consequential unobserved failure mode.
+        let native_price_probes = CounterVec::new(
+            Opts::new(
+                "native_price_probes_total",
+                "Native-price probe outcomes (per chain/result: priced|no_route|unknown)",
+            ),
+            &["chain", "result"],
+        )?;
+        registry
+            .register(Box::new(native_price_probes.clone()))
+            .context("register native_price_probes_total counter")?;
+
         let gross_profit_native = GaugeVec::new(
             Opts::new(
                 "gross_profit_native",
@@ -529,6 +545,7 @@ impl Metrics {
             tx_reverted,
             tx_relay_rejected,
             rpc_errors,
+            native_price_probes,
             gross_profit_native,
             fees_native,
             net_profit_native,
@@ -620,6 +637,15 @@ impl Metrics {
 
     pub fn record_rpc_error(&self, chain: &str) {
         self.rpc_errors.with_label_values(&[chain]).inc();
+    }
+
+    /// `result` is `NativePriceProbe::label()` — `priced`, `no_route`, or
+    /// `unknown`. A sustained `unknown` rate is the signal that pricing is
+    /// starved and detection is silently losing edges.
+    pub fn record_native_price_probe(&self, chain: &str, result: &str) {
+        self.native_price_probes
+            .with_label_values(&[chain, result])
+            .inc();
     }
 
     pub fn record_profit(

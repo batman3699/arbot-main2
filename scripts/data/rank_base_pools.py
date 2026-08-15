@@ -30,14 +30,29 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
-ALCHEMY_KEY = os.environ.get("ALCHEMY_KEY", "").strip()
-if not ALCHEMY_KEY:
-    print("FATAL: ALCHEMY_KEY not set", file=sys.stderr)
+# Prefer an explicit endpoint, then the URLs the bot itself uses, then Alchemy.
+# Hardcoding Alchemy made this unrunnable once that key hit its monthly quota.
+def _resolve_rpc_url():
+    for var in ("BASE_RANK_RPC_URL", "BASE_RPC_URL"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    urls = os.environ.get("BASE_RPC_URLS", "").strip()
+    if urls:
+        first = urls.split(",")[0].strip()
+        if first:
+            return first
+    key = os.environ.get("ALCHEMY_KEY", "").strip()
+    if key:
+        return f"https://base-mainnet.g.alchemy.com/v2/{key}"
+    print(
+        "FATAL: set BASE_RANK_RPC_URL (or BASE_RPC_URLS, or ALCHEMY_KEY)",
+        file=sys.stderr,
+    )
     sys.exit(2)
-RPC_URL = os.environ.get(
-    "BASE_RANK_RPC_URL",
-    f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_KEY}",
-)
+
+
+RPC_URL = _resolve_rpc_url()
 
 WETH = "0x4200000000000000000000000000000000000006"
 USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"

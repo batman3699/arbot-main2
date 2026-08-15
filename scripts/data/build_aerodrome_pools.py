@@ -18,11 +18,30 @@ import sys
 
 import requests
 
-ALCHEMY_KEY = os.environ.get("ALCHEMY_KEY", "").strip()
-if not ALCHEMY_KEY:
-    print("FATAL: ALCHEMY_KEY not set", file=sys.stderr)
+# RPC endpoint. Prefer an explicit BASE_RPC_URL (or the first entry of
+# BASE_RPC_URLS, which is what the bot itself uses), and only fall back to
+# Alchemy. The hardcoded Alchemy URL made these builders unrunnable once that
+# key hit its monthly quota, which is why the pool inventories went stale.
+def _resolve_rpc_url():
+    explicit = os.environ.get("BASE_RPC_URL", "").strip()
+    if explicit:
+        return explicit
+    urls = os.environ.get("BASE_RPC_URLS", "").strip()
+    if urls:
+        first = urls.split(",")[0].strip()
+        if first:
+            return first
+    key = os.environ.get("ALCHEMY_KEY", "").strip()
+    if key:
+        return f"https://base-mainnet.g.alchemy.com/v2/{key}"
+    print(
+        "FATAL: set BASE_RPC_URL (or BASE_RPC_URLS, or ALCHEMY_KEY) to a Base RPC endpoint",
+        file=sys.stderr,
+    )
     sys.exit(2)
-RPC_URL = f"https://base-mainnet.g.alchemy.com/v2/{ALCHEMY_KEY}"
+
+
+RPC_URL = _resolve_rpc_url()
 
 FACTORY = "0x420dd381b31aef6683db6b902084cb0ffece40da"
 
@@ -91,6 +110,40 @@ MAJORS = [
     "0x9a26f5433671751c3276a065f57e5a02d2817973",  # KEYCAT
     "0x1bc0c42215582d5a085795f4badbac3ff36d1bcb",  # CLANKER
 ]
+
+def _extra_majors() -> list:
+    """Additional non-hub tokens to pair against, comma-separated.
+
+    The hardcoded MAJORS list above is 8 tokens, which capped this builder at
+    ~17 pools on Base's deepest DEX. The ranked UniV3 inventory already names
+    500+ non-hub tokens that cleared a real USD liquidity bar, so the useful
+    list is data, not a literal. Sourced addresses are deduped against MAJORS
+    and validated as 20-byte hex so a malformed entry fails loudly here rather
+    than silently producing a pool that never resolves.
+    """
+    raw = os.environ.get("AERO_EXTRA_MAJORS", "").strip()
+    if not raw:
+        return []
+    out, seen = [], {m.lower() for m in MAJORS}
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if not (token.startswith("0x") and len(token) == 42):
+            print(f"FATAL: malformed AERO_EXTRA_MAJORS entry {token!r}", file=sys.stderr)
+            sys.exit(2)
+        try:
+            int(token, 16)
+        except ValueError:
+            print(f"FATAL: non-hex AERO_EXTRA_MAJORS entry {token!r}", file=sys.stderr)
+            sys.exit(2)
+        if token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+MAJORS = MAJORS + _extra_majors()
 MIN_USD = float(os.environ.get("AERO_MIN_USD", "10000"))
 OUT_PATH = os.environ.get("AERO_OUT", "config/base_aerodrome_pools.json")
 

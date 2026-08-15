@@ -7,6 +7,7 @@ The writing below is intentionally simple and step by step. It is designed so a 
 ## Scope
 
 This guide covers:
+
 - local fork execution checks,
 - shadow mode runtime validation,
 - per chain smoke tests for Ethereum and Base,
@@ -20,6 +21,7 @@ A unit test can prove one function works.
 An integration test proves the full money path works.
 
 For this trading system, integration testing checks that:
+
 - graph discovery reads real chain state,
 - simulation assumptions match execution assumptions,
 - risk controls block bad trades,
@@ -56,10 +58,12 @@ A fork remote procedure call Uniform Resource Locator is the upstream chain endp
 Use a paid reliable endpoint provider key for this value. In this repository, the expected source is Alchemy.
 
 Examples:
+
 - Ethereum mainnet fork source: `https://eth-mainnet.g.alchemy.com/v2/<your-key>`
 - Base mainnet fork source: `https://base-mainnet.g.alchemy.com/v2/<your-key>`
 
 Why this should be the value:
+
 - The fork must read current state from the real chain.
 - A stable provider reduces failed calls and stale state.
 - Reproducible testing requires one clearly defined upstream source.
@@ -116,6 +120,7 @@ cargo test --test integration_smoke integration_smoke_per_chain -- --nocapture
 ```
 
 Expected result:
+
 - test process connects to fork,
 - chain coverage checks pass,
 - no panic or unresolved chain configuration errors.
@@ -143,6 +148,7 @@ cargo test --test integration_smoke integration_smoke_per_chain -- --nocapture
 ```
 
 Expected result:
+
 - Base specific coverage checks pass,
 - no missing venue, token, or registry edge errors.
 
@@ -188,6 +194,7 @@ anvil --host 0.0.0.0 --fork-url "$BASE_UPSTREAM_RPC_URL" --port 8546 --chain-id 
 ```
 
 What these commands tell you:
+
 - whether your environment variable is empty,
 - whether the upstream endpoint is alive,
 - whether the endpoint is on the expected chain,
@@ -213,6 +220,7 @@ cargo test --test integration_smoke integration_smoke_per_chain -- --nocapture
 ## 8) Fork test for cycle reconstruction and profitable sizing
 
 This test validates three critical points on a live fork remote procedure call endpoint:
+
 - negative cycle detection is consistent,
 - predecessor based path reconstruction produces expected token sequence,
 - sizing chooses a non zero input with positive net output.
@@ -225,6 +233,7 @@ cargo test fork_negative_cycle_reconstruction_and_sizing_are_profitable -- --noc
 ```
 
 Notes:
+
 - If `ARBOT_FORK_RPC_URL` is not set, this test exits early safely.
 - Keep this test in your release gate after graph or sizing changes.
 
@@ -252,6 +261,7 @@ jq 'select(.net_profit_wei!=null) | {ts:.timestamp_ms, net:.net_profit_wei, gas:
 ```
 
 Expected result:
+
 - stable runtime,
 - opportunity evaluations include cost and profit fields,
 - fail closed behavior when required inputs are stale or missing.
@@ -260,19 +270,20 @@ Expected result:
 
 ## 10) Common failures and what they mean
 
-| Failure | Meaning in simple words | Action |
-| --- | --- | --- |
-| chain coverage assertion failure | required chain data is missing in configuration or registry | update registry and inputs, then rerun |
-| placeholder endpoint detection | environment still has unsafe placeholder values | replace placeholders in environment or operations files |
-| panic check failure | runtime crash path still exists | remove unwrap or expect in runtime path |
-| fork connection refused | Anvil is not running or address and port are wrong | restart Anvil and verify endpoint |
-| wrong chain identity | fork remote procedure call Uniform Resource Locator points to wrong chain | verify chain identifier with `eth_chainId` call |
+| Failure                          | Meaning in simple words                                                   | Action                                                  |
+| -------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------- |
+| chain coverage assertion failure | required chain data is missing in configuration or registry               | update registry and inputs, then rerun                  |
+| placeholder endpoint detection   | environment still has unsafe placeholder values                           | replace placeholders in environment or operations files |
+| panic check failure              | runtime crash path still exists                                           | remove unwrap or expect in runtime path                 |
+| fork connection refused          | Anvil is not running or address and port are wrong                        | restart Anvil and verify endpoint                       |
+| wrong chain identity             | fork remote procedure call Uniform Resource Locator points to wrong chain | verify chain identifier with `eth_chainId` call         |
 
 ---
 
 ## 11) Deployment readiness gate
 
 Only proceed toward live deployment when all items below pass:
+
 - static checks pass,
 - unit and integration suites pass,
 - Ethereum and Base fork smoke tests pass,
