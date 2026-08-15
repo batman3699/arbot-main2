@@ -1,0 +1,13 @@
+[
+  // Curve pools (Ink)
+  // Format (example):
+  // {
+  //   pool: "0x...",
+  //   tokenIn: "0x...",
+  //   tokenOut: "0x...",
+  //   selector: "0x3df02124", // get_dy(uint256,uint256,uint256)
+  //   i: 0,
+  //   j: 1
+  // }
+  // NOTE: Populate with real pool/token addresses on Ink.
+]

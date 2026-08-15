@@ -1,0 +1,62 @@
+[package]
+name = "arb-exec"
+version = "0.2.0"
+edition = "2021"
+default-run = "arb-exec"
+
+[[bin]]
+name = "arb-exec"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+ethers = { version = "2.0.14", features = ["abigen", "ws", "rustls"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+serde = { version = "1", features = ["derive"] }
+json5 = "0.4"
+dotenvy = "0.15"
+once_cell = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+hex = "0.4"
+hex-literal = "0.4"
+rayon = "1"
+rand = "0.8"
+arc-swap = "1"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+serde_json = "1.0"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+prometheus = "0.13"
+sha2 = "0.10"
+semver = { version = "1.0", default-features = false, features = ["std"] }
+csv = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+rust_decimal = { version = "1", default-features = false, features = ["maths", "std"] }
+lru = "0.12"
+serde_yaml = "0.9"
+async-trait = "0.1"
+dashmap = "6"
+# revm 20.x stack: in-process EVM fork simulation (sim_revm.rs)
+revm = { version = "20", features = ["std"] }
+rlp = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
+httpmock = "0.7"
+
+# Latency-critical: this binary races other searchers for block inclusion.
+# The deployed artifact is built with `cargo build --release`, so the release
+# profile must be fully optimized rather than relying on cargo defaults
+# (which omit LTO and use 16 codegen units).
+#
+# panic strategy is intentionally left at the default (unwind): spawn_supervised
+# relies on JoinError::is_panic() to catch and restart a panicking background
+# worker. `panic = "abort"` would turn any worker panic into a full process
+# abort and defeat that supervision, so it must NOT be set here.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# Keep symbol names so production panic backtraces stay readable while still
+# dropping the bulk of debug info from the shipped binary.
+strip = "debuginfo"

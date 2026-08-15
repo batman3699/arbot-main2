@@ -1,0 +1,103 @@
+{
+	"compiler": {
+		"version": "0.8.21+commit.d9974bed"
+	},
+	"language": "Solidity",
+	"output": {
+		"abi": [
+			{
+				"inputs": [],
+				"name": "InvalidRouter",
+				"type": "error"
+			},
+			{
+				"inputs": [
+					{
+						"internalType": "uint256",
+						"name": "expected",
+						"type": "uint256"
+					},
+					{
+						"internalType": "uint256",
+						"name": "actual",
+						"type": "uint256"
+					},
+					{
+						"internalType": "uint256",
+						"name": "maxSlippageBps",
+						"type": "uint256"
+					}
+				],
+				"name": "SlippageExceeded",
+				"type": "error"
+			},
+			{
+				"anonymous": false,
+				"inputs": [
+					{
+						"indexed": true,
+						"internalType": "address",
+						"name": "router",
+						"type": "address"
+					},
+					{
+						"indexed": false,
+						"internalType": "uint256",
+						"name": "amountOut",
+						"type": "uint256"
+					},
+					{
+						"indexed": false,
+						"internalType": "uint256",
+						"name": "minAmountOut",
+						"type": "uint256"
+					},
+					{
+						"indexed": false,
+						"internalType": "uint256",
+						"name": "expectedAmountOut",
+						"type": "uint256"
+					}
+				],
+				"name": "SwapExecuted",
+				"type": "event"
+			}
+		],
+		"devdoc": {
+			"kind": "dev",
+			"methods": {},
+			"version": 1
+		},
+		"userdoc": {
+			"kind": "user",
+			"methods": {},
+			"version": 1
+		}
+	},
+	"settings": {
+		"compilationTarget": {
+			"libraries/DexLib.sol": "DexLib"
+		},
+		"evmVersion": "shanghai",
+		"libraries": {},
+		"metadata": {
+			"bytecodeHash": "ipfs"
+		},
+		"optimizer": {
+			"enabled": true,
+			"runs": 200
+		},
+		"remappings": []
+	},
+	"sources": {
+		"libraries/DexLib.sol": {
+			"keccak256": "0x307da2cb6928fa394aac1733f4b6d82a365b608bb7b053a39dad7edc1463a938",
+			"license": "MIT",
+			"urls": [
+				"bzz-raw://b2e0c7acfe4475c3119373335df6a7e9390af47c866008b3d0be487986adf1bf",
+				"dweb:/ipfs/QmaZuN4aaDPk3Z2eiFbuqskrsbGKXgT5fFhokWw5XXvcYL"
+			]
+		}
+	},
+	"version": 1
+}

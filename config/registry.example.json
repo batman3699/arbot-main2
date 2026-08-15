@@ -1,0 +1,438 @@
+{
+  "version": "2025-02-01",
+  "last_updated": "2025-02-01T00:00:00Z",
+  "chains": {
+    "ethereum": {
+      "env_prefix": "ETH",
+      "chain_id": 1,
+      "rpc_http": [
+        "https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}",
+        "https://rpc.ankr.com/eth"
+      ],
+      "rpc_ws": [
+        "wss://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      ],
+      "tokens": [
+        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+        "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+        "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+      ],
+      "univ3_quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+      "univ3_factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+      "univ3_router": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+      "bal_vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
+      "aave_pool": "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2",
+      "bal_flashloan_tokens": [
+        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+      ],
+      "pools": {
+        "balancer": [
+          {
+            "poolId": "0x32296969ef14eb0c6d29669c550d4a044913023000200000000000000000064",
+            "tokenIn": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            "tokenOut": "0x7f39c581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
+          },
+          {
+            "poolId": "0x32296969ef14eb0c6d29669c550d4a044913023000200000000000000000064",
+            "tokenIn": "0x7f39c581F595B53c5cb19bD0b3f8dA6c935E2Ca0",
+            "tokenOut": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+          }
+        ],
+        "curve": [
+          {
+            "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",
+            "tokenIn": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "tokenOut": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+            "selector": "0x3df02124",
+            "i": 1,
+            "j": 2
+          },
+          {
+            "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",
+            "tokenIn": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+            "tokenOut": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "selector": "0x3df02124",
+            "i": 2,
+            "j": 1
+          }
+        ],
+        "univ2": [
+          {
+            "pair": "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc",
+            "tokenIn": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "tokenOut": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            "feeBps": 30
+          },
+          {
+            "pair": "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc",
+            "tokenIn": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            "tokenOut": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "feeBps": 30
+          }
+        ]
+      }
+    },
+    "arbitrum": {
+      "env_prefix": "ARB",
+      "chain_id": 42161,
+      "rpc_http": [
+        "https://arb-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}",
+        "https://arb-mainnet-backup.example"
+      ],
+      "rpc_ws": [
+        "wss://arb-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      ],
+      "tokens": [
+        "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+        "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+        "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+        "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+        "0x912CE59144191C1204E64559FE8253a0e49E6548",
+        "0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a",
+        "0x539bdE0d7Dbd336b79148AA742883198BBF60342",
+        "0xf97f4df75117a78c1A5a0DBb814Af92458539FB4"
+      ],
+      "univ3_quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+      "univ3_factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+      "univ3_router": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+      "bal_vault": "0xba12222222228d8ba445958a75a0704d566bf2c8",
+      "aave_pool": "0x4f7E9c8c52c8A8C5B9bAE2a9d36dA70eb2F1B2b3",
+      "bal_flashloan_tokens": [
+        "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+        "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8"
+      ],
+      "pools": {
+        "balancer": [
+          {
+            "poolId": "0x2c045c3065622000a2cf5ecb97c1d8b20d19e5e60002000000000000000005e6",
+            "tokenIn": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            "tokenOut": "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+          },
+          {
+            "poolId": "0x2c045c3065622000a2cf5ecb97c1d8b20d19e5e60002000000000000000005e6",
+            "tokenIn": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+            "tokenOut": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+          },
+          {
+            "poolId": "0xaf0561dc5bfbb6a85ccf7f9449199c65f23e5f340002000000000000000005f1",
+            "tokenIn": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            "tokenOut": "0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+          },
+          {
+            "poolId": "0xaf0561dc5bfbb6a85ccf7f9449199c65f23e5f340002000000000000000005f1",
+            "tokenIn": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+            "tokenOut": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+          },
+          {
+            "poolId": "0x32df62dc3aed2cd6224193052ce665dc181658410002000000000000000003bd",
+            "tokenIn": "0x3082cc23568ea640225c2467653db90e9250aaa0",
+            "tokenOut": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+          },
+          {
+            "poolId": "0x32df62dc3aed2cd6224193052ce665dc181658410002000000000000000003bd",
+            "tokenIn": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            "tokenOut": "0x3082cc23568ea640225c2467653db90e9250aaa0"
+          },
+          {
+            "poolId": "0x64541216bafffeec8ea535bb71fbc927831d0595000100000000000000000002",
+            "tokenIn": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1",
+            "tokenOut": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8"
+          },
+          {
+            "poolId": "0x64541216bafffeec8ea535bb71fbc927831d0595000100000000000000000002",
+            "tokenIn": "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8",
+            "tokenOut": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+          }
+        ],
+        "curve": [
+          {
+            "pool": "0x7f90122BF0700F9E7e1F688fe926940E8839F353",
+            "tokenIn": "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+            "tokenOut": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+            "selector": "0x3df02124",
+            "i": 0,
+            "j": 1
+          },
+          {
+            "pool": "0x7f90122BF0700F9E7e1F688fe926940E8839F353",
+            "tokenIn": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+            "tokenOut": "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+            "selector": "0x3df02124",
+            "i": 1,
+            "j": 0
+          }
+        ],
+        "univ2": [
+          {
+            "pair": "0x905dfCD5649217c42684f23958568e533C711Aa3",
+            "tokenIn": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "tokenOut": "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x905dfCD5649217c42684f23958568e533C711Aa3",
+            "tokenIn": "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+            "tokenOut": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x57b85FEf094e10b5eeCDF350Af688299E9553378",
+            "tokenIn": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "tokenOut": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x57b85FEf094e10b5eeCDF350Af688299E9553378",
+            "tokenIn": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+            "tokenOut": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "feeBps": 30
+          },
+          {
+            "pair": "0xCB0E5bFa72bBb4d16AB5aA0c60601c438F04b4ad",
+            "tokenIn": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "tokenOut": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+            "feeBps": 30
+          },
+          {
+            "pair": "0xCB0E5bFa72bBb4d16AB5aA0c60601c438F04b4ad",
+            "tokenIn": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+            "tokenOut": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x84652bb2539513BAf36e225c930Fdd8eaa63CE27",
+            "tokenIn": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "tokenOut": "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x84652bb2539513BAf36e225c930Fdd8eaa63CE27",
+            "tokenIn": "0xff970A61A04b1cA14834A43f5dE4533eBDDB5CC8",
+            "tokenOut": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x54B26fAf3671677C19F70c4B879A6f7B898F732c",
+            "tokenIn": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "tokenOut": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x54B26fAf3671677C19F70c4B879A6f7B898F732c",
+            "tokenIn": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+            "tokenOut": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x97b192198d164C2a1834295e302B713bc32C8F1d",
+            "tokenIn": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "tokenOut": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x97b192198d164C2a1834295e302B713bc32C8F1d",
+            "tokenIn": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+            "tokenOut": "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "feeBps": 30
+          }
+        ]
+      }
+    },
+    "optimism": {
+      "env_prefix": "OPT",
+      "chain_id": 10,
+      "rpc_http": [
+        "https://opt-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}",
+        "https://rpc.ankr.com/optimism"
+      ],
+      "rpc_ws": [
+        "wss://opt-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      ],
+      "tokens": [
+        "0x4200000000000000000000000000000000000006",
+        "0x7F5c764cBc14f9669B88837ca1490cCa17c31607",
+        "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
+        "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58",
+        "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1",
+        "0x4200000000000000000000000000000000000042",
+        "0x9560e827aF36c94D2Ac33a39bCE1Fe78631088Db",
+        "0x8700dAec35aF8Ff88c16BdF0418774CB3D7599B4"
+      ],
+      "univ3_quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+      "univ3_factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+      "univ3_router": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+      "bal_vault": "0xBA12222222228d8Ba445958a75a0704d566BF2C8",
+      "aave_pool": "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb",
+      "bal_flashloan_tokens": [
+        "0x4200000000000000000000000000000000000006"
+      ],
+      "pools": {
+        "balancer": [],
+        "curve": [],
+        "univ2": []
+      }
+    },
+    "base": {
+      "env_prefix": "BASE",
+      "chain_id": 8453,
+      "rpc_http": [
+        "https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}",
+        "https://rpc.ankr.com/base"
+      ],
+      "rpc_ws": [
+        "wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      ],
+      "tokens": [
+        "0x4200000000000000000000000000000000000006",
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913",
+        "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
+        "0x940181a94A35A4569E4529A3CDfB74e38FD98631",
+        "0xFe20C1B85ABa875EA8cecac8200bF86971968F3A",
+        "0x64FCC3A02eeEba05Ef701b7eed066c6ebD5d4E51"
+      ],
+      "univ3_quoter": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+      "univ3_factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+      "univ3_router": "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+      "bal_vault": null,
+      "aave_pool": "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+      "bal_flashloan_tokens": [
+        "0x4200000000000000000000000000000000000006"
+      ],
+      "pools": {
+        "balancer": [
+          {
+            "poolId": "0x4c42b5057a8663e2b1ac21685d1502c937a0381700020000000000000000019c",
+            "tokenIn": "0x4200000000000000000000000000000000000006",
+            "tokenOut": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+          },
+          {
+            "poolId": "0x4c42b5057a8663e2b1ac21685d1502c937a0381700020000000000000000019c",
+            "tokenIn": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "tokenOut": "0x4200000000000000000000000000000000000006"
+          }
+        ],
+        "curve": [],
+        "univ2": [
+          {
+            "pair": "0xE80B4F755417FB4baF4dbd23C029db3F62786523",
+            "tokenIn": "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
+            "tokenOut": "0x4200000000000000000000000000000000000006",
+            "feeBps": 30
+          },
+          {
+            "pair": "0xE80B4F755417FB4baF4dbd23C029db3F62786523",
+            "tokenIn": "0x4200000000000000000000000000000000000006",
+            "tokenOut": "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x901C8995097710F9809bc7F52b5fd7990D1ce873",
+            "tokenIn": "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
+            "tokenOut": "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913",
+            "feeBps": 30
+          },
+          {
+            "pair": "0x901C8995097710F9809bc7F52b5fd7990D1ce873",
+            "tokenIn": "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913",
+            "tokenOut": "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
+            "feeBps": 30
+          },
+          {
+            "pair": "0xD8052652da8cFE907f7E29704D569506DdAaeEB4",
+            "tokenIn": "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
+            "tokenOut": "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913",
+            "feeBps": 30
+          },
+          {
+            "pair": "0xD8052652da8cFE907f7E29704D569506DdAaeEB4",
+            "tokenIn": "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913",
+            "tokenOut": "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
+            "feeBps": 30
+          }
+        ]
+      }
+    },
+    "abstract": {
+      "env_prefix": "ABSTRACT",
+      "chain_id": 2741,
+      "rpc_http": [
+        "https://abstract-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      ],
+      "rpc_ws": [
+        "wss://abstract-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      ],
+      "tokens": [
+        "0x3439153EB7AF838Ad19d56E1571FBD09333C2809",
+        "0x84A71ccD554Cc1b02749b35d22F684CC8ec987e1",
+        "0x0709F39376dEEe2A2dfC94A58EdEb2Eb9DF012bD"
+      ],
+      "univ3_quoter": null,
+      "univ3_factory": null,
+      "univ3_router": null,
+      "bal_vault": null,
+      "aave_pool": null,
+      "bal_flashloan_tokens": [],
+      "pools": {
+        "balancer": [],
+        "curve": [],
+        "univ2": []
+      }
+    },
+    "ink": {
+      "env_prefix": "INK",
+      "chain_id": 763373,
+      "rpc_http": [
+        "https://ink-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      ],
+      "rpc_ws": [
+        "wss://ink-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      ],
+      "tokens": [
+        "0x4200000000000000000000000000000000000006",
+        "0x2D270e6886d130D724215A266106e6832161EAEd",
+        "0xF1815bd50389c46847f0Bda824eC8da914045D14"
+      ],
+      "univ3_quoter": null,
+      "univ3_factory": null,
+      "univ3_router": null,
+      "bal_vault": null,
+      "aave_pool": null,
+      "bal_flashloan_tokens": [],
+      "pools": {
+        "balancer": [],
+        "curve": [],
+        "univ2": []
+      }
+    },
+    "linea": {
+      "env_prefix": "LINEA",
+      "chain_id": 59144,
+      "rpc_http": [
+        "https://linea-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}",
+        "https://rpc.ankr.com/linea"
+      ],
+      "rpc_ws": [
+        "wss://linea-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}"
+      ],
+      "tokens": [
+        "0xe5D7C2a44FfDDf6b295A15c148167daaAf5Cf34f",
+        "0x176211869cA2b568f2A7d4EE941E073a821EE1ff"
+      ],
+      "univ3_quoter": null,
+      "univ3_factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+      "univ3_router": null,
+      "bal_vault": null,
+      "aave_pool": null,
+      "bal_flashloan_tokens": [],
+      "pools": {
+        "balancer": [],
+        "curve": [],
+        "univ2": []
+      }
+    }
+  }
+}

@@ -1,0 +1,260 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "grafana" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": null,
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "content": "### Profit funnel — where are trades lost?\nRead the funnel top-to-bottom over the selected time range and use the rates to localise the bottleneck:\n\n- **Detected high, Sim-passed low** → economics/edge problem (thresholds too high, thin spreads, bad quotes). *Edge-limited.*\n- **Sim-passed high, Confirmed low** (low inclusion %, high relay-reject %) → losing the block race / relay market. *RPC/latency-limited.*\n- **All stages high, Net profit low** → spreads too thin after real gas + flash fees, or trade size capped. *Capital/edge-limited.*\n- **RPC errors climbing** → provider throttling; nothing downstream can work. *RPC-limited.*\n\nTarget: **$833 net/day** ($25k/mo). The *Projected $/day* stat extrapolates the current rate.\n\n> Note: `net_profit_*` are cumulative process gauges (reset on restart); `increase()`/`rate()` approximate per-run deltas. Realised-vs-simulated net is not yet instrumented (needs on-chain profit extraction from the executor receipt).",
+        "mode": "markdown"
+      },
+      "title": "How to read this dashboard",
+      "type": "text"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "continuous-GrYlRd" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
+      "id": 2,
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "showUnfilled": true,
+        "valueMode": "text"
+      },
+      "targets": [
+        { "expr": "sum(increase(opportunities_detected[$__range]))", "legendFormat": "1 Detected", "refId": "A" },
+        { "expr": "sum(increase(opportunities_seen_total[$__range]))", "legendFormat": "2 Seen (ranked)", "refId": "B" },
+        { "expr": "sum(increase(simulations_passed_total[$__range]))", "legendFormat": "3 Sim-passed", "refId": "C" },
+        { "expr": "sum(increase(tx_sent_total[$__range]))", "legendFormat": "4 Broadcast", "refId": "D" },
+        { "expr": "sum(increase(tx_confirmed_total[$__range]))", "legendFormat": "5 Included", "refId": "E" },
+        { "expr": "sum(increase(opportunities_executed[$__range]))", "legendFormat": "6 Executed (net+)", "refId": "F" }
+      ],
+      "title": "Funnel (count over range)",
+      "type": "bargauge"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "percentage",
+            "steps": [
+              { "color": "red", "value": 0 },
+              { "color": "orange", "value": 0.4 },
+              { "color": "green", "value": 0.75 }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byNames", "options": ["Revert rate", "Relay-reject rate"] },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "percentage",
+                  "steps": [
+                    { "color": "green", "value": 0 },
+                    { "color": "orange", "value": 0.1 },
+                    { "color": "red", "value": 0.25 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 5 },
+      "id": 3,
+      "options": {
+        "displayMode": "lcd",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "showUnfilled": true
+      },
+      "targets": [
+        { "expr": "sum(increase(simulations_passed_total[$__range])) / clamp_min(sum(increase(simulations_passed_total[$__range])) + sum(increase(simulations_failed_total[$__range])), 1)", "legendFormat": "Sim pass rate", "refId": "A" },
+        { "expr": "sum(increase(tx_confirmed_total[$__range])) / clamp_min(sum(increase(tx_sent_total[$__range])), 1)", "legendFormat": "Inclusion rate", "refId": "B" },
+        { "expr": "sum(increase(tx_reverted_total[$__range])) / clamp_min(sum(increase(tx_sent_total[$__range])), 1)", "legendFormat": "Revert rate", "refId": "C" },
+        { "expr": "sum(increase(tx_relay_rejected_total[$__range])) / clamp_min(sum(increase(tx_sent_total[$__range])) + sum(increase(tx_relay_rejected_total[$__range])), 1)", "legendFormat": "Relay-reject rate", "refId": "D" }
+      ],
+      "title": "Conversion rates (over range)",
+      "type": "bargauge"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "usd"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Projected $/day" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "orange", "value": 200 },
+                    { "color": "green", "value": 833 }
+                  ]
+                }
+              },
+              { "id": "color", "value": { "mode": "thresholds" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Executed (range)" },
+            "properties": [{ "id": "unit", "value": "short" }]
+          }
+        ]
+      },
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 14 },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        { "expr": "sum(increase(net_profit_usd[$__range]))", "legendFormat": "Net USD (range)", "refId": "A" },
+        { "expr": "sum(rate(net_profit_usd[1h])) * 86400", "legendFormat": "Projected $/day", "refId": "B" },
+        { "expr": "sum(rate(net_profit_usd[1h])) * 86400 * 30", "legendFormat": "Projected $/mo", "refId": "C" },
+        { "expr": "sum(increase(opportunities_executed[$__range]))", "legendFormat": "Executed (range)", "refId": "D" }
+      ],
+      "title": "Net profit & projection (target $833/day)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never", "stacking": { "mode": "none" } },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "id": 5,
+      "options": {
+        "legend": { "calcs": ["mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        { "expr": "sum(rate(opportunities_detected[5m])) * 60", "legendFormat": "Detected /min", "refId": "A" },
+        { "expr": "sum(rate(simulations_passed_total[5m])) * 60", "legendFormat": "Sim-passed /min", "refId": "B" },
+        { "expr": "sum(rate(tx_sent_total[5m])) * 60", "legendFormat": "Broadcast /min", "refId": "C" },
+        { "expr": "sum(rate(tx_confirmed_total[5m])) * 60", "legendFormat": "Included /min", "refId": "D" }
+      ],
+      "title": "Funnel throughput (per minute)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never", "stacking": { "mode": "none" } },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+      "id": 6,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        { "expr": "sum(rate(rpc_errors_total[5m])) * 60", "legendFormat": "RPC errors /min", "refId": "A" },
+        { "expr": "sum(rate(tx_reverted_total[5m])) * 60", "legendFormat": "Reverts /min", "refId": "B" },
+        { "expr": "sum(rate(tx_relay_rejected_total[5m])) * 60", "legendFormat": "Relay rejects /min", "refId": "C" },
+        { "expr": "sum(rate(simulations_failed_total[5m])) * 60", "legendFormat": "Sim fails /min", "refId": "D" },
+        { "expr": "sum(rate(cycle_search_timeouts_total[5m])) * 60", "legendFormat": "Search timeouts /min", "refId": "E" }
+      ],
+      "title": "Loss & failure signals (per minute)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "showPoints": "never", "stacking": { "mode": "none" } },
+          "mappings": [],
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 27 },
+      "id": 7,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(scan_ms_bucket[5m])) by (le))", "legendFormat": "scan p95", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum(rate(stage_latency_ms_bucket[5m])) by (le, stage))", "legendFormat": "{{stage}} p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.95, sum(rate(execution_latency_ms_bucket[5m])) by (le))", "legendFormat": "inclusion p95", "refId": "C" }
+      ],
+      "title": "Per-stage latency (p95)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["arbitrage", "funnel", "profit"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Arbot — Profit Funnel",
+  "version": 1,
+  "weekStart": ""
+}

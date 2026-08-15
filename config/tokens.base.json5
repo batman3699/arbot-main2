@@ -1,0 +1,20 @@
+[
+  // Core routing tokens
+  "0x4200000000000000000000000000000000000006", // WETH
+  "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913", // USDC (native Circle USDC, 6dp — NOT USDbC)
+  // Mid-cap coverage
+  "0x940181a94A35A4569E4529A3CDfB74e38FD98631"  // AERO
+]
+
+// Removed 2026-08-06 — every fee tier reverts against the Base UniV3 QuoterV2,
+// so these have no native price and every cycle starting at them is rejected
+// pre-simulation. Verified live via quoteExactInput(token -> WETH):
+//   BSWAP 0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9 -> "execution reverted: SPL"
+//         (pool exists, no liquidity in range)
+//   BALD  0xFe20C1B85ABa875EA8cecac8200bF86971968F3A -> "execution reverted"
+//         (dead 2023 memecoin, no route)
+//
+// Also removed: 0x64FCC3A02eeEba05Ef701b7eed066c6ebD5d4E51, previously commented
+// "cbETH". On-chain that address is SPECTRA (Spectra Token), not cbETH — the
+// engine was configured to trade a token nobody intended. Real cbETH on Base is
+// 0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22; re-add deliberately if wanted.

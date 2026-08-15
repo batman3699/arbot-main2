@@ -1,0 +1,13 @@
+[
+  // Balancer pools (Abstract)
+  // Format: { poolId, tokenIn, tokenOut }
+  //
+  // NOTE: As of the Balancer docs, Balancer V3 deployments/subgraphs are listed for:
+  // Arbitrum, Avalanche, Base, Ethereum, Gnosis, Optimism, Plasma, Sepolia.
+  // Abstract is not listed, so keep this empty until Balancer is deployed here.
+  //
+  // Common routing tokens on Abstract (for convenience when you add pools):
+  // - WETH9: 0x3439153EB7AF838Ad19d56E1571FBD09333C2809
+  // - USDC:  0x84A71ccD554Cc1b02749b35d22F684CC8ec987e1
+  // - USDT:  0x0709F39376dEEe2A2dfC94A58EdEb2Eb9DF012bD
+]

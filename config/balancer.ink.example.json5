@@ -1,0 +1,13 @@
+[
+  // Balancer pools (Ink)
+  // Format: { poolId, tokenIn, tokenOut }
+  //
+  // NOTE: As of the Balancer docs, Balancer V3 deployments/subgraphs are listed for:
+  // Arbitrum, Avalanche, Base, Ethereum, Gnosis, Optimism, Plasma, Sepolia.
+  // Ink is not listed, so keep this empty until Balancer is deployed here.
+  //
+  // Common routing tokens on Ink (for convenience when you add pools):
+  // - WETH:    0x4200000000000000000000000000000000000006
+  // - USDC:    0x2D270e6886d130D724215A266106e6832161EAEd
+  // - USDC.e:  0xF1815bd50389c46847f0Bda824eC8da914045D14
+]

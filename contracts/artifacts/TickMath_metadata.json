@@ -1,0 +1,45 @@
+{
+	"compiler": {
+		"version": "0.8.21+commit.d9974bed"
+	},
+	"language": "Solidity",
+	"output": {
+		"abi": [],
+		"devdoc": {
+			"kind": "dev",
+			"methods": {},
+			"version": 1
+		},
+		"userdoc": {
+			"kind": "user",
+			"methods": {},
+			"version": 1
+		}
+	},
+	"settings": {
+		"compilationTarget": {
+			"libraries/TickMath.sol": "TickMath"
+		},
+		"evmVersion": "shanghai",
+		"libraries": {},
+		"metadata": {
+			"bytecodeHash": "ipfs"
+		},
+		"optimizer": {
+			"enabled": true,
+			"runs": 200
+		},
+		"remappings": []
+	},
+	"sources": {
+		"libraries/TickMath.sol": {
+			"keccak256": "0x6922111068998b9a482505243eefc434f5c947410af136e57bd98e29e77c6d8e",
+			"license": "MIT",
+			"urls": [
+				"bzz-raw://74167bb7d3dd9c3dbd47f17c5500d133426748f7a2cb6db7a23bc164bb6ce308",
+				"dweb:/ipfs/Qmb8JkUjKovWHQgeWJAU4X3DRfKkTZnwV5USiH4Ka5Wthi"
+			]
+		}
+	},
+	"version": 1
+}

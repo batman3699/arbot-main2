@@ -1,0 +1,84 @@
+{
+	"compiler": {
+		"version": "0.8.21+commit.d9974bed"
+	},
+	"language": "Solidity",
+	"output": {
+		"abi": [
+			{
+				"inputs": [
+					{
+						"internalType": "address",
+						"name": "borrower",
+						"type": "address"
+					}
+				],
+				"name": "health",
+				"outputs": [
+					{
+						"internalType": "uint256",
+						"name": "",
+						"type": "uint256"
+					}
+				],
+				"stateMutability": "view",
+				"type": "function"
+			},
+			{
+				"inputs": [
+					{
+						"internalType": "bytes",
+						"name": "data",
+						"type": "bytes"
+					}
+				],
+				"name": "liquidate",
+				"outputs": [
+					{
+						"internalType": "uint256",
+						"name": "seizedCollateral",
+						"type": "uint256"
+					}
+				],
+				"stateMutability": "nonpayable",
+				"type": "function"
+			}
+		],
+		"devdoc": {
+			"kind": "dev",
+			"methods": {},
+			"version": 1
+		},
+		"userdoc": {
+			"kind": "user",
+			"methods": {},
+			"version": 1
+		}
+	},
+	"settings": {
+		"compilationTarget": {
+			"libraries/LiquidationLib.sol": "ILendingAdapter"
+		},
+		"evmVersion": "shanghai",
+		"libraries": {},
+		"metadata": {
+			"bytecodeHash": "ipfs"
+		},
+		"optimizer": {
+			"enabled": true,
+			"runs": 200
+		},
+		"remappings": []
+	},
+	"sources": {
+		"libraries/LiquidationLib.sol": {
+			"keccak256": "0x78e9807e4a60d1a8b8838275fbf04f6bbe5e922e96e0121361e7430872776c7a",
+			"license": "MIT",
+			"urls": [
+				"bzz-raw://eb1b0fc3eecc34c7d723610f519c8aa9eb8bfb73e9e140ac76590aa6dc5d668c",
+				"dweb:/ipfs/QmQR9968AdaNMVH7KFFJUgwQK7XNztCVVaNNjoSt2fB5ZM"
+			]
+		}
+	},
+	"version": 1
+}

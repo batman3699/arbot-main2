@@ -1,0 +1,64 @@
+{
+	"compiler": {
+		"version": "0.8.21+commit.d9974bed"
+	},
+	"language": "Solidity",
+	"output": {
+		"abi": [
+			{
+				"inputs": [
+					{
+						"internalType": "bytes",
+						"name": "data",
+						"type": "bytes"
+					},
+					{
+						"internalType": "address",
+						"name": "",
+						"type": "address"
+					}
+				],
+				"name": "execute",
+				"outputs": [],
+				"stateMutability": "nonpayable",
+				"type": "function"
+			}
+		],
+		"devdoc": {
+			"kind": "dev",
+			"methods": {},
+			"version": 1
+		},
+		"userdoc": {
+			"kind": "user",
+			"methods": {},
+			"version": 1
+		}
+	},
+	"settings": {
+		"compilationTarget": {
+			"executor/steps/BridgeExecutor.sol": "BridgeExecutor"
+		},
+		"evmVersion": "shanghai",
+		"libraries": {},
+		"metadata": {
+			"bytecodeHash": "ipfs"
+		},
+		"optimizer": {
+			"enabled": true,
+			"runs": 200
+		},
+		"remappings": []
+	},
+	"sources": {
+		"executor/steps/BridgeExecutor.sol": {
+			"keccak256": "0x0af1f7eabc3dae4e2ada2f95b11fab185e9590360e1ceda6b92e267e4466f77d",
+			"license": "MIT",
+			"urls": [
+				"bzz-raw://633bd8f22358f6cb00e7eea4d418693ea9ea2c68eae1ce3382a66e5efbdd8abc",
+				"dweb:/ipfs/QmZCcWdkfTR3kxTKTdhTWAZZt9FkmRUqQ5BAVkyQsvxjhh"
+			]
+		}
+	},
+	"version": 1
+}

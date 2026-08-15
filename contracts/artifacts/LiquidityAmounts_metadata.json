@@ -1,0 +1,53 @@
+{
+	"compiler": {
+		"version": "0.8.21+commit.d9974bed"
+	},
+	"language": "Solidity",
+	"output": {
+		"abi": [],
+		"devdoc": {
+			"kind": "dev",
+			"methods": {},
+			"version": 1
+		},
+		"userdoc": {
+			"kind": "user",
+			"methods": {},
+			"version": 1
+		}
+	},
+	"settings": {
+		"compilationTarget": {
+			"libraries/LiquidityAmounts.sol": "LiquidityAmounts"
+		},
+		"evmVersion": "shanghai",
+		"libraries": {},
+		"metadata": {
+			"bytecodeHash": "ipfs"
+		},
+		"optimizer": {
+			"enabled": true,
+			"runs": 200
+		},
+		"remappings": []
+	},
+	"sources": {
+		"libraries/FullMath.sol": {
+			"keccak256": "0x22ad7cc45c3929f32a9c008b521c55798ba3c774897d4a18de2264e221c165c4",
+			"license": "MIT",
+			"urls": [
+				"bzz-raw://766e914678cc7ab271d97a4da2365f1d439e8f7d5b54bcf578ed3200e153e1e2",
+				"dweb:/ipfs/QmaBMokZRm2sKBNiwAU9r6KNnQFg93dBuzboJt81VE8GpS"
+			]
+		},
+		"libraries/LiquidityAmounts.sol": {
+			"keccak256": "0x2ee8503b4961e25d333f5bbf9f189cfd0cec4c373840b80c0feabfadddf0de0d",
+			"license": "MIT",
+			"urls": [
+				"bzz-raw://45ccb3489d337c49d95717d90ac2bbe4b135b032fef7d4afe322fdeb64560da9",
+				"dweb:/ipfs/QmUKTtuR29fR2wQnswtBreQEtpfp6WiiP8GKh3kSzqQzfZ"
+			]
+		}
+	},
+	"version": 1
+}
