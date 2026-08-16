@@ -123,6 +123,7 @@ impl TickDataSource for StaticTickSource {
     }
 }
 
+use crate::cl_math::{MAX_TICK, MIN_TICK};
 use crate::cl_sim::ClPoolState;
 use crate::cl_swap::TickLadder;
 
@@ -191,10 +192,25 @@ pub async fn build_ladder<S: TickDataSource + ?Sized>(
 
     // Coverage spans every tick the fetched words describe, whether or not a
     // bit was set there.
-    let lowest_word = i32::from(*word_positions.first().unwrap_or(&0));
-    let highest_word = i32::from(*word_positions.last().unwrap_or(&0));
-    let lower_bound = lowest_word * 256 * spacing;
-    let upper_bound = (highest_word * 256 + 255) * spacing;
+    //
+    // Computed in i64 and clamped to the protocol tick range. `spacing` is
+    // chain data decoded as int24 (up to 8_388_607) and `highest_word * 256 +
+    // 255` reaches ~889_599, so the product overflows i32 for any spacing
+    // above ~933_000 — reachable from a non-conforming pool, the same threat
+    // model the tick_spacing guard above exists for. Unchecked i32 math there
+    // PANICS in debug/test (overflow-checks on) and silently WRAPS in release
+    // (this crate's [profile.release] does not set overflow-checks), handing
+    // `TickLadder` a corrupted value as a *proven* bound. Both outcomes are
+    // forbidden by this plan's global constraints. i64 has ample headroom
+    // (worst case ~7.5e12 against i64::MAX ~9.2e18), and clamping is exact
+    // rather than lossy: a ladder cannot cover ticks the AMM cannot represent.
+    let lowest_word = i64::from(*word_positions.first().unwrap_or(&0));
+    let highest_word = i64::from(*word_positions.last().unwrap_or(&0));
+    let spacing_i64 = i64::from(spacing);
+    let lower_bound = (lowest_word * 256 * spacing_i64)
+        .clamp(i64::from(MIN_TICK), i64::from(MAX_TICK)) as i32;
+    let upper_bound = ((highest_word * 256 + 255) * spacing_i64)
+        .clamp(i64::from(MIN_TICK), i64::from(MAX_TICK)) as i32;
 
     if candidate_ticks.is_empty() {
         return Ok(TickLadder::new(Vec::new(), lower_bound, upper_bound));
@@ -345,6 +361,37 @@ mod tests {
         assert!(
             build_ladder(&src, pool, &state, U64::zero(), 1).await.is_err(),
             "a negative tick_spacing must be refused too"
+        );
+    }
+
+    /// A pool reporting an absurd but int24-representable spacing must not
+    /// overflow the bounds arithmetic. At spacing 8_388_607 with 8 words per
+    /// side the raw product is ~1.9e10, far past `i32::MAX`: unchecked i32
+    /// math panics in debug/test and silently wraps in release.
+    #[tokio::test]
+    async fn build_ladder_bounds_survive_an_absurd_tick_spacing() {
+        let pool = Address::zero();
+        let src = StaticTickSource::new(pool, Vec::new(), 60);
+        let mut state = state_at_tick_zero();
+        state.tick_spacing = 8_388_607;
+
+        let ladder = build_ladder(&src, pool, &state, U64::zero(), 8)
+            .await
+            .expect("an absurd spacing must clamp, not panic or error");
+
+        assert!(
+            ladder.lower_bound() >= crate::cl_math::MIN_TICK,
+            "lower bound {} escaped the protocol range",
+            ladder.lower_bound()
+        );
+        assert!(
+            ladder.upper_bound() <= crate::cl_math::MAX_TICK,
+            "upper bound {} escaped the protocol range",
+            ladder.upper_bound()
+        );
+        assert!(
+            ladder.lower_bound() < ladder.upper_bound(),
+            "clamping must not invert the bounds"
         );
     }
 
