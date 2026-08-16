@@ -139,6 +139,89 @@ pub fn get_sqrt_ratio_at_tick(tick: i32) -> Option<U256> {
     }
 }
 
+/// Uniswap v3-core `SqrtPriceMath.getAmount0Delta`.
+///
+/// `amount0 = L * (sqrt(b) - sqrt(a)) / (sqrt(a) * sqrt(b))`, in Q64.96.
+pub fn get_amount0_delta(a: U256, b: U256, liquidity: u128, round_up: bool) -> Option<U256> {
+    let (lo, hi) = if a > b { (b, a) } else { (a, b) };
+    if lo.is_zero() {
+        return None;
+    }
+    let numerator1 = U256::from(liquidity) << 96;
+    let numerator2 = hi.checked_sub(lo)?;
+    if round_up {
+        let inner = mul_div_rounding_up(numerator1, numerator2, hi)?;
+        div_rounding_up(inner, lo)
+    } else {
+        Some(mul_div_checked(numerator1, numerator2, hi)? / lo)
+    }
+}
+
+/// Uniswap v3-core `SqrtPriceMath.getAmount1Delta`.
+///
+/// `amount1 = L * (sqrt(b) - sqrt(a))`, in Q64.96.
+pub fn get_amount1_delta(a: U256, b: U256, liquidity: u128, round_up: bool) -> Option<U256> {
+    let (lo, hi) = if a > b { (b, a) } else { (a, b) };
+    let delta = hi.checked_sub(lo)?;
+    let liq = U256::from(liquidity);
+    if round_up {
+        mul_div_rounding_up(liq, delta, q96())
+    } else {
+        mul_div_checked(liq, delta, q96())
+    }
+}
+
+/// Price after adding `amount_in` of token0, rounding UP.
+///
+/// Rounding up keeps the resulting price conservatively high on the
+/// `zero_for_one` path, which makes the derived output conservatively low.
+fn next_sqrt_price_from_amount0_in(sqrt_p: U256, liquidity: u128, amount: U256) -> Option<U256> {
+    if amount.is_zero() {
+        return Some(sqrt_p);
+    }
+    let numerator1 = U256::from(liquidity) << 96;
+
+    // Preferred form, valid while `amount * sqrt_p` fits in 256 bits.
+    if let Some(product) = amount.checked_mul(sqrt_p) {
+        if let Some(denominator) = numerator1.checked_add(product) {
+            if denominator >= numerator1 {
+                return mul_div_rounding_up(numerator1, sqrt_p, denominator);
+            }
+        }
+    }
+    // Overflow-safe fallback (v3-core takes the same branch).
+    if sqrt_p.is_zero() {
+        return None;
+    }
+    div_rounding_up(numerator1, (numerator1 / sqrt_p).checked_add(amount)?)
+}
+
+/// Price after adding `amount_in` of token1, rounding DOWN.
+fn next_sqrt_price_from_amount1_in(sqrt_p: U256, liquidity: u128, amount: U256) -> Option<U256> {
+    if liquidity == 0 {
+        return None;
+    }
+    let quotient = mul_div_checked(amount, q96(), U256::from(liquidity))?;
+    sqrt_p.checked_add(quotient)
+}
+
+/// Uniswap v3-core `SqrtPriceMath.getNextSqrtPriceFromInput`.
+pub fn get_next_sqrt_price_from_input(
+    sqrt_p: U256,
+    liquidity: u128,
+    amount_in: U256,
+    zero_for_one: bool,
+) -> Option<U256> {
+    if sqrt_p.is_zero() || liquidity == 0 {
+        return None;
+    }
+    if zero_for_one {
+        next_sqrt_price_from_amount0_in(sqrt_p, liquidity, amount_in)
+    } else {
+        next_sqrt_price_from_amount1_in(sqrt_p, liquidity, amount_in)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +280,79 @@ mod tests {
             let hi = get_sqrt_ratio_at_tick(pair[1]).expect("probe in range");
             assert!(lo < hi, "tick {} -> {lo} not below tick {} -> {hi}", pair[0], pair[1]);
         }
+    }
+
+    /// At 1:1 price with a one-tick-wide band, amount0 and amount1 deltas must
+    /// agree to within rounding — the curve is symmetric there.
+    #[test]
+    fn amount_deltas_agree_near_unit_price() {
+        let a = get_sqrt_ratio_at_tick(0).expect("tick 0");
+        let b = get_sqrt_ratio_at_tick(1).expect("tick 1");
+        let liquidity = 1_000_000_000_000_000u128;
+
+        let amount0 = get_amount0_delta(a, b, liquidity, false).expect("amount0");
+        let amount1 = get_amount1_delta(a, b, liquidity, false).expect("amount1");
+
+        let diff = if amount0 > amount1 { amount0 - amount1 } else { amount1 - amount0 };
+        assert!(
+            diff * U256::from(10_000u64) < amount0,
+            "amount0 {amount0} and amount1 {amount1} diverge by more than 1bp at unit price"
+        );
+    }
+
+    #[test]
+    fn amount_deltas_are_order_independent() {
+        let a = get_sqrt_ratio_at_tick(-60).expect("tick -60");
+        let b = get_sqrt_ratio_at_tick(60).expect("tick 60");
+        let liquidity = 5_000_000_000u128;
+        assert_eq!(
+            get_amount0_delta(a, b, liquidity, false),
+            get_amount0_delta(b, a, liquidity, false)
+        );
+        assert_eq!(
+            get_amount1_delta(a, b, liquidity, false),
+            get_amount1_delta(b, a, liquidity, false)
+        );
+    }
+
+    #[test]
+    fn rounding_up_never_understates() {
+        let a = get_sqrt_ratio_at_tick(-200).expect("tick -200");
+        let b = get_sqrt_ratio_at_tick(200).expect("tick 200");
+        let liquidity = 123_456_789u128;
+        assert!(
+            get_amount0_delta(a, b, liquidity, true).expect("up")
+                >= get_amount0_delta(a, b, liquidity, false).expect("down")
+        );
+        assert!(
+            get_amount1_delta(a, b, liquidity, true).expect("up")
+                >= get_amount1_delta(a, b, liquidity, false).expect("down")
+        );
+    }
+
+    /// Adding token1 raises price; adding token0 lowers it. Getting this
+    /// backwards inverts every quote, so it is pinned explicitly.
+    #[test]
+    fn next_sqrt_price_moves_in_the_correct_direction() {
+        let start = get_sqrt_ratio_at_tick(0).expect("tick 0");
+        let liquidity = 1_000_000_000_000u128;
+        let amount = U256::from(1_000_000u64);
+
+        let down = get_next_sqrt_price_from_input(start, liquidity, amount, true)
+            .expect("zero_for_one");
+        assert!(down < start, "selling token0 must lower price");
+
+        let up = get_next_sqrt_price_from_input(start, liquidity, amount, false)
+            .expect("one_for_zero");
+        assert!(up > start, "selling token1 must raise price");
+    }
+
+    #[test]
+    fn next_sqrt_price_is_identity_for_zero_input() {
+        let start = get_sqrt_ratio_at_tick(0).expect("tick 0");
+        assert_eq!(
+            get_next_sqrt_price_from_input(start, 1_000u128, U256::zero(), true),
+            Some(start)
+        );
     }
 }
