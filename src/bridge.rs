@@ -192,6 +192,7 @@ impl BridgePlanner {
                 observed_slippage_bps: route.fee_bps,
                 quote_block: None,
                 active: true,
+                tick_ladder: None,
             };
             graph.add_edge(edge.clone());
             edges.push(edge);

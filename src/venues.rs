@@ -2218,6 +2218,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
                     active: true,
+                    tick_ladder: None,
                 };
                 local_edges.push(edge);
             }
@@ -2840,6 +2841,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
                     active: true,
+                    tick_ladder: None,
                 };
                 local_edges.push(edge);
             }
@@ -3075,6 +3077,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(ctx.block_number),
                     active: true,
+                    tick_ladder: None,
                 };
                 edges.push(edge);
             }
@@ -3232,6 +3235,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
                     active: true,
+                    tick_ladder: None,
                 };
                 edges.push(edge);
             }
@@ -3419,6 +3423,7 @@ where
                 observed_slippage_bps: quote.slippage_bps,
                 quote_block,
                 active: true,
+                tick_ladder: None,
             };
             edges.push(edge);
         }
@@ -3616,6 +3621,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block,
                     active: true,
+                    tick_ladder: None,
                 };
                 edges.push(edge);
             }
@@ -3719,6 +3725,7 @@ async fn collect_univ4_edges(
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: None,
                     active: true,
+                    tick_ladder: None,
                 };
                 edges.push(edge);
             }
@@ -4322,6 +4329,7 @@ where
                         observed_slippage_bps: quote.slippage_bps,
                         quote_block: Some(block_number),
                         active: true,
+                        tick_ladder: None,
                     };
                     let mut edge = edge;
                     apply_pruning(
@@ -4541,6 +4549,7 @@ mod tests {
                 observed_slippage_bps: 0,
                 quote_block: block,
                 active: true,
+                tick_ladder: None,
             }
         }
 
@@ -4580,6 +4589,7 @@ mod tests {
             observed_slippage_bps: 50,
             quote_block: Some(U64::from(100u64)),
             active: true,
+            tick_ladder: None,
         };
 
         let healthy = edge_health_score_bps(&edge, U64::from(101u64), U64::from(10u64));

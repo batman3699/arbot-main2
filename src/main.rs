@@ -9881,6 +9881,7 @@ mod runner_tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         };
         graph.add_edge(edge.clone());
         graph.add_edge(Edge { to: a, ..edge });
@@ -13447,6 +13448,7 @@ chains:
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         let digest = graph_digest(&graph);
         assert!(!graph_changed_significantly(Some(digest), digest));
@@ -13672,6 +13674,7 @@ chains:
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: b,
@@ -13690,6 +13693,7 @@ chains:
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: a,
@@ -13708,6 +13712,7 @@ chains:
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: c,
@@ -13726,6 +13731,7 @@ chains:
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let cycles = vec![
@@ -13909,6 +13915,7 @@ chains:
             observed_slippage_bps: 100,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: a,
@@ -13928,6 +13935,7 @@ chains:
             observed_slippage_bps: 10,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let hot_paths = HotPathCache::with_failure_backoff(
@@ -14188,6 +14196,7 @@ chains:
             observed_slippage_bps: 10,
             quote_block: Some(block_number),
             active: true,
+            tick_ladder: None,
         };
 
         let mut graph = Graph::default();

@@ -112,6 +112,9 @@ pub struct Edge {
     pub observed_slippage_bps: u32,
     pub quote_block: Option<U64>,
     pub active: bool,
+    /// Ladder for the CL pool on this edge, when one was built. `None` keeps
+    /// the single-tick path with its crossing buffer.
+    pub tick_ladder: Option<std::sync::Arc<crate::cl_swap::TickLadder>>,
 }
 
 /// `a * b / d`, evaluated in 512 bits so the intermediate product cannot wrap.
@@ -1981,6 +1984,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         }
     }
 
@@ -2088,6 +2092,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         }
     }
 
@@ -2304,6 +2309,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: b,
@@ -2323,6 +2329,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: c,
@@ -2342,6 +2349,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         let mut priorities = HashMap::new();
@@ -2399,6 +2407,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         // Pool 2 (b->a): 2000 b buys 1 a (a is cheap here) -> round trip nets +5%.
         graph.add_edge(Edge {
@@ -2422,6 +2431,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let mut priorities = HashMap::new();
@@ -2482,6 +2492,7 @@ mod tests {
                 quote_block: None,
 
                 active: true,
+                tick_ladder: None,
             });
         }
 
@@ -2521,6 +2532,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         graph.add_edge(Edge {
@@ -2541,6 +2553,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: b,
@@ -2560,6 +2573,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: c,
@@ -2579,6 +2593,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         let mut priorities = HashMap::new();
@@ -2634,6 +2649,7 @@ mod tests {
                 quote_block: None,
 
                 active: true,
+                tick_ladder: None,
             });
         }
 
@@ -2672,6 +2688,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: b,
@@ -2691,6 +2708,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         graph.add_edge(Edge {
@@ -2710,6 +2728,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: c,
@@ -2728,6 +2747,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let priorities = HashMap::from([(a, 5), (b, 4), (c, 3)]);
@@ -2765,6 +2785,7 @@ mod tests {
                 observed_slippage_bps: 0,
                 quote_block: None,
                 active: true,
+                tick_ladder: None,
             });
         }
 
@@ -2785,6 +2806,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         graph.add_edge(Edge {
@@ -2804,6 +2826,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let priorities = HashMap::from([(source, 1), (mid, 1)]);
@@ -2842,6 +2865,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: hop1,
@@ -2860,6 +2884,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         graph.add_edge(Edge {
@@ -2879,6 +2904,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: cycle_b,
@@ -2897,6 +2923,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: cycle_c,
@@ -2915,6 +2942,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let priorities = HashMap::from([(source, 1)]);
@@ -2965,6 +2993,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         graph.add_edge(Edge {
@@ -2985,6 +3014,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         graph.add_edge(Edge {
@@ -3005,6 +3035,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         let mut priorities = HashMap::new();
@@ -3057,6 +3088,7 @@ mod tests {
                 quote_block: None,
 
                 active: true,
+                tick_ladder: None,
             });
         }
 
@@ -3078,6 +3110,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: b,
@@ -3097,6 +3130,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: c,
@@ -3116,6 +3150,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         let mut priorities = HashMap::new();
@@ -3162,6 +3197,7 @@ mod tests {
                 quote_block: None,
 
                 active: true,
+                tick_ladder: None,
             });
             graph.add_edge(Edge {
                 from: mid,
@@ -3181,6 +3217,7 @@ mod tests {
                 quote_block: None,
 
                 active: true,
+                tick_ladder: None,
             });
             graph.add_edge(Edge {
                 from: end,
@@ -3200,6 +3237,7 @@ mod tests {
                 quote_block: None,
 
                 active: true,
+                tick_ladder: None,
             });
         }
 
@@ -3252,6 +3290,7 @@ mod tests {
                 observed_slippage_bps: 10,
                 quote_block: None,
                 active: true,
+                tick_ladder: None,
             });
         }
 
@@ -3299,6 +3338,7 @@ mod tests {
                 observed_slippage_bps: 0,
                 quote_block: None,
                 active: true,
+                tick_ladder: None,
             });
         }
 
@@ -3345,6 +3385,7 @@ mod tests {
                 observed_slippage_bps: 0,
                 quote_block: None,
                 active: true,
+                tick_ladder: None,
             });
         }
         let priorities = HashMap::new();
@@ -3387,6 +3428,7 @@ mod tests {
                     observed_slippage_bps: 0,
                     quote_block: None,
                     active: true,
+                    tick_ladder: None,
                 });
             }
             g
@@ -3461,6 +3503,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         }
     }
 
@@ -3624,6 +3667,7 @@ mod tests {
                 observed_slippage_bps: 0,
                 quote_block: None,
                 active: true,
+                tick_ladder: None,
             });
         }
 
@@ -3660,6 +3704,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let before = graph.build_adjacency();
@@ -3682,6 +3727,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let after = graph.build_adjacency();
@@ -3718,6 +3764,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let edge = graph
@@ -3753,6 +3800,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         };
 
         let mut better = worse.clone();
@@ -3807,6 +3855,7 @@ mod tests {
             observed_slippage_bps: 10,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: a,
@@ -3829,6 +3878,7 @@ mod tests {
             observed_slippage_bps: 10,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: b,
@@ -3851,6 +3901,7 @@ mod tests {
             observed_slippage_bps: 10,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let priorities = HashMap::new();

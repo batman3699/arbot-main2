@@ -90,6 +90,7 @@ impl LiquidationOpportunity {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         }
     }
 }
