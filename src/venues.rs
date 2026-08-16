@@ -1759,6 +1759,44 @@ where
         Arc::new(std::collections::HashMap::new())
     };
 
+    // Ladders ride along with the state prefetch: same block, same pool set,
+    // and `CachedTickSource` collapses repeat words across the scan. Skipped
+    // entirely when the flag is off, so this costs nothing until enabled.
+    let tick_ladders: Arc<HashMap<Address, Arc<crate::cl_swap::TickLadder>>> =
+        if crate::cl_sim::multi_tick_enabled() {
+            let source = crate::cl_ticks::CachedTickSource::new(
+                crate::cl_ticks::RpcTickSource::new(Arc::clone(&ctx.provider)),
+                32,
+            );
+            let words = crate::cl_sim::cl_ladder_words();
+            let mut built = HashMap::new();
+            for (pool, state) in prefetched_cl_state.iter() {
+                match crate::cl_ticks::build_ladder(
+                    &source,
+                    *pool,
+                    state,
+                    ctx.edge_ctx.block_number,
+                    words,
+                )
+                .await
+                {
+                    Ok(ladder) if !ladder.is_empty() => {
+                        built.insert(*pool, Arc::new(ladder));
+                    }
+                    Ok(_) => {}
+                    Err(err) => debug!(
+                        target: "cl_ticks",
+                        pool = %format!("0x{}", hex::encode(pool)),
+                        error = %err,
+                        "ladder build failed; edge keeps the single-tick path"
+                    ),
+                }
+            }
+            Arc::new(built)
+        } else {
+            Arc::new(HashMap::new())
+        };
+
     let mut join_set: JoinSet<Result<Vec<Edge>>> = JoinSet::new();
     let mut edges = Vec::new();
     let mut pool_tasks_spawned = 0usize;
@@ -1798,6 +1836,7 @@ where
         let chain_env_prefix = ctx.chain_env_prefix.clone();
         let quote_concurrency_limit = ctx.quote_concurrency_limit;
         let prefetched_cl_state = Arc::clone(&prefetched_cl_state);
+        let tick_ladders = Arc::clone(&tick_ladders);
         join_set.spawn(async move {
             let mut local_edges = Vec::new();
             // Prefer the Multicall3-prefetched state; only fall back to the
@@ -2218,7 +2257,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
                     active: true,
-                    tick_ladder: None,
+                    tick_ladder: tick_ladders.get(&pool.pool).cloned(),
                 };
                 local_edges.push(edge);
             }
@@ -2384,6 +2423,44 @@ where
         Arc::new(std::collections::HashMap::new())
     };
 
+    // Ladders ride along with the state prefetch: same block, same pool set,
+    // and `CachedTickSource` collapses repeat words across the scan. Skipped
+    // entirely when the flag is off, so this costs nothing until enabled.
+    let tick_ladders: Arc<HashMap<Address, Arc<crate::cl_swap::TickLadder>>> =
+        if crate::cl_sim::multi_tick_enabled() {
+            let source = crate::cl_ticks::CachedTickSource::new(
+                crate::cl_ticks::RpcTickSource::new(Arc::clone(&ctx.provider)),
+                32,
+            );
+            let words = crate::cl_sim::cl_ladder_words();
+            let mut built = HashMap::new();
+            for (pool, state) in prefetched_cl_state.iter() {
+                match crate::cl_ticks::build_ladder(
+                    &source,
+                    *pool,
+                    state,
+                    ctx.edge_ctx.block_number,
+                    words,
+                )
+                .await
+                {
+                    Ok(ladder) if !ladder.is_empty() => {
+                        built.insert(*pool, Arc::new(ladder));
+                    }
+                    Ok(_) => {}
+                    Err(err) => debug!(
+                        target: "cl_ticks",
+                        pool = %format!("0x{}", hex::encode(pool)),
+                        error = %err,
+                        "ladder build failed; edge keeps the single-tick path"
+                    ),
+                }
+            }
+            Arc::new(built)
+        } else {
+            Arc::new(HashMap::new())
+        };
+
     let mut join_set: JoinSet<Result<Vec<Edge>>> = JoinSet::new();
     let mut edges = Vec::new();
     let mut pool_tasks_spawned = 0usize;
@@ -2424,6 +2501,7 @@ where
         let chain_env_prefix = ctx.chain_env_prefix.clone();
         let quote_concurrency_limit = ctx.quote_concurrency_limit;
         let prefetched_cl_state = Arc::clone(&prefetched_cl_state);
+        let tick_ladders = Arc::clone(&tick_ladders);
         join_set.spawn(async move {
             let mut local_edges = Vec::new();
             let cl_state = if !crate::cl_sim::local_cl_quotes_enabled() {
@@ -2841,7 +2919,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
                     active: true,
-                    tick_ladder: None,
+                    tick_ladder: tick_ladders.get(&pool.pool).cloned(),
                 };
                 local_edges.push(edge);
             }
