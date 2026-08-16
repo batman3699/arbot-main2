@@ -357,6 +357,109 @@ where
     }
 }
 
+use dashmap::DashMap;
+
+/// Caching decorator over any `TickDataSource`.
+///
+/// Keyed by `(pool, word|tick, epoch)` where `epoch = block / ttl_blocks`.
+/// Tick liquidity changes only on mint/burn in that range, so an epoch of a
+/// few dozen blocks trades a bounded staleness window for the removal of
+/// nearly all tick RPC from the hot path. `invalidate_pool` is the escape
+/// hatch when a mint/burn event is observed.
+pub struct CachedTickSource<S> {
+    inner: S,
+    ttl_blocks: u64,
+    words: DashMap<(Address, i16, u64), Option<U256>>,
+    nets: DashMap<(Address, i32, u64), Option<i128>>,
+}
+
+impl<S> CachedTickSource<S> {
+    pub fn new(inner: S, ttl_blocks: u64) -> Self {
+        Self {
+            inner,
+            ttl_blocks: ttl_blocks.max(1),
+            words: DashMap::new(),
+            nets: DashMap::new(),
+        }
+    }
+
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn cached_words(&self) -> usize {
+        self.words.len()
+    }
+
+    /// Drop every cached entry for one pool. Call on an observed mint/burn.
+    pub fn invalidate_pool(&self, pool: Address) {
+        self.words.retain(|(p, _, _), _| *p != pool);
+        self.nets.retain(|(p, _, _), _| *p != pool);
+    }
+
+    fn epoch(&self, block: U64) -> u64 {
+        block.as_u64() / self.ttl_blocks
+    }
+}
+
+#[async_trait]
+impl<S> TickDataSource for CachedTickSource<S>
+where
+    S: TickDataSource,
+{
+    async fn tick_words(
+        &self,
+        pool: Address,
+        word_positions: &[i16],
+        block: U64,
+    ) -> Result<Vec<Option<U256>>> {
+        let epoch = self.epoch(block);
+        let missing: Vec<i16> = word_positions
+            .iter()
+            .filter(|w| !self.words.contains_key(&(pool, **w, epoch)))
+            .copied()
+            .collect();
+
+        if !missing.is_empty() {
+            let fetched = self.inner.tick_words(pool, &missing, block).await?;
+            for (w, value) in missing.iter().zip(fetched.into_iter()) {
+                self.words.insert((pool, *w, epoch), value);
+            }
+        }
+
+        Ok(word_positions
+            .iter()
+            .map(|w| self.words.get(&(pool, *w, epoch)).and_then(|v| *v))
+            .collect())
+    }
+
+    async fn liquidity_net(
+        &self,
+        pool: Address,
+        ticks: &[i32],
+        block: U64,
+    ) -> Result<Vec<Option<i128>>> {
+        let epoch = self.epoch(block);
+        let missing: Vec<i32> = ticks
+            .iter()
+            .filter(|t| !self.nets.contains_key(&(pool, **t, epoch)))
+            .copied()
+            .collect();
+
+        if !missing.is_empty() {
+            let fetched = self.inner.liquidity_net(pool, &missing, block).await?;
+            for (t, value) in missing.iter().zip(fetched.into_iter()) {
+                self.nets.insert((pool, *t, epoch), value);
+            }
+        }
+
+        Ok(ticks
+            .iter()
+            .map(|t| self.nets.get(&(pool, *t, epoch)).and_then(|v| *v))
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,5 +722,101 @@ mod tests {
             Some(9),
             "exactly two words must decode — do not tighten this to 256"
         );
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingSource {
+        inner: StaticTickSource,
+        word_calls: AtomicUsize,
+        net_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TickDataSource for CountingSource {
+        async fn tick_words(
+            &self,
+            pool: Address,
+            word_positions: &[i16],
+            block: U64,
+        ) -> Result<Vec<Option<U256>>> {
+            self.word_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.tick_words(pool, word_positions, block).await
+        }
+        async fn liquidity_net(
+            &self,
+            pool: Address,
+            ticks: &[i32],
+            block: U64,
+        ) -> Result<Vec<Option<i128>>> {
+            self.net_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.liquidity_net(pool, ticks, block).await
+        }
+    }
+
+    fn counting_source() -> CountingSource {
+        CountingSource {
+            inner: StaticTickSource::new(Address::zero(), vec![(-60, 300), (60, -300)], 60),
+            word_calls: AtomicUsize::new(0),
+            net_calls: AtomicUsize::new(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_source_serves_repeat_reads_without_hitting_inner() {
+        let pool = Address::zero();
+        let cached = CachedTickSource::new(counting_source(), 32);
+
+        let first = cached.tick_words(pool, &[0], U64::from(1_000u64)).await.expect("first");
+        let second = cached.tick_words(pool, &[0], U64::from(1_001u64)).await.expect("second");
+
+        assert_eq!(first, second);
+        assert_eq!(
+            cached.inner().word_calls.load(Ordering::SeqCst),
+            1,
+            "a second read inside the epoch must not reach the inner source"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_source_refetches_after_the_epoch_rolls() {
+        let pool = Address::zero();
+        let cached = CachedTickSource::new(counting_source(), 32);
+
+        cached.tick_words(pool, &[0], U64::from(1_000u64)).await.expect("first");
+        cached.tick_words(pool, &[0], U64::from(1_064u64)).await.expect("two epochs later");
+
+        assert_eq!(
+            cached.inner().word_calls.load(Ordering::SeqCst),
+            2,
+            "crossing the epoch boundary must refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_pool_forces_a_refetch() {
+        let pool = Address::zero();
+        let cached = CachedTickSource::new(counting_source(), 32);
+
+        cached.tick_words(pool, &[0], U64::from(1_000u64)).await.expect("first");
+        cached.invalidate_pool(pool);
+        cached.tick_words(pool, &[0], U64::from(1_000u64)).await.expect("after invalidate");
+
+        assert_eq!(cached.inner().word_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cached_source_only_fetches_the_missing_ticks() {
+        let pool = Address::zero();
+        let cached = CachedTickSource::new(counting_source(), 32);
+
+        cached.liquidity_net(pool, &[-60], U64::from(1_000u64)).await.expect("first");
+        let both = cached
+            .liquidity_net(pool, &[-60, 60], U64::from(1_000u64))
+            .await
+            .expect("second");
+
+        assert_eq!(both, vec![Some(300), Some(-300)], "cached and fresh values must merge");
+        assert_eq!(cached.inner().net_calls.load(Ordering::SeqCst), 2);
     }
 }
