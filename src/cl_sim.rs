@@ -245,7 +245,13 @@ where
     }))
 }
 
-/// Minimal single-tick exact-input quote. Returns `None` when price would cross ticks.
+/// Minimal single-tick exact-input quote.
+///
+/// Holds liquidity CONSTANT and does NOT cross ticks — `state.tick` and
+/// `state.tick_spacing` are ignored. For any swap large enough to cross a tick
+/// boundary the result is systematically OPTIMISTIC. Callers compensate with
+/// `ARBOT_CL_TICK_BUFFER_BPS` (see `plan.rs::hop_expected_out`). Prefer
+/// `cl_swap::quote_exact_input_multi_tick` where a `TickLadder` is available.
 pub fn quote_exact_input_single_tick(
     state: &ClPoolState,
     amount_in: U256,
