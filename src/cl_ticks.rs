@@ -5,7 +5,7 @@
 //! source later, `StaticTickSource` in tests — none of which the math layer
 //! can distinguish.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use ethers::types::{Address, U256, U64};
 use std::collections::HashMap;
@@ -123,6 +123,94 @@ impl TickDataSource for StaticTickSource {
     }
 }
 
+use crate::cl_sim::ClPoolState;
+use crate::cl_swap::TickLadder;
+
+/// Materialise a `TickLadder` around the pool's current price.
+///
+/// Fetches `words_per_side` bitmap words on each side of the current word,
+/// expands the set bits into ticks, then batch-reads `liquidityNet` for those
+/// ticks. Two round trips regardless of how many ticks turn up.
+///
+/// The ladder's bounds are derived from the words actually fetched, NOT from
+/// the ticks found. A pool with sparse liquidity yields a short tick list over
+/// a wide proven range, and that range is what makes `Exhausted` meaningful.
+pub async fn build_ladder<S: TickDataSource + ?Sized>(
+    source: &S,
+    pool: Address,
+    state: &ClPoolState,
+    block: U64,
+    words_per_side: usize,
+) -> Result<TickLadder> {
+    // A conforming UniV3-family pool always reports a positive tick spacing
+    // (1/10/60/200). Zero or negative means this address is not a pool we can
+    // model: a stale inventory entry, a proxy returning zeros, a
+    // non-conforming fork. Refuse it here rather than substituting a
+    // plausible-looking 1.
+    //
+    // This is reachable from chain data. `cl_sim::load_cl_pool_states_batched`
+    // only falls back to 60 when the sub-CALL fails or returns short data — a
+    // pool that successfully returns an all-zero word decodes to 0 and arrives
+    // here intact. Substituting 1 would compute bitmap words for entirely the
+    // wrong ticks and yield a silently meaningless ladder.
+    //
+    // The guard lives here, not in `word_position`/`ticks_in_word`, because
+    // those are total pure functions with no way to report an error, and
+    // making them panic on a zero spacing would violate the plan's "no panic
+    // on chain data" constraint.
+    if state.tick_spacing <= 0 {
+        return Err(anyhow!(
+            "pool 0x{} reports non-positive tick_spacing {}; refusing to build a ladder",
+            hex::encode(pool),
+            state.tick_spacing
+        ));
+    }
+    let spacing = state.tick_spacing;
+    let span = words_per_side.min(MAX_TICK_WORDS) as i32;
+    let (centre_word, _) = word_position(state.tick, spacing);
+
+    let word_positions: Vec<i16> = (-span..=span)
+        .filter_map(|offset| i32::from(centre_word).checked_add(offset))
+        .filter(|w| *w >= i32::from(i16::MIN) && *w <= i32::from(i16::MAX))
+        .map(|w| w as i16)
+        .collect();
+    if word_positions.is_empty() {
+        return Ok(TickLadder::new(Vec::new(), state.tick, state.tick));
+    }
+
+    let words = source.tick_words(pool, &word_positions, block).await?;
+
+    let mut candidate_ticks: Vec<i32> = Vec::new();
+    for (word_pos, word) in word_positions.iter().zip(words.iter()) {
+        if let Some(bitmap) = word {
+            candidate_ticks.extend(ticks_in_word(*word_pos, *bitmap, spacing));
+        }
+    }
+    candidate_ticks.sort_unstable();
+    candidate_ticks.dedup();
+
+    // Coverage spans every tick the fetched words describe, whether or not a
+    // bit was set there.
+    let lowest_word = i32::from(*word_positions.first().unwrap_or(&0));
+    let highest_word = i32::from(*word_positions.last().unwrap_or(&0));
+    let lower_bound = lowest_word * 256 * spacing;
+    let upper_bound = (highest_word * 256 + 255) * spacing;
+
+    if candidate_ticks.is_empty() {
+        return Ok(TickLadder::new(Vec::new(), lower_bound, upper_bound));
+    }
+
+    let nets = source.liquidity_net(pool, &candidate_ticks, block).await?;
+    let ticks: Vec<(i32, i128)> = candidate_ticks
+        .into_iter()
+        .zip(nets.into_iter())
+        .filter_map(|(tick, net)| net.map(|n| (tick, n)))
+        .filter(|(_, net)| *net != 0)
+        .collect();
+
+    Ok(TickLadder::new(ticks, lower_bound, upper_bound))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,5 +267,97 @@ mod tests {
         let words = src.tick_words(pool, &[0], U64::zero()).await.expect("static source");
         let word = words[0].expect("word 0 present");
         assert!(!(word & (U256::one() << 1)).is_zero(), "tick 60 -> bit 1 must be set");
+    }
+
+    use crate::cl_sim::ClPoolState;
+
+    fn state_at_tick_zero() -> ClPoolState {
+        ClPoolState {
+            sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
+            liquidity: 1_000_000_000_000,
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 3_000,
+        }
+    }
+
+    #[tokio::test]
+    async fn build_ladder_collects_seeded_ticks() {
+        let pool = Address::zero();
+        let src = StaticTickSource::new(
+            pool,
+            vec![(-120, 500), (-60, 300), (60, -300), (120, -500)],
+            60,
+        );
+
+        let ladder = build_ladder(&src, pool, &state_at_tick_zero(), U64::zero(), 1)
+            .await
+            .expect("ladder builds");
+
+        assert_eq!(ladder.len(), 4);
+        assert_eq!(
+            ladder.next_initialized(0, true),
+            crate::cl_swap::LadderStep::Initialized { tick: -60, liquidity_net: 300 }
+        );
+        assert_eq!(
+            ladder.next_initialized(0, false),
+            crate::cl_swap::LadderStep::Initialized { tick: 60, liquidity_net: -300 }
+        );
+    }
+
+    /// The bounds must reflect the words actually fetched. Claiming wider
+    /// coverage than was read reintroduces the extrapolation bug one layer up.
+    #[tokio::test]
+    async fn build_ladder_bounds_match_words_fetched() {
+        let pool = Address::zero();
+        let src = StaticTickSource::new(pool, vec![(60, -300)], 60);
+
+        let ladder = build_ladder(&src, pool, &state_at_tick_zero(), U64::zero(), 1)
+            .await
+            .expect("ladder builds");
+
+        // One word each side of word 0 => words -1..=1 => compressed -256..=511
+        // => ticks -15360..=30660 at spacing 60.
+        assert_eq!(ladder.lower_bound(), -256 * 60);
+        assert_eq!(ladder.upper_bound(), (2 * 256 - 1) * 60);
+    }
+
+    /// A malformed pool must be refused, not silently modelled with a
+    /// substituted spacing. Reachable: the batched CL state loader only falls
+    /// back to 60 when the call FAILS, so a pool returning an all-zero word
+    /// decodes to 0 and arrives here.
+    #[tokio::test]
+    async fn build_ladder_refuses_a_pool_with_non_positive_tick_spacing() {
+        let pool = Address::zero();
+        let src = StaticTickSource::new(pool, vec![(60, -300)], 60);
+        let mut state = state_at_tick_zero();
+        state.tick_spacing = 0;
+
+        let err = build_ladder(&src, pool, &state, U64::zero(), 1)
+            .await
+            .expect_err("a zero tick_spacing must be refused, not silently defaulted");
+        assert!(
+            err.to_string().contains("tick_spacing"),
+            "error must name the offending field, got: {err}"
+        );
+
+        state.tick_spacing = -60;
+        assert!(
+            build_ladder(&src, pool, &state, U64::zero(), 1).await.is_err(),
+            "a negative tick_spacing must be refused too"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_ladder_survives_a_pool_with_no_initialized_ticks() {
+        let pool = Address::zero();
+        let src = StaticTickSource::new(pool, Vec::new(), 60);
+
+        let ladder = build_ladder(&src, pool, &state_at_tick_zero(), U64::zero(), 1)
+            .await
+            .expect("ladder builds");
+
+        assert!(ladder.is_empty());
+        assert_eq!(ladder.next_initialized(0, true), crate::cl_swap::LadderStep::Exhausted);
     }
 }
