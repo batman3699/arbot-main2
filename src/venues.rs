@@ -1361,6 +1361,13 @@ where
     token_whitelist: Arc<HashSet<Address>>,
     chain_env_prefix: String,
     pool_filter: Option<HashSet<Address>>,
+    /// Long-lived tick ladder cache, owned by the chain's `Runner` and shared
+    /// across every `scan_once()` call so the epoch cache in
+    /// `CachedTickSource` actually pays off across scans instead of being
+    /// rebuilt (and thrown away) once per `populate_edges` call. One instance
+    /// per chain/provider — never shared across chains, so it cannot serve
+    /// one chain's tick data to another.
+    tick_cache: Arc<crate::cl_ticks::CachedTickSource<crate::cl_ticks::RpcTickSource<C>>>,
 }
 
 const ESTIMATED_GAS_SLIPSTREAM: u64 = ESTIMATED_GAS_UNIV3;
@@ -1380,6 +1387,8 @@ where
     token_whitelist: Arc<HashSet<Address>>,
     chain_env_prefix: String,
     pool_filter: Option<HashSet<Address>>,
+    /// See `Univ3EdgeContext::tick_cache` — same long-lived, per-chain cache.
+    tick_cache: Arc<crate::cl_ticks::CachedTickSource<crate::cl_ticks::RpcTickSource<C>>>,
 }
 
 async fn slipstream_grid_quote<C>(
@@ -1759,39 +1768,26 @@ where
         Arc::new(std::collections::HashMap::new())
     };
 
-    // Ladders ride along with the state prefetch: same block, same pool set,
-    // and `CachedTickSource` collapses repeat words across the scan. Skipped
-    // entirely when the flag is off, so this costs nothing until enabled.
+    // Ladders ride along with the state prefetch: same block, same pool set.
+    // `tick_cache` is the chain's long-lived `CachedTickSource` (owned by
+    // `Runner`, threaded through `populate_edges`), so its epoch cache
+    // actually collapses repeat words across scans rather than being rebuilt
+    // and discarded on every call. Built concurrently, bounded by the same
+    // `max_pool_tasks` limit the per-pool quote loop below uses, so this
+    // doesn't reintroduce the sequential-RPC pattern spec §3.4 forbids.
+    // Skipped entirely when the flag is off, so this costs nothing until
+    // enabled.
     let tick_ladders: Arc<HashMap<Address, Arc<crate::cl_swap::TickLadder>>> =
         if crate::cl_sim::multi_tick_enabled() {
-            let source = crate::cl_ticks::CachedTickSource::new(
-                crate::cl_ticks::RpcTickSource::new(Arc::clone(&ctx.provider)),
-                32,
-            );
             let words = crate::cl_sim::cl_ladder_words();
-            let mut built = HashMap::new();
-            for (pool, state) in prefetched_cl_state.iter() {
-                match crate::cl_ticks::build_ladder(
-                    &source,
-                    *pool,
-                    state,
-                    ctx.edge_ctx.block_number,
-                    words,
-                )
-                .await
-                {
-                    Ok(ladder) if !ladder.is_empty() => {
-                        built.insert(*pool, Arc::new(ladder));
-                    }
-                    Ok(_) => {}
-                    Err(err) => debug!(
-                        target: "cl_ticks",
-                        pool = %format!("0x{}", hex::encode(pool)),
-                        error = %err,
-                        "ladder build failed; edge keeps the single-tick path"
-                    ),
-                }
-            }
+            let built = crate::cl_ticks::build_ladders_concurrent(
+                Arc::clone(&ctx.tick_cache),
+                &prefetched_cl_state,
+                ctx.edge_ctx.block_number,
+                words,
+                max_pool_tasks,
+            )
+            .await;
             Arc::new(built)
         } else {
             Arc::new(HashMap::new())
@@ -2423,39 +2419,26 @@ where
         Arc::new(std::collections::HashMap::new())
     };
 
-    // Ladders ride along with the state prefetch: same block, same pool set,
-    // and `CachedTickSource` collapses repeat words across the scan. Skipped
-    // entirely when the flag is off, so this costs nothing until enabled.
+    // Ladders ride along with the state prefetch: same block, same pool set.
+    // `tick_cache` is the chain's long-lived `CachedTickSource` (owned by
+    // `Runner`, threaded through `populate_edges`), so its epoch cache
+    // actually collapses repeat words across scans rather than being rebuilt
+    // and discarded on every call. Built concurrently, bounded by the same
+    // `max_pool_tasks` limit the per-pool quote loop below uses, so this
+    // doesn't reintroduce the sequential-RPC pattern spec §3.4 forbids.
+    // Skipped entirely when the flag is off, so this costs nothing until
+    // enabled.
     let tick_ladders: Arc<HashMap<Address, Arc<crate::cl_swap::TickLadder>>> =
         if crate::cl_sim::multi_tick_enabled() {
-            let source = crate::cl_ticks::CachedTickSource::new(
-                crate::cl_ticks::RpcTickSource::new(Arc::clone(&ctx.provider)),
-                32,
-            );
             let words = crate::cl_sim::cl_ladder_words();
-            let mut built = HashMap::new();
-            for (pool, state) in prefetched_cl_state.iter() {
-                match crate::cl_ticks::build_ladder(
-                    &source,
-                    *pool,
-                    state,
-                    ctx.edge_ctx.block_number,
-                    words,
-                )
-                .await
-                {
-                    Ok(ladder) if !ladder.is_empty() => {
-                        built.insert(*pool, Arc::new(ladder));
-                    }
-                    Ok(_) => {}
-                    Err(err) => debug!(
-                        target: "cl_ticks",
-                        pool = %format!("0x{}", hex::encode(pool)),
-                        error = %err,
-                        "ladder build failed; edge keeps the single-tick path"
-                    ),
-                }
-            }
+            let built = crate::cl_ticks::build_ladders_concurrent(
+                Arc::clone(&ctx.tick_cache),
+                &prefetched_cl_state,
+                ctx.edge_ctx.block_number,
+                words,
+                max_pool_tasks,
+            )
+            .await;
             Arc::new(built)
         } else {
             Arc::new(HashMap::new())
@@ -3879,6 +3862,12 @@ pub async fn populate_edges<C>(
     _wrapped_native: Address,
     populate_options: PopulateOptions,
     metrics: Option<Arc<Metrics>>,
+    // Owned by `Runner`, constructed once per chain and reused across every
+    // `scan_once()` call — NOT rebuilt here. That's what lets the epoch cache
+    // inside `CachedTickSource` actually collapse repeat tick reads across
+    // scans instead of paying full RPC cost every cycle. Never share one
+    // instance across chains/providers: each `Runner` owns exactly one.
+    cl_tick_cache: Arc<crate::cl_ticks::CachedTickSource<crate::cl_ticks::RpcTickSource<C>>>,
 ) -> Result<PopulateResult>
 where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
@@ -4015,6 +4004,7 @@ where
         token_whitelist: Arc::new(token_whitelist.clone()),
         chain_env_prefix: chain_env_prefix.to_string(),
         pool_filter: pool_filter.clone(),
+        tick_cache: Arc::clone(&cl_tick_cache),
     };
     let hot_univ3_filtered = filter_hot_univ3_pools(hot_univ3_pools, token_whitelist);
     let hot_univ2_filtered = filter_hot_univ2_pools(hot_univ2_pools, token_whitelist);
@@ -4110,6 +4100,7 @@ where
         token_whitelist: Arc::new(token_whitelist.clone()),
         chain_env_prefix: chain_env_prefix.to_string(),
         pool_filter: pool_filter.clone(),
+        tick_cache: Arc::clone(&cl_tick_cache),
     });
     let slipstream_collect = async {
         if let Some(ctx) = slipstream_ctx.as_ref() {
@@ -4186,6 +4177,7 @@ where
         token_whitelist: Arc::new(token_whitelist.clone()),
         chain_env_prefix: chain_env_prefix.to_string(),
         pool_filter: pool_filter.clone(),
+        tick_cache: Arc::clone(&cl_tick_cache),
     });
     let pancakeswap_collect = async {
         if let Some(ctx) = pancakeswap_ctx.as_ref() {

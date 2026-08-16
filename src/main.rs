@@ -3353,6 +3353,15 @@ where
     last_scanned_block: Arc<Mutex<Option<U64>>>,
     block_head_rx: Option<Arc<Mutex<watch::Receiver<BlockHead>>>>,
     populate_cache: Arc<Mutex<PopulateCacheState>>,
+    /// Long-lived tick-ladder cache for the multi-tick CL simulator
+    /// (`ARBOT_CL_MULTI_TICK`). Built once here and reused across every
+    /// `scan_once()` call for this chain, so `CachedTickSource`'s epoch cache
+    /// actually collapses repeat tick RPC across scans instead of being
+    /// rebuilt (and its cache thrown away) once per scan. This `Runner` is
+    /// the ONLY owner: one `Runner` per chain, each with its own `provider`
+    /// and its own `cl_tick_cache` instance, so there is no path for one
+    /// chain's tick data to reach another chain's pools.
+    cl_tick_cache: Arc<crate::cl_ticks::CachedTickSource<crate::cl_ticks::RpcTickSource<C>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3509,6 +3518,12 @@ where
         };
         let bal_quote = Arc::new(BalQuote::new(provider.clone(), bal_vault));
         let curve_quote = Arc::new(CurveQuote::new(provider.clone()));
+        // One cache per `Runner`, i.e. one per chain: see the field doc on
+        // `cl_tick_cache` for why this must never be shared across chains.
+        let cl_tick_cache = Arc::new(crate::cl_ticks::CachedTickSource::new(
+            crate::cl_ticks::RpcTickSource::new(provider.clone()),
+            32,
+        ));
         Self {
             feature_gate,
             provider,
@@ -3628,6 +3643,7 @@ where
             last_scanned_block: Arc::new(Mutex::new(None)),
             block_head_rx,
             populate_cache: Arc::new(Mutex::new(PopulateCacheState::default())),
+            cl_tick_cache,
         }
     }
 
@@ -3889,6 +3905,7 @@ where
         let hub_tokens = Arc::new(self.hub_tokens.clone());
         let wrapped_native = self.wrapped_native;
         let metrics = self.metrics.clone();
+        let cl_tick_cache = Arc::clone(&self.cl_tick_cache);
         let outcome = self
             .scan_once_with(
                 |graph,
@@ -3929,6 +3946,7 @@ where
                     let populate_cache = populate_cache.clone();
                     let hub_tokens = hub_tokens.clone();
                     let metrics = metrics.clone();
+                    let cl_tick_cache = Arc::clone(&cl_tick_cache);
                     Box::pin(async move {
                         let populate_options = {
                             let guard = populate_cache.lock().await;
@@ -3986,6 +4004,7 @@ where
                             wrapped_native,
                             populate_options,
                             metrics,
+                            cl_tick_cache,
                         )
                         .await?;
                         Ok(result.edges)

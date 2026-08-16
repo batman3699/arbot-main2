@@ -229,7 +229,84 @@ pub async fn build_ladder<S: TickDataSource + ?Sized>(
 
 use ethers::providers::{JsonRpcClient, Provider};
 use std::sync::Arc;
+use tokio::task::JoinSet;
 use tracing::debug;
+
+/// Build tick ladders for many pools concurrently, bounded by `max_concurrent`
+/// ladder builds in flight at once.
+///
+/// `build_ladder` alone issues at least two RPC round trips per pool (one
+/// `tick_words`, one `liquidity_net` per 128-tick chunk). Awaiting it in a
+/// plain sequential loop over dozens of pools reintroduces the exact "N
+/// sequential RPC round-trips per scan" pattern spec §3.4 forbids for
+/// pool-state reads — this is that same rule applied to tick ladders.
+/// `max_concurrent` should be the caller's existing per-scan concurrency
+/// limit (e.g. `max_pool_tasks` in `venues.rs`), not a new bound invented
+/// here, so ladder building and per-pool quoting compete for RPC capacity
+/// under one shared policy.
+///
+/// A pool whose ladder build errors, comes back empty, or whose task panics
+/// is simply absent from the returned map — the caller's edge keeps
+/// `tick_ladder: None` and falls back to the single-tick path. One pool's
+/// failure never aborts the batch or affects any other pool.
+pub async fn build_ladders_concurrent<S>(
+    source: Arc<S>,
+    pools: &HashMap<Address, ClPoolState>,
+    block: U64,
+    words_per_side: usize,
+    max_concurrent: usize,
+) -> HashMap<Address, Arc<TickLadder>>
+where
+    S: TickDataSource + 'static,
+{
+    let max_concurrent = max_concurrent.max(1);
+    let mut built = HashMap::new();
+    let mut tasks: JoinSet<(Address, Result<TickLadder>)> = JoinSet::new();
+
+    for (pool, state) in pools.iter() {
+        while tasks.len() >= max_concurrent {
+            if let Some(joined) = tasks.join_next().await {
+                absorb_ladder_result(joined, &mut built);
+            }
+        }
+        let pool = *pool;
+        let state = state.clone();
+        let source = Arc::clone(&source);
+        tasks.spawn(async move {
+            let result = build_ladder(source.as_ref(), pool, &state, block, words_per_side).await;
+            (pool, result)
+        });
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        absorb_ladder_result(joined, &mut built);
+    }
+
+    built
+}
+
+fn absorb_ladder_result(
+    joined: std::result::Result<(Address, Result<TickLadder>), tokio::task::JoinError>,
+    built: &mut HashMap<Address, Arc<TickLadder>>,
+) {
+    match joined {
+        Ok((pool, Ok(ladder))) if !ladder.is_empty() => {
+            built.insert(pool, Arc::new(ladder));
+        }
+        Ok((_, Ok(_))) => {}
+        Ok((pool, Err(err))) => debug!(
+            target: "cl_ticks",
+            pool = %format!("0x{}", hex::encode(pool)),
+            error = %err,
+            "ladder build failed; edge keeps the single-tick path"
+        ),
+        Err(join_err) => debug!(
+            target: "cl_ticks",
+            error = %join_err,
+            "ladder build task panicked; pool falls back to single-tick"
+        ),
+    }
+}
 
 /// Selector for `tickBitmap(int16)`.
 fn tick_bitmap_selector() -> [u8; 4] {
@@ -884,6 +961,214 @@ mod tests {
             cached.inner().net_calls.load(Ordering::SeqCst),
             2,
             "a failed read must be retried within the epoch, not served from cache"
+        );
+    }
+
+    /// Proof of concurrency, not a timing guess. `N` fake pools each block on
+    /// an `N`-party `Barrier` inside `tick_words`. A genuinely concurrent
+    /// implementation has all `N` ladder-build tasks in flight together, so
+    /// the barrier fills and every call returns. A regression back to the
+    /// sequential `for pool in pools { build_ladder(...).await }` pattern
+    /// this wrapper replaces would only ever have ONE task running at a time
+    /// — the barrier would never see its second party, every call would hang
+    /// forever, and the surrounding `timeout` would fire. Either way the
+    /// test resolves deterministically; nothing here depends on wall-clock
+    /// timing to distinguish "concurrent" from "sequential".
+    #[tokio::test]
+    async fn build_ladders_concurrent_runs_pools_in_parallel_not_sequentially() {
+        const N: usize = 4;
+
+        struct RendezvousSource {
+            barrier: tokio::sync::Barrier,
+        }
+
+        #[async_trait]
+        impl TickDataSource for RendezvousSource {
+            async fn tick_words(
+                &self,
+                _pool: Address,
+                word_positions: &[i16],
+                _block: U64,
+            ) -> Result<Vec<Option<U256>>> {
+                // Every task must reach here before any of them can leave.
+                self.barrier.wait().await;
+                Ok(vec![Some(U256::zero()); word_positions.len()])
+            }
+
+            async fn liquidity_net(
+                &self,
+                _pool: Address,
+                ticks: &[i32],
+                _block: U64,
+            ) -> Result<Vec<Option<i128>>> {
+                Ok(vec![None; ticks.len()])
+            }
+        }
+
+        let source = Arc::new(RendezvousSource {
+            barrier: tokio::sync::Barrier::new(N),
+        });
+        let mut pools = HashMap::new();
+        for i in 0..N {
+            pools.insert(Address::from_low_u64_be(i as u64 + 1), state_at_tick_zero());
+        }
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            build_ladders_concurrent(source, &pools, U64::zero(), 1, N),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "build_ladders_concurrent must run all {N} ladder builds concurrently; a \
+             sequential implementation deadlocks on the {N}-party barrier and this \
+             times out"
+        );
+    }
+
+    /// The concurrency bound itself: with `max_concurrent` below the pool
+    /// count, no more than `max_concurrent` ladder builds may ever be
+    /// in-flight at once. Tracked with a plain atomic high-water mark rather
+    /// than wall-clock timing, so this cannot be flaky under scheduler
+    /// jitter — it is a hard invariant checked on every call, not a
+    /// probabilistic race.
+    #[tokio::test]
+    async fn build_ladders_concurrent_never_exceeds_the_bound() {
+        const POOLS: usize = 6;
+        const MAX_CONCURRENT: usize = 2;
+
+        struct TrackingSource {
+            in_flight: std::sync::atomic::AtomicUsize,
+            high_water: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait]
+        impl TickDataSource for TrackingSource {
+            async fn tick_words(
+                &self,
+                _pool: Address,
+                word_positions: &[i16],
+                _block: U64,
+            ) -> Result<Vec<Option<U256>>> {
+                use std::sync::atomic::Ordering;
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.high_water.fetch_max(now, Ordering::SeqCst);
+                // Give other spawned tasks a chance to observe/overlap.
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec![Some(U256::zero()); word_positions.len()])
+            }
+
+            async fn liquidity_net(
+                &self,
+                _pool: Address,
+                ticks: &[i32],
+                _block: U64,
+            ) -> Result<Vec<Option<i128>>> {
+                Ok(vec![None; ticks.len()])
+            }
+        }
+
+        let source = Arc::new(TrackingSource {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            high_water: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut pools = HashMap::new();
+        for i in 0..POOLS {
+            pools.insert(Address::from_low_u64_be(i as u64 + 1), state_at_tick_zero());
+        }
+
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            build_ladders_concurrent(Arc::clone(&source), &pools, U64::zero(), 1, MAX_CONCURRENT),
+        )
+        .await
+        .expect("build_ladders_concurrent must not hang");
+
+        assert!(
+            source.high_water.load(std::sync::atomic::Ordering::SeqCst) <= MAX_CONCURRENT,
+            "never more than max_concurrent ({MAX_CONCURRENT}) ladder builds may be in flight"
+        );
+    }
+
+    /// One pool's failure must not take down the others: the batch must
+    /// still return every pool that succeeded, with the failing pool simply
+    /// absent (its edge falls back to single-tick).
+    #[tokio::test]
+    async fn build_ladders_concurrent_isolates_one_pools_failure_from_the_rest() {
+        struct SelectiveSource {
+            bad_pool: Address,
+            inner: StaticTickSource,
+        }
+
+        #[async_trait]
+        impl TickDataSource for SelectiveSource {
+            async fn tick_words(
+                &self,
+                pool: Address,
+                word_positions: &[i16],
+                block: U64,
+            ) -> Result<Vec<Option<U256>>> {
+                if pool == self.bad_pool {
+                    return Err(anyhow!("synthetic failure for isolation test"));
+                }
+                self.inner.tick_words(pool, word_positions, block).await
+            }
+
+            async fn liquidity_net(
+                &self,
+                pool: Address,
+                ticks: &[i32],
+                block: U64,
+            ) -> Result<Vec<Option<i128>>> {
+                if pool == self.bad_pool {
+                    return Err(anyhow!("synthetic failure for isolation test"));
+                }
+                self.inner.liquidity_net(pool, ticks, block).await
+            }
+        }
+
+        let good_pool = Address::from_low_u64_be(1);
+        let bad_pool = Address::from_low_u64_be(2);
+        let source = Arc::new(SelectiveSource {
+            bad_pool,
+            inner: StaticTickSource::new(good_pool, vec![(-60, 300), (60, -300)], 60),
+        });
+
+        let mut pools = HashMap::new();
+        pools.insert(good_pool, state_at_tick_zero());
+        pools.insert(bad_pool, state_at_tick_zero());
+
+        let built = build_ladders_concurrent(source, &pools, U64::zero(), 1, 2).await;
+
+        assert_eq!(
+            built.len(),
+            1,
+            "the failing pool must be absent; the healthy one must still be present"
+        );
+        assert!(!built.contains_key(&bad_pool), "a failed build must not appear in the map");
+        let ladder = built.get(&good_pool).expect("healthy pool must still build a ladder");
+        assert_eq!(ladder.len(), 2, "the healthy pool's ladder must be built correctly");
+    }
+
+    /// A pool whose ladder comes back empty (no initialized ticks) must be
+    /// absent from the result too — same fallback-to-single-tick contract as
+    /// a hard error, just via the `Ok(ladder) if !ladder.is_empty()` arm.
+    #[tokio::test]
+    async fn build_ladders_concurrent_omits_pools_with_empty_ladders() {
+        let pool = Address::from_low_u64_be(1);
+        let source = Arc::new(StaticTickSource::new(pool, Vec::new(), 60));
+        let mut pools = HashMap::new();
+        pools.insert(pool, state_at_tick_zero());
+
+        let built = build_ladders_concurrent(source, &pools, U64::zero(), 1, 4).await;
+
+        assert!(
+            built.is_empty(),
+            "a pool with no initialized ticks must not appear in the map"
         );
     }
 }
