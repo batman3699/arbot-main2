@@ -5,6 +5,7 @@ mod capital;
 mod chain;
 mod cl_math;
 mod cl_sim;
+mod cl_swap;
 #[cfg(test)]
 mod config_validation;
 mod discovery;
