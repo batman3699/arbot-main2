@@ -366,11 +366,25 @@ use dashmap::DashMap;
 /// few dozen blocks trades a bounded staleness window for the removal of
 /// nearly all tick RPC from the hot path. `invalidate_pool` is the escape
 /// hatch when a mint/burn event is observed.
+///
+/// Only SUCCESSFUL reads are cached. The maps hold bare values, not
+/// `Option`, because a `None` from the inner source means the read FAILED —
+/// reverted, malformed, or a whole-chunk RPC error that `RpcTickSource`
+/// swallows into `Ok(vec![None; 128])`. It is never a legitimate stable
+/// answer: a genuinely empty bitmap word is `Some(0)` and a genuinely zero
+/// net is `Some(0)`.
+///
+/// Caching a failure would be actively harmful. `contains_key` would report
+/// the entry present, so the tick would never re-enter the `missing` set and
+/// one transient hiccup would mark up to 128 ticks unreadable for the rest of
+/// the epoch — silently starving that pool's ladder with no retry path, since
+/// `invalidate_pool` only fires on an observed mint/burn, not on RPC health.
+/// Leaving failures absent costs one re-fetch and restores the retry.
 pub struct CachedTickSource<S> {
     inner: S,
     ttl_blocks: u64,
-    words: DashMap<(Address, i16, u64), Option<U256>>,
-    nets: DashMap<(Address, i32, u64), Option<i128>>,
+    words: DashMap<(Address, i16, u64), U256>,
+    nets: DashMap<(Address, i32, u64), i128>,
 }
 
 impl<S> CachedTickSource<S> {
@@ -423,13 +437,16 @@ where
         if !missing.is_empty() {
             let fetched = self.inner.tick_words(pool, &missing, block).await?;
             for (w, value) in missing.iter().zip(fetched.into_iter()) {
-                self.words.insert((pool, *w, epoch), value);
+                // Successful reads only — see the struct docstring.
+                if let Some(word) = value {
+                    self.words.insert((pool, *w, epoch), word);
+                }
             }
         }
 
         Ok(word_positions
             .iter()
-            .map(|w| self.words.get(&(pool, *w, epoch)).and_then(|v| *v))
+            .map(|w| self.words.get(&(pool, *w, epoch)).map(|v| *v))
             .collect())
     }
 
@@ -449,13 +466,19 @@ where
         if !missing.is_empty() {
             let fetched = self.inner.liquidity_net(pool, &missing, block).await?;
             for (t, value) in missing.iter().zip(fetched.into_iter()) {
-                self.nets.insert((pool, *t, epoch), value);
+                // Successful reads only — see the struct docstring. This is
+                // the path that matters most: `RpcTickSource::liquidity_net`
+                // turns a whole-chunk RPC error into `Ok(vec![None; 128])`, so
+                // caching `None` here would poison 128 ticks per hiccup.
+                if let Some(net) = value {
+                    self.nets.insert((pool, *t, epoch), net);
+                }
             }
         }
 
         Ok(ticks
             .iter()
-            .map(|t| self.nets.get(&(pool, *t, epoch)).and_then(|v| *v))
+            .map(|t| self.nets.get(&(pool, *t, epoch)).map(|v| *v))
             .collect())
     }
 }
@@ -730,6 +753,10 @@ mod tests {
         inner: StaticTickSource,
         word_calls: AtomicUsize,
         net_calls: AtomicUsize,
+        /// What was actually asked of the inner source, per call. Counting
+        /// invocations alone cannot distinguish "fetched only the missing
+        /// tick" from "refetched everything" — both are one call.
+        net_args: std::sync::Mutex<Vec<Vec<i32>>>,
     }
 
     #[async_trait]
@@ -750,6 +777,10 @@ mod tests {
             block: U64,
         ) -> Result<Vec<Option<i128>>> {
             self.net_calls.fetch_add(1, Ordering::SeqCst);
+            self.net_args
+                .lock()
+                .expect("net_args mutex")
+                .push(ticks.to_vec());
             self.inner.liquidity_net(pool, ticks, block).await
         }
     }
@@ -759,6 +790,7 @@ mod tests {
             inner: StaticTickSource::new(Address::zero(), vec![(-60, 300), (60, -300)], 60),
             word_calls: AtomicUsize::new(0),
             net_calls: AtomicUsize::new(0),
+            net_args: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -818,5 +850,40 @@ mod tests {
 
         assert_eq!(both, vec![Some(300), Some(-300)], "cached and fresh values must merge");
         assert_eq!(cached.inner().net_calls.load(Ordering::SeqCst), 2);
+
+        // The call COUNT alone cannot prove the cache did its job — a
+        // regression that refetched the whole slice on any partial miss would
+        // also be 2 calls with identical merged values, and would defeat this
+        // component's entire purpose. Assert what was actually requested.
+        let args = cached.inner().net_args.lock().expect("net_args mutex").clone();
+        assert_eq!(
+            args,
+            vec![vec![-60], vec![60]],
+            "second call must request ONLY the uncached tick, not the full slice"
+        );
+    }
+
+    /// A failed read must not be cached: `None` means the read failed, never
+    /// that the value is legitimately absent. `RpcTickSource::liquidity_net`
+    /// turns a whole-chunk RPC error into `Ok(vec![None; 128])`, so caching it
+    /// would mark up to 128 ticks unreadable for the rest of the epoch with no
+    /// retry path.
+    #[tokio::test]
+    async fn cached_source_retries_a_failed_read_instead_of_caching_it() {
+        let pool = Address::zero();
+        // Tick 999 is not seeded, so StaticTickSource yields None for it.
+        let cached = CachedTickSource::new(counting_source(), 32);
+
+        let first = cached.liquidity_net(pool, &[999], U64::from(1_000u64)).await.expect("first");
+        assert_eq!(first, vec![None], "unseeded tick reads as a failure");
+
+        let second = cached.liquidity_net(pool, &[999], U64::from(1_000u64)).await.expect("second");
+        assert_eq!(second, vec![None]);
+
+        assert_eq!(
+            cached.inner().net_calls.load(Ordering::SeqCst),
+            2,
+            "a failed read must be retried within the epoch, not served from cache"
+        );
     }
 }
