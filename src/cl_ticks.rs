@@ -538,6 +538,27 @@ mod tests {
         assert_eq!(ladder.next_initialized(0, true), crate::cl_swap::LadderStep::Exhausted);
     }
 
+    /// Pin the selector bytes as LITERALS, independently confirmed with
+    /// `cast sig`. Asserting against `keccak256` of the same signature string
+    /// the implementation uses would be circular and catch nothing: a typo in
+    /// that string would change both sides together, compile fine, pass the
+    /// suite, and then revert 100% of on-chain calls — degrading silently
+    /// through the chunk-failure path into "the ladder is short" rather than
+    /// surfacing as a failure.
+    #[test]
+    fn calldata_selectors_match_the_deployed_signatures() {
+        assert_eq!(
+            &tick_bitmap_calldata(0)[0..4],
+            &[0x53, 0x39, 0xc2, 0x96],
+            "tickBitmap(int16) selector must be 0x5339c296"
+        );
+        assert_eq!(
+            &ticks_calldata(0)[0..4],
+            &[0xf3, 0x0d, 0xba, 0x93],
+            "ticks(int24) selector must be 0xf30dba93"
+        );
+    }
+
     #[test]
     fn tick_bitmap_calldata_encodes_signed_word_position() {
         let call = tick_bitmap_calldata(-1);
@@ -581,5 +602,22 @@ mod tests {
     fn decode_liquidity_net_rejects_short_return_data() {
         assert_eq!(decode_liquidity_net(&[0u8; 32]), None);
         assert_eq!(decode_liquidity_net(&[]), None);
+    }
+
+    /// Pin the 64-byte boundary exactly. The decoder deliberately requires
+    /// only the first two fields so it stays portable across UniV3 forks that
+    /// extend the tail of `Tick.Info`; tightening it to the full 256 bytes
+    /// would silently stop decoding those forks. 63 must fail, 64 must work.
+    #[test]
+    fn decode_liquidity_net_accepts_exactly_two_words() {
+        assert_eq!(decode_liquidity_net(&[0u8; 63]), None, "63 bytes is short");
+
+        let mut data = vec![0u8; 64];
+        data[63] = 9;
+        assert_eq!(
+            decode_liquidity_net(&data),
+            Some(9),
+            "exactly two words must decode — do not tighten this to 256"
+        );
     }
 }
