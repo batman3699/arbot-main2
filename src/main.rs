@@ -6,6 +6,7 @@ mod chain;
 mod cl_math;
 mod cl_sim;
 mod cl_swap;
+mod cl_ticks;
 #[cfg(test)]
 mod config_validation;
 mod discovery;
