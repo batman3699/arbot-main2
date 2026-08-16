@@ -108,6 +108,9 @@ async fn main() -> Result<()> {
     let (token0, token1) = pool_tokens(provider.clone(), pool).await?;
 
     let mut worst_multi_bps: i64 = 0;
+    let mut non_exhausted: usize = 0;
+    let mut unrepresentable: usize = 0;
+    let total = amounts.len();
     for amount in amounts {
         let on_chain = quoter
             .quote_path(vec![(token0, None), (token1, Some(fee_ppm))], amount, block)
@@ -118,16 +121,30 @@ async fn main() -> Result<()> {
             .unwrap_or_default();
         let multi = cl_swap::quote_exact_input_multi_tick(&state, &ladder, amount, true, 128);
 
-        let err_bps = |model: U256| -> i64 {
+        // Returns `None` when the ratio is not representable. `U256::as_u64()`
+        // PANICS on a value that does not fit, and the value that would not fit
+        // is precisely a catastrophic model error — a units or decimals bug
+        // producing an output orders of magnitude off. That is the single most
+        // important thing this harness could ever report, so it must not crash
+        // there. `None` is rendered as a loud marker instead.
+        let err_bps = |model: U256| -> Option<i64> {
             if on_chain.is_zero() {
-                return 0;
+                return None;
             }
             let (diff, sign) = if model >= on_chain {
                 (model - on_chain, 1i64)
             } else {
                 (on_chain - model, -1i64)
             };
-            sign * (diff * U256::from(10_000u64) / on_chain).as_u64() as i64
+            let scaled = diff.checked_mul(U256::from(10_000u64))? / on_chain;
+            if scaled > U256::from(i64::MAX as u64) {
+                return None;
+            }
+            Some(sign * (scaled.as_u64() as i64))
+        };
+        let show = |v: Option<i64>| match v {
+            Some(b) => b.to_string(),
+            None => "OVERFLOW".to_string(),
         };
 
         let (multi_out, crossed, exhausted) = match multi {
@@ -135,17 +152,45 @@ async fn main() -> Result<()> {
             None => (U256::zero(), 0, true),
         };
         let multi_bps = err_bps(multi_out);
-        if !exhausted && multi_bps.abs() > worst_multi_bps.abs() {
-            worst_multi_bps = multi_bps;
+        if !exhausted {
+            non_exhausted += 1;
+            match multi_bps {
+                Some(b) if b.abs() > worst_multi_bps.abs() => worst_multi_bps = b,
+                // A non-representable error on a row we are actually judging is
+                // a failure, not a curiosity.
+                None => unrepresentable += 1,
+                _ => {}
+            }
         }
 
         println!(
-            "{amount},{single},{multi_out},{crossed},{exhausted},{},{multi_bps}",
-            err_bps(single)
+            "{amount},{single},{multi_out},{crossed},{exhausted},{},{}",
+            show(err_bps(single)),
+            show(multi_bps)
         );
     }
 
-    println!("\nworst non-exhausted multi-tick error: {worst_multi_bps} bps");
+    // A verdict drawn from zero judged samples is worthless. Without this, a
+    // sweep whose every amount exhausts the ladder leaves `worst_multi_bps` at
+    // its initial 0 and prints PASS having validated nothing — and anything
+    // grepping for "PASS" would rubber-stamp itself.
+    if non_exhausted == 0 {
+        return Err(anyhow!(
+            "INCONCLUSIVE: all {} samples exhausted the ladder, so nothing was validated. \
+             Use smaller amounts, or raise ARBOT_CL_LADDER_WORDS / ARBOT_CL_MAX_TICKS.",
+            total
+        ));
+    }
+    if unrepresentable > 0 {
+        return Err(anyhow!(
+            "{unrepresentable} of {non_exhausted} judged samples produced an unrepresentable \
+             error ratio — the model output is implausible. Do NOT enable ARBOT_CL_MULTI_TICK."
+        ));
+    }
+
+    println!(
+        "\njudged {non_exhausted} non-exhausted samples; worst multi-tick error: {worst_multi_bps} bps"
+    );
     if worst_multi_bps.abs() > 5 {
         return Err(anyhow!(
             "multi-tick deviates from the on-chain quoter by {worst_multi_bps} bps (limit 5) — do NOT enable ARBOT_CL_MULTI_TICK"
