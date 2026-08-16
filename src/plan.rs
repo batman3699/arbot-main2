@@ -2001,4 +2001,71 @@ mod tests {
             .expect("hop prices");
         assert!(!used_multi, "flag off must keep the single-tick path");
     }
+
+    /// The one branch that skips the haircut. Pins it against the inversion
+    /// that would otherwise pass the whole suite.
+    #[test]
+    fn hop_expected_out_does_not_haircut_a_successful_multi_tick_quote() {
+        let _guard = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ARBOT_CL_MULTI_TICK", "1");
+
+        // Same fixture shape as `cl_hop_expected_out_uses_the_curve_not_the_secant`,
+        // with a ladder attached. 5e9 crosses tick -60 exactly once and stops
+        // mid-range, so the quote is NOT exhausted (see the sizing note in the
+        // `cl_hop_out` tests above for where those bounds come from).
+        let ladder = std::sync::Arc::new(crate::cl_swap::TickLadder::new(
+            vec![(-180, 50_000_000_000), (-60, 500_000_000_000)],
+            -180,
+            180,
+        ));
+        let amount_in = U256::from(5_000_000_000u64);
+
+        let cl_state = crate::cl_sim::ClPoolState {
+            sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
+            liquidity: 1_000_000_000_000,
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 3_000,
+        };
+        // rate_num/rate_den = 1:1, as in the sibling fixture — the linear
+        // estimate is irrelevant to this test; only the haircut matters.
+        let edge = Edge {
+            from: addr(1),
+            to: addr(2),
+            rate_num: U256::from(1u64),
+            rate_den: U256::from(1u64),
+            venue: VenueEdge::UniV3 {
+                path: vec![(addr(1), Some(3000))],
+                pool: addr(99),
+                fee: 3000,
+                state: Some(cl_state.clone()),
+            },
+            estimated_gas: 0,
+            weight: compute_edge_weight(U256::from(1u64), U256::from(1u64)),
+            max_input: U256::zero(),
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+            tick_ladder: Some(ladder.clone()),
+        };
+
+        let (multi_out, used_multi) =
+            cl_hop_out(&cl_state, Some(ladder.as_ref()), amount_in, true).expect("multi quote");
+        assert!(used_multi, "fixture must produce a non-exhausted multi-tick quote");
+
+        let actual = hop_expected_out(&edge, edge.from, amount_in);
+
+        assert_eq!(
+            actual, multi_out,
+            "a successful multi-tick quote must pass through UNDISCOUNTED"
+        );
+        assert!(
+            actual > crate::util::apply_slippage(multi_out, cl_tick_buffer_bps()),
+            "the tick buffer must NOT be applied on top of a modelled crossing — \
+             if this fails, the two match arms in hop_expected_out are inverted"
+        );
+
+        std::env::remove_var("ARBOT_CL_MULTI_TICK");
+    }
 }
