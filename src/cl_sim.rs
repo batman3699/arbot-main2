@@ -26,11 +26,9 @@ abigen!(
 pub struct ClPoolState {
     pub sqrt_price_x96: U256,
     pub liquidity: u128,
-    // Populated from chain but not yet consumed (single-tick sim doesn't cross
-    // ticks); retained for the planned multi-tick simulation.
-    #[allow(dead_code)]
+    /// Current tick from `slot0`. Drives ladder navigation in `cl_swap`.
     pub tick: i32,
-    #[allow(dead_code)]
+    /// Pool tick spacing. Drives bitmap word/bit decomposition in `cl_ticks`.
     pub tick_spacing: i32,
     /// Swap fee in hundredths of a bip (UniV3 fee tier or on-chain fee()).
     pub fee_ppm: u32,
@@ -364,6 +362,28 @@ where
     Ok(())
 }
 
+/// Multi-tick simulation. Default OFF: it changes quoted prices on a funded
+/// bot, so it stays behind a flag until `cl_parity` shows agreement with the
+/// on-chain quoter.
+pub fn multi_tick_enabled() -> bool {
+    crate::util::env_flag("ARBOT_CL_MULTI_TICK", false)
+}
+
+/// Bitmap words fetched per side when building a ladder.
+pub fn cl_ladder_words() -> usize {
+    crate::util::env_parse_opt::<usize>("ARBOT_CL_LADDER_WORDS")
+        .unwrap_or(2)
+        .clamp(1, crate::cl_ticks::MAX_TICK_WORDS)
+}
+
+/// Ceiling on tick crossings per quote. A swap needing more is reported
+/// exhausted rather than quoted, bounding worst-case loop cost.
+pub fn cl_max_ticks_crossed() -> u32 {
+    crate::util::env_parse_opt::<u32>("ARBOT_CL_MAX_TICKS")
+        .unwrap_or(128)
+        .clamp(1, 1_024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +458,31 @@ mod tests {
         // Short/empty returndata must not panic.
         assert_eq!(decode_int24(&[0u8; 8]), 0);
         assert_eq!(decode_int24(&[]), 0);
+    }
+
+    #[test]
+    fn multi_tick_defaults_off() {
+        let _guard = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ARBOT_CL_MULTI_TICK");
+        assert!(
+            !multi_tick_enabled(),
+            "multi-tick must stay off until the parity harness is green"
+        );
+    }
+
+    #[test]
+    fn multi_tick_honours_the_flag() {
+        let _guard = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ARBOT_CL_MULTI_TICK", "1");
+        assert!(multi_tick_enabled());
+        std::env::remove_var("ARBOT_CL_MULTI_TICK");
+    }
+
+    #[test]
+    fn ladder_words_is_clamped_to_the_word_ceiling() {
+        let _guard = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ARBOT_CL_LADDER_WORDS", "999");
+        assert!(cl_ladder_words() <= crate::cl_ticks::MAX_TICK_WORDS);
+        std::env::remove_var("ARBOT_CL_LADDER_WORDS");
     }
 }
