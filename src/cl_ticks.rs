@@ -227,6 +227,136 @@ pub async fn build_ladder<S: TickDataSource + ?Sized>(
     Ok(TickLadder::new(ticks, lower_bound, upper_bound))
 }
 
+use ethers::providers::{JsonRpcClient, Provider};
+use std::sync::Arc;
+use tracing::debug;
+
+/// Selector for `tickBitmap(int16)`.
+fn tick_bitmap_selector() -> [u8; 4] {
+    let h = ethers::utils::keccak256(b"tickBitmap(int16)");
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// Selector for `ticks(int24)`.
+fn ticks_selector() -> [u8; 4] {
+    let h = ethers::utils::keccak256(b"ticks(int24)");
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// ABI-encode a signed 32-bit value into a sign-extended 32-byte word.
+fn encode_signed_word(value: i32) -> [u8; 32] {
+    let mut word = if value < 0 { [0xffu8; 32] } else { [0u8; 32] };
+    word[28..32].copy_from_slice(&value.to_be_bytes());
+    word
+}
+
+pub(crate) fn tick_bitmap_calldata(word_pos: i16) -> Vec<u8> {
+    let mut call = tick_bitmap_selector().to_vec();
+    call.extend_from_slice(&encode_signed_word(i32::from(word_pos)));
+    call
+}
+
+pub(crate) fn ticks_calldata(tick: i32) -> Vec<u8> {
+    let mut call = ticks_selector().to_vec();
+    call.extend_from_slice(&encode_signed_word(tick));
+    call
+}
+
+/// Decode `liquidityNet` — the second field of the 8-field `ticks()` struct —
+/// as a signed 128-bit value.
+///
+/// Requires only `len >= 64` rather than the full 256-byte struct, so it stays
+/// correct on UniV3 forks that extend the tail of `Tick.Info`. Reading the
+/// FIRST field instead would silently return `liquidityGross`, which is always
+/// non-negative and would make every tick crossing add liquidity.
+pub fn decode_liquidity_net(data: &[u8]) -> Option<i128> {
+    if data.len() < 64 {
+        return None;
+    }
+    let word = &data[32..64];
+    // int128 occupies the low 16 bytes, sign-extended across the word.
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&word[16..32]);
+    Some(i128::from_be_bytes(buf))
+}
+
+/// Tick data read from chain via Multicall3.
+pub struct RpcTickSource<C> {
+    provider: Arc<Provider<C>>,
+}
+
+impl<C> RpcTickSource<C> {
+    pub fn new(provider: Arc<Provider<C>>) -> Self {
+        Self { provider }
+    }
+}
+
+#[async_trait]
+impl<C> TickDataSource for RpcTickSource<C>
+where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    async fn tick_words(
+        &self,
+        pool: Address,
+        word_positions: &[i16],
+        block: U64,
+    ) -> Result<Vec<Option<U256>>> {
+        if word_positions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let calls: Vec<(Address, Vec<u8>)> = word_positions
+            .iter()
+            .map(|w| (pool, tick_bitmap_calldata(*w)))
+            .collect();
+        let results =
+            crate::quote_cl::multicall3_aggregate3(&self.provider, &calls, block).await?;
+        Ok(results
+            .into_iter()
+            .map(|r| match r {
+                Some(bytes) if bytes.len() >= 32 => Some(U256::from_big_endian(&bytes[..32])),
+                _ => None,
+            })
+            .collect())
+    }
+
+    async fn liquidity_net(
+        &self,
+        pool: Address,
+        ticks: &[i32],
+        block: U64,
+    ) -> Result<Vec<Option<i128>>> {
+        if ticks.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Chunked so one aggregate3 stays inside node eth_call gas limits,
+        // matching the 32-pool convention in `cl_sim::load_cl_pool_states_batched`.
+        const TICKS_PER_BATCH: usize = 128;
+        let mut out = Vec::with_capacity(ticks.len());
+        for chunk in ticks.chunks(TICKS_PER_BATCH) {
+            let calls: Vec<(Address, Vec<u8>)> =
+                chunk.iter().map(|t| (pool, ticks_calldata(*t))).collect();
+            match crate::quote_cl::multicall3_aggregate3(&self.provider, &calls, block).await {
+                Ok(results) => {
+                    out.extend(results.into_iter().map(|r| {
+                        r.as_deref().and_then(decode_liquidity_net)
+                    }));
+                }
+                Err(err) => {
+                    debug!(
+                        target: "cl_ticks",
+                        error = %err,
+                        ticks = chunk.len(),
+                        "batched ticks() read failed; ladder will be short"
+                    );
+                    out.extend(std::iter::repeat(None).take(chunk.len()));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -406,5 +536,50 @@ mod tests {
 
         assert!(ladder.is_empty());
         assert_eq!(ladder.next_initialized(0, true), crate::cl_swap::LadderStep::Exhausted);
+    }
+
+    #[test]
+    fn tick_bitmap_calldata_encodes_signed_word_position() {
+        let call = tick_bitmap_calldata(-1);
+        assert_eq!(call.len(), 36, "4-byte selector + one 32-byte word");
+        // int16 -1 sign-extends to all-ones.
+        assert!(call[4..36].iter().all(|b| *b == 0xff), "-1 must sign-extend");
+
+        let call = tick_bitmap_calldata(1);
+        assert_eq!(call[35], 1);
+        assert!(call[4..35].iter().all(|b| *b == 0), "positive word must zero-extend");
+    }
+
+    #[test]
+    fn ticks_calldata_encodes_signed_tick() {
+        let call = ticks_calldata(-60);
+        assert_eq!(call.len(), 36);
+        assert_eq!(&call[33..36], &[0xff, 0xff, 0xc4], "-60 in two's complement");
+        assert!(call[4..33].iter().all(|b| *b == 0xff), "-60 must sign-extend");
+    }
+
+    /// `liquidityNet` is the SECOND field of the `ticks()` tuple. Reading the
+    /// first (`liquidityGross`, always positive) instead would silently make
+    /// every crossing add liquidity.
+    #[test]
+    fn decode_liquidity_net_reads_the_second_field_signed() {
+        let mut data = vec![0u8; 256];
+        // Field 0: liquidityGross = 5 (must be ignored).
+        data[31] = 5;
+        // Field 1: liquidityNet = -1.
+        for b in data[32..64].iter_mut() {
+            *b = 0xff;
+        }
+        assert_eq!(decode_liquidity_net(&data), Some(-1));
+
+        let mut data = vec![0u8; 256];
+        data[63] = 7;
+        assert_eq!(decode_liquidity_net(&data), Some(7));
+    }
+
+    #[test]
+    fn decode_liquidity_net_rejects_short_return_data() {
+        assert_eq!(decode_liquidity_net(&[0u8; 32]), None);
+        assert_eq!(decode_liquidity_net(&[]), None);
     }
 }
