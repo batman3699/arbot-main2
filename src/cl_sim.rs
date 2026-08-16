@@ -41,6 +41,54 @@ pub struct ClPoolState {
 #[cfg(test)]
 pub(crate) static CL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// RAII guard that restores `ARBOT_CL_MULTI_TICK` to its pre-guard value when
+/// dropped — including when the drop happens during panic unwinding.
+///
+/// `CL_ENV_LOCK` only serialises access to the var across tests; it does
+/// nothing about a single test that panics on an assertion between
+/// `set_var`/`remove_var` and its intended trailing cleanup. Without this
+/// guard that leaves the flag set (or cleared) for whichever test the process
+/// happens to run next, which is a spurious, cascading, hard-to-reproduce
+/// failure — not a real bug in the code under test. `Drop::drop` runs on
+/// unwind, so constructing this guard right after taking `CL_ENV_LOCK` makes
+/// cleanup unconditional.
+///
+/// Lives here (not in main.rs's test module), following `CL_ENV_LOCK`, so
+/// both `cl_sim`'s own tests and `plan`'s tests can share one implementation.
+/// Callers must still take `CL_ENV_LOCK` themselves first — this guard
+/// governs value restoration, not cross-test serialisation.
+#[cfg(test)]
+pub(crate) struct MultiTickEnvGuard {
+    previous: Option<String>,
+}
+
+#[cfg(test)]
+impl MultiTickEnvGuard {
+    /// Snapshot the current value, then set `ARBOT_CL_MULTI_TICK = value`.
+    pub(crate) fn set(value: &str) -> Self {
+        let previous = std::env::var("ARBOT_CL_MULTI_TICK").ok();
+        std::env::set_var("ARBOT_CL_MULTI_TICK", value);
+        Self { previous }
+    }
+
+    /// Snapshot the current value, then remove `ARBOT_CL_MULTI_TICK`.
+    pub(crate) fn cleared() -> Self {
+        let previous = std::env::var("ARBOT_CL_MULTI_TICK").ok();
+        std::env::remove_var("ARBOT_CL_MULTI_TICK");
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for MultiTickEnvGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("ARBOT_CL_MULTI_TICK", value),
+            None => std::env::remove_var("ARBOT_CL_MULTI_TICK"),
+        }
+    }
+}
+
 pub fn local_cl_quotes_enabled() -> bool {
     std::env::var("ARBOT_LOCAL_CL_QUOTES")
         .map(|raw| !matches!(raw.to_ascii_lowercase().as_str(), "0" | "false" | "no"))
@@ -462,8 +510,8 @@ mod tests {
 
     #[test]
     fn multi_tick_defaults_off() {
-        let _guard = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("ARBOT_CL_MULTI_TICK");
+        let _lock = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = MultiTickEnvGuard::cleared();
         assert!(
             !multi_tick_enabled(),
             "multi-tick must stay off until the parity harness is green"
@@ -472,10 +520,9 @@ mod tests {
 
     #[test]
     fn multi_tick_honours_the_flag() {
-        let _guard = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("ARBOT_CL_MULTI_TICK", "1");
+        let _lock = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = MultiTickEnvGuard::set("1");
         assert!(multi_tick_enabled());
-        std::env::remove_var("ARBOT_CL_MULTI_TICK");
     }
 
     #[test]

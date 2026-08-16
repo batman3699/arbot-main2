@@ -1922,8 +1922,8 @@ mod tests {
 
     #[test]
     fn cl_hop_out_uses_the_ladder_when_multi_tick_is_enabled() {
-        let _guard = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("ARBOT_CL_MULTI_TICK", "1");
+        let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cl_sim::MultiTickEnvGuard::set("1");
 
         let state = crate::cl_sim::ClPoolState {
             sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
@@ -1956,14 +1956,12 @@ mod tests {
             .expect("single call")
             .expect("single quote");
         assert!(out < single, "multi-tick must be below the optimistic estimate");
-
-        std::env::remove_var("ARBOT_CL_MULTI_TICK");
     }
 
     #[test]
     fn cl_hop_out_falls_back_when_the_ladder_is_exhausted() {
-        let _guard = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("ARBOT_CL_MULTI_TICK", "1");
+        let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cl_sim::MultiTickEnvGuard::set("1");
 
         let state = crate::cl_sim::ClPoolState {
             sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
@@ -1979,14 +1977,12 @@ mod tests {
         let (_, used_multi) =
             cl_hop_out(&state, Some(&ladder), amount_in, true).expect("hop prices");
         assert!(!used_multi, "an exhausted ladder must fall back, not be trusted");
-
-        std::env::remove_var("ARBOT_CL_MULTI_TICK");
     }
 
     #[test]
     fn cl_hop_out_ignores_the_ladder_when_the_flag_is_off() {
-        let _guard = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("ARBOT_CL_MULTI_TICK");
+        let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cl_sim::MultiTickEnvGuard::cleared();
 
         let state = crate::cl_sim::ClPoolState {
             sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
@@ -2006,8 +2002,8 @@ mod tests {
     /// that would otherwise pass the whole suite.
     #[test]
     fn hop_expected_out_does_not_haircut_a_successful_multi_tick_quote() {
-        let _guard = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("ARBOT_CL_MULTI_TICK", "1");
+        let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cl_sim::MultiTickEnvGuard::set("1");
 
         // Same fixture shape as `cl_hop_expected_out_uses_the_curve_not_the_secant`,
         // with a ladder attached. 5e9 crosses tick -60 exactly once and stops
@@ -2065,7 +2061,5 @@ mod tests {
             "the tick buffer must NOT be applied on top of a modelled crossing — \
              if this fails, the two match arms in hop_expected_out are inverted"
         );
-
-        std::env::remove_var("ARBOT_CL_MULTI_TICK");
     }
 }
