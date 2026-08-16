@@ -109,7 +109,8 @@ pub struct MultiTickQuote {
     pub exhausted: bool,
 }
 
-/// Apply a signed liquidity delta, saturating at the u128 domain edges.
+/// Apply a signed liquidity delta. Returns `None` (never saturates) if the
+/// result would over/underflow `u128` — the caller treats that as exhaustion.
 fn apply_liquidity_net(liquidity: u128, liquidity_net: i128) -> Option<u128> {
     if liquidity_net >= 0 {
         liquidity.checked_add(liquidity_net.unsigned_abs())
@@ -187,6 +188,13 @@ pub fn quote_exact_input_multi_tick(
             // Stopped mid-range: the input is spent. v3-core would recompute
             // `tick` here via `getTickAtSqrtRatio`; the loop exits on the next
             // condition check and never reads it, so it is omitted.
+            break;
+        }
+        if remaining.is_zero() {
+            // Input landed exactly on the boundary. The fill is COMPLETE —
+            // crossing now would only matter if there were more to swap, and
+            // running the crossing guards here can mislabel a complete quote
+            // as exhausted.
             break;
         }
 
@@ -379,6 +387,71 @@ mod tests {
             "multi-tick {} must be below the optimistic single-tick {}",
             multi.amount_out,
             single
+        );
+    }
+
+    /// The mirror of `crossing_swap_is_below_the_constant_liquidity_estimate`
+    /// for the `!zero_for_one` (one_for_zero) direction: the loop must not
+    /// negate `liquidity_net` above the starting price, and must advance
+    /// `tick` to `next_tick` (not `next_tick - 1`) after crossing upward.
+    /// Neither of those is exercised by ladder-navigation tests alone.
+    #[test]
+    fn crossing_swap_works_for_one_for_zero() {
+        // Ticks above the current price carry NEGATIVE liquidity_net (see the
+        // SIGN CONVENTION note above). The loop does not negate net when
+        // `!zero_for_one`, so crossing 60 upward applies -500e9 directly,
+        // dropping liquidity from 1000e9 to 500e9 — still positive, so the
+        // swap continues rather than exhausting on that count. A second,
+        // far-away tick (6000) keeps the ladder from running out of coverage:
+        // `amount_in` is enough to fully cross 60 but far short of what a
+        // ~2970-tick price move to 6000 would need, so the loop stops
+        // mid-range on the way there and exits via the ordinary "stopped
+        // mid-range" break rather than exhaustion.
+        let l = TickLadder::new(
+            vec![(60, -500_000_000_000), (6_000, -100_000_000_000)],
+            -180,
+            6_000,
+        );
+        let state = pool_state(1_000_000_000_000, 3_000);
+        let amount_in = U256::from(10_000_000_000u64);
+
+        let quote = quote_exact_input_multi_tick(&state, &l, amount_in, false, 128)
+            .expect("multi-tick quote");
+
+        assert_eq!(quote.ticks_crossed, 1, "this size must cross tick 60 upward and stop before 6000");
+        assert!(!quote.exhausted, "sufficient remaining liquidity and coverage must not exhaust");
+    }
+
+    /// The bug this regression pins: a step that lands EXACTLY on a tick
+    /// boundary while consuming precisely all of `remaining` must not fall
+    /// through into the crossing guards and get mislabelled `exhausted`. The
+    /// fill is complete the moment `remaining` hits zero.
+    ///
+    /// These constants are an exact fixed-point tie between `amount_in` and
+    /// `amount_in_full + fee_amount` for this liquidity/tick/fee combination.
+    /// If `compute_swap_step`'s fee or delta rounding ever changes, this test
+    /// will fail and must be RE-DERIVED (new exact numbers for the new
+    /// rounding), not loosened — the point is exactness, not an approximate
+    /// tolerance.
+    #[test]
+    fn exact_boundary_fill_is_not_exhausted() {
+        // net exactly equals current liquidity, so crossing tick -60 downward
+        // zeroes liquidity and would trip the liquidity guard on the next
+        // iteration IF the loop incorrectly tried to keep going.
+        let l = TickLadder::new(vec![(-60, 1_000_000_000_000)], -180, 180);
+        let state = pool_state(1_000_000_000_000, 3_000);
+        let amount_in = U256::from(3_013_394_246u64);
+
+        let quote = quote_exact_input_multi_tick(&state, &l, amount_in, true, 128)
+            .expect("multi-tick quote");
+
+        assert!(
+            !quote.exhausted,
+            "a fill that lands exactly on a boundary and spends all of amount_in is complete, not exhausted"
+        );
+        assert_eq!(
+            quote.amount_in_consumed, amount_in,
+            "amount_in_consumed must equal amount_in for a complete fill"
         );
     }
 
