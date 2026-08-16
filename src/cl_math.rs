@@ -222,6 +222,97 @@ pub fn get_next_sqrt_price_from_input(
     }
 }
 
+/// One exact-input swap step within a single tick range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapStep {
+    /// Price after this step. Equals `sqrt_price_target` iff the range was
+    /// fully traversed.
+    pub sqrt_price_next: U256,
+    /// Input consumed, excluding fee.
+    pub amount_in: U256,
+    /// Output produced.
+    pub amount_out: U256,
+    /// Fee taken from input.
+    pub fee_amount: U256,
+}
+
+/// Uniswap v3-core `SwapMath.computeSwapStep`, exact-input branch only.
+pub fn compute_swap_step(
+    sqrt_price_current: U256,
+    sqrt_price_target: U256,
+    liquidity: u128,
+    amount_remaining: U256,
+    fee_ppm: u32,
+) -> Option<SwapStep> {
+    if liquidity == 0 || sqrt_price_current.is_zero() || sqrt_price_target.is_zero() {
+        return None;
+    }
+    let fee = U256::from(fee_ppm.min(1_000_000));
+    let one = U256::from(1_000_000u64);
+    let fee_complement = one.checked_sub(fee)?;
+    if fee_complement.is_zero() {
+        return None;
+    }
+
+    let zero_for_one = sqrt_price_current >= sqrt_price_target;
+    let amount_remaining_less_fee = mul_div_checked(amount_remaining, fee_complement, one)?;
+
+    // Input required to traverse the whole range, rounded up (the pool
+    // rounds in its own favour).
+    let amount_in_full = if zero_for_one {
+        get_amount0_delta(sqrt_price_target, sqrt_price_current, liquidity, true)?
+    } else {
+        get_amount1_delta(sqrt_price_current, sqrt_price_target, liquidity, true)?
+    };
+
+    let sqrt_price_next = if amount_remaining_less_fee >= amount_in_full {
+        sqrt_price_target
+    } else {
+        get_next_sqrt_price_from_input(
+            sqrt_price_current,
+            liquidity,
+            amount_remaining_less_fee,
+            zero_for_one,
+        )?
+    };
+
+    let reached_target = sqrt_price_next == sqrt_price_target;
+
+    let (amount_in, amount_out) = if zero_for_one {
+        let a_in = if reached_target {
+            amount_in_full
+        } else {
+            get_amount0_delta(sqrt_price_next, sqrt_price_current, liquidity, true)?
+        };
+        let a_out = get_amount1_delta(sqrt_price_next, sqrt_price_current, liquidity, false)?;
+        (a_in, a_out)
+    } else {
+        let a_in = if reached_target {
+            amount_in_full
+        } else {
+            get_amount1_delta(sqrt_price_current, sqrt_price_next, liquidity, true)?
+        };
+        let a_out = get_amount0_delta(sqrt_price_current, sqrt_price_next, liquidity, false)?;
+        (a_in, a_out)
+    };
+
+    // When the step stops short, all remaining input is consumed and the
+    // difference is fee. Otherwise the fee is the proportional charge on
+    // what was actually spent.
+    let fee_amount = if reached_target {
+        mul_div_rounding_up(amount_in, fee, fee_complement)?
+    } else {
+        amount_remaining.checked_sub(amount_in)?
+    };
+
+    Some(SwapStep {
+        sqrt_price_next,
+        amount_in,
+        amount_out,
+        fee_amount,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +445,69 @@ mod tests {
             get_next_sqrt_price_from_input(start, 1_000u128, U256::zero(), true),
             Some(start)
         );
+    }
+
+    /// A step that cannot reach the target must stop short of it and consume
+    /// the whole input.
+    #[test]
+    fn swap_step_stops_short_when_input_is_insufficient() {
+        let current = get_sqrt_ratio_at_tick(0).expect("tick 0");
+        let target = get_sqrt_ratio_at_tick(-600).expect("tick -600");
+        let liquidity = 1_000_000_000_000_000_000u128;
+        let amount_remaining = U256::from(1_000u64);
+
+        let step = compute_swap_step(current, target, liquidity, amount_remaining, 3_000)
+            .expect("step computes");
+
+        assert!(step.sqrt_price_next > target, "must not reach the target");
+        assert!(step.sqrt_price_next < current, "price must fall");
+        assert_eq!(
+            step.amount_in + step.fee_amount,
+            amount_remaining,
+            "an unreached target consumes exactly the remaining input"
+        );
+        assert!(!step.amount_out.is_zero());
+    }
+
+    /// A step with input to spare must land exactly on the target and leave
+    /// the remainder for the next tick range.
+    #[test]
+    fn swap_step_reaches_target_when_input_is_ample() {
+        let current = get_sqrt_ratio_at_tick(0).expect("tick 0");
+        let target = get_sqrt_ratio_at_tick(-60).expect("tick -60");
+        let liquidity = 1_000_000u128;
+        let amount_remaining = U256::from(10u64).pow(U256::from(24u64));
+
+        let step = compute_swap_step(current, target, liquidity, amount_remaining, 3_000)
+            .expect("step computes");
+
+        assert_eq!(step.sqrt_price_next, target, "ample input must reach the target");
+        assert!(
+            step.amount_in + step.fee_amount < amount_remaining,
+            "reaching the target must leave input remaining"
+        );
+    }
+
+    /// The fee is charged on input, so a higher tier yields strictly less out
+    /// for the same input over the same range.
+    #[test]
+    fn swap_step_fee_reduces_output() {
+        let current = get_sqrt_ratio_at_tick(0).expect("tick 0");
+        let target = get_sqrt_ratio_at_tick(-600).expect("tick -600");
+        let liquidity = 1_000_000_000_000_000_000u128;
+        let amount = U256::from(1_000_000u64);
+
+        let cheap = compute_swap_step(current, target, liquidity, amount, 100).expect("100ppm");
+        let dear = compute_swap_step(current, target, liquidity, amount, 10_000).expect("10000ppm");
+
+        assert!(cheap.amount_out > dear.amount_out);
+        assert!(cheap.fee_amount < dear.fee_amount);
+    }
+
+    #[test]
+    fn swap_step_rejects_zero_liquidity() {
+        let current = get_sqrt_ratio_at_tick(0).expect("tick 0");
+        let target = get_sqrt_ratio_at_tick(-60).expect("tick -60");
+        assert!(compute_swap_step(current, target, 0, U256::from(1_000u64), 3_000).is_none());
     }
 }
