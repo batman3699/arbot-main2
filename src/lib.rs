@@ -5,6 +5,7 @@ pub mod abi;
 pub mod abi_fixture;
 pub mod capital;
 pub mod chain;
+pub mod cycle_index;
 pub mod discovery;
 pub mod graph;
 pub mod hot_path;
