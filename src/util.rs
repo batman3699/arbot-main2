@@ -545,7 +545,7 @@ pub fn expand_env_placeholders(raw: &str) -> String {
         if ch == '$' && chars.peek() == Some(&'{') {
             chars.next(); // consume '{'
             let mut var = String::new();
-            while let Some(next) = chars.next() {
+            for next in chars.by_ref() {
                 if next == '}' {
                     break;
                 }
@@ -574,7 +574,7 @@ pub fn parse_endpoint_list(raw: &str) -> Vec<String> {
     raw.split([',', '\n'])
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(|s| expand_env_placeholders(s))
+        .map(expand_env_placeholders)
         .collect()
 }
 

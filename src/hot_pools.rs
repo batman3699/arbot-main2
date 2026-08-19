@@ -1238,7 +1238,7 @@ mod tests {
         // ranking kept the dead one. Arbitrage needs flow, not depth.
         let dead_deep = score_for(1_000_000, 0, 0);
         let live_shallow = score_for(1_000, 0, 45);
-        let mut v = vec![dead_deep, live_shallow.clone()];
+        let mut v = [dead_deep, live_shallow.clone()];
         v.sort_by_key(|s| Reverse(s.score_tuple_with(true, true)));
         assert_eq!(
             v[0].liquidity_score, live_shallow.liquidity_score,
@@ -1250,7 +1250,7 @@ mod tests {
     fn liquidity_still_breaks_ties_between_equally_active_pools() {
         let shallow = score_for(1_000, 0, 20);
         let deep = score_for(1_000_000, 0, 20);
-        let mut v = vec![shallow, deep.clone()];
+        let mut v = [shallow, deep.clone()];
         v.sort_by_key(|s| Reverse(s.score_tuple_with(true, true)));
         assert_eq!(
             v[0].liquidity_score, deep.liquidity_score,
@@ -1263,7 +1263,7 @@ mod tests {
         // Escape hatch back to the old liquidity-first behaviour.
         let dead_deep = score_for(1_000_000, 0, 0);
         let live_shallow = score_for(1_000, 0, 45);
-        let mut v = vec![live_shallow, dead_deep.clone()];
+        let mut v = [live_shallow, dead_deep.clone()];
         v.sort_by_key(|s| Reverse(s.score_tuple_with(false, true)));
         assert_eq!(
             v[0].liquidity_score, dead_deep.liquidity_score,
@@ -1457,7 +1457,7 @@ mod tests {
         // nothing, and must not outrank a cheap pool that actually moved.
         let expensive = score_for_fee(1_000_000, 0, 20, 100);
         let cheap = score_for_fee(1_000, 0, 5, 1);
-        let mut v = vec![expensive, cheap.clone()];
+        let mut v = [expensive, cheap.clone()];
         v.sort_by_key(|s| Reverse(s.score_tuple_with(true, true)));
         assert_eq!(
             v[0].fee_bps, cheap.fee_bps,
@@ -1480,7 +1480,7 @@ mod tests {
         // that emptied the graph of closable cycles.)
         let dear = score_for_fee(1_000, 0, 0, 100);
         let cheap = score_for_fee(1_000, 0, 0, 1);
-        let mut v = vec![dear, cheap.clone()];
+        let mut v = [dear, cheap.clone()];
         v.sort_by_key(|s| Reverse(s.score_tuple_with(true, true)));
         assert_eq!(v[0].fee_bps, cheap.fee_bps, "cheaper pool wins the tie");
     }

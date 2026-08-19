@@ -1505,7 +1505,7 @@ impl OpsInputs {
         // cycles also pay one swap fee per hop, so depth is not free.
         const MAX_HOPS_CEILING: usize = 8;
         if let Some(max_hops) = self.universe.max_hops {
-            if max_hops < 2 || max_hops > MAX_HOPS_CEILING {
+            if !(2..=MAX_HOPS_CEILING).contains(&max_hops) {
                 return Err(anyhow!(
                     "universe.max_hops must be between 2 and {MAX_HOPS_CEILING} (got {max_hops})"
                 ));

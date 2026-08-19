@@ -286,7 +286,7 @@ struct SimForkWork {
 }
 
 fn execute_fork_sim(work: SimForkWork) -> Result<RevmSimResult> {
-    let mut rpc_db = RpcForkDb::new(work.rpc_url.clone(), work.block_number);
+    let mut rpc_db = RpcForkDb::new(work.rpc_url.clone(), work.block_number)?;
     if sim_prefetch_enabled() && Instant::now() < work.deadline {
         let prefetch_start = Instant::now();
         let prefetched = rpc_db.batch_prefetch_accounts(&work.prefetch_addresses, work.deadline);
@@ -447,14 +447,14 @@ fn parse_execution_result(result: &ExecutionResult) -> Result<RevmSimResult> {
 }
 
 fn decode_revert_reason(output: &[u8]) -> String {
-    if output.len() >= 4 && &output[..4] == &[0x08, 0xc3, 0x79, 0xa0] {
+    if output.len() >= 4 && output[..4] == [0x08, 0xc3, 0x79, 0xa0] {
         if let Ok(decoded) = ethers::abi::decode(&[ethers::abi::ParamType::String], &output[4..]) {
             if let Some(reason) = decoded.first().and_then(|t| t.clone().into_string()) {
                 return reason;
             }
         }
     }
-    if output.len() >= 4 && &output[..4] == &[0x4e, 0x48, 0x7b, 0x71] {
+    if output.len() >= 4 && output[..4] == [0x4e, 0x48, 0x7b, 0x71] {
         return "Panic(uint256)".to_string();
     }
     if output.is_empty() {
@@ -941,17 +941,17 @@ struct RpcForkDb {
 }
 
 impl RpcForkDb {
-    fn new(rpc_url: String, block_number: u64) -> Self {
+    fn new(rpc_url: String, block_number: u64) -> Result<Self> {
         let client = BlockingClient::builder()
             .timeout(Duration::from_secs(12))
             .build()
-            .expect("blocking rpc client");
-        Self {
+            .context("blocking rpc client")?;
+        Ok(Self {
             rpc_url: Arc::new(rpc_url),
             block_number,
             client,
             account_cache: std::collections::HashMap::new(),
-        }
+        })
     }
 
     fn batch_prefetch_accounts(&mut self, addresses: &[Address], deadline: Instant) -> usize {
@@ -1259,7 +1259,7 @@ mod tests {
             AccountInfo {
                 balance: U256::from(10u128.pow(18)),
                 nonce: 0,
-                code_hash: keccak256(&[]),
+                code_hash: keccak256([]),
                 code: None,
             },
         );

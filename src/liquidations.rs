@@ -204,7 +204,7 @@ impl CandidateTracker {
                 }
             })
             .collect();
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        scored.sort_by_key(|s| std::cmp::Reverse(s.1));
         scored
             .into_iter()
             .take(self.max_candidates)

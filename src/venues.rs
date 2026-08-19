@@ -3954,13 +3954,13 @@ where
     }
 
     let hot_slipstream_filtered = filter_hot_univ3_pools(hot_slipstream_pools, token_whitelist);
-    let slipstream_enabled = slipstream_quoter.is_some()
-        && slipstream_router != Address::zero()
-        && !hot_slipstream_filtered.is_empty();
-    if slipstream_enabled {
+    let active_slipstream_quoter = slipstream_quoter
+        .as_ref()
+        .filter(|_| slipstream_router != Address::zero() && !hot_slipstream_filtered.is_empty());
+    if let Some(active_quoter) = active_slipstream_quoter {
         if let Some(validation) = slipstream_validation.clone() {
             if slipstream_validation_once.get().is_none() {
-                let quoter = slipstream_quoter.as_ref().expect("slipstream quoter").clone();
+                let quoter = Arc::clone(active_quoter);
                 let chain = chain_name.clone();
                 let env_prefix = chain_env_prefix.to_string();
                 if let Err(err) = slipstream_validation_once
@@ -4013,10 +4013,10 @@ where
         }
     }
 
-    let slipstream_ctx = slipstream_enabled.then(|| SlipstreamEdgeContext {
+    let slipstream_ctx = active_slipstream_quoter.map(|active_quoter| SlipstreamEdgeContext {
         edge_ctx: edge_ctx.clone(),
         allowed_tick_spacings: slipstream_tick_spacings.clone(),
-        quoter: Arc::clone(slipstream_quoter.as_ref().expect("slipstream quoter")),
+        quoter: Arc::clone(active_quoter),
         provider: Arc::clone(&provider),
         router: slipstream_router,
         hot_paths: Arc::clone(&hot_paths),
@@ -4035,11 +4035,13 @@ where
     };
 
     let hot_pancakeswap_filtered = filter_hot_univ3_pools(hot_pancakeswap_pools, token_whitelist);
-    let pancakeswap_enabled = pancakeswap_quoter.is_some() && !hot_pancakeswap_filtered.is_empty();
-    if pancakeswap_enabled {
+    let active_pancakeswap_quoter = pancakeswap_quoter
+        .as_ref()
+        .filter(|_| !hot_pancakeswap_filtered.is_empty());
+    if let Some(active_quoter) = active_pancakeswap_quoter {
         if let Some(validation) = pancakeswap_validation.clone() {
             if pancakeswap_validation_once.get().is_none() {
-                let quoter = pancakeswap_quoter.as_ref().expect("pancakeswap quoter").clone();
+                let quoter = Arc::clone(active_quoter);
                 let chain = chain_name.clone();
                 let env_prefix = chain_env_prefix.to_string();
                 let validation_for_init = validation.clone();
@@ -4090,10 +4092,10 @@ where
             }
         }
     }
-    let pancakeswap_ctx = pancakeswap_enabled.then(|| Univ3EdgeContext {
+    let pancakeswap_ctx = active_pancakeswap_quoter.map(|active_quoter| Univ3EdgeContext {
         edge_ctx: edge_ctx.clone(),
         allowed_fee_tiers: pancakeswap_fee_tiers.clone(),
-        quoter: Arc::clone(pancakeswap_quoter.as_ref().expect("pancakeswap quoter")),
+        quoter: Arc::clone(active_quoter),
         provider: Arc::clone(&provider),
         hot_paths: Arc::clone(&hot_paths),
         quote_semaphore: Arc::clone(&quote_semaphore),

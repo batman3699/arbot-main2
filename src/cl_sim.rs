@@ -211,7 +211,7 @@ where
         .call()
         .await
         .context("CL pool slot0()")?;
-    if U256::from(sqrt_price_x96).is_zero() {
+    if sqrt_price_x96.is_zero() {
         return Ok(None);
     }
 
@@ -232,12 +232,10 @@ where
         .await
         .unwrap_or(60);
     let fee_on_chain = contract.fee().block(block_id).call().await.ok();
-    let fee_ppm = fee_hint
-        .or(fee_on_chain.map(|f| f as u32))
-        .unwrap_or(3_000);
+    let fee_ppm = fee_hint.or(fee_on_chain).unwrap_or(3_000);
 
     Ok(Some(ClPoolState {
-        sqrt_price_x96: U256::from(sqrt_price_x96),
+        sqrt_price_x96,
         liquidity,
         tick,
         tick_spacing,

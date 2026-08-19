@@ -2,7 +2,7 @@ use crate::{metrics::Metrics, util::u256_to_f64, util::WEIGHT_SCALE};
 use dashmap::DashMap;
 use ethers::types::{Address, U256, U512, U64};
 use rayon::prelude::*;
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering as AtomicOrdering};
 use std::sync::Arc;
@@ -274,7 +274,7 @@ impl Graph {
         let mut seen: HashSet<Vec<[u8; 32]>> = HashSet::new();
 
         for &hub in hubs {
-            if self.ix.get(&hub).is_none() {
+            if !self.ix.contains_key(&hub) {
                 continue;
             }
             let reach = self.best_reach_hub_log(&pruned, hub, limits.max_hops);
@@ -299,7 +299,7 @@ impl Graph {
             }
         }
 
-        out.sort_by(|a, b| b.estimated_profit_bps.cmp(&a.estimated_profit_bps));
+        out.sort_by_key(|c| Reverse(c.estimated_profit_bps));
         out.truncate(k);
         out
     }
@@ -546,7 +546,7 @@ impl BellmanFordLimits {
     pub fn sanitized(self) -> Self {
         let min_hops = self.min_hops.max(1);
         let max_hops = self.max_hops.max(1);
-        let max_relaxations = self.max_relaxations.max(1).min(256);
+        let max_relaxations = self.max_relaxations.clamp(1, 256);
         let max_cycles = self.max_cycles.max(1);
         let timeout = if self.timeout.is_zero() {
             Duration::from_millis(1)
@@ -569,6 +569,9 @@ type EdgeWeight = i64;
 type AdjacentEdge = (NodeIx, EdgeWeight, usize);
 type AdjacencyList = Arc<Vec<AdjacentEdge>>;
 type AdjacencyMap = DashMap<NodeIx, AdjacencyList>;
+/// One negative cycle found by the parallel Bellman-Ford sweep, as
+/// `(weight, cycle, edge_indices, start_priority, estimated_profit_bps)`.
+type DiscoveredCycle = (EdgeWeight, Vec<NodeIx>, Vec<usize>, i128, i64);
 
 pub struct Graph {
     pub nodes: Vec<Address>,
@@ -999,7 +1002,7 @@ impl Graph {
             .max()
             .unwrap_or_default();
 
-        let discovered: Vec<(i64, Vec<usize>, Vec<usize>, i128, i64)> = filtered_starts
+        let discovered: Vec<DiscoveredCycle> = filtered_starts
             .par_iter()
             .flat_map(|&(priority, start_idx)| {
                 if abort.load(AtomicOrdering::Relaxed) || timed_out.load(AtomicOrdering::Relaxed) {
@@ -1011,7 +1014,7 @@ impl Graph {
                     timed_out: &timed_out,
                     deadline,
                     allow_abort,
-                    best_gross_scaled: &best_gross_scaled,
+                    best_gross_scaled,
                 };
                 self.bellman_ford_from(start_idx, &limits, &adjacency, search_control)
                     .into_iter()
@@ -1825,7 +1828,7 @@ impl Graph {
                 continue;
             }
             let rate = u256_to_f64(protected) / u256_to_f64(edge.rate_den);
-            if !(rate > 0.0) || !rate.is_finite() {
+            if !rate.is_finite() || rate <= 0.0 {
                 continue;
             }
             best.entry((from_ix, to_ix))
@@ -2044,7 +2047,7 @@ mod tests {
         let edge = cap_edge(a, b, 1, 1, U256::from(10u64));
 
         assert!(cycle_input_capacity(&[], U256::from(5u64)).is_zero());
-        assert!(cycle_input_capacity(&[edge.clone()], U256::zero()).is_zero());
+        assert!(cycle_input_capacity(std::slice::from_ref(&edge), U256::zero()).is_zero());
 
         // A hop that outputs nothing kills the cycle rather than dividing by zero.
         let dead = cap_edge(b, a, 0, 1, U256::MAX);

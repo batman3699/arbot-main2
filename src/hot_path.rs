@@ -82,7 +82,7 @@ impl HotPathCache {
             .iter()
             .map(|(addr, profile)| (*addr, *profile))
             .collect();
-        tokens.sort_by(|a, b| b.1.base_amount.cmp(&a.1.base_amount));
+        tokens.sort_by_key(|t| std::cmp::Reverse(t.1.base_amount));
         let mut hot = HashSet::new();
         for (idx, (addr, profile)) in tokens.into_iter().enumerate() {
             if idx >= self.hot_token_count {

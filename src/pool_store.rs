@@ -170,7 +170,7 @@ pub fn prioritize_cold_pool_inventory(records: &mut Vec<PoolRecord>, max_cold: u
 #[allow(dead_code)]
 pub fn merge_pool_records(existing: Vec<PoolRecord>, incoming: Vec<PoolRecord>) -> Vec<PoolRecord> {
     let mut merged: HashMap<Address, PoolRecord> = HashMap::new();
-    for record in existing.into_iter().chain(incoming.into_iter()) {
+    for record in existing.into_iter().chain(incoming) {
         merged
             .entry(record.pool)
             .and_modify(|entry| {

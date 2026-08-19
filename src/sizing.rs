@@ -633,7 +633,7 @@ async fn optimize_with_evaluator<'a>(
             scored.push((amount, result));
         }
     }
-    scored.sort_by(|a, b| a.0.cmp(&b.0));
+    scored.sort_by_key(|s| s.0);
     if scored.is_empty() {
         return None;
     }
