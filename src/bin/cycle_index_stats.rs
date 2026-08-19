@@ -13,7 +13,7 @@
 //!   cargo run --bin cycle_index_stats -- data/base/uniswap_v3/pools.jsonl [max_hops]
 
 use anyhow::{Context, Result};
-use arb_exec::cycle_index::{CycleIndex, CycleIndexLimits};
+use arb_exec::cycle_index::{CycleIndex, CycleIndexLimits, PoolUniverse};
 use arb_exec::graph::{Edge, Graph, VenueEdge};
 use ethers::types::{Address, U256};
 use std::collections::{HashMap, HashSet};
@@ -100,10 +100,19 @@ fn main() -> Result<()> {
     .filter(|a| graph.ix.contains_key(a))
     .collect();
 
+    // Structure comes from the inventory itself, not from realised edges.
+    let universe = PoolUniverse::from_pools(
+        graph
+            .edges
+            .iter()
+            .filter_map(|e| arb_exec::venues::edge_pool_address(e).map(|p| (p, e.from, e.to))),
+    );
+
     println!("inventory : {path}");
     println!("pools     : {pool_count}");
     println!("tokens    : {}", tokens.len());
     println!("edges     : {} (both directions)", graph.edges.len());
+    println!("pairs     : {} distinct token pairs", universe.pair_count());
     println!("starts    : {} flash-loanable\n", starts.len());
 
     for hops in 2..=max_hops {
@@ -113,7 +122,7 @@ fn main() -> Result<()> {
             max_cycles: 250_000,
         };
         let began = std::time::Instant::now();
-        let idx = CycleIndex::build(&graph, &starts, limits);
+        let idx = CycleIndex::build(&universe, &starts, limits);
         let build_ms = began.elapsed().as_millis();
 
         let mut by_len: HashMap<usize, usize> = HashMap::new();
@@ -139,9 +148,8 @@ fn main() -> Result<()> {
                 let Some(pool) = arb_exec::venues::edge_pool_address(edge) else {
                     continue;
                 };
-                let hops_touched =
-                    CycleIndex::hops_for_pools(&graph, &HashSet::from([pool]));
-                let touched = idx.cycles_touching(hops_touched);
+                let touched =
+                    idx.cycles_touching(universe.hops_for_pools(&HashSet::from([pool])));
                 samples.push(touched.len() as f64 / idx.len() as f64 * 100.0);
             }
             if !samples.is_empty() {

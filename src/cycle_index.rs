@@ -31,10 +31,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-/// Node index into [`Graph::nodes`]. `u32` keeps the index compact; the token
-/// universe is capped far below `u32::MAX` by `TOKEN_WHITELIST_MAX`.
-pub type NodeId = u32;
-
 /// Identifier of a cycle within a [`CycleIndex`].
 pub type CycleId = u32;
 
@@ -72,6 +68,112 @@ impl Default for CycleIndexLimits {
             min_hops: 2,
             max_cycles: 20_000,
         }
+    }
+}
+
+/// The structural input: which pools exist and which token pair each serves.
+///
+/// This is deliberately NOT the graph's realised edge set. An edge only exists
+/// once a pool has quoted successfully, so a pool whose quote times out drops
+/// its token pair from the graph for that scan — and keying structure on the
+/// edge set therefore reported a topology change every time a quote flaked.
+/// Measured: after fixing index-vs-address keying, 8 of 16 scans still rebuilt,
+/// with edge counts oscillating over just three distinct values (747/754/756).
+///
+/// Pool membership is what actually defines the cycle set, and it changes only
+/// when the hot-pool inventory changes.
+#[derive(Clone, Debug, Default)]
+pub struct PoolUniverse {
+    /// pool address -> the unordered token pair it serves.
+    pools: HashMap<Address, (Address, Address)>,
+    /// Distinct unordered token pairs, sorted. The cycle set depends on THIS,
+    /// not on pool count: adding a fourth WETH/USDC fee tier is a new pool but
+    /// not a new edge in the token graph, and must not invalidate the index.
+    pairs: Vec<(Address, Address)>,
+    digest: u64,
+}
+
+// main.rs compiles its own copy of this module; items used only by the
+// library, tests or helper bins read as dead there.
+#[allow(dead_code)]
+impl PoolUniverse {
+    /// Build from `(pool, token_a, token_b)` triples across every venue.
+    pub fn from_pools(pools: impl IntoIterator<Item = (Address, Address, Address)>) -> Self {
+        let mut map: HashMap<Address, (Address, Address)> = HashMap::new();
+        for (pool, a, b) in pools {
+            if a == b {
+                continue;
+            }
+            map.insert(pool, (a, b));
+        }
+
+        let mut pairs: Vec<(Address, Address)> = map
+            .values()
+            .map(|(a, b)| if a <= b { (*a, *b) } else { (*b, *a) })
+            .collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+
+        let mut hasher = DefaultHasher::new();
+        pairs.len().hash(&mut hasher);
+        for (a, b) in &pairs {
+            a.0.hash(&mut hasher);
+            b.0.hash(&mut hasher);
+        }
+
+        Self {
+            pools: map,
+            digest: hasher.finish(),
+            pairs,
+        }
+    }
+
+    pub fn digest(&self) -> u64 {
+        self.digest
+    }
+
+    pub fn pool_count(&self) -> usize {
+        self.pools.len()
+    }
+
+    pub fn pair_count(&self) -> usize {
+        self.pairs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Ordered token hops served by any pool in `changed`. A pool serves both
+    /// directions of its pair.
+    pub fn hops_for_pools(
+        &self,
+        changed: &HashSet<Address>,
+    ) -> HashSet<(Address, Address)> {
+        let mut hops = HashSet::new();
+        for pool in changed {
+            if let Some((a, b)) = self.pools.get(pool) {
+                hops.insert((*a, *b));
+                hops.insert((*b, *a));
+            }
+        }
+        hops
+    }
+
+    /// Directed adjacency over tokens: every pair, both ways.
+    fn adjacency(&self) -> HashMap<Address, Vec<Address>> {
+        let mut adj: HashMap<Address, HashSet<Address>> = HashMap::new();
+        for (a, b) in &self.pairs {
+            adj.entry(*a).or_default().insert(*b);
+            adj.entry(*b).or_default().insert(*a);
+        }
+        adj.into_iter()
+            .map(|(k, v)| {
+                let mut t: Vec<Address> = v.into_iter().collect();
+                t.sort_unstable();
+                (k, t)
+            })
+            .collect()
     }
 }
 
@@ -132,31 +234,6 @@ pub struct CycleIndex {
     pub truncated: bool,
 }
 
-/// Fingerprint of the graph's token adjacency — the thing the cycle set depends
-/// on. Deliberately ignores rates, liquidity and `active`: those change every
-/// block and must NOT invalidate the precomputed set, which is the entire point
-/// of separating structure from state.
-///
-/// Keyed on token ADDRESSES, never node indices. `Graph::add_node` assigns
-/// indices in first-seen order and the graph is rebuilt fresh each scan while
-/// quoting is concurrent, so identical adjacency arrives with different indices
-/// every time. An index-keyed digest therefore reported a structure change on
-/// literally every scan (measured: 11 rebuilds in 11 scans).
-pub fn structure_digest(graph: &Graph) -> u64 {
-    let mut pairs: Vec<(Address, Address)> =
-        graph.edges.iter().map(|e| (e.from, e.to)).collect();
-    pairs.sort_unstable();
-    pairs.dedup();
-
-    let mut hasher = DefaultHasher::new();
-    pairs.len().hash(&mut hasher);
-    for (from, to) in &pairs {
-        from.0.hash(&mut hasher);
-        to.0.hash(&mut hasher);
-    }
-    hasher.finish()
-}
-
 // main.rs compiles its own copy of this module; items used only by the
 // library, tests or helper bins read as dead there.
 #[allow(dead_code)]
@@ -181,10 +258,10 @@ impl CycleIndex {
         self.structure_digest
     }
 
-    /// True when `graph`'s adjacency no longer matches what this index was built
+    /// True when the pool universe no longer matches what this index was built
     /// from. Cheap enough to call per scan.
-    pub fn is_stale(&self, graph: &Graph) -> bool {
-        self.structure_digest != structure_digest(graph)
+    pub fn is_stale(&self, universe: &PoolUniverse) -> bool {
+        self.structure_digest != universe.digest()
     }
 
     /// Cycle ids traversing any of `hops`, deduplicated.
@@ -242,37 +319,17 @@ impl CycleIndex {
         self.contains_tokens(&tokens)
     }
 
-    /// Ordered token hops served by any pool in `pools`, for feeding
-    /// [`Self::cycles_touching`]. A pool serves both directions.
-    pub fn hops_for_pools(
-        graph: &Graph,
-        pools: &HashSet<Address>,
-    ) -> HashSet<(Address, Address)> {
-        let mut hops = HashSet::new();
-        for edge in &graph.edges {
-            let Some(pool) = crate::venues::edge_pool_address(edge) else {
-                continue;
-            };
-            if pools.contains(&pool) {
-                hops.insert((edge.from, edge.to));
-            }
-        }
-        hops
-    }
-
     /// Enumerate cycles reachable from `starts`, shortest first.
     ///
     /// `starts` are the tokens a cycle may open and close on — in practice the
     /// flash-loanable set, since a cycle that cannot be funded cannot be traded.
     /// Restricting starts is what keeps this tractable: unrestricted enumeration
     /// over every token is combinatorial.
-    pub fn build(graph: &Graph, starts: &[Address], limits: CycleIndexLimits) -> Self {
-        let adjacency = structural_adjacency(graph);
-        let start_ids: Vec<NodeId> = starts
-            .iter()
-            .filter_map(|addr| graph.ix.get(addr).map(|ix| *ix as NodeId))
-            .collect();
-
+    ///
+    /// Takes the [`PoolUniverse`] rather than the graph, so a transient quote
+    /// failure cannot look like a topology change.
+    pub fn build(universe: &PoolUniverse, starts: &[Address], limits: CycleIndexLimits) -> Self {
+        let adjacency = universe.adjacency();
         let max_hops = limits.max_hops.max(limits.min_hops);
         let mut seen: HashSet<Vec<Address>> = HashSet::new();
         let mut cycles: Vec<TokenCycle> = Vec::new();
@@ -282,11 +339,13 @@ impl CycleIndex {
         // d+1, so a truncated set is the SHORTEST cycles rather than an
         // arbitrary prefix of a depth-first walk.
         'outer: for depth in limits.min_hops.max(2)..=max_hops {
-            for start in &start_ids {
+            for start in starts {
+                if !adjacency.contains_key(start) {
+                    continue;
+                }
                 let mut path = vec![*start];
-                let mut on_path: HashSet<NodeId> = HashSet::from([*start]);
+                let mut on_path: HashSet<Address> = HashSet::from([*start]);
                 if !enumerate_at_depth(
-                    graph,
                     &adjacency,
                     *start,
                     depth,
@@ -312,38 +371,10 @@ impl CycleIndex {
         Self {
             cycles,
             by_hop,
-            structure_digest: structure_digest(graph),
+            structure_digest: universe.digest(),
             truncated,
         }
     }
-}
-
-/// Distinct directed token pairs, collapsing every pool between the same pair
-/// into ONE structural hop. Parallel pools (WETH/USDC at 100/500/3000/10000)
-/// are the same edge structurally; which one to use — or how to split across
-/// them — is a per-scan pricing decision.
-fn structural_adjacency(graph: &Graph) -> HashMap<NodeId, Vec<NodeId>> {
-    let mut adjacency: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
-    for edge in &graph.edges {
-        let (Some(from), Some(to)) = (graph.ix.get(&edge.from), graph.ix.get(&edge.to)) else {
-            continue;
-        };
-        if from == to {
-            continue;
-        }
-        adjacency
-            .entry(*from as NodeId)
-            .or_default()
-            .insert(*to as NodeId);
-    }
-    adjacency
-        .into_iter()
-        .map(|(k, v)| {
-            let mut targets: Vec<NodeId> = v.into_iter().collect();
-            targets.sort_unstable();
-            (k, targets)
-        })
-        .collect()
 }
 
 /// DFS for simple cycles of exactly `remaining` more hops back to `start`.
@@ -351,12 +382,11 @@ fn structural_adjacency(graph: &Graph) -> HashMap<NodeId, Vec<NodeId>> {
 /// flag truncation rather than silently capping.
 #[allow(clippy::too_many_arguments)]
 fn enumerate_at_depth(
-    graph: &Graph,
-    adjacency: &HashMap<NodeId, Vec<NodeId>>,
-    start: NodeId,
+    adjacency: &HashMap<Address, Vec<Address>>,
+    start: Address,
     remaining: usize,
-    path: &mut Vec<NodeId>,
-    on_path: &mut HashSet<NodeId>,
+    path: &mut Vec<Address>,
+    on_path: &mut HashSet<Address>,
     seen: &mut HashSet<Vec<Address>>,
     out: &mut Vec<TokenCycle>,
     max_cycles: usize,
@@ -373,16 +403,7 @@ fn enumerate_at_depth(
             if *next != start {
                 continue;
             }
-            // Enumeration walks indices for speed, but the cycle is STORED as
-            // tokens so it survives the next rebuild's index reshuffle.
-            let tokens: Vec<Address> = path
-                .iter()
-                .filter_map(|n| graph.nodes.get(*n as usize).copied())
-                .collect();
-            if tokens.len() != path.len() {
-                continue;
-            }
-            let cycle = TokenCycle::canonicalise(tokens);
+            let cycle = TokenCycle::canonicalise(path.clone());
             if seen.insert(cycle.tokens.clone()) {
                 out.push(cycle);
                 if out.len() >= max_cycles {
@@ -399,7 +420,7 @@ fn enumerate_at_depth(
         path.push(*next);
         on_path.insert(*next);
         let ok = enumerate_at_depth(
-            graph, adjacency, start, remaining - 1, path, on_path, seen, out, max_cycles,
+            adjacency, start, remaining - 1, path, on_path, seen, out, max_cycles,
         );
         on_path.remove(next);
         path.pop();
@@ -456,8 +477,15 @@ mod tests {
         graph
     }
 
+    /// Universe view of an existing Graph fixture, so both views stay in step.
+    fn universe_of(graph: &Graph) -> PoolUniverse {
+        PoolUniverse::from_pools(graph.edges.iter().filter_map(|e| {
+            crate::venues::edge_pool_address(e).map(|p| (p, e.from, e.to))
+        }))
+    }
+
     /// Directed triangle 1→2→3→1.
-    pub(crate) fn triangle_graph() -> Graph {
+    fn triangle_graph() -> Graph {
         graph_from(vec![
             edge(addr(1), addr(2), addr(100)),
             edge(addr(2), addr(3), addr(101)),
@@ -476,7 +504,7 @@ mod tests {
     #[test]
     fn enumerates_a_simple_two_hop_cycle() {
         let graph = two_hop_graph();
-        let idx = CycleIndex::build(&graph, &[addr(1)], CycleIndexLimits::default());
+        let idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], CycleIndexLimits::default());
         assert_eq!(idx.len(), 1, "A->B->A is one cycle");
         let cycle = idx.cycle(0).expect("cycle 0");
         assert_eq!(cycle.hops(), 2);
@@ -495,7 +523,7 @@ mod tests {
             edge(addr(2), addr(1), addr(100)),
             edge(addr(2), addr(1), addr(101)),
         ]);
-        let idx = CycleIndex::build(&graph, &[addr(1)], CycleIndexLimits::default());
+        let idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], CycleIndexLimits::default());
         assert_eq!(idx.len(), 1, "5 edges over 1 token pair is still 1 cycle");
     }
 
@@ -509,11 +537,15 @@ mod tests {
             edge(addr(3), addr(1), addr(102)),
         ]);
         let idx = CycleIndex::build(
-            &graph,
+            &universe_of(&graph),
             &[addr(1), addr(2), addr(3)],
             CycleIndexLimits::default(),
         );
-        assert_eq!(idx.len(), 1, "one triangle, three possible entry points");
+        // A pool trades BOTH ways, so the universe is pair-keyed and yields the
+        // triangle in each direction — but only once per direction, however many
+        // entry points reach it.
+        let triangles = idx.cycles().iter().filter(|c| c.hops() == 3).count();
+        assert_eq!(triangles, 2, "one triangle per direction, not per entry point");
     }
 
     #[test]
@@ -527,7 +559,7 @@ mod tests {
             edge(addr(3), addr(2), addr(101)),
             edge(addr(2), addr(1), addr(100)),
         ]);
-        let idx = CycleIndex::build(&graph, &[addr(1)], CycleIndexLimits::default());
+        let idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], CycleIndexLimits::default());
         let triangles = idx.cycles().iter().filter(|c| c.hops() == 3).count();
         assert_eq!(triangles, 2, "both traversal directions are distinct trades");
     }
@@ -541,7 +573,7 @@ mod tests {
             edge(addr(1), addr(3), addr(200)),
             edge(addr(3), addr(1), addr(200)),
         ]);
-        let idx = CycleIndex::build(&graph, &[addr(1)], CycleIndexLimits::default());
+        let idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], CycleIndexLimits::default());
         assert_eq!(idx.len(), 2);
 
         let touched = idx.cycles_touching([(addr(1), addr(2))]);
@@ -558,7 +590,7 @@ mod tests {
     fn pool_addresses_map_to_the_hops_they_serve() {
         let graph = two_hop_graph();
         let pools = HashSet::from([addr(100)]);
-        let hops = CycleIndex::hops_for_pools(&graph, &pools);
+        let hops = universe_of(&graph).hops_for_pools(&pools);
         assert_eq!(hops.len(), 2, "one pool serves both directions of its pair");
     }
 
@@ -585,14 +617,14 @@ mod tests {
             "precondition: insertion order really does shift indices"
         );
         assert_eq!(
-            structure_digest(&forward),
-            structure_digest(&shuffled),
+            universe_of(&forward).digest(),
+            universe_of(&shuffled).digest(),
             "identical adjacency must produce an identical digest"
         );
 
-        let idx = CycleIndex::build(&forward, &[addr(1)], CycleIndexLimits::default());
+        let idx = CycleIndex::build(&universe_of(&forward), &[addr(1)], CycleIndexLimits::default());
         assert!(
-            !idx.is_stale(&shuffled),
+            !idx.is_stale(&universe_of(&shuffled)),
             "a reordered rebuild of the same graph must not invalidate the set"
         );
     }
@@ -612,7 +644,7 @@ mod tests {
             edge(addr(3), addr(1), addr(102)),
             edge(addr(1), addr(2), addr(100)),
         ]);
-        let idx = CycleIndex::build(&forward, &[addr(1)], CycleIndexLimits::default());
+        let idx = CycleIndex::build(&universe_of(&forward), &[addr(1)], CycleIndexLimits::default());
 
         let cycle_in_shuffled = vec![
             shuffled.ix[&addr(1)],
@@ -628,8 +660,8 @@ mod tests {
     #[test]
     fn structure_digest_ignores_state_but_tracks_topology() {
         let graph = two_hop_graph();
-        let idx = CycleIndex::build(&graph, &[addr(1)], CycleIndexLimits::default());
-        assert!(!idx.is_stale(&graph));
+        let idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], CycleIndexLimits::default());
+        assert!(!idx.is_stale(&universe_of(&graph)));
 
         // State churn must NOT invalidate: that is the whole point of splitting
         // structure from state.
@@ -640,14 +672,14 @@ mod tests {
             e.quote_block = Some(1234u64.into());
         }
         assert!(
-            !idx.is_stale(&restated),
+            !idx.is_stale(&universe_of(&restated)),
             "rates/liquidity/active must not invalidate the cycle set"
         );
 
         // A genuinely new token pair must invalidate.
         let mut grown = two_hop_graph();
         grown.add_edge(edge(addr(1), addr(9), addr(300)));
-        assert!(idx.is_stale(&grown), "new adjacency must invalidate");
+        assert!(idx.is_stale(&universe_of(&grown)), "new adjacency must invalidate");
     }
 
     #[test]
@@ -667,7 +699,7 @@ mod tests {
             min_hops: 2,
             max_cycles: 8,
         };
-        let idx = CycleIndex::build(&graph, &[addr(1)], limits);
+        let idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], limits);
         assert!(idx.truncated, "hitting the cap must be reported, not silent");
         assert!(idx.len() <= 8);
         // Iterative deepening means the survivors are the SHORTEST cycles.
@@ -680,7 +712,7 @@ mod tests {
     #[test]
     fn unreachable_start_yields_no_cycles() {
         let graph = two_hop_graph();
-        let idx = CycleIndex::build(&graph, &[addr(42)], CycleIndexLimits::default());
+        let idx = CycleIndex::build(&universe_of(&graph), &[addr(42)], CycleIndexLimits::default());
         assert!(idx.is_empty());
         assert!(!idx.truncated);
     }
@@ -698,20 +730,32 @@ mod tests {
             max_hops: 3,
             ..CycleIndexLimits::default()
         };
-        assert!(CycleIndex::build(&graph, &[addr(1)], tight).is_empty());
+        let tight_idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], tight);
+        assert!(
+            tight_idx.cycles().iter().all(|c| c.hops() <= 3),
+            "max_hops must bind"
+        );
+        assert!(
+            !tight_idx.cycles().iter().any(|c| c.hops() == 4),
+            "the 4-cycle must be excluded below its length"
+        );
 
         let loose = CycleIndexLimits {
             max_hops: 4,
             ..CycleIndexLimits::default()
         };
-        assert_eq!(CycleIndex::build(&graph, &[addr(1)], loose).len(), 1);
+        let loose_idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], loose);
+        assert!(
+            loose_idx.cycles().iter().any(|c| c.hops() == 4),
+            "the 4-cycle must appear once max_hops allows it"
+        );
     }
 
 
     #[test]
     fn contains_nodes_matches_closed_and_rotated_forms() {
         let graph = triangle_graph();
-        let idx = CycleIndex::build(&graph, &[addr(1)], CycleIndexLimits::default());
+        let idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], CycleIndexLimits::default());
         let n1 = graph.ix[&addr(1)];
         let n2 = graph.ix[&addr(2)];
         let n3 = graph.ix[&addr(3)];
@@ -721,8 +765,30 @@ mod tests {
         assert!(idx.contains_nodes_in(&graph, &[n1, n2, n3]), "open form");
         // Any rotation is the same loop.
         assert!(idx.contains_nodes_in(&graph, &[n2, n3, n1, n2]), "rotated closed");
-        // Reversed traversal is a DIFFERENT trade and is absent here.
-        assert!(!idx.contains_nodes_in(&graph, &[n1, n3, n2, n1]), "reverse direction");
+        // Reversed traversal is a DIFFERENT trade, and since a pool trades both
+        // ways the pair-keyed universe contains it too — as its own cycle, not
+        // as a rotation of the forward one.
+        assert!(
+            idx.contains_nodes_in(&graph, &[n1, n3, n2, n1]),
+            "reverse direction is its own tradable cycle"
+        );
         assert!(!idx.contains_nodes_in(&graph, &[]), "empty is not a cycle");
+    }
+
+    #[test]
+    fn pair_keying_makes_adjacency_bidirectional() {
+        // Structural consequence of keying on pools rather than realised edges:
+        // a pool is tradable in both directions regardless of which direction
+        // happened to quote this scan. This newly surfaces the parallel-pool
+        // 2-hop arb (buy on one fee tier, sell on another) that a one-directional
+        // edge view could miss entirely.
+        let one_way = graph_from(vec![edge(addr(1), addr(2), addr(100))]);
+        let idx = CycleIndex::build(
+            &universe_of(&one_way),
+            &[addr(1)],
+            CycleIndexLimits::default(),
+        );
+        assert_eq!(idx.len(), 1, "A<->B is one 2-hop cycle");
+        assert!(idx.contains_tokens(&[addr(1), addr(2)]));
     }
 }

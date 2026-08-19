@@ -4881,6 +4881,27 @@ where
         (!addr.is_zero()).then_some(addr)
     }
 
+    /// Token pairs the configured pool inventory can serve, across every venue.
+    ///
+    /// Reads the hot-pool lists rather than the graph so transient quote
+    /// failures do not register as topology changes.
+    async fn pool_universe(&self) -> crate::cycle_index::PoolUniverse {
+        let mut triples: Vec<(Address, Address, Address)> = Vec::new();
+        for records in [
+            &self.hot_univ3_pools,
+            &self.hot_slipstream_pools,
+            &self.hot_pancakeswap_pools,
+        ] {
+            for r in records.read().await.iter() {
+                triples.push((r.pool, r.token0, r.token1));
+            }
+        }
+        for cfg in self.hot_univ2_pools.read().await.iter() {
+            triples.push((cfg.pair, cfg.token_in, cfg.token_out));
+        }
+        crate::cycle_index::PoolUniverse::from_pools(triples)
+    }
+
     /// Compare the precomputed cycle index against what the live search found.
     ///
     /// Gated on `ARBOT_CYCLE_INDEX_COMPARE`. The search stays authoritative —
@@ -4892,13 +4913,21 @@ where
     ///
     /// The index is rebuilt only when `structure_digest` changes, which is the
     /// whole point: adjacency is near-static while state churns every block.
-    fn compare_cycle_index(&self, graph: &Graph, found: &[crate::graph::CycleCandidate]) {
+    fn compare_cycle_index(
+        &self,
+        graph: &Graph,
+        universe: &crate::cycle_index::PoolUniverse,
+        found: &[crate::graph::CycleCandidate],
+    ) {
         use crate::cycle_index::{CycleIndex, CycleIndexLimits};
 
         let Ok(mut guard) = self.cycle_index.lock() else {
             return;
         };
-        let stale = guard.as_ref().map(|idx| idx.is_stale(graph)).unwrap_or(true);
+        let stale = guard
+            .as_ref()
+            .map(|idx| idx.is_stale(universe))
+            .unwrap_or(true);
         if stale {
             let hubs = self.flash_loan_hub_tokens(graph);
             let limits = CycleIndexLimits {
@@ -4907,10 +4936,12 @@ where
                 ..CycleIndexLimits::default()
             };
             let began = Instant::now();
-            let idx = CycleIndex::build(graph, &hubs, limits);
+            let idx = CycleIndex::build(universe, &hubs, limits);
             info!(
                 cycles = idx.len(),
                 hubs = hubs.len(),
+                pools = universe.pool_count(),
+                pairs = universe.pair_count(),
                 build_ms = began.elapsed().as_millis(),
                 truncated = idx.truncated,
                 "cycle index rebuilt (graph structure changed)"
@@ -4951,8 +4982,7 @@ where
                 .filter(|e| e.active)
                 .filter_map(crate::venues::edge_pool_address)
                 .collect();
-            let hops = CycleIndex::hops_for_pools(graph, &changed);
-            idx.cycles_touching(hops).len()
+            idx.cycles_touching(universe.hops_for_pools(&changed)).len()
         };
 
         if missed > 0 {
@@ -6345,7 +6375,12 @@ where
             // Gated so a bad index can never affect detection while we build
             // confidence that it covers everything the search finds.
             if read_feature_flag("ARBOT_CYCLE_INDEX_COMPARE", false) {
-                self.compare_cycle_index(&graph, &found);
+                // Structure comes from the pool INVENTORY, not the realised edge
+                // set: a pool whose quote timed out this scan is still part of
+                // the topology, and treating it as a structure change was what
+                // made the index rebuild on half of all scans.
+                let universe = self.pool_universe().await;
+                self.compare_cycle_index(&graph, &universe, &found);
             }
 
             let found_total = found.len();
