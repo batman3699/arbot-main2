@@ -58,6 +58,52 @@ fn bps_below(expected: U256, floor: U256) -> u64 {
     mul_div(diff, U256::from(10_000u64), expected).as_u64()
 }
 
+/// Price one CL hop, preferring the multi-tick model.
+///
+/// Returns `(amount_out, used_multi_tick)`. `used_multi_tick` is true only
+/// when a ladder produced a NON-exhausted quote — i.e. when tick crossing was
+/// genuinely modelled. Callers use it to decide whether the
+/// `ARBOT_CL_TICK_BUFFER_BPS` haircut still applies.
+pub fn cl_hop_out(
+    state: &crate::cl_sim::ClPoolState,
+    ladder: Option<&crate::cl_swap::TickLadder>,
+    amount_in: U256,
+    zero_for_one: bool,
+) -> Option<(U256, bool)> {
+    if crate::cl_sim::multi_tick_enabled() {
+        if let Some(ladder) = ladder {
+            if let Some(quote) = crate::cl_swap::quote_exact_input_multi_tick(
+                state,
+                ladder,
+                amount_in,
+                zero_for_one,
+                crate::cl_sim::cl_max_ticks_crossed(),
+            ) {
+                if !quote.exhausted && !quote.amount_out.is_zero() {
+                    return Some((quote.amount_out, true));
+                }
+                tracing::debug!(
+                    target: "minout",
+                    ticks_crossed = quote.ticks_crossed,
+                    ladder_len = ladder.len(),
+                    "multi-tick quote exhausted the ladder; falling back to single-tick"
+                );
+            }
+        }
+    }
+    let out = crate::cl_sim::quote_exact_input_single_tick(
+        state,
+        amount_in,
+        zero_for_one,
+        state.fee_ppm,
+    )
+    .ok()??;
+    if out.is_zero() {
+        return None;
+    }
+    Some((out, false))
+}
+
 fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
     let linear = mul_div(current_amount, edge.rate_num, edge.rate_den);
     match &edge.venue {
@@ -90,26 +136,22 @@ fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
             // UniV3-family pools order tokens by address, so `from` is token0
             // exactly when it sorts below `to`.
             let zero_for_one = edge.from < edge.to;
-            match crate::cl_sim::quote_exact_input_single_tick(
-                cl_state,
-                current_amount,
-                zero_for_one,
-                cl_state.fee_ppm,
-            ) {
-                Ok(Some(out)) if !out.is_zero() => {
-                    // `quote_exact_input_single_tick` holds liquidity CONSTANT —
-                    // it does not cross ticks (`tick`/`tick_spacing` are carried
-                    // but unused, pending multi-tick simulation). Real liquidity
-                    // can fall past a tick boundary, so this estimate is
-                    // systematically OPTIMISTIC for any swap large enough to
-                    // cross one, and a `min_out` built from it sits above what
-                    // the pool pays -> `Too little received`.
-                    //
-                    // Discount it to cover that unmodelled crossing. This is a
-                    // correction for a KNOWN bias, not a loosening of slippage
-                    // protection: without it min_out is simply wrong. Tune with
-                    // ARBOT_CL_TICK_BUFFER_BPS; it can be removed once the
-                    // simulator crosses ticks properly.
+            match cl_hop_out(cl_state, edge.tick_ladder.as_deref(), current_amount, zero_for_one) {
+                // Multi-tick modelled the crossing, so the tick buffer would
+                // double-count it and give up real edge. Use the quote as-is.
+                Some((out, true)) => {
+                    tracing::debug!(
+                        target: "minout",
+                        curve_out = %out,
+                        linear_out = %linear,
+                        "CL hop priced multi-tick"
+                    );
+                    out
+                }
+                // Single-tick fallback: liquidity was held constant, so the
+                // estimate is systematically optimistic and the buffer still
+                // covers the unmodelled crossing.
+                Some((out, false)) => {
                     let discounted = crate::util::apply_slippage(out, cl_tick_buffer_bps());
                     tracing::debug!(
                         target: "minout",
@@ -117,11 +159,11 @@ fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
                         linear_out = %linear,
                         discounted = %discounted,
                         buffer_bps = cl_tick_buffer_bps(),
-                        "CL hop priced on the curve"
+                        "CL hop priced single-tick with crossing buffer"
                     );
                     discounted
                 }
-                _ => linear,
+                None => linear,
             }
         }
         VenueEdge::UniV2 {
@@ -789,6 +831,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         };
 
         let amount_in = U256::from(1_000_000_000u64);
@@ -852,6 +895,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: b,
@@ -874,6 +918,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let plan = build_plan_for_cycle(
@@ -1007,6 +1052,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         };
         let amount_in = U256::from(1_000u64);
         assert_eq!(hop_expected_out(&edge, addr(1), amount_in), U256::from(2_000u64));
@@ -1042,6 +1088,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: b,
@@ -1061,6 +1108,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: c,
@@ -1080,6 +1128,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         let cycle = vec![
@@ -1175,6 +1224,7 @@ mod tests {
             observed_slippage_bps: 100,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: token_out,
@@ -1193,6 +1243,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let cycle = vec![
@@ -1267,6 +1318,7 @@ mod tests {
             observed_slippage_bps: 100,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: token_out,
@@ -1285,6 +1337,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let cycle = vec![
@@ -1348,6 +1401,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         graph.add_edge(Edge {
@@ -1368,6 +1422,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         let cycle = vec![
@@ -1439,6 +1494,7 @@ mod tests {
             observed_slippage_bps: 100,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: token_out,
@@ -1457,6 +1513,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let cycle = vec![
@@ -1528,6 +1585,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
         graph.add_edge(Edge {
             from: token1,
@@ -1546,6 +1604,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let cycle = vec![
@@ -1629,6 +1688,7 @@ mod tests {
             observed_slippage_bps: 50,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         graph.add_edge(Edge {
@@ -1648,6 +1708,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         });
 
         let cycle = vec![
@@ -1766,6 +1827,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         graph.add_edge(Edge {
@@ -1786,6 +1848,7 @@ mod tests {
             quote_block: None,
 
             active: true,
+            tick_ladder: None,
         });
 
         let cycle = vec![
@@ -1855,5 +1918,148 @@ mod tests {
             }
             _ => panic!("expected generic step for univ2"),
         }
+    }
+
+    #[test]
+    fn cl_hop_out_uses_the_ladder_when_multi_tick_is_enabled() {
+        let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cl_sim::MultiTickEnvGuard::set("1");
+
+        let state = crate::cl_sim::ClPoolState {
+            sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
+            liquidity: 1_000_000_000_000,
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 3_000,
+        };
+        // Positive net below the price: crossing -60 downward removes 500e9,
+        // taking liquidity 1000e9 -> 500e9. See the SIGN CONVENTION note in
+        // Task 2.
+        let ladder = crate::cl_swap::TickLadder::new(
+            vec![(-180, 50_000_000_000), (-60, 500_000_000_000)],
+            -180,
+            180,
+        );
+        // Deliberately NOT 10^18: at this pool's tiny synthetic liquidity
+        // (1e12), that size fully drains both ladder ticks (-60 and -180)
+        // after consuming only ~6.04e9 and reports `exhausted`, which is
+        // correct behaviour but not what this test wants to exercise. 5e9
+        // crosses -60 (so the liquidity-drop discount is observed) while
+        // staying below the ~6.04e9 point where the ladder runs out.
+        let amount_in = U256::from(5_000_000_000u64);
+
+        let (out, used_multi) =
+            cl_hop_out(&state, Some(&ladder), amount_in, true).expect("hop prices");
+        assert!(used_multi, "an available ladder must be used");
+
+        let single = crate::cl_sim::quote_exact_input_single_tick(&state, amount_in, true, 3_000)
+            .expect("single call")
+            .expect("single quote");
+        assert!(out < single, "multi-tick must be below the optimistic estimate");
+    }
+
+    #[test]
+    fn cl_hop_out_falls_back_when_the_ladder_is_exhausted() {
+        let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cl_sim::MultiTickEnvGuard::set("1");
+
+        let state = crate::cl_sim::ClPoolState {
+            sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
+            liquidity: 1_000_000_000_000,
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 3_000,
+        };
+        // Coverage far too narrow for the size below.
+        let ladder = crate::cl_swap::TickLadder::new(vec![(-60, 900_000_000_000)], -60, 60);
+        let amount_in = U256::from(10u64).pow(U256::from(24u64));
+
+        let (_, used_multi) =
+            cl_hop_out(&state, Some(&ladder), amount_in, true).expect("hop prices");
+        assert!(!used_multi, "an exhausted ladder must fall back, not be trusted");
+    }
+
+    #[test]
+    fn cl_hop_out_ignores_the_ladder_when_the_flag_is_off() {
+        let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cl_sim::MultiTickEnvGuard::cleared();
+
+        let state = crate::cl_sim::ClPoolState {
+            sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
+            liquidity: 1_000_000_000_000,
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 3_000,
+        };
+        let ladder = crate::cl_swap::TickLadder::new(vec![(-60, 500_000_000_000)], -180, 180);
+
+        let (_, used_multi) = cl_hop_out(&state, Some(&ladder), U256::from(1_000u64), true)
+            .expect("hop prices");
+        assert!(!used_multi, "flag off must keep the single-tick path");
+    }
+
+    /// The one branch that skips the haircut. Pins it against the inversion
+    /// that would otherwise pass the whole suite.
+    #[test]
+    fn hop_expected_out_does_not_haircut_a_successful_multi_tick_quote() {
+        let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cl_sim::MultiTickEnvGuard::set("1");
+
+        // Same fixture shape as `cl_hop_expected_out_uses_the_curve_not_the_secant`,
+        // with a ladder attached. 5e9 crosses tick -60 exactly once and stops
+        // mid-range, so the quote is NOT exhausted (see the sizing note in the
+        // `cl_hop_out` tests above for where those bounds come from).
+        let ladder = std::sync::Arc::new(crate::cl_swap::TickLadder::new(
+            vec![(-180, 50_000_000_000), (-60, 500_000_000_000)],
+            -180,
+            180,
+        ));
+        let amount_in = U256::from(5_000_000_000u64);
+
+        let cl_state = crate::cl_sim::ClPoolState {
+            sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
+            liquidity: 1_000_000_000_000,
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 3_000,
+        };
+        // rate_num/rate_den = 1:1, as in the sibling fixture — the linear
+        // estimate is irrelevant to this test; only the haircut matters.
+        let edge = Edge {
+            from: addr(1),
+            to: addr(2),
+            rate_num: U256::from(1u64),
+            rate_den: U256::from(1u64),
+            venue: VenueEdge::UniV3 {
+                path: vec![(addr(1), Some(3000))],
+                pool: addr(99),
+                fee: 3000,
+                state: Some(cl_state.clone()),
+            },
+            estimated_gas: 0,
+            weight: compute_edge_weight(U256::from(1u64), U256::from(1u64)),
+            max_input: U256::zero(),
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+            tick_ladder: Some(ladder.clone()),
+        };
+
+        let (multi_out, used_multi) =
+            cl_hop_out(&cl_state, Some(ladder.as_ref()), amount_in, true).expect("multi quote");
+        assert!(used_multi, "fixture must produce a non-exhausted multi-tick quote");
+
+        let actual = hop_expected_out(&edge, edge.from, amount_in);
+
+        assert_eq!(
+            actual, multi_out,
+            "a successful multi-tick quote must pass through UNDISCOUNTED"
+        );
+        assert!(
+            actual > crate::util::apply_slippage(multi_out, cl_tick_buffer_bps()),
+            "the tick buffer must NOT be applied on top of a modelled crossing — \
+             if this fails, the two match arms in hop_expected_out are inverted"
+        );
     }
 }

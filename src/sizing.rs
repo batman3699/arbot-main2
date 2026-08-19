@@ -327,13 +327,12 @@ where
             // router quoter below. UniV3-family pools order tokens by address,
             // so `from` is token0 exactly when it sorts below `to`.
             let zero_for_one = edge.from < edge.to;
-            let out = crate::cl_sim::quote_exact_input_single_tick(
+            let (out, used_multi) = crate::plan::cl_hop_out(
                 cl_state,
+                edge.tick_ladder.as_deref(),
                 amount_in,
                 zero_for_one,
-                cl_state.fee_ppm,
-            )
-            .ok()??;
+            )?;
             if out.is_zero() {
                 return None;
             }
@@ -343,6 +342,7 @@ where
             debug!(
                 pool = %format!("0x{}", hex::encode(pool)),
                 ?amount_in,
+                used_multi,
                 "sized hop locally from cached CL state (no RPC)"
             );
             let expected = mul_div(amount_in, edge.rate_num, edge.rate_den);
@@ -990,6 +990,7 @@ mod tests {
             observed_slippage_bps: 75,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         }
     }
 
@@ -1153,6 +1154,7 @@ mod tests {
             observed_slippage_bps: 0,
             quote_block: None,
             active: true,
+            tick_ladder: None,
         };
 
         let (provider, _) = Provider::mocked();

@@ -26,11 +26,9 @@ abigen!(
 pub struct ClPoolState {
     pub sqrt_price_x96: U256,
     pub liquidity: u128,
-    // Populated from chain but not yet consumed (single-tick sim doesn't cross
-    // ticks); retained for the planned multi-tick simulation.
-    #[allow(dead_code)]
+    /// Current tick from `slot0`. Drives ladder navigation in `cl_swap`.
     pub tick: i32,
-    #[allow(dead_code)]
+    /// Pool tick spacing. Drives bitmap word/bit decomposition in `cl_ticks`.
     pub tick_spacing: i32,
     /// Swap fee in hundredths of a bip (UniV3 fee tier or on-chain fee()).
     pub fee_ppm: u32,
@@ -42,6 +40,54 @@ pub struct ClPoolState {
 /// the lib and bin targets, and the lib cannot see bin-only items.
 #[cfg(test)]
 pub(crate) static CL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard that restores `ARBOT_CL_MULTI_TICK` to its pre-guard value when
+/// dropped — including when the drop happens during panic unwinding.
+///
+/// `CL_ENV_LOCK` only serialises access to the var across tests; it does
+/// nothing about a single test that panics on an assertion between
+/// `set_var`/`remove_var` and its intended trailing cleanup. Without this
+/// guard that leaves the flag set (or cleared) for whichever test the process
+/// happens to run next, which is a spurious, cascading, hard-to-reproduce
+/// failure — not a real bug in the code under test. `Drop::drop` runs on
+/// unwind, so constructing this guard right after taking `CL_ENV_LOCK` makes
+/// cleanup unconditional.
+///
+/// Lives here (not in main.rs's test module), following `CL_ENV_LOCK`, so
+/// both `cl_sim`'s own tests and `plan`'s tests can share one implementation.
+/// Callers must still take `CL_ENV_LOCK` themselves first — this guard
+/// governs value restoration, not cross-test serialisation.
+#[cfg(test)]
+pub(crate) struct MultiTickEnvGuard {
+    previous: Option<String>,
+}
+
+#[cfg(test)]
+impl MultiTickEnvGuard {
+    /// Snapshot the current value, then set `ARBOT_CL_MULTI_TICK = value`.
+    pub(crate) fn set(value: &str) -> Self {
+        let previous = std::env::var("ARBOT_CL_MULTI_TICK").ok();
+        std::env::set_var("ARBOT_CL_MULTI_TICK", value);
+        Self { previous }
+    }
+
+    /// Snapshot the current value, then remove `ARBOT_CL_MULTI_TICK`.
+    pub(crate) fn cleared() -> Self {
+        let previous = std::env::var("ARBOT_CL_MULTI_TICK").ok();
+        std::env::remove_var("ARBOT_CL_MULTI_TICK");
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for MultiTickEnvGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("ARBOT_CL_MULTI_TICK", value),
+            None => std::env::remove_var("ARBOT_CL_MULTI_TICK"),
+        }
+    }
+}
 
 pub fn local_cl_quotes_enabled() -> bool {
     std::env::var("ARBOT_LOCAL_CL_QUOTES")
@@ -243,7 +289,13 @@ where
     }))
 }
 
-/// Minimal single-tick exact-input quote. Returns `None` when price would cross ticks.
+/// Minimal single-tick exact-input quote.
+///
+/// Holds liquidity CONSTANT and does NOT cross ticks — `state.tick` and
+/// `state.tick_spacing` are ignored. For any swap large enough to cross a tick
+/// boundary the result is systematically OPTIMISTIC. Callers compensate with
+/// `ARBOT_CL_TICK_BUFFER_BPS` (see `plan.rs::hop_expected_out`). Prefer
+/// `cl_swap::quote_exact_input_multi_tick` where a `TickLadder` is available.
 pub fn quote_exact_input_single_tick(
     state: &ClPoolState,
     amount_in: U256,
@@ -356,6 +408,28 @@ where
     Ok(())
 }
 
+/// Multi-tick simulation. Default OFF: it changes quoted prices on a funded
+/// bot, so it stays behind a flag until `cl_parity` shows agreement with the
+/// on-chain quoter.
+pub fn multi_tick_enabled() -> bool {
+    crate::util::env_flag("ARBOT_CL_MULTI_TICK", false)
+}
+
+/// Bitmap words fetched per side when building a ladder.
+pub fn cl_ladder_words() -> usize {
+    crate::util::env_parse_opt::<usize>("ARBOT_CL_LADDER_WORDS")
+        .unwrap_or(2)
+        .clamp(1, crate::cl_ticks::MAX_TICK_WORDS)
+}
+
+/// Ceiling on tick crossings per quote. A swap needing more is reported
+/// exhausted rather than quoted, bounding worst-case loop cost.
+pub fn cl_max_ticks_crossed() -> u32 {
+    crate::util::env_parse_opt::<u32>("ARBOT_CL_MAX_TICKS")
+        .unwrap_or(128)
+        .clamp(1, 1_024)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +504,30 @@ mod tests {
         // Short/empty returndata must not panic.
         assert_eq!(decode_int24(&[0u8; 8]), 0);
         assert_eq!(decode_int24(&[]), 0);
+    }
+
+    #[test]
+    fn multi_tick_defaults_off() {
+        let _lock = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = MultiTickEnvGuard::cleared();
+        assert!(
+            !multi_tick_enabled(),
+            "multi-tick must stay off until the parity harness is green"
+        );
+    }
+
+    #[test]
+    fn multi_tick_honours_the_flag() {
+        let _lock = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = MultiTickEnvGuard::set("1");
+        assert!(multi_tick_enabled());
+    }
+
+    #[test]
+    fn ladder_words_is_clamped_to_the_word_ceiling() {
+        let _guard = CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ARBOT_CL_LADDER_WORDS", "999");
+        assert!(cl_ladder_words() <= crate::cl_ticks::MAX_TICK_WORDS);
+        std::env::remove_var("ARBOT_CL_LADDER_WORDS");
     }
 }

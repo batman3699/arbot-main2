@@ -1361,6 +1361,13 @@ where
     token_whitelist: Arc<HashSet<Address>>,
     chain_env_prefix: String,
     pool_filter: Option<HashSet<Address>>,
+    /// Long-lived tick ladder cache, owned by the chain's `Runner` and shared
+    /// across every `scan_once()` call so the epoch cache in
+    /// `CachedTickSource` actually pays off across scans instead of being
+    /// rebuilt (and thrown away) once per `populate_edges` call. One instance
+    /// per chain/provider — never shared across chains, so it cannot serve
+    /// one chain's tick data to another.
+    tick_cache: Arc<crate::cl_ticks::CachedTickSource<crate::cl_ticks::RpcTickSource<C>>>,
 }
 
 const ESTIMATED_GAS_SLIPSTREAM: u64 = ESTIMATED_GAS_UNIV3;
@@ -1380,6 +1387,8 @@ where
     token_whitelist: Arc<HashSet<Address>>,
     chain_env_prefix: String,
     pool_filter: Option<HashSet<Address>>,
+    /// See `Univ3EdgeContext::tick_cache` — same long-lived, per-chain cache.
+    tick_cache: Arc<crate::cl_ticks::CachedTickSource<crate::cl_ticks::RpcTickSource<C>>>,
 }
 
 async fn slipstream_grid_quote<C>(
@@ -1759,6 +1768,31 @@ where
         Arc::new(std::collections::HashMap::new())
     };
 
+    // Ladders ride along with the state prefetch: same block, same pool set.
+    // `tick_cache` is the chain's long-lived `CachedTickSource` (owned by
+    // `Runner`, threaded through `populate_edges`), so its epoch cache
+    // actually collapses repeat words across scans rather than being rebuilt
+    // and discarded on every call. Built concurrently, bounded by the same
+    // `max_pool_tasks` limit the per-pool quote loop below uses, so this
+    // doesn't reintroduce the sequential-RPC pattern spec §3.4 forbids.
+    // Skipped entirely when the flag is off, so this costs nothing until
+    // enabled.
+    let tick_ladders: Arc<HashMap<Address, Arc<crate::cl_swap::TickLadder>>> =
+        if crate::cl_sim::multi_tick_enabled() {
+            let words = crate::cl_sim::cl_ladder_words();
+            let built = crate::cl_ticks::build_ladders_concurrent(
+                Arc::clone(&ctx.tick_cache),
+                &prefetched_cl_state,
+                ctx.edge_ctx.block_number,
+                words,
+                max_pool_tasks,
+            )
+            .await;
+            Arc::new(built)
+        } else {
+            Arc::new(HashMap::new())
+        };
+
     let mut join_set: JoinSet<Result<Vec<Edge>>> = JoinSet::new();
     let mut edges = Vec::new();
     let mut pool_tasks_spawned = 0usize;
@@ -1798,6 +1832,7 @@ where
         let chain_env_prefix = ctx.chain_env_prefix.clone();
         let quote_concurrency_limit = ctx.quote_concurrency_limit;
         let prefetched_cl_state = Arc::clone(&prefetched_cl_state);
+        let tick_ladders = Arc::clone(&tick_ladders);
         join_set.spawn(async move {
             let mut local_edges = Vec::new();
             // Prefer the Multicall3-prefetched state; only fall back to the
@@ -2218,6 +2253,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
                     active: true,
+                    tick_ladder: tick_ladders.get(&pool.pool).cloned(),
                 };
                 local_edges.push(edge);
             }
@@ -2383,6 +2419,31 @@ where
         Arc::new(std::collections::HashMap::new())
     };
 
+    // Ladders ride along with the state prefetch: same block, same pool set.
+    // `tick_cache` is the chain's long-lived `CachedTickSource` (owned by
+    // `Runner`, threaded through `populate_edges`), so its epoch cache
+    // actually collapses repeat words across scans rather than being rebuilt
+    // and discarded on every call. Built concurrently, bounded by the same
+    // `max_pool_tasks` limit the per-pool quote loop below uses, so this
+    // doesn't reintroduce the sequential-RPC pattern spec §3.4 forbids.
+    // Skipped entirely when the flag is off, so this costs nothing until
+    // enabled.
+    let tick_ladders: Arc<HashMap<Address, Arc<crate::cl_swap::TickLadder>>> =
+        if crate::cl_sim::multi_tick_enabled() {
+            let words = crate::cl_sim::cl_ladder_words();
+            let built = crate::cl_ticks::build_ladders_concurrent(
+                Arc::clone(&ctx.tick_cache),
+                &prefetched_cl_state,
+                ctx.edge_ctx.block_number,
+                words,
+                max_pool_tasks,
+            )
+            .await;
+            Arc::new(built)
+        } else {
+            Arc::new(HashMap::new())
+        };
+
     let mut join_set: JoinSet<Result<Vec<Edge>>> = JoinSet::new();
     let mut edges = Vec::new();
     let mut pool_tasks_spawned = 0usize;
@@ -2423,6 +2484,7 @@ where
         let chain_env_prefix = ctx.chain_env_prefix.clone();
         let quote_concurrency_limit = ctx.quote_concurrency_limit;
         let prefetched_cl_state = Arc::clone(&prefetched_cl_state);
+        let tick_ladders = Arc::clone(&tick_ladders);
         join_set.spawn(async move {
             let mut local_edges = Vec::new();
             let cl_state = if !crate::cl_sim::local_cl_quotes_enabled() {
@@ -2840,6 +2902,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
                     active: true,
+                    tick_ladder: tick_ladders.get(&pool.pool).cloned(),
                 };
                 local_edges.push(edge);
             }
@@ -3075,6 +3138,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(ctx.block_number),
                     active: true,
+                    tick_ladder: None,
                 };
                 edges.push(edge);
             }
@@ -3232,6 +3296,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
                     active: true,
+                    tick_ladder: None,
                 };
                 edges.push(edge);
             }
@@ -3419,6 +3484,7 @@ where
                 observed_slippage_bps: quote.slippage_bps,
                 quote_block,
                 active: true,
+                tick_ladder: None,
             };
             edges.push(edge);
         }
@@ -3616,6 +3682,7 @@ where
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block,
                     active: true,
+                    tick_ladder: None,
                 };
                 edges.push(edge);
             }
@@ -3719,6 +3786,7 @@ async fn collect_univ4_edges(
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: None,
                     active: true,
+                    tick_ladder: None,
                 };
                 edges.push(edge);
             }
@@ -3794,6 +3862,12 @@ pub async fn populate_edges<C>(
     _wrapped_native: Address,
     populate_options: PopulateOptions,
     metrics: Option<Arc<Metrics>>,
+    // Owned by `Runner`, constructed once per chain and reused across every
+    // `scan_once()` call — NOT rebuilt here. That's what lets the epoch cache
+    // inside `CachedTickSource` actually collapse repeat tick reads across
+    // scans instead of paying full RPC cost every cycle. Never share one
+    // instance across chains/providers: each `Runner` owns exactly one.
+    cl_tick_cache: Arc<crate::cl_ticks::CachedTickSource<crate::cl_ticks::RpcTickSource<C>>>,
 ) -> Result<PopulateResult>
 where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
@@ -3930,6 +4004,7 @@ where
         token_whitelist: Arc::new(token_whitelist.clone()),
         chain_env_prefix: chain_env_prefix.to_string(),
         pool_filter: pool_filter.clone(),
+        tick_cache: Arc::clone(&cl_tick_cache),
     };
     let hot_univ3_filtered = filter_hot_univ3_pools(hot_univ3_pools, token_whitelist);
     let hot_univ2_filtered = filter_hot_univ2_pools(hot_univ2_pools, token_whitelist);
@@ -4025,6 +4100,7 @@ where
         token_whitelist: Arc::new(token_whitelist.clone()),
         chain_env_prefix: chain_env_prefix.to_string(),
         pool_filter: pool_filter.clone(),
+        tick_cache: Arc::clone(&cl_tick_cache),
     });
     let slipstream_collect = async {
         if let Some(ctx) = slipstream_ctx.as_ref() {
@@ -4103,6 +4179,7 @@ where
         token_whitelist: Arc::new(token_whitelist.clone()),
         chain_env_prefix: chain_env_prefix.to_string(),
         pool_filter: pool_filter.clone(),
+        tick_cache: Arc::clone(&cl_tick_cache),
     });
     let pancakeswap_collect = async {
         if let Some(ctx) = pancakeswap_ctx.as_ref() {
@@ -4324,6 +4401,7 @@ where
                         observed_slippage_bps: quote.slippage_bps,
                         quote_block: Some(block_number),
                         active: true,
+                        tick_ladder: None,
                     };
                     let mut edge = edge;
                     apply_pruning(
@@ -4543,6 +4621,7 @@ mod tests {
                 observed_slippage_bps: 0,
                 quote_block: block,
                 active: true,
+                tick_ladder: None,
             }
         }
 
@@ -4582,6 +4661,7 @@ mod tests {
             observed_slippage_bps: 50,
             quote_block: Some(U64::from(100u64)),
             active: true,
+            tick_ladder: None,
         };
 
         let healthy = edge_health_score_bps(&edge, U64::from(101u64), U64::from(10u64));

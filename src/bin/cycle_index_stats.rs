@@ -43,6 +43,8 @@ fn structural_edge(from: Address, to: Address, pool: Address) -> Edge {
         observed_slippage_bps: 0,
         quote_block: None,
         active: true,
+        // Structure-only edge: no CL ladder needed for adjacency enumeration.
+        tick_ladder: None,
     }
 }
 

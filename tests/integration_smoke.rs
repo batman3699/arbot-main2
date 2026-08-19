@@ -526,6 +526,7 @@ async fn build_dry_run_plan(
         observed_slippage_bps: 50,
         quote_block: None,
         active: true,
+        tick_ladder: None,
     };
     graph.add_edge(edge_forward);
     let edge_reverse = Edge {
@@ -546,6 +547,7 @@ async fn build_dry_run_plan(
         observed_slippage_bps: 50,
         quote_block: None,
         active: true,
+        tick_ladder: None,
     };
     graph.add_edge(edge_reverse);
 
