@@ -4915,8 +4915,9 @@ where
     /// whole point: adjacency is near-static while state churns every block.
     fn compare_cycle_index(
         &self,
-        graph: &Graph,
         universe: &crate::cycle_index::PoolUniverse,
+        changed_pools: &HashSet<Address>,
+        graph: &Graph,
         found: &[crate::graph::CycleCandidate],
     ) {
         use crate::cycle_index::{CycleIndex, CycleIndexLimits};
@@ -4975,15 +4976,12 @@ where
 
         // Selectivity: what the index would have re-priced this block, versus
         // the full search the graph actually paid for.
-        let touched = {
-            let changed: HashSet<Address> = graph
-                .edges
-                .iter()
-                .filter(|e| e.active)
-                .filter_map(crate::venues::edge_pool_address)
-                .collect();
-            idx.cycles_touching(universe.hops_for_pools(&changed)).len()
-        };
+        // Selectivity: the point of the index. Measured against the pools that
+        // ACTUALLY moved this block — an earlier version passed every active
+        // pool, which answered "if the whole graph moved" and reported ~88%.
+        let touched = idx
+            .cycles_touching(universe.hops_for_pools(changed_pools))
+            .len();
 
         if missed > 0 {
             warn!(
@@ -4999,6 +4997,7 @@ where
                 found = found.len(),
                 hits,
                 index_cycles = idx.len(),
+                changed_pools = changed_pools.len(),
                 touched,
                 "cycle index covered every cycle the search found"
             );
@@ -6091,6 +6090,10 @@ where
             token_whitelist_cap,
         ));
         let t_populate = Instant::now();
+        // Pools that actually moved this block. `populate_cache.touched_pools`
+        // is cleared once populate finishes, so keep a copy for downstream
+        // instrumentation that runs after it.
+        let changed_pools: HashSet<Address>;
         {
             let mut touched = HashSet::new();
             if let Some(monitor) = &self.pool_monitor {
@@ -6115,6 +6118,7 @@ where
                     }
                 }
             }
+            changed_pools = touched.clone();
             let mut guard = self.populate_cache.lock().await;
             guard.touched_pools = touched;
         }
@@ -6380,7 +6384,7 @@ where
                 // the topology, and treating it as a structure change was what
                 // made the index rebuild on half of all scans.
                 let universe = self.pool_universe().await;
-                self.compare_cycle_index(&graph, &universe, &found);
+                self.compare_cycle_index(&universe, &changed_pools, &graph, &found);
             }
 
             let found_total = found.len();
