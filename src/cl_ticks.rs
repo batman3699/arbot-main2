@@ -78,6 +78,9 @@ pub struct StaticTickSource {
     tick_spacing: i32,
 }
 
+// main.rs compiles its own copy of this module; items used only by the
+// library, tests or helper bins read as dead there.
+#[allow(dead_code)]
 impl StaticTickSource {
     pub fn new(pool: Address, ticks: Vec<(i32, i128)>, tick_spacing: i32) -> Self {
         Self {
@@ -219,7 +222,7 @@ pub async fn build_ladder<S: TickDataSource + ?Sized>(
     let nets = source.liquidity_net(pool, &candidate_ticks, block).await?;
     let ticks: Vec<(i32, i128)> = candidate_ticks
         .into_iter()
-        .zip(nets.into_iter())
+        .zip(nets)
         .filter_map(|(tick, net)| net.map(|n| (tick, n)))
         .filter(|(_, net)| *net != 0)
         .collect();
@@ -426,7 +429,7 @@ where
                         ticks = chunk.len(),
                         "batched ticks() read failed; ladder will be short"
                     );
-                    out.extend(std::iter::repeat(None).take(chunk.len()));
+                    out.extend(std::iter::repeat_n(None, chunk.len()));
                 }
             }
         }
@@ -474,15 +477,18 @@ impl<S> CachedTickSource<S> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn inner(&self) -> &S {
         &self.inner
     }
 
+    #[allow(dead_code)]
     pub fn cached_words(&self) -> usize {
         self.words.len()
     }
 
     /// Drop every cached entry for one pool. Call on an observed mint/burn.
+    #[allow(dead_code)]
     pub fn invalidate_pool(&self, pool: Address) {
         self.words.retain(|(p, _, _), _| *p != pool);
         self.nets.retain(|(p, _, _), _| *p != pool);
@@ -513,7 +519,7 @@ where
 
         if !missing.is_empty() {
             let fetched = self.inner.tick_words(pool, &missing, block).await?;
-            for (w, value) in missing.iter().zip(fetched.into_iter()) {
+            for (w, value) in missing.iter().zip(fetched) {
                 // Successful reads only — see the struct docstring.
                 if let Some(word) = value {
                     self.words.insert((pool, *w, epoch), word);
@@ -542,7 +548,7 @@ where
 
         if !missing.is_empty() {
             let fetched = self.inner.liquidity_net(pool, &missing, block).await?;
-            for (t, value) in missing.iter().zip(fetched.into_iter()) {
+            for (t, value) in missing.iter().zip(fetched) {
                 // Successful reads only — see the struct docstring. This is
                 // the path that matters most: `RpcTickSource::liquidity_net`
                 // turns a whole-chunk RPC error into `Ok(vec![None; 128])`, so

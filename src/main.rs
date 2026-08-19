@@ -9,6 +9,7 @@ mod cl_swap;
 mod cl_ticks;
 #[cfg(test)]
 mod config_validation;
+mod cycle_index;
 mod discovery;
 mod fees;
 mod flash_loan;
@@ -3390,6 +3391,9 @@ where
     block_head_rx: Option<Arc<Mutex<watch::Receiver<BlockHead>>>>,
     populate_cache: Arc<Mutex<PopulateCacheState>>,
     flash_capacity: Arc<StdMutex<FlashCapacityCache>>,
+    /// Precomputed cycle set, rebuilt only when graph STRUCTURE changes.
+    /// Populated only under ARBOT_CYCLE_INDEX_COMPARE; `None` otherwise.
+    cycle_index: Arc<StdMutex<Option<crate::cycle_index::CycleIndex>>>,
     /// Long-lived tick-ladder cache for the multi-tick CL simulator
     /// (`ARBOT_CL_MULTI_TICK`). Built once here and reused across every
     /// `scan_once()` call for this chain, so `CachedTickSource`'s epoch cache
@@ -3699,6 +3703,7 @@ where
             block_head_rx,
             populate_cache: Arc::new(Mutex::new(PopulateCacheState::default())),
             flash_capacity: Arc::new(StdMutex::new(FlashCapacityCache::default())),
+            cycle_index: Arc::new(StdMutex::new(None)),
             cl_tick_cache,
         }
     }
@@ -4874,6 +4879,100 @@ where
         let word = &bytes[8 * 32..9 * 32];
         let addr = Address::from_slice(&word[12..32]);
         (!addr.is_zero()).then_some(addr)
+    }
+
+    /// Compare the precomputed cycle index against what the live search found.
+    ///
+    /// Gated on `ARBOT_CYCLE_INDEX_COMPARE`. The search stays authoritative —
+    /// this only observes — because the cut-over question is whether the index
+    /// is a SUPERSET of what the search surfaces. A miss means a profitable
+    /// cycle exists that the precomputed set does not contain, and switching
+    /// over would silently drop that trade. Cut over only once misses are 0
+    /// across a long window.
+    ///
+    /// The index is rebuilt only when `structure_digest` changes, which is the
+    /// whole point: adjacency is near-static while state churns every block.
+    fn compare_cycle_index(&self, graph: &Graph, found: &[crate::graph::CycleCandidate]) {
+        use crate::cycle_index::{CycleIndex, CycleIndexLimits};
+
+        let Ok(mut guard) = self.cycle_index.lock() else {
+            return;
+        };
+        let stale = guard.as_ref().map(|idx| idx.is_stale(graph)).unwrap_or(true);
+        if stale {
+            let hubs = self.flash_loan_hub_tokens(graph);
+            let limits = CycleIndexLimits {
+                min_hops: self.cycle_limits.min_hops,
+                max_hops: self.cycle_limits.max_hops,
+                ..CycleIndexLimits::default()
+            };
+            let began = Instant::now();
+            let idx = CycleIndex::build(graph, &hubs, limits);
+            info!(
+                cycles = idx.len(),
+                hubs = hubs.len(),
+                build_ms = began.elapsed().as_millis(),
+                truncated = idx.truncated,
+                "cycle index rebuilt (graph structure changed)"
+            );
+            *guard = Some(idx);
+        }
+
+        let Some(idx) = guard.as_ref() else {
+            return;
+        };
+        if found.is_empty() {
+            return;
+        }
+
+        let mut hits = 0usize;
+        let mut misses: Vec<String> = Vec::new();
+        for candidate in found {
+            if idx.contains_nodes_in(graph, &candidate.cycle) {
+                hits += 1;
+            } else if misses.len() < 3 {
+                let path: Vec<String> = candidate
+                    .cycle
+                    .iter()
+                    .filter_map(|n| graph.nodes.get(*n))
+                    .map(|a| format!("{a:#x}")[..10].to_string())
+                    .collect();
+                misses.push(format!("{}bps:{}", candidate.estimated_profit_bps, path.join(">")));
+            }
+        }
+        let missed = found.len() - hits;
+
+        // Selectivity: what the index would have re-priced this block, versus
+        // the full search the graph actually paid for.
+        let touched = {
+            let changed: HashSet<Address> = graph
+                .edges
+                .iter()
+                .filter(|e| e.active)
+                .filter_map(crate::venues::edge_pool_address)
+                .collect();
+            let hops = CycleIndex::hops_for_pools(graph, &changed);
+            idx.cycles_touching(hops).len()
+        };
+
+        if missed > 0 {
+            warn!(
+                found = found.len(),
+                hits,
+                missed,
+                index_cycles = idx.len(),
+                examples = ?misses,
+                "cycle index MISSED cycles the search found; not safe to cut over"
+            );
+        } else {
+            debug!(
+                found = found.len(),
+                hits,
+                index_cycles = idx.len(),
+                touched,
+                "cycle index covered every cycle the search found"
+            );
+        }
     }
 
     fn flash_loan_quotes(&self, token: Address, max_cycle_input: U256) -> Vec<FlashLoanQuote> {
@@ -6241,6 +6340,14 @@ where
                 }
             });
             best_gross_scaled = best;
+
+            // Observation only: the live search above stays authoritative.
+            // Gated so a bad index can never affect detection while we build
+            // confidence that it covers everything the search finds.
+            if read_feature_flag("ARBOT_CYCLE_INDEX_COMPARE", false) {
+                self.compare_cycle_index(&graph, &found);
+            }
+
             let found_total = found.len();
             let filter_unfundable = crate::util::env_parse_opt::<u8>("ARBOT_FILTER_UNFUNDABLE")
                 .map(|v| v != 0)

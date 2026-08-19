@@ -34,6 +34,9 @@ pub struct TickLadder {
     upper_bound: i32,
 }
 
+// main.rs compiles its own copy of this module; items used only by the
+// library, tests or helper bins read as dead there.
+#[allow(dead_code)]
 impl TickLadder {
     pub fn new(mut ticks: Vec<(i32, i128)>, lower_bound: i32, upper_bound: i32) -> Self {
         ticks.sort_unstable_by_key(|(t, _)| *t);
@@ -94,6 +97,9 @@ impl TickLadder {
 }
 
 /// Result of a multi-tick exact-input quote.
+// Diagnostic fields on the quote are read by tests and the cl_parity harness,
+// which are separate crates from the binary that also compiles this module.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct MultiTickQuote {
     pub amount_out: U256,

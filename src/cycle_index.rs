@@ -78,38 +78,45 @@ impl Default for CycleIndexLimits {
 /// A cycle in the token graph, structure only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenCycle {
-    /// Node indices in traversal order, **open** form: the closing hop back to
-    /// `nodes[0]` is implied, not stored. Canonicalised so the numerically
-    /// smallest node is first, making rotations of the same loop compare equal.
-    pub nodes: Vec<NodeId>,
+    /// Tokens in traversal order, **open** form: the closing hop back to
+    /// `tokens[0]` is implied, not stored. Canonicalised so the numerically
+    /// smallest address leads, making rotations of the same loop compare equal.
+    ///
+    /// Stored as ADDRESSES, not node indices. `Graph::add_node` assigns indices
+    /// in first-seen order and the graph is rebuilt every scan, so an
+    /// index-keyed cycle silently refers to different tokens after a rebuild.
+    pub tokens: Vec<Address>,
 }
 
+// main.rs compiles its own copy of this module; items used only by the
+// library, tests or helper bins read as dead there.
+#[allow(dead_code)]
 impl TokenCycle {
-    /// Hop count — equal to node count, since the closing hop is implied.
+    /// Hop count — equal to token count, since the closing hop is implied.
     pub fn hops(&self) -> usize {
-        self.nodes.len()
+        self.tokens.len()
     }
 
     /// Ordered `(from, to)` hops, including the implied closing hop.
-    pub fn hop_pairs(&self) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
-        let n = self.nodes.len();
-        (0..n).map(move |i| (self.nodes[i], self.nodes[(i + 1) % n]))
+    pub fn hop_pairs(&self) -> impl Iterator<Item = (Address, Address)> + '_ {
+        let n = self.tokens.len();
+        (0..n).map(move |i| (self.tokens[i], self.tokens[(i + 1) % n]))
     }
 
-    /// Rotate so the smallest node leads. Direction is preserved: A→B→C and
+    /// Rotate so the smallest address leads. Direction is preserved: A→B→C and
     /// A→C→B are genuinely different trades and must not collapse together.
-    fn canonicalise(mut nodes: Vec<NodeId>) -> Self {
-        if nodes.is_empty() {
-            return Self { nodes };
+    fn canonicalise(mut tokens: Vec<Address>) -> Self {
+        if tokens.is_empty() {
+            return Self { tokens };
         }
-        let min_at = nodes
+        let min_at = tokens
             .iter()
             .enumerate()
-            .min_by_key(|(_, n)| **n)
+            .min_by_key(|(_, t)| **t)
             .map(|(i, _)| i)
             .unwrap_or(0);
-        nodes.rotate_left(min_at);
-        Self { nodes }
+        tokens.rotate_left(min_at);
+        Self { tokens }
     }
 }
 
@@ -117,7 +124,7 @@ impl TokenCycle {
 #[derive(Clone, Debug, Default)]
 pub struct CycleIndex {
     cycles: Vec<TokenCycle>,
-    by_hop: HashMap<(NodeId, NodeId), Vec<CycleId>>,
+    by_hop: HashMap<(Address, Address), Vec<CycleId>>,
     structure_digest: u64,
     /// True when [`CycleIndexLimits::max_cycles`] stopped enumeration early, so
     /// callers can report that coverage is partial rather than silently
@@ -129,27 +136,30 @@ pub struct CycleIndex {
 /// on. Deliberately ignores rates, liquidity and `active`: those change every
 /// block and must NOT invalidate the precomputed set, which is the entire point
 /// of separating structure from state.
+///
+/// Keyed on token ADDRESSES, never node indices. `Graph::add_node` assigns
+/// indices in first-seen order and the graph is rebuilt fresh each scan while
+/// quoting is concurrent, so identical adjacency arrives with different indices
+/// every time. An index-keyed digest therefore reported a structure change on
+/// literally every scan (measured: 11 rebuilds in 11 scans).
 pub fn structure_digest(graph: &Graph) -> u64 {
-    let mut pairs: Vec<(usize, usize)> = graph
-        .edges
-        .iter()
-        .filter_map(|edge| {
-            let from = *graph.ix.get(&edge.from)?;
-            let to = *graph.ix.get(&edge.to)?;
-            Some((from, to))
-        })
-        .collect();
+    let mut pairs: Vec<(Address, Address)> =
+        graph.edges.iter().map(|e| (e.from, e.to)).collect();
     pairs.sort_unstable();
     pairs.dedup();
 
     let mut hasher = DefaultHasher::new();
     pairs.len().hash(&mut hasher);
-    for pair in &pairs {
-        pair.hash(&mut hasher);
+    for (from, to) in &pairs {
+        from.0.hash(&mut hasher);
+        to.0.hash(&mut hasher);
     }
     hasher.finish()
 }
 
+// main.rs compiles its own copy of this module; items used only by the
+// library, tests or helper bins read as dead there.
+#[allow(dead_code)]
 impl CycleIndex {
     pub fn len(&self) -> usize {
         self.cycles.len()
@@ -183,7 +193,7 @@ impl CycleIndex {
     /// block, return only the cycles that need re-pricing.
     pub fn cycles_touching(
         &self,
-        hops: impl IntoIterator<Item = (NodeId, NodeId)>,
+        hops: impl IntoIterator<Item = (Address, Address)>,
     ) -> Vec<CycleId> {
         let mut seen: HashSet<CycleId> = HashSet::new();
         let mut out = Vec::new();
@@ -200,24 +210,52 @@ impl CycleIndex {
         out
     }
 
-    /// Map changed pool addresses to the ordered hops they can serve, for
-    /// feeding [`Self::cycles_touching`]. A pool serves both directions.
+    /// Whether the token loop `tokens` (open or closed, any rotation) is in the
+    /// index.
+    pub fn contains_tokens(&self, tokens: &[Address]) -> bool {
+        let mut open = tokens.to_vec();
+        if open.len() > 1 && open.first() == open.last() {
+            open.pop();
+        }
+        if open.is_empty() {
+            return false;
+        }
+        let canonical = TokenCycle::canonicalise(open);
+        self.cycles.iter().any(|c| c.tokens == canonical.tokens)
+    }
+
+    /// Membership for a cycle expressed as `graph`'s node indices.
+    ///
+    /// Resolves indices to tokens through the CALLER's graph, so a cached index
+    /// stays valid across rebuilds that reshuffle index assignment. This is the
+    /// cut-over safety check: before the index can replace the live search it
+    /// must be a SUPERSET of what that search surfaces, and a miss means
+    /// switching over would silently drop a profitable cycle.
+    pub fn contains_nodes_in(&self, graph: &Graph, nodes: &[usize]) -> bool {
+        let tokens: Vec<Address> = nodes
+            .iter()
+            .filter_map(|n| graph.nodes.get(*n).copied())
+            .collect();
+        if tokens.len() != nodes.len() {
+            return false;
+        }
+        self.contains_tokens(&tokens)
+    }
+
+    /// Ordered token hops served by any pool in `pools`, for feeding
+    /// [`Self::cycles_touching`]. A pool serves both directions.
     pub fn hops_for_pools(
         graph: &Graph,
         pools: &HashSet<Address>,
-    ) -> HashSet<(NodeId, NodeId)> {
+    ) -> HashSet<(Address, Address)> {
         let mut hops = HashSet::new();
         for edge in &graph.edges {
             let Some(pool) = crate::venues::edge_pool_address(edge) else {
                 continue;
             };
-            if !pools.contains(&pool) {
-                continue;
+            if pools.contains(&pool) {
+                hops.insert((edge.from, edge.to));
             }
-            let (Some(from), Some(to)) = (graph.ix.get(&edge.from), graph.ix.get(&edge.to)) else {
-                continue;
-            };
-            hops.insert((*from as NodeId, *to as NodeId));
         }
         hops
     }
@@ -236,7 +274,7 @@ impl CycleIndex {
             .collect();
 
         let max_hops = limits.max_hops.max(limits.min_hops);
-        let mut seen: HashSet<Vec<NodeId>> = HashSet::new();
+        let mut seen: HashSet<Vec<Address>> = HashSet::new();
         let mut cycles: Vec<TokenCycle> = Vec::new();
         let mut truncated = false;
 
@@ -248,6 +286,7 @@ impl CycleIndex {
                 let mut path = vec![*start];
                 let mut on_path: HashSet<NodeId> = HashSet::from([*start]);
                 if !enumerate_at_depth(
+                    graph,
                     &adjacency,
                     *start,
                     depth,
@@ -263,7 +302,7 @@ impl CycleIndex {
             }
         }
 
-        let mut by_hop: HashMap<(NodeId, NodeId), Vec<CycleId>> = HashMap::new();
+        let mut by_hop: HashMap<(Address, Address), Vec<CycleId>> = HashMap::new();
         for (id, cycle) in cycles.iter().enumerate() {
             for hop in cycle.hop_pairs() {
                 by_hop.entry(hop).or_default().push(id as CycleId);
@@ -312,12 +351,13 @@ fn structural_adjacency(graph: &Graph) -> HashMap<NodeId, Vec<NodeId>> {
 /// flag truncation rather than silently capping.
 #[allow(clippy::too_many_arguments)]
 fn enumerate_at_depth(
+    graph: &Graph,
     adjacency: &HashMap<NodeId, Vec<NodeId>>,
     start: NodeId,
     remaining: usize,
     path: &mut Vec<NodeId>,
     on_path: &mut HashSet<NodeId>,
-    seen: &mut HashSet<Vec<NodeId>>,
+    seen: &mut HashSet<Vec<Address>>,
     out: &mut Vec<TokenCycle>,
     max_cycles: usize,
 ) -> bool {
@@ -333,8 +373,17 @@ fn enumerate_at_depth(
             if *next != start {
                 continue;
             }
-            let cycle = TokenCycle::canonicalise(path.clone());
-            if seen.insert(cycle.nodes.clone()) {
+            // Enumeration walks indices for speed, but the cycle is STORED as
+            // tokens so it survives the next rebuild's index reshuffle.
+            let tokens: Vec<Address> = path
+                .iter()
+                .filter_map(|n| graph.nodes.get(*n as usize).copied())
+                .collect();
+            if tokens.len() != path.len() {
+                continue;
+            }
+            let cycle = TokenCycle::canonicalise(tokens);
+            if seen.insert(cycle.tokens.clone()) {
                 out.push(cycle);
                 if out.len() >= max_cycles {
                     return false;
@@ -350,7 +399,7 @@ fn enumerate_at_depth(
         path.push(*next);
         on_path.insert(*next);
         let ok = enumerate_at_depth(
-            adjacency, start, remaining - 1, path, on_path, seen, out, max_cycles,
+            graph, adjacency, start, remaining - 1, path, on_path, seen, out, max_cycles,
         );
         on_path.remove(next);
         path.pop();
@@ -367,7 +416,7 @@ mod tests {
     use crate::graph::{Edge, VenueEdge};
     use ethers::types::U256;
 
-    fn addr(id: u64) -> Address {
+    pub(crate) fn addr(id: u64) -> Address {
         Address::from_low_u64_be(id)
     }
 
@@ -405,6 +454,15 @@ mod tests {
             graph.add_edge(e);
         }
         graph
+    }
+
+    /// Directed triangle 1→2→3→1.
+    pub(crate) fn triangle_graph() -> Graph {
+        graph_from(vec![
+            edge(addr(1), addr(2), addr(100)),
+            edge(addr(2), addr(3), addr(101)),
+            edge(addr(3), addr(1), addr(102)),
+        ])
     }
 
     /// A→B→A, both directions present.
@@ -486,14 +544,12 @@ mod tests {
         let idx = CycleIndex::build(&graph, &[addr(1)], CycleIndexLimits::default());
         assert_eq!(idx.len(), 2);
 
-        let n1 = graph.ix[&addr(1)] as NodeId;
-        let n2 = graph.ix[&addr(2)] as NodeId;
-        let touched = idx.cycles_touching([(n1, n2)]);
+        let touched = idx.cycles_touching([(addr(1), addr(2))]);
         assert_eq!(touched.len(), 1, "only the 1<->2 loop re-prices");
 
         let cycle = idx.cycle(touched[0]).expect("touched cycle");
         assert!(
-            cycle.nodes.contains(&n2),
+            cycle.tokens.contains(&addr(2)),
             "the returned cycle must actually traverse the changed pair"
         );
     }
@@ -504,6 +560,69 @@ mod tests {
         let pools = HashSet::from([addr(100)]);
         let hops = CycleIndex::hops_for_pools(&graph, &pools);
         assert_eq!(hops.len(), 2, "one pool serves both directions of its pair");
+    }
+
+    #[test]
+    fn digest_is_stable_under_edge_insertion_order() {
+        // Graph::add_node assigns indices in first-seen order and the graph is
+        // rebuilt fresh every scan, while quoting is concurrent — so the SAME
+        // adjacency arrives in a different order each scan. Keying the digest
+        // on node indices made every scan look like a structure change.
+        let forward = graph_from(vec![
+            edge(addr(1), addr(2), addr(100)),
+            edge(addr(2), addr(3), addr(101)),
+            edge(addr(3), addr(1), addr(102)),
+        ]);
+        let shuffled = graph_from(vec![
+            edge(addr(3), addr(1), addr(102)),
+            edge(addr(1), addr(2), addr(100)),
+            edge(addr(2), addr(3), addr(101)),
+        ]);
+
+        // Same topology, different index assignment.
+        assert_ne!(
+            forward.ix[&addr(1)], shuffled.ix[&addr(1)],
+            "precondition: insertion order really does shift indices"
+        );
+        assert_eq!(
+            structure_digest(&forward),
+            structure_digest(&shuffled),
+            "identical adjacency must produce an identical digest"
+        );
+
+        let idx = CycleIndex::build(&forward, &[addr(1)], CycleIndexLimits::default());
+        assert!(
+            !idx.is_stale(&shuffled),
+            "a reordered rebuild of the same graph must not invalidate the set"
+        );
+    }
+
+    #[test]
+    fn membership_survives_reindexing() {
+        // The cached cycle must still resolve to the same TOKENS after the
+        // graph is rebuilt with different index assignment — otherwise
+        // contains_nodes silently compares against the wrong tokens.
+        let forward = graph_from(vec![
+            edge(addr(1), addr(2), addr(100)),
+            edge(addr(2), addr(3), addr(101)),
+            edge(addr(3), addr(1), addr(102)),
+        ]);
+        let shuffled = graph_from(vec![
+            edge(addr(2), addr(3), addr(101)),
+            edge(addr(3), addr(1), addr(102)),
+            edge(addr(1), addr(2), addr(100)),
+        ]);
+        let idx = CycleIndex::build(&forward, &[addr(1)], CycleIndexLimits::default());
+
+        let cycle_in_shuffled = vec![
+            shuffled.ix[&addr(1)],
+            shuffled.ix[&addr(2)],
+            shuffled.ix[&addr(3)],
+        ];
+        assert!(
+            idx.contains_nodes_in(&shuffled, &cycle_in_shuffled),
+            "the same token loop must be recognised under new indices"
+        );
     }
 
     #[test]
@@ -586,5 +705,24 @@ mod tests {
             ..CycleIndexLimits::default()
         };
         assert_eq!(CycleIndex::build(&graph, &[addr(1)], loose).len(), 1);
+    }
+
+
+    #[test]
+    fn contains_nodes_matches_closed_and_rotated_forms() {
+        let graph = triangle_graph();
+        let idx = CycleIndex::build(&graph, &[addr(1)], CycleIndexLimits::default());
+        let n1 = graph.ix[&addr(1)];
+        let n2 = graph.ix[&addr(2)];
+        let n3 = graph.ix[&addr(3)];
+
+        // BF emits closed form; the index stores open form.
+        assert!(idx.contains_nodes_in(&graph, &[n1, n2, n3, n1]), "closed form");
+        assert!(idx.contains_nodes_in(&graph, &[n1, n2, n3]), "open form");
+        // Any rotation is the same loop.
+        assert!(idx.contains_nodes_in(&graph, &[n2, n3, n1, n2]), "rotated closed");
+        // Reversed traversal is a DIFFERENT trade and is absent here.
+        assert!(!idx.contains_nodes_in(&graph, &[n1, n3, n2, n1]), "reverse direction");
+        assert!(!idx.contains_nodes_in(&graph, &[]), "empty is not a cycle");
     }
 }
