@@ -419,17 +419,42 @@ fn edge_capacity_from_quote(quote: &QuoteComputation, tolerance_bps: u32) -> U25
     scaled.max(probe).min(ceiling)
 }
 
-fn profit_value(quote: &QuoteComputation) -> Decimal {
-    u256_to_decimal(quote.amount_out)
-        .checked_sub(u256_to_decimal(quote.amount_in))
-        .unwrap_or(Decimal::ZERO)
+/// Effective price of a quote, as `amount_out` per unit of `amount_in`.
+///
+/// Unit-safe ONLY across quotes for the same token pair, which is the only way
+/// it is used: comparing grid points on one edge. It deliberately does not try
+/// to express "profit" — a single swap converts A to B and has no profit until
+/// it is closed by the rest of a cycle.
+fn effective_rate(quote: &QuoteComputation) -> Decimal {
+    let denom = u256_to_decimal(quote.amount_in);
+    if denom.is_zero() {
+        return Decimal::ZERO;
+    }
+    u256_to_decimal(quote.amount_out) / denom
 }
 
+/// Pick the size that represents this edge: the LARGEST one inside the slippage
+/// tolerance the caller has already applied.
+///
+/// This previously ranked by `amount_out - amount_in`, subtracting a token_IN
+/// amount from a token_OUT amount with no decimal normalisation. On any pair
+/// where the input carries more decimals than the output — every
+/// WETH->USDC/USDT/cbBTC edge on Base — that expression reduces to
+/// `-amount_in`, so "most profitable" silently meant "smallest". Every such
+/// edge was then rated at the `base/1000` probe: spot price with effectively no
+/// slippage. Cycles looked profitable during detection and died in sizing,
+/// which is precisely the `no_profitable_size` signature.
+///
+/// Every candidate here has already passed `slippage_bps <= tolerance`, so the
+/// largest is the most executable size at an acceptable price — the
+/// representative notional an edge weight is supposed to carry, rather than an
+/// infinitesimal one that flatters the whole graph.
 fn best_quote(candidates: &[QuoteComputation]) -> Option<&QuoteComputation> {
     candidates.iter().max_by(|a, b| {
-        profit_value(a)
-            .cmp(&profit_value(b))
-            .then(a.amount_in.cmp(&b.amount_in))
+        a.amount_in
+            .cmp(&b.amount_in)
+            // Same size quoted twice: prefer the better fill.
+            .then(a.amount_out.cmp(&b.amount_out))
     })
 }
 
@@ -659,7 +684,6 @@ where
 
     // Seed with a small probe to estimate slippage curve.
     let mut current = probe_amount(base_amount).max(U256::one());
-    let mut prev_profit = Decimal::MIN;
     let mut bracket: Option<(U256, U256)> = None;
     let mut last_amount: Option<U256> = None;
     for _ in 0..12 {
@@ -667,16 +691,14 @@ where
             break;
         }
         if let Some(q) = evaluate(current, &mut eval_cached)? {
-            let profit = profit_value(&q);
+            // Expansion stops when a size stops being quotable within tolerance
+            // (the `else` arm below), NOT on a decline in this value. It used to
+            // break as soon as `profit_value` fell, but that quantity was
+            // ~= -amount_in and therefore decreased on every single step, so the
+            // search bracketed on iteration 2 every time and never explored the
+            // range SIZE_SEARCH_EXPAND_ITERS was configured for.
             evaluated.push(q);
-            if let Some(prev) = last_amount {
-                if profit < prev_profit {
-                    bracket = Some((prev, current));
-                    break;
-                }
-            }
             last_amount = Some(current);
-            prev_profit = profit;
         } else if let Some(prev) = last_amount {
             let lower = (prev / U256::from(2u64)).max(U256::one());
             bracket = Some((lower, current));
@@ -712,7 +734,7 @@ where
             }
             match (q1.as_ref(), q2.as_ref()) {
                 (Some(p1), Some(p2)) => {
-                    if profit_value(p1) < profit_value(p2) {
+                    if effective_rate(p1) < effective_rate(p2) {
                         low = m1;
                     } else {
                         high = m2;
@@ -777,7 +799,6 @@ where
 
     // Start from a probe and expand until profit declines.
     let mut current = probe_amount(base_amount).max(U256::one());
-    let mut prev_profit = Decimal::MIN;
     let mut bracket: Option<(U256, U256)> = None;
     let mut last_amount: Option<U256> = None;
     for _ in 0..size_search_expand_iters() {
@@ -787,16 +808,10 @@ where
         if let Some(q) =
             evaluate_quote_async(current, threshold_bps, &mut eval_cached, &mut quote_fn).await?
         {
-            let profit = profit_value(&q);
+            // Same correction as the sync path: bracket on tolerance failure,
+            // not on a decline in a quantity that only ever declined.
             evaluated.push(q);
-            if let Some(prev) = last_amount {
-                if profit < prev_profit {
-                    bracket = Some((prev, current));
-                    break;
-                }
-            }
             last_amount = Some(current);
-            prev_profit = profit;
         } else if let Some(prev) = last_amount {
             let lower = (prev / U256::from(2u64)).max(U256::one());
             bracket = Some((lower, current));
@@ -833,7 +848,7 @@ where
             }
             match (q1.as_ref(), q2.as_ref()) {
                 (Some(p1), Some(p2)) => {
-                    if profit_value(p1) < profit_value(p2) {
+                    if effective_rate(p1) < effective_rate(p2) {
                         low = m1;
                     } else {
                         high = m2;
@@ -4531,31 +4546,52 @@ mod tests {
         assert_eq!(class, "local_fork");
     }
 
+    /// Replaces `optimal_trade_size_prefers_peak_profit`, which modelled the
+    /// quote as `amount_out = amount_in + profit` — same units, with a genuine
+    /// interior maximum. No production caller looks like that: every one
+    /// (`quote_exact_input_from_state`, `quote_solidly_exact_input`,
+    /// `bal.quote_single_given_in`, `curve.quote_get_dy`, ...) is a SINGLE SWAP
+    /// converting token_in to token_out, so the two amounts are different
+    /// tokens with different decimals and their difference is meaningless.
+    ///
+    /// For a single swap, output rises monotonically with input at a declining
+    /// marginal rate. There is no interior optimum to find; the only meaningful
+    /// bound is slippage tolerance, so the sizer must return the largest size
+    /// still inside it.
     #[test]
-    fn optimal_trade_size_prefers_peak_profit() {
+    fn optimal_trade_size_takes_the_largest_size_within_tolerance() {
         let base = U256::from(200u64);
-        let tolerance = 100u32;
+        let tolerance = 60u32;
 
         let quote = adjust_trade_size_sync(base, tolerance, |amount| {
-            let x = amount.as_u64() as f64;
-            let profit = (20000.0 - (x - 100.0).powi(2)).max(0.0);
-            if profit <= 0.0 {
+            let x = amount.as_u64();
+            if x == 0 {
                 return Ok(None);
             }
-            let out = amount + U256::from(profit as u64);
+            // Declining marginal rate, and slippage growing with size. Past the
+            // tolerance the venue stops offering a usable quote.
+            let slippage_bps = (x / 10) as u32;
+            if slippage_bps > tolerance {
+                return Ok(None);
+            }
             Ok(Some(QuoteComputation {
                 amount_in: amount,
-                amount_out: out,
-                slippage_bps: 50,
+                amount_out: U256::from(x * 2 - x * x / 4000),
+                slippage_bps,
             }))
         })
-        .expect("sizing should succeed");
+        .expect("sizing should succeed")
+        .expect("expected a quote");
 
-        let quote = quote.expect("expected a quote");
-        let amount = quote.amount_in.as_u64();
         assert!(
-            (80..=120).contains(&amount),
-            "amount {amount} not near optimum"
+            quote.slippage_bps <= tolerance,
+            "must never exceed the tolerance"
+        );
+        assert!(
+            quote.amount_in >= U256::from(400u64),
+            "must reach a real notional, not stop at the base/1000 probe \
+             (got {})",
+            quote.amount_in
         );
     }
 
@@ -4816,5 +4852,78 @@ mod tests {
         let filtered = filter_hot_univ3_pools(&pools, &whitelist);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].pool, pools[0].pool);
+    }
+
+    /// Grid points for a real WETH->USDC edge: 18-decimal input, 6-decimal
+    /// output. `amount_out - amount_in` is ~= -amount_in here, which is what
+    /// made "most profitable" mean "smallest" and rated every such edge at the
+    /// base/1000 probe.
+    fn weth_usdc_grid() -> Vec<QuoteComputation> {
+        [
+            (10_000_000_000_000_000u128, 20_690_000u128),      // 0.01 WETH probe
+            (2_500_000_000_000_000_000, 5_172_500_000),        // 2.5 WETH
+            (10_000_000_000_000_000_000, 20_690_000_000),      // 10 WETH
+            (100_000_000_000_000_000_000, 206_900_000_000),    // 100 WETH
+        ]
+        .into_iter()
+        .map(|(i, o)| QuoteComputation {
+            amount_in: U256::from(i),
+            amount_out: U256::from(o),
+            slippage_bps: 5,
+        })
+        .collect()
+    }
+
+    #[test]
+    fn best_quote_picks_the_largest_size_within_tolerance() {
+        let grid = weth_usdc_grid();
+        let best = best_quote(&grid).expect("a winner");
+        assert_eq!(
+            best.amount_in,
+            U256::from(100_000_000_000_000_000_000u128),
+            "must represent the edge at the largest executable size, not the probe"
+        );
+    }
+
+    #[test]
+    fn best_quote_is_not_fooled_by_cross_decimal_pairs() {
+        // The regression itself: with the old `amount_out - amount_in` ranking,
+        // the 0.01 WETH probe won because -1e16 > -1e20.
+        let grid = weth_usdc_grid();
+        let best = best_quote(&grid).expect("a winner");
+        assert_ne!(
+            best.amount_in,
+            U256::from(10_000_000_000_000_000u128),
+            "the probe size must never be selected as representative"
+        );
+    }
+
+    #[test]
+    fn effective_rate_is_comparable_across_sizes() {
+        // Rate falls with size on a real curve; the comparator must see that.
+        let small = QuoteComputation {
+            amount_in: U256::from(1_000_000_000_000_000_000u128),
+            amount_out: U256::from(2_069_000_000u128),
+            slippage_bps: 0,
+        };
+        let large = QuoteComputation {
+            amount_in: U256::from(100_000_000_000_000_000_000u128),
+            amount_out: U256::from(206_000_000_000u128),
+            slippage_bps: 40,
+        };
+        assert!(
+            effective_rate(&small) > effective_rate(&large),
+            "slippage must show up as a worse effective rate"
+        );
+    }
+
+    #[test]
+    fn effective_rate_handles_zero_input() {
+        let z = QuoteComputation {
+            amount_in: U256::zero(),
+            amount_out: U256::from(1u64),
+            slippage_bps: 0,
+        };
+        assert_eq!(effective_rate(&z), Decimal::ZERO, "must not divide by zero");
     }
 }

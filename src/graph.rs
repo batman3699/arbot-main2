@@ -1892,6 +1892,21 @@ fn is_better(candidate: &Edge, current: &Edge) -> bool {
     if candidate.active != current.active {
         return candidate.active;
     }
+    // Freshness outranks price. `edge_signature` keys on the pool (and fee tier
+    // / tick spacing), so the two edges compared here are always the SAME pool
+    // in the SAME direction — two quotes of one price, taken at different
+    // blocks. Keeping the "better" one meant a stale quote could beat the
+    // current one purely by being more favourable, which is the definition of a
+    // phantom: a price that is not there any more. filter_stale_edges bounds
+    // this to MAX_QUOTE_BLOCK_LAG (2 blocks, ~4s on Base), but 4 seconds is
+    // ample to invent an edge on a pair whose real spread is 1-2 bps.
+    match (candidate.quote_block, current.quote_block) {
+        (Some(cand), Some(cur)) if cand != cur => return cand > cur,
+        // An evidence-backed quote beats one with no block attribution.
+        (Some(_), None) => return true,
+        (None, Some(_)) => return false,
+        _ => {}
+    }
     if candidate.weight != current.weight {
         return candidate.weight < current.weight;
     }
@@ -3045,6 +3060,39 @@ mod tests {
         priorities.insert(origin, 1);
         let cycles = graph.bellman_ford(&priorities, &limits(1), 2, None);
         assert!(cycles.is_empty());
+    }
+
+    #[test]
+    fn fresher_quote_wins_even_when_the_stale_one_looks_better() {
+        // Same pool, same direction, two blocks. The older quote is strictly
+        // more favourable — which is exactly the case that must NOT win, since
+        // it prices a trade at a rate that no longer exists.
+        let a = addr(1);
+        let b = addr(2);
+        let pool = addr(100);
+
+        let mut stale = cap_edge(a, b, 3, 1, U256::from(1_000u64));
+        stale.venue = VenueEdge::UniV3 {
+            path: Default::default(),
+            pool,
+            fee: 3000,
+            state: None,
+        };
+        stale.quote_block = Some(U64::from(100u64));
+        stale.weight = -500;
+
+        let mut fresh = stale.clone();
+        fresh.quote_block = Some(U64::from(102u64));
+        fresh.weight = -100; // worse price, but current
+
+        assert!(
+            is_better(&fresh, &stale),
+            "the fresher quote must win despite the worse rate"
+        );
+        assert!(
+            !is_better(&stale, &fresh),
+            "and the stale one must never displace it"
+        );
     }
 
     #[test]
