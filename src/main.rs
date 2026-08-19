@@ -393,6 +393,42 @@ fn expected_univ3_edge_upper_bound(pool_count: usize) -> usize {
     pool_count.saturating_mul(2)
 }
 
+/// Slippage ceiling used when the executor preflight is skipped in shadow mode.
+///
+/// Normally this comes from the deployed executor's `getConfig()`. On a chain
+/// with no executor there is nothing to read, so a shadow run needs a stand-in.
+/// The default mirrors the value the deployed Base executor reports (150 bps),
+/// which keeps shadow candidate filtering comparable to a live Base run rather
+/// than accidentally permissive.
+fn shadow_executor_max_slippage_bps() -> u32 {
+    crate::util::env_parse_opt::<u32>("SHADOW_EXECUTOR_MAX_SLIPPAGE_BPS")
+        .unwrap_or(150)
+        .clamp(1, 10_000)
+}
+
+/// Decide how much a flash-loan provider may advertise, given what it can
+/// actually lend. Extracted from `Runner::capacity_capped` so the policy is
+/// testable without a live provider.
+///
+/// `None` withholds the provider. Unknown capacity with a configured allowlist
+/// fails CLOSED: offering an unmeasured provider at full size is what let
+/// Balancer win the 0-bps fee sort at amounts its vault could not fund.
+fn capacity_capped_amount(
+    available: Option<U256>,
+    requested: U256,
+    min_flash_loan: U256,
+    allowlist_configured: bool,
+) -> Option<U256> {
+    match available {
+        Some(available) => {
+            let capped = requested.min(available);
+            (capped >= min_flash_loan).then_some(capped)
+        }
+        None if allowlist_configured => None,
+        None => Some(requested),
+    }
+}
+
 fn chain_hot_pool_base_cap(chain_name: &str) -> usize {
     match chain_name.to_ascii_lowercase().as_str() {
         "ethereum" => 420,
@@ -1344,7 +1380,7 @@ fn cap_cycles_per_start(
     }
     let mut capped = Vec::new();
     for entries in per_start.values_mut() {
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by_key(|e| e.0);
         for (_, indexed) in entries.drain(..).take(topk_per_token) {
             capped.push(indexed);
         }
@@ -3350,6 +3386,7 @@ where
     last_scanned_block: Arc<Mutex<Option<U64>>>,
     block_head_rx: Option<Arc<Mutex<watch::Receiver<BlockHead>>>>,
     populate_cache: Arc<Mutex<PopulateCacheState>>,
+    flash_capacity: Arc<StdMutex<FlashCapacityCache>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3357,6 +3394,24 @@ struct PopulateCacheState {
     cached_edges: Vec<Edge>,
     last_digest: Option<EdgeDigest>,
     touched_pools: HashSet<Address>,
+}
+
+/// Per-(provider, token) flash-loan capacity, refreshed once per block.
+///
+/// `flash_loan_quotes` used to advertise the same config-derived cap for every
+/// provider, so Balancer — quoted at 0 bps — won the fee sort at ANY size,
+/// including sizes its vault cannot fund. On Base the vault holds ~27.5 WETH
+/// while sizing routinely asked for more, and the loan reverts on-chain as
+/// `BAL#528` (INSUFFICIENT_FLASH_LOAN_BALANCE). Shadow mode hid it because no
+/// dispatch ever happened; the first funded run would have burned gas on it.
+///
+/// `aTokens` is resolved once per (pool, token) and reused: the aToken address
+/// for a reserve does not change, only its balance does.
+#[derive(Debug, Default)]
+struct FlashCapacityCache {
+    block: u64,
+    caps: HashMap<(u8, Address), U256>,
+    atokens: HashMap<Address, Address>,
 }
 
 impl<M, C> Runner<M, C>
@@ -3625,6 +3680,7 @@ where
             last_scanned_block: Arc::new(Mutex::new(None)),
             block_head_rx,
             populate_cache: Arc::new(Mutex::new(PopulateCacheState::default())),
+            flash_capacity: Arc::new(StdMutex::new(FlashCapacityCache::default())),
         }
     }
 
@@ -3664,6 +3720,7 @@ where
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn log_candidate_stage(
         &self,
         stage: &str,
@@ -3937,7 +3994,6 @@ where
                                 } else {
                                     Some(guard.cached_edges.clone())
                                 },
-                                ..Default::default()
                             }
                         };
                         let result = populate_edges(
@@ -4637,6 +4693,167 @@ where
         hubs
     }
 
+    /// Available balance a provider can actually lend for `token`, or `None`
+    /// when this block's capacity has not been read yet.
+    fn flash_capacity_for(&self, provider: FlashLoanProvider, token: Address) -> Option<U256> {
+        let guard = self.flash_capacity.lock().ok()?;
+        guard.caps.get(&(provider.as_id(), token)).copied()
+    }
+
+    /// Clamp an advertised loan size to what the provider can actually lend.
+    ///
+    /// `None` means withhold the provider entirely: either its capacity is below
+    /// the minimum viable loan, or capacity is unknown while an allowlist is
+    /// configured. That second case fails CLOSED on purpose — a provider we
+    /// could have measured but did not must never be offered at an unbounded
+    /// size, which is exactly how Balancer won the fee sort at sizes its vault
+    /// could not fund.
+    ///
+    /// When no allowlist is configured the token set cannot be enumerated to
+    /// refresh, so the previous unbounded behavior is preserved rather than
+    /// silently disabling the provider on chains that never set one.
+    fn capacity_capped(
+        &self,
+        provider: FlashLoanProvider,
+        token: Address,
+        requested: U256,
+        min_flash_loan: U256,
+        allowlist_configured: bool,
+    ) -> Option<U256> {
+        capacity_capped_amount(
+            self.flash_capacity_for(provider, token),
+            requested,
+            min_flash_loan,
+            allowlist_configured,
+        )
+    }
+
+    /// Refresh per-provider flash-loan capacity for every allowlisted token.
+    ///
+    /// Cheap and bounded: the allowlists hold a handful of tokens, aToken
+    /// addresses are resolved once and reused, and the whole thing is skipped
+    /// when the cached block is still current. Failures leave the entry absent
+    /// rather than stale — `flash_loan_quotes` fails closed on a missing entry,
+    /// so a degraded RPC withholds the provider instead of over-promising it.
+    async fn refresh_flash_capacity(&self, block_number: u64) {
+        if let Ok(guard) = self.flash_capacity.lock() {
+            if guard.block == block_number && !guard.caps.is_empty() {
+                return;
+            }
+        }
+
+        let mut wanted: Vec<(u8, Address, Address)> = Vec::new();
+        if let Some(tokens) = self.bal_flashloan_tokens.as_ref() {
+            for token in tokens.iter() {
+                wanted.push((FlashLoanProvider::Balancer.as_id(), *token, self.bal_vault));
+            }
+        }
+        let aave_pool = self.aave_pool;
+        if let (Some(tokens), Some(pool)) = (self.aave_flashloan_tokens.as_ref(), aave_pool) {
+            for token in tokens.iter() {
+                // Holder is the aToken, resolved below; `pool` marks the lookup.
+                wanted.push((FlashLoanProvider::AaveV3.as_id(), *token, pool));
+            }
+        }
+        if wanted.is_empty() {
+            return;
+        }
+
+        let mut caps: HashMap<(u8, Address), U256> = HashMap::new();
+        let mut atokens: HashMap<Address, Address> = self
+            .flash_capacity
+            .lock()
+            .map(|g| g.atokens.clone())
+            .unwrap_or_default();
+
+        for (provider_id, token, target) in wanted {
+            let holder = if provider_id == FlashLoanProvider::AaveV3.as_id() {
+                match atokens.get(&token).copied() {
+                    Some(addr) => addr,
+                    None => match self.resolve_aave_atoken(target, token).await {
+                        Some(addr) => {
+                            atokens.insert(token, addr);
+                            addr
+                        }
+                        None => continue,
+                    },
+                }
+            } else {
+                target
+            };
+
+            let contract = crate::util::IERC20::new(token, Arc::clone(&self.provider));
+            match contract.balance_of(holder).call().await {
+                Ok(balance) => {
+                    caps.insert((provider_id, token), balance);
+                }
+                Err(err) => {
+                    warn!(
+                        token = %format!("0x{}", hex::encode(token)),
+                        provider_id,
+                        error = %err,
+                        "flash-loan capacity read failed; provider withheld for this block"
+                    );
+                }
+            }
+        }
+
+        // Success-path visibility. Without this, "capacity enforced correctly"
+        // and "capacity never read" are indistinguishable in the log, and the
+        // fail-closed branch would silently withhold every provider.
+        if caps.is_empty() {
+            warn!(
+                block = block_number,
+                "flash-loan capacity refresh produced no entries; all allowlisted \
+                 providers will be withheld this block"
+            );
+        } else {
+            let summary = caps
+                .iter()
+                .map(|((provider_id, token), amount)| {
+                    format!("{provider_id}:0x{}={amount}", hex::encode(&token[..4]))
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            debug!(
+                block = block_number,
+                entries = caps.len(),
+                %summary,
+                "flash-loan capacity refreshed"
+            );
+        }
+
+        if let Ok(mut guard) = self.flash_capacity.lock() {
+            guard.block = block_number;
+            guard.caps = caps;
+            guard.atokens = atokens;
+        }
+    }
+
+    /// `getReserveData(address).aTokenAddress` — the contract holding a reserve's
+    /// underlying, whose balance is Aave's lendable liquidity. Word 8 of the
+    /// returned struct; verified against Base WETH.
+    async fn resolve_aave_atoken(&self, pool: Address, token: Address) -> Option<Address> {
+        const GET_RESERVE_DATA: [u8; 4] = [0x35, 0xea, 0x6a, 0x75];
+        let mut data = Vec::with_capacity(36);
+        data.extend_from_slice(&GET_RESERVE_DATA);
+        data.extend(ethers::abi::encode(&[ethers::abi::Token::Address(token)]));
+        let tx: TypedTransaction = TransactionRequest {
+            to: Some(NameOrAddress::Address(pool)),
+            data: Some(data.into()),
+            ..Default::default()
+        }
+        .into();
+        let raw = self.provider.call(&tx, None).await.ok()?;
+        let bytes = raw.as_ref();
+        if bytes.len() < 9 * 32 {
+            return None;
+        }
+        let word = &bytes[8 * 32..9 * 32];
+        let addr = Address::from_slice(&word[12..32]);
+        (!addr.is_zero()).then_some(addr)
+    }
+
     fn flash_loan_quotes(&self, token: Address, max_cycle_input: U256) -> Vec<FlashLoanQuote> {
         let capital = self.capital.snapshot();
         let mut quotes = Vec::new();
@@ -4655,12 +4872,20 @@ where
             .unwrap_or(true);
 
         if balancer_supported {
-            quotes.push(FlashLoanQuote {
-                provider: FlashLoanProvider::Balancer,
-                max_amount: capped_amount,
-                fee_bps: 0,
-                provider_addr: Some(self.bal_vault),
-            });
+            if let Some(max_amount) = self.capacity_capped(
+                FlashLoanProvider::Balancer,
+                token,
+                capped_amount,
+                capital.min_flash_loan,
+                self.bal_flashloan_tokens.is_some(),
+            ) {
+                quotes.push(FlashLoanQuote {
+                    provider: FlashLoanProvider::Balancer,
+                    max_amount,
+                    fee_bps: 0,
+                    provider_addr: Some(self.bal_vault),
+                });
+            }
         }
 
         let aave_supported = self
@@ -4669,12 +4894,20 @@ where
             .map(|set| set.contains(&token))
             .unwrap_or(false);
         if aave_supported && self.aave_pool.is_some() {
-            quotes.push(FlashLoanQuote {
-                provider: FlashLoanProvider::AaveV3,
-                max_amount: capped_amount,
-                fee_bps: self.aave_fee_bps,
-                provider_addr: self.aave_pool,
-            });
+            if let Some(max_amount) = self.capacity_capped(
+                FlashLoanProvider::AaveV3,
+                token,
+                capped_amount,
+                capital.min_flash_loan,
+                self.aave_flashloan_tokens.is_some(),
+            ) {
+                quotes.push(FlashLoanQuote {
+                    provider: FlashLoanProvider::AaveV3,
+                    max_amount,
+                    fee_bps: self.aave_fee_bps,
+                    provider_addr: self.aave_pool,
+                });
+            }
         }
 
         let erc3156_supported = self
@@ -5395,7 +5628,7 @@ where
     async fn current_block_head(&self, last_scanned: Option<U64>) -> Result<(Option<U256>, U64)> {
         if let Some(rx) = &self.block_head_rx {
             let head = *rx.lock().await.borrow();
-            if !head.number.is_zero() && last_scanned.map_or(true, |ls| head.number > ls) {
+            if !head.number.is_zero() && last_scanned.is_none_or(|ls| head.number > ls) {
                 return Ok((head.base_fee_per_gas, head.number));
             }
         }
@@ -5556,6 +5789,10 @@ where
             let mut guard = self.last_scanned_block.lock().await;
             *guard = Some(block_number);
         }
+
+        // Read what each flash-loan provider can actually lend at this head,
+        // before any candidate is sized against it.
+        self.refresh_flash_capacity(block_number.as_u64()).await;
 
         let priority_fee = self.broadcast.priority_fee();
         let baseline_calldata = vec![0u8; 120];
@@ -6882,7 +7119,7 @@ where
                     candidate_id,
                 };
             ranked_candidates.push(candidate_plan);
-            ranked_candidates.sort_by(|a, b| b.net_profit.cmp(&a.net_profit));
+            ranked_candidates.sort_by_key(|c| Reverse(c.net_profit));
             ranked_candidates.truncate(sim_cascade_cap);
         }
 
@@ -6917,7 +7154,7 @@ where
             self.log_candidate_stage(
                 "candidate_sent_to_sim",
                 &self.chain_name,
-                Some(format!("{}", candidate.candidate_id)),
+                Some(candidate.candidate_id.to_string()),
                 Some(candidate.cycle_start),
                 Some(candidate.hops),
                 edges_scanned,
@@ -7007,9 +7244,7 @@ where
                             .await
                         {
                             Ok((_, achieved, _)) => {
-                                let shortfall_bps = if demanded.is_zero() {
-                                    0u64
-                                } else if achieved >= demanded {
+                                let shortfall_bps = if demanded.is_zero() || achieved >= demanded {
                                     0u64
                                 } else {
                                     mul_div(
@@ -7045,7 +7280,7 @@ where
                     self.log_candidate_stage(
                         "candidate_rejected_post_sim",
                         &self.chain_name,
-                        Some(format!("{}", candidate.candidate_id)),
+                        Some(candidate.candidate_id.to_string()),
                         Some(candidate.cycle_start),
                         Some(candidate.hops),
                         edges_scanned,
@@ -7093,7 +7328,7 @@ where
                     self.log_candidate_stage(
                         "candidate_rejected_post_sim",
                         &self.chain_name,
-                        Some(format!("{}", candidate.candidate_id)),
+                        Some(candidate.candidate_id.to_string()),
                         Some(candidate.cycle_start),
                         Some(candidate.hops),
                         edges_scanned,
@@ -7144,7 +7379,7 @@ where
                 self.log_candidate_stage(
                     "candidate_rejected_post_sim",
                     &self.chain_name,
-                    Some(format!("{}", candidate.candidate_id)),
+                    Some(candidate.candidate_id.to_string()),
                     Some(candidate.cycle_start),
                     Some(candidate.hops),
                     edges_scanned,
@@ -7263,7 +7498,7 @@ where
                 self.log_candidate_stage(
                     "candidate_rejected_post_sim",
                     &self.chain_name,
-                    Some(format!("{}", candidate.candidate_id)),
+                    Some(candidate.candidate_id.to_string()),
                     Some(candidate.cycle_start),
                     Some(candidate.hops),
                     edges_scanned,
@@ -7335,7 +7570,7 @@ where
             self.log_candidate_stage(
                 "candidate_dispatch_eligible",
                 &self.chain_name,
-                Some(format!("{}", candidate.candidate_id)),
+                Some(candidate.candidate_id.to_string()),
                 Some(candidate.cycle_start),
                 Some(candidate.hops),
                 edges_scanned,
@@ -7406,7 +7641,7 @@ where
                     self.log_candidate_stage(
                         "candidate_rejected_post_sim",
                         &self.chain_name,
-                        Some(format!("{}", candidate.candidate_id)),
+                        Some(candidate.candidate_id.to_string()),
                         Some(candidate.cycle_start),
                         Some(candidate.hops),
                         edges_scanned,
@@ -7427,7 +7662,7 @@ where
             self.log_candidate_stage(
                 "candidate_dispatched",
                 &self.chain_name,
-                Some(format!("{}", candidate.candidate_id)),
+                Some(candidate.candidate_id.to_string()),
                 Some(candidate.cycle_start),
                 Some(candidate.hops),
                 edges_scanned,
@@ -9386,6 +9621,9 @@ mod runner_tests {
         assert!(message.contains("http://test-rpc"));
     }
 
+    // ENV_LOCK must span the whole test body: it serializes env-var mutation
+    // against every other test, so it cannot be dropped before the awaits.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn ensure_contract_deployed_enforces_pinned_codehash() {
         use std::env;
@@ -10762,8 +11000,7 @@ impl RuntimeTuning {
     let bounded_max_hops = max_hops.min(max_hops_cap);
     let max_relaxations: usize = crate::util::env_parse_opt::<usize>("BELLMAN_MAX_RELAXATIONS")
         .unwrap_or(bounded_max_hops.saturating_mul(4).max(24))
-        .max(1)
-        .min(256);
+        .clamp(1, 256);
     let max_hops = bounded_max_hops;
     let edge_slippage_bps: u32 = std::env::var("EDGE_SLIPPAGE_BPS")
         .unwrap_or_else(|_| "30".into())
@@ -11263,47 +11500,77 @@ async fn launch_chain_runtime(
         ops_chain.and_then(|chain| chain.permit2_address.clone()),
     )?;
     let executor = MultiVenueArbExecutor::new(executor_address, client.clone());
-    ensure_contract_deployed(
-        provider.as_ref(),
-        ContractDeploymentCheck {
-            chain: &cfg.name,
-            env_prefix: &cfg.env_prefix,
-            label: "executor",
-            suffix: "EXECUTOR_ADDRESS",
-            address: executor_address,
-            expected_chain_id: cfg.chain_id,
-            rpc_endpoint: &rpc_endpoint,
-        },
-    )
-    .await?;
-    ensure_executor_allowlisted(&executor, wallet.address(), &cfg.name).await?;
-    let batch_router =
-        ensure_executor_ownership_chain(&executor, executor_owner, &cfg.name).await?;
-    let (_, executor_max_slippage_bps_raw, _) = executor
-        .get_config()
-        .call()
-        .await
-        .context("fetch executor config")?;
-    let executor_max_slippage_bps = u32::from(executor_max_slippage_bps_raw);
 
-    info!(
-        chain = %cfg.name,
-        batch_router = %format!("{batch_router:#x}"),
-        signer = %format!("{:#x}", wallet.address()),
-        "live execution path: signer → executor.startV2 (allowlisted) or BatchRouter.startV2 (router owner)"
-    );
+    // Every check below validates the on-chain executor: that it is deployed,
+    // attested, allowlists our signer, and is owned through the expected chain.
+    // They exist to stop a LIVE run against the wrong contract.
+    //
+    // A shadow run never broadcasts (`shadow_dispatch` short-circuits
+    // `dispatch_call`), so these validate a contract that is never called —
+    // while hard-failing startup on any chain without a deployed executor. That
+    // blocks detection-only runs, which is exactly the venue-comparison
+    // workflow: pointing the scanner at a new chain to measure whether edge
+    // exists there before committing to a deployment.
+    //
+    // So gate strictly on shadow. This is deliberately NOT a standalone bypass
+    // flag: the instant SHADOW_MODE is off, every check runs again
+    // unconditionally, so no stray env var can start a funded run against an
+    // unvalidated executor.
+    let shadow_enabled = read_feature_flag("SHADOW_MODE", false);
+    let executor_max_slippage_bps = if shadow_enabled {
+        warn!(
+            chain = %cfg.name,
+            executor = %format!("{executor_address:#x}"),
+            max_slippage_bps = shadow_executor_max_slippage_bps(),
+            "SHADOW_MODE: executor preflight SKIPPED (deployment, attestation, \
+             allowlist, ownership, permit2). This run cannot broadcast and the \
+             executor is NOT validated — never reuse this config for a live run"
+        );
+        shadow_executor_max_slippage_bps()
+    } else {
+        ensure_contract_deployed(
+            provider.as_ref(),
+            ContractDeploymentCheck {
+                chain: &cfg.name,
+                env_prefix: &cfg.env_prefix,
+                label: "executor",
+                suffix: "EXECUTOR_ADDRESS",
+                address: executor_address,
+                expected_chain_id: cfg.chain_id,
+                rpc_endpoint: &rpc_endpoint,
+            },
+        )
+        .await?;
+        ensure_executor_allowlisted(&executor, wallet.address(), &cfg.name).await?;
+        let batch_router =
+            ensure_executor_ownership_chain(&executor, executor_owner, &cfg.name).await?;
+        let (_, executor_max_slippage_bps_raw, _) = executor
+            .get_config()
+            .call()
+            .await
+            .context("fetch executor config")?;
 
-    if let Ok(onchain_permit2) = executor.permit_2().call().await {
-        if onchain_permit2 != permit2_address {
-            warn!(
-                chain = %cfg.name,
-                env_prefix = %cfg.env_prefix,
-                onchain = %format!("{:#x}", onchain_permit2),
-                expected = %format!("{:#x}", permit2_address),
-                "executor permit2 mismatch; ensure deployment matches configuration"
-            );
+        info!(
+            chain = %cfg.name,
+            batch_router = %format!("{batch_router:#x}"),
+            signer = %format!("{:#x}", wallet.address()),
+            "live execution path: signer → executor.startV2 (allowlisted) or BatchRouter.startV2 (router owner)"
+        );
+
+        if let Ok(onchain_permit2) = executor.permit_2().call().await {
+            if onchain_permit2 != permit2_address {
+                warn!(
+                    chain = %cfg.name,
+                    env_prefix = %cfg.env_prefix,
+                    onchain = %format!("{:#x}", onchain_permit2),
+                    expected = %format!("{:#x}", permit2_address),
+                    "executor permit2 mismatch; ensure deployment matches configuration"
+                );
+            }
         }
-    }
+
+        u32::from(executor_max_slippage_bps_raw)
+    };
 
     let (broadcast_endpoint, public_jitter_override) =
         select_broadcast_endpoint(&cfg, ops_chain, &wallet, ws_backoff).await?;
@@ -11338,14 +11605,12 @@ async fn launch_chain_runtime(
         .unwrap_or(5_000)
         .min(9_000);
 
-    if cfg.chain_id == 8453 {
-        if matches!(broadcast_endpoint, BroadcastEndpoint::Private { .. }) {
-            warn!(
-                chain = %cfg.name,
-                chain_id = cfg.chain_id,
-                "Base (8453) uses public eth_sendRawTransaction for inclusion; Flashbots-style bundle relays are ignored on this chain"
-            );
-        }
+    if cfg.chain_id == 8453 && matches!(broadcast_endpoint, BroadcastEndpoint::Private { .. }) {
+        warn!(
+            chain = %cfg.name,
+            chain_id = cfg.chain_id,
+            "Base (8453) uses public eth_sendRawTransaction for inclusion; Flashbots-style bundle relays are ignored on this chain"
+        );
     }
 
     let broadcast = BroadcastConfig {
@@ -11361,7 +11626,9 @@ async fn launch_chain_runtime(
         bid_profit_fraction_bps,
     };
 
-    let shadow_enabled = read_feature_flag("SHADOW_MODE", false);
+    // `shadow_enabled` is read once, before the executor preflight above, so the
+    // preflight gate and the dispatch path can never disagree about whether this
+    // is a shadow run.
     let shadow_log_path = std::env::var("SHADOW_LOG_PATH").ok().map(PathBuf::from);
     let shadow_tag = std::env::var("SHADOW_TAG").ok();
     let shadow = if shadow_enabled {
@@ -11386,7 +11653,7 @@ async fn launch_chain_runtime(
         broadcast_delay_ms: chaos_broadcast_delay_ms,
     };
 
-    let feature_gate = FeatureGate::from_env_for_chain(&ops_inputs, &cfg.name);
+    let feature_gate = FeatureGate::from_env_for_chain(ops_inputs, &cfg.name);
     info!(
         cycle_arb = feature_gate.cycle_arb,
         backrun = feature_gate.backrun,
@@ -11594,7 +11861,7 @@ async fn launch_chain_runtime(
     let mut combined_univ3: Vec<PoolRecord> = Vec::new();
     let mut combined_pancakeswap: Vec<PoolRecord> = Vec::new();
     let mut combined_slipstream: Vec<PoolRecord> = Vec::new();
-    let token_decimals_hint: HashMap<Address, u8> = load_token_decimals_map(&ops_inputs);
+    let token_decimals_hint: HashMap<Address, u8> = load_token_decimals_map(ops_inputs);
 
     for venue in venues.iter() {
         let Some(kind) = venue.kind.as_ref() else {
@@ -11779,7 +12046,7 @@ async fn launch_chain_runtime(
     let hot_config_v3 = hot_pool_config.clone();
     let hot_config_slipstream = hot_pool_config.clone();
     let decimals_for_rank = token_decimals_hint.clone();
-    let univ3_rank_ctx = Arc::new(build_univ3_rank_context(&ops_inputs, &cfg.env_prefix));
+    let univ3_rank_ctx = Arc::new(build_univ3_rank_context(ops_inputs, &cfg.env_prefix));
     let univ3_rank_ctx_for_startup = Arc::clone(&univ3_rank_ctx);
     let slipstream_rank_ctx = Arc::clone(&univ3_rank_ctx_for_startup);
 
@@ -12378,10 +12645,11 @@ async fn launch_chain_runtime(
         "Bellman-Ford stable-graph skip configuration"
     );
 
-    let (slipstream_factory, slipstream_router, slipstream_quoter_addr) =
-        resolve_slipstream_venue(&ops_inputs, &cfg.name)
-            .unwrap_or((Address::zero(), Address::zero(), Address::zero()));
-    let slipstream_tick_spacings_set = collect_slipstream_tick_spacings(&ops_inputs, &cfg.name);
+    let (slipstream_factory, slipstream_router, slipstream_quoter_addr) = resolve_slipstream_venue(
+        ops_inputs, &cfg.name,
+    )
+    .unwrap_or((Address::zero(), Address::zero(), Address::zero()));
+    let slipstream_tick_spacings_set = collect_slipstream_tick_spacings(ops_inputs, &cfg.name);
     let slipstream_tick_spacings = if slipstream_tick_spacings_set.is_empty() {
         None
     } else {
@@ -12396,9 +12664,12 @@ async fn launch_chain_runtime(
     };
 
     let (pancakeswap_factory, pancakeswap_router, pancakeswap_quoter_addr) =
-        resolve_pancakeswap_venue(&ops_inputs, &cfg.name)
-            .unwrap_or((Address::zero(), Address::zero(), Address::zero()));
-    let pancakeswap_fee_tiers_set = collect_pancakeswap_fee_tiers(&ops_inputs, &cfg.name);
+        resolve_pancakeswap_venue(ops_inputs, &cfg.name).unwrap_or((
+            Address::zero(),
+            Address::zero(),
+            Address::zero(),
+        ));
+    let pancakeswap_fee_tiers_set = collect_pancakeswap_fee_tiers(ops_inputs, &cfg.name);
     let pancakeswap_fee_tiers = if pancakeswap_fee_tiers_set.is_empty() {
         None
     } else {
@@ -13352,6 +13623,53 @@ chains:
                 assert_eq!(allocations, 2);
             }
         }
+    }
+
+    #[test]
+    fn capacity_caps_request_to_what_the_provider_can_lend() {
+        let min = U256::from(100u64);
+        // Balancer's real Base failure: 100 WETH asked, 27.5 WETH in the vault.
+        // Previously the full 100 was advertised and reverted as BAL#528.
+        assert_eq!(
+            capacity_capped_amount(Some(U256::from(275u64)), U256::from(1000u64), min, true),
+            Some(U256::from(275u64)),
+            "must clamp down to available capacity"
+        );
+        // Ample capacity leaves the request untouched.
+        assert_eq!(
+            capacity_capped_amount(Some(U256::from(9999u64)), U256::from(1000u64), min, true),
+            Some(U256::from(1000u64))
+        );
+    }
+
+    #[test]
+    fn capacity_withholds_provider_below_min_flash_loan() {
+        let min = U256::from(100u64);
+        assert_eq!(
+            capacity_capped_amount(Some(U256::from(99u64)), U256::from(1000u64), min, true),
+            None,
+            "dust capacity must withhold the provider, not offer an unfillable loan"
+        );
+        assert_eq!(
+            capacity_capped_amount(Some(U256::zero()), U256::from(1000u64), min, true),
+            None
+        );
+    }
+
+    #[test]
+    fn capacity_unknown_fails_closed_only_when_allowlist_configured() {
+        let min = U256::from(100u64);
+        // Allowlist configured => we could have measured it => withhold.
+        assert_eq!(
+            capacity_capped_amount(None, U256::from(1000u64), min, true),
+            None,
+            "unmeasured provider must not be advertised at full size"
+        );
+        // No allowlist => token set not enumerable => preserve prior behavior.
+        assert_eq!(
+            capacity_capped_amount(None, U256::from(1000u64), min, false),
+            Some(U256::from(1000u64))
+        );
     }
 
     #[test]

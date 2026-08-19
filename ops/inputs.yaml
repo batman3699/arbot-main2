@@ -221,9 +221,13 @@ chains:
     max_loan_assets:
       - '0x4200000000000000000000000000000000000006' # WETH
       - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
+      - '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' # cbBTC
+      - '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22' # cbETH
     allowlist_tokens:
       - '0x4200000000000000000000000000000000000006' # WETH
       - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
+      - '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' # cbBTC
+      - '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22' # cbETH
   - name: balancer_v2
     kind: balancer_vault_like
     vault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8'
@@ -231,9 +235,13 @@ chains:
     max_loan_assets:
       - '0x4200000000000000000000000000000000000006' # WETH
       - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
+      - '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' # cbBTC
+      - '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22' # cbETH
     allowlist_tokens:
       - '0x4200000000000000000000000000000000000006' # WETH
       - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
+      - '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' # cbBTC
+      - '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22' # cbETH
   broadcast:
     mode: private
     # Base has no Flashbots-style bundle market; submit via private RPC
@@ -372,7 +380,7 @@ universe:
   min_pool_liquidity_tokens: 1
   max_hot_pools_per_chain_per_venue: 1500
   max_cold_pools_stored: 2500
-  max_edges_hot: 800
+  max_edges_hot: 1000
   topk_per_token: 6
   max_hops: 6
   cycle_candidate_cap_per_block: 500
