@@ -98,7 +98,7 @@ use ingestion::{
     block_head_channel, spawn_block_head_monitor, BlockHead, MonitoredPool,
     PoolMonitor,
 };
-use mempool::{spawn_live_mempool_monitor, BackrunHint, BackrunMonitor};
+use mempool::{spawn_live_mempool_monitor, spawn_mined_swap_monitor, BackrunHint, BackrunMonitor};
 use pool_store::{
     load_pool_records, pool_data_path, prioritize_cold_pool_inventory, univ2_configs_from_records,
     PoolRecord, ResolvedUniV2PoolCfg,
@@ -12710,6 +12710,34 @@ async fn launch_chain_runtime(
             },
         );
 
+        // Chains with no public mempool (Base: single sequencer) deliver zero
+        // pending transactions, so the monitor above receives nothing and
+        // backrun is enabled in name only. Verified empirically:
+        // eth_newPendingTransactionFilter is accepted and returns 0 txs while
+        // blocks advance normally. Backrunning the block that just landed is the
+        // pattern that does work there, so run it alongside — on a chain WITH a
+        // mempool it is simply a slower duplicate feed, and hints dedupe.
+        let mined_provider = provider.clone();
+        let mined_backrun = backrun_monitor.clone();
+        spawn_supervised(
+            "mined_swap_monitor",
+            cfg.name.clone(),
+            metrics.clone(),
+            move || {
+                let mined_provider = mined_provider.clone();
+                let mined_backrun = mined_backrun.clone();
+                spawn_mined_swap_monitor(
+                    mined_provider,
+                    mined_backrun,
+                    Duration::from_millis(
+                        crate::util::env_parse_opt::<u64>("BACKRUN_MINED_POLL_MS")
+                            .unwrap_or(1_000)
+                            .clamp(200, 10_000),
+                    ),
+                    Duration::from_secs(45),
+                )
+            },
+        );
     }
 
     // The `newHeads` monitor was spawned inside the backrun guard above, so

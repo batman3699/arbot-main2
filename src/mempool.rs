@@ -220,7 +220,7 @@ impl BackrunMonitor {
         None
     }
 
-    async fn ingest_transaction(&self, tx: &Transaction, source: &str) {
+    pub(crate) async fn ingest_transaction(&self, tx: &Transaction, source: &str) {
         if let Some((amount_in, path)) = decode_swap_transaction(tx) {
             self.record(&path, amount_in, source).await;
         }
@@ -544,6 +544,65 @@ fn tokens_from_abi_array(tokens: Vec<Token>) -> Option<Vec<Address>> {
         path.push(token.into_address()?);
     }
     Some(path)
+}
+
+/// Backrun MINED swaps, for chains with no public mempool.
+///
+/// `spawn_live_mempool_monitor` subscribes to `newPendingTransactions`, which is
+/// the right feed on a chain with a public mempool. Base has none — a single
+/// Coinbase sequencer — and this is not a theory: `eth_newPendingTransactionFilter`
+/// is accepted and then returns ZERO transactions while blocks advance normally.
+/// So on Base that monitor runs and receives nothing, and backrun is enabled in
+/// name only.
+///
+/// The viable pattern there is to backrun the block that just landed: decode the
+/// swaps in it, and arb the dislocation they left before it is closed. That is
+/// strictly later than mempool backrunning, but on Base nobody gets the earlier
+/// signal either, so the race is run from the same start line.
+///
+/// `BackrunMonitor::run` already contained this logic and had no callers. This
+/// drives only the mined-block half — polling the pending block on a chain that
+/// has none is a wasted RPC per tick.
+pub async fn spawn_mined_swap_monitor<C>(
+    provider: Arc<Provider<C>>,
+    backrun: Option<Arc<BackrunMonitor>>,
+    poll_interval: Duration,
+    hint_ttl: Duration,
+) where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    let Some(monitor) = backrun else {
+        return;
+    };
+    let mut last_seen: Option<u64> = None;
+    loop {
+        match provider.get_block_with_txs(BlockNumber::Latest).await {
+            Ok(Some(block)) => {
+                let number = block.number.map(|n| n.as_u64());
+                // Re-ingesting a block would double-count its swaps and inflate
+                // every hint's apparent size.
+                if number.is_some() && number != last_seen {
+                    let txs = block.transactions.len();
+                    for tx in &block.transactions {
+                        monitor.ingest_transaction(tx, "latest_block").await;
+                    }
+                    last_seen = number;
+                    tracing::debug!(
+                        target: "backrun",
+                        block = ?number,
+                        txs,
+                        "ingested mined block for backrun hints"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(target: "backrun", error = %err, "mined-block fetch failed");
+            }
+        }
+        monitor.prune(hint_ttl).await;
+        sleep(poll_interval).await;
+    }
 }
 
 /// Subscribe to `newPendingTransactions`, fetch each tx, decode swaps, feed backrun hints.
