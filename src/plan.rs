@@ -71,6 +71,12 @@ pub fn cl_hop_out(
     zero_for_one: bool,
 ) -> Option<(U256, bool)> {
     if crate::cl_sim::multi_tick_enabled() {
+        if ladder.is_none() {
+            tracing::debug!(
+                target: "minout",
+                "multi-tick ON but this edge carries NO ladder; forced to single-tick"
+            );
+        }
         if let Some(ladder) = ladder {
             if let Some(quote) = crate::cl_swap::quote_exact_input_multi_tick(
                 state,
@@ -767,6 +773,9 @@ pub async fn build_plan_for_cycle(
             target: "minout",
             hop = steps.len().saturating_sub(1),
             venue = venue_kind_label(&edge.venue),
+            pool = ?crate::venues::edge_pool_address(edge),
+            token_in = %format!("{from:#x}"),
+            token_out = %format!("{to:#x}"),
             amount_in = %current_amount,
             expected_out = %expected_out,
             min_out = %min_out,
