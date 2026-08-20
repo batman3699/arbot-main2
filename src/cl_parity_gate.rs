@@ -193,6 +193,23 @@ pub fn divergence_bps(model: U256, on_chain: U256) -> Option<i64> {
 /// Size matters and callers must pass the notional edges are actually quoted
 /// at: the known-bad pool is only 62 bps out at 0.0001 WETH but 40,423 bps out
 /// at 0.01 WETH, so measuring at a token amount would pass it.
+/// Sizes to attempt when measuring, largest first: the full notional, then
+/// progressively smaller fractions.
+///
+/// A pool whose ladder exhausts at the full notional still deserves a verdict —
+/// it may model smaller trades perfectly, and the hop amounts we actually
+/// execute are frequently well below the base notional. Measuring only at the
+/// full size left ~270 of 371 pools permanently unmeasured (and therefore
+/// untrusted, and therefore laddered by nobody), which silently forced every
+/// hop back onto the optimistic single-tick path.
+pub fn measurement_sizes(notional: U256) -> Vec<U256> {
+    [1u64, 4, 16, 64, 256]
+        .iter()
+        .map(|d| notional / U256::from(*d))
+        .filter(|a| !a.is_zero())
+        .collect()
+}
+
 pub fn model_quote(
     state: &crate::cl_sim::ClPoolState,
     ladder: &crate::cl_swap::TickLadder,
@@ -309,5 +326,24 @@ mod tests {
     #[test]
     fn divergence_declines_to_answer_on_a_zero_reference() {
         assert_eq!(divergence_bps(U256::from(1u64), U256::zero()), None);
+    }
+
+    #[test]
+    fn measurement_sizes_step_down_from_the_notional() {
+        let n = U256::from(10_000u64);
+        let sizes = measurement_sizes(n);
+        assert_eq!(sizes.first(), Some(&n), "full notional is tried first");
+        assert!(sizes.len() > 1, "must offer smaller fallbacks");
+        assert!(
+            sizes.windows(2).all(|w| w[0] > w[1]),
+            "must descend so the largest answerable size wins"
+        );
+        assert!(!sizes.iter().any(|s| s.is_zero()), "zero is not a size");
+    }
+
+    #[test]
+    fn measurement_sizes_degrade_gracefully_on_dust() {
+        assert!(measurement_sizes(U256::zero()).is_empty());
+        assert_eq!(measurement_sizes(U256::one()), vec![U256::one()]);
     }
 }

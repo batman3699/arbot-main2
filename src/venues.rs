@@ -1838,30 +1838,53 @@ where
                     .copied()
                     .unwrap_or(ctx.edge_ctx.default_profile)
                     .base_amount;
-                let Some(model) =
-                    crate::cl_parity_gate::model_quote(state, ladder, notional, zero_for_one)
-                else {
-                    continue;
-                };
-                let on_chain = ctx
-                    .quoter
-                    .quote_path(
-                        vec![(token_in, None), (token_out, Some(state.fee_ppm))],
-                        notional,
-                        ctx.edge_ctx.block_number,
-                    )
-                    .await
-                    .ok();
-                gate.record(
-                    pool,
-                    on_chain.and_then(|oc| crate::cl_parity_gate::divergence_bps(model, oc)),
-                );
+                // Step down until the model can answer. A pool whose ladder
+                // exhausts at the full notional still deserves a verdict; it may
+                // model smaller trades exactly, and executed hop amounts are
+                // often well below the base notional. Measuring only at full
+                // size left most pools permanently unmeasured, hence untrusted,
+                // hence with no ladder — silently forcing every hop back onto
+                // the optimistic single-tick path.
+                let mut verdict: Option<i64> = None;
+                for size in crate::cl_parity_gate::measurement_sizes(notional) {
+                    let Some(model) =
+                        crate::cl_parity_gate::model_quote(state, ladder, size, zero_for_one)
+                    else {
+                        continue;
+                    };
+                    let Ok(on_chain) = ctx
+                        .quoter
+                        .quote_path(
+                            // PoolRecord.fee is the venue's POOL KEY: a fee tier
+                        // for univ3, a TICK SPACING for slipstream. Passing
+                        // state.fee_ppm (the on-chain fee()) resolved no pool on
+                        // slipstream, so no verdict was ever earned and all 24
+                        // slipstream pools stayed untrusted with zero ladders —
+                        // forcing one hop of every univ3+slipstream cycle onto
+                        // the optimistic single-tick model.
+                        vec![(token_in, None), (token_out, Some(record.fee))],
+                            size,
+                            ctx.edge_ctx.block_number,
+                        )
+                        .await
+                    else {
+                        // Transport failure is not evidence either way; stop
+                        // rather than record a verdict we did not earn.
+                        break;
+                    };
+                    verdict = crate::cl_parity_gate::divergence_bps(model, on_chain);
+                    break;
+                }
+                gate.record(pool, verdict);
             }
 
             let trusted: HashMap<Address, Arc<crate::cl_swap::TickLadder>> =
                 built.into_iter().filter(|(p, _)| gate.trusted(*p)).collect();
             let (ok, rejected, tracked) = gate.stats();
-            debug!(
+            info!(
+                target: "ladder",
+                pools_with_state = prefetched_cl_state.len(),
+                hot_pools = hot_pools.len(),
                 ladders = trusted.len(),
                 trusted = ok,
                 rejected,
@@ -2554,30 +2577,53 @@ where
                     .copied()
                     .unwrap_or(ctx.edge_ctx.default_profile)
                     .base_amount;
-                let Some(model) =
-                    crate::cl_parity_gate::model_quote(state, ladder, notional, zero_for_one)
-                else {
-                    continue;
-                };
-                let on_chain = ctx
-                    .quoter
-                    .quote_path(
-                        vec![(token_in, None), (token_out, Some(state.fee_ppm))],
-                        notional,
-                        ctx.edge_ctx.block_number,
-                    )
-                    .await
-                    .ok();
-                gate.record(
-                    pool,
-                    on_chain.and_then(|oc| crate::cl_parity_gate::divergence_bps(model, oc)),
-                );
+                // Step down until the model can answer. A pool whose ladder
+                // exhausts at the full notional still deserves a verdict; it may
+                // model smaller trades exactly, and executed hop amounts are
+                // often well below the base notional. Measuring only at full
+                // size left most pools permanently unmeasured, hence untrusted,
+                // hence with no ladder — silently forcing every hop back onto
+                // the optimistic single-tick path.
+                let mut verdict: Option<i64> = None;
+                for size in crate::cl_parity_gate::measurement_sizes(notional) {
+                    let Some(model) =
+                        crate::cl_parity_gate::model_quote(state, ladder, size, zero_for_one)
+                    else {
+                        continue;
+                    };
+                    let Ok(on_chain) = ctx
+                        .quoter
+                        .quote_path(
+                            // PoolRecord.fee is the venue's POOL KEY: a fee tier
+                        // for univ3, a TICK SPACING for slipstream. Passing
+                        // state.fee_ppm (the on-chain fee()) resolved no pool on
+                        // slipstream, so no verdict was ever earned and all 24
+                        // slipstream pools stayed untrusted with zero ladders —
+                        // forcing one hop of every univ3+slipstream cycle onto
+                        // the optimistic single-tick model.
+                        vec![(token_in, None), (token_out, Some(record.fee))],
+                            size,
+                            ctx.edge_ctx.block_number,
+                        )
+                        .await
+                    else {
+                        // Transport failure is not evidence either way; stop
+                        // rather than record a verdict we did not earn.
+                        break;
+                    };
+                    verdict = crate::cl_parity_gate::divergence_bps(model, on_chain);
+                    break;
+                }
+                gate.record(pool, verdict);
             }
 
             let trusted: HashMap<Address, Arc<crate::cl_swap::TickLadder>> =
                 built.into_iter().filter(|(p, _)| gate.trusted(*p)).collect();
             let (ok, rejected, tracked) = gate.stats();
-            debug!(
+            info!(
+                target: "ladder",
+                pools_with_state = prefetched_cl_state.len(),
+                hot_pools = hot_pools.len(),
                 ladders = trusted.len(),
                 trusted = ok,
                 rejected,
