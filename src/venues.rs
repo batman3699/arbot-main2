@@ -1803,7 +1803,72 @@ where
                 max_pool_tasks,
             )
             .await;
-            Arc::new(built)
+
+            // Earn trust per pool. The local model is exact on nearly every pool
+            // measured, but where a pool's own reported state is internally
+            // inconsistent it can be 40,000+ bps out — and no local check
+            // detects that, because the inputs look self-consistent. Only the
+            // pool's own quoter is authoritative. Verdicts carry a TTL and only
+            // a bounded number of pools are (re)measured per scan, so this costs
+            // one quoter call per pool per TTL rather than reintroducing the
+            // per-scan RPC the local path exists to avoid.
+            let gate = crate::cl_parity_gate::gate();
+            for pool in gate.due_for_check(built.keys().copied()) {
+                let (Some(state), Some(ladder), Some(record)) = (
+                    prefetched_cl_state.get(&pool),
+                    built.get(&pool),
+                    hot_pools.iter().find(|p| p.pool == pool),
+                ) else {
+                    continue;
+                };
+                let zero_for_one = record.token0 < record.token1;
+                let (token_in, token_out) = if zero_for_one {
+                    (record.token0, record.token1)
+                } else {
+                    (record.token1, record.token0)
+                };
+                // Measure at the same notional the quote loop uses for this
+                // token, not a token amount: the divergence is size-dependent,
+                // so a small probe would pass a pool that fails at trade size.
+                let notional = ctx
+                    .edge_ctx
+                    .base_profiles
+                    .as_ref()
+                    .get(&token_in)
+                    .copied()
+                    .unwrap_or(ctx.edge_ctx.default_profile)
+                    .base_amount;
+                let Some(model) =
+                    crate::cl_parity_gate::model_quote(state, ladder, notional, zero_for_one)
+                else {
+                    continue;
+                };
+                let on_chain = ctx
+                    .quoter
+                    .quote_path(
+                        vec![(token_in, None), (token_out, Some(state.fee_ppm))],
+                        notional,
+                        ctx.edge_ctx.block_number,
+                    )
+                    .await
+                    .ok();
+                gate.record(
+                    pool,
+                    on_chain.and_then(|oc| crate::cl_parity_gate::divergence_bps(model, oc)),
+                );
+            }
+
+            let trusted: HashMap<Address, Arc<crate::cl_swap::TickLadder>> =
+                built.into_iter().filter(|(p, _)| gate.trusted(*p)).collect();
+            let (ok, rejected, tracked) = gate.stats();
+            debug!(
+                ladders = trusted.len(),
+                trusted = ok,
+                rejected,
+                tracked,
+                "CL parity gate applied"
+            );
+            Arc::new(trusted)
         } else {
             Arc::new(HashMap::new())
         };
@@ -2454,7 +2519,72 @@ where
                 max_pool_tasks,
             )
             .await;
-            Arc::new(built)
+
+            // Earn trust per pool. The local model is exact on nearly every pool
+            // measured, but where a pool's own reported state is internally
+            // inconsistent it can be 40,000+ bps out — and no local check
+            // detects that, because the inputs look self-consistent. Only the
+            // pool's own quoter is authoritative. Verdicts carry a TTL and only
+            // a bounded number of pools are (re)measured per scan, so this costs
+            // one quoter call per pool per TTL rather than reintroducing the
+            // per-scan RPC the local path exists to avoid.
+            let gate = crate::cl_parity_gate::gate();
+            for pool in gate.due_for_check(built.keys().copied()) {
+                let (Some(state), Some(ladder), Some(record)) = (
+                    prefetched_cl_state.get(&pool),
+                    built.get(&pool),
+                    hot_pools.iter().find(|p| p.pool == pool),
+                ) else {
+                    continue;
+                };
+                let zero_for_one = record.token0 < record.token1;
+                let (token_in, token_out) = if zero_for_one {
+                    (record.token0, record.token1)
+                } else {
+                    (record.token1, record.token0)
+                };
+                // Measure at the same notional the quote loop uses for this
+                // token, not a token amount: the divergence is size-dependent,
+                // so a small probe would pass a pool that fails at trade size.
+                let notional = ctx
+                    .edge_ctx
+                    .base_profiles
+                    .as_ref()
+                    .get(&token_in)
+                    .copied()
+                    .unwrap_or(ctx.edge_ctx.default_profile)
+                    .base_amount;
+                let Some(model) =
+                    crate::cl_parity_gate::model_quote(state, ladder, notional, zero_for_one)
+                else {
+                    continue;
+                };
+                let on_chain = ctx
+                    .quoter
+                    .quote_path(
+                        vec![(token_in, None), (token_out, Some(state.fee_ppm))],
+                        notional,
+                        ctx.edge_ctx.block_number,
+                    )
+                    .await
+                    .ok();
+                gate.record(
+                    pool,
+                    on_chain.and_then(|oc| crate::cl_parity_gate::divergence_bps(model, oc)),
+                );
+            }
+
+            let trusted: HashMap<Address, Arc<crate::cl_swap::TickLadder>> =
+                built.into_iter().filter(|(p, _)| gate.trusted(*p)).collect();
+            let (ok, rejected, tracked) = gate.stats();
+            debug!(
+                ladders = trusted.len(),
+                trusted = ok,
+                rejected,
+                tracked,
+                "CL parity gate applied"
+            );
+            Arc::new(trusted)
         } else {
             Arc::new(HashMap::new())
         };

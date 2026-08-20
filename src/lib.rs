@@ -1,6 +1,7 @@
 pub mod backrun_state;
 pub mod cl_math;
 pub mod cl_sim;
+pub mod cl_parity_gate;
 pub mod cl_swap;
 pub mod cl_ticks;
 pub mod sim_revm;

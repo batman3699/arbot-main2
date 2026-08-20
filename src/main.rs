@@ -5,6 +5,7 @@ mod capital;
 mod chain;
 mod cl_math;
 mod cl_sim;
+mod cl_parity_gate;
 mod cl_swap;
 mod cl_ticks;
 #[cfg(test)]
