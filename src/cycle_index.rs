@@ -90,6 +90,13 @@ pub struct PoolUniverse {
     /// not on pool count: adding a fourth WETH/USDC fee tier is a new pool but
     /// not a new edge in the token graph, and must not invalidate the index.
     pairs: Vec<(Address, Address)>,
+    /// Canonical unordered pair -> every pool serving it.
+    ///
+    /// The inverse of [`PoolUniverse::hops_for_pools`]. Deliberately NOT part
+    /// of `digest`: the digest keys cycle-index staleness on adjacency, and
+    /// this field is derived from the same `pools` map, so including it would
+    /// add nothing but a rebuild trigger.
+    by_pair: HashMap<(Address, Address), Vec<Address>>,
     digest: u64,
 }
 
@@ -114,6 +121,16 @@ impl PoolUniverse {
         pairs.sort_unstable();
         pairs.dedup();
 
+        let mut by_pair: HashMap<(Address, Address), Vec<Address>> = HashMap::new();
+        for (pool, (a, b)) in map.iter() {
+            let key = if a <= b { (*a, *b) } else { (*b, *a) };
+            by_pair.entry(key).or_default().push(*pool);
+        }
+        for pools in by_pair.values_mut() {
+            pools.sort_unstable();
+            pools.dedup();
+        }
+
         let mut hasher = DefaultHasher::new();
         pairs.len().hash(&mut hasher);
         for (a, b) in &pairs {
@@ -125,6 +142,7 @@ impl PoolUniverse {
             pools: map,
             digest: hasher.finish(),
             pairs,
+            by_pair,
         }
     }
 
@@ -158,6 +176,16 @@ impl PoolUniverse {
             }
         }
         hops
+    }
+
+    /// Every pool serving the token hop `from -> to`.
+    ///
+    /// A pool trades both directions, so the lookup is direction-insensitive.
+    /// Returns all parallel pools: a hint on WETH/USDC must dirty every fee
+    /// tier, not whichever one happened to be found first.
+    pub fn pools_for_hop(&self, from: Address, to: Address) -> &[Address] {
+        let key = if from <= to { (from, to) } else { (to, from) };
+        self.by_pair.get(&key).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Directed adjacency over tokens: every pair, both ways.
@@ -584,6 +612,52 @@ mod tests {
             cycle.tokens.contains(&addr(2)),
             "the returned cycle must actually traverse the changed pair"
         );
+    }
+
+    #[test]
+    fn pools_for_hop_resolves_both_directions_to_the_same_pools() {
+        let graph = two_hop_graph();
+        let universe = universe_of(&graph);
+        let forward = universe.pools_for_hop(addr(1), addr(2));
+        let reverse = universe.pools_for_hop(addr(2), addr(1));
+        assert_eq!(forward, [addr(100)], "hop must resolve to its pool");
+        assert_eq!(
+            forward, reverse,
+            "a pool trades both ways; direction must not change the answer"
+        );
+    }
+
+    #[test]
+    fn pools_for_hop_returns_every_parallel_pool() {
+        // Same token pair across three fee tiers. A hint on this pair must
+        // dirty ALL of them, not an arbitrary one.
+        let graph = graph_from(vec![
+            edge(addr(1), addr(2), addr(100)),
+            edge(addr(1), addr(2), addr(101)),
+            edge(addr(1), addr(2), addr(102)),
+        ]);
+        let mut pools = universe_of(&graph).pools_for_hop(addr(1), addr(2)).to_vec();
+        pools.sort_unstable();
+        assert_eq!(pools, vec![addr(100), addr(101), addr(102)]);
+    }
+
+    #[test]
+    fn pools_for_hop_is_empty_for_an_unknown_pair() {
+        let universe = universe_of(&two_hop_graph());
+        assert!(
+            universe.pools_for_hop(addr(7), addr(8)).is_empty(),
+            "an unknown pair must yield nothing, not a panic or a wrong pool"
+        );
+    }
+
+    #[test]
+    fn the_reverse_index_does_not_perturb_the_digest() {
+        // digest() drives cycle-index staleness. If adding by_pair changed it,
+        // every scan would rebuild.
+        let graph = two_hop_graph();
+        let universe = universe_of(&graph);
+        let idx = CycleIndex::build(&universe, &[addr(1)], CycleIndexLimits::default());
+        assert!(!idx.is_stale(&universe_of(&two_hop_graph())));
     }
 
     #[test]
