@@ -32,6 +32,18 @@ use crate::{
 /// the constants it depends on were wrong for the life of the process: each
 /// had a correct prefix and a fabricated tail, so the subscription connected
 /// cleanly and delivered nothing.
+/// Grace period before a silent subscription is treated as suspicious.
+const SILENT_SUBSCRIPTION_GRACE: Duration = Duration::from_secs(60);
+
+/// True when a subscription has been connected long enough that receiving
+/// nothing is more likely a broken filter than a quiet market.
+///
+/// This exists because a wrong `topic0` produced a subscription that connected
+/// cleanly, logged success, and delivered nothing for the life of the process.
+pub(crate) fn should_warn_silent(events: u64, connected_for: Duration) -> bool {
+    events == 0 && connected_for >= SILENT_SUBSCRIPTION_GRACE
+}
+
 pub(crate) fn pool_log_filter(pools: &[MonitoredPool]) -> Filter {
     Filter::new()
         .address(pools.iter().map(|p| p.pair).collect::<Vec<_>>())
@@ -190,11 +202,15 @@ where
                     self.ws_connected.store(true, Ordering::SeqCst);
                     self.ws_warned.store(false, Ordering::Relaxed);
                     info!(pools = pools.len(), "pool monitor websocket connected");
+                    let connected_at = std::time::Instant::now();
+                    let mut events_seen: u64 = 0;
+                    let mut silence_warned = false;
                     loop {
                         tokio::select! {
                             log = sub.next() => {
                                 match log {
                                     Some(log) => {
+                                        events_seen = events_seen.saturating_add(1);
                                         if let Err(err) = self.handle_log(log).await {
                                             warn!(error = %err, "failed to refresh pool after ws event");
                                         }
@@ -208,6 +224,19 @@ where
                             _ = self.pool_updates.notified() => {
                                 warn!("pool list updated; resubscribing websocket filter");
                                 break;
+                            }
+                            _ = sleep(SILENT_SUBSCRIPTION_GRACE) => {
+                                if !silence_warned
+                                    && should_warn_silent(events_seen, connected_at.elapsed())
+                                {
+                                    silence_warned = true;
+                                    warn!(
+                                        pools = pools.len(),
+                                        connected_secs = connected_at.elapsed().as_secs(),
+                                        "pool monitor websocket connected but has received NO \
+                                         logs; check that the subscribed topics match the pools"
+                                    );
+                                }
                             }
                         }
                     }
@@ -879,6 +908,28 @@ mod tests {
             seen,
             WRITERS * PER_WRITER,
             "a concurrent mark was erased by a drain"
+        );
+    }
+
+    #[test]
+    fn a_silent_subscription_warns_once_connected_long_enough() {
+        assert!(
+            should_warn_silent(0, Duration::from_secs(120)),
+            "a connected-but-deaf subscription is exactly the shipped bug and \
+             must be loud"
+        );
+    }
+
+    #[test]
+    fn a_busy_subscription_never_warns() {
+        assert!(!should_warn_silent(1, Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn a_freshly_connected_subscription_is_given_time() {
+        assert!(
+            !should_warn_silent(0, Duration::from_secs(5)),
+            "a quiet market must not warn during normal startup"
         );
     }
 
