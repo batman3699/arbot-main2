@@ -584,8 +584,10 @@ fn edge_capacity_from_pool_balance(balance_in: U256) -> U256 {
 /// constant-product pool with reserves `L/sqrt(P)` and `L*sqrt(P)`. With
 /// `sqrt_price_x96 = sqrt(P) * 2^96`:
 ///
-///     reserve0 = L * 2^96 / sqrt_price_x96
-///     reserve1 = L * sqrt_price_x96 / 2^96
+/// ```text
+/// reserve0 = L * 2^96 / sqrt_price_x96
+/// reserve1 = L * sqrt_price_x96 / 2^96
+/// ```
 ///
 /// This is depth measured from POOL STATE, which is what `max_input` should have
 /// been derived from all along — see `edge_capacity_from_cl_state`.
