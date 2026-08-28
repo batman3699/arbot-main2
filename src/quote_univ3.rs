@@ -39,8 +39,21 @@ abigen!(
     ]"#,
 );
 
-/// Fee tiers in hundredths of a bip: 500=0.05%, 3000=0.3%, 10000=1%
-pub const FEE_TIERS: [u32; 3] = [500, 3000, 10000];
+/// Fee tiers in hundredths of a bip: 500=0.05%, 3000=0.3%, 10000=1%, 100=0.01%
+///
+/// 100 is LAST, not first, and that ordering is load-bearing. Callers that probe
+/// for a native price take the FIRST tier returning a non-zero quote, so leading
+/// with the 1bp tier would let a thin correlated-pair pool outrank a deep 500
+/// pool and set the price. Appended, it only answers when every other tier has
+/// no route — strictly additive, no change to prices that already resolve.
+///
+/// It was missing entirely, which mattered: 63 pools in the Base inventory sit
+/// at this tier (stable- and LST-correlated pairs — wstETH, cbETH, stable/stable),
+/// and a token whose only WETH route is a 1bp pool resolved as `NoRoute`. That
+/// verdict is cached, and an unpriceable start token is rejected as
+/// `unreliable_native_price_for_start_token` BEFORE sizing runs, so every cycle
+/// beginning at that token vanished silently and looked like "no opportunity".
+pub const FEE_TIERS: [u32; 4] = [500, 3000, 10000, 100];
 
 #[allow(dead_code)]
 pub fn is_supported_univ3_fee(fee: u32) -> bool {

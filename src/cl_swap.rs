@@ -115,6 +115,41 @@ pub struct MultiTickQuote {
     pub exhausted: bool,
 }
 
+/// Published UniV3 price bounds. A swap that ends here has consumed every
+/// unit of the output token the pool can give in that direction.
+pub const MIN_SQRT_RATIO: u128 = 4_295_128_739;
+
+impl MultiTickQuote {
+    /// True when this quote is not a real, fillable answer.
+    ///
+    /// `exhausted` alone is not enough. It describes OUR ladder — how far we
+    /// could see — so a wide ladder over a pool whose `liquidity()` overstates
+    /// what it actually holds walks happily to the end and reports success.
+    /// These two signals describe the POOL instead, and neither needs an extra
+    /// RPC:
+    ///
+    /// * `amount_in_consumed < amount_in` — the swap could not spend the full
+    ///   input. Whatever the reason, the pool cannot fill this size.
+    /// * `sqrt_price_after` at the price bound — the swap drove the pool to
+    ///   MIN/MAX sqrt ratio, i.e. drained that side outright.
+    ///
+    /// Measured on WETH/bsdETH 0xdea629c5587037d0925ff85f1961d95db62bedd6: the
+    /// pool reports `liquidity() = 2.446e22` while holding just 0.154 bsdETH
+    /// against 248.9 WETH. The model quoted 2 WETH -> 1.904 bsdETH; the on-chain
+    /// quoter pays 0.0000169 and returns `sqrtPriceAfter = 4295128740`, exactly
+    /// `MIN_SQRT_RATIO + 1`. Because the mispricing made it the most profitable
+    /// edge on the chain (~1.9%), it outranked every genuine edge and was
+    /// selected on every block — the ranking was sorting on model error.
+    pub fn is_unfillable(&self, amount_in: U256) -> bool {
+        if self.amount_in_consumed < amount_in {
+            return true;
+        }
+        // Within a small margin of the bound: the quoter lands on
+        // MIN_SQRT_RATIO + 1, so an exact compare would miss it.
+        self.sqrt_price_after <= U256::from(MIN_SQRT_RATIO).saturating_add(U256::from(16u64))
+    }
+}
+
 /// Apply a signed liquidity delta. Returns `None` (never saturates) if the
 /// result would over/underflow `u128` — the caller treats that as exhaustion.
 fn apply_liquidity_net(liquidity: u128, liquidity_net: i128) -> Option<u128> {
@@ -316,6 +351,7 @@ mod tests {
             tick: 0,
             tick_spacing: 60,
             fee_ppm,
+            ..Default::default()
         }
     }
 

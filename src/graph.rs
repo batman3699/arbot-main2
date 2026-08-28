@@ -119,6 +119,41 @@ pub struct Edge {
 
 /// `a * b / d`, evaluated in 512 bits so the intermediate product cannot wrap.
 /// Saturates instead of panicking; a zero divisor yields zero.
+/// Per-hop capacity projected to start-token units with no intermediate flooring.
+///
+/// Returns `None` only if the running rate products would overflow U512, or a
+/// rate is degenerate (zero numerator/denominator), in which case the caller
+/// falls back to the sequential form.
+fn cycle_input_capacity_exact(edges: &[Edge]) -> Option<U256> {
+    let mut num = U512::one(); // PROD rate_num over hops already traversed
+    let mut den = U512::one(); // PROD rate_den over hops already traversed
+    let mut capacity: Option<U512> = None;
+
+    for edge in edges {
+        if edge.rate_num.is_zero() || edge.rate_den.is_zero() {
+            return None;
+        }
+        // capacity_i = max_input_i * den / num, exact until this single divide.
+        let scaled = U512::from(edge.max_input).checked_mul(den)?;
+        let hop_capacity = scaled / num;
+        capacity = Some(match capacity {
+            Some(current) => current.min(hop_capacity),
+            None => hop_capacity,
+        });
+
+        num = num.checked_mul(U512::from(edge.rate_num))?;
+        den = den.checked_mul(U512::from(edge.rate_den))?;
+    }
+
+    let capacity = capacity?;
+    if capacity > U512::from(U256::MAX) {
+        return Some(U256::MAX);
+    }
+    let mut buf = [0u8; 64];
+    capacity.to_little_endian(&mut buf);
+    Some(U256::from_little_endian(&buf[..32]))
+}
+
 fn mul_div_floor(a: U256, b: U256, d: U256) -> U256 {
     if d.is_zero() {
         return U256::zero();
@@ -156,15 +191,75 @@ pub fn cycle_input_capacity(edges: &[Edge], probe: U256) -> U256 {
     if edges.is_empty() || probe.is_zero() {
         return U256::zero();
     }
+    // Exact-fraction projection in U512.
+    //
+    // The sequential form re-floored `amount` at every hop
+    // (`amount = mul_div_floor(amount, rate_num, rate_den)`), so truncation
+    // compounded along the cycle and the final divide could floor a real
+    // capacity to zero. Measured on Base: 18/18 zero-capacity events were this,
+    // at hops=4 and hops=5, on WETH/USDC/cbBTC/cbETH — the deepest pairs on the
+    // chain. Those cycles were never dead; the arithmetic said zero.
+    //
+    // Algebraically the probe cancels out:
+    //   amount_i    = probe * PROD_{j<i}(rate_num_j / rate_den_j)
+    //   capacity_i  = probe * max_input_i / amount_i
+    //               = max_input_i * PROD_{j<i}(rate_den_j) / PROD_{j<i}(rate_num_j)
+    // so carrying the running rate as an exact num/den pair in U512 and dividing
+    // ONCE per hop removes every intermediate floor. `mul_div_floor` was already
+    // U512 internally, so widening it was never the fix — the fold was.
+    //
+    // Falls back to the sequential form only if the running products overflow
+    // U512, which needs an implausible rate stack; behaviour is then no worse
+    // than before.
+    if let Some(exact) = cycle_input_capacity_exact(edges) {
+        return exact;
+    }
+
     let mut capacity = U256::MAX;
     let mut amount = probe;
-    for edge in edges {
+    for (hop, edge) in edges.iter().enumerate() {
         // A hop that receives nothing cannot be scaled into; the cycle is dead.
+        //
+        // Two very different causes both land on zero here, and the caller
+        // reports both as `no_liquidity`:
+        //   1. `amount` floored to zero projecting through this hop's rate --
+        //      an ARITHMETIC artifact of a small probe crossing a decimals gap
+        //      (e.g. 18dp -> 8dp), not an absence of liquidity.
+        //   2. `edge.max_input == 0` -- a genuinely dead edge.
+        // Naming which one fired is the difference between "there is no trade"
+        // and "we computed zero"; `no_liquidity` on WETH/USDC/cbBTC, which are
+        // the deepest pairs on the chain, is the signature of (1).
         if amount.is_zero() {
+            tracing::debug!(
+                target: "capacity",
+                hop,
+                hops = edges.len(),
+                %probe,
+                "cycle capacity zero: amount floored to zero projecting through \
+                 this hop's rate (decimals/probe artifact, NOT dead liquidity)"
+            );
+            return U256::zero();
+        }
+        if edge.max_input.is_zero() {
+            tracing::debug!(
+                target: "capacity",
+                hop,
+                hops = edges.len(),
+                "cycle capacity zero: this hop's edge has max_input = 0 (dead edge)"
+            );
             return U256::zero();
         }
         capacity = capacity.min(mul_div_floor(probe, edge.max_input, amount));
         amount = mul_div_floor(amount, edge.rate_num, edge.rate_den);
+    }
+    if capacity.is_zero() {
+        tracing::debug!(
+            target: "capacity",
+            hops = edges.len(),
+            %probe,
+            "cycle capacity floored to zero across hops: probe too small to \
+             project a non-zero capacity (arithmetic, not liquidity)"
+        );
     }
     capacity
 }
@@ -2071,6 +2166,69 @@ mod tests {
         // A hop that outputs nothing kills the cycle rather than dividing by zero.
         let dead = cap_edge(b, a, 0, 1, U256::MAX);
         assert!(cycle_input_capacity(&[edge, dead, cap_edge(a, b, 1, 1, U256::MAX)], U256::from(5u64)).is_zero());
+    }
+
+    /// A multi-hop cycle across a decimals gap must not have its capacity
+    /// floored to zero by the fold's own truncation.
+    ///
+    /// Measured on Base: 18/18 zero-capacity events came from this path at
+    /// hops=4 and hops=5, on WETH/USDC/cbBTC/cbETH — the four deepest pairs on
+    /// the chain. `no_liquidity` was the largest rejection reason (401/490) and
+    /// none of it was missing liquidity.
+    ///
+    /// Shape below: WETH(18dp) -> USDC(6dp) -> cbBTC(8dp) -> WETH, i.e. rates
+    /// that swing across twelve orders of magnitude, which is exactly where the
+    /// sequential `mul_div_floor` fold loses the value.
+    #[test]
+    fn cycle_capacity_survives_a_cross_decimal_multi_hop() {
+        fn hop(from: Address, to: Address, num: u128, den: u128, max_input: u128) -> Edge {
+            Edge {
+                from,
+                to,
+                rate_num: U256::from(num),
+                rate_den: U256::from(den),
+                venue: VenueEdge::Balancer {
+                    pool_id: [7u8; 32],
+                    token_in: from,
+                    token_out: to,
+                },
+                estimated_gas: 0,
+                weight: -1,
+                max_input: U256::from(max_input),
+                tolerance_bps: 0,
+                observed_slippage_bps: 0,
+                quote_block: None,
+                active: true,
+                tick_ladder: None,
+            }
+        }
+        let weth = addr(1);
+        let usdc = addr(2);
+        let cbbtc = addr(3);
+
+        // 1 WETH (1e18) -> 3600 USDC (3.6e9)  => 3.6e9 / 1e18
+        // 1 USDC (1e6)  -> 1/95000 cbBTC      => 1.05e3 / 1e6  (8dp cbBTC)
+        // 1 cbBTC (1e8) -> 26.4 WETH          => 2.64e19 / 1e8
+        let edges = vec![
+            hop(weth, usdc, 3_600_000_000, 1_000_000_000_000_000_000, 50_000_000_000),
+            hop(usdc, cbbtc, 1_052, 1_000_000, 10_000_000_000),
+            hop(cbbtc, weth, 26_400_000_000_000_000_000, 100_000_000, 500_000_000),
+        ];
+
+        let probe = U256::exp10(19); // 20 WETH, the probe seen in the live logs
+        let capacity = cycle_input_capacity(&edges, probe);
+
+        assert!(
+            !capacity.is_zero(),
+            "a cross-decimal multi-hop cycle with real per-hop depth must report \
+             non-zero capacity; zero here is the arithmetic underflow, not liquidity"
+        );
+
+        // And the exact path must be the one answering — not the fallback.
+        assert!(
+            cycle_input_capacity_exact(&edges).is_some_and(|c| !c.is_zero()),
+            "exact U512 projection must resolve this cycle without falling back"
+        );
     }
 
     #[test]

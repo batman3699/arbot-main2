@@ -84,6 +84,10 @@ pub fn advance_cl_state(
         tick: state.tick,
         tick_spacing: state.tick_spacing,
         fee_ppm: state.fee_ppm,
+        // Balances are not re-derived for a hypothetical post-swap state; carry
+        // the observed ones so capacity stays anchored to a real read.
+        balance0: state.balance0,
+        balance1: state.balance1,
     })
 }
 

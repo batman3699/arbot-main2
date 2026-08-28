@@ -32,6 +32,38 @@ fn cl_tick_buffer_bps() -> u32 {
     })
 }
 
+/// Slack applied to a MULTI-TICK hop's `min_out`.
+///
+/// Distinct from [`cl_tick_buffer_bps`], which compensates for the single-tick
+/// model holding liquidity constant. Multi-tick models the crossing, so
+/// re-applying THAT buffer would double-count it. But modelling the curve is not
+/// the same as matching the router, and the residual gap was measured, not
+/// guessed.
+///
+/// Slipstream pool 0xdbc6998296caa1652a810dc8d3baf4a8294330f1, 4340.955932 USDC
+/// -> WETH, quoted through the deployed router with the planner's own path bytes
+/// (tickSpacing=1):
+///
+///   planner expected_out  1.891636 WETH
+///   planner min_out       1.890690 WETH
+///   router pays           1.885833 WETH
+///
+/// The model overstates the router by ~31 bps, while `edge.tolerance_bps` on
+/// these edges is 5. `min_out` therefore lands 25.8 bps ABOVE what the router
+/// will pay and `amountOutMinimum` fails — observed on 100% of candidates across
+/// 57k+ records, invariant to trade size, tick buffer and pricing model.
+///
+/// Default 75 bps: covers the measured 31 with margin for the pool moving
+/// between quote and execution.
+fn cl_exec_buffer_bps() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        crate::util::env_parse_opt::<u32>("ARBOT_CL_EXEC_BUFFER_BPS")
+            .unwrap_or(75)
+            .min(2_000)
+    })
+}
+
 /// Low-cardinality venue label for diagnostics.
 fn venue_kind_label(venue: &VenueEdge) -> &'static str {
     match venue {
@@ -85,15 +117,69 @@ pub fn cl_hop_out(
                 zero_for_one,
                 crate::cl_sim::cl_max_ticks_crossed(),
             ) {
-                if !quote.exhausted && !quote.amount_out.is_zero() {
+                if !quote.exhausted
+                    && !quote.amount_out.is_zero()
+                    && !quote.is_unfillable(amount_in)
+                {
                     return Some((quote.amount_out, true));
                 }
+                // `exhausted` is an ANSWER, not a failure: the pool cannot fill
+                // this size. Falling through to single-tick here was the bug
+                // that made every candidate a phantom — that model holds
+                // liquidity constant, i.e. assumes INFINITE depth, so it is
+                // guaranteed to be *more* optimistic than the model that just
+                // said "impossible". Exhaustion is precisely the signal that
+                // the constant-liquidity assumption is invalid, so it must
+                // never be the trigger for adopting it.
+                //
+                // Measured on WETH/bsdETH 0xdea629c5587037d0925ff85f1961d95db62bedd6
+                // (fee 500) at block 50222943. The pool holds 248.9 WETH but
+                // only 0.154 bsdETH:
+                //   single-tick model   1.904190 bsdETH   <- what we planned on
+                //   on-chain quoter     0.0000169 bsdETH  <- what it actually pays
+                // a ~112,000x overstatement, and the quoter drives the pool to
+                // MIN_SQRT_RATIO+1, i.e. it drains that side outright. Every
+                // such edge reverts `Too little received`, and draining
+                // thousands of empty ticks is what burned 3-4M gas per attempt.
+                //
+                // Exhaustion is ambiguous: `cl_swap` reports it BOTH when the
+                // pool runs out of liquidity and when our ladder simply did not
+                // reach far enough. Rejecting on it alone threw away hops the
+                // pool can genuinely fill — measured: 641,933 PLAY against a
+                // pool holding 6,115,660 (0.1x) and 48,615 AERO against 244,323
+                // (0.2x) were both rejected as "cannot fill", and this was 100%
+                // of `plan_build_failed`. Widening the ladder made it WORSE
+                // (34% -> 48% of rejections) because more hops then reach the
+                // multi-tick path at all.
+                //
+                // Disambiguate against the pool's REAL input-side balance, the
+                // same ground truth that sets `max_input`. If the size is within
+                // the fraction of depth we already deem tradeable, our ladder
+                // was the limit, not the pool: fall through to the single-tick
+                // estimate, which carries `cl_tick_buffer_bps`. If the balance
+                // is unknown, FAIL CLOSED and reject — never invent depth.
+                let balance_in = if zero_for_one {
+                    state.balance0
+                } else {
+                    state.balance1
+                };
+                let within_real_depth = balance_in
+                    .filter(|b| !b.is_zero())
+                    .is_some_and(|b| amount_in <= b / 3);
                 tracing::debug!(
                     target: "minout",
                     ticks_crossed = quote.ticks_crossed,
                     ladder_len = ladder.len(),
-                    "multi-tick quote exhausted the ladder; falling back to single-tick"
+                    amount_in = %amount_in,
+                    partial_out = %quote.amount_out,
+                    balance_in = ?balance_in,
+                    within_real_depth,
+                    "multi-tick exhausted"
                 );
+                if !within_real_depth {
+                    return None;
+                }
+                // else: fall through to single-tick below.
             }
         }
     }
@@ -110,7 +196,16 @@ pub fn cl_hop_out(
     Some((out, false))
 }
 
-fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
+/// Expected output for one hop, or `None` when the hop is genuinely unpriceable.
+///
+/// `None` is not "we failed to compute" — it is "this pool cannot fill this
+/// size". The distinction matters because every fallback estimate available
+/// here is MORE optimistic than the model that refused: the secant lies above
+/// the convex curve, and the single-tick model assumes constant (infinite)
+/// liquidity. Substituting either one for a refusal manufactures an edge that
+/// cannot execute, which is precisely how a pool holding 0.154 bsdETH came to
+/// be quoted at 1.904.
+fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> Option<U256> {
     let linear = mul_div(current_amount, edge.rate_num, edge.rate_den);
     match &edge.venue {
         // Concentrated-liquidity hops carry their pool state on the edge, so the
@@ -146,13 +241,21 @@ fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
                 // Multi-tick modelled the crossing, so the tick buffer would
                 // double-count it and give up real edge. Use the quote as-is.
                 Some((out, true)) => {
+                    // Crossing is modelled, so `cl_tick_buffer_bps` would
+                    // double-count. The residual gap to the ROUTER is not
+                    // modelled — measured at ~31 bps — so apply the smaller
+                    // execution buffer. Without it `min_out` lands above what
+                    // the router pays and every hop reverts.
+                    let discounted = crate::util::apply_slippage(out, cl_exec_buffer_bps());
                     tracing::debug!(
                         target: "minout",
                         curve_out = %out,
                         linear_out = %linear,
+                        discounted = %discounted,
+                        exec_buffer_bps = cl_exec_buffer_bps(),
                         "CL hop priced multi-tick"
                     );
-                    out
+                    Some(discounted)
                 }
                 // Single-tick fallback: liquidity was held constant, so the
                 // estimate is systematically optimistic and the buffer still
@@ -167,9 +270,14 @@ fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
                         buffer_bps = cl_tick_buffer_bps(),
                         "CL hop priced single-tick with crossing buffer"
                     );
-                    discounted
+                    Some(discounted)
                 }
-                None => linear,
+                // `cl_hop_out` refused. Do NOT substitute `linear`: the secant
+                // lies above the convex curve, so it is the most optimistic
+                // estimate in the file and would resurrect exactly the phantom
+                // edge that was just rejected. Propagate the refusal and let
+                // the caller drop the cycle.
+                None => None,
             }
         }
         VenueEdge::UniV2 {
@@ -192,8 +300,8 @@ fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
                 reserve1,
             };
             match quote_univ2_out(&state, from, current_amount, *fee_bps) {
-                Ok(Some(quote)) => quote.amount_out,
-                _ => linear,
+                Ok(Some(quote)) => Some(quote.amount_out),
+                _ => Some(linear),
             }
         }
         VenueEdge::SolidlyV2 {
@@ -222,11 +330,11 @@ fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> U256 {
                 decimals1: *decimals1,
             };
             match quote_solidly_out(&state, from, current_amount, *fee_bps) {
-                Ok(Some(quote)) => quote.amount_out,
-                _ => linear,
+                Ok(Some(quote)) => Some(quote.amount_out),
+                _ => Some(linear),
             }
         }
-        _ => linear,
+        _ => Some(linear),
     }
 }
 
@@ -413,7 +521,15 @@ pub async fn build_plan_for_cycle(
         ) {
             tracing::debug!(target: "minout", "CL hop has NO pool state; using linear estimate");
         }
-        let expected_out = hop_expected_out(edge, from, current_amount);
+        // A refusal here means the pool cannot fill this size. That is a real
+        // answer and the cycle must die on it — the alternative is emitting a
+        // plan whose `min_out` the pool provably cannot pay, which reverts
+        // `Too little received` after burning gas draining empty ticks.
+        let Some(expected_out) = hop_expected_out(edge, from, current_amount) else {
+            return Err(anyhow!(
+                "hop {from:?}->{to:?} is unpriceable: pool cannot fill {current_amount}"
+            ));
+        };
         let min_out = apply_slippage(expected_out, edge.tolerance_bps);
         if min_out.is_zero() {
             return Err(anyhow!("min_out is zero for hop {from:?}->{to:?}"));
@@ -818,6 +934,7 @@ mod tests {
             tick: 0,
             tick_spacing: 60,
             fee_ppm: 3000,
+            ..Default::default()
         };
         let state_for_raw = state.clone();
         // rate_num/rate_den = 1:1 => the linear estimate ignores both fee and
@@ -845,7 +962,7 @@ mod tests {
 
         let amount_in = U256::from(1_000_000_000u64);
         let linear = mul_div(amount_in, edge.rate_num, edge.rate_den);
-        let actual = hop_expected_out(&edge, addr(1), amount_in);
+        let actual = hop_expected_out(&edge, addr(1), amount_in).expect("hop must be priceable");
 
         assert!(!actual.is_zero(), "curve quote must resolve");
         assert!(
@@ -1064,7 +1181,10 @@ mod tests {
             tick_ladder: None,
         };
         let amount_in = U256::from(1_000u64);
-        assert_eq!(hop_expected_out(&edge, addr(1), amount_in), U256::from(2_000u64));
+        assert_eq!(
+            hop_expected_out(&edge, addr(1), amount_in),
+            Some(U256::from(2_000u64))
+        );
     }
 
     fn fp_weight(num: u64, den: u64) -> i64 {
@@ -1940,6 +2060,7 @@ mod tests {
             tick: 0,
             tick_spacing: 60,
             fee_ppm: 3_000,
+            ..Default::default()
         };
         // Positive net below the price: crossing -60 downward removes 500e9,
         // taking liquidity 1000e9 -> 500e9. See the SIGN CONVENTION note in
@@ -1967,8 +2088,21 @@ mod tests {
         assert!(out < single, "multi-tick must be below the optimistic estimate");
     }
 
+    /// An exhausted ladder must REJECT the hop, never fall back.
+    ///
+    /// This test previously asserted the opposite — that exhaustion falls back
+    /// to single-tick — and that assertion was the bug, pinned. Exhaustion means
+    /// the pool cannot fill the size; single-tick holds liquidity constant, so
+    /// it assumes infinite depth and is strictly more optimistic than the model
+    /// that just refused. Falling back therefore converts "impossible" into an
+    /// attractive quote.
+    ///
+    /// Real instance: WETH/bsdETH 0xdea629c5587037d0925ff85f1961d95db62bedd6
+    /// (fee 500) holds 248.9 WETH but only 0.154 bsdETH. The fallback quoted
+    /// 2 WETH -> 1.904 bsdETH; the on-chain quoter pays 0.0000169 and drives the
+    /// pool to MIN_SQRT_RATIO+1. Every candidate built on such an edge reverted.
     #[test]
-    fn cl_hop_out_falls_back_when_the_ladder_is_exhausted() {
+    fn cl_hop_out_rejects_an_exhausted_ladder_instead_of_falling_back() {
         let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::cl_sim::MultiTickEnvGuard::set("1");
 
@@ -1978,14 +2112,80 @@ mod tests {
             tick: 0,
             tick_spacing: 60,
             fee_ppm: 3_000,
+            ..Default::default()
         };
         // Coverage far too narrow for the size below.
         let ladder = crate::cl_swap::TickLadder::new(vec![(-60, 900_000_000_000)], -60, 60);
         let amount_in = U256::from(10u64).pow(U256::from(24u64));
 
-        let (_, used_multi) =
-            cl_hop_out(&state, Some(&ladder), amount_in, true).expect("hop prices");
-        assert!(!used_multi, "an exhausted ladder must fall back, not be trusted");
+        assert!(
+            cl_hop_out(&state, Some(&ladder), amount_in, true).is_none(),
+            "an exhausted ladder must reject the hop, not fall back to a more optimistic model"
+        );
+
+        // And the refusal must survive to the caller: the single-tick model,
+        // asked the same question, happily answers — which is exactly why it
+        // must not be consulted here.
+        assert!(
+            crate::cl_sim::quote_exact_input_single_tick(&state, amount_in, true, 3_000)
+                .ok()
+                .flatten()
+                .is_some_and(|v| !v.is_zero()),
+            "guard: single-tick answers this size, so the fallback would have masked the refusal"
+        );
+    }
+
+    /// Exhaustion with the pool DEMONSTRABLY holding the depth must not reject.
+    ///
+    /// `cl_swap` reports `exhausted` both when liquidity runs out and when our
+    /// ladder was too short. Rejecting on that alone discarded hops at 0.1-0.2x
+    /// of a pool's real holdings and accounted for 100% of `plan_build_failed`.
+    /// The real balance disambiguates.
+    #[test]
+    fn cl_hop_out_accepts_an_exhausted_ladder_when_real_depth_covers_the_size() {
+        let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cl_sim::MultiTickEnvGuard::set("1");
+
+        let base = crate::cl_sim::ClPoolState {
+            sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
+            liquidity: 1_000_000_000_000,
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 3_000,
+            ..Default::default()
+        };
+        // Ladder far too narrow for the size => the quote will report exhausted.
+        let ladder = crate::cl_swap::TickLadder::new(vec![(-60, 900_000_000_000)], -60, 60);
+        let amount_in = U256::from(10u64).pow(U256::from(24u64));
+
+        // No balance known => FAIL CLOSED, still rejected.
+        assert!(
+            cl_hop_out(&base, Some(&ladder), amount_in, true).is_none(),
+            "unknown balance must fail closed"
+        );
+
+        // Balance comfortably covers the size (amount is 1/10th of holdings) =>
+        // our ladder was the limit, not the pool. Price it single-tick.
+        let funded = crate::cl_sim::ClPoolState {
+            balance0: Some(amount_in * U256::from(10u64)),
+            ..base.clone()
+        };
+        let priced = cl_hop_out(&funded, Some(&ladder), amount_in, true);
+        assert!(
+            priced.is_some_and(|(out, used_multi)| !out.is_zero() && !used_multi),
+            "real depth covers the size, so fall through to single-tick rather \
+             than discarding a fillable hop"
+        );
+
+        // Size exceeds the tradeable fraction of real depth => genuinely reject.
+        let thin = crate::cl_sim::ClPoolState {
+            balance0: Some(amount_in),
+            ..base
+        };
+        assert!(
+            cl_hop_out(&thin, Some(&ladder), amount_in, true).is_none(),
+            "a size at 100% of holdings is not fillable"
+        );
     }
 
     #[test]
@@ -1999,6 +2199,7 @@ mod tests {
             tick: 0,
             tick_spacing: 60,
             fee_ppm: 3_000,
+            ..Default::default()
         };
         let ladder = crate::cl_swap::TickLadder::new(vec![(-60, 500_000_000_000)], -180, 180);
 
@@ -2007,10 +2208,20 @@ mod tests {
         assert!(!used_multi, "flag off must keep the single-tick path");
     }
 
-    /// The one branch that skips the haircut. Pins it against the inversion
-    /// that would otherwise pass the whole suite.
+    /// A successful multi-tick quote takes the EXECUTION buffer, not the tick
+    /// buffer. Pins both halves: the tick buffer must not double-count a
+    /// modelled crossing, and the quote must not pass through raw either.
+    ///
+    /// This previously asserted the quote passed through UNDISCOUNTED. That was
+    /// measured wrong: on Slipstream pool
+    /// 0xdbc6998296caa1652a810dc8d3baf4a8294330f1, quoting the planner's own
+    /// path bytes through the deployed router showed the model overstates by
+    /// ~31 bps while `tolerance_bps` is 5, so `min_out` landed 25.8 bps above
+    /// what the router pays and `amountOutMinimum` failed on 100% of
+    /// candidates. Modelling the curve correctly is not the same as matching
+    /// the router.
     #[test]
-    fn hop_expected_out_does_not_haircut_a_successful_multi_tick_quote() {
+    fn hop_expected_out_applies_the_execution_buffer_to_a_multi_tick_quote() {
         let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = crate::cl_sim::MultiTickEnvGuard::set("1");
 
@@ -2031,6 +2242,7 @@ mod tests {
             tick: 0,
             tick_spacing: 60,
             fee_ppm: 3_000,
+            ..Default::default()
         };
         // rate_num/rate_den = 1:1, as in the sibling fixture — the linear
         // estimate is irrelevant to this test; only the haircut matters.
@@ -2059,16 +2271,33 @@ mod tests {
             cl_hop_out(&cl_state, Some(ladder.as_ref()), amount_in, true).expect("multi quote");
         assert!(used_multi, "fixture must produce a non-exhausted multi-tick quote");
 
-        let actual = hop_expected_out(&edge, edge.from, amount_in);
+        let actual = hop_expected_out(&edge, edge.from, amount_in).expect("hop must be priceable");
 
         assert_eq!(
-            actual, multi_out,
-            "a successful multi-tick quote must pass through UNDISCOUNTED"
+            actual,
+            crate::util::apply_slippage(multi_out, cl_exec_buffer_bps()),
+            "a successful multi-tick quote must take the EXECUTION buffer"
         );
         assert!(
-            actual > crate::util::apply_slippage(multi_out, cl_tick_buffer_bps()),
-            "the tick buffer must NOT be applied on top of a modelled crossing — \
-             if this fails, the two match arms in hop_expected_out are inverted"
+            actual < multi_out,
+            "it must NOT pass through raw — min_out then sits above what the \
+             router pays and every hop reverts with Too little received"
+        );
+        // Arms-not-inverted check. Identity, not magnitude: the execution
+        // buffer is deliberately larger than the tick buffer (75 vs 50), so
+        // "greater than the tick-buffer discount" no longer discriminates.
+        assert_ne!(
+            cl_exec_buffer_bps(),
+            cl_tick_buffer_bps(),
+            "precondition: the two buffers must differ for this test to \
+             discriminate between the arms"
+        );
+        assert_ne!(
+            actual,
+            crate::util::apply_slippage(multi_out, cl_tick_buffer_bps()),
+            "the TICK buffer must not be what got applied to a modelled \
+             crossing — if this fails, the two match arms in hop_expected_out \
+             are inverted"
         );
     }
 }

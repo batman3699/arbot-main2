@@ -22,7 +22,7 @@ abigen!(
     ]"#,
 );
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ClPoolState {
     pub sqrt_price_x96: U256,
     pub liquidity: u128,
@@ -32,6 +32,21 @@ pub struct ClPoolState {
     pub tick_spacing: i32,
     /// Swap fee in hundredths of a bip (UniV3 fee tier or on-chain fee()).
     pub fee_ppm: u32,
+    /// The pool's ACTUAL holding of token0/token1, from `balanceOf`, read at the
+    /// same block as the rest of this state. `None` when the read failed.
+    ///
+    /// This is the only sound capacity source for a CL edge. `liquidity` with
+    /// `sqrt_price_x96` yields the VIRTUAL constant-product reserves (`L/sqrt(P)`,
+    /// `L*sqrt(P)`) of the curve the pool is tangent to at the current price —
+    /// that curve runs 0..infinity, far outside the ticks actually holding
+    /// liquidity, and measured on Base it overstates real holdings by 16-56x on
+    /// deep WETH/USDC and by orders of magnitude on thin pools. A pool can never
+    /// pay out more than it holds, so the balance is the honest bound.
+    ///
+    /// `None` must FAIL CLOSED at the call site: keep the probe-derived capacity
+    /// for that edge rather than inventing depth.
+    pub balance0: Option<U256>,
+    pub balance1: Option<U256>,
 }
 
 /// Serialises tests that mutate `ARBOT_LOCAL_CL_QUOTES`. The env is process
@@ -143,9 +158,13 @@ fn decode_int24(word: &[u8]) -> i32 {
 /// one batch stays within node `eth_call` gas limits. Pools whose sub-calls
 /// revert or return zero liquidity are simply absent from the result, and the
 /// caller falls back to the per-pool path for those.
+/// `pools` entries are `(pool, fee_hint, token0, token1)`. The token addresses
+/// are needed for the `balanceOf` sub-calls that give each pool's REAL depth —
+/// see [`ClPoolState::balance0`]. Pass `Address::zero()` for a token to skip its
+/// balance read; the state then carries `None` and the caller must fail closed.
 pub async fn load_cl_pool_states_batched<C>(
     provider: Arc<Provider<C>>,
-    pools: &[(Address, Option<u32>)],
+    pools: &[(Address, Option<u32>, Address, Address)],
     block: U64,
 ) -> std::collections::HashMap<Address, ClPoolState>
 where
@@ -158,15 +177,32 @@ where
     }
     let [slot0_sel, liq_sel, spacing_sel, fee_sel] = cl_state_selectors();
 
-    // 4 sub-calls per pool; 32 pools => 128 sub-calls per batch.
-    const POOLS_PER_BATCH: usize = 32;
+    // balanceOf(address) — the pool's real holding of each token, which is the
+    // only sound capacity bound (see `ClPoolState::balance0`).
+    const BALANCE_OF: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
+    let balance_of = |pool: &Address| {
+        let mut data = Vec::with_capacity(36);
+        data.extend_from_slice(&BALANCE_OF);
+        data.extend_from_slice(&[0u8; 12]);
+        data.extend_from_slice(pool.as_bytes());
+        data
+    };
+
+    // 6 sub-calls per pool; 24 pools => 144 sub-calls per batch, comparable to
+    // the previous 32x4=128 so node gas limits are respected.
+    const POOLS_PER_BATCH: usize = 24;
+    const CALLS_PER_POOL: usize = 6;
     for chunk in pools.chunks(POOLS_PER_BATCH) {
-        let mut calls: Vec<(Address, Vec<u8>)> = Vec::with_capacity(chunk.len() * 4);
-        for (pool, _) in chunk {
+        let mut calls: Vec<(Address, Vec<u8>)> =
+            Vec::with_capacity(chunk.len() * CALLS_PER_POOL);
+        for (pool, _, token0, token1) in chunk {
             calls.push((*pool, slot0_sel.to_vec()));
             calls.push((*pool, liq_sel.to_vec()));
             calls.push((*pool, spacing_sel.to_vec()));
             calls.push((*pool, fee_sel.to_vec()));
+            // Target is the TOKEN, argument is the pool.
+            calls.push((*token0, balance_of(pool)));
+            calls.push((*token1, balance_of(pool)));
         }
 
         let results =
@@ -183,8 +219,8 @@ where
                 }
             };
 
-        for (i, (pool, fee_hint)) in chunk.iter().enumerate() {
-            let base = i * 4;
+        for (i, (pool, fee_hint, token0, token1)) in chunk.iter().enumerate() {
+            let base = i * CALLS_PER_POOL;
             let Some(Some(slot0)) = results.get(base) else {
                 continue;
             };
@@ -219,6 +255,20 @@ where
                 _ => None,
             };
 
+            // Fail closed on a failed/short balance read: `None` makes the
+            // caller keep its probe-derived capacity rather than invent depth.
+            let decode_balance = |slot: usize, token: &Address| -> Option<U256> {
+                if token.is_zero() {
+                    return None;
+                }
+                match results.get(slot) {
+                    Some(Some(b)) if b.len() >= 32 => Some(U256::from_big_endian(&b[..32])),
+                    _ => None,
+                }
+            };
+            let balance0 = decode_balance(base + 4, token0);
+            let balance1 = decode_balance(base + 5, token1);
+
             out.insert(
                 *pool,
                 ClPoolState {
@@ -227,6 +277,8 @@ where
                     tick,
                     tick_spacing,
                     fee_ppm: fee_hint.or(fee_on_chain).unwrap_or(3_000),
+                    balance0,
+                    balance1,
                 },
             );
         }
@@ -286,6 +338,10 @@ where
         tick,
         tick_spacing,
         fee_ppm,
+        // Per-pool fallback reads no balances. Fail closed: the caller keeps the
+        // probe-derived capacity rather than inventing depth.
+        balance0: None,
+        balance1: None,
     }))
 }
 
@@ -442,6 +498,7 @@ mod tests {
             tick: 0,
             tick_spacing: 60,
             fee_ppm: 3_000,
+            ..Default::default()
         };
         let out = quote_exact_input_single_tick(&state, U256::from(1_000_000u64), true, 3_000)
             .unwrap()

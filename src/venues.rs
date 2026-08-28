@@ -116,8 +116,27 @@ abigen!(
     ]"#,
 );
 
+/// Price the size grid for one CL pool.
+///
+/// Prefers the multi-tick model when a ladder is available, and treats an
+/// exhausted quote as "this pool cannot fill THIS size" — that grid point
+/// becomes `None` and is simply not selectable, so sizing lands on the largest
+/// size the pool can actually pay for. If no grid point is fillable the pool
+/// yields no edge at all.
+///
+/// This used to call `quote_exact_input_single_tick` unconditionally. That model
+/// holds liquidity constant — it assumes infinite depth — so a pool with almost
+/// nothing on the output side still quoted a near-spot rate at any size, and the
+/// edge entered the graph looking attractive. That is where phantom candidates
+/// were born; `plan.rs` only caught them one stage later, after they had already
+/// displaced real edges in ranking.
+///
+/// Measured: WETH/bsdETH 0xdea629c5587037d0925ff85f1961d95db62bedd6 (fee 500)
+/// holds 248.9 WETH and 0.154 bsdETH. Single-tick quoted 2 WETH -> 1.904 bsdETH;
+/// the on-chain quoter pays 0.0000169 and lands at MIN_SQRT_RATIO+1.
 fn cl_grid_quote(
     state: &crate::cl_sim::ClPoolState,
+    ladder: Option<&crate::cl_swap::TickLadder>,
     base_amount: U256,
     tolerance_bps: u32,
     zero_for_one: bool,
@@ -126,16 +145,138 @@ fn cl_grid_quote(
     if grid.is_empty() {
         return Ok(None);
     }
+    let use_multi = crate::cl_sim::multi_tick_enabled() && ladder.is_some();
+
+    // A pool cannot pay out more than it HOLDS of the output token. This is the
+    // one bound that needs no model and cannot be argued with, and it catches
+    // quotes that are wrong by any margin — including the ones no plausibility
+    // heuristic would flag.
+    //
+    // Measured on Base: an edge claimed 0.01 SAPIEN -> 5.372e25 raw USDC. The
+    // chain pays 327 raw USDC (fee tier 10000). That is ~1.6e23x, twenty-three
+    // orders of magnitude. Such an edge does not merely misprice itself — it
+    // blows `amount` up through `cycle_input_capacity`, flooring the projection
+    // to zero and surfacing as `no_liquidity` on cycles that are perfectly
+    // sound. 37/37 sampled `no_liquidity` rejections were this, at 3-5 hops.
+    //
+    // `None` (balance unknown) applies NO cap: fail open here rather than
+    // silently deleting every edge on a degraded RPC. The capacity path already
+    // fails closed separately.
+    let balance_out = if zero_for_one {
+        state.balance1
+    } else {
+        state.balance0
+    }
+    .filter(|b| !b.is_zero());
+
     let mut outs = Vec::with_capacity(grid.len());
     for amount in &grid {
-        outs.push(crate::cl_sim::quote_exact_input_single_tick(
-            state,
-            *amount,
-            zero_for_one,
-            state.fee_ppm,
-        )?);
+        let out = match (use_multi, ladder) {
+            (true, Some(ladder)) => {
+                match crate::cl_swap::quote_exact_input_multi_tick(
+                    state,
+                    ladder,
+                    *amount,
+                    zero_for_one,
+                    crate::cl_sim::cl_max_ticks_crossed(),
+                ) {
+                    // Exhausted means the pool ran out of liquidity before
+                    // filling this size. Not a fillable grid point.
+                    Some(q)
+                        if q.exhausted || q.amount_out.is_zero() || q.is_unfillable(*amount) =>
+                    {
+                        None
+                    }
+                    Some(q) => Some(q.amount_out),
+                    // `None` is "cannot answer" (e.g. ladder too short to even
+                    // start), which is distinct from "cannot fill" — the
+                    // single-tick estimate is still the best available there.
+                    None => crate::cl_sim::quote_exact_input_single_tick(
+                        state,
+                        *amount,
+                        zero_for_one,
+                        state.fee_ppm,
+                    )?,
+                }
+            }
+            _ => crate::cl_sim::quote_exact_input_single_tick(
+                state,
+                *amount,
+                zero_for_one,
+                state.fee_ppm,
+            )?,
+        };
+        // Discard any grid point claiming more output than the pool holds.
+        let out = match (out, balance_out) {
+            (Some(o), Some(bal)) if o > bal => {
+                tracing::debug!(
+                    target: "capacity",
+                    amount_in = %amount,
+                    claimed_out = %o,
+                    pool_holds = %bal,
+                    "quote exceeds the pool's balance of the output token; discarding"
+                );
+                None
+            }
+            (other, _) => other,
+        };
+        outs.push(out);
     }
     Ok(best_from_grid(&grid, &outs, tolerance_bps))
+}
+
+
+#[cfg(test)]
+mod cl_grid_quote_discrimination_tests {
+    use super::*;
+    use ethers::types::U256;
+
+    fn state(liq: u128) -> crate::cl_sim::ClPoolState {
+        crate::cl_sim::ClPoolState {
+            sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
+            liquidity: liq,
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 3_000,
+            ..Default::default()
+        }
+    }
+
+    /// The fix must DISCRIMINATE, not blanket-reject. A pool with depth on both
+    /// sides still prices; a pool whose ladder is exhausted by the size does not.
+    /// Without this pairing, "rejects the phantom" is indistinguishable from
+    /// "rejects everything", which would silently starve the edge set.
+    #[test]
+    fn deep_pool_still_prices_while_exhausted_pool_is_rejected() {
+        let _lock = crate::cl_sim::CL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::cl_sim::MultiTickEnvGuard::set("1");
+
+        let base = U256::from(1_000_000u64);
+
+        // Deep: wide ladder, ample liquidity across it.
+        let deep_state = state(1_000_000_000_000_000);
+        let deep_ladder = crate::cl_swap::TickLadder::new(
+            vec![(-600, 10_000_000_000_000), (600, -10_000_000_000_000)],
+            -6000,
+            6000,
+        );
+        let deep = cl_grid_quote(&deep_state, Some(&deep_ladder), base, 50, true)
+            .expect("deep quote must not error");
+        assert!(
+            deep.is_some_and(|q| !q.amount_out.is_zero()),
+            "a pool with real depth on both sides must still produce an edge"
+        );
+
+        // Shallow: ladder far too narrow for the same grid.
+        let thin_state = state(1_000);
+        let thin_ladder = crate::cl_swap::TickLadder::new(vec![(-60, 900)], -60, 60);
+        let thin = cl_grid_quote(&thin_state, Some(&thin_ladder), base, 50, true)
+            .expect("thin quote must not error");
+        assert!(
+            thin.is_none(),
+            "a pool that cannot fill any grid size must yield no edge, not a phantom one"
+        );
+    }
 }
 
 fn edge_health_score_bps(edge: &Edge, current_block: U64, max_block_lag: U64) -> u32 {
@@ -393,15 +534,126 @@ fn edge_capacity_from_reserve(reserve_in: U256) -> U256 {
     reserve_in.saturating_mul(U256::from(EDGE_CAPACITY_RESERVE_BPS)) / U256::from(10_000u32)
 }
 
+/// VIRTUAL reserves of a CL pool at its current price. **NOT a depth measure.**
+///
+/// DO NOT use this to size trades or set `max_input`. `L/sqrt(P)` and
+/// `L*sqrt(P)` describe the constant-product curve a CL pool is tangent to at
+/// the current price, and that curve runs from zero to infinity — far outside
+/// the ticks where liquidity actually exists. It therefore OVERSTATES what the
+/// pool holds, without bound.
+///
+/// Measured on Base against real `balanceOf`:
+///   WETH/USDC 0x6c561b446: virtual reserve0 562,148 WETH vs 10,046 held (56x);
+///                          virtual reserve1 1.40B USDC vs 88.3M held (16x).
+///   WETH/bsdETH 0xdea629c5: virtual reserve1 7.98e21 raw vs 0.154 bsdETH held.
+///
+/// Wiring this into `max_input` capped a 10,046-WETH pool at 187,364 WETH, let
+/// sizing explore amounts the pool cannot honour, and took candidate production
+/// from ~400 per 7min to ZERO (confirmed by A/B revert).
+///
+/// The only sound depth source is the pool's actual token balances — see
+/// `edge_capacity_from_pool_balance`.
+#[allow(dead_code)]
+fn cl_virtual_reserves_unsafe_for_depth(
+    state: &crate::cl_sim::ClPoolState,
+) -> Option<(U256, U256)> {
+    cl_virtual_reserves(state)
+}
+
+/// Capacity of an edge from the pool's REAL holding of the input token.
+///
+/// `balance_in` must come from `balanceOf(pool)` for the input token — ground
+/// truth, and the same source used to validate the pool inventory. A pool can
+/// never pay out more than it holds, and can never absorb input beyond what
+/// drains the far side, so this is the honest bound. Uses the same
+/// `EDGE_CAPACITY_RESERVE_BPS` fraction as the UniV2/Solidly path.
+///
+/// NOT YET WIRED: `ClPoolState` carries no balances, so they must first be
+/// fetched alongside `slot0`/`liquidity` in `cl_sim::load_cl_pool_states_batched`
+/// (which needs the pool's token addresses threaded in from the caller).
+/// Until then CL edges keep the probe-derived capacity, which is wrong but is
+/// at least the wrong value the rest of the pipeline is tuned around.
+fn edge_capacity_from_pool_balance(balance_in: U256) -> U256 {
+    edge_capacity_from_reserve(balance_in)
+}
+
+/// Virtual reserves of a concentrated-liquidity pool at its current price, in
+/// raw token units, or `None` when the state cannot support the derivation.
+///
+/// A CL pool with active liquidity `L` at price `P` behaves locally like a
+/// constant-product pool with reserves `L/sqrt(P)` and `L*sqrt(P)`. With
+/// `sqrt_price_x96 = sqrt(P) * 2^96`:
+///
+///     reserve0 = L * 2^96 / sqrt_price_x96
+///     reserve1 = L * sqrt_price_x96 / 2^96
+///
+/// This is depth measured from POOL STATE, which is what `max_input` should have
+/// been derived from all along — see `edge_capacity_from_cl_state`.
+///
+/// It describes the liquidity active at the current tick, so it is an
+/// approximation for a swap that crosses ticks. That is the correct direction to
+/// be wrong in: it under-states depth for a pool whose neighbouring ticks also
+/// hold liquidity, and never invents capacity that is not there. The multi-tick
+/// simulator and `is_unfillable` remain the authority on whether a specific size
+/// actually fills.
+fn cl_virtual_reserves(state: &crate::cl_sim::ClPoolState) -> Option<(U256, U256)> {
+    if state.sqrt_price_x96.is_zero() || state.liquidity == 0 {
+        return None;
+    }
+    let liquidity = U512::from(U256::from(state.liquidity));
+    let sqrt_p = U512::from(state.sqrt_price_x96);
+    let q96 = U512::from(1u64) << 96;
+
+    let reserve0 = liquidity.checked_mul(q96)? / sqrt_p;
+    let reserve1 = liquidity.checked_mul(sqrt_p)? >> 96;
+
+    let narrow = |v: U512| -> Option<U256> {
+        if v > U512::from(U256::MAX) {
+            return Some(U256::MAX);
+        }
+        let mut buf = [0u8; 64];
+        v.to_little_endian(&mut buf);
+        Some(U256::from_little_endian(&buf[..32]))
+    };
+    Some((narrow(reserve0)?, narrow(reserve1)?))
+}
+
+/// Capacity of a concentrated-liquidity edge derived from POOL DEPTH rather than
+/// from the probe we happened to quote at.
+///
+/// `zero_for_one` selects which side is the INPUT, so the cap is taken against
+/// the reserve the trade actually spends into. Uses the same
+/// `EDGE_CAPACITY_RESERVE_BPS` fraction as the UniV2/Solidly path, so CL and
+/// constant-product edges are finally sized on the same basis.
+fn edge_capacity_from_cl_state(
+    state: &crate::cl_sim::ClPoolState,
+    zero_for_one: bool,
+) -> Option<U256> {
+    let (reserve0, reserve1) = cl_virtual_reserves(state)?;
+    let reserve_in = if zero_for_one { reserve0 } else { reserve1 };
+    if reserve_in.is_zero() {
+        return None;
+    }
+    Some(edge_capacity_from_reserve(reserve_in))
+}
+
 /// Capacity of a quote-backed edge (UniV3 / Slipstream / Balancer / Curve / V4),
 /// in `from`-token units.
 ///
-/// These `VenueEdge` variants carry no reserve or tick-liquidity state, so depth
-/// has to be inferred from the probe itself. Price impact is locally linear in
-/// size, so a probe of `amount_in` that moved the price `s` bps can absorb about
-/// `amount_in * tolerance / s` before it moves `tolerance` bps. A probe with no
-/// measurable impact says the pool is deep relative to the probe, not that the
-/// probe is the limit — fall back to a generous multiple there.
+/// Fallback for variants that genuinely carry no depth state (Balancer, Curve,
+/// V4). Price impact is locally linear in size, so a probe of `amount_in` that
+/// moved the price `s` bps can absorb about `amount_in * tolerance / s` before it
+/// moves `tolerance` bps. A probe with no measurable impact says the pool is deep
+/// relative to the probe, not that the probe is the limit — fall back to a
+/// generous multiple there.
+///
+/// NOT for UniV3/Slipstream: those carry `ClPoolState`, so their depth is
+/// measurable and `edge_capacity_from_cl_state` must be preferred. Deriving their
+/// capacity from the probe made `max_input` an artifact of the size we happened
+/// to quote at rather than a fact about the pool. Measured on Base: a live
+/// WETH-pair hop reported `max_input = 0.2087` tokens while the preceding hop
+/// pushed 9,546 through it, collapsing cycle capacity below one raw unit of the
+/// start token and rejecting the cycle as `no_liquidity` — 297 of 411 records.
 ///
 /// Never returns less than the probe: an amount we already quoted successfully
 /// is by construction within capacity.
@@ -518,20 +770,41 @@ fn univ3_size_grid(base_amount: U256) -> Vec<U256> {
     }
     let probe = probe_amount(base_amount).max(U256::one());
     let mut grid = vec![probe];
-    for (num, den) in [
-        (1u64, 4u64),
-        (1, 2),
-        (1, 1),
-        (2, 1),
-        (4, 1),
-        (8, 1),
-        (10, 1),
-    ] {
-        let amount = base_amount.saturating_mul(U256::from(num)) / U256::from(den);
-        if !amount.is_zero() {
-            grid.push(amount);
+
+    // Dense geometric ladder from the probe up to 10x base.
+    //
+    // The old grid was [probe, base/4, base/2, base, 2b, 4b, 8b, 10b], which
+    // left a 250x HOLE between the probe (base/1000) and base/4 — and
+    // `base = depth/5`, so with a 10 WETH pool the tested sizes were
+    // 0.002 then nothing until 0.5. Every size was either too small to clear
+    // gas or already deep into price impact, and the profitable band in between
+    // was never sampled. That is a systematic reason to report
+    // `no_profitable_size` on a cycle that genuinely has an optimum: the
+    // optimiser can only choose from points it was given, and it was never
+    // given one near the peak.
+    //
+    // Doubling from the probe covers the full 10,000x span in ~14 points, so
+    // consecutive sizes differ by 2x instead of 250x and the search always has
+    // a sample within 2x of the true optimum.
+    let ceiling = base_amount.saturating_mul(U256::from(10u64));
+    let mut amount = probe;
+    while amount < ceiling && grid.len() < 20 {
+        amount = amount.saturating_mul(U256::from(2u64));
+        if amount.is_zero() || amount > ceiling {
+            break;
+        }
+        grid.push(amount);
+    }
+
+    // Keep the exact anchors the sizer and its tests reason about, so the
+    // denser ladder is strictly additive rather than a replacement.
+    for (num, den) in [(1u64, 1u64), (10, 1)] {
+        let anchor = base_amount.saturating_mul(U256::from(num)) / U256::from(den);
+        if !anchor.is_zero() {
+            grid.push(anchor);
         }
     }
+
     grid.sort();
     grid.dedup();
     grid
@@ -1760,9 +2033,11 @@ where
     // fee in one batched call instead of letting each spawned task issue its own
     // four sequential reads. At 64 pools that is 256 round-trips collapsed to 2.
     let prefetched_cl_state = if crate::cl_sim::local_cl_quotes_enabled() {
-        let targets: Vec<(Address, Option<u32>)> = source_pools
+        // token0/token1 ride along so the loader can read each pool's REAL
+        // balances in the same batch — the only sound capacity source.
+        let targets: Vec<(Address, Option<u32>, Address, Address)> = source_pools
             .iter()
-            .map(|p| (p.pool, Some(p.fee)))
+            .map(|p| (p.pool, Some(p.fee), p.token0, p.token1))
             .collect();
         let started = Instant::now();
         let states = crate::cl_sim::load_cl_pool_states_batched(
@@ -1995,7 +2270,13 @@ where
                 // QuoterV2 multicall. Fall back to quoter on local sim errors.
                 let quote = if let Some(ref cl_state) = cl_state {
                     let zero_for_one = token_in == pool.token0;
-                    match cl_grid_quote(cl_state, base_amount_in, tolerance_bps, zero_for_one) {
+                    match cl_grid_quote(
+                        cl_state,
+                        tick_ladders.get(&pool.pool).map(|l| l.as_ref()),
+                        base_amount_in,
+                        tolerance_bps,
+                        zero_for_one,
+                    ) {
                         Ok(Some(q)) => Ok(Some(q)),
                         Ok(None) => Ok(None),
                         Err(err) => {
@@ -2351,7 +2632,28 @@ where
                     },
                     estimated_gas: ESTIMATED_GAS_UNIV3,
                     weight,
-                    max_input: edge_capacity_from_quote(&quote, tolerance_bps),
+                    // Depth from POOL STATE when we have it; the probe-derived
+                    // value only as a fallback. `max_input` bounded by the quote
+                    // probe is a fact about our sampling, not about the pool.
+                    // Capacity from the pool's REAL balance of the input token
+                    // when we have it. Falls back to the probe-derived value
+                    // per-edge when the balance read failed — never to the
+                    // virtual L/sqrt(P) reserves, which overstate holdings by
+                    // 16-56x on deep pools and unboundedly on thin ones.
+                    max_input: cl_state
+                        .as_ref()
+                        .and_then(|st| {
+                            let zero_for_one = token_in == pool.token0;
+                            let balance_in = if zero_for_one {
+                                st.balance0
+                            } else {
+                                st.balance1
+                            };
+                            balance_in
+                                .filter(|b| !b.is_zero())
+                                .map(edge_capacity_from_pool_balance)
+                        })
+                        .unwrap_or_else(|| edge_capacity_from_quote(&quote, tolerance_bps)),
                     tolerance_bps,
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
@@ -2501,8 +2803,10 @@ where
     // `fee` is read from chain here (no hint) because Slipstream keys pools by
     // tick spacing rather than a fee tier.
     let prefetched_cl_state = if crate::cl_sim::local_cl_quotes_enabled() {
-        let targets: Vec<(Address, Option<u32>)> =
-            source_pools.iter().map(|p| (p.pool, None)).collect();
+        let targets: Vec<(Address, Option<u32>, Address, Address)> = source_pools
+            .iter()
+            .map(|p| (p.pool, None, p.token0, p.token1))
+            .collect();
         let started = Instant::now();
         let states = crate::cl_sim::load_cl_pool_states_batched(
             Arc::clone(&ctx.provider),
@@ -2731,7 +3035,13 @@ where
                 let quote_semaphore_fee = Arc::clone(&quote_semaphore);
                 let quote = if let Some(ref cl_state) = cl_state {
                     let zero_for_one = token_in == pool.token0;
-                    match cl_grid_quote(cl_state, base_amount_in, tolerance_bps, zero_for_one) {
+                    match cl_grid_quote(
+                        cl_state,
+                        tick_ladders.get(&pool.pool).map(|l| l.as_ref()),
+                        base_amount_in,
+                        tolerance_bps,
+                        zero_for_one,
+                    ) {
                         Ok(Some(q)) => Ok(Some(q)),
                         Ok(None) => Ok(None),
                         Err(err) => {
@@ -3088,7 +3398,28 @@ where
                     },
                     estimated_gas: ESTIMATED_GAS_SLIPSTREAM,
                     weight,
-                    max_input: edge_capacity_from_quote(&quote, tolerance_bps),
+                    // Depth from POOL STATE when we have it; the probe-derived
+                    // value only as a fallback. `max_input` bounded by the quote
+                    // probe is a fact about our sampling, not about the pool.
+                    // Capacity from the pool's REAL balance of the input token
+                    // when we have it. Falls back to the probe-derived value
+                    // per-edge when the balance read failed — never to the
+                    // virtual L/sqrt(P) reserves, which overstate holdings by
+                    // 16-56x on deep pools and unboundedly on thin ones.
+                    max_input: cl_state
+                        .as_ref()
+                        .and_then(|st| {
+                            let zero_for_one = token_in == pool.token0;
+                            let balance_in = if zero_for_one {
+                                st.balance0
+                            } else {
+                                st.balance1
+                            };
+                            balance_in
+                                .filter(|b| !b.is_zero())
+                                .map(edge_capacity_from_pool_balance)
+                        })
+                        .unwrap_or_else(|| edge_capacity_from_quote(&quote, tolerance_bps)),
                     tolerance_bps,
                     observed_slippage_bps: quote.slippage_bps,
                     quote_block: Some(block_number),
@@ -4673,6 +5004,139 @@ mod tests {
             parse_rpc_quote_timeout_secs(Some("not-a-number")),
             DEFAULT_RPC_QUOTE_TIMEOUT_SECS
         );
+    }
+
+    /// The virtual-reserve formula OVERSTATES real depth and must never be used
+    /// to size a trade. This pins the trap so it is not re-wired.
+    ///
+    /// Measured on Base against `balanceOf`: WETH/USDC 0x6c561b446 has virtual
+    /// reserve0 562,148 WETH against 10,046 actually held (56x), and virtual
+    /// reserve1 1.40B USDC against 88.3M held (16x). Wiring it into `max_input`
+    /// took candidate production from ~400/7min to ZERO.
+    #[test]
+    fn virtual_reserves_overstate_real_depth_and_are_not_a_capacity_source() {
+        // sqrt(P)=1 => sqrt_price_x96 = 2^96, so reserve0 == reserve1 == L.
+        let state = crate::cl_sim::ClPoolState {
+            sqrt_price_x96: U256::from(1u64) << 96,
+            liquidity: 1_000_000_000_000_000_000_000, // 1e21
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 500,
+            ..Default::default()
+        };
+        let (r0, r1) = cl_virtual_reserves(&state).expect("reserves derivable");
+        assert_eq!(r0, U256::from(1_000_000_000_000_000_000_000u128));
+        assert_eq!(r0, r1, "at sqrt(P)=1 both virtual reserves equal L");
+
+        // The virtual curve claims depth a real pool need not hold. Model a pool
+        // whose ACTUAL balance is a small fraction of the virtual reserve, which
+        // is the ordinary case for concentrated liquidity.
+        let real_balance = r0 / U256::from(56u64); // the measured WETH/USDC ratio
+        assert!(
+            edge_capacity_from_pool_balance(real_balance) < edge_capacity_from_reserve(r0),
+            "capacity from the real balance must be BELOW the virtual-reserve figure; \
+             if this ever inverts, the virtual formula is being trusted as depth"
+        );
+
+        // Balance-derived capacity uses the same fraction as UniV2/Solidly.
+        assert_eq!(
+            edge_capacity_from_pool_balance(real_balance),
+            edge_capacity_from_reserve(real_balance)
+        );
+
+        // No active liquidity => no derivation, so callers fall back rather than
+        // inventing a number.
+        let empty = crate::cl_sim::ClPoolState { liquidity: 0, ..state };
+        assert!(cl_virtual_reserves(&empty).is_none());
+        assert!(edge_capacity_from_cl_state(&empty, true).is_none());
+    }
+
+    /// Balance-derived capacity must equal `balance_in * RESERVE_BPS / 10_000`
+    /// — the same fraction UniV2/Solidly already use — and must NOT be
+    /// `probe * PROBE_MULTIPLIER`.
+    #[test]
+    fn cl_capacity_uses_real_balance_not_probe() {
+        // 10,046 WETH — the real holding of WETH/USDC 0x6c561b446 on Base.
+        let balance_in = U256::from(10_046u64) * U256::exp10(18);
+        let expected = balance_in * U256::from(EDGE_CAPACITY_RESERVE_BPS) / U256::from(10_000u32);
+        assert_eq!(edge_capacity_from_pool_balance(balance_in), expected);
+        assert_eq!(
+            edge_capacity_from_pool_balance(balance_in),
+            edge_capacity_from_reserve(balance_in),
+            "CL and constant-product edges must size on the same basis"
+        );
+
+        // A tiny probe with no measured impact is capped at probe * 256 and
+        // cannot see the pool's real depth.
+        let tiny_probe = QuoteComputation {
+            amount_in: U256::from(1_000u64),
+            amount_out: U256::from(1_000u64),
+            slippage_bps: 0,
+        };
+        assert!(
+            edge_capacity_from_pool_balance(balance_in)
+                > edge_capacity_from_quote(&tiny_probe, 50),
+            "real balance must dominate the probe artifact"
+        );
+    }
+
+    /// The virtual-reserve formula must never reach a capacity path.
+    ///
+    /// It overstates real holdings by 16-56x on deep Base pools (measured
+    /// against balanceOf) and unboundedly on thin ones, because it describes the
+    /// tangent constant-product curve running 0..infinity rather than the ticks
+    /// that actually hold liquidity. This asserts the source itself, so the trap
+    /// cannot be re-introduced by a future edit.
+    #[test]
+    fn virtual_reserves_are_not_referenced_by_capacity_paths() {
+        let src = include_str!("venues.rs");
+        // Needles are assembled at runtime so this test's own source does not
+        // match itself via `include_str!`.
+        let virtual_fn = concat!("cl_virtual", "_reserves");
+        let capacity_field = concat!("max_", "input");
+        for (n, line) in src.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains(virtual_fn) && code.contains(capacity_field) {
+                panic!("line {}: virtual reserves reached a capacity path: {line}", n + 1);
+            }
+        }
+        // And the balance path is what construction actually calls.
+        assert!(
+            src.contains(concat!("edge_capacity_from_pool", "_balance")),
+            "CL construction must use the balance-derived helper"
+        );
+    }
+
+    /// The shipped UniV4 inventory must parse as a PoolKey, not as a UniV3 pool.
+    ///
+    /// `data/base/uniswap_v4/pools.jsonl` previously held `{pool, token0, token1,
+    /// fee, ...}` — the UniV3 shape, with entries that were literally UniV3 pool
+    /// ADDRESSES. UniV4 has no per-pool address: a pool is identified by
+    /// `poolId = keccak256(abi.encode(currency0, currency1, fee, tickSpacing,
+    /// hooks))` under a single PoolManager, and quoting needs the KEY, not the id
+    /// (the hash is one-way). A later revision held `{poolId, pair, liq_usd}`,
+    /// which is the right identity but still unparseable here.
+    ///
+    /// This pins the file against the real resolver so neither shape can return.
+    #[test]
+    fn shipped_univ4_inventory_parses_as_poolkeys() {
+        let raw = match std::fs::read_to_string("data/base/uniswap_v4/pools.json") {
+            Ok(raw) => raw,
+            // Not every checkout carries chain data; absence is not a failure.
+            Err(_) => return,
+        };
+        if raw.trim().is_empty() {
+            return;
+        }
+        let pools = resolve_univ4_pools(&raw, "data/base/uniswap_v4/pools.json")
+            .expect("shipped UniV4 inventory must parse as PoolKeys");
+        assert!(!pools.is_empty(), "inventory present but yielded no pools");
+        for p in &pools {
+            assert!(!p.pool_manager.is_zero(), "poolManager must be set");
+            assert_ne!(p.token_in, p.token_out, "a pool cannot trade a token for itself");
+            assert!(!p.sqrt_price_x96.is_zero(), "sqrtPriceX96 must be a live price");
+            assert!(p.token0 < p.token1, "currencies must be sorted, as PoolKey requires");
+        }
     }
 
     #[test]

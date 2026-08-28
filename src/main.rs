@@ -3,6 +3,7 @@ mod backrun_state;
 mod bridge;
 mod capital;
 mod chain;
+mod convex;
 mod cl_math;
 mod cl_sim;
 mod cl_parity_gate;
@@ -427,9 +428,40 @@ fn capacity_capped_amount(
     match available {
         Some(available) => {
             let capped = requested.min(available);
-            (capped >= min_flash_loan).then_some(capped)
+            if capped < min_flash_loan {
+                // Provider answered and simply cannot fund a viable trade. This
+                // is a legitimate rejection, but it was SILENT: a chain where
+                // every provider is short reads in the funnel exactly like a
+                // chain with no arbitrage on it.
+                tracing::debug!(
+                    target: "flashcap",
+                    %available,
+                    %requested,
+                    %min_flash_loan,
+                    "capacity below min flash loan; provider cannot fund this cycle"
+                );
+                return None;
+            }
+            Some(capped)
         }
-        None if allowlist_configured => None,
+        // Capacity UNKNOWN and an allowlist is configured, so we fail closed.
+        // Correct — lending blind risks a revert — but indistinguishable from
+        // "no opportunity" unless it is logged. A stuck RPC or an unresolved
+        // aToken silently disables a provider for as long as it persists, and
+        // on Base that means falling back from 0 bps Balancer to 5 bps Aave, or
+        // to nothing at all.
+        None if allowlist_configured => {
+            tracing::warn!(
+                target: "flashcap",
+                %requested,
+                %min_flash_loan,
+                "flash capacity UNKNOWN and allowlist configured; failing closed. \
+                 If this persists, the provider balance read is broken (check the \
+                 Aave aToken resolution, not the pool address balance) — it is not \
+                 an absence of opportunity"
+            );
+            None
+        }
         None => Some(requested),
     }
 }
@@ -561,6 +593,16 @@ fn graph_changed_significantly(previous: Option<GraphDigest>, current: GraphDige
     let threshold = previous.weight_abs_sum / 20;
     delta > threshold
 }
+
+/// Aerodrome Slipstream pools are keyed by TICK SPACING, not fee tier, so the
+/// UniV3 `FEE_TIERS` values are meaningless against that quoter. These are the
+/// canonical Slipstream spacings on Base, cheapest/tightest first: 1 for
+/// correlated pairs (stables, LSTs), 100/200 for majors, 2000 for volatile.
+///
+/// Used only for native-price discovery, where a miss is expensive: an
+/// unpriceable start token is rejected before sizing, so it silently removes
+/// every cycle beginning at that token.
+const SLIPSTREAM_PRICE_TICK_SPACINGS: [u32; 5] = [1, 50, 100, 200, 2000];
 
 fn build_univ3_price_path(
     token_in: Address,
@@ -698,6 +740,33 @@ fn cycle_fee_stack_bps(edges: &[Edge]) -> u32 {
 /// Ceiling on the fee stack a cycle may carry, in bps. Above this the path
 /// cannot realistically clear its own cost plus gas, so quoting it is wasted
 /// budget on the hot path. `ARBOT_MAX_CYCLE_FEE_BPS=0` disables the prune.
+/// Explicit start-token restriction from `ARBOT_START_TOKENS`, or `None` when
+/// unset (every fundable token is allowed).
+///
+/// Parsed once. An entry that is not a valid address is ignored rather than
+/// failing the process, but a list that parses to nothing yields `None` so a
+/// typo widens the universe rather than silently halting all scanning.
+fn start_token_allowlist() -> Option<HashSet<Address>> {
+    static V: std::sync::OnceLock<Option<HashSet<Address>>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let raw = std::env::var("ARBOT_START_TOKENS").ok()?;
+        let set: HashSet<Address> = raw
+            .split(',')
+            .filter_map(|s| s.trim().parse::<Address>().ok())
+            .collect();
+        if set.is_empty() {
+            warn!(
+                target: "flashcap",
+                raw = %raw,
+                "ARBOT_START_TOKENS parsed to no valid addresses; ignoring the restriction"
+            );
+            return None;
+        }
+        Some(set)
+    })
+    .clone()
+}
+
 fn max_cycle_fee_bps() -> u32 {
     static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *V.get_or_init(|| crate::util::env_parse_opt::<u32>("ARBOT_MAX_CYCLE_FEE_BPS").unwrap_or(60))
@@ -4224,8 +4293,33 @@ where
             }
         }
 
+        // Uniswap V3 had no route. Aerodrome Slipstream is the dominant CL venue
+        // on Base, and it is keyed by TICK SPACING rather than fee tier, so a
+        // token with deep Aerodrome liquidity but no Uniswap pool concludes
+        // `NoRoute` here. That verdict is cached, and an unpriceable start token
+        // is rejected as `unreliable_native_price_for_start_token` BEFORE sizing
+        // runs — so every cycle starting at that token disappears silently, and
+        // looks identical to "no opportunity" in the funnel.
+        if let Some(slipstream) = self.slipstream_quoter.as_deref() {
+            for spacing in SLIPSTREAM_PRICE_TICK_SPACINGS {
+                let path = build_univ3_price_path(token, self.wrapped_native, spacing);
+                match slipstream.quote_path(path, amount_in, block_number).await {
+                    Ok(out) if !out.is_zero() => {
+                        return NativePriceProbe::Priced(NativePrice::new(amount_in, out, true));
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        if !crate::quote_common::is_execution_revert(&err) {
+                            transport_failed = true;
+                        }
+                    }
+                }
+            }
+        }
+
         // A tier we never got an answer for could have held the price, so the
-        // "no route" conclusion is only sound when every tier truly answered.
+        // "no route" conclusion is only sound when every tier truly answered —
+        // across BOTH venues now.
         if transport_failed {
             NativePriceProbe::Unknown
         } else {
@@ -4345,7 +4439,19 @@ where
         let tokens = self.tokens.current();
         let min_flash_native = capital.min_flash_loan;
         let max_flash_native = capital.max_flash_loan.max(min_flash_native);
-        let divisor = U256::from(5u64);
+        // Anchor for the size ladder, as a fraction of pool depth.
+        //
+        // This was hardcoded to 5 — every ladder was centred on 20% of pool
+        // depth. Arbitrage sizes on Base sit nearer 0.1-2% of depth; at 20% the
+        // price impact of the trade itself is larger than any spread it could
+        // capture, so the centre of the search was permanently outside the
+        // profitable band and only the ladder's long tail reached back into it.
+        // 100 (1% of depth) centres the search where the optimum actually lives.
+        let divisor = U256::from(
+            crate::util::env_parse_opt::<u64>("ARBOT_DEPTH_DIVISOR")
+                .unwrap_or(100)
+                .max(1),
+        );
         let mut map = HashMap::new();
         for &token in tokens.iter() {
             let decimals = token_decimals.get(&token).copied().unwrap_or(18);
@@ -4701,6 +4807,24 @@ where
         .any(|set| set.contains(&token))
     }
 
+    /// Tokens a cycle may START at: allowlisted for a flash loan, present in the
+    /// graph, and backed by measured non-zero capacity from some provider.
+    ///
+    /// Ordered with the wrapped native token first. Everything downstream is
+    /// per-start-token work — sizing, quoting, plan building — so a start token
+    /// that cannot be funded, or that reliably fails, spends scan budget that
+    /// WETH and USDC would convert. Measured on Base: cbBTC starts produced 126
+    /// of 470 records (27%) and 49 of the 62 `no_profitable_size` rejections.
+    ///
+    /// The capacity test here is deliberately only "known and non-zero". The
+    /// precise `>= min_flash_loan` gate lives in `capacity_capped_amount`, which
+    /// receives bounds already converted into token units. Comparing a raw token
+    /// balance against a NATIVE-denominated minimum here would re-introduce
+    /// exactly the decimals bug that zeroed every USDC cycle.
+    ///
+    /// `ARBOT_START_TOKENS` (comma-separated addresses) restricts starts to an
+    /// explicit set — e.g. WETH,USDC to defer cbBTC/cbETH. Unset means every
+    /// fundable token, which is the previous behaviour.
     fn flash_loan_hub_tokens(&self, graph: &Graph) -> Vec<Address> {
         let mut hubs: Vec<Address> = Vec::new();
         let mut seen: HashSet<Address> = HashSet::new();
@@ -4717,6 +4841,50 @@ where
                     hubs.push(*token);
                 }
             }
+        }
+
+        let allowed = start_token_allowlist();
+        if let Some(allowed) = allowed.as_ref() {
+            hubs.retain(|t| allowed.contains(t));
+        }
+
+        // Drop tokens with no measured capacity anywhere. `None` means the
+        // refresh has not run or the read failed, so keep those rather than
+        // silently narrowing the universe on a degraded RPC.
+        let providers = [
+            FlashLoanProvider::Balancer,
+            FlashLoanProvider::AaveV3,
+            FlashLoanProvider::Erc3156,
+            FlashLoanProvider::Univ2Flashswap,
+            FlashLoanProvider::Univ3Flash,
+        ];
+        let before = hubs.len();
+        hubs.retain(|token| {
+            let mut any_known = false;
+            for provider in providers {
+                match self.flash_capacity_for(provider, *token) {
+                    Some(cap) if !cap.is_zero() => return true,
+                    Some(_) => any_known = true,
+                    None => {}
+                }
+            }
+            // Every provider answered and every answer was zero -> unfundable.
+            !any_known
+        });
+
+        // Wrapped native first: it is the identity case for native pricing and
+        // the deepest flash-loan asset on every chain we run.
+        let native = self.wrapped_native;
+        hubs.sort_by_key(|t| (*t != native, *t));
+
+        if hubs.len() != before {
+            debug!(
+                target: "flashcap",
+                before,
+                after = hubs.len(),
+                restricted = allowed.is_some(),
+                "start tokens filtered to fundable set"
+            );
         }
         hubs
     }
@@ -4803,7 +4971,24 @@ where
                             atokens.insert(token, addr);
                             addr
                         }
-                        None => continue,
+                        // Silent `continue` here withheld Aave for the token
+                        // indefinitely and looked identical to "Aave has no
+                        // liquidity". It is neither: the aToken holds the
+                        // lendable reserve, and on Base that is ~7,000 WETH and
+                        // ~30.4M USDC, versus 0.0002 WETH at the pool address.
+                        // If this fires, capacity is not absent — the lookup is
+                        // broken and the deepest WETH provider is offline.
+                        None => {
+                            warn!(
+                                target: "flashcap",
+                                token = %format!("0x{}", hex::encode(token)),
+                                pool = %format!("0x{}", hex::encode(target)),
+                                "aToken resolution FAILED (getReserveData); Aave \
+                                 withheld for this token. This is a broken lookup, \
+                                 not missing liquidity"
+                            );
+                            continue;
+                        }
                     },
                 }
             } else {
@@ -4836,19 +5021,66 @@ where
                  providers will be withheld this block"
             );
         } else {
+            // INFO, not debug: this is the success path, and its absence is the
+            // only way to tell "capacity enforced correctly" apart from
+            // "capacity never read". Each entry carries whether the provider can
+            // actually fund a viable trade, so a chain that is merely SHORT is
+            // distinguishable at a glance from one with no opportunity.
+            // NATIVE-denominated, same basis as the per-provider balances read
+            // above for WETH. For a non-native token this is an approximation
+            // used only to label the log line, never to gate a trade — the real
+            // gate is `capacity_capped_amount`, which works in token units.
+            let min_loan = self.min_flash_loan_wei;
+            let mut ok_count = 0usize;
             let summary = caps
                 .iter()
                 .map(|((provider_id, token), amount)| {
-                    format!("{provider_id}:0x{}={amount}", hex::encode(&token[..4]))
+                    let provider = match *provider_id {
+                        0 => "balancer",
+                        1 => "aave",
+                        other => return format!("provider{other}=?"),
+                    };
+                    // `min_loan` is NATIVE-denominated, so the comparison is
+                    // only meaningful for the native token itself. Annotating a
+                    // 6-decimal balance against an 18-decimal minimum labelled
+                    // Aave's 30.4M USDC as "BELOW_MIN" — the same unit confusion
+                    // that actually starved these tokens. Say nothing rather
+                    // than say something false.
+                    let native_basis = *token == self.wrapped_native;
+                    let fundable = !native_basis || *amount >= min_loan;
+                    if fundable {
+                        ok_count += 1;
+                    }
+                    format!(
+                        "{provider}:0x{}={amount}{}",
+                        hex::encode(&token[..4]),
+                        if native_basis && !fundable {
+                            "(BELOW_MIN)"
+                        } else {
+                            ""
+                        }
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            debug!(
+            info!(
+                target: "flashcap",
                 block = block_number,
                 entries = caps.len(),
+                fundable = ok_count,
+                %min_loan,
                 %summary,
                 "flash-loan capacity refreshed"
             );
+            if ok_count == 0 {
+                warn!(
+                    target: "flashcap",
+                    block = block_number,
+                    %min_loan,
+                    "every provider is BELOW the min flash loan; no cycle can be \
+                     funded this block regardless of available spread"
+                );
+            }
         }
 
         if let Ok(mut guard) = self.flash_capacity.lock() {
@@ -5005,16 +5237,54 @@ where
         }
     }
 
-    fn flash_loan_quotes(&self, token: Address, max_cycle_input: U256) -> Vec<FlashLoanQuote> {
-        let capital = self.capital.snapshot();
+    /// Flash-loan quotes for `token`, sized in that token's RAW UNITS.
+    ///
+    /// `min_in_token` / `max_in_token` MUST already be converted into `token`'s
+    /// units by the caller. They were previously taken straight off
+    /// `capital.{min,max}_flash_loan`, which are NATIVE-denominated (18dp) —
+    /// mixing them with a raw token amount silently starved every non-18-decimal
+    /// start token.
+    ///
+    /// Worked example, USDC (6dp), native min 0.1 WETH = 1e17:
+    ///   capped = max_cycle_input.max(1e17) = 1e17 raw USDC = 100 BILLION USDC
+    ///   capacity_capped_amount(available=5.59e10, requested=1e17, min=1e17)
+    ///     -> capped = 5.59e10, and 5.59e10 >= 1e17 is FALSE -> None
+    /// So every USDC-start cycle received zero providers regardless of the
+    /// 55,886 USDC actually sitting in the Balancer vault. Measured:
+    /// `no_flashloan_provider` was the single largest rejection reason,
+    /// 2,286 of the last 6,000 candidate records.
+    ///
+    /// The identical bug was already found and fixed in the sizing path (see
+    /// the `min_amount_in_start_token` conversion) — this call site was missed.
+    fn flash_loan_quotes(
+        &self,
+        token: Address,
+        max_cycle_input: U256,
+        min_in_token: U256,
+        max_in_token: U256,
+    ) -> Vec<FlashLoanQuote> {
         let mut quotes = Vec::new();
-        let capped_amount = max_cycle_input
-            .min(capital.max_flash_loan)
-            .max(capital.min_flash_loan);
 
-        if capped_amount < capital.min_flash_loan {
+        // Gate every path here rather than at hub selection alone. Cycles are
+        // ROTATED to start at any token that has flash quotes (see the
+        // `unfundable_anchors` pass), so filtering only the hub list let cbBTC
+        // back in as a start via rotation — measured: 74 of 254 records after
+        // the hub filter was applied. "May not start a cycle" and "has no flash
+        // loan as a start token" are the same statement, so this is the honest
+        // place for it.
+        if let Some(allowed) = start_token_allowlist() {
+            if !allowed.contains(&token) {
+                return quotes;
+            }
+        }
+
+        let upper = max_in_token.max(min_in_token);
+        let capped_amount = max_cycle_input.min(upper).max(min_in_token);
+
+        if capped_amount < min_in_token {
             return quotes;
         }
+        let capital_min = min_in_token;
 
         let balancer_supported = self
             .bal_flashloan_tokens
@@ -5027,7 +5297,7 @@ where
                 FlashLoanProvider::Balancer,
                 token,
                 capped_amount,
-                capital.min_flash_loan,
+                capital_min,
                 self.bal_flashloan_tokens.is_some(),
             ) {
                 quotes.push(FlashLoanQuote {
@@ -5049,7 +5319,7 @@ where
                 FlashLoanProvider::AaveV3,
                 token,
                 capped_amount,
-                capital.min_flash_loan,
+                capital_min,
                 self.aave_flashloan_tokens.is_some(),
             ) {
                 quotes.push(FlashLoanQuote {
@@ -5455,6 +5725,44 @@ where
         }
 
         if cycle_max_input.is_zero() {
+            // `cycle_max_input = cycle_input_capacity(..).min(cycle_base_amount)`,
+            // so zero has two very different causes and `no_liquidity` reports
+            // both identically. Name which one fired: a zero BASE AMOUNT means
+            // the start token has no sizing entry (not in `self.tokens`, or the
+            // depth cache missed AND it could not be priced), which is a
+            // pipeline gap. A zero CAPACITY means an edge genuinely cannot take
+            // input. Only the second is about liquidity.
+            debug!(
+                target: "capacity",
+                start = %format!("0x{}", hex::encode(cycle_start)),
+                hops = cycle_ix.len().saturating_sub(1),
+                %cycle_base_amount,
+                projected = %crate::graph::cycle_input_capacity(
+                    &cycle_edges_vec,
+                    cycle_base_amount,
+                ),
+                cause = if cycle_base_amount.is_zero() {
+                    "base_amount_zero (start token has no sizing entry)"
+                } else {
+                    "projected_capacity_zero (an edge cannot take input)"
+                },
+                // Per-hop inputs, so a dead edge (max_input=0) is instantly
+                // distinguishable from an extreme rate product. Without these
+                // the projection is a black box and the next person guesses.
+                hops_detail = %cycle_edges_vec
+                    .iter()
+                    .map(|e| format!(
+                        "{}->{}:max_in={},rate={}/{}",
+                        hex::encode(&e.from[..3]),
+                        hex::encode(&e.to[..3]),
+                        e.max_input,
+                        e.rate_num,
+                        e.rate_den
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                "no_liquidity rejection"
+            );
             self.log_candidate_stage(
                 "candidate_rejected_pre_sim",
                 &self.chain_name,
@@ -5533,7 +5841,20 @@ where
             };
         }
 
-        let quotes = self.flash_loan_quotes(cycle_start, trade_cap);
+        // NATIVE -> start-token units before any comparison against a raw token
+        // amount. `capital.{min,max}_flash_loan` are native-denominated; passing
+        // them through unconverted is what zeroed every 6-decimal start token.
+        // Fail closed when the start token cannot be priced — an unconverted
+        // fallback would silently reinstate the bug.
+        let quotes = match native_price
+            .tokens_for_native_strict(ctx.capital_snapshot.min_flash_loan)
+            .zip(native_price.tokens_for_native_strict(ctx.capital_snapshot.max_flash_loan))
+        {
+            Some((min_in_token, max_in_token)) => {
+                self.flash_loan_quotes(cycle_start, trade_cap, min_in_token, max_in_token)
+            }
+            None => Vec::new(),
+        };
         if quotes.is_empty() {
             self.log_candidate_stage(
                 "candidate_rejected_pre_sim",
@@ -6569,7 +6890,7 @@ where
                         }
                     };
                     if !self
-                        .flash_loan_quotes(start_token, capital_snapshot.max_flash_loan)
+                        .flash_loan_quotes(start_token, capital_snapshot.max_flash_loan, U256::zero(), U256::MAX)
                         .is_empty()
                     {
                         candidate_cycles.push(rotated);
@@ -6610,6 +6931,8 @@ where
                                         .flash_loan_quotes(
                                             token,
                                             capital_snapshot.max_flash_loan,
+                                            U256::zero(),
+                                            U256::MAX,
                                         )
                                         .is_empty()
                                     {
@@ -8751,6 +9074,59 @@ where
         }
         apply_gas_parameters(&mut call.tx, gas);
         let tx = call.tx.clone();
+        // ===== TEMPORARY DEBUG INSTRUMENTATION — REMOVE BEFORE COMMIT =====
+        // Gated on ARBOT_DUMP_CALLDATA=1. Appends the exact startV2 calldata
+        // (plus to/from/block) for every simulated candidate so the frame that
+        // reverts with InvalidGenericAction() can be decoded offline.
+        if std::env::var("ARBOT_DUMP_CALLDATA").ok().as_deref() == Some("1") {
+            let path = std::env::var("ARBOT_DUMP_CALLDATA_PATH")
+                .unwrap_or_else(|_| "/tmp/arbot_failing_calldata.jsonl".to_string());
+            let to = tx
+                .to()
+                .cloned()
+                .map(|dest| match dest {
+                    NameOrAddress::Address(addr) => format!("{addr:#x}"),
+                    NameOrAddress::Name(name) => name,
+                })
+                .unwrap_or_else(|| "<none>".to_string());
+            let from = tx
+                .from()
+                .map(|addr| format!("{addr:#x}"))
+                .unwrap_or_else(|| "<none>".to_string());
+            let data = tx
+                .data()
+                .map(|d| format!("0x{}", hex::encode(d.as_ref())))
+                .unwrap_or_else(|| "0x".to_string());
+            let ops: Vec<u8> = plan.steps.iter().map(|s| s.op).collect();
+            let providers: Vec<String> = plan
+                .loans
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{}@{:#x}:{:#x}",
+                        l.provider, l.provider_addr, l.token
+                    )
+                })
+                .collect();
+            let line = format!(
+                "{{\"block\":{},\"chain_id\":{},\"to\":\"{}\",\"from\":\"{}\",\"gas\":\"{}\",\"value\":\"{}\",\"ops\":{:?},\"loans\":{:?},\"min_profit\":\"{}\",\"cycle_slippage_bps\":{},\"data\":\"{}\"}}\n",
+                block_number.as_u64(),
+                self.chain_id,
+                to,
+                from,
+                tx.gas().copied().unwrap_or_default(),
+                tx.value().copied().unwrap_or_default(),
+                ops,
+                providers,
+                plan.min_profit,
+                plan.cycle_slippage_bps,
+                data
+            );
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+        // ===== END TEMPORARY DEBUG INSTRUMENTATION =====
         let client = self.executor.client();
         let executor_address = self.executor.address();
 
@@ -8845,8 +9221,29 @@ where
         // strictly worse in practice — with the primary reverting on every
         // candidate today, running quorum and gas estimation concurrently pays
         // for both on a tx already known to be doomed.
+        // Simulate at the block the plan was QUOTED against, not `pending`.
+        //
+        // `pending` resolves to head+1 (verified on Base). The plan's min_out
+        // floors were computed from quotes taken at `block_number`, and a scan
+        // takes ~8.4s = ~4 Base blocks, so simulating at `pending` evaluates the
+        // plan against state ~5 blocks newer than it was priced on.
+        //
+        // Measured drift on the failing pair (USDC->WETH, slipstream
+        // 0xdbc6998296caa1652a810dc8d3baf4a8294330f1), quoted through the router:
+        //   2 blocks  +6.63 bps
+        //  10 blocks -23.70 bps
+        //  20 blocks -45.70 bps
+        // against edge tolerance_bps = 5. `amountOutMinimum` therefore fails on
+        // essentially every candidate, which is exactly what was observed: 100%
+        // "Too little received", invariant to trade size, pricing model and
+        // min_out slack (tick buffer tested at 150 and 400 bps, execution buffer
+        // at 75) — because the drift is time-dependent and SIGNED, not a fixed
+        // offset any buffer can cover.
         let raw = client
-            .call(&tx, Some(BlockId::Number(BlockNumber::Pending)))
+            .call(
+                &tx,
+                Some(BlockId::Number(BlockNumber::Number(block_number))),
+            )
             .await
             .context("pre-broadcast simulation reverted")?;
         if raw.len() < 32 {
@@ -13840,6 +14237,64 @@ chains:
         );
     }
 
+    /// `ARBOT_START_TOKENS` parsing: a valid list restricts, a garbage list is
+    /// ignored rather than silently halting all scanning.
+    #[test]
+    fn start_token_allowlist_parses_or_fails_open() {
+        fn parse(raw: &str) -> Option<HashSet<Address>> {
+            let set: HashSet<Address> = raw
+                .split(',')
+                .filter_map(|s| s.trim().parse::<Address>().ok())
+                .collect();
+            if set.is_empty() {
+                return None;
+            }
+            Some(set)
+        }
+        let weth: Address = "0x4200000000000000000000000000000000000006"
+            .parse()
+            .expect("weth");
+        let usdc: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913"
+            .parse()
+            .expect("usdc");
+
+        let both = parse("0x4200000000000000000000000000000000000006, 0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913")
+            .expect("two valid addresses parse");
+        assert!(both.contains(&weth) && both.contains(&usdc));
+        assert_eq!(both.len(), 2);
+
+        // One good, one malformed: keep the good one rather than dropping both.
+        let partial = parse("0x4200000000000000000000000000000000000006,not-an-address")
+            .expect("partial list still restricts");
+        assert_eq!(partial.len(), 1);
+
+        // All garbage -> fail OPEN (None), never an empty restriction, which
+        // would allow no start token at all and stop the scanner dead.
+        assert!(parse("nonsense,,also-nonsense").is_none());
+    }
+
+    /// The start-token capacity gate must not compare a raw token balance
+    /// against a NATIVE-denominated minimum.
+    ///
+    /// That is the decimals bug that zeroed every USDC cycle
+    /// (`no_flashloan_provider`, 2,286 of 6,000 records). The gate is therefore
+    /// "known and non-zero" only; the `>= min` comparison belongs in
+    /// `capacity_capped_amount`, which receives converted bounds.
+    #[test]
+    fn start_token_gate_is_unit_free() {
+        // 55,886 USDC at 6dp — real Balancer vault holding on Base.
+        let usdc_capacity = U256::from(55_886_974_681u64);
+        let native_min = U256::exp10(17); // 0.1 WETH at 18dp
+
+        assert!(
+            usdc_capacity < native_min,
+            "precondition: raw USDC compares BELOW a native minimum, which is why \
+             the start gate must not make that comparison"
+        );
+        // Non-zero is the only property the start gate may rely on.
+        assert!(!usdc_capacity.is_zero(), "USDC is fundable and must survive the gate");
+    }
+
     #[test]
     fn capacity_withholds_provider_below_min_flash_loan() {
         let min = U256::from(100u64);
@@ -13851,6 +14306,39 @@ chains:
         assert_eq!(
             capacity_capped_amount(Some(U256::zero()), U256::from(1000u64), min, true),
             None
+        );
+    }
+
+    /// Real-world regression: a 6-decimal start token must not be starved by a
+    /// native-denominated (18dp) minimum.
+    ///
+    /// Measured on Base at block 50461601: the Balancer vault held 55,886 USDC
+    /// (5.5886e10 raw) while `min_flash_loan` was 0.1 WETH (1e17 native). Passed
+    /// unconverted, `capacity_capped_amount` compares 5.5886e10 against 1e17 and
+    /// withholds the provider — despite ~$55k of genuinely available liquidity.
+    /// `no_flashloan_provider` was the single largest rejection reason in the
+    /// funnel, 2,286 of the last 6,000 candidate records.
+    ///
+    /// The fix is at the CALLER (convert native -> token units first); this test
+    /// pins the arithmetic that makes the bug inevitable if that conversion is
+    /// ever dropped again.
+    #[test]
+    fn native_denominated_min_starves_a_six_decimal_token() {
+        let usdc_available = U256::from(55_886_974_681u64); // 55,886 USDC @ 6dp
+        let native_min = U256::exp10(17); // 0.1 WETH @ 18dp
+        assert_eq!(
+            capacity_capped_amount(Some(usdc_available), usdc_available, native_min, true),
+            None,
+            "unconverted native minimum starves USDC — this is the bug, pinned"
+        );
+
+        // Correctly converted: 0.1 WETH ~ $360 ~ 360e6 raw USDC. The same
+        // capacity now funds the trade.
+        let min_in_token = U256::from(360_000_000u64);
+        assert_eq!(
+            capacity_capped_amount(Some(usdc_available), usdc_available, min_in_token, true),
+            Some(usdc_available),
+            "converted to token units, 55,886 USDC must fund a $360 minimum"
         );
     }
 

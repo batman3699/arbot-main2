@@ -633,6 +633,7 @@ mod tests {
             tick: 0,
             tick_spacing: 60,
             fee_ppm: 3_000,
+            ..Default::default()
         }
     }
 
