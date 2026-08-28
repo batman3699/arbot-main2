@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use ethers::{
     prelude::*,
     providers::{JsonRpcClient, Ws},
-    types::{BlockId, BlockNumber, Filter, H256, U64},
+    types::{BlockId, BlockNumber, Filter, U64},
 };
 use futures_util::StreamExt;
 use tokio::{
@@ -26,15 +26,20 @@ use crate::{
     metrics::Metrics, quote_univ2::UniV2PairState, util::connect_ws_provider_with_fallbacks,
 };
 
-const TOPIC_SYNC: H256 = H256([
-    0x1c, 0x41, 0x68, 0xcd, 0xb0, 0xbe, 0xa3, 0xc4, 0x7c, 0xea, 0xd5, 0x56, 0x31, 0xe2, 0xd4, 0xf7,
-    0x69, 0x59, 0x6b, 0x05, 0x6c, 0xc5, 0x0f, 0xaa, 0xa8, 0x3d, 0x72, 0x8a, 0xfa, 0xba, 0xf8, 0x5,
-]);
-
-const TOPIC_SWAP: H256 = H256([
-    0xd7, 0x8a, 0xd9, 0x5f, 0xa4, 0x6c, 0x99, 0x4b, 0x65, 0x51, 0xd0, 0xda, 0x85, 0xfc, 0x27, 0x5f,
-    0xe6, 0x13, 0xd2, 0xf6, 0xad, 0x69, 0x7f, 0xc0, 0x97, 0x1d, 0xf5, 0x40, 0x87, 0x19, 0x5c, 0x1,
-]);
+/// The websocket filter for a pool set.
+///
+/// Extracted from `run_ws` so it can be tested. It could not be before, and
+/// the constants it depends on were wrong for the life of the process: each
+/// had a correct prefix and a fabricated tail, so the subscription connected
+/// cleanly and delivered nothing.
+pub(crate) fn pool_log_filter(pools: &[MonitoredPool]) -> Filter {
+    Filter::new()
+        .address(pools.iter().map(|p| p.pair).collect::<Vec<_>>())
+        .topic0(vec![
+            *crate::log_decode::TOPIC_V2_SYNC,
+            *crate::log_decode::TOPIC_V2_SWAP,
+        ])
+}
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,9 +170,7 @@ where
                 sleep(self.poll_interval).await;
                 continue;
             }
-            let filter = Filter::new()
-                .address(pools.iter().map(|p| p.pair).collect::<Vec<_>>())
-                .topic0(vec![TOPIC_SYNC, TOPIC_SWAP]);
+            let filter = pool_log_filter(&pools);
 
             match provider.subscribe_logs(&filter).await {
                 Ok(mut sub) => {
@@ -761,5 +764,62 @@ mod tests {
 
         assert!(signal.take_requested());
         assert!(!signal.take_requested());
+    }
+
+    fn monitored(n: u64) -> MonitoredPool {
+        MonitoredPool {
+            pair: Address::from_low_u64_be(n),
+            token_in: Address::from_low_u64_be(n + 1000),
+            token_out: Address::from_low_u64_be(n + 2000),
+            fee_bps: 30,
+            stable: false,
+            kind: PoolMonitorKind::UniV2,
+        }
+    }
+
+    /// `Filter::topics` is `[Option<Topic>; 4]` where `Topic` is
+    /// `ValueOrArray<Option<H256>>`. Destructure it rather than matching on
+    /// `Debug` output, which is not a stable contract.
+    fn topic0_of(filter: &Filter) -> Vec<H256> {
+        match filter.topics[0].clone().expect("topic0 must be set") {
+            ValueOrArray::Value(v) => v.into_iter().collect(),
+            ValueOrArray::Array(vs) => vs.into_iter().flatten().collect(),
+        }
+    }
+
+    fn addresses_of(filter: &Filter) -> Vec<Address> {
+        match filter.address.clone().expect("address must be set") {
+            ValueOrArray::Value(a) => vec![a],
+            ValueOrArray::Array(a) => a,
+        }
+    }
+
+    #[test]
+    fn filter_subscribes_to_the_real_sync_and_swap_topics() {
+        let topics = topic0_of(&pool_log_filter(&[monitored(1), monitored(2)]));
+        // `&*` derefs the LazyLock: `contains` wants `&H256`, not
+        // `&LazyLock<H256>`, and the deref is not inserted implicitly here.
+        assert!(
+            topics.contains(&crate::log_decode::TOPIC_V2_SYNC),
+            "Sync topic missing from filter: {topics:?}"
+        );
+        assert!(
+            topics.contains(&crate::log_decode::TOPIC_V2_SWAP),
+            "Swap topic missing from filter: {topics:?}"
+        );
+        assert_eq!(topics.len(), 2, "no extra topics should be subscribed");
+    }
+
+    #[test]
+    fn filter_covers_every_supplied_pool() {
+        let addrs = addresses_of(&pool_log_filter(&[
+            monitored(1),
+            monitored(2),
+            monitored(3),
+        ]));
+        for n in 1..=3u64 {
+            let addr = Address::from_low_u64_be(n);
+            assert!(addrs.contains(&addr), "pool {addr:#x} missing from filter");
+        }
     }
 }
