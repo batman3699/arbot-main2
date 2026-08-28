@@ -6424,9 +6424,19 @@ where
             }
             if let Some(monitor) = &self.backrun {
                 let hints = monitor.active_hints(Duration::from_secs(45)).await;
-                for hint in &hints {
-                    touched.insert(hint.from);
-                    touched.insert(hint.to);
+                // `hint.from`/`hint.to` are TOKENS, and `post_state_from_hint`
+                // leaves `pool` zeroed — hints carry no pool identity. Putting
+                // tokens in a pool set does not merely fail to match: it makes
+                // the set non-empty, which flips populate to incremental with a
+                // filter that matches nothing, dropping every CL re-quote for
+                // that scan. Resolve to real pools, or contribute nothing.
+                if !hints.is_empty() {
+                    let universe = self.pool_universe().await;
+                    for hint in &hints {
+                        for pool in universe.pools_for_hop(hint.from, hint.to) {
+                            touched.insert(*pool);
+                        }
+                    }
                 }
             }
             {
@@ -13682,6 +13692,55 @@ mod tests {
     use std::sync::Mutex;
 
     pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn hint_tokens_never_enter_the_touched_pool_set() {
+        use crate::cycle_index::PoolUniverse;
+
+        let weth = Address::from_low_u64_be(1);
+        let usdc = Address::from_low_u64_be(2);
+        let pool_a = Address::from_low_u64_be(100);
+        let pool_b = Address::from_low_u64_be(101);
+        let universe =
+            PoolUniverse::from_pools(vec![(pool_a, weth, usdc), (pool_b, weth, usdc)]);
+
+        let mut touched: HashSet<Address> = HashSet::new();
+        for pool in universe.pools_for_hop(weth, usdc) {
+            touched.insert(*pool);
+        }
+
+        assert!(touched.contains(&pool_a) && touched.contains(&pool_b));
+        assert!(
+            !touched.contains(&weth) && !touched.contains(&usdc),
+            "token addresses in a pool set flip populate to incremental and \
+             filter every CL pool out of the scan"
+        );
+    }
+
+    #[test]
+    fn a_hint_on_an_unknown_pair_dirties_nothing() {
+        use crate::cycle_index::PoolUniverse;
+
+        let universe = PoolUniverse::from_pools(vec![(
+            Address::from_low_u64_be(100),
+            Address::from_low_u64_be(1),
+            Address::from_low_u64_be(2),
+        )]);
+
+        let mut touched: HashSet<Address> = HashSet::new();
+        for pool in universe.pools_for_hop(
+            Address::from_low_u64_be(50),
+            Address::from_low_u64_be(51),
+        ) {
+            touched.insert(*pool);
+        }
+
+        assert!(
+            touched.is_empty(),
+            "an unresolvable hint must leave the set empty so populate stays \
+             on the full path, not go incremental with a filter matching nothing"
+        );
+    }
 
     /// The quorum bug: a tx reaching simulation with no gas limit is rejected by
     /// every verifier as `intrinsic gas too low`, so cross-endpoint verification

@@ -102,16 +102,6 @@ pub fn post_state_from_hint(hint: &BackrunHint) -> PostSwapPoolState {
     }
 }
 
-#[allow(dead_code)]
-pub fn touched_pools_from_hints(hints: &[BackrunHint]) -> HashSet<Address> {
-    let mut touched = HashSet::new();
-    for hint in hints {
-        touched.insert(hint.from);
-        touched.insert(hint.to);
-    }
-    touched
-}
-
 pub fn log_backrun_opportunity(
     from: Address,
     to: Address,
