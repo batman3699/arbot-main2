@@ -15,6 +15,7 @@ pub mod discovery;
 pub mod graph;
 pub mod hot_path;
 pub mod ingestion;
+pub mod log_decode;
 pub mod math;
 pub mod metrics;
 pub mod ops_inputs;

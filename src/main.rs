@@ -23,6 +23,7 @@ mod hot_path;
 mod ingestion;
 mod liquidations;
 mod liquidity_cache;
+mod log_decode;
 mod math;
 mod metrics;
 mod ops_inputs;
