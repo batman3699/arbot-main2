@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
@@ -83,7 +83,13 @@ where
     ws_connected: Arc<AtomicBool>,
     ws_warned: Arc<AtomicBool>,
     pool_updates: Arc<Notify>,
-    touched_pools: Arc<DashMap<Address, ()>>,
+    /// Pools whose state moved since the last drain.
+    ///
+    /// A `Mutex<HashSet>` rather than a `DashMap`, because the drain must be a
+    /// single atomic swap. The previous `DashMap` drain collected then cleared,
+    /// which erased any insert landing between the two — a permanent loss, not
+    /// a delay. Never held across an `.await`.
+    touched_pools: Arc<StdMutex<HashSet<Address>>>,
 }
 
 impl<C> PoolMonitor<C>
@@ -115,18 +121,25 @@ where
             ws_connected: Arc::new(AtomicBool::new(false)),
             ws_warned: Arc::new(AtomicBool::new(false)),
             pool_updates: Arc::new(Notify::new()),
-            touched_pools: Arc::new(DashMap::new()),
+            touched_pools: Arc::new(StdMutex::new(HashSet::new())),
         })
     }
 
     pub fn mark_touched(&self, pool: Address) {
-        self.touched_pools.insert(pool, ());
+        if let Ok(mut guard) = self.touched_pools.lock() {
+            guard.insert(pool);
+        }
     }
 
+    /// Take the dirty set and leave an empty one, in one atomic step.
+    ///
+    /// A mark landing immediately after the swap belongs to the next batch and
+    /// cannot be erased. Collect-then-clear did not have this property.
     pub fn drain_touched(&self) -> HashSet<Address> {
-        let touched: HashSet<Address> = self.touched_pools.iter().map(|entry| *entry.key()).collect();
-        self.touched_pools.clear();
-        touched
+        match self.touched_pools.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(_) => HashSet::new(),
+        }
     }
 
     pub fn spawn(self: Arc<Self>) -> Vec<JoinHandle<()>> {
@@ -214,7 +227,7 @@ where
         if let Some(metrics) = &self.metrics {
             metrics.ingestion_ws_events.inc();
         }
-        self.touched_pools.insert(pair, ());
+        self.mark_touched(pair);
 
         let block_number = log.block_number;
         if let Some(mut entry) = self.cache.get_mut(&pair) {
@@ -808,6 +821,76 @@ mod tests {
             "Swap topic missing from filter: {topics:?}"
         );
         assert_eq!(topics.len(), 2, "no extra topics should be subscribed");
+    }
+
+    /// A concurrent mark must never be erased by a drain. The previous
+    /// collect-then-clear implementation dropped any insert that landed
+    /// between the iteration and the `clear()`.
+    #[test]
+    fn concurrent_marks_are_never_lost_across_a_drain() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Arc as StdArc;
+
+        const WRITERS: u64 = 4;
+        const PER_WRITER: u64 = 2_000;
+
+        let touched: StdArc<StdMutex<HashSet<Address>>> =
+            StdArc::new(StdMutex::new(HashSet::new()));
+        let done = StdArc::new(AtomicBool::new(false));
+        let drained: StdArc<StdMutex<HashSet<Address>>> =
+            StdArc::new(StdMutex::new(HashSet::new()));
+
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let touched = StdArc::clone(&touched);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..PER_WRITER {
+                    let addr = Address::from_low_u64_be(w * PER_WRITER + i);
+                    touched.lock().expect("mark").insert(addr);
+                }
+            }));
+        }
+
+        let reader = {
+            let touched = StdArc::clone(&touched);
+            let drained = StdArc::clone(&drained);
+            let done = StdArc::clone(&done);
+            std::thread::spawn(move || loop {
+                let batch: HashSet<Address> =
+                    std::mem::take(&mut *touched.lock().expect("drain"));
+                drained.lock().expect("record").extend(batch);
+                if done.load(AtomicOrdering::SeqCst) {
+                    let tail: HashSet<Address> =
+                        std::mem::take(&mut *touched.lock().expect("drain tail"));
+                    drained.lock().expect("record tail").extend(tail);
+                    break;
+                }
+            })
+        };
+
+        for h in handles {
+            h.join().expect("writer");
+        }
+        done.store(true, AtomicOrdering::SeqCst);
+        reader.join().expect("reader");
+
+        let seen = drained.lock().expect("final").len() as u64;
+        assert_eq!(
+            seen,
+            WRITERS * PER_WRITER,
+            "a concurrent mark was erased by a drain"
+        );
+    }
+
+    #[test]
+    fn drain_returns_everything_and_leaves_the_set_empty() {
+        let set: StdMutex<HashSet<Address>> = StdMutex::new(HashSet::new());
+        for n in 1..=5u64 {
+            set.lock().expect("mark").insert(Address::from_low_u64_be(n));
+        }
+        let batch: HashSet<Address> = std::mem::take(&mut *set.lock().expect("drain"));
+        assert_eq!(batch.len(), 5);
+        assert!(set.lock().expect("check").is_empty());
     }
 
     #[test]
