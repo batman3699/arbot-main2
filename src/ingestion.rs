@@ -852,6 +852,49 @@ mod tests {
         assert_eq!(topics.len(), 2, "no extra topics should be subscribed");
     }
 
+    /// `ingestion_ws_events_total` is the field signal that the subscription is
+    /// alive. It was structurally unreachable: production constructed the
+    /// monitor with `metrics: None`, so the counter read 0 whether logs flowed
+    /// or not — and was used as a release gate in exactly that state.
+    #[tokio::test]
+    async fn handle_log_increments_the_ws_event_counter() {
+        let metrics = Arc::new(crate::metrics::Metrics::new().expect("metrics"));
+        let provider = Arc::new(Provider::new(MockProvider::default()));
+        let pair = Address::random();
+        let pool = MonitoredPool {
+            pair,
+            token_in: Address::random(),
+            token_out: Address::random(),
+            fee_bps: 30,
+            stable: false,
+            kind: PoolMonitorKind::UniV2,
+        };
+        let monitor = PoolMonitor::new(
+            provider,
+            None,
+            vec![pool],
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            Some(metrics.clone()),
+        )
+        .expect("monitor should construct");
+
+        let before = metrics.ingestion_ws_events.get();
+        let log = Log {
+            address: pair,
+            ..Default::default()
+        };
+        // The refresh at the end of handle_log has no mocked response and will
+        // error. The counter is incremented before it, which is the point.
+        let _ = monitor.handle_log(log).await;
+
+        assert_eq!(
+            metrics.ingestion_ws_events.get(),
+            before + 1.0,
+            "a delivered log must be observable in metrics"
+        );
+    }
+
     /// A concurrent mark must never be erased by a drain. The previous
     /// collect-then-clear implementation dropped any insert that landed
     /// between the iteration and the `clear()`.

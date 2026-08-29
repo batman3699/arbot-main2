@@ -12793,7 +12793,12 @@ async fn launch_chain_runtime(
                 monitored,
                 Duration::from_millis(poll_ms.max(250)),
                 Duration::from_millis(stale_ms.max(poll_ms)),
-                None,
+                // Was `None`, which made ingestion_ws_events, ingestion_poll_refresh,
+                // ingestion_active_pools and ingestion_stale_pools structurally
+                // unreachable: registered at startup so they appeared in /metrics,
+                // but never incremented. ingestion_ws_events_total therefore read 0
+                // whether the log subscription was healthy or completely dead.
+                metrics.clone(),
             ) {
                 Ok(monitor) => {
                     let monitor = Arc::new(monitor);
