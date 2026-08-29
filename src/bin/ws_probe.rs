@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
                 }
             } => {
                 let n = heads.fetch_add(1, Ordering::SeqCst) + 1;
-                if n <= 3 || n % 10 == 0 {
+                if n <= 3 || n.is_multiple_of(10) {
                     println!("  [head #{n}] block={:?}", b.number);
                 }
             }

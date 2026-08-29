@@ -47,10 +47,7 @@ pub(crate) fn should_warn_silent(events: u64, connected_for: Duration) -> bool {
 pub(crate) fn pool_log_filter(pools: &[MonitoredPool]) -> Filter {
     Filter::new()
         .address(pools.iter().map(|p| p.pair).collect::<Vec<_>>())
-        .topic0(vec![
-            *crate::log_decode::TOPIC_V2_SYNC,
-            *crate::log_decode::TOPIC_V2_SWAP,
-        ])
+        .topic0(crate::log_decode::monitored_topics())
 }
 
 #[allow(dead_code)]
@@ -849,7 +846,23 @@ mod tests {
             topics.contains(&crate::log_decode::TOPIC_V2_SWAP),
             "Swap topic missing from filter: {topics:?}"
         );
-        assert_eq!(topics.len(), 2, "no extra topics should be subscribed");
+        assert_eq!(topics.len(), 4, "both pool families must be covered");
+    }
+
+    /// The monitored set on Base is 23 Solidly pools and zero UniV2 pools, so a
+    /// UniV2-only filter matched nothing at all — indistinguishable from a
+    /// quiet market. Whatever the mix, both families must be subscribed.
+    #[test]
+    fn filter_covers_solidly_pools_not_just_univ2() {
+        let topics = topic0_of(&pool_log_filter(&[monitored(1)]));
+        assert!(
+            topics.contains(&crate::log_decode::TOPIC_SOLIDLY_SYNC),
+            "Solidly Sync(uint256,uint256) missing: {topics:?}"
+        );
+        assert!(
+            topics.contains(&crate::log_decode::TOPIC_SOLIDLY_SWAP),
+            "Solidly Swap missing: {topics:?}"
+        );
     }
 
     /// `ingestion_ws_events_total` is the field signal that the subscription is
