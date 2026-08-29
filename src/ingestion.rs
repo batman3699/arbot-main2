@@ -32,6 +32,31 @@ use crate::{
 /// the constants it depends on were wrong for the life of the process: each
 /// had a correct prefix and a fabricated tail, so the subscription connected
 /// cleanly and delivered nothing.
+/// Pairs worth polling: everything monitored that is not already known bad.
+fn pollable_pairs(pools: &[MonitoredPool], ignored: &HashSet<Address>) -> Vec<Address> {
+    pools
+        .iter()
+        .map(|p| p.pair)
+        .filter(|pair| !ignored.contains(pair))
+        .collect()
+}
+
+/// Pairs the batch did not return, in the original order.
+///
+/// `load_pair_states_batched` simply omits pairs whose sub-calls revert or
+/// return malformed data, so these must fall back to the per-pair path — which
+/// is also what decides whether a pool gets added to the ignore set.
+fn batch_misses(
+    pairs: &[Address],
+    loaded: &std::collections::HashMap<Address, UniV2PairState>,
+) -> Vec<Address> {
+    pairs
+        .iter()
+        .copied()
+        .filter(|pair| !loaded.contains_key(pair))
+        .collect()
+}
+
 /// Grace period before a silent subscription is treated as suspicious.
 const SILENT_SUBSCRIPTION_GRACE: Duration = Duration::from_secs(60);
 
@@ -296,16 +321,76 @@ where
             let guard = self.pools.read().await;
             guard.clone()
         };
+        let ignored = {
+            let guard = self.ignored_pools.read().await;
+            guard.clone()
+        };
+        let pairs = pollable_pairs(&pools, &ignored);
 
-        for pool in pools.iter() {
-            if let Err(err) = self.refresh_pair(pool.pair).await {
-                warn!(
-                    error = %err,
-                    pair = %format!("0x{}", hex::encode(pool.pair)),
-                    "failed to refresh pool during poll"
-                );
+        // One Multicall3 round-trip for the whole set, pinned to one block.
+        //
+        // This loop used to await `refresh_pair` per pool, and each of those
+        // issues THREE sequential `eth_call`s — 69 serial round-trips for 23
+        // pools, measured at 13.8s per cycle against a 3.6s `stale_after`. A
+        // pool was therefore stale ~74% of the time by construction, and
+        // `state_with_block` returns None when stale, so the cache answered
+        // "nothing" for most pools and callers re-quoted over RPC.
+        //
+        // Batching also pins every read to one block; the per-pair path read
+        // each pool at whatever "latest" meant when its call landed, so
+        // reserves within a single refresh could straddle blocks.
+        let started = std::time::Instant::now();
+        let mut batched = 0usize;
+        if !pairs.is_empty() {
+            match self.provider.get_block_number().await {
+                Ok(block) => {
+                    let states = crate::quote_univ2::load_pair_states_batched(
+                        self.provider.clone(),
+                        &pairs,
+                        block,
+                    )
+                    .await;
+                    batched = states.len();
+                    for (pair, state) in states.iter() {
+                        self.cache_state(*pair, state.clone()).await;
+                    }
+
+                    // Pairs the batch dropped still need the per-pair path: it
+                    // is what distinguishes a transient failure from an empty
+                    // pool and maintains the ignore set.
+                    for pair in batch_misses(&pairs, &states) {
+                        if let Err(err) = self.refresh_pair(pair).await {
+                            warn!(
+                                error = %err,
+                                pair = %format!("0x{}", hex::encode(pair)),
+                                "failed to refresh pool during poll"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    // No block number means no pinned batch. Fall back wholesale
+                    // rather than skip the cycle — degraded, not absent.
+                    warn!(error = %err, "block number unavailable; polling pools individually");
+                    for pair in pairs.iter() {
+                        if let Err(err) = self.refresh_pair(*pair).await {
+                            warn!(
+                                error = %err,
+                                pair = %format!("0x{}", hex::encode(pair)),
+                                "failed to refresh pool during poll"
+                            );
+                        }
+                    }
+                }
             }
         }
+        debug!(
+            %reason,
+            pairs = pairs.len(),
+            batched,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "pool monitor poll cycle complete"
+        );
 
         if let Some(metrics) = &self.metrics {
             metrics.ingestion_poll_refresh.inc();
@@ -965,6 +1050,56 @@ mod tests {
             WRITERS * PER_WRITER,
             "a concurrent mark was erased by a drain"
         );
+    }
+
+    /// The poller must skip pools already known bad, or every cycle re-pays
+    /// their cost and `refresh_pair` re-adds them to the ignore set.
+    #[test]
+    fn pollable_pairs_excludes_ignored_pools() {
+        let pools: Vec<MonitoredPool> = (1..=4).map(monitored).collect();
+        let ignored: HashSet<Address> = HashSet::from([Address::from_low_u64_be(2)]);
+        let pairs = pollable_pairs(&pools, &ignored);
+        assert_eq!(pairs.len(), 3);
+        assert!(!pairs.contains(&Address::from_low_u64_be(2)));
+    }
+
+    /// `load_pair_states_batched` omits pairs whose sub-calls revert, so the
+    /// misses must fall back to the per-pair path rather than silently keeping
+    /// stale reserves.
+    #[test]
+    fn batch_misses_are_exactly_the_pairs_the_batch_dropped() {
+        let pairs: Vec<Address> = (1..=4).map(Address::from_low_u64_be).collect();
+        let state = UniV2PairState {
+            token0: Address::from_low_u64_be(90),
+            token1: Address::from_low_u64_be(91),
+            reserve0: U256::from(1u64),
+            reserve1: U256::from(2u64),
+        };
+        let loaded: std::collections::HashMap<Address, UniV2PairState> =
+            [(Address::from_low_u64_be(1), state.clone()),
+             (Address::from_low_u64_be(3), state)]
+                .into_iter()
+                .collect();
+
+        let misses = batch_misses(&pairs, &loaded);
+        assert_eq!(
+            misses,
+            vec![Address::from_low_u64_be(2), Address::from_low_u64_be(4)],
+            "only the dropped pairs fall back, and order is preserved"
+        );
+    }
+
+    #[test]
+    fn a_full_batch_needs_no_per_pair_fallback() {
+        let pairs: Vec<Address> = (1..=2).map(Address::from_low_u64_be).collect();
+        let state = UniV2PairState {
+            token0: Address::from_low_u64_be(90),
+            token1: Address::from_low_u64_be(91),
+            reserve0: U256::from(1u64),
+            reserve1: U256::from(2u64),
+        };
+        let loaded = pairs.iter().map(|p| (*p, state.clone())).collect();
+        assert!(batch_misses(&pairs, &loaded).is_empty());
     }
 
     #[test]
