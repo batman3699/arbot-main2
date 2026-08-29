@@ -58,10 +58,29 @@ async fn connect(url: &str) -> Result<Arc<Provider<Ws>>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let url = args
+    let url_raw = args
         .next()
         .context("usage: ws_probe <wss-url> [shared|dedicated|logs-only]")?;
     let mode = args.next().unwrap_or_else(|| "shared".into());
+
+    // A URL copy-pasted from a wrapped terminal line carries a literal newline,
+    // and `\n` in a URI is "invalid uri character". Strip ALL whitespace, which
+    // rejoins the split halves.
+    //
+    // Deliberately NOT `util::parse_endpoint_list`: that splits on '\n' and
+    // takes the first element, which would silently TRUNCATE a wrapped URL —
+    // connecting with half an API key instead of failing loudly. No legitimate
+    // URL contains whitespace, so removing it is safe and always correct.
+    let url: String = url_raw.split_whitespace().collect();
+    if url != url_raw {
+        eprintln!(
+            "note: stripped whitespace from endpoint ({} -> {} chars); \
+             a wrapped copy-paste was rejoined, not truncated",
+            url_raw.len(),
+            url.len()
+        );
+    }
+    anyhow::ensure!(!url.is_empty(), "endpoint argument was empty");
 
     let f = filter()?;
     println!("mode      : {mode}");
