@@ -156,6 +156,13 @@ decoder, never decode, and sit permanently untrusted — safe by §4.3, but Phas
 would silently deliver a fraction of its coverage with no signal separating that
 from quiet pools. Topic dispatch is simpler and immune to inventory drift.
 
+That specific contamination was fixed on 2026-08-30 (§10), but the argument is
+not weakened by the fix — it is the reason to keep topic dispatch. Inventories
+are rebuilt by scrapers whenever a venue is added, so a verified-clean file is a
+snapshot, not a guarantee. Dispatch that cannot be wrong by construction costs
+nothing; dispatch that depends on a file staying correct has to be re-earned
+after every rebuild.
+
 Functions are `&Log -> Option<Delta>`:
 
 - `decode_v2_sync` — both reserves, exact and complete.
@@ -713,19 +720,32 @@ this guard protects.
 
 - Pancake V3 `Swap` payload layout **still needs confirming** against a live
   Base log before its decoder is written; the two extra trailing fields are
-  asserted from the signature, not yet observed. Only 28 low-activity pools on
-  Base, so none appeared in sampled blocks — widen the window or query a known
-  Pancake pool's history.
+  asserted from the signature, not yet observed. The inventory is now 43 pools,
+  up from 28, and every address is factory-confirmed against `0x0BFbCF9f…` as of
+  2026-08-30 — so unlike before, a pool drawn from that file is certainly a
+  Pancake V3 pool, which the old file could not promise. It is still thin
+  (median hub liquidity ~$51k, four pools above $1M), which is why none appeared
+  in sampled blocks — widen the window, or query the deepest pool's history
+  directly (`0xaaba8e9c…`, ~$119M).
 - ~~Slipstream `Swap` assumed identical to UniV3~~ — **confirmed 2026-08-30**:
   Slipstream pools emit `0xc42079f9` with the same five-word payload. `Mint`/
   `Burn` remain assumed-identical and unverified.
-- **`data/base/aerodrome_slipstream/pools.jsonl` is ~half Solidly V2 pairs**
-  mislabeled as CL (4 of 8 sampled). Tracked as a separate data-correctness
-  task; §3.1's topic dispatch makes Phase 1 robust to it, but it independently
-  costs coverage today — the bot drops 59 of 187 pools per cycle
-  (`candidates=187 probed=128`). The three `aerodrome_slipstream*` inventories
-  are also near-duplicates, and at least two actively-trading CL pools
-  (`0xfcce67a1…`, `0xe36596c7…`) appear in no inventory at all.
+- ~~**`data/base/aerodrome_slipstream/pools.jsonl` is ~half Solidly V2 pairs**
+  mislabeled as CL (4 of 8 sampled)~~ — **fixed 2026-08-30.** Every Base CL
+  inventory is now rebuilt from chain and passes
+  `scripts/data/verify_pool_inventory.py --all base`: each record's `factory()`
+  matches its declared venue, `token0`/`token1` match the pool's own ordering,
+  and `fee` holds tickSpacing for Slipstream venues and the real fee tier for
+  UniV3-style ones. Counts moved accordingly — `aerodrome_slipstream` 187 -> 84,
+  `aerodrome_slipstream_v3` 177 -> 63, `uniswap_v3` 570 -> 513,
+  `pancakeswap_v3` 28 -> 43. **The coverage loss this bullet cited
+  (`candidates=187 probed=128`, 59 dropped per cycle) has not been re-measured
+  since the fix** — re-run shadow mode before assuming it is gone. Still open:
+  the three `aerodrome_slipstream*` inventories remain near-duplicates,
+  `aerodrome_slipstream_gauge` (32 records) is declared as a venue in no
+  `ops/inputs.yaml` entry and so can be quoted by nothing, and at least two
+  actively-trading CL pools (`0xfcce67a1…`, `0xe36596c7…`) appear in no
+  inventory at all.
 - Drift budget for CL balances needs a measured starting value from Phase 1
   reconciliation rather than a guessed constant.
 - **Phase 1 subscribes 683 pools, not ~985.** `hot_univ3_pools` and
@@ -745,11 +765,13 @@ this guard protects.
   is larger than anything Phase 3 saves. Instrument sizing, simulation,
   liquidity and native-price stages before assuming Phase 1 alone gets the scan
   near block cadence.
-- **The websocket covers 23 of ~985 Base pools (2.3%).** `PoolMonitor` watches
-  only constant-product pools; ~962 CL pools (570 univ3, 187+177 slipstream, 28
+- **The websocket covers 23 of ~726 Base pools (3.2%).** `PoolMonitor` watches
+  only constant-product pools; 703 CL pools (513 univ3, 84+63 slipstream, 43
   pancake) have no event subscription at all and enter the dirty set only via
-  the `max_quote_block_lag` sweep. Closing that is the substance of Phase 1, and
-  the pool-count asymmetry is why quoting dominates.
+  the `max_quote_block_lag` sweep. Counts restated 2026-08-30 after the
+  inventory repartition above; the ratio improved only because contaminated
+  records were removed, not because coverage grew. Closing that is the
+  substance of Phase 1, and the pool-count asymmetry is why quoting dominates.
 - `POOL_MONITOR_POLL_MS` (1200) and `POOL_MONITOR_STALE_MS` (defaults to
   `poll x 3` = 3.6s) are inherited defaults, not choices. They were harmless
   while the poller took 13.8s per cycle only because everything was stale
