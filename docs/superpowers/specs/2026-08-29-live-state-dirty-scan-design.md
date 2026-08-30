@@ -767,13 +767,26 @@ this guard protects.
   over a 36-minute run: 8 connects, all at 683 pools, across 7 consecutive
   refreshes. Any future caller that constructs a monitored set from one source
   must still be checked against this.
-- **The state gate produced ZERO verdicts in Phase 1, and that is not a pass.**
-  Nothing calls `StateGate::record()` — the background anchor task is Phase 2's
-  to build. So `trusted()` returns false for every pool (correct fail-closed
-  behaviour) and the shadow runs measured decode correctness only, NOT whether
-  log-derived state agrees with the chain. The §9 Phase 2 gate
-  (per-venue p99 `relative_delta_bps` <= 5) therefore has **no data yet**;
-  wiring the anchor task is the first thing Phase 2 must do.
+- ~~The state gate produced ZERO verdicts in Phase 1~~ — **resolved by Phase 2a.**
+  The background validation task now records verdicts. First measurement,
+  2026-08-30: **every comparison exactly 0 bps** — 16 CL and 3 V2 observations,
+  all in the `le=0` histogram bucket with none below, so zero by value rather
+  than by cancellation. Sample records show bit-exact agreement on `sqrtPriceX96`,
+  `liquidity`, `tick` and both reserves.
+
+  Confirmed genuine rather than self-comparison three ways: each pool is read at
+  ITS OWN block (50647015/16/18 in one pass, which is what block-pinning
+  produces and a shared head could not), values are large and distinct per pool,
+  and `absolute_delta` is computed from two separately-sourced reads.
+
+  **This does NOT clear the §9 Phase 2 gate.** That gate is per-venue p99
+  `relative_delta_bps` <= 5 over >= 24h; the above is a ~1 minute sample of 19
+  observations. It establishes that the decoders are correct, not that they stay
+  correct across reorgs, quiet pools, ladder churn or provider degradation.
+- **Phase 2a validates price and liquidity, NOT depth.** The CL comparison covers
+  `sqrt_price_x96`, `liquidity` and `tick` only. `balance0`/`balance1` are not
+  tracked in Phase 1, so a passing verdict says nothing about whether CL
+  *capacity* is right. Phase 2b must not conflate the two.
 - `loom` as a dev-dependency is a new dep. If declined, the fallback is a
   `std::sync::Barrier` forcing the known interleaving plus the stress test —
   which proves the one race we thought of, not the absence of races.
