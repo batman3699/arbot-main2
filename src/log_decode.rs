@@ -6,7 +6,7 @@
 //! chain, and left the pool monitor subscribed but deaf for the life of the
 //! process. Derivation removes that failure mode entirely.
 
-use ethers::types::{Log, H256, U256};
+use ethers::types::{I256, Log, H256, U256};
 use std::sync::LazyLock;
 
 /// keccak256 of an event signature — the value that appears as `topics[0]`.
@@ -43,6 +43,18 @@ pub static TOPIC_SOLIDLY_SYNC: LazyLock<H256> =
 pub static TOPIC_SOLIDLY_SWAP: LazyLock<H256> =
     LazyLock::new(|| topic_of("Swap(address,address,uint256,uint256,uint256,uint256)"));
 
+/// `Swap(address indexed sender, address indexed recipient, int256 amount0,
+///       int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)`
+///
+/// Uniswap V3 AND Aerodrome Slipstream. Confirmed on Base at block 0x3049142:
+/// six Slipstream pools and one UniV3 pool emitted this same topic in one
+/// block, with an identical five-word payload — so ONE decoder covers both.
+///
+/// PancakeSwap V3 uses a DIFFERENT topic (`0x19b47279…`, two extra trailing
+/// fields) which is not yet verified against a real log, so it is not decoded.
+pub static TOPIC_CL_SWAP: LazyLock<H256> =
+    LazyLock::new(|| topic_of("Swap(address,address,int256,int256,uint160,uint128,int24)"));
+
 /// Every topic the pool monitor subscribes to, across both pool families.
 ///
 /// Kept as one list so a venue cannot be silently omitted from the filter: the
@@ -54,6 +66,7 @@ pub fn monitored_topics() -> Vec<H256> {
         *TOPIC_V2_SWAP,
         *TOPIC_SOLIDLY_SYNC,
         *TOPIC_SOLIDLY_SWAP,
+        *TOPIC_CL_SWAP,
     ]
 }
 
@@ -87,6 +100,55 @@ pub fn decode_v2_sync(log: &Log) -> Option<V2SyncDelta> {
     Some(V2SyncDelta {
         reserve0: U256::from_big_endian(&word(&log.data, 0)?),
         reserve1: U256::from_big_endian(&word(&log.data, 1)?),
+    })
+}
+
+/// Post-swap CL pool state, straight out of the log.
+///
+/// `sqrt_price_x96`, `liquidity` and `tick` are the pool's new `slot0`/
+/// `liquidity()` — no RPC needed. `amount0`/`amount1` are signed pool-balance
+/// deltas, retained for the balance tracking Phase 2 adds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClSwapDelta {
+    pub amount0: I256,
+    pub amount1: I256,
+    pub sqrt_price_x96: U256,
+    pub liquidity: u128,
+    pub tick: i32,
+}
+
+/// Sign-extend a two's-complement ABI word to `i32`.
+///
+/// `int24` arrives sign-extended across all 32 bytes, so reading the low bytes
+/// unsigned turns tick -198238 into a huge positive number and puts the pool on
+/// the wrong side of the curve.
+fn word_to_i32(w: [u8; 32]) -> i32 {
+    let negative = w[0] & 0x80 != 0;
+    let mut v: i64 = 0;
+    for b in &w[28..32] {
+        v = (v << 8) | i64::from(*b);
+    }
+    if negative {
+        v -= 1i64 << 32;
+    }
+    v as i32
+}
+
+pub fn decode_cl_swap(log: &Log) -> Option<ClSwapDelta> {
+    if log.topics.first()? != &*TOPIC_CL_SWAP {
+        return None;
+    }
+    let amount0 = I256::from_raw(U256::from_big_endian(&word(&log.data, 0)?));
+    let amount1 = I256::from_raw(U256::from_big_endian(&word(&log.data, 1)?));
+    let sqrt_price_x96 = U256::from_big_endian(&word(&log.data, 2)?);
+    let liquidity = U256::from_big_endian(&word(&log.data, 3)?).as_u128();
+    let tick = word_to_i32(word(&log.data, 4)?);
+    Some(ClSwapDelta {
+        amount0,
+        amount1,
+        sqrt_price_x96,
+        liquidity,
+        tick,
     })
 }
 
@@ -150,6 +212,61 @@ mod tests {
         let mut log = log_with(*TOPIC_V2_SYNC, words(&[1, 2]));
         log.topics.clear();
         assert!(decode_v2_sync(&log).is_none());
+    }
+
+    #[test]
+    fn cl_swap_topic_matches_the_value_observed_on_chain() {
+        assert_eq!(
+            *TOPIC_CL_SWAP,
+            topic_of("Swap(address,address,int256,int256,uint160,uint128,int24)")
+        );
+        assert_eq!(
+            format!("{:#x}", *TOPIC_CL_SWAP),
+            "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+        );
+    }
+
+    /// Real Base log, block 0x3049142, pool 0x4e392fbfe4d0557c82d2f97f02ec39daa31516dd.
+    /// amount1 and tick are negative, which is the case a naive unsigned read
+    /// gets catastrophically wrong rather than slightly wrong.
+    #[test]
+    fn decodes_a_real_cl_swap_including_negative_values() {
+        let data = hex::decode(concat!(
+            "0000000000000000000000000000000000000000000000000283a6dc44aa9e00",
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffe56d1ffc",
+            "0000000000000000000000000000000000000000000340475901e2898ee7248d",
+            "00000000000000000000000000000000000000000000000001e42289497d0ed7",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffcf9a2",
+        ))
+        .expect("fixture hex");
+        let log = log_with(*TOPIC_CL_SWAP, data);
+        let d = decode_cl_swap(&log).expect("should decode");
+
+        // Values computed from the fixture words, not eyeballed.
+        assert_eq!(d.amount0, I256::from(181_171_875_000_000_000i64));
+        assert!(d.amount1.is_negative(), "amount1 must decode as negative");
+        assert_eq!(d.amount1, I256::from(-445_833_220i64));
+        assert_eq!(d.liquidity, 136_271_861_766_754_007u128);
+        assert_eq!(d.tick, -198_238, "int24 must sign-extend");
+        assert_eq!(
+            d.sqrt_price_x96,
+            U256::from_dec_str("3930325046233202984166541").expect("sqrt price")
+        );
+    }
+
+    #[test]
+    fn cl_swap_refuses_a_foreign_topic() {
+        let log = log_with(*TOPIC_V2_SYNC, vec![0u8; 160]);
+        assert!(decode_cl_swap(&log).is_none());
+    }
+
+    #[test]
+    fn cl_swap_refuses_a_short_payload() {
+        let log = log_with(*TOPIC_CL_SWAP, vec![0u8; 159]);
+        assert!(
+            decode_cl_swap(&log).is_none(),
+            "five words are required; a partial read is worse than no read"
+        );
     }
 
     #[test]
