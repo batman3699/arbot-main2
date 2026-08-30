@@ -769,10 +769,28 @@ this guard protects.
   must still be checked against this.
 - ~~The state gate produced ZERO verdicts in Phase 1~~ — **resolved by Phase 2a.**
   The background validation task now records verdicts. First measurement,
-  2026-08-30: **every comparison exactly 0 bps** — 16 CL and 3 V2 observations,
-  all in the `le=0` histogram bucket with none below, so zero by value rather
-  than by cancellation. Sample records show bit-exact agreement on `sqrtPriceX96`,
-  `liquidity`, `tick` and both reserves.
+  2026-08-30 over 52 checks: **`sqrtPriceX96` and `tick` exact in every single
+  observation**, and all 4 V2 comparisons exact on both reserves. The `Swap` and
+  `Sync` decoders are correct.
+
+  **2 of 48 CL observations diverged on `liquidity` alone** (+8656 and +1314 bps,
+  local always HIGHER), with price and tick still exact. Root-caused, not
+  guessed: in block 0x304cfed the observed `Swap` sat at txIndex 157 and two
+  `Burn`s landed at txIndex 246 — later in the SAME block. A log describes state
+  at a transaction; `eth_call` at that block returns state at the END of the
+  block. `Mint`/`Burn` move liquidity without touching price or tick, which is
+  exactly the signature seen.
+
+  So this is not decoder error but the measured cost of Phase 1 deferring
+  `Mint`/`Burn`: **liquidity derived from `Swap` alone goes stale whenever a
+  position changes**, ~4% of CL observations in a 2-minute window. The gate
+  correctly marks those pools untrusted. **Decoding `Mint`/`Burn` is therefore a
+  hard prerequisite for Phase 2b** — local `liquidity` cannot be priced from
+  until it exists.
+
+  Note this also puts an inherent noise floor under the measurement: it captures
+  decoder error PLUS unmodelled intra-block activity, and the two cannot be
+  separated at block granularity.
 
   Confirmed genuine rather than self-comparison three ways: each pool is read at
   ITS OWN block (50647015/16/18 in one pass, which is what block-pinning
