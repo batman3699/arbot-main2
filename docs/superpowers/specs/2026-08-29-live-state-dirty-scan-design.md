@@ -1,7 +1,7 @@
 # Live pool state and dirty-route scanning
 
 Date: 2026-08-29 (amended 2026-08-30 with the §1.1 measured baseline)
-Status: **Phase 0 complete and merged** (`093c760` on `main`); Phases 1-4 not started
+Status: **Phase 0 merged** (`093c760`); **Phase 1 complete** on `feat/phase1-live-state-shadow`; Phases 2-4 not started
 Branch context: merged to `main`; originally `fix/honest-pricing-and-capacity`
 
 Phase 0 found four faults, not one, each of which alone made the subscription
@@ -60,12 +60,12 @@ Taken from a live run once `SHADOW_MODE=true` lifted the wallet-balance gate
 that had been aborting every scan before `populate` — until then `scan_ms`
 measured only the cost of bailing out, and no full scan had ever executed.
 
-| Stage | Mean | Share |
-|---|---|---|
-| `stage="quote"` | **22,645 ms** | ~67% |
-| `stage="search"` | **5.7 ms** | ~0.017% |
-| unattributed (sizing, sim, liquidity, native price) | ~11,000 ms | ~33% |
-| **full scan** | **~33,700 ms** | |
+| Stage                                               | Mean           | Share   |
+| --------------------------------------------------- | -------------- | ------- |
+| `stage="quote"`                                     | **22,645 ms**  | ~67%    |
+| `stage="search"`                                    | **5.7 ms**     | ~0.017% |
+| unattributed (sizing, sim, liquidity, native price) | ~11,000 ms     | ~33%    |
+| **full scan**                                       | **~33,700 ms** |         |
 
 For scale: Base flashblocks are 200ms and blocks are 2s, so a scan completes
 against state roughly **17 blocks stale**.
@@ -90,10 +90,10 @@ magnitude, far outside anything sample size explains.
 `TOPIC_SYNC` and `TOPIC_SWAP` in `ingestion.rs:29-37` are both wrong. Each has a
 correct prefix and a fabricated tail.
 
-| Constant | In code | Logs on Base | Correct value | Logs on Base |
-|---|---|---|---|---|
-| `TOPIC_SYNC` | `0x1c4168cd…f805` | 0 | `0x1c411e9a…bad1` | 6 in one block |
-| `TOPIC_SWAP` | `0xd78ad95f…5c01` | 0 | `0xd78ad95f…d822` | 2 in one block |
+| Constant     | In code           | Logs on Base | Correct value     | Logs on Base   |
+| ------------ | ----------------- | ------------ | ----------------- | -------------- |
+| `TOPIC_SYNC` | `0x1c4168cd…f805` | 0            | `0x1c411e9a…bad1` | 6 in one block |
+| `TOPIC_SWAP` | `0xd78ad95f…5c01` | 0            | `0xd78ad95f…d822` | 2 in one block |
 
 Verified two ways: `cast keccak` of each event signature, and `eth_getLogs`
 against live Base at blocks `0x303afcb` / `0x303afd2`. No test covers either
@@ -183,14 +183,14 @@ replacement is wanted later; it is not required for this phase.
 
 Each snapshot carries:
 
-| Field | Purpose |
-|---|---|
-| `state_version: u64` | monotonic per pool, bumped on every accepted update |
-| `anchor_id: u64` | identity of the RPC anchor this lineage descends from |
-| `continuity_epoch: u64` | global epoch at time of application |
-| `trust: TrustState` | see §4.3 |
-| `drift_events: u32` | balance-affecting events since anchor (CL only) |
-| `ordinal: Ordinal` | cursor position of the log that produced it |
+| Field                   | Purpose                                               |
+| ----------------------- | ----------------------------------------------------- |
+| `state_version: u64`    | monotonic per pool, bumped on every accepted update   |
+| `anchor_id: u64`        | identity of the RPC anchor this lineage descends from |
+| `continuity_epoch: u64` | global epoch at time of application                   |
+| `trust: TrustState`     | see §4.3                                              |
+| `drift_events: u32`     | balance-affecting events since anchor (CL only)       |
+| `ordinal: Ordinal`      | cursor position of the log that produced it           |
 
 `ClSnapshot` additionally holds the `TickLadder`, and tracks `balance0`/
 `balance1` as running deltas — these are not present in any log, and
@@ -324,13 +324,13 @@ condition from one whose state merely aged out, it carries a magnitude worth
 retaining for diagnosis, and it warrants a forced re-anchor and a warn where
 ageing does not.
 
-| State | Hot search | Fallback |
-|---|---|---|
-| `Anchored` | local price | — |
-| `Derived` | local price | — |
-| `Stale(_)` | **excluded** | RPC quote in `populate` |
+| State          | Hot search   | Fallback                          |
+| -------------- | ------------ | --------------------------------- |
+| `Anchored`     | local price  | —                                 |
+| `Derived`      | local price  | —                                 |
+| `Stale(_)`     | **excluded** | RPC quote in `populate`           |
 | `Diverged{..}` | **excluded** | RPC quote, forced re-anchor, warn |
-| `Unknown(_)` | **excluded** | RPC quote |
+| `Unknown(_)`   | **excluded** | RPC quote                         |
 
 Every non-trusted state falls back to the existing RPC path. **The worst case is
 today's behaviour, not a missing edge.** `Stale` is explicitly not a flavour of
@@ -390,13 +390,13 @@ continuity.
 
 Acceptance:
 
-| Comparison | Outcome |
-|---|---|
-| strictly greater | accept |
-| equal | duplicate — ignore, fully idempotent, no version bump |
-| less | out-of-order — continuity failure |
-| index gap / bad reset | continuity failure |
-| `log.removed == true` | continuity failure (reorg / dropped preconf) |
+| Comparison            | Outcome                                               |
+| --------------------- | ----------------------------------------------------- |
+| strictly greater      | accept                                                |
+| equal                 | duplicate — ignore, fully idempotent, no version bump |
+| less                  | out-of-order — continuity failure                     |
+| index gap / bad reset | continuity failure                                    |
+| `log.removed == true` | continuity failure (reorg / dropped preconf)          |
 
 **Continuity failure response.** Marking every pool `Unknown` must not mean
 re-anchoring every pool inline; that would destroy the latency objective. The
@@ -519,16 +519,16 @@ Forgetting the gate becomes a compile error rather than a missing test.
 
 ## 7. Failure modes
 
-| Failure | Detection | Response |
-|---|---|---|
-| Missed log / dropped flashblock | cursor gap, envelope reconciliation | epoch bump, RPC path, background re-anchor |
-| Replayed log | cursor equal-or-less | ignored; version, state and dirty set unchanged |
-| Reorg / dropped preconf | `removed == true` | continuity path |
-| Balance delta drift | drift budget, gate divergence | `Stale(DriftBudgetExhausted)`, anchor |
-| Decoder bug on one venue | divergence clustered by venue | `Diverged`, RPC fallback, warn |
-| WS dies | `ws_connected` | pools age to `Stale`, RPC path carries |
-| Gate cannot reach RPC | `record(None)` | no verdict written; TTL ages pool to `Stale` |
-| Snapshot generation churn | retry exhaustion | scan proceeds on RPC path |
+| Failure                         | Detection                           | Response                                        |
+| ------------------------------- | ----------------------------------- | ----------------------------------------------- |
+| Missed log / dropped flashblock | cursor gap, envelope reconciliation | epoch bump, RPC path, background re-anchor      |
+| Replayed log                    | cursor equal-or-less                | ignored; version, state and dirty set unchanged |
+| Reorg / dropped preconf         | `removed == true`                   | continuity path                                 |
+| Balance delta drift             | drift budget, gate divergence       | `Stale(DriftBudgetExhausted)`, anchor           |
+| Decoder bug on one venue        | divergence clustered by venue       | `Diverged`, RPC fallback, warn                  |
+| WS dies                         | `ws_connected`                      | pools age to `Stale`, RPC path carries          |
+| Gate cannot reach RPC           | `record(None)`                      | no verdict written; TTL ages pool to `Stale`    |
+| Snapshot generation churn       | retry exhaustion                    | scan proceeds on RPC path                       |
 
 Every response degrades toward the current RPC system. No failure produces a
 missing edge or a silently stale price.
@@ -611,13 +611,13 @@ which is the failure this criterion exists to catch.
 
 ## 9. Rollout
 
-| Phase | Flag | Gate to advance |
-|---|---|---|
-| 0 · topic fix + §2.1 defects | none | `ingestion_ws_events` > 0 on Base |
-| 1 · decode + state, shadow | `ARBOT_LIVE_STATE_SHADOW` | per-venue p99 `relative_delta_bps` ≤ 5, over ≥ 24 h continuous |
-| 2 · local pricing, per pool | `ARBOT_LIVE_STATE` | ≥ 90 % of quoting pools `Anchored`/`Derived`; no venue-clustered `Diverged` |
-| 3 · bound search by dirty | `ARBOT_DIRTY_SCAN` | §8 I5 satisfied over ≥ 24 h continuous |
-| 4 · flashblock cursor | — | cursor reconciles against `newFlashblocks` with zero unexplained breaks over ≥ 24 h |
+| Phase                        | Flag                      | Gate to advance                                                                     |
+| ---------------------------- | ------------------------- | ----------------------------------------------------------------------------------- |
+| 0 · topic fix + §2.1 defects | none                      | `ingestion_ws_events` > 0 on Base                                                   |
+| 1 · decode + state, shadow   | `ARBOT_LIVE_STATE_SHADOW` | per-venue p99 `relative_delta_bps` ≤ 5, over ≥ 24 h continuous                      |
+| 2 · local pricing, per pool  | `ARBOT_LIVE_STATE`        | ≥ 90 % of quoting pools `Anchored`/`Derived`; no venue-clustered `Diverged`         |
+| 3 · bound search by dirty    | `ARBOT_DIRTY_SCAN`        | §8 I5 satisfied over ≥ 24 h continuous                                              |
+| 4 · flashblock cursor        | —                         | cursor reconciles against `newFlashblocks` with zero unexplained breaks over ≥ 24 h |
 
 Thresholds are proposed defaults, tunable by the operator. The 5 bps figure
 matches `ARBOT_CL_PARITY_MAX_ERR_BPS` deliberately, so the state gate and the
@@ -662,17 +662,17 @@ than a rework.
 Emitted per pool per check, so divergence can be attributed rather than merely
 observed:
 
-| Field | Purpose |
-|---|---|
-| `local_state` | log-derived snapshot |
-| `rpc_state` | fresh anchor read |
-| `absolute_delta` | raw difference |
-| `relative_delta_bps` | normalised, comparable across pools |
-| `local_state_version` | which update produced it |
-| `anchor_id` | which lineage it descends from |
-| `continuity_epoch` | whether a break intervened |
-| `trust_state` | what policy applied at the time |
-| `venue` | for clustering |
+| Field                 | Purpose                             |
+| --------------------- | ----------------------------------- |
+| `local_state`         | log-derived snapshot                |
+| `rpc_state`           | fresh anchor read                   |
+| `absolute_delta`      | raw difference                      |
+| `relative_delta_bps`  | normalised, comparable across pools |
+| `local_state_version` | which update produced it            |
+| `anchor_id`           | which lineage it descends from      |
+| `continuity_epoch`    | whether a break intervened          |
+| `trust_state`         | what policy applied at the time     |
+| `venue`               | for clustering                      |
 
 Attribution: a decoder bug clusters by venue; a missed event shows a version gap;
 an anchoring issue shows a stale `anchor_id`; an RPC/state timing artefact shows
@@ -728,6 +728,16 @@ this guard protects.
   (`0xfcce67a1…`, `0xe36596c7…`) appear in no inventory at all.
 - Drift budget for CL balances needs a measured starting value from Phase 1
   reconciliation rather than a guessed constant.
+- **Phase 1 subscribes 683 pools, not ~985.** `hot_univ3_pools` and
+  `hot_slipstream_pools` hold the ranked HOT subset, not the full inventories,
+  so the cold tail still has no event source. Coverage went from 2.3% to ~70%,
+  not to complete. Do not read Phase 1 as "CL is covered".
+- **A rebuilt pool list can silently drop sticky pools.** Observed live: the
+  subscription connected with 683 pools and reverted to 23 after five minutes,
+  because the univ2 hot-pool refresh calls `set_pools` with a set rebuilt from
+  scratch. Fixed structurally (`PoolMonitor::with_sticky_pools`), but any future
+  caller that constructs a monitored set from one source must be checked against
+  this.
 - `loom` as a dev-dependency is a new dep. If declined, the fallback is a
   `std::sync::Barrier` forcing the known interleaving plus the stress test —
   which proves the one race we thought of, not the absence of races.
