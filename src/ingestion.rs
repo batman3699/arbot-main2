@@ -130,6 +130,9 @@ where
     /// which erased any insert landing between the two — a permanent loss, not
     /// a delay. Never held across an `.await`.
     touched_pools: Arc<StdMutex<HashSet<Address>>>,
+    /// Shadow-mode live state. `None` disables it entirely. Nothing downstream
+    /// READS this store in Phase 1 — it is written and measured only.
+    live_state: Option<Arc<crate::live_state::LiveState>>,
 }
 
 impl<C> PoolMonitor<C>
@@ -162,7 +165,17 @@ where
             ws_warned: Arc::new(AtomicBool::new(false)),
             pool_updates: Arc::new(Notify::new()),
             touched_pools: Arc::new(StdMutex::new(HashSet::new())),
+            live_state: None,
         })
+    }
+
+    /// Attach a shadow-mode live-state store.
+    ///
+    /// Phase 1 only: logs are decoded and applied so divergence can be
+    /// measured, but no pricing path reads the result.
+    pub fn with_live_state(mut self, live: Arc<crate::live_state::LiveState>) -> Self {
+        self.live_state = Some(live);
+        self
     }
 
     pub fn mark_touched(&self, pool: Address) {
@@ -285,6 +298,28 @@ where
             metrics.ingestion_ws_events.inc();
         }
         self.mark_touched(pair);
+
+        if let Some(live) = &self.live_state {
+            use crate::live_state::ApplyOutcome;
+            match live.apply_log(&log) {
+                ApplyOutcome::Applied { .. } => {
+                    if let Some(m) = &self.metrics {
+                        m.live_state_applied.inc();
+                    }
+                }
+                ApplyOutcome::Undecodable => {
+                    if let Some(m) = &self.metrics {
+                        m.live_state_undecodable.inc();
+                    }
+                }
+                ApplyOutcome::ContinuityBroken(_) => {
+                    if let Some(m) = &self.metrics {
+                        m.continuity_breaks.inc();
+                    }
+                }
+                ApplyOutcome::Duplicate => {}
+            }
+        }
 
         let block_number = log.block_number;
         if let Some(mut entry) = self.cache.get_mut(&pair) {

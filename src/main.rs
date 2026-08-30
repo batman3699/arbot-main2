@@ -12820,6 +12820,19 @@ async fn launch_chain_runtime(
                 metrics.clone(),
             ) {
                 Ok(monitor) => {
+                    // Phase 1 shadow: decode logs into live state and measure
+                    // it. Nothing reads this store for pricing — that is
+                    // Phase 2, gated on the divergence this run produces.
+                    let monitor = if crate::util::env_flag("ARBOT_LIVE_STATE_SHADOW", false) {
+                        let live = Arc::new(crate::live_state::LiveState::new());
+                        info!(
+                            "live-state shadow mode enabled; state is recorded and measured, \
+                             never priced"
+                        );
+                        monitor.with_live_state(live)
+                    } else {
+                        monitor
+                    };
                     let monitor = Arc::new(monitor);
                     monitor.clone().spawn();
                     Some(monitor)

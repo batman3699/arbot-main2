@@ -29,6 +29,15 @@ pub struct Metrics {
     pub execution_latency_ms: Histogram,
     pub win_rate: Gauge,
     pub ingestion_ws_events: Counter,
+    /// Logs decoded and applied to live pool state (shadow mode).
+    pub live_state_applied: Counter,
+    /// Logs delivered that no known topic decoder handles. A large value means
+    /// a venue is emitting something we do not understand — most likely
+    /// PancakeSwap V3, which is deliberately not decoded.
+    pub live_state_undecodable: Counter,
+    /// Reorgs and out-of-order logs. Frequent breaks invalidate the
+    /// lossless-dirty-set argument.
+    pub continuity_breaks: Counter,
     pub ingestion_poll_refresh: Counter,
     pub ingestion_stale_pools: Gauge,
     pub ingestion_active_pools: Gauge,
@@ -165,6 +174,30 @@ impl Metrics {
         registry
             .register(Box::new(ingestion_ws_events.clone()))
             .context("register ingestion_ws_events_total counter")?;
+
+        let live_state_applied = Counter::with_opts(Opts::new(
+            "live_state_applied_total",
+            "Logs decoded and applied to live pool state",
+        ))?;
+        registry
+            .register(Box::new(live_state_applied.clone()))
+            .context("register live_state_applied_total counter")?;
+
+        let live_state_undecodable = Counter::with_opts(Opts::new(
+            "live_state_undecodable_total",
+            "Logs delivered but not decodable by any known topic",
+        ))?;
+        registry
+            .register(Box::new(live_state_undecodable.clone()))
+            .context("register live_state_undecodable_total counter")?;
+
+        let continuity_breaks = Counter::with_opts(Opts::new(
+            "continuity_breaks_total",
+            "Continuity breaks (reorg or out-of-order log)",
+        ))?;
+        registry
+            .register(Box::new(continuity_breaks.clone()))
+            .context("register continuity_breaks_total counter")?;
 
         let ingestion_poll_refresh = Counter::with_opts(Opts::new(
             "ingestion_poll_refresh_total",
@@ -531,6 +564,9 @@ impl Metrics {
             execution_latency_ms,
             win_rate,
             ingestion_ws_events,
+            live_state_applied,
+            live_state_undecodable,
+            continuity_breaks,
             ingestion_poll_refresh,
             ingestion_stale_pools,
             ingestion_active_pools,
@@ -792,6 +828,17 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn shadow_metrics_are_registered_and_start_at_zero() {
+        let m = Metrics::new().expect("metrics");
+        assert_eq!(m.live_state_applied.get(), 0.0);
+        assert_eq!(m.live_state_undecodable.get(), 0.0);
+        assert_eq!(m.continuity_breaks.get(), 0.0);
+        m.live_state_applied.inc();
+        assert_eq!(m.live_state_applied.get(), 1.0);
+    }
+
     use super::*;
 
     // Registration smoke test: every counter/gauge/histogram (including the new
