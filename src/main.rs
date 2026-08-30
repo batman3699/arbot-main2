@@ -12782,7 +12782,7 @@ async fn launch_chain_runtime(
             .unwrap_or_else(|| poll_ms.saturating_mul(3));
         let pools = hot_univ2_pools.read().await.clone();
         let solidly_pools = solidly_monitored_pools(&cfg.env_prefix);
-        let mut monitored = venues::merge_monitored_pools(
+        let monitored = venues::merge_monitored_pools(
             monitored_pools_from_configs(&pools),
             solidly_pools,
         );
@@ -12790,9 +12790,14 @@ async fn launch_chain_runtime(
         // CL pools are subscribed for logs but never polled. Without them the
         // Swap decoder never sees a log: the subscription carried 23 of ~985
         // Base pools, so 97.7% of the graph had no event source at all.
+        //
+        // Passed as STICKY rather than merged here: the univ2 hot-pool refresh
+        // calls set_pools with a set rebuilt from scratch, which dropped these
+        // and silently reverted the subscription to 23 pools after 5 minutes.
+        let mut cl_pools: Vec<MonitoredPool> = Vec::new();
         for records in [&hot_univ3_pools, &hot_slipstream_pools] {
             for r in records.read().await.iter() {
-                monitored.push(MonitoredPool {
+                cl_pools.push(MonitoredPool {
                     pair: r.pool,
                     token_in: r.token0,
                     token_out: r.token1,
@@ -12820,6 +12825,7 @@ async fn launch_chain_runtime(
                 metrics.clone(),
             ) {
                 Ok(monitor) => {
+                    let monitor = monitor.with_sticky_pools(cl_pools);
                     // Phase 1 shadow: decode logs into live state and measure
                     // it. Nothing reads this store for pricing — that is
                     // Phase 2, gated on the divergence this run produces.

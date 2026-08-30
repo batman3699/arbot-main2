@@ -133,6 +133,13 @@ where
     /// Shadow-mode live state. `None` disables it entirely. Nothing downstream
     /// READS this store in Phase 1 — it is written and measured only.
     live_state: Option<Arc<crate::live_state::LiveState>>,
+    /// Pools that survive every `set_pools`.
+    ///
+    /// The univ2 hot-pool refresh rebuilds the monitored set from scratch and
+    /// knows nothing about CL pools, so without this the subscription silently
+    /// reverted from 683 pools to 23 five minutes after startup. Holding them
+    /// here makes it impossible for a caller to forget.
+    sticky_pools: Vec<MonitoredPool>,
 }
 
 impl<C> PoolMonitor<C>
@@ -166,7 +173,26 @@ where
             pool_updates: Arc::new(Notify::new()),
             touched_pools: Arc::new(StdMutex::new(HashSet::new())),
             live_state: None,
+            sticky_pools: Vec::new(),
         })
+    }
+
+    /// Pools that must persist across every `set_pools` call.
+    ///
+    /// Merged into the live set immediately as well, so they are subscribed
+    /// from the first connection rather than only after the first refresh.
+    pub fn with_sticky_pools(mut self, sticky: Vec<MonitoredPool>) -> Self {
+        if let Some(pools) = Arc::get_mut(&mut self.pools) {
+            let live = pools.get_mut();
+            let known: HashSet<Address> = live.iter().map(|p| p.pair).collect();
+            for p in &sticky {
+                if !known.contains(&p.pair) {
+                    live.push(p.clone());
+                }
+            }
+        }
+        self.sticky_pools = sticky;
+        self
     }
 
     /// Attach a shadow-mode live-state store.
@@ -215,6 +241,15 @@ where
     pub async fn set_pools(&self, pools: Vec<MonitoredPool>) {
         if pools.is_empty() {
             warn!("pool monitor received empty pool list; disabling monitoring until refreshed");
+        }
+        let mut pools = pools;
+        // Re-append sticky pools: callers rebuild the set from a source that
+        // does not know about them.
+        let known: HashSet<Address> = pools.iter().map(|p| p.pair).collect();
+        for p in &self.sticky_pools {
+            if !known.contains(&p.pair) {
+                pools.push(p.clone());
+            }
         }
         let mut guard = self.pools.write().await;
         *guard = pools;
@@ -984,6 +1019,43 @@ mod tests {
     /// The monitored set on Base is 23 Solidly pools and zero UniV2 pools, so a
     /// UniV2-only filter matched nothing at all — indistinguishable from a
     /// quiet market. Whatever the mix, both families must be subscribed.
+    /// The univ2 hot-pool refresh calls `set_pools` with a set it rebuilds from
+    /// scratch, which does not know about CL pools. Without sticky pools the
+    /// subscription silently reverts from 683 pools to 23 after five minutes —
+    /// observed live before this was fixed.
+    #[tokio::test]
+    async fn set_pools_preserves_sticky_cl_pools() {
+        let provider = Arc::new(Provider::new(MockProvider::default()));
+        let monitor = PoolMonitor::new(
+            provider,
+            None,
+            vec![monitored(1)],
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            None,
+        )
+        .expect("monitor")
+        .with_sticky_pools(vec![cl_monitored(99)]);
+
+        // Sticky pools must be present immediately, not only after a refresh.
+        let before = pool_log_filter(&monitor.pools.read().await.clone());
+        assert!(addresses_of(&before).contains(&Address::from_low_u64_be(99)));
+
+        // A refresh that knows nothing about CL pools must not drop them.
+        monitor.set_pools(vec![monitored(2), monitored(3)]).await;
+        let after = monitor.pools.read().await.clone();
+        let addrs = addresses_of(&pool_log_filter(&after));
+        assert!(
+            addrs.contains(&Address::from_low_u64_be(99)),
+            "sticky CL pool dropped by set_pools: {addrs:?}"
+        );
+        assert!(addrs.contains(&Address::from_low_u64_be(2)));
+        assert!(
+            !addrs.contains(&Address::from_low_u64_be(1)),
+            "non-sticky pools are still replaced"
+        );
+    }
+
     fn cl_monitored(n: u64) -> MonitoredPool {
         MonitoredPool {
             pair: Address::from_low_u64_be(n),
