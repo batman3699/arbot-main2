@@ -33,5 +33,6 @@ pub mod quote_slipstream;
 pub mod quote_univ3;
 pub mod quote_univ4;
 pub mod registry;
+pub mod state_gate;
 pub mod util;
 pub mod venues;

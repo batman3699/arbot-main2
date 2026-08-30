@@ -1,0 +1,263 @@
+//! Per-pool trust gate for LOG-DERIVED STATE.
+//!
+//! Distinct from `cl_parity_gate`, which validates the multi-tick MATH against
+//! the pool's own quoter given fresh state. This validates the STATE itself:
+//! log-derived snapshot versus a fresh RPC read. Different causes, different
+//! fixes, different TTLs — so a single verdict could not tell you which tripped.
+//!
+//! Fails CLOSED: a pool with no verdict is not trusted.
+
+use ethers::types::{Address, U256};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug)]
+struct Verdict {
+    /// Retained for diagnosis: when a pool is rejected the operator needs the
+    /// magnitude, not just the verdict.
+    #[allow(dead_code)]
+    err_bps: i64,
+    trusted: bool,
+    checked_at: Instant,
+}
+
+pub struct StateGate {
+    verdicts: Mutex<HashMap<Address, Verdict>>,
+    ttl: Duration,
+    max_err_bps: i64,
+    checks_per_scan: usize,
+}
+
+/// Process-wide gate, keyed by pool address (chain-unique).
+#[allow(dead_code)]
+pub fn gate() -> &'static StateGate {
+    static GATE: OnceLock<StateGate> = OnceLock::new();
+    GATE.get_or_init(StateGate::from_env)
+}
+
+#[allow(dead_code)]
+impl StateGate {
+    pub fn from_env() -> Self {
+        Self {
+            ttl: Duration::from_secs(
+                crate::util::env_parse_opt::<u64>("ARBOT_STATE_GATE_TTL_SECS")
+                    .unwrap_or(300)
+                    .max(30),
+            ),
+            // Matches ARBOT_CL_PARITY_MAX_ERR_BPS so the two gates cannot
+            // disagree about what "passing" means.
+            max_err_bps: i64::from(
+                crate::util::env_parse_opt::<u32>("ARBOT_STATE_GATE_MAX_ERR_BPS").unwrap_or(5),
+            ),
+            checks_per_scan: crate::util::env_parse_opt::<usize>(
+                "ARBOT_STATE_GATE_CHECKS_PER_SCAN",
+            )
+            .unwrap_or(8)
+            .clamp(1, 64),
+            verdicts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn for_test(max_err_bps: i64, ttl_secs: u64, checks_per_scan: usize) -> Self {
+        Self {
+            verdicts: Mutex::new(HashMap::new()),
+            ttl: Duration::from_secs(ttl_secs),
+            max_err_bps,
+            checks_per_scan,
+        }
+    }
+
+    /// May this pool's log-derived state be trusted? Unknown or expired
+    /// verdicts are NOT trusted.
+    pub fn trusted(&self, pool: Address) -> bool {
+        let Ok(guard) = self.verdicts.lock() else {
+            return false;
+        };
+        match guard.get(&pool) {
+            Some(v) => v.trusted && v.checked_at.elapsed() < self.ttl,
+            None => false,
+        }
+    }
+
+    fn needs_check(&self, pool: Address) -> bool {
+        let Ok(guard) = self.verdicts.lock() else {
+            return false;
+        };
+        match guard.get(&pool) {
+            Some(v) => v.checked_at.elapsed() >= self.ttl,
+            None => true,
+        }
+    }
+
+    /// `None` means the read failed. That is NOT evidence of correctness, so
+    /// nothing is stored and the pool stays untrusted until a real measurement.
+    pub fn record(&self, pool: Address, err_bps: Option<i64>) {
+        let Some(err_bps) = err_bps else {
+            return;
+        };
+        let trusted = err_bps.abs() <= self.max_err_bps;
+        if let Ok(mut guard) = self.verdicts.lock() {
+            guard.insert(
+                pool,
+                Verdict { trusted, checked_at: Instant::now(), err_bps },
+            );
+        }
+        if !trusted {
+            tracing::warn!(
+                pool = %format!("{pool:#x}"),
+                err_bps,
+                max_err_bps = self.max_err_bps,
+                "log-derived state disagrees with a fresh RPC read"
+            );
+        }
+    }
+
+    /// Pools due for a check, capped at `checks_per_scan`.
+    ///
+    /// Validation competes for the same RPC budget as quoting, so it drips
+    /// rather than stampedes.
+    pub fn due_for_check(&self, pools: impl IntoIterator<Item = Address>) -> Vec<Address> {
+        let mut out = Vec::new();
+        for pool in pools {
+            if out.len() >= self.checks_per_scan {
+                break;
+            }
+            if self.needs_check(pool) {
+                out.push(pool);
+            }
+        }
+        out
+    }
+
+    /// (trusted, rejected, total tracked).
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let Ok(guard) = self.verdicts.lock() else {
+            return (0, 0, 0);
+        };
+        let total = guard.len();
+        let trusted = guard
+            .values()
+            .filter(|v| v.trusted && v.checked_at.elapsed() < self.ttl)
+            .count();
+        (trusted, total.saturating_sub(trusted), total)
+    }
+}
+
+/// Divergence of `local` from `on_chain` in bps, signed.
+///
+/// `None` when the ratio is not representable — precisely the catastrophic
+/// case (a units error orders of magnitude out), so it must never read as
+/// agreement. Callers record `None` as "no measurement".
+#[allow(dead_code)]
+pub fn divergence_bps(local: U256, on_chain: U256) -> Option<i64> {
+    if on_chain.is_zero() {
+        return None;
+    }
+    let (diff, sign) = if local >= on_chain {
+        (local - on_chain, 1i64)
+    } else {
+        (on_chain - local, -1i64)
+    };
+    let scaled = diff.checked_mul(U256::from(10_000u64))?;
+    let bps = scaled / on_chain;
+    if bps > U256::from(u64::MAX) {
+        return None;
+    }
+    i64::try_from(bps.as_u128()).ok().map(|v| v * sign)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ethers::types::Address;
+
+    fn addr(n: u64) -> Address {
+        Address::from_low_u64_be(n)
+    }
+
+    fn gate(max_err_bps: i64, ttl_secs: u64) -> StateGate {
+        StateGate::for_test(max_err_bps, ttl_secs, 8)
+    }
+
+    #[test]
+    fn an_unmeasured_pool_is_not_trusted() {
+        let g = gate(5, 300);
+        assert!(
+            !g.trusted(addr(1)),
+            "trusting the unmeasured is the failure this exists to prevent"
+        );
+    }
+
+    #[test]
+    fn a_passing_measurement_grants_trust() {
+        let g = gate(5, 300);
+        g.record(addr(1), Some(3));
+        assert!(g.trusted(addr(1)));
+    }
+
+    #[test]
+    fn a_failing_measurement_withholds_trust() {
+        let g = gate(5, 300);
+        g.record(addr(1), Some(4_000));
+        assert!(!g.trusted(addr(1)));
+    }
+
+    #[test]
+    fn under_reporting_fails_too() {
+        let g = gate(5, 300);
+        g.record(addr(1), Some(-4_000));
+        assert!(!g.trusted(addr(1)));
+    }
+
+    /// A failed RPC is NOT evidence of correctness. It must write no verdict,
+    /// leaving the TTL to age the pool out on its own — failure downgrades
+    /// trust, it never stalls the searcher.
+    #[test]
+    fn an_unreachable_rpc_is_not_evidence() {
+        let g = gate(5, 300);
+        g.record(addr(1), None);
+        assert!(!g.trusted(addr(1)));
+        assert!(g.due_for_check([addr(1)]).contains(&addr(1)));
+    }
+
+    #[test]
+    fn trust_expires_with_the_ttl() {
+        let g = gate(5, 0);
+        g.record(addr(1), Some(0));
+        assert!(!g.trusted(addr(1)), "a verdict is evidence with a shelf life");
+    }
+
+    #[test]
+    fn due_for_check_is_bounded_and_skips_fresh_pools() {
+        let g = gate(5, 300);
+        g.record(addr(1), Some(0));
+        let due = g.due_for_check((1..=20).map(addr));
+        assert_eq!(due.len(), 8, "must respect checks_per_scan");
+        assert!(!due.contains(&addr(1)));
+    }
+
+    #[test]
+    fn divergence_is_signed_and_symmetric() {
+        assert_eq!(
+            divergence_bps(U256::from(101u64), U256::from(100u64)),
+            Some(100)
+        );
+        assert_eq!(
+            divergence_bps(U256::from(99u64), U256::from(100u64)),
+            Some(-100)
+        );
+        assert_eq!(
+            divergence_bps(U256::from(100u64), U256::from(100u64)),
+            Some(0)
+        );
+    }
+
+    /// A zero reference is exactly the catastrophic case, so it must decline
+    /// rather than be silently treated as agreement.
+    #[test]
+    fn divergence_declines_on_a_zero_reference() {
+        assert_eq!(divergence_bps(U256::from(1u64), U256::zero()), None);
+    }
+}
