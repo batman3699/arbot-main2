@@ -196,13 +196,48 @@ Each snapshot carries:
 | `anchor_id: u64`        | identity of the RPC anchor this lineage descends from |
 | `continuity_epoch: u64` | global epoch at time of application                   |
 | `trust: TrustState`     | see §4.3                                              |
-| `drift_events: u32`     | balance-affecting events since anchor (CL only)       |
+| `drift_events: u32`     | see §3.2.1 — capacity is RPC-anchored, not delta-tracked |
 | `ordinal: Ordinal`      | cursor position of the log that produced it           |
 
-`ClSnapshot` additionally holds the `TickLadder`, and tracks `balance0`/
-`balance1` as running deltas — these are not present in any log, and
-`cl_sim.rs:35-49` documents them as the only sound capacity source, so the
-drift budget in §4.3 exists specifically to bound their error.
+`ClSnapshot` additionally holds the `TickLadder`.
+
+### 3.2.1 Pricing state and capacity state are separate, and only one is log-derivable
+
+**Amended 2026-08-31.** An earlier draft had `ClSnapshot` track `balance0`/
+`balance1` as running deltas from `Swap`/`Mint`/`Burn`. That is unsound and the
+design is withdrawn.
+
+| Concern | Fields | Source |
+|---|---|---|
+| **Pricing state** | `sqrt_price_x96`, `tick`, `liquidity`, tick liquidity-net | log-derived; `Swap` + `Mint` + `Burn` are sufficient |
+| **Capacity state** | `balance0`, `balance1` | **RPC-anchored only**; NOT log-derivable |
+
+Why balances cannot be maintained from logs:
+
+- `Collect` (`0x70935338…`), `CollectProtocol` (`0x596b5739…`) and `Flash`
+  (`0xbdbdb71d…`) all move token balances and appear in none of
+  `Swap`/`Mint`/`Burn`. `Collect` is not rare — it was observed twice in block
+  `0x304cfed` on `0x200681425b…`, immediately following the `Burn`s.
+- Worse, a **direct ERC-20 transfer to the pool emits no pool event at all**. A
+  donation or an errant transfer changes `balanceOf` with zero pool-side logs.
+  No decoder set closes this: adding the three events above narrows the gap but
+  leaves a hole that is undetectable by construction.
+
+So the rule is not "decode more events". It is:
+
+> **Balances are read over RPC on the anchor path, carry their own TTL, and a
+> pool whose balance anchor is stale is CAPACITY-untrusted — it may still be
+> priced, but its size must come from the RPC quote path.**
+
+This is simpler than delta-tracking six event types and strictly safer, because
+it removes an undetectable failure mode instead of adding decoders that cannot
+close it. It also matches `cl_sim.rs:35-49`, which already documents balances as
+the only sound capacity source and requires callers to fail closed on `None`.
+
+**Why this separation matters:** a route can carry an accurate price and an
+inaccurate maximum executable size. In arbitrage that turns an apparently
+profitable trade into a revert — gas spent, no fill. Price being right is not
+evidence that size is.
 
 **The dirty set lives here**, as `dirty: StdMutex<HashMap<Address, u64>>`
 mapping pool to highest published version. It is owned by the writer so the
