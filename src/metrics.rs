@@ -38,6 +38,12 @@ pub struct Metrics {
     /// Reorgs and out-of-order logs. Frequent breaks invalidate the
     /// lossless-dirty-set argument.
     pub continuity_breaks: Counter,
+    /// Signed divergence of log-derived state from a fresh RPC read, by venue.
+    pub live_state_divergence_bps: HistogramVec,
+    /// Validation attempts by outcome: measured | unreachable | skipped_lag | no_ordinal.
+    pub live_state_checks: CounterVec,
+    pub live_state_trusted: Gauge,
+    pub live_state_untrusted: Gauge,
     pub ingestion_poll_refresh: Counter,
     pub ingestion_stale_pools: Gauge,
     pub ingestion_active_pools: Gauge,
@@ -198,6 +204,47 @@ impl Metrics {
         registry
             .register(Box::new(continuity_breaks.clone()))
             .context("register continuity_breaks_total counter")?;
+
+        let live_state_divergence_bps = HistogramVec::new(
+            HistogramOpts::new(
+                "live_state_divergence_bps",
+                "Signed divergence of log-derived state from a fresh RPC read",
+            )
+            .buckets(vec![
+                -10000.0, -1000.0, -100.0, -5.0, 0.0, 5.0, 100.0, 1000.0, 10000.0,
+            ]),
+            &["venue"],
+        )?;
+        registry
+            .register(Box::new(live_state_divergence_bps.clone()))
+            .context("register live_state_divergence_bps histogram")?;
+
+        let live_state_checks = CounterVec::new(
+            Opts::new(
+                "live_state_checks_total",
+                "State validation attempts by outcome",
+            ),
+            &["outcome"],
+        )?;
+        registry
+            .register(Box::new(live_state_checks.clone()))
+            .context("register live_state_checks_total counter")?;
+
+        let live_state_trusted = Gauge::with_opts(Opts::new(
+            "live_state_trusted_pools",
+            "Pools whose log-derived state currently passes the state gate",
+        ))?;
+        registry
+            .register(Box::new(live_state_trusted.clone()))
+            .context("register live_state_trusted_pools gauge")?;
+
+        let live_state_untrusted = Gauge::with_opts(Opts::new(
+            "live_state_untrusted_pools",
+            "Pools tracked by the state gate that do not currently pass",
+        ))?;
+        registry
+            .register(Box::new(live_state_untrusted.clone()))
+            .context("register live_state_untrusted_pools gauge")?;
 
         let ingestion_poll_refresh = Counter::with_opts(Opts::new(
             "ingestion_poll_refresh_total",
@@ -567,6 +614,10 @@ impl Metrics {
             live_state_applied,
             live_state_undecodable,
             continuity_breaks,
+            live_state_divergence_bps,
+            live_state_checks,
+            live_state_trusted,
+            live_state_untrusted,
             ingestion_poll_refresh,
             ingestion_stale_pools,
             ingestion_active_pools,
@@ -828,6 +879,23 @@ impl Metrics {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn validation_metrics_are_registered_and_labelled() {
+        let m = Metrics::new().expect("metrics");
+        m.live_state_divergence_bps
+            .with_label_values(&["cl"])
+            .observe(3.0);
+        m.live_state_checks.with_label_values(&["measured"]).inc();
+        m.live_state_checks.with_label_values(&["unreachable"]).inc();
+        m.live_state_trusted.set(5.0);
+        m.live_state_untrusted.set(2.0);
+        assert_eq!(m.live_state_trusted.get(), 5.0);
+        assert_eq!(
+            m.live_state_checks.with_label_values(&["measured"]).get(),
+            1.0
+        );
+    }
 
     #[test]
     fn shadow_metrics_are_registered_and_start_at_zero() {
