@@ -836,6 +836,28 @@ this guard protects.
   `relative_delta_bps` <= 5 over >= 24h; the above is a ~1 minute sample of 19
   observations. It establishes that the decoders are correct, not that they stay
   correct across reorgs, quiet pools, ladder churn or provider degradation.
+- **Within pricing state, `liquidity` is materially less trustworthy than
+  `sqrt_price_x96`/`tick`, and Phase 2b must not treat them alike.** Measured
+  2026-08-30 after Mint/Burn decoding and the sampling fix, 478 CL observations:
+  471 exactly zero, but 7 divergent — and in EVERY divergent case price and tick
+  were exact while liquidity was wrong, by up to 10.3x (+93199 bps).
+
+  Bounded but NOT root-caused. Because 471/478 are exact, the `Swap` decoder
+  resyncs liquidity correctly, so drift accumulates only BETWEEN swaps — which
+  implicates the `Mint`/`Burn` application. One plausible mechanism: a missed
+  `Swap` leaves the stored `tick` stale, so an out-of-range position is
+  misclassified as in-range and its full `amount` is wrongly applied. That ties
+  to the §8 I1 limitation — a filtered subscription cannot detect a dropped log.
+  **Unverified.** Do not act on it without testing it.
+
+  Note the sampling fix (`validatable()`) is what exposed this: with slots ~6%
+  productive, only a thin and unrepresentative slice of pools was ever measured,
+  and nothing above 1000 bps had been seen in 4 hours.
+
+  **Practical consequence for Phase 2b:** `sqrt_price_x96` and `tick` are ready
+  to price from; `liquidity` is not. Since liquidity determines size, this sits
+  alongside §3.2.1 — price can be right while size is wrong, and in arbitrage
+  that is a revert.
 - **Phase 2a validates price and liquidity, NOT depth.** The CL comparison covers
   `sqrt_price_x96`, `liquidity` and `tick` only. `balance0`/`balance1` are not
   tracked in Phase 1, so a passing verdict says nothing about whether CL
