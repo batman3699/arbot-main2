@@ -2338,6 +2338,8 @@ where
                             let queue_wait_window = queue_wait_timeout();
                             let rpc_timeout_window = rpc_quote_timeout();
                             let total_deadline_window = univ3_total_deadline_timeout();
+                            // Hoisted: the batched quote below needs BOTH samples.
+                            let probe_in = probe_amount(amount);
                             let quote_eval = async {
                                 let wait_started_at = Instant::now();
                                 let permits_before = quote_semaphore.available_permits();
@@ -2390,9 +2392,22 @@ where
 
                                 let hold_started_at = Instant::now();
                                 let rpc_started_at = Instant::now();
+                                // ONE round trip for both samples. slippage_from_samples
+                                // needs a probe and the full size; quoting them
+                                // separately cost 2 RPCs per fallback edge, and
+                                // populate is ~960 calls/scan at ~600ms per round of 64.
+                                let grid_amounts: Vec<U256> = if probe_in == amount {
+                                    vec![amount]
+                                } else {
+                                    vec![probe_in, amount]
+                                };
                                 let result = timeout(
                                     rpc_timeout_window,
-                                    quoter.quote_path(path_inner.clone(), amount, block_number),
+                                    quoter.quote_path_grid(
+                                        path_inner.clone(),
+                                        &grid_amounts,
+                                        block_number,
+                                    ),
                                 )
                                 .await;
                                 let hold_elapsed_ms = hold_started_at.elapsed().as_millis() as usize;
@@ -2420,10 +2435,17 @@ where
                                 let total_elapsed_ms = quote_started_at.elapsed().as_millis() as u64;
 
                                 match result {
-                                    Ok(Ok(out)) if out > U256::zero() => Ok(Some(out)),
-                                    Ok(Ok(_)) => {
-                                        stats.quote_failures.fetch_add(1, Ordering::Relaxed);
-                                        Ok(None)
+                                    Ok(Ok(outs)) => {
+                                        let out =
+                                            outs.last().copied().flatten().unwrap_or_default();
+                                        let probe_out =
+                                            outs.first().copied().flatten().unwrap_or(out);
+                                        if out > U256::zero() {
+                                            Ok(Some((out, probe_out)))
+                                        } else {
+                                            stats.quote_failures.fetch_add(1, Ordering::Relaxed);
+                                            Ok(None)
+                                        }
                                     }
                                     Ok(Err(err)) => {
                                         stats.quote_failures.fetch_add(1, Ordering::Relaxed);
@@ -2467,9 +2489,9 @@ where
                                     }
                                 }
                             };
-                            let out = match timeout(total_deadline_window, quote_eval).await {
+                            let (out, probe_out) = match timeout(total_deadline_window, quote_eval).await {
                                 Ok(result) => match result? {
-                                    Some(value) => value,
+                                    Some(pair) => pair,
                                     None => return Ok(None),
                                 },
                                 Err(_) => {
@@ -2490,92 +2512,8 @@ where
                                     return Ok(None);
                                 }
                             };
-                            let probe_in = probe_amount(amount);
-                            let probe_out = if probe_in == amount {
-                                out
-                            } else {
-                                let probe_wait_started_at = Instant::now();
-                                stats
-                                    .semaphore_acquire_attempts
-                                    .fetch_add(1, Ordering::Relaxed);
-                                let permits_before = quote_semaphore.available_permits();
-                                let permit = match timeout(
-                                    queue_wait_window,
-                                    quote_semaphore.clone().acquire_owned(),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(permit)) => permit,
-                                    Ok(Err(_)) => {
-                                        return Err(anyhow!("univ3 quote semaphore closed"));
-                                    }
-                                    Err(_) => {
-                                        stats.queue_wait_timeouts.fetch_add(1, Ordering::Relaxed);
-                                        warn!(
-                                            target: "venue::univ3",
-                                            chain = %chain_env_prefix,
-                                            venue = "uniswap_v3",
-                                            token_in = %format!("0x{}", hex::encode(token_in)),
-                                            token_out = %format!("0x{}", hex::encode(token_out)),
-                                            fee = pool.fee,
-                                            amount = %probe_in,
-                                            timeout_secs = queue_wait_window.as_secs(),
-                                            queue_wait_ms = probe_wait_started_at.elapsed().as_millis() as u64,
-                                            permits_available_before = permits_before,
-                                            provider_class,
-                                            "UniV3 probe quote stalled before network submission (semaphore wait timeout)"
-                                        );
-                                        return Ok(None);
-                                    }
-                                };
-                                stats.semaphore_acquired.fetch_add(1, Ordering::Relaxed);
-                                let probe_queue_wait_ms =
-                                    probe_wait_started_at.elapsed().as_millis() as usize;
-                                stats
-                                    .max_queue_wait_ms
-                                    .fetch_max(probe_queue_wait_ms, Ordering::Relaxed);
-                                let probe_result = timeout(
-                                    rpc_quote_timeout(),
-                                    quoter.quote_path(path_inner.clone(), probe_in, block_number),
-                                )
-                                .await;
-                                let probe_hold_ms = probe_wait_started_at.elapsed().as_millis() as usize;
-                                stats
-                                    .max_permit_hold_ms
-                                    .fetch_max(probe_hold_ms, Ordering::Relaxed);
-                                drop(permit);
-                                stats.semaphore_releases.fetch_add(1, Ordering::Relaxed);
-
-                                match probe_result {
-                                    Ok(Ok(value)) => value,
-                                    Ok(Err(err)) => {
-                                        stats.quote_failures.fetch_add(1, Ordering::Relaxed);
-                                        warn!(
-                                            target: "venue::univ3",
-                                            error = %err,
-                                            token_in = %format!("0x{}", hex::encode(token_in)),
-                                            token_out = %format!("0x{}", hex::encode(token_out)),
-                                            fee = pool.fee,
-                                            amount = %probe_in,
-                                            "UniV3 probe quote failed"
-                                        );
-                                        U256::zero()
-                                    }
-                                    Err(_) => {
-                                        stats.quote_timeouts.fetch_add(1, Ordering::Relaxed);
-                                        warn!(
-                                            target: "venue::univ3",
-                                            token_in = %format!("0x{}", hex::encode(token_in)),
-                                            token_out = %format!("0x{}", hex::encode(token_out)),
-                                            fee = pool.fee,
-                                            amount = %probe_in,
-                                            timeout_secs = rpc_quote_timeout().as_secs(),
-                                            "UniV3 probe quote timed out"
-                                        );
-                                        U256::zero()
-                                    }
-                                }
-                            };
+                            // probe_out comes from the batched grid above; the separate
+                            // probe round trip is gone.
                             if probe_out.is_zero() {
                                 return Ok(None);
                             }
@@ -3103,6 +3041,8 @@ where
                             let queue_wait_window = queue_wait_timeout();
                             let rpc_timeout_window = rpc_quote_timeout();
                             let total_deadline_window = univ3_total_deadline_timeout();
+                            // Hoisted: the batched quote below needs BOTH samples.
+                            let probe_in = probe_amount(amount);
                             let quote_eval = async {
                                 let wait_started_at = Instant::now();
                                 let permits_before = quote_semaphore.available_permits();
@@ -3155,9 +3095,22 @@ where
 
                                 let hold_started_at = Instant::now();
                                 let rpc_started_at = Instant::now();
+                                // ONE round trip for both samples. slippage_from_samples
+                                // needs a probe and the full size; quoting them
+                                // separately cost 2 RPCs per fallback edge, and
+                                // populate is ~960 calls/scan at ~600ms per round of 64.
+                                let grid_amounts: Vec<U256> = if probe_in == amount {
+                                    vec![amount]
+                                } else {
+                                    vec![probe_in, amount]
+                                };
                                 let result = timeout(
                                     rpc_timeout_window,
-                                    quoter.quote_path(path_inner.clone(), amount, block_number),
+                                    quoter.quote_path_grid(
+                                        path_inner.clone(),
+                                        &grid_amounts,
+                                        block_number,
+                                    ),
                                 )
                                 .await;
                                 let hold_elapsed_ms = hold_started_at.elapsed().as_millis() as usize;
@@ -3185,10 +3138,17 @@ where
                                 let total_elapsed_ms = quote_started_at.elapsed().as_millis() as u64;
 
                                 match result {
-                                    Ok(Ok(out)) if out > U256::zero() => Ok(Some(out)),
-                                    Ok(Ok(_)) => {
-                                        stats.quote_failures.fetch_add(1, Ordering::Relaxed);
-                                        Ok(None)
+                                    Ok(Ok(outs)) => {
+                                        let out =
+                                            outs.last().copied().flatten().unwrap_or_default();
+                                        let probe_out =
+                                            outs.first().copied().flatten().unwrap_or(out);
+                                        if out > U256::zero() {
+                                            Ok(Some((out, probe_out)))
+                                        } else {
+                                            stats.quote_failures.fetch_add(1, Ordering::Relaxed);
+                                            Ok(None)
+                                        }
                                     }
                                     Ok(Err(err)) => {
                                         stats.quote_failures.fetch_add(1, Ordering::Relaxed);
@@ -3232,9 +3192,9 @@ where
                                     }
                                 }
                             };
-                            let out = match timeout(total_deadline_window, quote_eval).await {
+                            let (out, probe_out) = match timeout(total_deadline_window, quote_eval).await {
                                 Ok(result) => match result? {
-                                    Some(value) => value,
+                                    Some(pair) => pair,
                                     None => return Ok(None),
                                 },
                                 Err(_) => {
@@ -3255,92 +3215,8 @@ where
                                     return Ok(None);
                                 }
                             };
-                            let probe_in = probe_amount(amount);
-                            let probe_out = if probe_in == amount {
-                                out
-                            } else {
-                                let probe_wait_started_at = Instant::now();
-                                stats
-                                    .semaphore_acquire_attempts
-                                    .fetch_add(1, Ordering::Relaxed);
-                                let permits_before = quote_semaphore.available_permits();
-                                let permit = match timeout(
-                                    queue_wait_window,
-                                    quote_semaphore.clone().acquire_owned(),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(permit)) => permit,
-                                    Ok(Err(_)) => {
-                                        return Err(anyhow!("slipstream quote semaphore closed"));
-                                    }
-                                    Err(_) => {
-                                        stats.queue_wait_timeouts.fetch_add(1, Ordering::Relaxed);
-                                        warn!(
-                                            target: "venue::slipstream",
-                                            chain = %chain_env_prefix,
-                                            venue = "aerodrome_slipstream",
-                                            token_in = %format!("0x{}", hex::encode(token_in)),
-                                            token_out = %format!("0x{}", hex::encode(token_out)),
-                                            fee = pool.fee,
-                                            amount = %probe_in,
-                                            timeout_secs = queue_wait_window.as_secs(),
-                                            queue_wait_ms = probe_wait_started_at.elapsed().as_millis() as u64,
-                                            permits_available_before = permits_before,
-                                            provider_class,
-                                            "Slipstream probe quote stalled before network submission (semaphore wait timeout)"
-                                        );
-                                        return Ok(None);
-                                    }
-                                };
-                                stats.semaphore_acquired.fetch_add(1, Ordering::Relaxed);
-                                let probe_queue_wait_ms =
-                                    probe_wait_started_at.elapsed().as_millis() as usize;
-                                stats
-                                    .max_queue_wait_ms
-                                    .fetch_max(probe_queue_wait_ms, Ordering::Relaxed);
-                                let probe_result = timeout(
-                                    rpc_quote_timeout(),
-                                    quoter.quote_path(path_inner.clone(), probe_in, block_number),
-                                )
-                                .await;
-                                let probe_hold_ms = probe_wait_started_at.elapsed().as_millis() as usize;
-                                stats
-                                    .max_permit_hold_ms
-                                    .fetch_max(probe_hold_ms, Ordering::Relaxed);
-                                drop(permit);
-                                stats.semaphore_releases.fetch_add(1, Ordering::Relaxed);
-
-                                match probe_result {
-                                    Ok(Ok(value)) => value,
-                                    Ok(Err(err)) => {
-                                        stats.quote_failures.fetch_add(1, Ordering::Relaxed);
-                                        warn!(
-                                            target: "venue::slipstream",
-                                            error = %err,
-                                            token_in = %format!("0x{}", hex::encode(token_in)),
-                                            token_out = %format!("0x{}", hex::encode(token_out)),
-                                            fee = pool.fee,
-                                            amount = %probe_in,
-                                            "Slipstream probe quote failed"
-                                        );
-                                        U256::zero()
-                                    }
-                                    Err(_) => {
-                                        stats.quote_timeouts.fetch_add(1, Ordering::Relaxed);
-                                        warn!(
-                                            target: "venue::slipstream",
-                                            token_in = %format!("0x{}", hex::encode(token_in)),
-                                            token_out = %format!("0x{}", hex::encode(token_out)),
-                                            fee = pool.fee,
-                                            amount = %probe_in,
-                                            timeout_secs = rpc_quote_timeout().as_secs(),
-                                            "Slipstream probe quote timed out"
-                                        );
-                                        U256::zero()
-                                    }
-                                }
-                            };
+                            // probe_out comes from the batched grid above; the separate
+                            // probe round trip is gone.
                             if probe_out.is_zero() {
                                 return Ok(None);
                             }
@@ -4976,6 +4852,57 @@ where
 
 #[cfg(test)]
 mod tests {
+
+/// Serialises the tests that mutate RPC endpoint env vars, and restores them
+/// on drop.
+///
+/// `classify_provider_for_chain` reads these FRESH on every call, so two tests
+/// mutating them concurrently flip each other's result. Observed live: a
+/// different `classify_provider_*` test failed on each full-suite run while
+/// every one passed in isolation.
+///
+/// The lock alone is not enough. A test that panics between `set_var` and its
+/// trailing `remove_var` leaks the value into whichever test runs next, so the
+/// restore has to happen on unwind too — hence the guard rather than a bare
+/// lock. Same reasoning as `cl_sim::EnvGuard`.
+#[cfg(test)]
+struct RpcEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+#[cfg(test)]
+impl RpcEnvGuard {
+    const VARS: [&'static str; 4] = ["BASE_RPC_URL", "BASE_RPC_URLS", "RPC_URL", "RPC_URLS"];
+
+    fn acquire() -> Self {
+        static RPC_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A poisoned lock means an earlier test panicked while holding it. The
+        // env is restored by that test's own guard drop, so the lock itself is
+        // still usable and recovering beats cascading failures.
+        let lock = RPC_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = Self::VARS
+            .iter()
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in Self::VARS {
+            std::env::remove_var(k);
+        }
+        Self { _lock: lock, saved }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RpcEnvGuard {
+    fn drop(&mut self) {
+        for (k, v) in &self.saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+}
     use super::*;
     use ethers::types::{Address, U64};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5148,44 +5075,30 @@ mod tests {
 
     #[test]
     fn classify_provider_prefers_prefixed_single_url() {
+        let _env = RpcEnvGuard::acquire();
         std::env::set_var("BASE_RPC_URL", "http://127.0.0.1:8545");
-        std::env::remove_var("BASE_RPC_URLS");
-        std::env::remove_var("RPC_URL");
-        std::env::remove_var("RPC_URLS");
 
-        let class = classify_provider_for_chain("BASE");
-
-        std::env::remove_var("BASE_RPC_URL");
-        assert_eq!(class, "local_fork");
+        assert_eq!(classify_provider_for_chain("BASE"), "local_fork");
     }
 
     #[test]
     fn classify_provider_uses_prefixed_url_list_when_single_missing() {
-        std::env::remove_var("BASE_RPC_URL");
+        // Guard clears all four vars on acquire and restores on drop.
+        let _env = RpcEnvGuard::acquire();
         std::env::set_var(
             "BASE_RPC_URLS",
             " https://base.example , http://127.0.0.1:8545 ",
         );
-        std::env::remove_var("RPC_URL");
-        std::env::remove_var("RPC_URLS");
 
-        let class = classify_provider_for_chain("BASE");
-
-        std::env::remove_var("BASE_RPC_URLS");
-        assert_eq!(class, "upstream");
+        assert_eq!(classify_provider_for_chain("BASE"), "upstream");
     }
 
     #[test]
     fn classify_provider_uses_global_url_list_fallback() {
-        std::env::remove_var("BASE_RPC_URL");
-        std::env::remove_var("BASE_RPC_URLS");
-        std::env::remove_var("RPC_URL");
+        let _env = RpcEnvGuard::acquire();
         std::env::set_var("RPC_URLS", " , http://localhost:8545, https://base.example");
 
-        let class = classify_provider_for_chain("BASE");
-
-        std::env::remove_var("RPC_URLS");
-        assert_eq!(class, "local_fork");
+        assert_eq!(classify_provider_for_chain("BASE"), "local_fork");
     }
 
     /// Replaces `optimal_trade_size_prefers_peak_profit`, which modelled the

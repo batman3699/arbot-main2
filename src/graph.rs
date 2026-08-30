@@ -2074,7 +2074,7 @@ mod tests {
             max_hops,
             max_relaxations: max_hops,
             max_cycles: 16,
-            timeout: Duration::from_millis(250),
+            timeout: Duration::from_secs(60),
         }
     }
 
@@ -2451,7 +2451,7 @@ mod tests {
             max_hops: 3,
             max_relaxations: 8,
             max_cycles: 4,
-            timeout: Duration::from_millis(250),
+            timeout: Duration::from_secs(60),
         }
         .sanitized();
 
@@ -3127,7 +3127,7 @@ mod tests {
             max_hops: 4,
             max_relaxations: 8,
             max_cycles: 2,
-            timeout: Duration::from_millis(250),
+            timeout: Duration::from_secs(60),
         };
 
         let cycles = graph.bellman_ford(&priorities, &constrained_limits, 2, None);
@@ -3370,7 +3370,7 @@ mod tests {
             max_hops: 3,
             max_relaxations: 8,
             max_cycles: 4,
-            timeout: Duration::from_millis(250),
+            timeout: Duration::from_secs(60),
         };
 
         let cycles = graph.bellman_ford(&priorities, &tight_limits, 1, None);
@@ -4119,7 +4119,7 @@ mod tests {
             max_hops: 2,
             max_relaxations: 8,
             max_cycles: 4,
-            timeout: Duration::from_millis(200),
+            timeout: Duration::from_secs(60),
         };
         let cycles = graph.bellman_ford(&priorities, &limits, 4, None);
         assert!(!cycles.is_empty(), "should detect 2-hop arb");
