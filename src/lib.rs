@@ -35,4 +35,5 @@ pub mod quote_univ4;
 pub mod registry;
 pub mod state_gate;
 pub mod util;
+pub mod validation_select;
 pub mod venues;

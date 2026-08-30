@@ -50,6 +50,7 @@ mod sizing;
 mod state_gate;
 mod token_refresh;
 mod util;
+mod validation_select;
 mod venue_adapter;
 mod venues;
 
