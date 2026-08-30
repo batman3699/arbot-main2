@@ -40,6 +40,7 @@ mod quote_univ2;
 mod quote_univ3;
 mod quote_slipstream;
 mod quote_univ4;
+mod reconcile;
 mod registry;
 mod risk_policy;
 mod rpc_failover;

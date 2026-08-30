@@ -32,6 +32,7 @@ pub mod quote_univ2;
 pub mod quote_slipstream;
 pub mod quote_univ3;
 pub mod quote_univ4;
+pub mod reconcile;
 pub mod registry;
 pub mod state_gate;
 pub mod util;
