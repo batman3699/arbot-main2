@@ -854,10 +854,31 @@ this guard protects.
   productive, only a thin and unrepresentative slice of pools was ever measured,
   and nothing above 1000 bps had been seen in 4 hours.
 
+  **Corrected rates**, since the sampling regime changes what the number means:
+
+  | regime | outside +/-5 bps | note |
+  |---|---|---|
+  | thin sampling, pre-Mint/Burn | 37/686 = **5.39%** | |
+  | thin sampling, post-Mint/Burn | 2/550 = **0.36%** | same regime -> ~15x better |
+  | full sampling, both fixes | 12/871 = **1.38%** | the TRUE population rate |
+
+  Compare like with like: Mint/Burn decoding improved divergence ~15x on the
+  regime it was measured in. The 0.36% figure is NOT the population rate — full
+  sampling puts that at ~1.4%, because the old slice never reached the pools
+  that diverge most.
+
   **Practical consequence for Phase 2b:** `sqrt_price_x96` and `tick` are ready
   to price from; `liquidity` is not. Since liquidity determines size, this sits
   alongside §3.2.1 — price can be right while size is wrong, and in arbitrage
   that is a revert.
+- **`live_state_untrusted_pools` overstates failure and must not be read as a
+  gate.** `StateGate::stats()` computes `untrusted = total - trusted` where
+  trusted requires `v.trusted && checked_at.elapsed() < ttl`, so a PASSING
+  verdict that has merely aged past the 300s TTL is counted as untrusted.
+  Observed: trusted fell 212 -> 166 over a 22-minute run purely from verdict
+  expiry, while the measured divergence rate was ~1.4%. Before the §9 gate is
+  evaluated, split this into measured-and-failed versus verdict-expired —
+  otherwise the gate reads re-check latency as untrustworthiness.
 - **Phase 2a validates price and liquidity, NOT depth.** The CL comparison covers
   `sqrt_price_x96`, `liquidity` and `tick` only. `balance0`/`balance1` are not
   tracked in Phase 1, so a passing verdict says nothing about whether CL
