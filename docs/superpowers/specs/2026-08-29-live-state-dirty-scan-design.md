@@ -748,12 +748,20 @@ this guard protects.
   inventory at all.
 - Drift budget for CL balances needs a measured starting value from Phase 1
   reconciliation rather than a guessed constant.
-- **Phase 1 subscribes 683 pools, not ~985.** `hot_univ3_pools` and
+- **Phase 1 does not subscribe the whole graph, and its measured count is now
+  stale.** The field run recorded **683 pools subscribed**, up from 23 — but
+  that was measured on 2026-08-30 against the PRE-repartition inventories.
+  `da8efd0` has since changed them materially (`aerodrome_slipstream` 187 -> 84,
+  `_v3` 177 -> 63, `_gauge` 177 -> 32, `uniswap_v3` 570 -> 513,
+  `pancakeswap_v3` 28 -> 43), so **683 no longer describes the current
+  configuration and must be re-measured** before it is quoted anywhere.
+  The structural point survives the churn: `hot_univ3_pools` and
   `hot_slipstream_pools` hold the ranked HOT subset, not the full inventories,
-  so the cold tail still has no event source. Coverage went from 2.3% to ~70%,
-  not to complete. Do not read Phase 1 as "CL is covered".
+  so the cold tail has no event source whatever the counts are. Do not read
+  Phase 1 as "CL is covered".
 - **A rebuilt pool list can silently drop sticky pools.** Observed live: the
-  subscription connected with 683 pools and reverted to 23 after five minutes,
+  subscription connected with 683 pools (pre-repartition count) and reverted to
+  23 after five minutes,
   because the univ2 hot-pool refresh calls `set_pools` with a set rebuilt from
   scratch. Fixed structurally (`PoolMonitor::with_sticky_pools`), but any future
   caller that constructs a monitored set from one source must be checked against
