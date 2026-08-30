@@ -6,7 +6,7 @@
 //! chain, and left the pool monitor subscribed but deaf for the life of the
 //! process. Derivation removes that failure mode entirely.
 
-use ethers::types::H256;
+use ethers::types::{Log, H256, U256};
 use std::sync::LazyLock;
 
 /// keccak256 of an event signature — the value that appears as `topics[0]`.
@@ -57,9 +57,100 @@ pub fn monitored_topics() -> Vec<H256> {
     ]
 }
 
+/// The `index`-th 32-byte ABI word of `data`, or `None` if it is not there.
+pub fn word(data: &[u8], index: usize) -> Option<[u8; 32]> {
+    let start = index.checked_mul(32)?;
+    let end = start.checked_add(32)?;
+    let slice = data.get(start..end)?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(slice);
+    Some(out)
+}
+
+/// Reserves after a `Sync`, for either pool family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V2SyncDelta {
+    pub reserve0: U256,
+    pub reserve1: U256,
+}
+
+/// Decode a `Sync` from either UniV2 (`uint112`) or Solidly (`uint256`).
+///
+/// The payload layout is identical — ABI pads both widths to 32 bytes — so the
+/// topic is the only thing that differs, and this accepts both. `Sync` carries
+/// COMPLETE state rather than a delta, which is why V2 needs no drift budget.
+pub fn decode_v2_sync(log: &Log) -> Option<V2SyncDelta> {
+    let topic = log.topics.first()?;
+    if topic != &*TOPIC_V2_SYNC && topic != &*TOPIC_SOLIDLY_SYNC {
+        return None;
+    }
+    Some(V2SyncDelta {
+        reserve0: U256::from_big_endian(&word(&log.data, 0)?),
+        reserve1: U256::from_big_endian(&word(&log.data, 1)?),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethers::types::{Address, Bytes};
+
+    fn log_with(topic: H256, data: Vec<u8>) -> Log {
+        Log {
+            address: Address::from_low_u64_be(1),
+            topics: vec![topic],
+            data: Bytes::from(data),
+            ..Default::default()
+        }
+    }
+
+    /// N 32-byte words, big-endian.
+    fn words(vals: &[u128]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for v in vals {
+            let mut w = [0u8; 32];
+            w[16..].copy_from_slice(&v.to_be_bytes());
+            out.extend_from_slice(&w);
+        }
+        out
+    }
+
+    #[test]
+    fn decodes_univ2_sync_reserves() {
+        let log = log_with(*TOPIC_V2_SYNC, words(&[111, 222]));
+        let d = decode_v2_sync(&log).expect("should decode");
+        assert_eq!(d.reserve0, U256::from(111u64));
+        assert_eq!(d.reserve1, U256::from(222u64));
+    }
+
+    /// Same payload shape, different topic — one decoder covers both families.
+    #[test]
+    fn decodes_solidly_sync_with_the_same_layout() {
+        let log = log_with(*TOPIC_SOLIDLY_SYNC, words(&[333, 444]));
+        let d = decode_v2_sync(&log).expect("should decode");
+        assert_eq!(d.reserve0, U256::from(333u64));
+        assert_eq!(d.reserve1, U256::from(444u64));
+    }
+
+    #[test]
+    fn refuses_a_foreign_topic() {
+        let log = log_with(*TOPIC_V2_SWAP, words(&[1, 2]));
+        assert!(decode_v2_sync(&log).is_none(), "topic0 decides, nothing else");
+    }
+
+    /// A truncated payload must decline rather than read garbage or panic.
+    #[test]
+    fn refuses_a_short_payload() {
+        let log = log_with(*TOPIC_V2_SYNC, vec![0u8; 63]);
+        assert!(decode_v2_sync(&log).is_none());
+    }
+
+    #[test]
+    fn refuses_a_log_with_no_topics() {
+        let mut log = log_with(*TOPIC_V2_SYNC, words(&[1, 2]));
+        log.topics.clear();
+        assert!(decode_v2_sync(&log).is_none());
+    }
 
     #[test]
     fn topics_match_the_keccak_of_their_signatures() {
