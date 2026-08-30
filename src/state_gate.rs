@@ -50,11 +50,16 @@ impl StateGate {
             max_err_bps: i64::from(
                 crate::util::env_parse_opt::<u32>("ARBOT_STATE_GATE_MAX_ERR_BPS").unwrap_or(5),
             ),
+            // 32/pass at the 15s default is ~128 pools/min per venue. With
+            // ~700 tracked pools and a 300s verdict TTL, that is roughly full
+            // coverage per TTL; at the previous default of 8 it was a quarter
+            // of that, and most of those slots were wasted on pools too stale
+            // to validate (see state_validation::validatable).
             checks_per_scan: crate::util::env_parse_opt::<usize>(
                 "ARBOT_STATE_GATE_CHECKS_PER_SCAN",
             )
-            .unwrap_or(8)
-            .clamp(1, 64),
+            .unwrap_or(32)
+            .clamp(1, 256),
             verdicts: Mutex::new(HashMap::new()),
         }
     }
