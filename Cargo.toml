@@ -43,6 +43,14 @@ dashmap = "6"
 # revm 20.x stack: in-process EVM fork simulation (sim_revm.rs)
 revm = { version = "20", features = ["std"] }
 rlp = "0.5"
+# Exhaustive interleaving model for the dirty-set protocol (spec 8 I1).
+# Gated behind a FEATURE, not RUSTFLAGS="--cfg loom": a global cfg activates
+# cfg(loom) paths inside concurrent-queue, which cannot build without loom as
+# its own dependency.
+loom = { version = "0.7", optional = true }
+
+[features]
+loom-model = ["dep:loom"]
 
 [dev-dependencies]
 tempfile = "3"
