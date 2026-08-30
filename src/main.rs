@@ -12782,10 +12782,26 @@ async fn launch_chain_runtime(
             .unwrap_or_else(|| poll_ms.saturating_mul(3));
         let pools = hot_univ2_pools.read().await.clone();
         let solidly_pools = solidly_monitored_pools(&cfg.env_prefix);
-        let monitored = venues::merge_monitored_pools(
+        let mut monitored = venues::merge_monitored_pools(
             monitored_pools_from_configs(&pools),
             solidly_pools,
         );
+
+        // CL pools are subscribed for logs but never polled. Without them the
+        // Swap decoder never sees a log: the subscription carried 23 of ~985
+        // Base pools, so 97.7% of the graph had no event source at all.
+        for records in [&hot_univ3_pools, &hot_slipstream_pools] {
+            for r in records.read().await.iter() {
+                monitored.push(MonitoredPool {
+                    pair: r.pool,
+                    token_in: r.token0,
+                    token_out: r.token1,
+                    fee_bps: r.fee,
+                    stable: false,
+                    kind: ingestion::PoolMonitorKind::ConcentratedLiquidity,
+                });
+            }
+        }
 
         if monitored.is_empty() {
             None

@@ -36,6 +36,9 @@ use crate::{
 fn pollable_pairs(pools: &[MonitoredPool], ignored: &HashSet<Address>) -> Vec<Address> {
     pools
         .iter()
+        // CL pools have no getReserves; polling one wastes a round-trip per
+        // cycle and logs a revert that reads like an RPC fault.
+        .filter(|p| p.kind != PoolMonitorKind::ConcentratedLiquidity)
         .map(|p| p.pair)
         .filter(|pair| !ignored.contains(pair))
         .collect()
@@ -80,6 +83,9 @@ pub(crate) fn pool_log_filter(pools: &[MonitoredPool]) -> Filter {
 pub enum PoolMonitorKind {
     UniV2,
     Solidly,
+    /// UniV3 / Aerodrome Slipstream. Subscribed for logs, but NOT polled: it
+    /// has no `getReserves`, and its state arrives via `Swap` instead.
+    ConcentratedLiquidity,
 }
 
 #[allow(dead_code)]
@@ -931,12 +937,54 @@ mod tests {
             topics.contains(&crate::log_decode::TOPIC_V2_SWAP),
             "Swap topic missing from filter: {topics:?}"
         );
-        assert_eq!(topics.len(), 4, "both pool families must be covered");
+        assert_eq!(
+            topics.len(),
+            5,
+            "4 constant-product topics + CL Swap; every family must be covered"
+        );
     }
 
     /// The monitored set on Base is 23 Solidly pools and zero UniV2 pools, so a
     /// UniV2-only filter matched nothing at all — indistinguishable from a
     /// quiet market. Whatever the mix, both families must be subscribed.
+    fn cl_monitored(n: u64) -> MonitoredPool {
+        MonitoredPool {
+            pair: Address::from_low_u64_be(n),
+            token_in: Address::from_low_u64_be(n + 1000),
+            token_out: Address::from_low_u64_be(n + 2000),
+            fee_bps: 500,
+            stable: false,
+            kind: PoolMonitorKind::ConcentratedLiquidity,
+        }
+    }
+
+    #[test]
+    fn filter_includes_cl_pools_and_the_cl_swap_topic() {
+        let filter = pool_log_filter(&[monitored(1), cl_monitored(2)]);
+        let topics = topic0_of(&filter);
+        assert!(
+            topics.contains(&crate::log_decode::TOPIC_CL_SWAP),
+            "CL Swap topic missing: {topics:?}"
+        );
+        let addrs = addresses_of(&filter);
+        assert!(
+            addrs.contains(&Address::from_low_u64_be(2)),
+            "CL pool not subscribed"
+        );
+        assert_eq!(topics.len(), 5, "4 constant-product topics + 1 CL");
+    }
+
+    /// The poller reads getReserves, which reverts on a CL pool. Polling one
+    /// wastes a round-trip every cycle and logs a failure that looks like an
+    /// RPC problem.
+    #[test]
+    fn cl_pools_are_excluded_from_the_reserves_poll() {
+        let pools = vec![monitored(1), cl_monitored(2), monitored(3)];
+        let pairs = pollable_pairs(&pools, &HashSet::new());
+        assert_eq!(pairs.len(), 2);
+        assert!(!pairs.contains(&Address::from_low_u64_be(2)));
+    }
+
     #[test]
     fn filter_covers_solidly_pools_not_just_univ2() {
         let topics = topic0_of(&pool_log_filter(&[monitored(1)]));
