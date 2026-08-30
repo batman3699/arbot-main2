@@ -3,6 +3,7 @@ mod backrun_state;
 mod bridge;
 mod capital;
 mod chain;
+mod continuity;
 mod convex;
 mod cl_math;
 mod cl_sim;

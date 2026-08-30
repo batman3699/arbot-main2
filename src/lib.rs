@@ -9,6 +9,7 @@ pub mod abi;
 pub mod abi_fixture;
 pub mod capital;
 pub mod chain;
+pub mod continuity;
 pub mod convex;
 pub mod cycle_index;
 pub mod discovery;
