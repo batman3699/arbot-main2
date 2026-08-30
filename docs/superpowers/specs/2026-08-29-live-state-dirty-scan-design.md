@@ -144,13 +144,27 @@ Three new modules, each with one responsibility.
 
 ### 3.1 `src/log_decode.rs` — pure decoding
 
-No I/O, no async, no state. Topic constants derived from signatures. Functions
-are `&Log -> Option<Delta>`:
+No I/O, no async, no state. Topic constants derived from signatures.
+
+**Dispatch on `topic0`, never on the venue label** (amended 2026-08-30). A log
+is self-describing: `0xcf2aa508` *is* a Solidly `Sync` whatever any inventory
+claims. Venue labels are not trustworthy — sampling
+`data/base/aerodrome_slipstream/pools.jsonl` against Base found 4 of 8 pools
+answering `getReserves()`/`stable()` and reverting `slot0()`, i.e. Solidly V2
+pairs filed as CL. Under label dispatch those pools would be handed the CL
+decoder, never decode, and sit permanently untrusted — safe by §4.3, but Phase 1
+would silently deliver a fraction of its coverage with no signal separating that
+from quiet pools. Topic dispatch is simpler and immune to inventory drift.
+
+Functions are `&Log -> Option<Delta>`:
 
 - `decode_v2_sync` — both reserves, exact and complete.
-- `decode_cl_swap` — per venue. UniV3 and Slipstream share
-  `0xc42079f9…`; PancakeSwap V3 is `0x19b47279…` with two extra trailing
-  fields and needs its own decoder.
+- `decode_cl_swap` — keyed on topic. UniV3 and Slipstream share
+  `0xc42079f9…`, **confirmed on Base**: six Slipstream pools plus one UniV3
+  pool emitted it in a single block, so ONE decoder covers both venues. Payload
+  verified as five words: `amount0`, `amount1`, `sqrtPriceX96`, `liquidity`,
+  `tick`. PancakeSwap V3's `0x19b47279…` is still **unverified** — see §10; do
+  not write that decoder until a real log confirms the layout.
 - `decode_cl_mint` / `decode_cl_burn` — tick range and liquidity delta, for
   ladder maintenance.
 
@@ -697,11 +711,21 @@ this guard protects.
 
 ## 10. Open items
 
-- Pancake V3 `Swap` payload layout needs confirming against a live Base log
-  before its decoder is written; the two extra trailing fields are asserted from
-  the signature, not yet observed.
-- Slipstream `Mint`/`Burn` signatures assumed identical to UniV3; confirm before
-  relying on ladder maintenance for that venue.
+- Pancake V3 `Swap` payload layout **still needs confirming** against a live
+  Base log before its decoder is written; the two extra trailing fields are
+  asserted from the signature, not yet observed. Only 28 low-activity pools on
+  Base, so none appeared in sampled blocks — widen the window or query a known
+  Pancake pool's history.
+- ~~Slipstream `Swap` assumed identical to UniV3~~ — **confirmed 2026-08-30**:
+  Slipstream pools emit `0xc42079f9` with the same five-word payload. `Mint`/
+  `Burn` remain assumed-identical and unverified.
+- **`data/base/aerodrome_slipstream/pools.jsonl` is ~half Solidly V2 pairs**
+  mislabeled as CL (4 of 8 sampled). Tracked as a separate data-correctness
+  task; §3.1's topic dispatch makes Phase 1 robust to it, but it independently
+  costs coverage today — the bot drops 59 of 187 pools per cycle
+  (`candidates=187 probed=128`). The three `aerodrome_slipstream*` inventories
+  are also near-duplicates, and at least two actively-trading CL pools
+  (`0xfcce67a1…`, `0xe36596c7…`) appear in no inventory at all.
 - Drift budget for CL balances needs a measured starting value from Phase 1
   reconciliation rather than a guessed constant.
 - `loom` as a dev-dependency is a new dep. If declined, the fallback is a
