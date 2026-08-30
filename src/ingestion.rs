@@ -1011,8 +1011,8 @@ mod tests {
         );
         assert_eq!(
             topics.len(),
-            5,
-            "4 constant-product topics + CL Swap; every family must be covered"
+            7,
+            "4 constant-product + CL Swap/Mint/Burn; every family must be covered"
         );
     }
 
@@ -1080,7 +1080,7 @@ mod tests {
             addrs.contains(&Address::from_low_u64_be(2)),
             "CL pool not subscribed"
         );
-        assert_eq!(topics.len(), 5, "4 constant-product topics + 1 CL");
+        assert_eq!(topics.len(), 7, "4 constant-product + CL Swap/Mint/Burn");
     }
 
     /// The poller reads getReserves, which reverts on a CL pool. Polling one

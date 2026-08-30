@@ -299,6 +299,43 @@ impl LiveState {
             return ApplyOutcome::Applied { pool, version };
         }
 
+        // A position change. Only the IN-RANGE liquidity is tracked here: an
+        // out-of-range Mint/Burn alters the tick ladder, which Phase 1 does not
+        // hold, and applying it to the live value would corrupt it.
+        //
+        // Deliberately ignores amount0/amount1. Balances are RPC-anchored, never
+        // log-derived (spec §3.2.1) — Collect, CollectProtocol, Flash and plain
+        // ERC-20 transfers also move them, and a direct transfer emits no pool
+        // event at all.
+        if let Some(d) = crate::log_decode::decode_cl_liquidity(log) {
+            let Some(existing) = self.cl.get(&pool).map(|e| (**e).clone()) else {
+                // No base to apply a delta to. Inventing one would fabricate
+                // state; the pool stays unknown until an anchor or a Swap.
+                return ApplyOutcome::NotStateBearing;
+            };
+            // UniV3 ranges are half-open: [tickLower, tickUpper).
+            let in_range = d.tick_lower <= existing.tick && existing.tick < d.tick_upper;
+            if !in_range {
+                return ApplyOutcome::NotStateBearing;
+            }
+            let updated = (existing.liquidity as i128).saturating_add(d.liquidity_delta);
+            let liquidity = u128::try_from(updated.max(0)).unwrap_or(0);
+            let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
+            let prov = self.provenance(version, Some(ordinal), TrustState::Derived);
+            self.cl.insert(
+                pool,
+                Arc::new(ClSnapshot {
+                    sqrt_price_x96: existing.sqrt_price_x96,
+                    liquidity,
+                    tick: existing.tick,
+                    prov,
+                }),
+            );
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.publish(pool, version);
+            return ApplyOutcome::Applied { pool, version };
+        }
+
         if let Some(d) = decode_cl_swap(log) {
             let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
             let prov = self.provenance(version, Some(ordinal), TrustState::Derived);
@@ -515,6 +552,108 @@ mod tests {
             ls.tracked_cl().is_empty(),
             "a V2 pool must not appear in the CL list"
         );
+    }
+
+    fn liquidity_log(pool: Address, mint: bool, lower: i32, upper: i32, amount: u128, block: u64, li: u64) -> Log {
+        let enc = |v: i32| {
+            let mut w = [0u8; 32];
+            let fill = if v < 0 { 0xffu8 } else { 0x00u8 };
+            for b in w.iter_mut().take(24) {
+                *b = fill;
+            }
+            w[24..].copy_from_slice(&(v as i64).to_be_bytes());
+            H256(w)
+        };
+        let mut data = Vec::new();
+        if mint {
+            data.extend_from_slice(&[0u8; 32]);
+        }
+        let mut w = [0u8; 32];
+        w[16..].copy_from_slice(&amount.to_be_bytes());
+        data.extend_from_slice(&w);
+        data.extend_from_slice(&[0u8; 64]);
+        let topic = if mint {
+            *crate::log_decode::TOPIC_CL_MINT
+        } else {
+            *crate::log_decode::TOPIC_CL_BURN
+        };
+        Log {
+            address: pool,
+            topics: vec![topic, H256::zero(), enc(lower), enc(upper)],
+            data: Bytes::from(data),
+            block_number: Some(block.into()),
+            transaction_index: Some(0u64.into()),
+            log_index: Some(li.into()),
+            removed: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// The measured Phase 2a failure: liquidity from Swap alone goes stale when
+    /// a position changes. A Burn spanning the current tick must reduce it.
+    #[test]
+    fn a_burn_spanning_the_current_tick_reduces_liquidity() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(1);
+        ls.anchor_cl(pool, U256::from(1u64), 10_000, 0);
+        assert!(matches!(
+            ls.apply_log(&liquidity_log(pool, false, -100, 100, 4_000, 100, 0)),
+            ApplyOutcome::Applied { .. }
+        ));
+        assert_eq!(ls.cl_snapshot(pool).unwrap().liquidity, 6_000);
+    }
+
+    #[test]
+    fn a_mint_spanning_the_current_tick_increases_liquidity() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(2);
+        ls.anchor_cl(pool, U256::from(1u64), 10_000, 0);
+        ls.apply_log(&liquidity_log(pool, true, -100, 100, 4_000, 100, 0));
+        assert_eq!(ls.cl_snapshot(pool).unwrap().liquidity, 14_000);
+    }
+
+    /// An out-of-range position changes the tick LADDER, not in-range
+    /// liquidity. Applying it would corrupt the live value.
+    #[test]
+    fn a_position_outside_the_current_tick_does_not_change_liquidity() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(3);
+        ls.anchor_cl(pool, U256::from(1u64), 10_000, 0);
+        ls.apply_log(&liquidity_log(pool, true, 500, 900, 4_000, 100, 0));
+        assert_eq!(
+            ls.cl_snapshot(pool).unwrap().liquidity,
+            10_000,
+            "out-of-range liquidity must not move the in-range value"
+        );
+    }
+
+    /// UniV3 ranges are [lower, upper): a position starting exactly at the
+    /// current tick is in range; one ending there is not.
+    #[test]
+    fn range_bounds_follow_the_half_open_convention() {
+        let ls = LiveState::new();
+        let a = Address::from_low_u64_be(4);
+        ls.anchor_cl(a, U256::from(1u64), 10_000, 100);
+        ls.apply_log(&liquidity_log(a, true, 100, 200, 1_000, 100, 0));
+        assert_eq!(ls.cl_snapshot(a).unwrap().liquidity, 11_000, "lower bound is inclusive");
+
+        let b = Address::from_low_u64_be(5);
+        ls.anchor_cl(b, U256::from(1u64), 10_000, 200);
+        ls.apply_log(&liquidity_log(b, true, 100, 200, 1_000, 100, 1));
+        assert_eq!(ls.cl_snapshot(b).unwrap().liquidity, 10_000, "upper bound is exclusive");
+    }
+
+    /// A position change on a pool we have never seen has no base to apply to.
+    /// Inventing one would fabricate state.
+    #[test]
+    fn a_liquidity_event_for_an_unknown_pool_is_not_applied() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(6);
+        assert_eq!(
+            ls.apply_log(&liquidity_log(pool, true, -100, 100, 4_000, 100, 0)),
+            ApplyOutcome::NotStateBearing
+        );
+        assert!(ls.cl_snapshot(pool).is_none());
     }
 
     #[test]

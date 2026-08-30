@@ -67,6 +67,8 @@ pub fn monitored_topics() -> Vec<H256> {
         *TOPIC_SOLIDLY_SYNC,
         *TOPIC_SOLIDLY_SWAP,
         *TOPIC_CL_SWAP,
+        *TOPIC_CL_MINT,
+        *TOPIC_CL_BURN,
     ]
 }
 
@@ -82,6 +84,73 @@ pub fn monitored_topics() -> Vec<H256> {
 /// that some venue is emitting something we do not understand.
 pub fn is_known_non_state_topic(topic: &H256) -> bool {
     topic == &*TOPIC_V2_SWAP || topic == &*TOPIC_SOLIDLY_SWAP
+}
+
+
+/// `Mint(address sender, address indexed owner, int24 indexed tickLower,
+///       int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1)`
+///
+/// UniV3 and Slipstream. Adds liquidity to a range.
+pub static TOPIC_CL_MINT: LazyLock<H256> = LazyLock::new(|| {
+    topic_of("Mint(address,address,int24,int24,uint128,uint256,uint256)")
+});
+
+/// `Burn(address indexed owner, int24 indexed tickLower, int24 indexed tickUpper,
+///       uint128 amount, uint256 amount0, uint256 amount1)`
+///
+/// Removes liquidity from a range.
+///
+/// Measured need: with `Swap` alone, local `liquidity` went stale whenever a
+/// position changed. Two of 48 CL observations diverged by +8656 and +1314 bps
+/// on liquidity while price and tick stayed exact — traced to `Burn`s landing
+/// later in the same block as the observed `Swap`.
+pub static TOPIC_CL_BURN: LazyLock<H256> =
+    LazyLock::new(|| topic_of("Burn(address,int24,int24,uint128,uint256,uint256)"));
+
+/// A position change: how much liquidity moved, and over which tick range.
+///
+/// This is PRICING state. It deliberately carries no `amount0`/`amount1`:
+/// balances are RPC-anchored, never log-derived (spec §3.2.1), because
+/// `Collect`, `CollectProtocol`, `Flash` and plain ERC-20 transfers also move
+/// them — and a direct transfer emits no pool event at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClLiquidityDelta {
+    pub tick_lower: i32,
+    pub tick_upper: i32,
+    /// Positive for `Mint`, negative for `Burn`.
+    pub liquidity_delta: i128,
+}
+
+/// Sign-extend an indexed `int24` topic word to `i32`.
+fn topic_to_i32(t: &H256) -> i32 {
+    word_to_i32(t.0)
+}
+
+/// Decode a `Mint` or `Burn` into a signed liquidity delta over a tick range.
+///
+/// `tickLower`/`tickUpper` are INDEXED, so they arrive in `topics[2]`/
+/// `topics[3]`, not the payload. Reading them from data would yield garbage
+/// ranges that still parse.
+///
+/// The `amount` offset differs between the two: `Burn`'s payload starts with
+/// `amount`, while `Mint`'s starts with the non-indexed `sender`.
+pub fn decode_cl_liquidity(log: &Log) -> Option<ClLiquidityDelta> {
+    let topic = log.topics.first()?;
+    let is_mint = topic == &*TOPIC_CL_MINT;
+    if !is_mint && topic != &*TOPIC_CL_BURN {
+        return None;
+    }
+    let tick_lower = topic_to_i32(log.topics.get(2)?);
+    let tick_upper = topic_to_i32(log.topics.get(3)?);
+    // Mint: [sender, amount, amount0, amount1]; Burn: [amount, amount0, amount1].
+    let amount_word = if is_mint { 1 } else { 0 };
+    let amount = U256::from_big_endian(&word(&log.data, amount_word)?);
+    let amount = i128::try_from(amount.as_u128()).ok()?;
+    Some(ClLiquidityDelta {
+        tick_lower,
+        tick_upper,
+        liquidity_delta: if is_mint { amount } else { -amount },
+    })
 }
 
 /// The `index`-th 32-byte ABI word of `data`, or `None` if it is not there.
@@ -238,6 +307,106 @@ mod tests {
         let mut log = log_with(*TOPIC_V2_SYNC, words(&[1, 2]));
         log.topics.clear();
         assert!(decode_v2_sync(&log).is_none());
+    }
+
+    #[test]
+    fn liquidity_event_topics_match_their_signatures() {
+        assert_eq!(
+            *TOPIC_CL_MINT,
+            topic_of("Mint(address,address,int24,int24,uint128,uint256,uint256)")
+        );
+        assert_eq!(
+            *TOPIC_CL_BURN,
+            topic_of("Burn(address,int24,int24,uint128,uint256,uint256)")
+        );
+        assert_eq!(
+            format!("{:#x}", *TOPIC_CL_MINT),
+            "0x7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde"
+        );
+        assert_eq!(
+            format!("{:#x}", *TOPIC_CL_BURN),
+            "0x0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c"
+        );
+    }
+
+    /// tickLower and tickUpper are INDEXED, so they live in topics[2] and
+    /// topics[3], not in the data. Reading them from the payload would silently
+    /// produce garbage ranges.
+    fn liquidity_log(topic: H256, lower: i32, upper: i32, amount: u128, data_words: usize) -> Log {
+        let enc = |v: i32| {
+            let mut w = [0u8; 32];
+            let bytes = (v as i64).to_be_bytes();
+            let fill = if v < 0 { 0xffu8 } else { 0x00u8 };
+            for b in w.iter_mut().take(24) {
+                *b = fill;
+            }
+            w[24..].copy_from_slice(&bytes);
+            H256(w)
+        };
+        // Mint's payload leads with `amount` for Burn but `sender`+`amount` for
+        // Mint; `data_words` selects which layout to build.
+        let mut data = Vec::new();
+        if data_words == 3 {
+            // Burn: amount, amount0, amount1
+            let mut w = [0u8; 32];
+            w[16..].copy_from_slice(&amount.to_be_bytes());
+            data.extend_from_slice(&w);
+            data.extend_from_slice(&[0u8; 64]);
+        } else {
+            // Mint: sender, amount, amount0, amount1
+            data.extend_from_slice(&[0u8; 32]);
+            let mut w = [0u8; 32];
+            w[16..].copy_from_slice(&amount.to_be_bytes());
+            data.extend_from_slice(&w);
+            data.extend_from_slice(&[0u8; 64]);
+        }
+        Log {
+            address: Address::from_low_u64_be(1),
+            topics: vec![topic, H256::zero(), enc(lower), enc(upper)],
+            data: Bytes::from(data),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn decodes_a_mint_as_a_positive_liquidity_delta() {
+        let log = liquidity_log(*TOPIC_CL_MINT, -100, 100, 5_000, 4);
+        let d = decode_cl_liquidity(&log).expect("should decode");
+        assert_eq!(d.tick_lower, -100);
+        assert_eq!(d.tick_upper, 100);
+        assert_eq!(d.liquidity_delta, 5_000i128);
+    }
+
+    #[test]
+    fn decodes_a_burn_as_a_negative_liquidity_delta() {
+        let log = liquidity_log(*TOPIC_CL_BURN, -100, 100, 5_000, 3);
+        let d = decode_cl_liquidity(&log).expect("should decode");
+        assert_eq!(d.liquidity_delta, -5_000i128, "a burn removes liquidity");
+    }
+
+    /// Real Base values: block 0x304cfed carried Burns at ticks
+    /// 0xfffd1520 / 0xfffd15e8, both negative.
+    #[test]
+    fn decodes_negative_tick_bounds_from_topics() {
+        let log = liquidity_log(*TOPIC_CL_BURN, -191_200, -191_000, 1, 3);
+        let d = decode_cl_liquidity(&log).expect("should decode");
+        assert_eq!(d.tick_lower, -191_200);
+        assert_eq!(d.tick_upper, -191_000);
+    }
+
+    #[test]
+    fn liquidity_decoder_refuses_a_foreign_topic() {
+        let log = liquidity_log(*TOPIC_CL_SWAP, -100, 100, 5_000, 3);
+        assert!(decode_cl_liquidity(&log).is_none());
+    }
+
+    /// Indexed ticks live in topics; too few topics means we cannot know the
+    /// range and must decline rather than guess.
+    #[test]
+    fn liquidity_decoder_refuses_missing_topics() {
+        let mut log = liquidity_log(*TOPIC_CL_MINT, -100, 100, 5_000, 4);
+        log.topics.truncate(2);
+        assert!(decode_cl_liquidity(&log).is_none());
     }
 
     #[test]
