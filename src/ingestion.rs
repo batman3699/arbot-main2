@@ -317,6 +317,8 @@ where
                         m.continuity_breaks.inc();
                     }
                 }
+                // Expected traffic, not a coverage gap — see is_known_non_state_topic.
+                ApplyOutcome::NotStateBearing => {}
                 ApplyOutcome::Duplicate => {}
             }
         }

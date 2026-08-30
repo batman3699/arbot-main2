@@ -107,6 +107,12 @@ pub enum ApplyOutcome {
     Applied { pool: Address, version: u64 },
     Duplicate,
     ContinuityBroken(BreakReason),
+    /// A topic we subscribe to but intentionally carry no decoder for — a
+    /// V2/Solidly `Swap`, whose paired `Sync` already carries full state.
+    /// Expected traffic, NOT a gap in coverage.
+    NotStateBearing,
+    /// A topic no decoder recognises. This one is a real signal: some venue is
+    /// emitting something we do not understand.
     Undecodable,
 }
 
@@ -299,6 +305,14 @@ impl LiveState {
             return ApplyOutcome::Applied { pool, version };
         }
 
+        if log
+            .topics
+            .first()
+            .map(crate::log_decode::is_known_non_state_topic)
+            .unwrap_or(false)
+        {
+            return ApplyOutcome::NotStateBearing;
+        }
         ApplyOutcome::Undecodable
     }
 }
@@ -450,6 +464,30 @@ mod tests {
         log.topics = vec![H256::zero()];
         assert_eq!(ls.apply_log(&log), ApplyOutcome::Undecodable);
         assert!(ls.drain_dirty().is_empty());
+    }
+
+    /// A V2 Swap is subscribed-to but has no payload decoder, because its
+    /// paired Sync already carries complete reserves. It must NOT count as
+    /// undecodable, or the metric that warns about unknown venues is drowned
+    /// by expected traffic.
+    #[test]
+    fn a_v2_swap_is_not_state_bearing_rather_than_undecodable() {
+        use crate::log_decode::TOPIC_V2_SWAP;
+        let ls = LiveState::new();
+        let mut log = sync_log(Address::from_low_u64_be(5), 1, 2, 100, 0);
+        log.topics = vec![*TOPIC_V2_SWAP];
+        assert_eq!(ls.apply_log(&log), ApplyOutcome::NotStateBearing);
+        assert!(ls.drain_dirty().is_empty(), "no state, so nothing to re-price");
+    }
+
+    /// A genuinely unknown topic still reports Undecodable — that signal must
+    /// survive.
+    #[test]
+    fn an_unrecognised_topic_is_still_undecodable() {
+        let ls = LiveState::new();
+        let mut log = sync_log(Address::from_low_u64_be(6), 1, 2, 100, 0);
+        log.topics = vec![H256::repeat_byte(0xAB)];
+        assert_eq!(ls.apply_log(&log), ApplyOutcome::Undecodable);
     }
 
     #[test]

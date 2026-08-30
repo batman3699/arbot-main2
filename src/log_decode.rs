@@ -70,6 +70,20 @@ pub fn monitored_topics() -> Vec<H256> {
     ]
 }
 
+/// Topics we subscribe to but deliberately do NOT decode a payload from.
+///
+/// A V2/Solidly `Swap` is redundant for state purposes: the pool emits a
+/// `Sync` in the same transaction carrying COMPLETE reserves, so the Swap adds
+/// nothing a decoder could use. We still subscribe, because the log is what
+/// marks the pool dirty.
+///
+/// This is distinct from a topic we do not recognise at all. Conflating them
+/// makes `live_state_undecodable_total` useless for its actual job — warning
+/// that some venue is emitting something we do not understand.
+pub fn is_known_non_state_topic(topic: &H256) -> bool {
+    topic == &*TOPIC_V2_SWAP || topic == &*TOPIC_SOLIDLY_SWAP
+}
+
 /// The `index`-th 32-byte ABI word of `data`, or `None` if it is not there.
 pub fn word(data: &[u8], index: usize) -> Option<[u8; 32]> {
     let start = index.checked_mul(32)?;
@@ -175,6 +189,18 @@ mod tests {
             out.extend_from_slice(&w);
         }
         out
+    }
+
+    #[test]
+    fn swap_topics_are_known_but_not_state_bearing() {
+        assert!(is_known_non_state_topic(&TOPIC_V2_SWAP));
+        assert!(is_known_non_state_topic(&TOPIC_SOLIDLY_SWAP));
+        assert!(
+            !is_known_non_state_topic(&TOPIC_V2_SYNC),
+            "Sync carries state and must be decoded"
+        );
+        assert!(!is_known_non_state_topic(&TOPIC_CL_SWAP));
+        assert!(!is_known_non_state_topic(&H256::repeat_byte(0xAB)));
     }
 
     #[test]
