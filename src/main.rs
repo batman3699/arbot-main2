@@ -12838,6 +12838,34 @@ async fn launch_chain_runtime(
                             "live-state shadow mode enabled; state is recorded and measured, \
                              never priced"
                         );
+                        // Validation runs off the hot path (spec 4.5): it owns
+                        // its own RPC budget and the searcher never waits on it.
+                        let validation_live = Arc::clone(&live);
+                        let validation_provider = provider.clone();
+                        let validation_metrics = metrics.clone();
+                        let interval_secs =
+                            crate::util::env_parse_opt::<u64>("ARBOT_STATE_VALIDATION_SECS")
+                                .unwrap_or(15)
+                                .max(1);
+                        spawn_supervised(
+                            "state_validation",
+                            cfg.name.clone(),
+                            metrics.clone(),
+                            move || {
+                                let live = Arc::clone(&validation_live);
+                                let provider = validation_provider.clone();
+                                let metrics = validation_metrics.clone();
+                                async move {
+                                    crate::state_validation::run_state_validation(
+                                        provider,
+                                        live,
+                                        metrics,
+                                        Duration::from_secs(interval_secs),
+                                    )
+                                    .await;
+                                }
+                            },
+                        );
                         monitor.with_live_state(live)
                     } else {
                         monitor
