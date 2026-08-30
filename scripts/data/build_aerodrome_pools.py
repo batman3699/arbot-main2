@@ -31,11 +31,15 @@ def _resolve_rpc_url():
         first = urls.split(",")[0].strip()
         if first:
             return first
+    key = os.environ.get("BLOCKPI_KEY", "").strip()
+    if key:
+        return f"https://base.blockpi.network/v1/rpc/{key}"
     key = os.environ.get("ALCHEMY_KEY", "").strip()
     if key:
         return f"https://base-mainnet.g.alchemy.com/v2/{key}"
     print(
-        "FATAL: set BASE_RPC_URL (or BASE_RPC_URLS, or ALCHEMY_KEY) to a Base RPC endpoint",
+        "FATAL: set BASE_RPC_URL (or BASE_RPC_URLS, BLOCKPI_KEY, or ALCHEMY_KEY) "
+        "to a Base RPC endpoint",
         file=sys.stderr,
     )
     sys.exit(2)
