@@ -211,6 +211,17 @@ impl LiveState {
         prov.trust
     }
 
+    /// Pools with a V2 snapshot. Validation candidates: a pool with no
+    /// snapshot has nothing to compare against.
+    pub fn tracked_v2(&self) -> Vec<Address> {
+        self.v2.iter().map(|e| *e.key()).collect()
+    }
+
+    /// Pools with a CL snapshot.
+    pub fn tracked_cl(&self) -> Vec<Address> {
+        self.cl.iter().map(|e| *e.key()).collect()
+    }
+
     pub fn v2_snapshot(&self, pool: Address) -> Option<V2Snapshot> {
         let entry = self.v2.get(&pool)?;
         let mut snap = (**entry).clone();
@@ -488,6 +499,22 @@ mod tests {
         let mut log = sync_log(Address::from_low_u64_be(6), 1, 2, 100, 0);
         log.topics = vec![H256::repeat_byte(0xAB)];
         assert_eq!(ls.apply_log(&log), ApplyOutcome::Undecodable);
+    }
+
+    #[test]
+    fn tracked_lists_only_pools_with_snapshots() {
+        let ls = LiveState::new();
+        assert!(ls.tracked_v2().is_empty());
+        assert!(ls.tracked_cl().is_empty());
+
+        let v2 = Address::from_low_u64_be(1);
+        ls.apply_log(&sync_log(v2, 10, 20, 100, 0));
+
+        assert_eq!(ls.tracked_v2(), vec![v2]);
+        assert!(
+            ls.tracked_cl().is_empty(),
+            "a V2 pool must not appear in the CL list"
+        );
     }
 
     #[test]
