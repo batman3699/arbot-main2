@@ -763,9 +763,17 @@ this guard protects.
   subscription connected with 683 pools (pre-repartition count) and reverted to
   23 after five minutes,
   because the univ2 hot-pool refresh calls `set_pools` with a set rebuilt from
-  scratch. Fixed structurally (`PoolMonitor::with_sticky_pools`), but any future
-  caller that constructs a monitored set from one source must be checked against
-  this.
+  scratch. Fixed structurally (`PoolMonitor::with_sticky_pools`) and verified
+  over a 36-minute run: 8 connects, all at 683 pools, across 7 consecutive
+  refreshes. Any future caller that constructs a monitored set from one source
+  must still be checked against this.
+- **The state gate produced ZERO verdicts in Phase 1, and that is not a pass.**
+  Nothing calls `StateGate::record()` — the background anchor task is Phase 2's
+  to build. So `trusted()` returns false for every pool (correct fail-closed
+  behaviour) and the shadow runs measured decode correctness only, NOT whether
+  log-derived state agrees with the chain. The §9 Phase 2 gate
+  (per-venue p99 `relative_delta_bps` <= 5) therefore has **no data yet**;
+  wiring the anchor task is the first thing Phase 2 must do.
 - `loom` as a dev-dependency is a new dep. If declined, the fallback is a
   `std::sync::Barrier` forcing the known interleaving plus the stress test —
   which proves the one race we thought of, not the absence of races.
