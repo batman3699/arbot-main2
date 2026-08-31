@@ -12828,7 +12828,19 @@ async fn launch_chain_runtime(
                 metrics.clone(),
             ) {
                 Ok(monitor) => {
+                    let chaos_gap = std::env::var("CHAOS_WS_GAP_SECS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .filter(|s| *s > 0)
+                        .map(Duration::from_secs);
+                    if let Some(d) = chaos_gap {
+                        warn!(
+                            secs = d.as_secs(),
+                            "CHAOS_WS_GAP_SECS set; forcing websocket gaps. Test harness only"
+                        );
+                    }
                     let monitor = monitor
+                        .with_chaos_gap(chaos_gap)
                         .with_sticky_pools(cl_pools)
                         // Without this the monitor can never rebuild a dead
                         // socket; BlockPI closes them every 30 minutes.
@@ -13590,6 +13602,16 @@ fn validate_global_config() -> Result<()> {
         {
             return Err(anyhow!(
                 "production mode rejected CHAOS_DISABLE_WS=true"
+            ));
+        }
+        if std::env::var("CHAOS_WS_GAP_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|s| s > 0)
+        {
+            return Err(anyhow!(
+                "production mode rejected CHAOS_WS_GAP_SECS; it deliberately \
+                 discards websocket coverage"
             ));
         }
     }

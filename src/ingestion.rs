@@ -251,6 +251,13 @@ where
     /// once that socket dies, resubscribing on it can never succeed.
     ws_endpoints: Vec<String>,
     ws_backoff: Duration,
+    /// Test-only: force a websocket gap on this interval.
+    ///
+    /// Real gaps follow pool-list churn, so they arrive on the market's
+    /// schedule, not ours -- 3 in one 15-minute run, 1 in the next, and that
+    /// one 29 seconds before shutdown. That is not enough to exercise the
+    /// post-gap recovery path deliberately. Rejected in production mode.
+    chaos_gap_interval: Option<Duration>,
     /// Pools that survive every `set_pools`.
     ///
     /// The univ2 hot-pool refresh rebuilds the monitored set from scratch and
@@ -294,6 +301,7 @@ where
             sticky_pools: Vec::new(),
             ws_endpoints: Vec::new(),
             ws_backoff: Duration::from_secs(5),
+            chaos_gap_interval: None,
         })
     }
 
@@ -327,6 +335,13 @@ where
     pub fn with_ws_reconnect(mut self, endpoints: Vec<String>, backoff: Duration) -> Self {
         self.ws_endpoints = endpoints;
         self.ws_backoff = backoff;
+        self
+    }
+
+    /// Force a websocket gap every `interval`, exercising the real teardown
+    /// path rather than a synthetic one. Test harness only.
+    pub fn with_chaos_gap(mut self, interval: Option<Duration>) -> Self {
+        self.chaos_gap_interval = interval;
         self
     }
 
@@ -450,6 +465,14 @@ where
                     self.ws_warned.store(false, Ordering::Relaxed);
                     info!(pools = pools.len(), "pool monitor websocket connected");
                     let connected_at = std::time::Instant::now();
+                    // Held across the inner loop on purpose: `select!` rebuilds
+                    // its branch futures every iteration, so a `sleep` here
+                    // would restart on each event and never fire on a busy
+                    // feed. An `Interval` keeps its own schedule.
+                    let mut chaos_tick = self.chaos_gap_interval.map(interval);
+                    if let Some(t) = chaos_tick.as_mut() {
+                        t.tick().await; // the first tick is immediate; discard it
+                    }
                     let mut last_event = connected_at;
                     let mut events_seen: u64 = 0;
                     let mut silence_warned = false;
@@ -469,6 +492,20 @@ where
                                         break;
                                     }
                                 }
+                            }
+                            _ = async {
+                                match chaos_tick.as_mut() {
+                                    Some(t) => {
+                                        t.tick().await;
+                                    }
+                                    None => std::future::pending::<()>().await,
+                                }
+                            } => {
+                                warn!("chaos: forcing a websocket gap");
+                                // The socket is healthy; we are only exercising
+                                // the gap path, not simulating a dead transport.
+                                ws_provider = Some(provider.clone());
+                                break;
                             }
                             _ = self.pool_updates.notified() => {
                                 warn!("pool list updated; resubscribing websocket filter");
@@ -1420,6 +1457,33 @@ mod tests {
             build().with_ws_reconnect(vec!["wss://example.invalid".into()], Duration::from_secs(5));
         assert_eq!(reconnectable.ws_endpoints.len(), 1);
         assert_eq!(reconnectable.ws_backoff, Duration::from_secs(5));
+    }
+
+    /// The chaos knob must be inert unless explicitly set, and must be a real
+    /// interval rather than a `sleep` in the `select!` -- `select!` rebuilds its
+    /// branch futures each iteration, so a sleep would restart on every event
+    /// and never fire on a busy feed, which is exactly the feed we need it on.
+    #[test]
+    fn the_chaos_gap_knob_is_off_by_default() {
+        let build = || {
+            PoolMonitor::new(
+                Arc::new(Provider::new(MockProvider::default())),
+                None,
+                vec![monitored(1)],
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+                None,
+            )
+            .expect("monitor should construct")
+        };
+        assert!(build().chaos_gap_interval.is_none());
+        assert!(build().with_chaos_gap(None).chaos_gap_interval.is_none());
+        assert_eq!(
+            build()
+                .with_chaos_gap(Some(Duration::from_secs(30)))
+                .chaos_gap_interval,
+            Some(Duration::from_secs(30))
+        );
     }
 
     /// A subscription gap orphans local state, and nothing detected it.
