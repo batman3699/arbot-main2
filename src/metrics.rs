@@ -40,6 +40,9 @@ pub struct Metrics {
     /// a venue is emitting something we do not understand — most likely
     /// PancakeSwap V3, which is deliberately not decoded.
     pub live_state_undecodable: Counter,
+    /// Mint/Burn deltas dropped because the pool's base snapshot was
+    /// invalidated by a websocket gap. The running cost of every gap.
+    pub live_state_untrusted_base: Counter,
     /// Reorgs and out-of-order logs. Frequent breaks invalidate the
     /// lossless-dirty-set argument.
     pub continuity_breaks: Counter,
@@ -193,6 +196,14 @@ impl Metrics {
         registry
             .register(Box::new(ingestion_ws_events.clone()))
             .context("register ingestion_ws_events_total counter")?;
+
+        let live_state_untrusted_base = Counter::with_opts(Opts::new(
+            "live_state_untrusted_base_total",
+            "Liquidity deltas dropped because the base snapshot was invalidated by a gap",
+        ))?;
+        registry
+            .register(Box::new(live_state_untrusted_base.clone()))
+            .context("register live_state_untrusted_base_total counter")?;
 
         let ingestion_ws_stalls = Counter::with_opts(Opts::new(
             "ingestion_ws_stalls_total",
@@ -641,6 +652,7 @@ impl Metrics {
             win_rate,
             ingestion_ws_events,
             ingestion_ws_stalls,
+            live_state_untrusted_base,
             live_state_applied,
             live_state_undecodable,
             continuity_breaks,

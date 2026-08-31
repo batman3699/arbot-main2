@@ -134,6 +134,9 @@ pub enum ApplyOutcome {
     /// V2/Solidly `Swap`, whose paired `Sync` already carries full state.
     /// Expected traffic, NOT a gap in coverage.
     NotStateBearing,
+    /// A delta arrived for a pool whose base snapshot is no longer trusted.
+    /// Dropped rather than applied: see the guard in the Mint/Burn path.
+    UntrustedBase,
     /// A topic no decoder recognises. This one is a real signal: some venue is
     /// emitting something we do not understand.
     Undecodable,
@@ -363,6 +366,20 @@ impl LiveState {
                 // state; the pool stays unknown until an anchor or a Swap.
                 return ApplyOutcome::NotStateBearing;
             };
+            // A delta is only meaningful on a base we still trust. After a
+            // continuity break the previous value silently missed whatever
+            // landed in the gap, and adding to it would launder an invalidated
+            // snapshot straight back to `Derived` -- the epoch stamp would be
+            // current while the number underneath it is not. Only an absolute
+            // write (a Swap, or an anchor) can restore trust after a gap.
+            //
+            // Same principle as the missing-base check above, which was already
+            // handled; this is the untrusted-base case, which was not. It is
+            // why the Liquidity path diverged after every gap while the Swap
+            // path, which overwrites `liquidity` outright, never did.
+            if !may_price_locally(&self.resolve_trust(&existing.prov)) {
+                return ApplyOutcome::UntrustedBase;
+            }
             // UniV3 ranges are half-open: [tickLower, tickUpper).
             let in_range = d.tick_lower <= existing.tick && existing.tick < d.tick_upper;
             if !in_range {
@@ -530,6 +547,54 @@ mod tests {
         assert!(ls.drain_dirty().is_empty(), "a duplicate must not re-dirty");
     }
 
+    /// The gap fix was necessary but not sufficient. `break_continuity` marks
+    /// every snapshot untrusted, but the Mint/Burn path read the old value
+    /// anyway and republished the sum under the CURRENT epoch — laundering an
+    /// invalidated number straight back to `Derived`. Observed 2026-08-31: two
+    /// Liquidity-sourced divergences appeared within two minutes of a gap, both
+    /// reporting `Derived`, both LOW, while the Swap path stayed exact because
+    /// it overwrites instead of accumulating.
+    #[test]
+    fn a_delta_is_never_applied_onto_an_invalidated_base() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(11);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        assert!(may_price_locally(&ls.cl_snapshot(pool).unwrap().prov.trust));
+
+        ls.break_continuity(UnknownReason::WsUnavailable);
+
+        // An in-range Mint that would previously have been absorbed silently.
+        let outcome = ls.apply_log(&liquidity_log(pool, true, -60, 60, 500_000, 101, 0));
+        assert_eq!(
+            outcome,
+            ApplyOutcome::UntrustedBase,
+            "adding to a value that missed the gap produces a confident wrong answer"
+        );
+        let snap = ls.cl_snapshot(pool).unwrap();
+        assert_eq!(snap.liquidity, 1_000_000, "the base must not have moved");
+        assert!(
+            !may_price_locally(&snap.prov.trust),
+            "and it must still be untrusted; only an absolute write restores trust"
+        );
+    }
+
+    /// The other half: an absolute write DOES restore trust after a gap,
+    /// otherwise the pool could never recover without an anchor.
+    #[test]
+    fn an_absolute_write_restores_trust_after_a_gap() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(12);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.break_continuity(UnknownReason::WsUnavailable);
+        assert!(!may_price_locally(&ls.cl_snapshot(pool).unwrap().prov.trust));
+
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 2_000_000, 0, 101, 0));
+
+        let snap = ls.cl_snapshot(pool).unwrap();
+        assert!(may_price_locally(&snap.prov.trust));
+        assert_eq!(snap.liquidity, 2_000_000);
+    }
+
     /// One atomic increment invalidates every extant snapshot — no map sweep,
     /// which is what lets the searcher keep running during recovery.
     #[test]
@@ -610,6 +675,41 @@ mod tests {
             ls.tracked_cl().is_empty(),
             "a V2 pool must not appear in the CL list"
         );
+    }
+
+    fn cl_swap_log(
+        pool: Address,
+        sqrt_p: u128,
+        liquidity: u128,
+        tick: i32,
+        block: u64,
+        li: u64,
+    ) -> Log {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0u8; 32]); // amount0
+        data.extend_from_slice(&[0u8; 32]); // amount1
+        for v in [sqrt_p, liquidity] {
+            let mut w = [0u8; 32];
+            w[16..].copy_from_slice(&v.to_be_bytes());
+            data.extend_from_slice(&w);
+        }
+        let mut w = [0u8; 32];
+        let fill = if tick < 0 { 0xffu8 } else { 0x00u8 };
+        for b in w.iter_mut().take(28) {
+            *b = fill;
+        }
+        w[28..].copy_from_slice(&tick.to_be_bytes());
+        data.extend_from_slice(&w);
+        Log {
+            address: pool,
+            topics: vec![*TOPIC_CL_SWAP],
+            data: Bytes::from(data),
+            block_number: Some(block.into()),
+            transaction_index: Some(0u64.into()),
+            log_index: Some(li.into()),
+            removed: Some(false),
+            ..Default::default()
+        }
     }
 
     fn liquidity_log(pool: Address, mint: bool, lower: i32, upper: i32, amount: u128, block: u64, li: u64) -> Log {
