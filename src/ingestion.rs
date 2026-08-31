@@ -72,6 +72,62 @@ pub(crate) fn should_warn_silent(events: u64, connected_for: Duration) -> bool {
     events == 0 && connected_for >= SILENT_SUBSCRIPTION_GRACE
 }
 
+/// How long a subscription that WAS delivering may go quiet before the socket
+/// is presumed half-open and replaced.
+///
+/// A websocket can stop delivering without ever closing: no error, no `None`
+/// from the stream, just silence. On 2026-08-31 a feed did exactly that and the
+/// process sat there for 12 hours believing it was live. Every reconnect path
+/// in this file keys off the stream ENDING, so none of them could fire.
+const SUBSCRIPTION_STALL_LIMIT: Duration = Duration::from_secs(90);
+
+/// How often the idle timer wakes to evaluate the above. Bounds detection
+/// latency to `SUBSCRIPTION_STALL_LIMIT + SUBSCRIPTION_IDLE_TICK`.
+const SUBSCRIPTION_IDLE_TICK: Duration = Duration::from_secs(15);
+
+/// `newHeads` is the strongest liveness signal available: blocks arrive on a
+/// schedule whether or not the market is busy, so silence here is never
+/// explained by a quiet market. Generous enough for slow chains; on Base
+/// (~2s blocks) this is thirty missed blocks.
+const NEWHEADS_STALL_LIMIT: Duration = Duration::from_secs(60);
+
+/// What the idle timer should do when it fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdleAction {
+    /// Nothing is wrong yet.
+    Wait,
+    /// Connected but has never delivered anything. Warn; do NOT reconnect —
+    /// this is a filter that matches nothing, and a new socket would carry the
+    /// same filter and be just as deaf.
+    WarnNeverDelivered,
+    /// Was delivering and went quiet. Replace the socket.
+    Reconnect,
+}
+
+/// Distinguishes the two ways a subscription goes quiet.
+///
+/// `idle_for` is measured from the last event received, NOT from connect —
+/// measuring from connect is the bug this replaces, because it can only ever
+/// describe a subscription that was born silent.
+pub(crate) fn idle_action(
+    events_seen: u64,
+    idle_for: Duration,
+    connected_for: Duration,
+) -> IdleAction {
+    if events_seen == 0 {
+        return if should_warn_silent(events_seen, connected_for) {
+            IdleAction::WarnNeverDelivered
+        } else {
+            IdleAction::Wait
+        };
+    }
+    if idle_for >= SUBSCRIPTION_STALL_LIMIT {
+        IdleAction::Reconnect
+    } else {
+        IdleAction::Wait
+    }
+}
+
 pub(crate) fn pool_log_filter(pools: &[MonitoredPool]) -> Filter {
     Filter::new()
         .address(pools.iter().map(|p| p.pair).collect::<Vec<_>>())
@@ -279,6 +335,7 @@ where
                     self.ws_warned.store(false, Ordering::Relaxed);
                     info!(pools = pools.len(), "pool monitor websocket connected");
                     let connected_at = std::time::Instant::now();
+                    let mut last_event = connected_at;
                     let mut events_seen: u64 = 0;
                     let mut silence_warned = false;
                     loop {
@@ -287,6 +344,7 @@ where
                                 match log {
                                     Some(log) => {
                                         events_seen = events_seen.saturating_add(1);
+                                        last_event = std::time::Instant::now();
                                         if let Err(err) = self.handle_log(log).await {
                                             warn!(error = %err, "failed to refresh pool after ws event");
                                         }
@@ -301,17 +359,34 @@ where
                                 warn!("pool list updated; resubscribing websocket filter");
                                 break;
                             }
-                            _ = sleep(SILENT_SUBSCRIPTION_GRACE) => {
-                                if !silence_warned
-                                    && should_warn_silent(events_seen, connected_at.elapsed())
-                                {
-                                    silence_warned = true;
-                                    warn!(
-                                        pools = pools.len(),
-                                        connected_secs = connected_at.elapsed().as_secs(),
-                                        "pool monitor websocket connected but has received NO \
-                                         logs; check that the subscribed topics match the pools"
-                                    );
+                            _ = sleep(SUBSCRIPTION_IDLE_TICK) => {
+                                let idle = last_event.elapsed();
+                                match idle_action(events_seen, idle, connected_at.elapsed()) {
+                                    IdleAction::Wait => {}
+                                    IdleAction::WarnNeverDelivered => {
+                                        if !silence_warned {
+                                            silence_warned = true;
+                                            warn!(
+                                                pools = pools.len(),
+                                                connected_secs = connected_at.elapsed().as_secs(),
+                                                "pool monitor websocket connected but has received NO \
+                                                 logs; check that the subscribed topics match the pools"
+                                            );
+                                        }
+                                    }
+                                    IdleAction::Reconnect => {
+                                        if let Some(metrics) = &self.metrics {
+                                            metrics.ingestion_ws_stalls.inc();
+                                        }
+                                        warn!(
+                                            pools = pools.len(),
+                                            idle_secs = idle.as_secs(),
+                                            events_seen,
+                                            "pool monitor websocket stalled; the socket never closed \
+                                             but stopped delivering. Reconnecting and resyncing"
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -797,7 +872,29 @@ pub async fn spawn_block_head_monitor<C>(
         match provider.subscribe_blocks().await {
             Ok(mut stream) => {
                 info!(chain = %chain_name, "newHeads block monitor connected");
-                while let Some(block) = stream.next().await {
+                loop {
+                    // Bounded, not `while let`: a half-open socket never yields
+                    // `None`, so an unbounded await parks forever and the
+                    // reconnect below is unreachable.
+                    let block = match timeout(NEWHEADS_STALL_LIMIT, stream.next()).await {
+                        Ok(Some(block)) => block,
+                        Ok(None) => {
+                            warn!(
+                                chain = %chain_name,
+                                "newHeads block monitor disconnected; reconnecting"
+                            );
+                            break;
+                        }
+                        Err(_) => {
+                            warn!(
+                                chain = %chain_name,
+                                stall_secs = NEWHEADS_STALL_LIMIT.as_secs(),
+                                "newHeads websocket stalled; blocks arrive on a schedule, so \
+                                 silence here means the socket is dead. Reconnecting"
+                            );
+                            break;
+                        }
+                    };
                     if let Some(number) = block.number {
                         if let Some(age_ms) = block_age_ms(block.timestamp) {
                             info!(
@@ -814,10 +911,6 @@ pub async fn spawn_block_head_monitor<C>(
                         });
                     }
                 }
-                warn!(
-                    chain = %chain_name,
-                    "newHeads block monitor disconnected; reconnecting"
-                );
             }
             Err(err) => {
                 if is_websocket_subscription_close(&err.to_string()) {
@@ -1271,6 +1364,58 @@ mod tests {
     #[test]
     fn a_busy_subscription_never_warns() {
         assert!(!should_warn_silent(1, Duration::from_secs(600)));
+    }
+
+    /// The shipped watchdog asked "has this subscription EVER delivered?".
+    /// On 2026-08-31 the feed delivered for 28 minutes and then went silent for
+    /// 12 hours; `events_seen` was in the thousands, so the watchdog stayed
+    /// mute and the reconnect path — which only runs when the stream ENDS —
+    /// was never reached. A half-open socket never ends.
+    #[test]
+    fn a_feed_that_delivered_and_then_went_quiet_reconnects() {
+        assert_eq!(
+            idle_action(5_000, Duration::from_secs(600), Duration::from_secs(1_800)),
+            IdleAction::Reconnect,
+            "this is the 12-hour silent stall; warning is not enough, the              socket has to be replaced"
+        );
+    }
+
+    #[test]
+    fn a_brief_quiet_spell_is_not_a_stall() {
+        assert_eq!(
+            idle_action(5_000, SUBSCRIPTION_STALL_LIMIT - Duration::from_secs(1), Duration::from_secs(1_800)),
+            IdleAction::Wait,
+            "a quiet market must not be mistaken for a dead socket"
+        );
+    }
+
+    /// A subscription that never delivered is a different fault: the filter
+    /// matches nothing. Reconnecting re-creates the same filter, so warning is
+    /// the correct response and reconnect-looping would be wrong.
+    #[test]
+    fn a_never_delivered_subscription_warns_rather_than_reconnecting() {
+        assert_eq!(
+            idle_action(0, Duration::from_secs(600), Duration::from_secs(600)),
+            IdleAction::WarnNeverDelivered
+        );
+    }
+
+    #[test]
+    fn a_young_silent_subscription_is_given_its_grace() {
+        assert_eq!(
+            idle_action(0, Duration::from_secs(5), Duration::from_secs(5)),
+            IdleAction::Wait
+        );
+    }
+
+    /// Idle time is measured from the last event, not from connect, so a
+    /// long-lived healthy feed is never reconnected for being old.
+    #[test]
+    fn a_long_lived_busy_feed_is_never_reconnected() {
+        assert_eq!(
+            idle_action(1_000_000, Duration::from_secs(0), Duration::from_secs(86_400)),
+            IdleAction::Wait
+        );
     }
 
     #[test]

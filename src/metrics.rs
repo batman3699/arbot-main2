@@ -29,6 +29,11 @@ pub struct Metrics {
     pub execution_latency_ms: Histogram,
     pub win_rate: Gauge,
     pub ingestion_ws_events: Counter,
+    /// Times a websocket that WAS delivering went silent past the stall limit
+    /// and had to be replaced. A socket can stop delivering without closing, so
+    /// this is the only counter that distinguishes "quiet market" from "dead
+    /// feed" -- alert on it.
+    pub ingestion_ws_stalls: Counter,
     /// Logs decoded and applied to live pool state (shadow mode).
     pub live_state_applied: Counter,
     /// Logs delivered that no known topic decoder handles. A large value means
@@ -188,6 +193,14 @@ impl Metrics {
         registry
             .register(Box::new(ingestion_ws_events.clone()))
             .context("register ingestion_ws_events_total counter")?;
+
+        let ingestion_ws_stalls = Counter::with_opts(Opts::new(
+            "ingestion_ws_stalls_total",
+            "Websocket subscriptions replaced after delivering nothing past the stall limit",
+        ))?;
+        registry
+            .register(Box::new(ingestion_ws_stalls.clone()))
+            .context("register ingestion_ws_stalls_total counter")?;
 
         let live_state_applied = Counter::with_opts(Opts::new(
             "live_state_applied_total",
@@ -627,6 +640,7 @@ impl Metrics {
             execution_latency_ms,
             win_rate,
             ingestion_ws_events,
+            ingestion_ws_stalls,
             live_state_applied,
             live_state_undecodable,
             continuity_breaks,
