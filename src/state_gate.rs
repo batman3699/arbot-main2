@@ -22,6 +22,23 @@ struct Verdict {
     checked_at: Instant,
 }
 
+/// How the tracked pool population currently splits.
+///
+/// Kept as three named counts rather than trusted/untrusted, because "not
+/// trusted right now" and "measured and wrong" are different facts and only the
+/// second is evidence about state quality.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GateStats {
+    /// Passing verdict, still inside its TTL.
+    pub trusted: usize,
+    /// Measured and diverged.
+    pub failed: usize,
+    /// Had a verdict, but it aged out. Says nothing about correctness.
+    pub expired: usize,
+    pub total: usize,
+}
+
 pub struct StateGate {
     verdicts: Mutex<HashMap<Address, Verdict>>,
     ttl: Duration,
@@ -136,17 +153,31 @@ impl StateGate {
         out
     }
 
-    /// (trusted, rejected, total tracked).
-    pub fn stats(&self) -> (usize, usize, usize) {
+    /// Partition of the tracked population.
+    ///
+    /// `failed` and `expired` are DISTINCT and must stay so. Deriving untrusted
+    /// as `total - trusted` conflated them, so a passing verdict that merely
+    /// aged out was reported as untrusted — which makes the §9 gate score
+    /// re-check latency as untrustworthiness. `trusted + failed + expired`
+    /// partitions `total` exactly.
+    pub fn stats(&self) -> GateStats {
         let Ok(guard) = self.verdicts.lock() else {
-            return (0, 0, 0);
+            return GateStats::default();
         };
-        let total = guard.len();
-        let trusted = guard
-            .values()
-            .filter(|v| v.trusted && v.checked_at.elapsed() < self.ttl)
-            .count();
-        (trusted, total.saturating_sub(trusted), total)
+        let mut s = GateStats {
+            total: guard.len(),
+            ..GateStats::default()
+        };
+        for v in guard.values() {
+            if v.checked_at.elapsed() >= self.ttl {
+                s.expired += 1;
+            } else if v.trusted {
+                s.trusted += 1;
+            } else {
+                s.failed += 1;
+            }
+        }
+        s
     }
 }
 
@@ -241,6 +272,48 @@ mod tests {
         let due = g.due_for_check((1..=20).map(addr));
         assert_eq!(due.len(), 8, "must respect checks_per_scan");
         assert!(!due.contains(&addr(1)));
+    }
+
+    /// `untrusted` must mean MEASURED AND FAILED. An earlier version derived it
+    /// as `total - trusted`, so a PASSING verdict that merely aged out counted
+    /// as untrusted — observed live as trusted falling 212 -> 166 over 22
+    /// minutes purely from expiry, while divergence was ~1.4%. Read that way,
+    /// the §9 gate scores re-check latency as untrustworthiness.
+    #[test]
+    fn an_expired_pass_is_expired_not_failed() {
+        let g = gate(5, 0); // ttl 0 => every verdict is immediately stale
+        g.record(addr(1), Some(0)); // a PASS
+        let s = g.stats();
+        assert_eq!(s.trusted, 0, "an expired verdict is not currently trusted");
+        assert_eq!(s.failed, 0, "but it did not fail — it aged out");
+        assert_eq!(s.expired, 1);
+        assert_eq!(s.total, 1);
+    }
+
+    #[test]
+    fn a_failing_verdict_counts_as_failed_not_expired() {
+        let g = gate(5, 300);
+        g.record(addr(1), Some(4_000));
+        let s = g.stats();
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.expired, 0);
+        assert_eq!(s.trusted, 0);
+    }
+
+    #[test]
+    fn stats_partition_the_tracked_population() {
+        let g = gate(5, 300);
+        g.record(addr(1), Some(0));
+        g.record(addr(2), Some(9_999));
+        let s = g.stats();
+        assert_eq!(s.trusted, 1);
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.expired, 0);
+        assert_eq!(
+            s.trusted + s.failed + s.expired,
+            s.total,
+            "the three buckets must partition the population exactly"
+        );
     }
 
     #[test]

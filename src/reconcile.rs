@@ -3,7 +3,7 @@
 //! Pure: no provider, no async. The RPC read happens in the validation task;
 //! this decides what the numbers mean.
 
-use crate::live_state::{ClSnapshot, TrustState, V2Snapshot};
+use crate::live_state::{ClSnapshot, SnapshotSource, TrustState, V2Snapshot};
 use crate::state_gate::divergence_bps;
 use ethers::types::U256;
 
@@ -26,6 +26,9 @@ pub struct Reconciliation {
     pub anchor_id: u64,
     pub continuity_epoch: u64,
     pub trust_state: TrustState,
+    /// Which event produced the local snapshot. Divergence following a `Swap`
+    /// is intra-block noise; following `Liquidity` it is our own arithmetic.
+    pub source: SnapshotSource,
     pub venue: &'static str,
 }
 
@@ -70,6 +73,7 @@ pub fn compare_v2(
         anchor_id: local.prov.anchor_id,
         continuity_epoch: local.prov.continuity_epoch,
         trust_state: local.prov.trust,
+        source: local.prov.source,
         venue: "v2",
     }
 }
@@ -98,6 +102,7 @@ pub fn compare_cl(local: &ClSnapshot, chain: &crate::cl_sim::ClPoolState) -> Rec
         anchor_id: local.prov.anchor_id,
         continuity_epoch: local.prov.continuity_epoch,
         trust_state: local.prov.trust,
+        source: local.prov.source,
         venue: "cl",
     }
 }
@@ -122,6 +127,7 @@ mod tests {
             }),
             anchored_at: Instant::now(),
             trust: TrustState::Derived,
+            source: SnapshotSource::Swap,
         }
     }
 

@@ -97,6 +97,7 @@ fn emit(rec: &Reconciliation, pool: Address, block: u64, metrics: Option<&Arc<Me
         anchor_id = rec.anchor_id,
         continuity_epoch = rec.continuity_epoch,
         trust_state = ?rec.trust_state,
+        source = ?rec.source,
         "state reconciliation"
     );
 }
@@ -204,9 +205,11 @@ where
     }
 
     if let Some(m) = metrics {
-        let (trusted, untrusted, _) = gate.stats();
-        m.live_state_trusted.set(trusted as f64);
-        m.live_state_untrusted.set(untrusted as f64);
+        let st = gate.stats();
+        m.live_state_trusted.set(st.trusted as f64);
+        // FAILED only. An expired pass is not evidence of anything wrong.
+        m.live_state_untrusted.set(st.failed as f64);
+        m.live_state_expired.set(st.expired as f64);
     }
     measured
 }
@@ -225,8 +228,15 @@ pub async fn run_state_validation<C>(
     loop {
         let measured = validate_once(&provider, &live, gate, metrics.as_ref()).await;
         if measured > 0 {
-            let (trusted, untrusted, total) = gate.stats();
-            debug!(measured, trusted, untrusted, total, "state validation pass");
+            let st = gate.stats();
+            debug!(
+                measured,
+                trusted = st.trusted,
+                failed = st.failed,
+                expired = st.expired,
+                total = st.total,
+                "state validation pass"
+            );
         }
         tokio::time::sleep(interval).await;
     }

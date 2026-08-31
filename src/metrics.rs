@@ -43,7 +43,12 @@ pub struct Metrics {
     /// Validation attempts by outcome: measured | unreachable | skipped_lag | no_ordinal.
     pub live_state_checks: CounterVec,
     pub live_state_trusted: Gauge,
+    /// MEASURED AND FAILED only. Not "everything that is not trusted" — an
+    /// expired pass is counted separately, because conflating them makes the
+    /// gate score re-check latency as untrustworthiness.
     pub live_state_untrusted: Gauge,
+    /// Had a verdict that aged out. Says nothing about correctness.
+    pub live_state_expired: Gauge,
     pub ingestion_poll_refresh: Counter,
     pub ingestion_stale_pools: Gauge,
     pub ingestion_active_pools: Gauge,
@@ -240,11 +245,19 @@ impl Metrics {
 
         let live_state_untrusted = Gauge::with_opts(Opts::new(
             "live_state_untrusted_pools",
-            "Pools tracked by the state gate that do not currently pass",
+            "Pools measured against the chain and found divergent",
         ))?;
         registry
             .register(Box::new(live_state_untrusted.clone()))
             .context("register live_state_untrusted_pools gauge")?;
+
+        let live_state_expired = Gauge::with_opts(Opts::new(
+            "live_state_expired_pools",
+            "Pools whose verdict aged out; says nothing about correctness",
+        ))?;
+        registry
+            .register(Box::new(live_state_expired.clone()))
+            .context("register live_state_expired_pools gauge")?;
 
         let ingestion_poll_refresh = Counter::with_opts(Opts::new(
             "ingestion_poll_refresh_total",
@@ -618,6 +631,7 @@ impl Metrics {
             live_state_checks,
             live_state_trusted,
             live_state_untrusted,
+            live_state_expired,
             ingestion_poll_refresh,
             ingestion_stale_pools,
             ingestion_active_pools,

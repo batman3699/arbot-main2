@@ -67,6 +67,27 @@ pub fn may_price_locally(trust: &TrustState) -> bool {
     }
 }
 
+/// Which event produced a snapshot.
+///
+/// The discriminator for liquidity drift. `Swap` carries the pool's post-swap
+/// liquidity outright, so a Swap-sourced snapshot is an authoritative reset
+/// point; a `Liquidity`-sourced one is our own arithmetic (previous + delta).
+/// Divergence following the first is intra-block noise we cannot fix; following
+/// the second it is our application being wrong. Without this the two are
+/// indistinguishable in the reconciliation record.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotSource {
+    /// RPC read — ground truth, no arithmetic.
+    Anchor,
+    /// Swap log: liquidity taken directly from the payload.
+    Swap,
+    /// Mint/Burn log: liquidity computed as previous + delta.
+    Liquidity,
+    /// V2 Sync: reserves taken directly from the payload.
+    Sync,
+}
+
 /// Where a snapshot came from and what lineage it belongs to.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
@@ -82,6 +103,8 @@ pub struct Provenance {
     pub ordinal: Option<Ordinal>,
     pub anchored_at: Instant,
     pub trust: TrustState,
+    /// Which event produced this snapshot — see [`SnapshotSource`].
+    pub source: SnapshotSource,
 }
 
 #[derive(Clone, Debug)]
@@ -156,7 +179,13 @@ impl LiveState {
         })
     }
 
-    fn provenance(&self, version: u64, ordinal: Option<Ordinal>, trust: TrustState) -> Provenance {
+    fn provenance(
+        &self,
+        version: u64,
+        ordinal: Option<Ordinal>,
+        trust: TrustState,
+        source: SnapshotSource,
+    ) -> Provenance {
         Provenance {
             state_version: version,
             anchor_id: self.next_anchor_id.load(Ordering::SeqCst),
@@ -164,6 +193,7 @@ impl LiveState {
             ordinal,
             anchored_at: Instant::now(),
             trust,
+            source,
         }
     }
 
@@ -239,7 +269,7 @@ impl LiveState {
     pub fn anchor_v2(&self, pool: Address, state: UniV2PairState) {
         let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
         self.next_anchor_id.fetch_add(1, Ordering::SeqCst);
-        let prov = self.provenance(version, None, TrustState::Anchored);
+        let prov = self.provenance(version, None, TrustState::Anchored, SnapshotSource::Anchor);
         self.v2.insert(pool, Arc::new(V2Snapshot { state, prov }));
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
@@ -247,7 +277,7 @@ impl LiveState {
     pub fn anchor_cl(&self, pool: Address, sqrt_price_x96: U256, liquidity: u128, tick: i32) {
         let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
         self.next_anchor_id.fetch_add(1, Ordering::SeqCst);
-        let prov = self.provenance(version, None, TrustState::Anchored);
+        let prov = self.provenance(version, None, TrustState::Anchored, SnapshotSource::Anchor);
         self.cl.insert(
             pool,
             Arc::new(ClSnapshot { sqrt_price_x96, liquidity, tick, prov }),
@@ -292,7 +322,8 @@ impl LiveState {
                 reserve0: d.reserve0,
                 reserve1: d.reserve1,
             };
-            let prov = self.provenance(version, Some(ordinal), TrustState::Derived);
+            let prov =
+                self.provenance(version, Some(ordinal), TrustState::Derived, SnapshotSource::Sync);
             self.v2.insert(pool, Arc::new(V2Snapshot { state, prov }));
             self.generation.fetch_add(1, Ordering::SeqCst);
             self.publish(pool, version);
@@ -321,7 +352,12 @@ impl LiveState {
             let updated = (existing.liquidity as i128).saturating_add(d.liquidity_delta);
             let liquidity = u128::try_from(updated.max(0)).unwrap_or(0);
             let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
-            let prov = self.provenance(version, Some(ordinal), TrustState::Derived);
+            let prov = self.provenance(
+                version,
+                Some(ordinal),
+                TrustState::Derived,
+                SnapshotSource::Liquidity,
+            );
             self.cl.insert(
                 pool,
                 Arc::new(ClSnapshot {
@@ -338,7 +374,8 @@ impl LiveState {
 
         if let Some(d) = decode_cl_swap(log) {
             let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
-            let prov = self.provenance(version, Some(ordinal), TrustState::Derived);
+            let prov =
+                self.provenance(version, Some(ordinal), TrustState::Derived, SnapshotSource::Swap);
             self.cl.insert(
                 pool,
                 Arc::new(ClSnapshot {
@@ -654,6 +691,37 @@ mod tests {
             ApplyOutcome::NotStateBearing
         );
         assert!(ls.cl_snapshot(pool).is_none());
+    }
+
+    /// The discriminator for liquidity drift. A Swap-sourced snapshot takes
+    /// liquidity straight from the payload — an authoritative reset. A
+    /// Liquidity-sourced one is our own arithmetic. Divergence following the
+    /// first is intra-block noise; following the second it is our bug. Without
+    /// the tag the two are indistinguishable in the reconciliation record.
+    #[test]
+    fn snapshots_record_which_event_produced_them() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(42);
+
+        ls.anchor_cl(pool, U256::from(1u64), 10_000, 0);
+        assert_eq!(
+            ls.cl_snapshot(pool).unwrap().prov.source,
+            SnapshotSource::Anchor
+        );
+
+        ls.apply_log(&liquidity_log(pool, true, -100, 100, 1_000, 100, 0));
+        assert_eq!(
+            ls.cl_snapshot(pool).unwrap().prov.source,
+            SnapshotSource::Liquidity,
+            "a Mint-derived snapshot is our arithmetic, not the chain's word"
+        );
+
+        let v2 = Address::from_low_u64_be(43);
+        ls.apply_log(&sync_log(v2, 1, 2, 101, 0));
+        assert_eq!(
+            ls.v2_snapshot(v2).unwrap().prov.source,
+            SnapshotSource::Sync
+        );
     }
 
     #[test]
