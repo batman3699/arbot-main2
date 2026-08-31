@@ -847,9 +847,13 @@ pub async fn spawn_pending_tx_monitor<C>(
         match provider.subscribe_pending_txs().await {
             Ok(mut sub) => {
                 info!("pending transaction monitor connected");
+                let connected_at = std::time::Instant::now();
+                let mut events_seen: u64 = 0;
+                let mut never_warned = false;
                 loop {
                     match next_before_stall!(sub, SUBSCRIPTION_STALL_LIMIT) {
                         StreamStep::Item(_) => {
+                            events_seen = events_seen.saturating_add(1);
                             if let Some(metrics) = &metrics {
                                 metrics.mempool_txs_observed.inc();
                             }
@@ -859,12 +863,32 @@ pub async fn spawn_pending_tx_monitor<C>(
                             break;
                         }
                         StreamStep::Stalled => {
-                            warn!(
-                                stall_secs = SUBSCRIPTION_STALL_LIMIT.as_secs(),
-                                "pending transaction subscription stalled; socket still open but \
-                                 delivering nothing. Reconnecting"
-                            );
-                            break;
+                            match idle_action(
+                                events_seen,
+                                SUBSCRIPTION_STALL_LIMIT,
+                                connected_at.elapsed(),
+                            ) {
+                                IdleAction::Reconnect => {
+                                    warn!(
+                                        stall_secs = SUBSCRIPTION_STALL_LIMIT.as_secs(),
+                                        events_seen,
+                                        "pending transaction subscription stalled; socket still \
+                                         open but stopped delivering. Reconnecting"
+                                    );
+                                    break;
+                                }
+                                IdleAction::WarnNeverDelivered => {
+                                    if !never_warned {
+                                        never_warned = true;
+                                        warn!(
+                                            "pending transaction subscription has delivered \
+                                             nothing since connect; not reconnecting, because a \
+                                             chain with no public pending pool will keep it empty"
+                                        );
+                                    }
+                                }
+                                IdleAction::Wait => {}
+                            }
                         }
                     }
                 }
@@ -1679,6 +1703,22 @@ mod tests {
             next_before_stall!(s, Duration::from_secs(30)),
             StreamStep::Item(7)
         );
+    }
+
+    /// Field-found 2026-08-31: Base routes through a sequencer with no public
+    /// pending pool, so its mempool subscription connects and delivers NOTHING,
+    /// forever. Treating that as a stall reconnected every 90 seconds in a loop
+    /// that could never terminate. Silence from birth is a different fault from
+    /// silence after delivery, and only the second one is fixed by a new socket.
+    #[test]
+    fn a_subscription_that_never_delivers_is_not_reconnected_forever() {
+        let hours = Duration::from_secs(6 * 3_600);
+        assert_eq!(
+            idle_action(0, hours, hours),
+            IdleAction::WarnNeverDelivered,
+            "reconnecting an empty-by-design subscription is an infinite loop"
+        );
+        assert_ne!(idle_action(0, hours, hours), IdleAction::Reconnect);
     }
 
     /// Rare-event subscriptions cannot be judged on the 90s idle budget; theirs
