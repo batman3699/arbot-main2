@@ -34,6 +34,9 @@ pub struct Metrics {
     /// this is the only counter that distinguishes "quiet market" from "dead
     /// feed" -- alert on it.
     pub ingestion_ws_stalls: Counter,
+    /// Pool-list refreshes adopted without tearing down the websocket. Each one
+    /// is a gap not taken, worth ~432 liquidity deltas by measurement.
+    pub ingestion_resubscribes_avoided: Counter,
     /// Logs decoded and applied to live pool state (shadow mode).
     pub live_state_applied: Counter,
     /// Logs delivered that no known topic decoder handles. A large value means
@@ -196,6 +199,14 @@ impl Metrics {
         registry
             .register(Box::new(ingestion_ws_events.clone()))
             .context("register ingestion_ws_events_total counter")?;
+
+        let ingestion_resubscribes_avoided = Counter::with_opts(Opts::new(
+            "ingestion_resubscribes_avoided_total",
+            "Pool-list refreshes that needed no new subscription",
+        ))?;
+        registry
+            .register(Box::new(ingestion_resubscribes_avoided.clone()))
+            .context("register ingestion_resubscribes_avoided_total counter")?;
 
         let live_state_untrusted_base = Counter::with_opts(Opts::new(
             "live_state_untrusted_base_total",
@@ -653,6 +664,7 @@ impl Metrics {
             ingestion_ws_events,
             ingestion_ws_stalls,
             live_state_untrusted_base,
+            ingestion_resubscribes_avoided,
             live_state_applied,
             live_state_undecodable,
             continuity_breaks,

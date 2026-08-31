@@ -184,6 +184,22 @@ pub(crate) fn idle_action(
     }
 }
 
+/// Whether a new pool set requires tearing down the live subscription.
+///
+/// Only ADDED addresses do. The filter is by address, so a set already covered
+/// by the live filter can be adopted without touching the socket; removals cost
+/// nothing to keep, since the worst case is receiving logs for pools we no
+/// longer rank, which `handle_log` applies harmlessly.
+///
+/// This exists because the hot-pool refresh re-ranks on a timer and called
+/// `set_pools` unconditionally, so an unchanged set tore down the websocket
+/// every 5 minutes. Measured cost of one teardown: ~432 liquidity deltas
+/// dropped, because the gap invalidates every snapshot and deltas may not be
+/// applied to an invalidated base.
+pub(crate) fn needs_resubscribe(subscribed: &HashSet<Address>, wanted: &[Address]) -> bool {
+    subscribed.is_empty() || wanted.iter().any(|a| !subscribed.contains(a))
+}
+
 pub(crate) fn pool_log_filter(pools: &[MonitoredPool]) -> Filter {
     Filter::new()
         .address(pools.iter().map(|p| p.pair).collect::<Vec<_>>())
@@ -258,6 +274,12 @@ where
     /// one 29 seconds before shutdown. That is not enough to exercise the
     /// post-gap recovery path deliberately. Rejected in production mode.
     chaos_gap_interval: Option<Duration>,
+    /// Addresses the LIVE filter actually covers.
+    ///
+    /// Tracked separately from `pools` because they drift apart on purpose: a
+    /// shrinking pool set is adopted without resubscribing, so the filter stays
+    /// wider than the list until something genuinely new appears.
+    subscribed: Arc<RwLock<HashSet<Address>>>,
     /// Pools that survive every `set_pools`.
     ///
     /// The univ2 hot-pool refresh rebuilds the monitored set from scratch and
@@ -302,6 +324,7 @@ where
             ws_endpoints: Vec::new(),
             ws_backoff: Duration::from_secs(5),
             chaos_gap_interval: None,
+            subscribed: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
@@ -397,9 +420,27 @@ where
                 pools.push(p.clone());
             }
         }
-        let mut guard = self.pools.write().await;
-        *guard = pools;
-        self.pool_updates.notify_waiters();
+        let wanted: Vec<Address> = pools.iter().map(|p| p.pair).collect();
+        let resubscribe = {
+            let subscribed = self.subscribed.read().await;
+            needs_resubscribe(&subscribed, &wanted)
+        };
+        {
+            let mut guard = self.pools.write().await;
+            *guard = pools;
+        }
+        if resubscribe {
+            self.pool_updates.notify_waiters();
+        } else {
+            // The whole point: a re-rank that adds nothing must not cost a gap.
+            if let Some(m) = &self.metrics {
+                m.ingestion_resubscribes_avoided.inc();
+            }
+            debug!(
+                pools = wanted.len(),
+                "pool list refreshed with no new addresses; keeping the websocket"
+            );
+        }
         self.resync.request();
     }
 
@@ -461,6 +502,10 @@ where
 
             match provider.subscribe_logs(&filter).await {
                 Ok(mut sub) => {
+                    {
+                        let mut subscribed = self.subscribed.write().await;
+                        *subscribed = pools.iter().map(|p| p.pair).collect();
+                    }
                     self.ws_connected.store(true, Ordering::SeqCst);
                     self.ws_warned.store(false, Ordering::Relaxed);
                     info!(pools = pools.len(), "pool monitor websocket connected");
@@ -551,6 +596,7 @@ where
                 }
             }
             self.ws_connected.store(false, Ordering::SeqCst);
+            self.subscribed.write().await.clear();
             // Reached only after a subscription ended, stalled, failed, or was
             // torn down to pick up a new pool list. Every one of those is a
             // hole in the log stream.
@@ -1457,6 +1503,47 @@ mod tests {
             build().with_ws_reconnect(vec!["wss://example.invalid".into()], Duration::from_secs(5));
         assert_eq!(reconnectable.ws_endpoints.len(), 1);
         assert_eq!(reconnectable.ws_backoff, Duration::from_secs(5));
+    }
+
+    /// The hot-pool refresh re-ranks on a 5-minute timer and called `set_pools`
+    /// unconditionally, so an UNCHANGED set tore down the websocket every five
+    /// minutes. Run 7 took three such gaps in fifteen minutes; each discards
+    /// ~432 liquidity deltas, because a gap invalidates every snapshot and a
+    /// delta may not be applied to an invalidated base.
+    #[test]
+    fn an_unchanged_pool_set_does_not_cost_a_resubscribe() {
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let subscribed: HashSet<Address> = [a, b].into_iter().collect();
+        assert!(!needs_resubscribe(&subscribed, &[a, b]));
+        assert!(!needs_resubscribe(&subscribed, &[b, a]), "order is irrelevant");
+    }
+
+    /// Removals are free: the filter simply stays wider than the list and we
+    /// receive logs for pools we no longer rank, which is harmless.
+    #[test]
+    fn a_shrinking_pool_set_does_not_cost_a_resubscribe() {
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let subscribed: HashSet<Address> = [a, b].into_iter().collect();
+        assert!(!needs_resubscribe(&subscribed, &[a]));
+        assert!(!needs_resubscribe(&subscribed, &[]));
+    }
+
+    /// Additions are the only case a new socket is actually required for.
+    #[test]
+    fn a_new_address_does_require_a_resubscribe() {
+        let a = Address::from_low_u64_be(1);
+        let subscribed: HashSet<Address> = [a].into_iter().collect();
+        assert!(needs_resubscribe(&subscribed, &[a, Address::from_low_u64_be(2)]));
+    }
+
+    /// Fails safe: with nothing subscribed we must always subscribe, or a
+    /// monitor that never connected would sit there believing it is covered.
+    #[test]
+    fn an_empty_subscription_always_resubscribes() {
+        assert!(needs_resubscribe(&HashSet::new(), &[]));
+        assert!(needs_resubscribe(&HashSet::new(), &[Address::from_low_u64_be(1)]));
     }
 
     /// The chaos knob must be inert unless explicitly set, and must be a real
