@@ -245,6 +245,12 @@ where
     /// Shadow-mode live state. `None` disables it entirely. Nothing downstream
     /// READS this store in Phase 1 — it is written and measured only.
     live_state: Option<Arc<crate::live_state::LiveState>>,
+    /// Endpoints for rebuilding the websocket transport.
+    ///
+    /// Empty means the monitor is stuck with whatever provider it was handed:
+    /// once that socket dies, resubscribing on it can never succeed.
+    ws_endpoints: Vec<String>,
+    ws_backoff: Duration,
     /// Pools that survive every `set_pools`.
     ///
     /// The univ2 hot-pool refresh rebuilds the monitored set from scratch and
@@ -286,6 +292,8 @@ where
             touched_pools: Arc::new(StdMutex::new(HashSet::new())),
             live_state: None,
             sticky_pools: Vec::new(),
+            ws_endpoints: Vec::new(),
+            ws_backoff: Duration::from_secs(5),
         })
     }
 
@@ -311,6 +319,17 @@ where
     ///
     /// Phase 1 only: logs are decoded and applied so divergence can be
     /// measured, but no pricing path reads the result.
+    /// Let the monitor rebuild its own websocket transport.
+    ///
+    /// Without this the monitor holds one `Arc<Provider<Ws>>` for the life of
+    /// the process. Providers close sockets on a schedule -- BlockPI at 30
+    /// minutes -- and after that every `subscribe_logs` is against a corpse.
+    pub fn with_ws_reconnect(mut self, endpoints: Vec<String>, backoff: Duration) -> Self {
+        self.ws_endpoints = endpoints;
+        self.ws_backoff = backoff;
+        self
+    }
+
     pub fn with_live_state(mut self, live: Arc<crate::live_state::LiveState>) -> Self {
         self.live_state = Some(live);
         self
@@ -370,9 +389,19 @@ where
     }
 
     async fn run_ws(&self) {
-        let Some(provider) = self.ws_provider.clone() else {
+        const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+        let mut ws_provider = self.ws_provider.clone();
+        if ws_provider.is_none() && self.ws_endpoints.is_empty() {
             return;
-        };
+        }
+        if self.ws_endpoints.is_empty() {
+            warn!(
+                "pool monitor has a websocket but no endpoints to rebuild it; when the provider \
+                 closes this socket (BlockPI does so every 30 minutes) log ingestion stops until \
+                 restart. Pass with_ws_reconnect."
+            );
+        }
 
         loop {
             let pools = {
@@ -383,6 +412,36 @@ where
                 sleep(self.poll_interval).await;
                 continue;
             }
+
+            // Taken, not cloned: a socket we suspect is dead must not be put
+            // back, and the only way to recover one is to build a new
+            // transport. `subscribe_logs` on a closed connection fails forever.
+            let provider = match ws_provider.take() {
+                Some(provider) => provider,
+                None => {
+                    let connect = connect_ws_provider_with_fallbacks(
+                        "pool-monitor-rpc",
+                        &self.ws_endpoints,
+                        self.ws_backoff,
+                    );
+                    match timeout(WS_CONNECT_TIMEOUT, connect).await {
+                        Ok(Ok(provider)) => Arc::new(provider),
+                        Ok(Err(err)) => {
+                            warn!(error = %err, "pool monitor websocket reconnect failed");
+                            sleep(self.poll_interval).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!(
+                                timeout_secs = WS_CONNECT_TIMEOUT.as_secs(),
+                                "pool monitor websocket reconnect timed out"
+                            );
+                            sleep(self.poll_interval).await;
+                            continue;
+                        }
+                    }
+                }
+            };
             let filter = pool_log_filter(&pools);
 
             match provider.subscribe_logs(&filter).await {
@@ -413,6 +472,8 @@ where
                             }
                             _ = self.pool_updates.notified() => {
                                 warn!("pool list updated; resubscribing websocket filter");
+                                // Our choice, not a fault: this socket is fine.
+                                ws_provider = Some(provider.clone());
                                 break;
                             }
                             _ = sleep(SUBSCRIPTION_IDLE_TICK) => {
@@ -1300,6 +1361,32 @@ mod tests {
             topics.contains(&crate::log_decode::TOPIC_SOLIDLY_SWAP),
             "Solidly Swap missing: {topics:?}"
         );
+    }
+
+    /// The monitor held one provider for the life of the process, so the stall
+    /// detection added in a77fd31 could break the loop but never recover: every
+    /// resubscribe went to the same dead socket.
+    #[test]
+    fn without_endpoints_the_monitor_cannot_replace_a_dead_socket() {
+        let build = || {
+            PoolMonitor::new(
+                Arc::new(Provider::new(MockProvider::default())),
+                None,
+                vec![monitored(1)],
+                Duration::from_secs(1),
+                Duration::from_secs(10),
+                None,
+            )
+            .expect("monitor should construct")
+        };
+        assert!(
+            build().ws_endpoints.is_empty(),
+            "the default is the trapped state, which is why main.rs must opt in"
+        );
+        let reconnectable =
+            build().with_ws_reconnect(vec!["wss://example.invalid".into()], Duration::from_secs(5));
+        assert_eq!(reconnectable.ws_endpoints.len(), 1);
+        assert_eq!(reconnectable.ws_backoff, Duration::from_secs(5));
     }
 
     /// A subscription gap orphans local state, and nothing detected it.

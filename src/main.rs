@@ -12828,7 +12828,11 @@ async fn launch_chain_runtime(
                 metrics.clone(),
             ) {
                 Ok(monitor) => {
-                    let monitor = monitor.with_sticky_pools(cl_pools);
+                    let monitor = monitor
+                        .with_sticky_pools(cl_pools)
+                        // Without this the monitor can never rebuild a dead
+                        // socket; BlockPI closes them every 30 minutes.
+                        .with_ws_reconnect(ws_endpoints.clone(), ws_backoff);
                     // Phase 1 shadow: decode logs into live state and measure
                     // it. Nothing reads this store for pricing — that is
                     // Phase 2, gated on the divergence this run produces.
