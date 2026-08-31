@@ -453,8 +453,39 @@ where
                 }
             }
             self.ws_connected.store(false, Ordering::SeqCst);
+            // Reached only after a subscription ended, stalled, failed, or was
+            // torn down to pick up a new pool list. Every one of those is a
+            // hole in the log stream.
+            self.note_ws_gap();
             self.resync.request();
             sleep(self.poll_interval).await;
+        }
+    }
+
+    /// Invalidate local state after a break in the log stream.
+    ///
+    /// The subscription is the only thing keeping `LiveState` in step with the
+    /// chain. Any interruption -- a stall, a clean close, a resubscribe to pick
+    /// up new pools -- means events landed while we were not listening, and the
+    /// continuity cursor cannot detect that: a filtered subscription has
+    /// meaningless index gaps, so a missed log looks exactly like a log for a
+    /// pool we do not watch.
+    ///
+    /// Without this, a snapshot built before the gap keeps its `Derived` trust
+    /// forever, silently missing whatever happened during the hole. That is the
+    /// shape of the one divergence that survived the settled-block fix: price
+    /// and tick exact, liquidity low, on a pool whose Mint/Burn deltas
+    /// accumulate rather than being overwritten.
+    ///
+    /// `break_continuity` is O(1) -- one epoch increment invalidates every
+    /// snapshot at once -- so this is cheap enough to do on every gap.
+    fn note_ws_gap(&self) {
+        if let Some(live) = &self.live_state {
+            let epoch = live.break_continuity(crate::live_state::UnknownReason::WsUnavailable);
+            warn!(
+                epoch,
+                "websocket gap; every local snapshot is now untrusted until re-anchored"
+            );
         }
     }
 
@@ -1268,6 +1299,59 @@ mod tests {
         assert!(
             topics.contains(&crate::log_decode::TOPIC_SOLIDLY_SWAP),
             "Solidly Swap missing: {topics:?}"
+        );
+    }
+
+    /// A subscription gap orphans local state, and nothing detected it.
+    ///
+    /// `break_continuity` existed from Phase 1 and was never called from
+    /// anywhere in production. The 2026-08-31 run resubscribed three times in
+    /// 28 minutes (pool-list rebuilds) and each gap silently kept every
+    /// snapshot at `Derived`. The one divergence that survived the
+    /// settled-block fix sits 22 seconds after one of those gaps.
+    #[tokio::test]
+    async fn a_ws_gap_invalidates_every_local_snapshot() {
+        use crate::live_state::{may_price_locally, LiveState};
+        let live = Arc::new(LiveState::new());
+        let pool = Address::from_low_u64_be(9);
+
+        let mut data = Vec::new();
+        for v in [1u128, 2u128] {
+            let mut w = [0u8; 32];
+            w[16..].copy_from_slice(&v.to_be_bytes());
+            data.extend_from_slice(&w);
+        }
+        live.apply_log(&Log {
+            address: pool,
+            topics: vec![*crate::log_decode::TOPIC_SOLIDLY_SYNC],
+            data: ethers::types::Bytes::from(data),
+            block_number: Some(100u64.into()),
+            transaction_index: Some(0u64.into()),
+            log_index: Some(0u64.into()),
+            removed: Some(false),
+            ..Default::default()
+        });
+        assert!(
+            may_price_locally(&live.v2_snapshot(pool).unwrap().prov.trust),
+            "precondition: the snapshot starts trusted"
+        );
+
+        let monitor = PoolMonitor::new(
+            Arc::new(Provider::new(MockProvider::default())),
+            None,
+            vec![monitored(1)],
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            None,
+        )
+        .expect("monitor should construct")
+        .with_live_state(live.clone());
+
+        monitor.note_ws_gap();
+
+        assert!(
+            !may_price_locally(&live.v2_snapshot(pool).unwrap().prov.trust),
+            "state carried across a gap is state that silently missed events"
         );
     }
 
