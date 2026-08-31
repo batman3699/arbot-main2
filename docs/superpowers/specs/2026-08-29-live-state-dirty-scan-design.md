@@ -954,6 +954,42 @@ this guard protects.
   `|liquidity_error|` as a function of `blocks_since_last_swap`: if error grows
   between swaps and collapses to zero at each Swap, that is strong evidence for
   the Mint/Burn path. Both are more informative than growing the sample.
+- **RESOLVED 2026-08-31 (run 5, `b294a35`): the settled-block fix removed most
+  of the CL divergence, and what remains is real.** Requiring a snapshot's block
+  to be strictly below `max_applied_block` before comparing it took the
+  Liquidity-sourced divergence rate from 19/314 (6.05%) to 1/224 (0.45%),
+  Fisher one-tailed p = 2.6e-4. Swap-sourced went 4/752 to 0/582; V2 `Sync`
+  0/49; tick delta was zero in all 855 checks. Most of what earlier runs
+  reported as divergence was the validator comparing a mid-block snapshot
+  against end-of-block `eth_call`, exactly as the replay experiment indicated.
+- **The one surviving divergence is NOT a measurement artefact — do not dismiss
+  it.** Pool `0x160d7e9d94...` (cbBTC/USDC, aerodrome-slipstream) at block
+  50684845: `sqrt_price_x96` and `tick` exact, `liquidity` low by 892994216111
+  (-2629 bps). The chain value 3395900606227 reproduces from an independent
+  provider, and our local value sits BELOW both block N and N-1, so staleness
+  does not explain it either. We were genuinely missing in-range liquidity.
+  Classification (A)/(C) from the note above; not yet separated. Against the
+  Swap path's 0/582 the residual is NOT statistically distinguishable
+  (p = 0.28), so one observation is all we have — it justifies instrumentation,
+  not a conclusion. The pool being Slipstream is suggestive given the
+  unverified Slipstream Mint/Burn assumption below, but Slipstream is also the
+  plurality of the CL sample, so that lead is unproven.
+- **Why only the Liquidity path can accumulate error (structural, from the
+  code).** The Swap path writes `liquidity` absolutely from the event, so every
+  Swap resets any accrued error to zero; the Mint/Burn path applies a delta to
+  the existing value. Error can therefore only build between Swaps. This makes
+  `liquidity_error_bps` against `blocks_since_last_swap` the right next
+  instrument — it was recommended in review and it is now supported by the
+  mechanism, not just by intuition. Build it before growing the sample.
+- **OPERATIONAL, found 2026-08-31: the bot ran 12.5 hours and produced 28
+  minutes of data, silently.** Tracing and `ws_newheads` stopped at 07:13:47
+  after `detected ws gap; requesting resync` warnings escalated 108 -> 135 ->
+  297 per 10-minute window; the process then looped its status banner 1405
+  times until it was stopped. The silence watchdog never fired (it covers
+  initial silence, not mid-run death) and there were zero reconnect attempts.
+  Trust states degrade correctly so this is not a mispricing risk, but before
+  any funded run there must be a liveness check on the ws feed itself and a
+  reconnect path. Rising gap warnings are the available early signal.
 - **Phase 2a validates price and liquidity, NOT depth.** The CL comparison covers
   `sqrt_price_x96`, `liquidity` and `tick` only. `balance0`/`balance1` are not
   tracked in Phase 1, so a passing verdict says nothing about whether CL
