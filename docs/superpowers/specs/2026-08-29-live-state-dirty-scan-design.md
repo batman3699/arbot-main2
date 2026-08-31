@@ -842,6 +842,31 @@ this guard protects.
   471 exactly zero, but 7 divergent — and in EVERY divergent case price and tick
   were exact while liquidity was wrong, by up to 10.3x (+93199 bps).
 
+  **RESOLVED to a class, 2026-08-31, by tagging snapshots with their source
+  event.** 613 reconciliations:
+
+  | snapshot source | records | divergent (>5 bps) | rate |
+  |---|---|---|---|
+  | `Swap` (liquidity taken from the payload) | 431 | 4 | **0.93%** |
+  | `Liquidity` (our `previous + delta`) | 148 | 10 | **6.76%** |
+  | `Sync` (V2) | 34 | 0 | 0% |
+
+  Fisher exact **p = 3.5e-4**. The `Swap` rate is the irreducible intra-block
+  floor — a position change landing later in the same block, which `eth_call`
+  sees and the log did not. The **5.8 percentage point excess on
+  `Liquidity`-sourced snapshots is our own arithmetic**, so this is case B or C,
+  NOT case D. Replay is now warranted and targeted.
+
+  Shape narrows it further: `tick_delta` was 0 in all ten, so it is not a
+  tick-decode fault. Errors run BOTH directions (-7859 to +35381) and pool
+  `0xb5f0b4ae66` oscillated across three observations (-3140, +2075, -2069). A
+  constant over- or under-application would show one sign; oscillation points at
+  the in-range classification being wrong INTERMITTENTLY — consistent with a
+  stale `tick` misclassifying a position, which ties back to §8 I1 (a filtered
+  subscription cannot detect a dropped log).
+
+  Still open: WHICH part — missing event, in-range test, or `amount` semantics.
+
   Bounded but NOT root-caused. Because 471/478 are exact, the `Swap` decoder
   resyncs liquidity correctly, so drift accumulates only BETWEEN swaps — which
   implicates the `Mint`/`Burn` application. One plausible mechanism: a missed
