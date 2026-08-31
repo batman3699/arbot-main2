@@ -879,6 +879,33 @@ this guard protects.
   expiry, while the measured divergence rate was ~1.4%. Before the §9 gate is
   evaluated, split this into measured-and-failed versus verdict-expired —
   otherwise the gate reads re-check latency as untrustworthiness.
+- **The Phase 2b gate should be QUOTE error, not field equality.** Field-by-field
+  agreement answers "is the state identical", but the engine consumes a quote.
+  The stronger criterion is: local CL quote vs authoritative quote at several
+  notionals (e.g. $1k/$5k/$10k/$25k/$50k), measuring `amountOut` error, price-
+  impact error, max-size error and profit-estimate error. That answers the
+  question that actually matters — *can this state be trusted to make a trading
+  decision* — and it naturally weights the fields by their effect on the
+  decision, which equality does not. Field equality stays useful as a cheap
+  continuous signal; the quote gate is what Phase 2b should be judged on.
+- **Validation sampling should become adaptive, not fixed-N.** At
+  `ARBOT_STATE_GATE_CHECKS_PER_SCAN = 32` a full day is on the order of a
+  million validations before multiplying by RPC calls each. Rather than lowering
+  N, prioritise by information value: high-volume, high-liquidity, recently
+  divergent, high event-rate, approaching-TTL and newly-anchored pools; de-
+  prioritise inactive, illiquid, recently-validated and low-EV ones. The
+  objective is validation value per RPC, not pools per scan — which matters more
+  as the pool set grows beyond Base.
+- **If the source tag points at `Liquidity`, replay is the next step.** For each
+  anomalous pool, replay anchor + every Swap/Mint/Burn across the divergence
+  interval and compare reconstructed `liquidity_local(t)` against chain state at
+  each event boundary, to find the first transition where they part and classify
+  it: (A) event missing from our stream, (B) event received but applied wrongly,
+  (C) tick/position in-range logic wrong, (D) validator temporal mismatch,
+  (E) pool-specific contract behaviour. A cheaper intermediate signal is
+  `|liquidity_error|` as a function of `blocks_since_last_swap`: if error grows
+  between swaps and collapses to zero at each Swap, that is strong evidence for
+  the Mint/Burn path. Both are more informative than growing the sample.
 - **Phase 2a validates price and liquidity, NOT depth.** The CL comparison covers
   `sqrt_price_x96`, `liquidity` and `tick` only. `balance0`/`balance1` are not
   tracked in Phase 1, so a passing verdict says nothing about whether CL
