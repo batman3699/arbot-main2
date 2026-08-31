@@ -79,7 +79,7 @@ pub(crate) fn should_warn_silent(events: u64, connected_for: Duration) -> bool {
 /// from the stream, just silence. On 2026-08-31 a feed did exactly that and the
 /// process sat there for 12 hours believing it was live. Every reconnect path
 /// in this file keys off the stream ENDING, so none of them could fire.
-const SUBSCRIPTION_STALL_LIMIT: Duration = Duration::from_secs(90);
+pub(crate) const SUBSCRIPTION_STALL_LIMIT: Duration = Duration::from_secs(90);
 
 /// How often the idle timer wakes to evaluate the above. Bounds detection
 /// latency to `SUBSCRIPTION_STALL_LIMIT + SUBSCRIPTION_IDLE_TICK`.
@@ -90,6 +90,62 @@ const SUBSCRIPTION_IDLE_TICK: Duration = Duration::from_secs(15);
 /// explained by a quiet market. Generous enough for slow chains; on Base
 /// (~2s blocks) this is thirty missed blocks.
 const NEWHEADS_STALL_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long a LOW-TRAFFIC subscription may go quiet before its socket is
+/// replaced.
+///
+/// Health-factor updates and liquidation events are legitimately rare, so idle
+/// time says nothing about whether the socket is alive and the 90s limit above
+/// would churn constantly. Sized instead against the provider's own schedule:
+/// BlockPI closes websocket connections after 30 minutes, so rotating at 25
+/// pre-empts that close rather than discovering it. It is a connection-lifetime
+/// bound wearing an idle timer's clothes.
+// Used from liquidations.rs, which is bin-only (not in lib.rs), so the lib
+// target sees no consumer.
+#[allow(dead_code)]
+pub(crate) const LOW_TRAFFIC_STALL_LIMIT: Duration = Duration::from_secs(25 * 60);
+
+/// Outcome of awaiting the next item from a subscription.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StreamStep<T> {
+    Item(T),
+    /// The stream closed cleanly. Reconnect.
+    Ended,
+    /// Nothing arrived within the limit. Reconnect.
+    Stalled,
+}
+
+/// `stream.next()` with a ceiling on how long silence is tolerated.
+///
+/// Every unbounded `while let Some(x) = stream.next().await` in this codebase
+/// was unrecoverable against a half-open socket: no error, no close frame and
+/// no `None`, so the reconnect immediately below it could never run. The task
+/// parks forever while the process reports itself healthy. Use this instead.
+///
+/// A macro rather than a generic fn on purpose: ethers' `SubscriptionStream`
+/// borrows its provider, and a generic `fn next<S: Stream>(&mut S)` makes the
+/// compiler demand `Stream` for ANY lifetime once the caller is inside a
+/// spawned task -- "implementation of `Stream` is not general enough". Expanding
+/// at the call site keeps the concrete lifetime.
+macro_rules! next_before_stall {
+    ($stream:expr, $limit:expr) => {
+        match ::tokio::time::timeout(
+            $limit,
+            ::futures_util::StreamExt::next(&mut $stream),
+        )
+        .await
+        {
+            Ok(Some(item)) => $crate::ingestion::StreamStep::Item(item),
+            Ok(None) => $crate::ingestion::StreamStep::Ended,
+            Err(_) => $crate::ingestion::StreamStep::Stalled,
+        }
+    };
+}
+// Required: mempool.rs and liquidations.rs import this by path and fail to
+// compile without it. rustc does not count cross-module macro imports as a use
+// of the re-export, so it warns here regardless.
+#[allow(unused_imports)]
+pub(crate) use next_before_stall;
 
 /// What the idle timer should do when it fires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -699,12 +755,27 @@ pub async fn spawn_pending_tx_monitor<C>(
         match provider.subscribe_pending_txs().await {
             Ok(mut sub) => {
                 info!("pending transaction monitor connected");
-                while sub.next().await.is_some() {
-                    if let Some(metrics) = &metrics {
-                        metrics.mempool_txs_observed.inc();
+                loop {
+                    match next_before_stall!(sub, SUBSCRIPTION_STALL_LIMIT) {
+                        StreamStep::Item(_) => {
+                            if let Some(metrics) = &metrics {
+                                metrics.mempool_txs_observed.inc();
+                            }
+                        }
+                        StreamStep::Ended => {
+                            warn!("pending transaction monitor disconnected; reconnecting");
+                            break;
+                        }
+                        StreamStep::Stalled => {
+                            warn!(
+                                stall_secs = SUBSCRIPTION_STALL_LIMIT.as_secs(),
+                                "pending transaction subscription stalled; socket still open but \
+                                 delivering nothing. Reconnecting"
+                            );
+                            break;
+                        }
                     }
                 }
-                warn!("pending transaction monitor disconnected; reconnecting");
             }
             Err(err) => {
                 if is_websocket_subscription_close(&err.to_string()) {
@@ -1406,6 +1477,48 @@ mod tests {
             idle_action(0, Duration::from_secs(5), Duration::from_secs(5)),
             IdleAction::Wait
         );
+    }
+
+    /// The trap this replaces: a socket that stays open and delivers nothing
+    /// never yields `None`, so an unbounded `stream.next().await` parks forever
+    /// and every reconnect path below it is dead code.
+    #[tokio::test]
+    async fn a_stream_that_never_yields_is_reported_stalled() {
+        let mut s = futures_util::stream::pending::<u8>();
+        assert_eq!(
+            next_before_stall!(s, Duration::from_millis(20)),
+            StreamStep::Stalled
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_stream_is_still_reported_as_ended() {
+        let mut s = futures_util::stream::iter(Vec::<u8>::new());
+        assert_eq!(
+            next_before_stall!(s, Duration::from_secs(30)),
+            StreamStep::Ended,
+            "a clean close must stay distinguishable from a stall"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delivering_stream_hands_back_its_item() {
+        let mut s = futures_util::stream::iter(vec![7u8]);
+        assert_eq!(
+            next_before_stall!(s, Duration::from_secs(30)),
+            StreamStep::Item(7)
+        );
+    }
+
+    /// Rare-event subscriptions cannot be judged on the 90s idle budget; theirs
+    /// is a connection-lifetime bound sized under the provider's own close.
+    #[test]
+    fn the_low_traffic_budget_pre_empts_the_provider_timeout() {
+        assert!(
+            LOW_TRAFFIC_STALL_LIMIT < Duration::from_secs(30 * 60),
+            "BlockPI closes websockets at 30 minutes; rotate BEFORE that, not after"
+        );
+        assert!(LOW_TRAFFIC_STALL_LIMIT > SUBSCRIPTION_STALL_LIMIT);
     }
 
     /// Idle time is measured from the last event, not from connect, so a

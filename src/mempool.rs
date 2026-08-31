@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use ethers::abi::{decode, ParamType, Token};
 use ethers::providers::{JsonRpcClient, Middleware, Provider, Ws};
 use ethers::types::{Address, BlockId, BlockNumber, Transaction, U256};
-use futures_util::StreamExt;
+use crate::ingestion::{next_before_stall, StreamStep, SUBSCRIPTION_STALL_LIMIT};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
@@ -654,7 +654,22 @@ pub async fn spawn_live_mempool_monitor<C>(
             Ok(sub) => {
                 info!("live mempool monitor connected (pending tx subscription)");
                 let mut sub = sub.transactions_unordered(8);
-                while let Some(result) = sub.next().await {
+                loop {
+                    let result = match next_before_stall!(sub, SUBSCRIPTION_STALL_LIMIT) {
+                        StreamStep::Item(result) => result,
+                        StreamStep::Ended => {
+                            warn!("mempool pending subscription ended; reconnecting");
+                            break;
+                        }
+                        StreamStep::Stalled => {
+                            warn!(
+                                stall_secs = SUBSCRIPTION_STALL_LIMIT.as_secs(),
+                                "mempool pending subscription stalled; socket still open but \
+                                 delivering nothing. Reconnecting"
+                            );
+                            break;
+                        }
+                    };
                     if let Some(metrics) = &metrics {
                         metrics.mempool_txs_observed.inc();
                     }
@@ -669,7 +684,6 @@ pub async fn spawn_live_mempool_monitor<C>(
                         }
                     }
                 }
-                warn!("mempool pending subscription ended; reconnecting");
             }
             Err(err) => {
                 warn!(error = %err, "mempool pending subscription failed");

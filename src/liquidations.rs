@@ -4,7 +4,7 @@ use ethers::{
     prelude::*,
     providers::{JsonRpcClient, PubsubClient},
 };
-use futures_util::StreamExt;
+use crate::ingestion::{next_before_stall, StreamStep, LOW_TRAFFIC_STALL_LIMIT};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -843,7 +843,25 @@ where
                 match provider.subscribe_logs(&filter).await {
                     Ok(mut stream) => {
                         debug!("Subscribed to Aave v3 health factor updates");
-                        while let Some(log) = stream.next().await {
+                        loop {
+                            let log = match next_before_stall!(
+                                stream,
+                                LOW_TRAFFIC_STALL_LIMIT
+                            ) {
+                                StreamStep::Item(log) => log,
+                                StreamStep::Ended => {
+                                    warn!("Aave v3 health factor subscription ended, retrying");
+                                    break;
+                                }
+                                StreamStep::Stalled => {
+                                    warn!(
+                                        stall_secs = LOW_TRAFFIC_STALL_LIMIT.as_secs(),
+                                        "Aave v3 health factor subscription rotated; these events are rare so \
+                                         this is a scheduled socket replacement, not a fault"
+                                    );
+                                    break;
+                                }
+                            };
                             if log.topics.len() < 2 {
                                 continue;
                             }
@@ -873,7 +891,9 @@ where
                                 }
                             }
                         }
-                        warn!("Aave v3 health factor subscription ended, retrying");
+                        // Never re-subscribe in a tight loop: the stream can
+                        // end immediately and repeatedly.
+                        sleep(Duration::from_secs(1)).await;
                     }
                     Err(err) => {
                         error!(error = %err, "Failed to subscribe to Aave v3 events");
@@ -902,7 +922,25 @@ where
                 match provider.subscribe_logs(&filter).await {
                     Ok(mut stream) => {
                         debug!("Subscribed to Compound v3 borrow/withdraw events");
-                        while let Some(log) = stream.next().await {
+                        loop {
+                            let log = match next_before_stall!(
+                                stream,
+                                LOW_TRAFFIC_STALL_LIMIT
+                            ) {
+                                StreamStep::Item(log) => log,
+                                StreamStep::Ended => {
+                                    warn!("Compound v3 subscription ended, retrying");
+                                    break;
+                                }
+                                StreamStep::Stalled => {
+                                    warn!(
+                                        stall_secs = LOW_TRAFFIC_STALL_LIMIT.as_secs(),
+                                        "Compound v3 subscription rotated; these events are rare so \
+                                         this is a scheduled socket replacement, not a fault"
+                                    );
+                                    break;
+                                }
+                            };
                             if log.topics.len() < 2 {
                                 continue;
                             }
@@ -915,7 +953,9 @@ where
                                 tracker.lock().await.record(borrower, 1);
                             }
                         }
-                        warn!("Compound v3 subscription ended, retrying");
+                        // Never re-subscribe in a tight loop: the stream can
+                        // end immediately and repeatedly.
+                        sleep(Duration::from_secs(1)).await;
                     }
                     Err(err) => {
                         error!(error = %err, "Failed to subscribe to Compound v3 events");
