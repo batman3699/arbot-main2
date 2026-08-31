@@ -11,9 +11,7 @@ use std::time::{Duration, Instant};
 use ethers::abi::{decode, ParamType, Token};
 use ethers::providers::{JsonRpcClient, Middleware, Provider, Ws};
 use ethers::types::{Address, BlockId, BlockNumber, Transaction, U256};
-use crate::ingestion::{
-    idle_action, next_before_stall, IdleAction, StreamStep, SUBSCRIPTION_STALL_LIMIT,
-};
+use crate::ingestion::{next_before_stall, StreamStep, LOW_TRAFFIC_STALL_LIMIT};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
@@ -658,9 +656,8 @@ pub async fn spawn_live_mempool_monitor<C>(
                 let mut sub = sub.transactions_unordered(8);
                 let connected_at = std::time::Instant::now();
                 let mut events_seen: u64 = 0;
-                let mut never_warned = false;
                 loop {
-                    let result = match next_before_stall!(sub, SUBSCRIPTION_STALL_LIMIT) {
+                    let result = match next_before_stall!(sub, LOW_TRAFFIC_STALL_LIMIT) {
                         StreamStep::Item(result) => {
                             events_seen = events_seen.saturating_add(1);
                             result
@@ -670,35 +667,19 @@ pub async fn spawn_live_mempool_monitor<C>(
                             break;
                         }
                         StreamStep::Stalled => {
-                            match idle_action(
+                            // Scheduled rotation, not a fault. Base deliveries
+                            // are minutes apart, so idle time cannot tell a
+                            // quiet sequencer from a dead socket -- see
+                            // LOW_TRAFFIC_STALL_LIMIT. Unconditional: a feed
+                            // that delivered nothing still sits on a socket the
+                            // provider will close at 30 minutes.
+                            warn!(
+                                rotate_secs = LOW_TRAFFIC_STALL_LIMIT.as_secs(),
                                 events_seen,
-                                SUBSCRIPTION_STALL_LIMIT,
-                                connected_at.elapsed(),
-                            ) {
-                                IdleAction::Reconnect => {
-                                    warn!(
-                                        stall_secs = SUBSCRIPTION_STALL_LIMIT.as_secs(),
-                                        events_seen,
-                                        "mempool pending subscription stalled; socket still open \
-                                         but stopped delivering. Reconnecting"
-                                    );
-                                    break;
-                                }
-                                IdleAction::WarnNeverDelivered => {
-                                    if !never_warned {
-                                        never_warned = true;
-                                        warn!(
-                                            "mempool pending subscription has delivered nothing \
-                                             since connect; Base routes through a sequencer with \
-                                             no public pending pool, so this is expected there. \
-                                             Not reconnecting -- a new socket would be just as \
-                                             empty"
-                                        );
-                                    }
-                                    continue;
-                                }
-                                IdleAction::Wait => continue,
-                            }
+                                connected_secs = connected_at.elapsed().as_secs(),
+                                "rotating the mempool pending subscription"
+                            );
+                            break;
                         }
                     };
                     if let Some(metrics) = &metrics {

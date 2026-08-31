@@ -94,15 +94,20 @@ const NEWHEADS_STALL_LIMIT: Duration = Duration::from_secs(60);
 /// How long a LOW-TRAFFIC subscription may go quiet before its socket is
 /// replaced.
 ///
-/// Health-factor updates and liquidation events are legitimately rare, so idle
-/// time says nothing about whether the socket is alive and the 90s limit above
-/// would churn constantly. Sized instead against the provider's own schedule:
-/// BlockPI closes websocket connections after 30 minutes, so rotating at 25
-/// pre-empts that close rather than discovering it. It is a connection-lifetime
-/// bound wearing an idle timer's clothes.
-// Used from liquidations.rs, which is bin-only (not in lib.rs), so the lib
-// target sees no consumer.
-#[allow(dead_code)]
+/// Liquidation events and Base pending transactions are legitimately sporadic,
+/// so idle time says nothing about whether the socket is alive and the 90s
+/// limit above churns by construction. Measured on the Base pending-tx feed
+/// 2026-08-31: stalls fired 5m21s, 5m48s, 1m58s and 2m10s after connect --
+/// four reconnects of a healthy socket in fifteen minutes, because deliveries
+/// are minutes apart.
+///
+/// Sized instead against the provider's own schedule: BlockPI closes websocket
+/// connections after 30 minutes, so rotating at 25 pre-empts that close rather
+/// than discovering it. It is a connection-lifetime bound wearing an idle
+/// timer's clothes, and it fires whether or not the feed has delivered -- which
+/// is the point. A feed that has NEVER delivered still sits on a socket the
+/// provider will close, and idle logic alone would leave that socket dead
+/// forever.
 pub(crate) const LOW_TRAFFIC_STALL_LIMIT: Duration = Duration::from_secs(25 * 60);
 
 /// Outcome of awaiting the next item from a subscription.
@@ -941,9 +946,8 @@ pub async fn spawn_pending_tx_monitor<C>(
                 info!("pending transaction monitor connected");
                 let connected_at = std::time::Instant::now();
                 let mut events_seen: u64 = 0;
-                let mut never_warned = false;
                 loop {
-                    match next_before_stall!(sub, SUBSCRIPTION_STALL_LIMIT) {
+                    match next_before_stall!(sub, LOW_TRAFFIC_STALL_LIMIT) {
                         StreamStep::Item(_) => {
                             events_seen = events_seen.saturating_add(1);
                             if let Some(metrics) = &metrics {
@@ -955,32 +959,16 @@ pub async fn spawn_pending_tx_monitor<C>(
                             break;
                         }
                         StreamStep::Stalled => {
-                            match idle_action(
+                            // Scheduled rotation, not a fault. Unconditional on
+                            // purpose: a feed that delivered nothing still sits
+                            // on a socket the provider will close.
+                            warn!(
+                                rotate_secs = LOW_TRAFFIC_STALL_LIMIT.as_secs(),
                                 events_seen,
-                                SUBSCRIPTION_STALL_LIMIT,
-                                connected_at.elapsed(),
-                            ) {
-                                IdleAction::Reconnect => {
-                                    warn!(
-                                        stall_secs = SUBSCRIPTION_STALL_LIMIT.as_secs(),
-                                        events_seen,
-                                        "pending transaction subscription stalled; socket still \
-                                         open but stopped delivering. Reconnecting"
-                                    );
-                                    break;
-                                }
-                                IdleAction::WarnNeverDelivered => {
-                                    if !never_warned {
-                                        never_warned = true;
-                                        warn!(
-                                            "pending transaction subscription has delivered \
-                                             nothing since connect; not reconnecting, because a \
-                                             chain with no public pending pool will keep it empty"
-                                        );
-                                    }
-                                }
-                                IdleAction::Wait => {}
-                            }
+                                connected_secs = connected_at.elapsed().as_secs(),
+                                "rotating the pending transaction subscription"
+                            );
+                            break;
                         }
                     }
                 }
@@ -1865,6 +1853,31 @@ mod tests {
         );
     }
 
+    /// Measured on the Base pending-tx feed 2026-08-31: with the 90s idle
+    /// budget, stalls fired 5m21s, 5m48s, 1m58s and 2m10s after connect --
+    /// four reconnects of a HEALTHY socket in fifteen minutes, because
+    /// deliveries are minutes apart. Idle time cannot separate a quiet
+    /// sequencer from a dead socket on a feed like that, so the budget has to
+    /// be a connection lifetime instead.
+    #[test]
+    fn the_mempool_budget_outlasts_the_silence_that_was_churning_it() {
+        for observed in [
+            Duration::from_secs(5 * 60 + 21),
+            Duration::from_secs(5 * 60 + 48),
+            Duration::from_secs(118),
+            Duration::from_secs(130),
+        ] {
+            assert!(
+                observed > SUBSCRIPTION_STALL_LIMIT,
+                "every one of these tripped the idle budget on a live socket"
+            );
+            assert!(
+                LOW_TRAFFIC_STALL_LIMIT > observed,
+                "and the lifetime budget must sit clear of all of them"
+            );
+        }
+    }
+
     /// Field-found 2026-08-31: Base routes through a sequencer with no public
     /// pending pool, so its mempool subscription connects and delivers NOTHING,
     /// forever. Treating that as a stall reconnected every 90 seconds in a loop
@@ -1879,6 +1892,42 @@ mod tests {
             "reconnecting an empty-by-design subscription is an infinite loop"
         );
         assert_ne!(idle_action(0, hours, hours), IdleAction::Reconnect);
+    }
+
+    /// Sized from the field, not from taste. The Base pending-tx feed stalled
+    /// 5m21s, 5m48s, 1m58s and 2m10s after connect on 2026-08-31 -- four
+    /// reconnects of a healthy socket in fifteen minutes. Any budget near those
+    /// inter-arrival times churns; the observed worst case is nearly six
+    /// minutes and four samples do not bound the tail, which is the argument
+    /// for a lifetime bound instead of an idle one.
+    #[test]
+    fn the_low_traffic_budget_clears_the_observed_inter_arrival_times() {
+        let worst_observed = Duration::from_secs(5 * 60 + 48);
+        assert!(
+            SUBSCRIPTION_STALL_LIMIT < worst_observed,
+            "the idle budget is BELOW real silences, which is why it churned"
+        );
+        assert!(
+            LOW_TRAFFIC_STALL_LIMIT > worst_observed * 4,
+            "a lifetime bound has to clear the tail with room, not just the samples"
+        );
+    }
+
+    /// The hole this closes: `idle_action` deliberately does not reconnect a
+    /// subscription that never delivered, which is right for a wrong filter but
+    /// leaves a never-delivering feed sitting on a socket the provider closes
+    /// at 30 minutes -- dead forever. Rotation is unconditional for that reason.
+    #[test]
+    fn rotation_must_pre_empt_the_provider_close_even_with_no_traffic() {
+        assert_eq!(
+            idle_action(0, Duration::from_secs(3_600), Duration::from_secs(3_600)),
+            IdleAction::WarnNeverDelivered,
+            "idle logic alone never replaces this socket"
+        );
+        assert!(
+            LOW_TRAFFIC_STALL_LIMIT < Duration::from_secs(30 * 60),
+            "so the lifetime bound has to, and before the provider does"
+        );
     }
 
     /// Rare-event subscriptions cannot be judged on the 90s idle budget; theirs
