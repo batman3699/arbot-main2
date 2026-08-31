@@ -44,6 +44,7 @@ pub(crate) const MAX_TICK_DRIFT: i32 = 16;
 pub(crate) fn validatable<F>(
     pools: Vec<Address>,
     head: u64,
+    settled_through: u64,
     ordinal_of: F,
 ) -> Vec<Address>
 where
@@ -51,7 +52,7 @@ where
 {
     pools
         .into_iter()
-        .filter(|p| matches!(select(ordinal_of(*p), head), SelectOutcome::Check { .. }))
+        .filter(|p| matches!(select(ordinal_of(*p), head, settled_through), SelectOutcome::Check { .. }))
         .collect()
 }
 
@@ -118,6 +119,8 @@ where
         return 0;
     };
     let head = head.as_u64();
+    // Only blocks we have fully received are comparable — see `select`.
+    let settled = live.settled_through();
     let mut measured = 0usize;
 
     let count = |outcome: &str| {
@@ -126,17 +129,21 @@ where
         }
     };
 
-    let v2_candidates = validatable(live.tracked_v2(), head, |p| {
+    let v2_candidates = validatable(live.tracked_v2(), head, settled, |p| {
         live.v2_snapshot(p).and_then(|s| s.prov.ordinal)
     });
     for pool in gate.due_for_check(v2_candidates) {
         let Some(snap) = live.v2_snapshot(pool) else {
             continue;
         };
-        let block = match select(snap.prov.ordinal, head) {
+        let block = match select(snap.prov.ordinal, head, settled) {
             SelectOutcome::Check { block } => block,
             SelectOutcome::NoOrdinal => {
                 count("no_ordinal");
+                continue;
+            }
+            SelectOutcome::Unsettled => {
+                count("unsettled");
                 continue;
             }
             SelectOutcome::TooOld { .. } => {
@@ -166,17 +173,21 @@ where
         }
     }
 
-    let cl_candidates = validatable(live.tracked_cl(), head, |p| {
+    let cl_candidates = validatable(live.tracked_cl(), head, settled, |p| {
         live.cl_snapshot(p).and_then(|s| s.prov.ordinal)
     });
     for pool in gate.due_for_check(cl_candidates) {
         let Some(snap) = live.cl_snapshot(pool) else {
             continue;
         };
-        let block = match select(snap.prov.ordinal, head) {
+        let block = match select(snap.prov.ordinal, head, settled) {
             SelectOutcome::Check { block } => block,
             SelectOutcome::NoOrdinal => {
                 count("no_ordinal");
+                continue;
+            }
+            SelectOutcome::Unsettled => {
+                count("unsettled");
                 continue;
             }
             SelectOutcome::TooOld { .. } => {
@@ -298,8 +309,31 @@ mod tests {
             }
         };
 
-        let out = validatable(vec![fresh, stale, anchored], head, ordinal_of);
+        // settled_through = head+1: every snapshot's block is settled here, so the
+        // filter is exercising staleness alone.
+        let out = validatable(vec![fresh, stale, anchored], head, head + 1, ordinal_of);
         assert_eq!(out, vec![fresh], "stale and anchored pools must not take slots");
+    }
+
+    /// A snapshot whose block is not yet settled must not take a slot: it could
+    /// be a mid-block state, and comparing it against end-of-block chain state
+    /// manufactures a divergence that is not there.
+    #[test]
+    fn validatable_excludes_unsettled_snapshots() {
+        use crate::continuity::Ordinal;
+        let head = 10_000u64;
+        let pool = ethers::types::Address::from_low_u64_be(1);
+        let at_head = |_p| Some(Ordinal { block: head, tx_index: 0, log_index: 0 });
+
+        assert!(
+            validatable(vec![pool], head, head, at_head).is_empty(),
+            "settled_through == snapshot block means more logs may still arrive"
+        );
+        assert_eq!(
+            validatable(vec![pool], head, head + 1, at_head),
+            vec![pool],
+            "a strictly later applied block settles it"
+        );
     }
 
     #[test]
@@ -307,7 +341,7 @@ mod tests {
         use crate::continuity::Ordinal;
         let head = 10_000u64;
         let pools: Vec<_> = (1..=5).map(ethers::types::Address::from_low_u64_be).collect();
-        let out = validatable(pools.clone(), head, |_| {
+        let out = validatable(pools.clone(), head, head + 1, |_| {
             Some(Ordinal { block: head, tx_index: 0, log_index: 0 })
         });
         assert_eq!(out, pools);

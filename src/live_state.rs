@@ -154,6 +154,14 @@ pub struct LiveState {
     /// Bumped on every accepted application and on every epoch change. Phase 2
     /// uses this for `ScanSnapshot` generation validation (spec §4.2).
     generation: AtomicU64,
+    /// Highest block from which a log has been APPLIED.
+    ///
+    /// A snapshot at block N is only comparable against `eth_call` once this
+    /// exceeds N: the cursor guarantees ordering, so seeing a later block means
+    /// every block-N log was delivered and the snapshot is that pool's
+    /// end-of-block state. Without it the validator compares a mid-block
+    /// snapshot against end-of-block chain state.
+    max_applied_block: AtomicU64,
 }
 
 // main.rs compiles its own copy; several accessors are Phase 2's consumers.
@@ -169,6 +177,16 @@ impl LiveState {
 
     pub fn continuity_epoch(&self) -> u64 {
         self.continuity_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Highest block from which a log has been applied. See
+    /// [`crate::validation_select::select`].
+    pub fn settled_through(&self) -> u64 {
+        self.max_applied_block.load(Ordering::SeqCst)
+    }
+
+    fn note_applied_block(&self, block: u64) {
+        self.max_applied_block.fetch_max(block, Ordering::SeqCst);
     }
 
     fn ordinal_of(log: &Log) -> Option<Ordinal> {
@@ -326,6 +344,7 @@ impl LiveState {
                 self.provenance(version, Some(ordinal), TrustState::Derived, SnapshotSource::Sync);
             self.v2.insert(pool, Arc::new(V2Snapshot { state, prov }));
             self.generation.fetch_add(1, Ordering::SeqCst);
+            self.note_applied_block(ordinal.block);
             self.publish(pool, version);
             return ApplyOutcome::Applied { pool, version };
         }
@@ -368,6 +387,7 @@ impl LiveState {
                 }),
             );
             self.generation.fetch_add(1, Ordering::SeqCst);
+            self.note_applied_block(ordinal.block);
             self.publish(pool, version);
             return ApplyOutcome::Applied { pool, version };
         }
@@ -386,6 +406,7 @@ impl LiveState {
                 }),
             );
             self.generation.fetch_add(1, Ordering::SeqCst);
+            self.note_applied_block(ordinal.block);
             self.publish(pool, version);
             return ApplyOutcome::Applied { pool, version };
         }
