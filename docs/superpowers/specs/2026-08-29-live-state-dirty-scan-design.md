@@ -851,6 +851,10 @@ this guard protects.
   | `Liquidity` (our `previous + delta`) | 148 | 10 | **6.76%** |
   | `Sync` (V2) | 34 | 0 | 0% |
 
+  Confirmed at double the sample — 1127 reconciliations: `Liquidity` 19/314 =
+  **6.05%**, `Swap` 4/752 = **0.53%**, a **11.4x** ratio at Fisher exact
+  **p = 1.4e-7**. The effect strengthened rather than regressed to the mean.
+
   Fisher exact **p = 3.5e-4**. The `Swap` rate is the irreducible intra-block
   floor — a position change landing later in the same block, which `eth_call`
   sees and the log did not. The **5.8 percentage point excess on
@@ -901,7 +905,13 @@ this guard protects.
   trusted requires `v.trusted && checked_at.elapsed() < ttl`, so a PASSING
   verdict that has merely aged past the 300s TTL is counted as untrusted.
   Observed: trusted fell 212 -> 166 over a 22-minute run purely from verdict
-  expiry, while the measured divergence rate was ~1.4%. Before the §9 gate is
+  expiry, while the measured divergence rate was ~1.4%.
+
+  **Fixed and validated in the field 2026-08-31.** After splitting the gauge, a
+  33-minute run reported trusted 150 / **failed 3** / expired 115. The old
+  derivation would have reported 118 untrusted — a **39x overstatement** of
+  failure, which would have made the §9 gate unpassable for reasons unrelated to
+  state quality. Before the §9 gate is
   evaluated, split this into measured-and-failed versus verdict-expired —
   otherwise the gate reads re-check latency as untrustworthiness.
 - **The Phase 2b gate should be QUOTE error, not field equality.** Field-by-field
