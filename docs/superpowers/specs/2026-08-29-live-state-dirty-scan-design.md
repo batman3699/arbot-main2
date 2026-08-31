@@ -855,11 +855,24 @@ this guard protects.
   **6.05%**, `Swap` 4/752 = **0.53%**, a **11.4x** ratio at Fisher exact
   **p = 1.4e-7**. The effect strengthened rather than regressed to the mean.
 
-  Fisher exact **p = 3.5e-4**. The `Swap` rate is the irreducible intra-block
-  floor — a position change landing later in the same block, which `eth_call`
-  sees and the log did not. The **5.8 percentage point excess on
-  `Liquidity`-sourced snapshots is our own arithmetic**, so this is case B or C,
-  NOT case D. Replay is now warranted and targeted.
+  Fisher exact **p = 3.5e-4**.
+
+  > **RETRACTED 2026-08-31 by the replay experiment.** This section previously
+  > concluded the 5.8pp excess was "our own arithmetic", case B/C. **That is
+  > wrong.** Replay over the real event stream for pool `0xb5f0b4ae66…`
+  > reconstructs chain end-of-block liquidity EXACTLY
+  > (`878713930767309959943171`, confirmed by `eth_call` at block 50679816).
+  > The Mint/Burn arithmetic is correct. This is case **D**.
+  >
+  > The statistics were sound; the interpretation was not. Liquidity-sourced
+  > snapshots diverge more often because **position events cluster densely
+  > within blocks** — that window held 146 Mints and 438 Burns against 2 Swaps —
+  > so a Liquidity-sourced snapshot is far more likely to be mid-block, while a
+  > Swap-sourced one is usually the last event for its pool in that block. The
+  > 11.4x ratio measured EVENT DENSITY, not correctness.
+  >
+  > Both numbers in the divergence record were genuine states inside one block:
+  > ours after event 2 of 4, the chain's after event 4.
 
   Shape narrows it further: `tick_delta` was 0 in all ten, so it is not a
   tick-decode fault. Errors run BOTH directions (-7859 to +35381) and pool
