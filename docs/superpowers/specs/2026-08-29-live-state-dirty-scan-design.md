@@ -1005,6 +1005,22 @@ this guard protects.
   measured; liquidity LOW on the accumulating Mint/Burn path. Confirm by
   fetching that block's logs and looking for an in-range Mint of 892994216111.
   Do NOT close the Slipstream decoder question on this alone.
+- **RESOLVED 2026-08-31 (`c706157`): the resubscribe gap was self-inflicted.**
+  The hot-pool refresh re-ranked on a 5-minute timer and called `set_pools`
+  unconditionally; the set was identical every time (683 pools before and
+  after). Only ADDED addresses need a new socket, so unchanged and shrinking
+  sets are now adopted in place. Verified over 15m49s: 3 refreshes, 3 avoided,
+  0 resubscribes, 0 continuity breaks, `live_state_untrusted_base_total` = 0,
+  518/518 records `Derived`, 0 divergences. Compare run 7 (3 gaps) and the
+  forced-gap run (12 gaps, 5194 deltas dropped, 36% Unknown).
+- **A genuine pool ADDITION still costs a gap, and closing that is blocked on
+  the cursor.** `continuity::Cursor` holds ONE global ordinal and treats
+  anything below it as `OutOfOrder`, which invalidates everything. Two sockets
+  delivering concurrently interleave ordinals by nature, so overlapping the old
+  and new subscriptions would trade a rare gap for constant spurious breaks --
+  worse than the gap. Per-pool cursors are the fix: ordering only matters
+  WITHIN a pool, and it would also make invalidation precise instead of global.
+  Do not attempt subscription overlap before that lands.
 - **Phase 2a validates price and liquidity, NOT depth.** The CL comparison covers
   `sqrt_price_x96`, `liquidity` and `tick` only. `balance0`/`balance1` are not
   tracked in Phase 1, so a passing verdict says nothing about whether CL
