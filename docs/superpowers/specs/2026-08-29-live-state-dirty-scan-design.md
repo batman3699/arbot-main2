@@ -990,6 +990,21 @@ this guard protects.
   Trust states degrade correctly so this is not a mispricing risk, but before
   any funded run there must be a liveness check on the ws feed itself and a
   reconnect path. Rising gap warnings are the available early signal.
+- **RESOLVED 2026-08-31: the silent death was BlockPI's 30-minute websocket
+  close, and three separate defects turned it into 12 hours of blindness.**
+  (1) Every subscription used an unbounded `stream.next().await`, which a
+  half-open socket never satisfies, so all reconnect paths were unreachable
+  (`a77fd31`, `57b68ed`). (2) `PoolMonitor` cloned its provider once outside
+  the loop and so could not rebuild a dead transport even once it noticed
+  (`fb576d9`). (3) `break_continuity` was never called, so gaps orphaned local
+  state silently (`7d56076`). One `Provider<Ws>` is shared by three monitors
+  (main.rs:12019), which is why they all died at the same instant.
+- **The surviving divergence is probably a gap artefact, not a decoder fault.**
+  Pool `0x160d7e9d94` diverged 22 seconds after a pool-list resubscribe whose
+  ~1.4s gap spans block 50684843, before the 50684845 snapshot that was
+  measured; liquidity LOW on the accumulating Mint/Burn path. Confirm by
+  fetching that block's logs and looking for an in-range Mint of 892994216111.
+  Do NOT close the Slipstream decoder question on this alone.
 - **Phase 2a validates price and liquidity, NOT depth.** The CL comparison covers
   `sqrt_price_x96`, `liquidity` and `tick` only. `balance0`/`balance1` are not
   tracked in Phase 1, so a passing verdict says nothing about whether CL
