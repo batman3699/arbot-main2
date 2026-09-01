@@ -551,3 +551,63 @@ lineage replay reconstructs blocks exactly — so the next step is to replay
 one gap in 31 minutes, against a measured rate of ~0.44 lost updates per gap
 under forced conditions. Exercising it needs `CHAOS_WS_GAP_SECS`, not a longer
 natural run.
+
+## 14. Intra-block replay — the fault is delivery, and the design predicted it
+
+Replayed pool `0x70acdf2ad0bf` event by event through blocks 50732766-50732772,
+the window containing the -2900 bps audit mismatch, starting from `liquidity()`
+and `slot0()` at 50732765.
+
+The window holds exactly one Swap, at block 50732769 log index 429. At that
+Swap:
+
+```
+ourL = 497075495346543070
+evL  = 497075495346543070      agree = True
+```
+
+**Replaying the chain's own event stream reproduces the Swap's liquidity
+exactly. The live system did not.** Swaps where a tick-preserving audit would
+have fired, replaying from chain data: **0**.
+
+So the chain data is consistent with our rules, and the live system's state at
+that instant was not what the event stream implies. The fault is in the LIVE
+path's handling of the stream — not the decoder, not the in-range rule, not the
+arithmetic, all of which the replay exercises identically.
+
+### Which brings it back to something already written down
+
+`continuity.rs` opens with this:
+
+> Detects duplicates, backwards movement and reorgs. It deliberately does NOT
+> detect MISSING logs: the subscription is filtered, so consecutive `log_index`
+> values are not expected and a gap carries no information. A dropped log is
+> caught downstream by `state_gate` divergence, not here.
+
+A missed delivery is the one fault the cursor is documented as unable to see,
+and the sign and magnitude fit: the live value was HIGH by ~29%, and not having
+applied the in-range Burn at log index 115 would read -3002 bps against an
+observed -2900. Same sign, same order. Not exact, so not proof of that
+particular event.
+
+### The gauge concentration probably needs no venue explanation
+
+If loss is per-event with some small probability, a pool emitting ten in-range
+position events per block loses roughly ten times as often as one emitting one —
+and on an auto-compounder each event is a large fraction of pool liquidity, so a
+loss is both more likely and far more visible. The 8/8 gauge concentration then
+follows from event VOLUME, not from `stakedLiquidity`, gauge semantics, or
+anything Slipstream-specific. That is a simpler explanation than any venue
+mechanism and it fits every observation.
+
+Testable: gauge pools should account for a share of applied events far above
+their 33.8% share of validated pools.
+
+### Status
+
+The residual is a delivery fault the design anticipated and routed to a
+downstream detector. `audit_against_swap` is that detector, working — it caught
+what 973 validations missed. What remains is to confirm loss directly, which
+means logging enough per-event provenance to compare our applied sequence
+against `eth_getLogs` for the same block, rather than inferring from the
+aggregate.
