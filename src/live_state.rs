@@ -310,6 +310,18 @@ impl LiveState {
     }
 
     pub fn anchor_v2(&self, pool: Address, block: u64, state: UniV2PairState) {
+        // The only writer that does not pass through `apply_log`, so it needs
+        // the same per-pool ordering check. An RPC read from an older block
+        // carries less information than the snapshot already held, and
+        // installing it would regress state while stamping it `Anchored`.
+        if !supersedes(self.current_ordinal(pool), Ordinal::end_of_block(block)) {
+            tracing::debug!(
+                pool = %format!("{pool:#x}"),
+                block,
+                "anchor refused: the pool already holds newer state"
+            );
+            return;
+        }
         let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
         self.next_anchor_id.fetch_add(1, Ordering::SeqCst);
         let prov = self.provenance(
@@ -330,6 +342,18 @@ impl LiveState {
         liquidity: u128,
         tick: i32,
     ) {
+        // The only writer that does not pass through `apply_log`, so it needs
+        // the same per-pool ordering check. An RPC read from an older block
+        // carries less information than the snapshot already held, and
+        // installing it would regress state while stamping it `Anchored`.
+        if !supersedes(self.current_ordinal(pool), Ordinal::end_of_block(block)) {
+            tracing::debug!(
+                pool = %format!("{pool:#x}"),
+                block,
+                "anchor refused: the pool already holds newer state"
+            );
+            return;
+        }
         let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
         self.next_anchor_id.fetch_add(1, Ordering::SeqCst);
         let prov = self.provenance(
@@ -651,6 +675,38 @@ mod tests {
         let snap = ls.cl_snapshot(pool).unwrap();
         assert!(may_price_locally(&snap.prov.trust));
         assert_eq!(snap.liquidity, 2_000_000);
+    }
+
+    /// Task 2 gave the LOG path per-pool monotonicity; the anchor path wrote
+    /// unconditionally, so an anchor read at an older block would silently
+    /// regress a newer snapshot. The poller always anchors at head, so this
+    /// cannot happen today — it is a loaded footgun for the next caller.
+    #[test]
+    fn an_anchor_older_than_the_snapshot_is_refused() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(41);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 9_000_000, 0, 200, 0));
+
+        ls.anchor_cl(pool, 199, U256::from(1u64) << 96, 1, 0);
+
+        let snap = ls.cl_snapshot(pool).unwrap();
+        assert_eq!(
+            snap.liquidity, 9_000_000,
+            "a stale RPC read must not overwrite a newer log-derived snapshot"
+        );
+        assert_eq!(snap.prov.source, SnapshotSource::Swap);
+    }
+
+    /// The same block is a no-op rather than a regression: an anchor at the end
+    /// of block N carries no more information than one already taken there.
+    #[test]
+    fn re_anchoring_the_same_block_does_not_bump_the_version() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(42);
+        ls.anchor_cl(pool, 300, U256::from(7u64), 10, 0);
+        let v1 = ls.cl_snapshot(pool).unwrap().prov.state_version;
+        ls.anchor_cl(pool, 300, U256::from(7u64), 10, 0);
+        assert_eq!(ls.cl_snapshot(pool).unwrap().prov.state_version, v1);
     }
 
     /// An anchor must be positioned, not positionless. `Provenance.ordinal`
