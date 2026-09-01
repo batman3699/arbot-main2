@@ -391,3 +391,67 @@ pool and block to examine.
 403 to requests carrying Python's default `urllib` User-Agent; the endpoint and
 key are fine, and the bot has used them all along. An earlier claim in this
 project that the key had been rotated was wrong.
+
+## 11. Lineage replay — the algorithm is correct, the live path is not
+
+Replayed pool `0xbe00ff35af70` from ground truth at block 50726990
+(`liquidity()` + `slot0()`), applying every Mint, Burn and Swap in stream order
+with the same rules the live decoder uses, and compared against `liquidity()` at
+every block.
+
+**23 of 23 blocks reconstruct chain liquidity EXACTLY**, straight through the
+window where the live system diverged — including block 50727016 itself, and
+through swings from 50.7e18 to 53.8e18 to 37.8e18 to 16.1e18 to 12.4e18 to
+22.4e18 and back to 12.4e18.
+
+So the decoders, the half-open in-range rule `[lower, upper)`, the int24 sign
+extension, the Mint/Burn word offsets and the Swap absolute-write are all
+correct. **The divergence is not arithmetic and never was.**
+
+### Where the live value actually came from
+
+| | |
+|---|---|
+| chain at 50727013 (replay == chain) | 12431930927139055136 |
+| chain Mint in block 50727014 | 10007336648694251113 |
+| chain at 50727014 | 22439267575833306249 |
+| **what the live system held**, stamped block 50727016 | **22439201962213688106** |
+| delta the live system actually applied | 10007271035074632970 |
+
+The live system applied a delta of 10007271035074632970 onto the correct base.
+That value **matches no Mint anywhere in the window** — the six Mints present
+are 10007330450692602954, 10007331623130153497, 10007333298317981031,
+10007334973506013570, 10007336648694251113 and 10007339507485756762.
+
+So it is **not** a missed event, and **not** a stale block: it is a different
+number, 65613619618143 below the Mint the chain applied. A missed event would
+leave the base untouched; a stale block would match some earlier block exactly.
+Neither happened.
+
+The auto-compounder grows its position by roughly 1.2e12 per cycle, and the
+shortfall is ~55 cycles of that growth — suggestive, not conclusive.
+
+### What this rules in and out
+
+- OUT: decoder, in-range test, arithmetic, missed log, stale-block snapshot.
+- IN: something in the LIVE path produced a delta that the chain never emitted.
+  The candidates are a stale `existing.liquidity` read under concurrency (the
+  Mint/Burn path does read-modify-write on a `DashMap` entry without holding a
+  per-pool lock across the read and the insert), or a lost update to a
+  concurrent writer.
+
+That last one is worth stating plainly: `apply_log` clones the existing snapshot,
+computes `existing.liquidity + delta`, and inserts. Two deltas for the same pool
+applied concurrently can both read the same base and the second can overwrite
+the first — a classic lost update. The loom model proved the DIRTY SET is
+lossless; it never covered the snapshot read-modify-write. On a pool receiving
+~10 in-range position events per block, this is exactly where it would show, and
+it would produce a value that matches no single event — which is what we see.
+
+### Next
+
+Extend the loom model to two concurrent `apply_log` calls on the SAME pool and
+assert the final liquidity equals the sum of both deltas. If it fails, the
+residual is a concurrency bug in the delta path and has nothing to do with
+gauges, staking, or Slipstream at all — those pools simply have the event
+density to expose it.
