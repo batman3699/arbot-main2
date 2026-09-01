@@ -56,9 +56,12 @@ pub struct Metrics {
     /// Signed divergence of log-derived state from a fresh RPC read, by venue.
     pub live_state_divergence_bps: HistogramVec,
     /// Validation attempts by outcome: measured, unreachable, unsettled,
+    /// not_independent,
     /// skipped_lag, no_ordinal. `unsettled` means the snapshot's block may still
     /// receive more logs, so comparing it against end-of-block chain state
-    /// would manufacture a divergence.
+    /// would manufacture a divergence. `not_independent` means the snapshot IS
+    /// an RPC read, so measuring it would compare an `eth_call` against the
+    /// `eth_call` it came from and pass by construction.
     pub live_state_checks: CounterVec,
     pub live_state_trusted: Gauge,
     /// MEASURED AND FAILED only. Not "everything that is not trusted" — an
