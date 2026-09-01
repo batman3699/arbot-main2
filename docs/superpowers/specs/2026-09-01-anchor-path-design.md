@@ -278,3 +278,51 @@ reproduce.
 
 Local pricing on anchored lineage is no longer blocked by §7's finding, but the
 unexplained residual is its own gate and has not moved.
+
+## 9. Going after the residual, 2026-09-01 — the arithmetic is exonerated
+
+The residual had been chased across five runs at roughly one observation per
+178 validations, which is why it was never characterised: the sampled validator
+is too slow an instrument for a sub-1% effect.
+
+`audit_against_swap` replaces sampling with a census. A CL `Swap` carries
+ABSOLUTE in-range liquidity, so when the tick has not moved it is a free,
+exact check on everything the Mint/Burn path accumulated since the last
+absolute write. No RPC, no sampling, and exact equality rather than a bps
+threshold.
+
+Run: 22m24s, no forced gaps.
+
+| | |
+|---|---|
+| swap audits | **3664** |
+| audit mismatches | **0** |
+| validator reconciliations | 751 |
+| validator divergences | 0 |
+| `live_state_untrusted_base_total` | 0 |
+| `live_state_lost_updates` | 0 |
+
+**The Mint/Burn arithmetic is correct.** By the rule of three, 0 mismatches in
+3664 trials bounds the true error rate below **0.082%** at 95% confidence —
+roughly six times below the LOW end of the 0.5–3.9% residual the validator has
+reported. Whatever the residual is, it is very unlikely to be the accumulation
+arithmetic, and a lost Mint/Burn log would also have shown here.
+
+### What this does not settle
+
+The residual did not occur at all in this run, so it has not been caught by the
+new instrument — only made catchable. The audit is also blind to a pool that
+diverges and never afterwards receives a tick-unchanged swap.
+
+What it does give is discrimination. If the residual recurs while
+`live_state_swap_audit_mismatches` stays 0, the fault is in the comparison or
+the validator, not in local state — which inverts where to look, and is exactly
+the question five runs of sampling could not answer.
+
+### Incidental: anchoring bootstraps pools that never trade
+
+636 anchors with zero continuity breaks. These are pools with no snapshot at
+all: previously a pool that emitted no event never entered `LiveState`, because
+a delta with no base returns `NotStateBearing`. The anchor path now gives them a
+base. That is a coverage gain independent of gap recovery, and it was not a
+stated goal of the design.
