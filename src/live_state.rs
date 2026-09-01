@@ -653,6 +653,61 @@ mod tests {
         assert_eq!(snap.liquidity, 2_000_000);
     }
 
+    /// An anchor must be positioned, not positionless. `Provenance.ordinal`
+    /// used to be documented as "None for an anchor", which is exactly why
+    /// anchors could not be ordered against logs.
+    #[test]
+    fn an_anchor_records_its_own_block_position() {
+        let ls = LiveState::new();
+        let cl = Address::from_low_u64_be(31);
+        ls.anchor_cl(cl, 500, U256::from(1u64) << 96, 42, 0);
+        let snap = ls.cl_snapshot(cl).unwrap();
+        assert_eq!(snap.prov.ordinal, Some(Ordinal::end_of_block(500)));
+        assert_eq!(snap.prov.source, SnapshotSource::Anchor);
+        assert!(may_price_locally(&snap.prov.trust));
+    }
+
+    /// V2 is symmetric; nothing here is CL-specific.
+    #[test]
+    fn a_v2_anchor_records_its_own_block_position() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(32);
+        ls.anchor_v2(
+            pool,
+            500,
+            UniV2PairState {
+                token0: Address::from_low_u64_be(901),
+                token1: Address::from_low_u64_be(902),
+                reserve0: U256::from(1u64),
+                reserve1: U256::from(2u64),
+            },
+        );
+        assert_eq!(
+            ls.v2_snapshot(pool).unwrap().prov.ordinal,
+            Some(Ordinal::end_of_block(500))
+        );
+    }
+
+    /// An anchor must restore trust after a gap — that is the entire reason for
+    /// this work. Only an absolute write can, and an anchor is one.
+    #[test]
+    fn an_anchor_restores_trust_after_a_gap() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(33);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.break_continuity(UnknownReason::WsUnavailable);
+        assert!(!may_price_locally(&ls.cl_snapshot(pool).unwrap().prov.trust));
+
+        ls.anchor_cl(pool, 101, U256::from(1u64) << 96, 2_000_000, 0);
+
+        let snap = ls.cl_snapshot(pool).unwrap();
+        assert!(
+            may_price_locally(&snap.prov.trust),
+            "without this a pool that never trades stays Unknown forever"
+        );
+        assert_eq!(snap.liquidity, 2_000_000);
+    }
+
     /// A log the anchor already reflects must be DROPPED, not treated as
     /// disorder. `Break(OutOfOrder)` calls `break_continuity`, which
     /// invalidates all 683 pools — routing expected traffic through it would
