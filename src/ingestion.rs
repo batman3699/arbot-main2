@@ -693,6 +693,39 @@ where
             .collect()
     }
 
+    /// Anchor V2 pools that cannot recover on their own.
+    ///
+    /// Costs nothing: `poll_all_pools` has already read every pair state at
+    /// `block`, so this is the same data the cache is about to take.
+    ///
+    /// Gated on need, and that gate is load-bearing in a way the CL path's is
+    /// not. Anchoring a HEALTHY pool would stamp it `SnapshotSource::Anchor`,
+    /// which `select` excludes as not independent — so anchoring everything
+    /// every cycle would silently delete the entire V2 divergence signal while
+    /// looking like an improvement.
+    fn anchor_v2_where_needed(
+        &self,
+        states: &std::collections::HashMap<Address, UniV2PairState>,
+        block: U64,
+    ) {
+        use crate::live_state::may_price_locally;
+        let Some(live) = &self.live_state else {
+            return;
+        };
+        for (pair, state) in states.iter() {
+            let needs = match live.v2_snapshot(*pair) {
+                None => true,
+                Some(s) => !may_price_locally(&s.prov.trust),
+            };
+            if needs {
+                live.anchor_v2(*pair, block.as_u64(), state.clone());
+                if let Some(m) = &self.metrics {
+                    m.live_state_anchors.inc();
+                }
+            }
+        }
+    }
+
     /// Read true state for pools that cannot recover on their own and install
     /// it as an anchor, pinned to `block`.
     ///
@@ -887,6 +920,9 @@ where
                     for (pair, state) in states.iter() {
                         self.cache_state(*pair, state.clone()).await;
                     }
+                    // Free: these were just read, pinned to `block`. No extra
+                    // RPC, which is why V2 needs no budget.
+                    self.anchor_v2_where_needed(&states, block);
 
                     // Pairs the batch dropped still need the per-pair path: it
                     // is what distinguishes a transient failure from an empty
@@ -1731,6 +1767,71 @@ mod tests {
         assert!(
             !got.contains(&trusted.pair),
             "spending an eth_call here buys nothing; its next Swap is free"
+        );
+    }
+
+    /// The V2 gate is load-bearing in a way the CL one is not: anchoring a
+    /// healthy pool stamps it `SnapshotSource::Anchor`, which validation
+    /// excludes as not independent. Anchoring every pool every cycle would
+    /// delete the V2 divergence signal entirely while looking like coverage.
+    #[tokio::test]
+    async fn v2_anchoring_skips_pools_that_can_recover_on_their_own() {
+        use crate::live_state::{LiveState, SnapshotSource};
+        use crate::quote_univ2::UniV2PairState;
+        let live = Arc::new(LiveState::new());
+        let healthy = Address::from_low_u64_be(1);
+        let unseen = Address::from_low_u64_be(2);
+
+        // `healthy` already has trusted, log-derived state.
+        let mut data = Vec::new();
+        for v in [7u128, 9u128] {
+            let mut w = [0u8; 32];
+            w[16..].copy_from_slice(&v.to_be_bytes());
+            data.extend_from_slice(&w);
+        }
+        live.apply_log(&Log {
+            address: healthy,
+            topics: vec![*crate::log_decode::TOPIC_SOLIDLY_SYNC],
+            data: ethers::types::Bytes::from(data),
+            block_number: Some(50u64.into()),
+            transaction_index: Some(0u64.into()),
+            log_index: Some(0u64.into()),
+            removed: Some(false),
+            ..Default::default()
+        });
+
+        let monitor = PoolMonitor::new(
+            Arc::new(Provider::new(MockProvider::default())),
+            None,
+            vec![monitored(1)],
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            None,
+        )
+        .expect("monitor should construct")
+        .with_live_state(live.clone());
+
+        let state = UniV2PairState {
+            token0: Address::from_low_u64_be(900),
+            token1: Address::from_low_u64_be(901),
+            reserve0: ethers::types::U256::from(1u64),
+            reserve1: ethers::types::U256::from(2u64),
+        };
+        let states = std::collections::HashMap::from([
+            (healthy, state.clone()),
+            (unseen, state.clone()),
+        ]);
+        monitor.anchor_v2_where_needed(&states, 100u64.into());
+
+        assert_eq!(
+            live.v2_snapshot(healthy).unwrap().prov.source,
+            SnapshotSource::Sync,
+            "a healthy pool must stay log-derived, or it stops being measured"
+        );
+        assert_eq!(
+            live.v2_snapshot(unseen).unwrap().prov.source,
+            SnapshotSource::Anchor,
+            "a pool with no state cannot recover from the log stream alone"
         );
     }
 
