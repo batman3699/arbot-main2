@@ -51,6 +51,9 @@ pub struct Metrics {
     /// Deltas confirmed lost to the anchor window: dropped for want of a
     /// trusted base at a block ABOVE the anchor's, so contained in neither.
     pub live_state_lost_updates: Gauge,
+    /// Deltas replayed onto an anchor because they arrived during its read and
+    /// are outside its end-of-block state.
+    pub live_state_replayed_deltas: Gauge,
     /// Swaps that served as a free audit of the Mint/Burn arithmetic — tick
     /// unchanged, so only a Mint/Burn could have moved liquidity.
     pub live_state_swap_audits: Gauge,
@@ -226,6 +229,14 @@ impl Metrics {
         registry
             .register(Box::new(live_state_lost_updates.clone()))
             .context("register live_state_lost_updates gauge")?;
+
+        let live_state_replayed_deltas = Gauge::with_opts(Opts::new(
+            "live_state_replayed_deltas",
+            "Deltas replayed after an anchor closed its read window",
+        ))?;
+        registry
+            .register(Box::new(live_state_replayed_deltas.clone()))
+            .context("register live_state_replayed_deltas gauge")?;
 
         let live_state_swap_audits = Gauge::with_opts(Opts::new(
             "live_state_swap_audits",
@@ -726,6 +737,7 @@ impl Metrics {
             live_state_superseded,
             live_state_anchors,
             live_state_lost_updates,
+            live_state_replayed_deltas,
             live_state_swap_audits,
             live_state_swap_audit_mismatches,
             ingestion_resubscribes_avoided,

@@ -64,6 +64,13 @@ pub enum TrustState {
 /// than. That case shrinks to nothing once anchors carry
 /// `Ordinal::end_of_block`, but refusing it would freeze any pool whose
 /// snapshot predates that change.
+/// Ceiling on deltas buffered per pool while it is untrusted.
+///
+/// Bounds memory against a pool that never regains trust. Past it we fall back
+/// to dropping, and `live_state_lost_updates` counts what that costs -- so the
+/// number means "genuinely lost", not "briefly deferred".
+const PENDING_DELTA_CAP: usize = 256;
+
 pub fn supersedes(existing: Option<Ordinal>, incoming: Ordinal) -> bool {
     match existing {
         None => true,
@@ -189,6 +196,7 @@ pub struct LiveState {
     /// Never held across an `.await`; `apply_log` is synchronous.
     state_write: StdMutex<()>,
     lost_updates: AtomicU64,
+    replayed_deltas: AtomicU64,
     swap_audits: AtomicU64,
     swap_audit_mismatches: AtomicU64,
     /// Bumped on every accepted application and on every epoch change. Phase 2
@@ -210,6 +218,16 @@ pub struct LiveState {
     /// ABOVE N is covered by neither the anchor nor the log path, and is gone.
     /// Compared against the anchor block at install time.
     dropped_while_untrusted: DashMap<Address, u64>,
+    /// Liquidity deltas held while a pool has no trusted base, so an anchor can
+    /// replay the ones it does not already contain.
+    ///
+    /// An anchor read at block N is end-of-block-N state. A delta from a LATER
+    /// block arrives during the read's flight, is refused for want of a trusted
+    /// base, and is in neither the anchor nor the snapshot -- lost from both.
+    /// Buffering is the only fix that converges: re-anchoring cannot, because a
+    /// pool taking ten position events per block will lose another delta in
+    /// every retry window.
+    pending_deltas: DashMap<Address, Vec<(Ordinal, crate::log_decode::ClLiquidityDelta)>>,
 }
 
 // main.rs compiles its own copy; several accessors are Phase 2's consumers.
@@ -400,6 +418,76 @@ impl LiveState {
             Arc::new(ClSnapshot { sqrt_price_x96, liquidity, tick, prov }),
         );
         self.generation.fetch_add(1, Ordering::SeqCst);
+        // Everything that arrived during the read's flight and was refused for
+        // want of a trusted base. Without this the anchor closes the trust gap
+        // and opens a correctness one.
+        self.replay_pending(pool, block);
+    }
+
+    /// Re-apply deltas the anchor does not already contain.
+    ///
+    /// An anchor at block N is end-of-block-N state, so buffered deltas at or
+    /// below N are already inside it and must be discarded — replaying those
+    /// would double-count. Only deltas from LATER blocks are replayed, in
+    /// ordinal order, exactly as `apply_log` would have.
+    ///
+    /// Called with `state_write` held, so it writes directly rather than
+    /// re-entering `apply_log`.
+    fn replay_pending(&self, pool: Address, anchor_block: u64) -> usize {
+        let Some((_, mut pending)) = self.pending_deltas.remove(&pool) else {
+            return 0;
+        };
+        pending.sort_by_key(|(o, _)| *o);
+        let mut applied = 0usize;
+        for (ordinal, d) in pending {
+            if ordinal.block <= anchor_block {
+                continue;
+            }
+            let Some(existing) = self.cl.get(&pool).map(|e| (**e).clone()) else {
+                continue;
+            };
+            if !(d.tick_lower <= existing.tick && existing.tick < d.tick_upper) {
+                continue;
+            }
+            let updated = (existing.liquidity as i128).saturating_add(d.liquidity_delta);
+            let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
+            let prov = self.provenance(
+                version,
+                Some(ordinal),
+                TrustState::Derived,
+                SnapshotSource::Liquidity,
+            );
+            self.cl.insert(
+                pool,
+                Arc::new(ClSnapshot {
+                    sqrt_price_x96: existing.sqrt_price_x96,
+                    liquidity: u128::try_from(updated.max(0)).unwrap_or(0),
+                    tick: existing.tick,
+                    prov,
+                }),
+            );
+            self.generation.fetch_add(1, Ordering::SeqCst);
+            self.note_applied_block(ordinal.block);
+            self.publish(pool, version);
+            applied += 1;
+        }
+        if applied > 0 {
+            self.replayed_deltas
+                .fetch_add(applied as u64, Ordering::SeqCst);
+            tracing::debug!(
+                target: "anchor_probe",
+                pool = %format!("{pool:#x}"),
+                anchor_block,
+                applied,
+                "replayed deltas that arrived during the anchor read"
+            );
+        }
+        applied
+    }
+
+    /// Deltas re-applied after an anchor. See `replay_pending`.
+    pub fn replayed_deltas(&self) -> u64 {
+        self.replayed_deltas.load(Ordering::SeqCst)
     }
 
     /// Audit the Mint/Burn arithmetic against ground truth, for free.
@@ -596,10 +684,17 @@ impl LiveState {
             // why the Liquidity path diverged after every gap while the Swap
             // path, which overwrites `liquidity` outright, never did.
             if !may_price_locally(&self.resolve_trust(&existing.prov)) {
-                self.dropped_while_untrusted
-                    .entry(pool)
-                    .and_modify(|b| *b = (*b).max(ordinal.block))
-                    .or_insert(ordinal.block);
+                // Hold it for the anchor to replay rather than discarding it.
+                let mut buf = self.pending_deltas.entry(pool).or_default();
+                if buf.len() < PENDING_DELTA_CAP {
+                    buf.push((ordinal, d));
+                } else {
+                    drop(buf);
+                    self.dropped_while_untrusted
+                        .entry(pool)
+                        .and_modify(|b| *b = (*b).max(ordinal.block))
+                        .or_insert(ordinal.block);
+                }
                 return ApplyOutcome::UntrustedBase;
             }
             // UniV3 ranges are half-open: [tickLower, tickUpper).
@@ -866,37 +961,108 @@ mod tests {
         assert_eq!(ls.swap_audit_counts(), (0, 0));
     }
 
-    /// The mechanism proposed for the 2026-09-01 divergence, as a unit test:
-    /// a delta that arrives after the anchor's READ but before it LANDS is
-    /// refused (the pool is still untrusted) and is absent from the anchor too,
-    /// because the anchor is end-of-block-N state and the delta is from N+1.
-    /// Lost from both paths.
+    /// The window, closed. A delta arriving after the anchor's READ but before
+    /// it LANDS used to be lost from both paths. It is now held and replayed.
     #[test]
-    fn a_delta_arriving_inside_the_anchor_window_is_lost() {
+    fn a_delta_from_inside_the_anchor_window_is_replayed() {
         let ls = LiveState::new();
-        let pool = Address::from_low_u64_be(51);
+        let pool = Address::from_low_u64_be(81);
         ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
         ls.break_continuity(UnknownReason::WsUnavailable);
 
-        // The anchor read happens at block 105. Before it lands, a Mint from
-        // block 106 arrives and is refused for want of a trusted base.
+        // Read at 105; a Mint from 106 arrives before the anchor lands.
         assert_eq!(
             ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 106, 0)),
             ApplyOutcome::UntrustedBase
         );
-        assert_eq!(ls.lost_updates(), 0, "not lost yet — the anchor could still cover it");
+        ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 2_000_000, 0);
 
+        let snap = ls.cl_snapshot(pool).unwrap();
+        assert_eq!(
+            snap.liquidity, 2_000_500,
+            "the block-106 Mint is outside end-of-block-105 state and must be replayed"
+        );
+        assert_eq!(ls.replayed_deltas(), 1);
+        assert_eq!(ls.lost_updates(), 0, "nothing was lost");
+    }
+
+    /// The other half, and the one that would double-count if got wrong: a
+    /// delta at or below the anchor's block is ALREADY inside its end-of-block
+    /// read, so replaying it would add the same Mint twice.
+    #[test]
+    fn a_delta_the_anchor_already_contains_is_not_replayed() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(82);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.break_continuity(UnknownReason::WsUnavailable);
+
+        assert_eq!(
+            ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 104, 0)),
+            ApplyOutcome::UntrustedBase
+        );
         ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 2_000_000, 0);
 
         assert_eq!(
+            ls.cl_snapshot(pool).unwrap().liquidity,
+            2_000_000,
+            "a block-104 Mint is inside end-of-block-105 state; replaying double-counts"
+        );
+        assert_eq!(ls.replayed_deltas(), 0);
+    }
+
+    /// Ordering survives the buffer: replayed deltas apply in ordinal order,
+    /// and the snapshot ends up carrying the LAST one's position.
+    #[test]
+    fn replayed_deltas_apply_in_order() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(83);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.break_continuity(UnknownReason::WsUnavailable);
+        for (blk, amt) in [(106u64, 500u128), (107, 700), (108, 900)] {
+            ls.apply_log(&liquidity_log(pool, true, -60, 60, amt, blk, 0));
+        }
+        ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 2_000_000, 0);
+
+        let snap = ls.cl_snapshot(pool).unwrap();
+        assert_eq!(snap.liquidity, 2_000_000 + 500 + 700 + 900);
+        assert_eq!(ls.replayed_deltas(), 3);
+        assert_eq!(snap.prov.ordinal.unwrap().block, 108);
+    }
+
+    /// Buffering is bounded, so past the cap deltas ARE genuinely lost — and
+    /// `live_state_lost_updates` counts exactly that, rather than the merely
+    /// deferred. This is the honest degradation path for a pool that never
+    /// regains trust.
+    ///
+    /// Replaces a test that asserted the loss happened unconditionally: that
+    /// was the mechanism before `replay_pending` closed the window, and it
+    /// rightly fails now.
+    #[test]
+    fn past_the_buffer_cap_deltas_are_lost_and_counted() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(84);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.break_continuity(UnknownReason::WsUnavailable);
+
+        let over = 10u64;
+        for i in 0..(PENDING_DELTA_CAP as u64 + over) {
+            ls.apply_log(&liquidity_log(pool, true, -60, 60, 1, 106 + i, 0));
+        }
+        ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 2_000_000, 0);
+
+        assert_eq!(
+            ls.replayed_deltas(),
+            PENDING_DELTA_CAP as u64,
+            "everything that fitted in the buffer must be replayed"
+        );
+        assert_eq!(
             ls.lost_updates(),
             1,
-            "the anchor is end-of-block-105 state, so it cannot contain a block-106 Mint"
+            "and the overflow must be reported, not silently dropped"
         );
         assert_eq!(
             ls.cl_snapshot(pool).unwrap().liquidity,
-            2_000_000,
-            "and the snapshot is short by exactly that Mint, while reporting Derived"
+            2_000_000 + PENDING_DELTA_CAP as u128
         );
     }
 
