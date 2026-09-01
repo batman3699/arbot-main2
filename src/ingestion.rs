@@ -948,9 +948,6 @@ where
                         }
                     }
 
-                    // V2 anchoring stays here: it consumes `states`, which
-                    // only exists on this path.
-                    self.anchor_v2_where_needed(&states, block);
                     self.anchor_untrusted(block).await;
                 }
                 Err(err) => {
