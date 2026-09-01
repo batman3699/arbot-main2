@@ -177,6 +177,8 @@ pub struct LiveState {
     continuity_epoch: AtomicU64,
     next_anchor_id: AtomicU64,
     lost_updates: AtomicU64,
+    swap_audits: AtomicU64,
+    swap_audit_mismatches: AtomicU64,
     /// Bumped on every accepted application and on every epoch change. Phase 2
     /// uses this for `ScanSnapshot` generation validation (spec §4.2).
     generation: AtomicU64,
@@ -380,6 +382,72 @@ impl LiveState {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Audit the Mint/Burn arithmetic against ground truth, for free.
+    ///
+    /// A CL `Swap` carries ABSOLUTE in-range liquidity, so it is a free check on
+    /// everything accumulated since the last absolute write — no RPC, no
+    /// sampling, one audit per qualifying swap instead of one validator sample
+    /// per pool per cycle.
+    ///
+    /// Only run when the tick has NOT moved. In-range liquidity changes for two
+    /// reasons: a Mint/Burn straddling the current tick, or the tick crossing an
+    /// initialised boundary during a swap. A swap moves price monotonically, so
+    /// an unchanged tick means no boundary was crossed and the Mint/Burn path is
+    /// the ONLY thing that can have altered liquidity. Any difference is then
+    /// ours: a lost log, or bad arithmetic.
+    ///
+    /// Anchored and untrusted bases are excluded — the first is RPC ground truth
+    /// rather than accumulation, and the second is already known to be wrong.
+    fn audit_against_swap(
+        &self,
+        pool: Address,
+        d: &crate::log_decode::ClSwapDelta,
+        ordinal: Ordinal,
+    ) {
+        let Some(existing) = self.cl.get(&pool).map(|e| (**e).clone()) else {
+            return;
+        };
+        if existing.tick != d.tick
+            || existing.prov.source == SnapshotSource::Anchor
+            || !may_price_locally(&self.resolve_trust(&existing.prov))
+        {
+            return;
+        }
+        self.swap_audits.fetch_add(1, Ordering::SeqCst);
+        if existing.liquidity == d.liquidity {
+            return;
+        }
+        self.swap_audit_mismatches.fetch_add(1, Ordering::SeqCst);
+        let drift = d.liquidity as i128 - existing.liquidity as i128;
+        let bps = if d.liquidity == 0 {
+            0
+        } else {
+            (drift.saturating_mul(10_000) / d.liquidity as i128) as i64
+        };
+        tracing::debug!(
+            target: "liq_audit",
+            pool = %format!("{pool:#x}"),
+            ours = existing.liquidity,
+            chain = d.liquidity,
+            drift,
+            bps,
+            tick = d.tick,
+            blocks_since = ordinal
+                .block
+                .saturating_sub(existing.prov.ordinal.map(|o| o.block).unwrap_or(ordinal.block)),
+            since_source = ?existing.prov.source,
+            "liquidity accumulated since the last absolute write disagrees with the swap"
+        );
+    }
+
+    /// Swaps that qualified as an audit, and how many disagreed.
+    pub fn swap_audit_counts(&self) -> (u64, u64) {
+        (
+            self.swap_audits.load(Ordering::SeqCst),
+            self.swap_audit_mismatches.load(Ordering::SeqCst),
+        )
+    }
+
     /// Did this anchor lose an event?
     ///
     /// An anchor read at block N is end-of-block-N state, so it already
@@ -538,6 +606,7 @@ impl LiveState {
         }
 
         if let Some(d) = decode_cl_swap(log) {
+            self.audit_against_swap(pool, &d, ordinal);
             let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
             let prov =
                 self.provenance(version, Some(ordinal), TrustState::Derived, SnapshotSource::Swap);
@@ -721,6 +790,54 @@ mod tests {
         let snap = ls.cl_snapshot(pool).unwrap();
         assert!(may_price_locally(&snap.prov.trust));
         assert_eq!(snap.liquidity, 2_000_000);
+    }
+
+    /// A Swap carries absolute liquidity, so when the tick has not moved it is
+    /// a free check on everything the Mint/Burn path accumulated since the last
+    /// absolute write. This is the residual detector: one audit per qualifying
+    /// swap instead of one sampled validation per pool per cycle.
+    #[test]
+    fn a_swap_audits_the_deltas_accumulated_since_the_last_one() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(61);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 101, 0));
+        assert_eq!(ls.cl_snapshot(pool).unwrap().liquidity, 1_000_500);
+
+        // The chain says 1_000_500 too: our accumulation was right.
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_500, 0, 102, 0));
+        assert_eq!(ls.swap_audit_counts(), (1, 0));
+
+        // Now the chain disagrees — exactly what a lost Mint looks like.
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_777_000, 0, 103, 0));
+        assert_eq!(ls.swap_audit_counts(), (2, 1));
+    }
+
+    /// A moved tick means a boundary was crossed, which changes in-range
+    /// liquidity for reasons that have nothing to do with Mint/Burn. Auditing
+    /// there would report constant false mismatches.
+    #[test]
+    fn a_swap_that_moved_the_tick_is_not_audited() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(62);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 4_000_000, 7, 101, 0));
+        assert_eq!(
+            ls.swap_audit_counts(),
+            (0, 0),
+            "a tick crossing legitimately changes liquidity"
+        );
+    }
+
+    /// An anchored base is RPC ground truth, not accumulation, so auditing it
+    /// would measure the anchor window rather than the Mint/Burn arithmetic.
+    #[test]
+    fn a_swap_after_an_anchor_is_not_audited() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(63);
+        ls.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000_000, 0);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 9_999_999, 0, 101, 0));
+        assert_eq!(ls.swap_audit_counts(), (0, 0));
     }
 
     /// The mechanism proposed for the 2026-09-01 divergence, as a unit test:

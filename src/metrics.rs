@@ -51,6 +51,13 @@ pub struct Metrics {
     /// Deltas confirmed lost to the anchor window: dropped for want of a
     /// trusted base at a block ABOVE the anchor's, so contained in neither.
     pub live_state_lost_updates: Gauge,
+    /// Swaps that served as a free audit of the Mint/Burn arithmetic — tick
+    /// unchanged, so only a Mint/Burn could have moved liquidity.
+    pub live_state_swap_audits: Gauge,
+    /// Audits where our accumulated liquidity disagreed with the swap's
+    /// absolute value. This is the residual, measured continuously instead of
+    /// waiting for the sampled validator to happen upon it.
+    pub live_state_swap_audit_mismatches: Gauge,
     /// Logs dropped because an anchor had already carried the pool past them.
     /// Expected traffic; a spike means anchoring is running too far ahead of
     /// the log stream.
@@ -219,6 +226,22 @@ impl Metrics {
         registry
             .register(Box::new(live_state_lost_updates.clone()))
             .context("register live_state_lost_updates gauge")?;
+
+        let live_state_swap_audits = Gauge::with_opts(Opts::new(
+            "live_state_swap_audits",
+            "Swaps usable as an audit of accumulated liquidity",
+        ))?;
+        registry
+            .register(Box::new(live_state_swap_audits.clone()))
+            .context("register live_state_swap_audits gauge")?;
+
+        let live_state_swap_audit_mismatches = Gauge::with_opts(Opts::new(
+            "live_state_swap_audit_mismatches",
+            "Audits where accumulated liquidity disagreed with the swap",
+        ))?;
+        registry
+            .register(Box::new(live_state_swap_audit_mismatches.clone()))
+            .context("register live_state_swap_audit_mismatches gauge")?;
 
         let live_state_anchors = Counter::with_opts(Opts::new(
             "live_state_anchors_total",
@@ -703,6 +726,8 @@ impl Metrics {
             live_state_superseded,
             live_state_anchors,
             live_state_lost_updates,
+            live_state_swap_audits,
+            live_state_swap_audit_mismatches,
             ingestion_resubscribes_avoided,
             live_state_applied,
             live_state_undecodable,
