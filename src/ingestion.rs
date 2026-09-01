@@ -651,7 +651,20 @@ where
     /// Anchoring is the `eth_call` traffic local state exists to avoid, so the
     /// budget is a recovery backlog, not a refresh cycle. A gap invalidates all
     /// 683 pools at once; draining that over several cycles is the intent.
-    const ANCHOR_BUDGET_PER_CYCLE: usize = 16;
+    ///
+    /// Sized against the DELTA BUFFER, not against tidiness. Measured
+    /// 2026-09-01: 636 pools drained in ~60s at 16 per 1200ms cycle, 13.25/sec.
+    /// The hottest pool observed takes ~10 in-range position events per block,
+    /// so at 2s blocks it buffers ~5 deltas/sec and fills `PENDING_DELTA_CAP`
+    /// (256) in ~51s — nine seconds BEFORE a 16/cycle drain would reach it. Past
+    /// the cap deltas are genuinely lost, so 16 loses data on exactly the pools
+    /// that matter most.
+    ///
+    /// 32 halves the drain to ~26s, leaving the hottest pool at ~128 of 256
+    /// buffered. Anchoring only runs on untrusted pools, and gaps are rare since
+    /// `c706157`, so this doubles a burst that is already uncommon rather than
+    /// doubling steady-state RPC.
+    const ANCHOR_BUDGET_PER_CYCLE: usize = 32;
 
     /// Pools that cannot recover without an RPC read.
     ///
@@ -1718,6 +1731,30 @@ mod tests {
         assert!(
             !got.contains(&trusted.pair),
             "spending an eth_call here buys nothing; its next Swap is free"
+        );
+    }
+
+    /// The budget is only correct relative to the buffer it feeds. If a full
+    /// drain takes longer than the hottest pool needs to fill
+    /// `PENDING_DELTA_CAP`, that pool loses data before it is ever anchored --
+    /// which is what 16 per cycle did.
+    #[test]
+    fn the_anchor_budget_drains_before_the_hottest_pool_overflows() {
+        const POOLS: f64 = 683.0;
+        const POLL_MS: f64 = 1200.0;
+        // Measured 2026-09-01 on the divergent pool: ~10 in-range position
+        // events per block, Base blocks ~2s.
+        const DELTAS_PER_SEC: f64 = 5.0;
+        const CAP: f64 = 256.0;
+
+        let cycles_per_sec = 1000.0 / POLL_MS;
+        let drain_secs = POOLS / (PoolMonitor::<MockProvider>::ANCHOR_BUDGET_PER_CYCLE as f64
+            * cycles_per_sec);
+        let headroom_secs = CAP / DELTAS_PER_SEC;
+        assert!(
+            drain_secs < headroom_secs,
+            "a full drain takes {drain_secs:.0}s but the hottest pool overflows its \
+             buffer in {headroom_secs:.0}s, so it loses deltas before being anchored"
         );
     }
 
