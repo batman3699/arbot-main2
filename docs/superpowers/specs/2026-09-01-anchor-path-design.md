@@ -455,3 +455,45 @@ assert the final liquidity equals the sum of both deltas. If it fails, the
 residual is a concurrency bug in the delta path and has nothing to do with
 gauges, staking, or Slipstream at all — those pools simply have the event
 density to expose it.
+
+## 12. The pre-anchor path was single-writer — confirmed
+
+The race in section 11 is real and fixed, but it cannot explain the residual it
+was found while hunting. Checked at `81bf4df`, the last commit before the anchor
+path:
+
+**Static.** The only mutators of `LiveState` snapshots are `apply_log`,
+`anchor_cl` and `anchor_v2`. Outside `live_state.rs`, the only callers anywhere
+in the tree are in `ingestion.rs`: `apply_log` from `handle_log`, and
+`break_continuity` from `note_ws_gap`. `main.rs`, `state_validation.rs` and
+`state_gate.rs` call none of them. `anchor_cl`/`anchor_v2` had no callers at
+all — the dead-code finding that started this work.
+
+Both live callers sit inside `run_ws`, which `PoolMonitor::spawn` starts
+exactly once, and `main.rs` constructs exactly one `PoolMonitor`. `handle_log`
+is awaited sequentially inside that task's loop. `break_continuity` writes no
+snapshot — it bumps an epoch and resets the cursor.
+
+So there was **one writer, on one task, applying logs in stream order**.
+
+**Empirical.** Two concurrent `apply_log` calls would race the global cursor,
+and the loser's lower ordinal would be reported as `OutOfOrder`, breaking
+continuity loudly. Across all eight recorded runs:
+`OutOfOrder`/`Reorg` breaks = **0**. Consistent with a single ordered writer,
+and inconsistent with concurrent log application.
+
+### Consequence
+
+The concurrency line is closed for the historical residual. Run 5's 1/224 had no
+second writer to race. Section 11's bug was introduced by the anchor path in
+this session, and its scope is the anchor path alone.
+
+The residual therefore remains open, with the following now ruled out: decoder,
+half-open in-range rule, int24 sign extension, Mint/Burn word offsets, Swap
+absolute-write, arithmetic (23/23 replay, 4224 audits), missed log, stale-block
+snapshot, undecoded event type, staked-liquidity accounting, and concurrency.
+
+What survives: it is specific to gauge pools hosting auto-compounders (8/8,
+p = 1.7e-4), it is rare, it self-heals on the next Swap, and the live system
+once applied a delta matching no event the chain emitted. The last of those is
+the sharpest remaining clue and is not yet explained.
