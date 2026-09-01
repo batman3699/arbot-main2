@@ -71,6 +71,11 @@ pub enum TrustState {
 /// number means "genuinely lost", not "briefly deferred".
 const PENDING_DELTA_CAP: usize = 256;
 
+/// Ceiling on the per-pool applied-delta trace. Bounds memory on a pool that
+/// goes a long time without an absolute write; past it the dump says so rather
+/// than quietly showing a partial sequence.
+const APPLIED_TRACE_CAP: usize = 64;
+
 pub fn supersedes(existing: Option<Ordinal>, incoming: Ordinal) -> bool {
     match existing {
         None => true,
@@ -228,6 +233,14 @@ pub struct LiveState {
     /// pool taking ten position events per block will lose another delta in
     /// every retry window.
     pending_deltas: DashMap<Address, Vec<(Ordinal, crate::log_decode::ClLiquidityDelta)>>,
+    /// Deltas applied to each pool since its last ABSOLUTE write, for diffing
+    /// our applied sequence against `eth_getLogs` when an audit fires.
+    ///
+    /// Exactly the set the audit is auditing: a Swap carries absolute
+    /// liquidity, so anything that could explain a disagreement arrived after
+    /// the previous absolute write. Cleared on every Swap and anchor, so it
+    /// stays small without a sweep.
+    applied_since_absolute: DashMap<Address, Vec<(Ordinal, i128)>>,
 }
 
 // main.rs compiles its own copy; several accessors are Phase 2's consumers.
@@ -418,6 +431,7 @@ impl LiveState {
             Arc::new(ClSnapshot { sqrt_price_x96, liquidity, tick, prov }),
         );
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.applied_since_absolute.remove(&pool);
         // Everything that arrived during the read's flight and was refused for
         // want of a trusted base. Without this the anchor closes the trust gap
         // and opens a correctness one.
@@ -485,6 +499,18 @@ impl LiveState {
         applied
     }
 
+    /// Deltas applied since this pool's last absolute write, oldest first.
+    ///
+    /// The set an audit mismatch is diffable against: a Swap carries absolute
+    /// liquidity, so only events after the previous absolute write can explain
+    /// a disagreement.
+    pub fn applied_trace(&self, pool: Address) -> Vec<(Ordinal, i128)> {
+        self.applied_since_absolute
+            .get(&pool)
+            .map(|t| t.clone())
+            .unwrap_or_default()
+    }
+
     /// Deltas re-applied after an anchor. See `replay_pending`.
     pub fn replayed_deltas(&self) -> u64 {
         self.replayed_deltas.load(Ordering::SeqCst)
@@ -532,11 +558,23 @@ impl LiveState {
         } else {
             (drift.saturating_mul(10_000) / d.liquidity as i128) as i64
         };
+        let trace = self
+            .applied_since_absolute
+            .get(&pool)
+            .map(|t| t.clone())
+            .unwrap_or_default();
+        let applied: Vec<String> = trace
+            .iter()
+            .map(|(o, delta)| format!("{}:{}:{}={delta:+}", o.block, o.tx_index, o.log_index))
+            .collect();
         tracing::debug!(
             target: "liq_audit",
             pool = %format!("{pool:#x}"),
             ours = existing.liquidity,
             chain = d.liquidity,
+            applied_count = trace.len(),
+            truncated = trace.len() >= APPLIED_TRACE_CAP,
+            applied = %applied.join(","),
             drift,
             bps,
             tick = d.tick,
@@ -722,6 +760,11 @@ impl LiveState {
             );
             self.generation.fetch_add(1, Ordering::SeqCst);
             self.note_applied_block(ordinal.block);
+            let mut trace = self.applied_since_absolute.entry(pool).or_default();
+            if trace.len() < APPLIED_TRACE_CAP {
+                trace.push((ordinal, d.liquidity_delta));
+            }
+            drop(trace);
             self.publish(pool, version);
             return ApplyOutcome::Applied { pool, version };
         }
@@ -742,6 +785,9 @@ impl LiveState {
             );
             self.generation.fetch_add(1, Ordering::SeqCst);
             self.note_applied_block(ordinal.block);
+            // A Swap is an absolute write, so nothing before it can explain a
+            // later disagreement.
+            self.applied_since_absolute.remove(&pool);
             self.publish(pool, version);
             return ApplyOutcome::Applied { pool, version };
         }
@@ -911,6 +957,52 @@ mod tests {
         let snap = ls.cl_snapshot(pool).unwrap();
         assert!(may_price_locally(&snap.prov.trust));
         assert_eq!(snap.liquidity, 2_000_000);
+    }
+
+    /// When the audit fires, the dump must name exactly the deltas applied
+    /// since the last absolute write — that is the set diffable against
+    /// `eth_getLogs` for the same blocks, and the whole point of the trace.
+    #[test]
+    fn the_applied_trace_covers_exactly_the_audited_window() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(91);
+        // Absolute write, then deltas, then another absolute write.
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 101, 0));
+        ls.apply_log(&liquidity_log(pool, false, -60, 60, 200, 102, 0));
+
+        let trace = ls.applied_trace(pool);
+        assert_eq!(
+            trace,
+            vec![
+                (
+                    Ordinal { block: 101, tx_index: 0, log_index: 0 },
+                    500i128
+                ),
+                (
+                    Ordinal { block: 102, tx_index: 0, log_index: 0 },
+                    -200i128
+                ),
+            ],
+            "both deltas, with the Burn negative"
+        );
+
+        // A Swap resets the window: nothing before it can explain a later
+        // disagreement, so keeping it would make the dump misleading.
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_300, 0, 103, 0));
+        assert!(ls.applied_trace(pool).is_empty());
+    }
+
+    /// An anchor is an absolute write too, so it resets the window as well.
+    #[test]
+    fn an_anchor_also_resets_the_applied_trace() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(92);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 101, 0));
+        assert_eq!(ls.applied_trace(pool).len(), 1);
+        ls.anchor_cl(pool, 200, U256::from(1u64) << 96, 5_000_000, 0);
+        assert!(ls.applied_trace(pool).is_empty());
     }
 
     /// A Swap carries absolute liquidity, so when the tick has not moved it is
