@@ -176,6 +176,18 @@ pub struct LiveState {
     next_version: AtomicU64,
     continuity_epoch: AtomicU64,
     next_anchor_id: AtomicU64,
+    /// Serialises check-and-write across every snapshot writer.
+    ///
+    /// `apply_log` and `anchor_cl` both validate against state they read and
+    /// then write — a read-modify-write with no lock between the halves. A
+    /// delta could pass `supersedes` before an anchor landed and write after
+    /// it, clobbering the anchor with a value derived from a stale base.
+    /// Measured at 5 losses per 500 forced races before this existed.
+    ///
+    /// A single mutex rather than per-pool: writes run at tens per second, so
+    /// contention is irrelevant, and one lock cannot deadlock against itself.
+    /// Never held across an `.await`; `apply_log` is synchronous.
+    state_write: StdMutex<()>,
     lost_updates: AtomicU64,
     swap_audits: AtomicU64,
     swap_audit_mismatches: AtomicU64,
@@ -322,9 +334,13 @@ impl LiveState {
 
     pub fn anchor_v2(&self, pool: Address, block: u64, state: UniV2PairState) {
         // The only writer that does not pass through `apply_log`, so it needs
-        // the same per-pool ordering check. An RPC read from an older block
-        // carries less information than the snapshot already held, and
-        // installing it would regress state while stamping it `Anchored`.
+        // the same per-pool ordering check AND the same serialisation: without
+        // the lock a concurrent delta can pass its own check against the
+        // pre-anchor state and overwrite this write afterwards.
+        let _write = match self.state_write.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         if !supersedes(self.current_ordinal(pool), Ordinal::end_of_block(block)) {
             tracing::debug!(
                 pool = %format!("{pool:#x}"),
@@ -355,9 +371,13 @@ impl LiveState {
         tick: i32,
     ) {
         // The only writer that does not pass through `apply_log`, so it needs
-        // the same per-pool ordering check. An RPC read from an older block
-        // carries less information than the snapshot already held, and
-        // installing it would regress state while stamping it `Anchored`.
+        // the same per-pool ordering check AND the same serialisation: without
+        // the lock a concurrent delta can pass its own check against the
+        // pre-anchor state and overwrite this write afterwards.
+        let _write = match self.state_write.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         if !supersedes(self.current_ordinal(pool), Ordinal::end_of_block(block)) {
             tracing::debug!(
                 pool = %format!("{pool:#x}"),
@@ -519,6 +539,12 @@ impl LiveState {
         }
 
         let pool = log.address;
+        // Held from the ordering check through every write below: the check is
+        // only meaningful if nothing can write between it and the insert.
+        let _write = match self.state_write.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         // Per-pool ordering. The global cursor guarantees the STREAM is
         // ordered, which used to imply per-pool ordering because every update
         // arrived through it. Anchors do not, so the implication has to become
@@ -893,6 +919,57 @@ mod tests {
             ls.lost_updates(),
             0,
             "a block-104 delta is inside end-of-block-105 state"
+        );
+    }
+
+    /// Does the anchor/log race actually lose an update?
+    ///
+    /// `apply_log` checks `supersedes`, clones the base, computes, and inserts.
+    /// `anchor_cl` does its own check and insert. Nothing serialises the two,
+    /// so a delta can pass its check BEFORE an anchor lands and write AFTER it,
+    /// clobbering the anchor with a value derived from a stale base — and
+    /// producing a number that matches no event the chain emitted, which is
+    /// exactly what the 2026-09-01 lineage replay found.
+    ///
+    /// The anchor here is at `end_of_block(200)`, the Mint at `(101, 0, 0)`.
+    /// The anchor strictly dominates, so it must win in EVERY interleaving:
+    /// applied first, the Mint's own check rejects it; applied second, it
+    /// overwrites. Any other outcome is a lost update.
+    #[test]
+    fn an_anchor_racing_a_delta_must_not_be_lost() {
+        use std::sync::{Arc as StdArc, Barrier};
+        const TRIALS: usize = 500;
+        let mut violations = 0;
+        let mut observed = std::collections::BTreeMap::new();
+        for _ in 0..TRIALS {
+            let ls = StdArc::new(LiveState::new());
+            let pool = Address::from_low_u64_be(70);
+            ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+
+            let gate = StdArc::new(Barrier::new(2));
+            let (a, b) = (ls.clone(), ls.clone());
+            let (g1, g2) = (gate.clone(), gate.clone());
+            let t1 = std::thread::spawn(move || {
+                g1.wait();
+                a.apply_log(&liquidity_log(pool, true, -60, 60, 500, 101, 0));
+            });
+            let t2 = std::thread::spawn(move || {
+                g2.wait();
+                b.anchor_cl(pool, 200, U256::from(1u64) << 96, 9_000_000, 0);
+            });
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            let snap = ls.cl_snapshot(pool).unwrap();
+            *observed.entry(snap.liquidity).or_insert(0usize) += 1;
+            if snap.prov.ordinal != Some(Ordinal::end_of_block(200)) {
+                violations += 1;
+            }
+        }
+        assert_eq!(
+            violations, 0,
+            "{violations}/{TRIALS} interleavings lost the anchor. \
+             Final liquidity values seen: {observed:?}"
         );
     }
 
