@@ -1048,7 +1048,16 @@ this guard protects.
   Wiring it is NOT a small change: an anchor read by `eth_call` is at HEAD and
   carries no ordinal, so it cannot be ordered against in-flight logs. Applying a
   delta onto an anchor that raced a log in the same block reintroduces the
-  mid-block fault the settled-block fix removed. Design it before building it.
+  mid-block fault the settled-block fix removed.
+  **Designed 2026-09-01 in `2026-09-01-anchor-path-design.md`.** Short version:
+  an anchor's true position IS expressible — `Ordinal::end_of_block(n)` sorts
+  after every log in block n — so anchors and logs become directly comparable
+  under the existing `Ord`. That needs an explicit per-pool monotonicity rule
+  with its own `Superseded` outcome, which must NOT route through
+  `Break(OutOfOrder)` (that invalidates all 683 pools). And anchored snapshots
+  must be excluded from validation, or the validator compares an `eth_call`
+  against the `eth_call` it came from and drives the divergence rate to zero by
+  construction.
 - **Phase 2a validates price and liquidity, NOT depth.** The CL comparison covers
   `sqrt_price_x96`, `liquidity` and `tick` only. `balance0`/`balance1` are not
   tracked in Phase 1, so a passing verdict says nothing about whether CL
