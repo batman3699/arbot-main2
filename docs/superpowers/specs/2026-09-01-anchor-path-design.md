@@ -160,3 +160,68 @@ suspect masking before celebrating.
   into provenance, but nothing reads it. Either give it a consumer — lineage
   attribution in the reconciliation record would be the obvious one — or drop
   it rather than carry a third never-wired field.
+
+## 7. Field result, 2026-09-01 — the design has a lost-update window
+
+Run: `CHAOS_WS_GAP_SECS=60`, 17m14s, 16 forced gaps, 538 reconciliations.
+
+| metric | predicted | measured | |
+|---|---|---|---|
+| `live_state_anchors_total` | > 0 | 10788 | met |
+| `live_state_untrusted_base_total` | far below 5194 | **472** | met — an 11x fall |
+| `live_state_superseded_total` | small, non-zero | 128 | met — anchors do race logs |
+| records with `source=Anchor` | 0 | **0** | met — §3.3 holds |
+| Liquidity divergence | unchanged | **6/153 (3.92%)** vs 1/69 (1.45%) | **MISSED** |
+
+The exclusion, the ordering and the coverage recovery all work. The divergence
+rate does not: it went UP, and rising divergence was flagged in §4 as the
+signal to stop and look rather than celebrate.
+
+### The mechanism
+
+An anchor read is not instantaneous. Between reading state at block N and
+installing it, in-flight logs for blocks > N arrive for that pool. The pool is
+still `Unknown` at that moment, so a Mint/Burn is dropped as `UntrustedBase` —
+and the anchor, being end-of-block-N state, does not contain it either. The
+event is lost from both paths. Subsequent deltas then build on a base that is
+short by exactly that event.
+
+Every observable matches:
+
+- all six divergences are `Liquidity`-sourced, `Derived`, with `anchor_id > 0`,
+  so all descend from an anchor;
+- `sqrt_price_x96` and `tick` are exact in all six — the anchor is authoritative
+  for those, and only the accumulated `liquidity` is wrong;
+- five are LOW (a missed Mint) and one is HIGH (+2262 bps, a missed Burn), which
+  is the symmetry a lost-update window predicts and a decoder bug would not;
+- all six land 10–55s after a forced gap, inside the re-anchoring window;
+- the rate rose while dropped deltas fell 11x, so this is not merely
+  pre-existing error becoming visible — that would leave the rate flat.
+
+A Swap during the window is harmless: it writes absolutely, restores trust, and
+the anchor guard then refuses the now-older read. Only Mint/Burn-only pools lose
+events.
+
+### Not proven
+
+The mechanism is inferred from provenance, sign symmetry and timing, not
+observed directly. The decisive test is to log the pool and block of every
+`UntrustedBase` drop and check that a divergent pool had one for a block > N
+between its anchor's read and install.
+
+### Options
+
+1. **Buffer, don't drop.** Queue Mint/Burn for a pool with an anchor in flight
+   and replay after it installs. Correct, and the most machinery.
+2. **Re-anchor pools that dropped a delta during their window.** Track the drop,
+   re-anchor next cycle. Converges, cheap, leaves a transient wrong state.
+3. **Anchor only quiescent pools** — no dropped delta since the last cycle.
+   Slowest recovery, no wrong state.
+4. **Accept it in production.** The window scales with anchor rate, and this run
+   anchored 10788 times in 17 minutes because forced gaps invalidate everything
+   every 60s. After `c706157` real gaps are rare, so real anchor volume is a
+   fraction of this. Needs measuring, not assuming.
+
+Do not enable local pricing on anchored lineage until this is resolved: the
+divergent snapshots reported `Derived`, so `may_price_locally` would have said
+yes to state that was wrong by up to 5559 bps.
