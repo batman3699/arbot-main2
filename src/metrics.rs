@@ -48,6 +48,9 @@ pub struct Metrics {
     pub live_state_untrusted_base: Counter,
     /// Pools restored to trust by an RPC read rather than by trading.
     pub live_state_anchors: Counter,
+    /// Deltas confirmed lost to the anchor window: dropped for want of a
+    /// trusted base at a block ABOVE the anchor's, so contained in neither.
+    pub live_state_lost_updates: Gauge,
     /// Logs dropped because an anchor had already carried the pool past them.
     /// Expected traffic; a spike means anchoring is running too far ahead of
     /// the log stream.
@@ -208,6 +211,14 @@ impl Metrics {
         registry
             .register(Box::new(ingestion_ws_events.clone()))
             .context("register ingestion_ws_events_total counter")?;
+
+        let live_state_lost_updates = Gauge::with_opts(Opts::new(
+            "live_state_lost_updates",
+            "Deltas lost between an anchor's read block and its install",
+        ))?;
+        registry
+            .register(Box::new(live_state_lost_updates.clone()))
+            .context("register live_state_lost_updates gauge")?;
 
         let live_state_anchors = Counter::with_opts(Opts::new(
             "live_state_anchors_total",
@@ -691,6 +702,7 @@ impl Metrics {
             live_state_untrusted_base,
             live_state_superseded,
             live_state_anchors,
+            live_state_lost_updates,
             ingestion_resubscribes_avoided,
             live_state_applied,
             live_state_undecodable,

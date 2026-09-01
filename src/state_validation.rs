@@ -254,6 +254,7 @@ where
 
     if let Some(m) = metrics {
         let st = gate.stats();
+        m.live_state_lost_updates.set(live.lost_updates() as f64);
         m.live_state_trusted.set(st.trusted as f64);
         // FAILED only. An expired pass is not evidence of anything wrong.
         m.live_state_untrusted.set(st.failed as f64);

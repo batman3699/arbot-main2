@@ -176,6 +176,7 @@ pub struct LiveState {
     next_version: AtomicU64,
     continuity_epoch: AtomicU64,
     next_anchor_id: AtomicU64,
+    lost_updates: AtomicU64,
     /// Bumped on every accepted application and on every epoch change. Phase 2
     /// uses this for `ScanSnapshot` generation validation (spec §4.2).
     generation: AtomicU64,
@@ -187,6 +188,14 @@ pub struct LiveState {
     /// end-of-block state. Without it the validator compares a mid-block
     /// snapshot against end-of-block chain state.
     max_applied_block: AtomicU64,
+    /// Highest block whose liquidity delta we DROPPED because the pool's base
+    /// was untrusted, per pool.
+    ///
+    /// Diagnostic for the anchor lost-update window: an anchor read at block N
+    /// covers every drop at or below block N, so those are harmless. A drop
+    /// ABOVE N is covered by neither the anchor nor the log path, and is gone.
+    /// Compared against the anchor block at install time.
+    dropped_while_untrusted: DashMap<Address, u64>,
 }
 
 // main.rs compiles its own copy; several accessors are Phase 2's consumers.
@@ -322,6 +331,7 @@ impl LiveState {
             );
             return;
         }
+        self.note_anchor_window(pool, block);
         let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
         self.next_anchor_id.fetch_add(1, Ordering::SeqCst);
         let prov = self.provenance(
@@ -354,6 +364,7 @@ impl LiveState {
             );
             return;
         }
+        self.note_anchor_window(pool, block);
         let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
         self.next_anchor_id.fetch_add(1, Ordering::SeqCst);
         let prov = self.provenance(
@@ -367,6 +378,37 @@ impl LiveState {
             Arc::new(ClSnapshot { sqrt_price_x96, liquidity, tick, prov }),
         );
         self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Did this anchor lose an event?
+    ///
+    /// An anchor read at block N is end-of-block-N state, so it already
+    /// contains every delta dropped at or below block N. A delta dropped ABOVE
+    /// N arrived after the read and was refused because the pool was still
+    /// untrusted — it is in neither the anchor nor the snapshot, and no later
+    /// delta will reintroduce it. Only a Swap or a fresh anchor can.
+    ///
+    /// This is the mechanism proposed for the 6/153 divergence measured on
+    /// 2026-09-01; the counter is what turns that from inference into a count.
+    fn note_anchor_window(&self, pool: Address, block: u64) {
+        if let Some((_, dropped)) = self.dropped_while_untrusted.remove(&pool) {
+            if dropped > block {
+                self.lost_updates.fetch_add(1, Ordering::SeqCst);
+                tracing::debug!(
+                    target: "anchor_probe",
+                    pool = %format!("{pool:#x}"),
+                    anchor_block = block,
+                    dropped_block = dropped,
+                    "lost update: a delta arrived after the anchor read and was refused \
+                     before the anchor landed"
+                );
+            }
+        }
+    }
+
+    /// Deltas confirmed lost to the anchor window. See `note_anchor_window`.
+    pub fn lost_updates(&self) -> u64 {
+        self.lost_updates.load(Ordering::SeqCst)
     }
 
     /// The position of whatever this pool currently holds, across both venue
@@ -460,6 +502,10 @@ impl LiveState {
             // why the Liquidity path diverged after every gap while the Swap
             // path, which overwrites `liquidity` outright, never did.
             if !may_price_locally(&self.resolve_trust(&existing.prov)) {
+                self.dropped_while_untrusted
+                    .entry(pool)
+                    .and_modify(|b| *b = (*b).max(ordinal.block))
+                    .or_insert(ordinal.block);
                 return ApplyOutcome::UntrustedBase;
             }
             // UniV3 ranges are half-open: [tickLower, tickUpper).
@@ -675,6 +721,62 @@ mod tests {
         let snap = ls.cl_snapshot(pool).unwrap();
         assert!(may_price_locally(&snap.prov.trust));
         assert_eq!(snap.liquidity, 2_000_000);
+    }
+
+    /// The mechanism proposed for the 2026-09-01 divergence, as a unit test:
+    /// a delta that arrives after the anchor's READ but before it LANDS is
+    /// refused (the pool is still untrusted) and is absent from the anchor too,
+    /// because the anchor is end-of-block-N state and the delta is from N+1.
+    /// Lost from both paths.
+    #[test]
+    fn a_delta_arriving_inside_the_anchor_window_is_lost() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(51);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.break_continuity(UnknownReason::WsUnavailable);
+
+        // The anchor read happens at block 105. Before it lands, a Mint from
+        // block 106 arrives and is refused for want of a trusted base.
+        assert_eq!(
+            ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 106, 0)),
+            ApplyOutcome::UntrustedBase
+        );
+        assert_eq!(ls.lost_updates(), 0, "not lost yet — the anchor could still cover it");
+
+        ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 2_000_000, 0);
+
+        assert_eq!(
+            ls.lost_updates(),
+            1,
+            "the anchor is end-of-block-105 state, so it cannot contain a block-106 Mint"
+        );
+        assert_eq!(
+            ls.cl_snapshot(pool).unwrap().liquidity,
+            2_000_000,
+            "and the snapshot is short by exactly that Mint, while reporting Derived"
+        );
+    }
+
+    /// The harmless half: a delta dropped at or below the anchor's block IS
+    /// contained in the anchor's end-of-block read, so nothing is lost.
+    #[test]
+    fn a_delta_the_anchor_read_already_contains_is_not_lost() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(52);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.break_continuity(UnknownReason::WsUnavailable);
+
+        assert_eq!(
+            ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 104, 0)),
+            ApplyOutcome::UntrustedBase
+        );
+        ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 2_000_000, 0);
+
+        assert_eq!(
+            ls.lost_updates(),
+            0,
+            "a block-104 delta is inside end-of-block-105 state"
+        );
     }
 
     /// Task 2 gave the LOG path per-pool monotonicity; the anchor path wrote
