@@ -46,6 +46,8 @@ pub struct Metrics {
     /// Mint/Burn deltas dropped because the pool's base snapshot was
     /// invalidated by a websocket gap. The running cost of every gap.
     pub live_state_untrusted_base: Counter,
+    /// Pools restored to trust by an RPC read rather than by trading.
+    pub live_state_anchors: Counter,
     /// Logs dropped because an anchor had already carried the pool past them.
     /// Expected traffic; a spike means anchoring is running too far ahead of
     /// the log stream.
@@ -206,6 +208,14 @@ impl Metrics {
         registry
             .register(Box::new(ingestion_ws_events.clone()))
             .context("register ingestion_ws_events_total counter")?;
+
+        let live_state_anchors = Counter::with_opts(Opts::new(
+            "live_state_anchors_total",
+            "Pools anchored from a block-pinned RPC read",
+        ))?;
+        registry
+            .register(Box::new(live_state_anchors.clone()))
+            .context("register live_state_anchors_total counter")?;
 
         let live_state_superseded = Counter::with_opts(Opts::new(
             "live_state_superseded_total",
@@ -680,6 +690,7 @@ impl Metrics {
             ingestion_ws_stalls,
             live_state_untrusted_base,
             live_state_superseded,
+            live_state_anchors,
             ingestion_resubscribes_avoided,
             live_state_applied,
             live_state_undecodable,

@@ -646,6 +646,86 @@ where
         }
     }
 
+    /// Cap on anchor reads per poll cycle.
+    ///
+    /// Anchoring is the `eth_call` traffic local state exists to avoid, so the
+    /// budget is a recovery backlog, not a refresh cycle. A gap invalidates all
+    /// 683 pools at once; draining that over several cycles is the intent.
+    const ANCHOR_BUDGET_PER_CYCLE: usize = 16;
+
+    /// Pools that cannot recover without an RPC read.
+    ///
+    /// A trusted pool is deliberately excluded: its next Swap overwrites its
+    /// state for free, so an anchor buys nothing. Only pools that are
+    /// invalidated, or that have no snapshot at all, are worth the call.
+    ///
+    /// V2 is excluded because it has no anchor caller yet — the poller caches
+    /// those into `CachedState`, not `LiveState`.
+    pub(crate) fn anchor_candidates(
+        &self,
+        pools: &[MonitoredPool],
+        live: &crate::live_state::LiveState,
+        cap: usize,
+    ) -> Vec<MonitoredPool> {
+        use crate::live_state::may_price_locally;
+        pools
+            .iter()
+            .filter(|p| matches!(p.kind, PoolMonitorKind::ConcentratedLiquidity))
+            .filter(|p| match live.cl_snapshot(p.pair) {
+                None => true,
+                Some(s) => !may_price_locally(&s.prov.trust),
+            })
+            .take(cap)
+            .cloned()
+            .collect()
+    }
+
+    /// Read true state for pools that cannot recover on their own and install
+    /// it as an anchor, pinned to `block`.
+    ///
+    /// Without this a pool regains trust only when it next trades, because
+    /// `e5e76fe` made only an absolute write able to restore it. Pools that
+    /// trade rarely are exactly the ones whose liquidity the Mint/Burn path
+    /// exists to track.
+    async fn anchor_untrusted(&self, block: U64) {
+        let Some(live) = &self.live_state else {
+            return;
+        };
+        let pools = {
+            let guard = self.pools.read().await;
+            guard.clone()
+        };
+        let candidates = self.anchor_candidates(&pools, live, Self::ANCHOR_BUDGET_PER_CYCLE);
+        if candidates.is_empty() {
+            return;
+        }
+        let request: Vec<(Address, Option<u32>, Address, Address)> = candidates
+            .iter()
+            .map(|p| (p.pair, None, p.token_in, p.token_out))
+            .collect();
+        let states =
+            crate::cl_sim::load_cl_pool_states_batched(self.provider.clone(), &request, block)
+                .await;
+        for (pool, state) in states.iter() {
+            live.anchor_cl(
+                *pool,
+                block.as_u64(),
+                state.sqrt_price_x96,
+                state.liquidity,
+                state.tick,
+            );
+            if let Some(m) = &self.metrics {
+                m.live_state_anchors.inc();
+            }
+        }
+        debug!(
+            requested = candidates.len(),
+            anchored = states.len(),
+            block = block.as_u64(),
+            "anchored pools that could not recover from the log stream"
+        );
+    }
+
     /// Invalidate local state after a break in the log stream.
     ///
     /// The subscription is the only thing keeping `LiveState` in step with the
@@ -807,6 +887,10 @@ where
                             );
                         }
                     }
+
+                    // Reuses the block the batch already pinned rather than
+                    // asking for another one.
+                    self.anchor_untrusted(block).await;
                 }
                 Err(err) => {
                     // No block number means no pinned batch. Fall back wholesale
@@ -1574,6 +1658,89 @@ mod tests {
     fn an_empty_subscription_always_resubscribes() {
         assert!(needs_resubscribe(&HashSet::new(), &[]));
         assert!(needs_resubscribe(&HashSet::new(), &[Address::from_low_u64_be(1)]));
+    }
+
+    fn monitored_cl(n: u64) -> MonitoredPool {
+        MonitoredPool {
+            kind: PoolMonitorKind::ConcentratedLiquidity,
+            ..monitored(n)
+        }
+    }
+
+    /// `PoolMonitor::new` rejects an empty pool list, so this carries one
+    /// throwaway pool. `anchor_candidates` takes its candidates as an argument
+    /// rather than from `self.pools`, so the contents do not affect the result.
+    fn bare_monitor() -> PoolMonitor<MockProvider> {
+        PoolMonitor::new(
+            Arc::new(Provider::new(MockProvider::default())),
+            None,
+            vec![monitored(99)],
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            None,
+        )
+        .expect("monitor should construct")
+    }
+
+    /// Anchoring is `eth_call` traffic, and avoiding that traffic is the point
+    /// of local state. Only pools that cannot recover on their own are worth
+    /// it: a trusted pool will be corrected by its next Swap for free.
+    #[test]
+    fn only_untrusted_pools_are_anchor_candidates() {
+        use crate::live_state::{LiveState, UnknownReason};
+        let live = LiveState::new();
+        let trusted = monitored_cl(1);
+        let untrusted = monitored_cl(2);
+        let never_seen = monitored_cl(3);
+
+        for p in [&trusted, &untrusted] {
+            live.anchor_cl(p.pair, 100, ethers::types::U256::from(1u64), 5, 0);
+        }
+        // Only `untrusted` stays invalidated: re-anchor `trusted` under the new epoch.
+        live.break_continuity(UnknownReason::WsUnavailable);
+        live.anchor_cl(trusted.pair, 101, ethers::types::U256::from(1u64), 5, 0);
+
+        let got: Vec<_> = bare_monitor()
+            .anchor_candidates(
+                &[trusted.clone(), untrusted.clone(), never_seen.clone()],
+                &live,
+                8,
+            )
+            .into_iter()
+            .map(|p| p.pair)
+            .collect();
+
+        assert!(got.contains(&untrusted.pair), "invalidated pools are the point");
+        assert!(
+            got.contains(&never_seen.pair),
+            "a pool with no snapshot cannot recover alone"
+        );
+        assert!(
+            !got.contains(&trusted.pair),
+            "spending an eth_call here buys nothing; its next Swap is free"
+        );
+    }
+
+    /// The cap is the RPC budget. Without it a single gap would anchor all 683
+    /// pools in one cycle.
+    #[test]
+    fn anchor_candidates_respect_the_cap() {
+        use crate::live_state::LiveState;
+        let live = LiveState::new();
+        let pools: Vec<_> = (10..40).map(monitored_cl).collect();
+        assert_eq!(bare_monitor().anchor_candidates(&pools, &live, 8).len(), 8);
+    }
+
+    /// V2 pools have no anchor caller yet — the poller caches them into
+    /// `CachedState`, not `LiveState`. Selecting them would spend eth_calls
+    /// that nothing consumes.
+    #[test]
+    fn v2_pools_are_not_anchor_candidates() {
+        use crate::live_state::LiveState;
+        let live = LiveState::new();
+        assert!(bare_monitor()
+            .anchor_candidates(&[monitored(1)], &live, 8)
+            .is_empty());
     }
 
     /// The chaos knob must be inert unless explicitly set, and must be a real
