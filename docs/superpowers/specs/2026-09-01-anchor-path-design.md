@@ -326,3 +326,68 @@ all: previously a pool that emitted no event never entered `LiveState`, because
 a delta with no base returns `NotStateBearing`. The anchor path now gives them a
 base. That is a coverage gain independent of gap recovery, and it was not a
 stated goal of the design.
+
+## 10. The residual, characterised — 2026-09-01
+
+A 30-minute run (the first to exceed 25 minutes) plus the swap audit finally
+produced a characterisation. Two of my hypotheses died on the way.
+
+### Established
+
+- **Every pool that has ever diverged is an Aerodrome Slipstream GAUGE pool.**
+  8 of 8, against a base rate of 140/414 = 33.8% of validated pools.
+  p = 1.7e-4. This is the strongest signal in the whole investigation.
+- **The Mint/Burn arithmetic is correct.** 4224 swap audits across two runs,
+  1 mismatch. `ours == liquidity()` EXACTLY in 5 of 6 observations of the pool
+  that did diverge.
+- **Gauge pools do carry a second bucket.** `stakedLiquidity()` on the
+  divergent pool returned 11797183206753424888 against `liquidity()`'s
+  12431930927139055136 — nearly half the pool.
+- **The 25-minute socket rotation works.** Connected 06:13:54, rotated
+  06:38:54.585967, reconnected 1.9s later, `ingestion_ws_stalls_total` = 0.
+  BlockPI never got to close it.
+
+### Refuted, both mine
+
+- **"We track total liquidity; the validator reads unstaked."** No. In 5 of 6
+  observations `ours == liquidity()` exactly, so our value tracks the unstaked
+  figure and the validator's reference is right.
+- **"There is an undecoded event type on gauge pools."** No. `eth_getLogs` over
+  the window returned only Mint, Burn and Collect. Nothing arrives that we fail
+  to recognise.
+
+### What the log replay actually shows
+
+The divergent pool runs an **auto-compounding position**: a burn and re-mint of
+~1.0007e19 every one to two blocks, each cycle slightly larger as fees compound.
+Blocks 50727005-50727016 contain 10 in-range Mint/Burn events, and the position
+is roughly 80% of the pool's unstaked liquidity.
+
+Our excess at block 50727016 was 10007271035074632970. The final Burn in that
+block, which has no matching Mint, was 10007339507485756762 — the same value to
+within 0.0007%. Our snapshot behaved as though that last Burn had not been
+applied.
+
+### Where that points
+
+Not at staking. At **event density**. A gauge pool hosting an auto-compounder
+gets ~10 in-range position events per block, each worth ~80% of pool liquidity,
+so any residual mid-block or ordering effect is both far more likely to occur
+and enormously amplified when it does. That reframes the gauge correlation:
+gauge pools are not special because of `stakedLiquidity`, but because they are
+where the auto-compounders live.
+
+The 0.0007% shortfall against a clean "we missed exactly that Burn" is not
+explained and matters — an exact miss would be exact.
+
+### Next
+
+Replay this pool from a known anchor across the full lineage, event by event,
+and find the first transition where our value parts from `liquidity()`. The
+tooling now exists: `BASE_RPC_URLS` works, and both detectors agree on which
+pool and block to examine.
+
+**Note on the RPC:** `BASE_RPC_URLS` was never misconfigured. BlockPI returns
+403 to requests carrying Python's default `urllib` User-Agent; the endpoint and
+key are fine, and the bot has used them all along. An earlier claim in this
+project that the key had been rotated was wrong.
