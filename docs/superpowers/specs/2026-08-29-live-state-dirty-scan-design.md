@@ -1021,6 +1021,34 @@ this guard protects.
   worse than the gap. Per-pool cursors are the fix: ordering only matters
   WITHIN a pool, and it would also make invalidation precise instead of global.
   Do not attempt subscription overlap before that lands.
+- **VERIFIED 2026-09-01: Slipstream Mint/Burn decodes correctly. §10's
+  unverified assumption is closed.** Two independent facts. (1) The filter
+  subscribes ONLY to our derived topic0 values, and topic0 is the keccak of the
+  full signature including parameter types -- so a Slipstream pool producing a
+  `source=Liquidity` snapshot proves its event signature is byte-identical to
+  UniV3's, and the ABI layout follows from the signature. (2) 82 such snapshots
+  across runs r10/r11 were then validated against `eth_call` pinned to their own
+  block, all exact. That covers field extraction too -- word offsets, int24 sign
+  extension, the half-open in-range test -- not just the signature.
+- **MOOT 2026-09-01: the PancakeSwap V3 `Swap` assumption is unverified AND
+  unused.** Its two extra trailing fields give it a different topic0, which
+  `monitored_topics()` does not include, and the CL sticky set is built from
+  `hot_univ3_pools` + `hot_slipstream_pools` only. Measured: 0 reconciliations
+  on any of the 29 known Pancake pools across 7 runs and 387 distinct validated
+  pools. It cannot be a correctness risk because nothing reaches it -- but it is
+  29 pools of zero event coverage, which is a COVERAGE item, not a decoder one.
+- **BLOCKER for Phase 2b: `anchor_cl` and `anchor_v2` are never called from
+  production.** Same "written in Phase 1, never wired" pattern as
+  `break_continuity` before `7d56076`. Every reference is inside
+  `live_state.rs`. So `TrustState::Anchored` and `SnapshotSource::Anchor` are
+  unreachable, and since `e5e76fe` made only an ABSOLUTE write able to restore
+  trust after a gap, a pool recovers ONLY when it next emits a Swap. Pools that
+  swap rarely stay `Unknown` indefinitely after any gap -- exactly the pools
+  whose liquidity the Mint/Burn path was built to track.
+  Wiring it is NOT a small change: an anchor read by `eth_call` is at HEAD and
+  carries no ordinal, so it cannot be ordered against in-flight logs. Applying a
+  delta onto an anchor that raced a log in the same block reintroduces the
+  mid-block fault the settled-block fix removed. Design it before building it.
 - **Phase 2a validates price and liquidity, NOT depth.** The CL comparison covers
   `sqrt_price_x96`, `liquidity` and `tick` only. `balance0`/`balance1` are not
   tracked in Phase 1, so a passing verdict says nothing about whether CL
