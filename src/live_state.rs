@@ -499,6 +499,12 @@ impl LiveState {
         applied
     }
 
+    /// Deltas currently buffered for a pool awaiting an anchor.
+    #[cfg(test)]
+    pub fn pending_len(&self, pool: Address) -> usize {
+        self.pending_deltas.get(&pool).map(|b| b.len()).unwrap_or(0)
+    }
+
     /// Deltas applied since this pool's last absolute write, oldest first.
     ///
     /// The set an audit mismatch is diffable against: a Swap carries absolute
@@ -788,6 +794,12 @@ impl LiveState {
             // A Swap is an absolute write, so nothing before it can explain a
             // later disagreement.
             self.applied_since_absolute.remove(&pool);
+            // Same reasoning for the buffer: a Swap restores trust with an
+            // absolute value, so anything buffered while untrusted is now
+            // folded into it and must not be held. Only `replay_pending`
+            // cleared this before, so a pool that recovered by TRADING rather
+            // than by anchoring kept its buffer forever.
+            self.pending_deltas.remove(&pool);
             self.publish(pool, version);
             return ApplyOutcome::Applied { pool, version };
         }
@@ -1051,6 +1063,33 @@ mod tests {
         ls.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000_000, 0);
         ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 9_999_999, 0, 101, 0));
         assert_eq!(ls.swap_audit_counts(), (0, 0));
+    }
+
+    /// A pool can regain trust by TRADING as well as by anchoring, and a Swap
+    /// is an absolute write that folds in everything buffered while untrusted.
+    /// Only `replay_pending` cleared the buffer, so that pool kept its deltas
+    /// forever — bounded by the cap, but never released.
+    #[test]
+    fn a_swap_releases_the_buffer_an_anchor_would_have_replayed() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(93);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.break_continuity(UnknownReason::WsUnavailable);
+        assert_eq!(
+            ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 101, 0)),
+            ApplyOutcome::UntrustedBase
+        );
+        assert_eq!(ls.pending_len(pool), 1, "buffered while untrusted");
+
+        // Trust returns via a trade, not an anchor.
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 2_000_000, 0, 102, 0));
+
+        assert_eq!(
+            ls.pending_len(pool),
+            0,
+            "the Swap's absolute value already contains it; holding it leaks"
+        );
+        assert_eq!(ls.cl_snapshot(pool).unwrap().liquidity, 2_000_000);
     }
 
     /// The window, closed. A delta arriving after the anchor's READ but before
