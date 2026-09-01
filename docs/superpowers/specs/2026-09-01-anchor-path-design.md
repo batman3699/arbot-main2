@@ -611,3 +611,61 @@ what 973 validations missed. What remains is to confirm loss directly, which
 means logging enough per-event provenance to compare our applied sequence
 against `eth_getLogs` for the same block, rather than inferring from the
 aggregate.
+
+## 15. The residual is confirmed log loss — with the missing events named
+
+40-minute chaos run (`CHAOS_WS_GAP_SECS=60`, 39 forced gaps), with the
+provenance dump enabled. The dump did exactly what it was built for.
+
+### The replay fix, measured
+
+| | pre-fix (19min, 18 gaps) | now (40min, 39 gaps) |
+|---|---|---|
+| lost updates | 8 | **1** |
+| deltas rescued by replay | 0 (feature absent) | **206** across 64 anchors |
+| loss rate per gap | 0.444 | **0.026** — a 17x reduction |
+
+The replay path fired in the field for the first time.
+
+### The residual, resolved
+
+Audit mismatch on pool `0x6c561b44...`, dump showing `applied_count=1`,
+`applied=50735233:46:241=+0`. Reconstructing from chain logs:
+
+```
+SWAP  50735201     L = 30514808821339110725
+Mint  50735205       +889000024081024   ticks[-198900,-197700)  in range
+                   = 30515697821363191749  == OURS, to the unit
+Burn  50735220:166   -469782971221337   ticks[-198420,-198060)  IN RANGE
+Burn  50735220:171   -175391105569075   ticks[-198420,-198300)  out of range
+Mint  50735220:178   +469783456747593   ticks[-198420,-198060)  IN RANGE
+Mint  50735220:180   +175545911012367   ticks[-198420,-198300)  out of range
+        in-range net = +485526256
+SWAP  50735237     L = 30515697821848718005
+        chain - ours = +485526256        EXACT MATCH
+```
+
+Our value is right to the unit for every event we received. The block-50735220
+burn/remint pair nets exactly the drift, and we never applied it. The pool was
+`Derived` throughout — the audit skips untrusted bases, so it could not have
+fired otherwise — which rules out the gap, buffering and anchor paths.
+
+**Four events were emitted by the chain and never delivered to us.** That is
+websocket log loss, the one fault `continuity.rs` states it cannot detect and
+deliberately routes to a downstream detector. `audit_against_swap` is that
+detector, and the provenance dump is what turned "delivery fault, inferred" into
+named events with matching arithmetic.
+
+It also explains the gauge concentration without any venue mechanism: loss is
+per-event, so a pool emitting ten in-range events per block loses ten times as
+often, and on an auto-compounder each event is large enough to see.
+
+### Consequence
+
+This is a property of the feed, not a defect in our code. The design already
+anticipated it. What it changes is the question: not "how do we fix the
+arithmetic" — the arithmetic is exact — but "what divergence rate is tolerable,
+and should the audit force a re-anchor when it fires?" A pool with a detected
+mismatch is knowably wrong and cheap to correct, since `audit_against_swap`
+already runs on the write path and the Swap it fires on restores the value
+absolutely a moment later.
