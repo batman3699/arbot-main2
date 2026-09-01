@@ -905,6 +905,17 @@ where
         // Batching also pins every read to one block; the per-pair path read
         // each pool at whatever "latest" meant when its call landed, so
         // reserves within a single refresh could straddle blocks.
+        // CL anchoring must NOT depend on there being V2 pairs to poll.
+        // `pollable_pairs` deliberately excludes every ConcentratedLiquidity
+        // pool, so nesting the CL anchor call inside `if !pairs.is_empty()`
+        // switched off the entire anchor path -- the point of this work -- for
+        // any chain whose monitored set is CL-only. It is benign today only
+        // because Base happens to carry ~23 V2 pools.
+        if pairs.is_empty() {
+            if let Ok(block) = self.provider.get_block_number().await {
+                self.anchor_untrusted(block).await;
+            }
+        }
         let started = std::time::Instant::now();
         let mut batched = 0usize;
         if !pairs.is_empty() {
@@ -937,8 +948,9 @@ where
                         }
                     }
 
-                    // Reuses the block the batch already pinned rather than
-                    // asking for another one.
+                    // V2 anchoring stays here: it consumes `states`, which
+                    // only exists on this path.
+                    self.anchor_v2_where_needed(&states, block);
                     self.anchor_untrusted(block).await;
                 }
                 Err(err) => {

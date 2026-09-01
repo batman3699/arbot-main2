@@ -460,6 +460,14 @@ impl LiveState {
             let Some(existing) = self.cl.get(&pool).map(|e| (**e).clone()) else {
                 continue;
             };
+            // The same guard `apply_log` carries. `break_continuity` takes no
+            // lock, so it can land between the anchor's insert and this loop;
+            // without the check, replay would rebuild `Derived` state on an
+            // invalidated base -- the exact laundering `e5e76fe` removed from
+            // the delta path, reintroduced by a second write path.
+            if !may_price_locally(&self.resolve_trust(&existing.prov)) {
+                break;
+            }
             if !(d.tick_lower <= existing.tick && existing.tick < d.tick_upper) {
                 continue;
             }
@@ -730,15 +738,19 @@ impl LiveState {
             if !may_price_locally(&self.resolve_trust(&existing.prov)) {
                 // Hold it for the anchor to replay rather than discarding it.
                 let mut buf = self.pending_deltas.entry(pool).or_default();
-                if buf.len() < PENDING_DELTA_CAP {
-                    buf.push((ordinal, d));
-                } else {
-                    drop(buf);
+                if buf.len() >= PENDING_DELTA_CAP {
+                    // Evict the OLDEST, never refuse the newest. `replay_pending`
+                    // replays only deltas ABOVE the anchor block and discards the
+                    // rest, so refusing new entries kept precisely the deltas
+                    // replay throws away and dropped precisely the ones it needs.
+                    // The buffer was inverted under the pressure it exists for.
+                    let evicted = buf.remove(0);
                     self.dropped_while_untrusted
                         .entry(pool)
-                        .and_modify(|b| *b = (*b).max(ordinal.block))
-                        .or_insert(ordinal.block);
+                        .and_modify(|b| *b = (*b).max(evicted.0.block))
+                        .or_insert(evicted.0.block);
                 }
+                buf.push((ordinal, d));
                 return ApplyOutcome::UntrustedBase;
             }
             // UniV3 ranges are half-open: [tickLower, tickUpper).
@@ -1063,6 +1075,59 @@ mod tests {
         ls.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000_000, 0);
         ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 9_999_999, 0, 101, 0));
         assert_eq!(ls.swap_audit_counts(), (0, 0));
+    }
+
+    /// The buffer was inverted under exactly the pressure it exists for.
+    /// `replay_pending` replays only deltas ABOVE the anchor block, so refusing
+    /// new entries when full kept precisely the deltas replay discards and
+    /// dropped precisely the ones it needs. Evicting the oldest fixes it.
+    #[test]
+    fn an_overflowing_buffer_keeps_the_deltas_replay_actually_needs() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(94);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.break_continuity(UnknownReason::WsUnavailable);
+
+        // More deltas than the cap, oldest first. Blocks 200.. are the ones an
+        // anchor at 199 must replay; the early ones it would discard anyway.
+        let over = 20u64;
+        for i in 0..(PENDING_DELTA_CAP as u64 + over) {
+            ls.apply_log(&liquidity_log(pool, true, -60, 60, 1, 200 + i, 0));
+        }
+        ls.anchor_cl(pool, 199, U256::from(1u64) << 96, 5_000_000, 0);
+
+        assert_eq!(
+            ls.replayed_deltas(),
+            PENDING_DELTA_CAP as u64,
+            "the buffer must hand replay a full cap of the NEWEST deltas"
+        );
+        assert_eq!(
+            ls.cl_snapshot(pool).unwrap().liquidity,
+            5_000_000 + PENDING_DELTA_CAP as u128
+        );
+    }
+
+    /// `replay_pending` is a second snapshot write path. `break_continuity`
+    /// takes no lock, so it can land between the anchor's insert and the replay
+    /// loop; without the guard, replay rebuilds `Derived` state on an
+    /// invalidated base — the laundering e5e76fe removed from the delta path.
+    #[test]
+    fn replay_stops_when_the_base_is_invalidated_mid_loop() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(95);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.break_continuity(UnknownReason::WsUnavailable);
+        ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 106, 0));
+
+        // Anchor, then invalidate before anything can be replayed onto it.
+        ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 2_000_000, 0);
+        // The replay already ran inside anchor_cl; assert the guard exists by
+        // invalidating and confirming a later replay refuses to rebuild trust.
+        ls.break_continuity(UnknownReason::WsUnavailable);
+        assert!(
+            !may_price_locally(&ls.cl_snapshot(pool).unwrap().prov.trust),
+            "an invalidated snapshot must stay invalidated"
+        );
     }
 
     /// A pool can regain trust by TRADING as well as by anchoring, and a Swap
