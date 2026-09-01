@@ -110,6 +110,21 @@ const NEWHEADS_STALL_LIMIT: Duration = Duration::from_secs(60);
 /// forever.
 pub(crate) const LOW_TRAFFIC_STALL_LIMIT: Duration = Duration::from_secs(25 * 60);
 
+/// How long the pool-monitor socket may live before it is replaced on purpose.
+///
+/// Same provider fact as `LOW_TRAFFIC_STALL_LIMIT`, applied for a different
+/// reason: BlockPI closes websocket connections after 30 minutes, and the
+/// original 2026-08-31 incident was exactly that close arriving unannounced at
+/// 28 minutes. Reacting to it costs a gap PLUS up to
+/// `SUBSCRIPTION_STALL_LIMIT + SUBSCRIPTION_IDLE_TICK` of blindness before we
+/// notice; pre-empting it costs only the gap. Strictly cheaper.
+///
+/// It also closes the one hole `idle_action` cannot: a subscription that has
+/// NEVER delivered is deliberately not reconnected, because a new socket
+/// carries the same deaf filter -- but the provider still closes that socket,
+/// and nothing would ever have replaced it.
+const WS_MAX_CONNECTION_AGE: Duration = Duration::from_secs(25 * 60);
+
 /// Outcome of awaiting the next item from a subscription.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StreamStep<T> {
@@ -523,6 +538,14 @@ where
                     if let Some(t) = chaos_tick.as_mut() {
                         t.tick().await; // the first tick is immediate; discard it
                     }
+                    // An `Interval`, NOT a `sleep` in the `select!`: select
+                    // rebuilds its branch futures every iteration, so a sleep
+                    // restarts on each event and never completes on a feed
+                    // carrying ~21 events/sec -- which is the only feed whose
+                    // socket age we care about. Same trap the original watchdog
+                    // fell into.
+                    let mut lifetime = interval(WS_MAX_CONNECTION_AGE);
+                    lifetime.tick().await; // immediate first tick; discard it
                     let mut last_event = connected_at;
                     let mut events_seen: u64 = 0;
                     let mut silence_warned = false;
@@ -555,6 +578,18 @@ where
                                 // The socket is healthy; we are only exercising
                                 // the gap path, not simulating a dead transport.
                                 ws_provider = Some(provider.clone());
+                                break;
+                            }
+                            _ = lifetime.tick() => {
+                                warn!(
+                                    age_secs = connected_at.elapsed().as_secs(),
+                                    events_seen,
+                                    "rotating the pool monitor websocket before the provider \
+                                     closes it"
+                                );
+                                // Deliberately NOT putting the provider back:
+                                // the entire point is to replace a connection
+                                // the provider is about to close.
                                 break;
                             }
                             _ = self.pool_updates.notified() => {
@@ -1850,6 +1885,35 @@ mod tests {
         assert_eq!(
             next_before_stall!(s, Duration::from_secs(30)),
             StreamStep::Item(7)
+        );
+    }
+
+    /// Rotation has to beat the provider's own close, with enough margin that
+    /// a slow reconnect does not lose the race. The 2026-08-31 incident was
+    /// that close landing unannounced at 28 minutes on a socket nothing was
+    /// watching.
+    #[test]
+    fn the_socket_is_replaced_before_the_provider_closes_it() {
+        const BLOCKPI_CLOSES_AT: Duration = Duration::from_secs(30 * 60);
+        assert!(
+            WS_MAX_CONNECTION_AGE < BLOCKPI_CLOSES_AT,
+            "pre-empt the close; reacting to it costs blindness the rotation does not"
+        );
+        assert!(
+            BLOCKPI_CLOSES_AT - WS_MAX_CONNECTION_AGE >= Duration::from_secs(120),
+            "leave margin for a slow reconnect"
+        );
+    }
+
+    /// Reacting is strictly more expensive than pre-empting: a provider close
+    /// is only noticed after the idle budget plus a tick, and that whole window
+    /// is blind. Rotation pays the gap without the blindness.
+    #[test]
+    fn reacting_to_a_close_costs_more_than_pre_empting_it() {
+        let detection_lag = SUBSCRIPTION_STALL_LIMIT + SUBSCRIPTION_IDLE_TICK;
+        assert!(
+            detection_lag >= Duration::from_secs(105),
+            "this is the blind window rotation exists to avoid"
         );
     }
 
