@@ -497,3 +497,57 @@ What survives: it is specific to gauge pools hosting auto-compounders (8/8,
 p = 1.7e-4), it is rare, it self-heals on the next Swap, and the live system
 once applied a delta matching no event the chain emitted. The last of those is
 the sharpest remaining clue and is not yet explained.
+
+## 13. Field run 31m36s — and a much sharper constraint on the residual
+
+Binary as of `f18afcf` (so budget 16, no V2 anchoring — both landed after this
+run started).
+
+| | |
+|---|---|
+| socket rotation | fired at 09:43:55.919, **25m00.001s** after connect; reconnect 2.0s |
+| `ingestion_ws_stalls_total` | 0 — the provider close was pre-empted again |
+| validator reconciliations | 973, **0 divergent** across Liquidity/Swap/Sync |
+| swap audits | 5240, **2 mismatches** |
+| `live_state_replayed_deltas` | 0 |
+| `live_state_lost_updates` | 0 |
+
+The rotation is now confirmed twice, to the millisecond.
+
+### The audit found what the validator could not
+
+973 validations found nothing. 5240 audits found two. That is the instrument
+paying for itself: five times the sample rate, exact equality rather than a bps
+threshold, and it surfaces signal in a run the validator calls perfectly clean.
+Both flagged pools — `0x70acdf2ad0bf` and `0x3fe04a59ebd3` — are in the 8/8
+gauge set, so the venue concentration now stands at 8/8 across two detectors.
+
+### `blocks_since=0` — the sharpest constraint yet
+
+| time | pool | bps | blocks_since | since_source |
+|---|---|---|---|---|
+| 09:28:05 | 0x70acdf2ad0bf | **-2900** | **0** | Liquidity |
+| 09:44:29 | 0x3fe04a59ebd3 | +27 | 1 | Liquidity |
+
+The first mismatch happened with `blocks_since = 0`: the previous absolute write
+and the disagreeing swap are **in the same block**, with the tick unchanged
+throughout.
+
+That rules out every cross-block explanation still standing — websocket gaps,
+anchors, the rotation, settledness, delivery order across blocks. Whatever this
+is, it happens **inside a single block**, between two events we both received
+and applied.
+
+With the tick unchanged, in-range liquidity can only move via a Mint or Burn.
+So either an in-range position event occurred within that block that we did not
+apply, or the swap's `liquidity` field does not mean what the decoder assumes at
+that instant. Both are testable against the block's own logs, and the earlier
+lineage replay reconstructs blocks exactly — so the next step is to replay
+*within* the block rather than across blocks.
+
+### Replay path still unexercised
+
+`live_state_replayed_deltas` = 0, but that is expected rather than suspicious:
+one gap in 31 minutes, against a measured rate of ~0.44 lost updates per gap
+under forced conditions. Exercising it needs `CHAOS_WS_GAP_SECS`, not a longer
+natural run.
