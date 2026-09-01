@@ -58,6 +58,19 @@ pub enum TrustState {
 /// Exhaustive on purpose — NO wildcard arm. A new `TrustState` variant must
 /// fail to compile here until someone decides its policy.
 #[allow(dead_code)]
+/// True when `incoming` is strictly newer than what the pool already holds.
+///
+/// `None` accepts anything: a pool with no ordinal has no position to be older
+/// than. That case shrinks to nothing once anchors carry
+/// `Ordinal::end_of_block`, but refusing it would freeze any pool whose
+/// snapshot predates that change.
+pub fn supersedes(existing: Option<Ordinal>, incoming: Ordinal) -> bool {
+    match existing {
+        None => true,
+        Some(prev) => incoming > prev,
+    }
+}
+
 pub fn may_price_locally(trust: &TrustState) -> bool {
     match trust {
         TrustState::Anchored | TrustState::Derived => true,
@@ -137,6 +150,15 @@ pub enum ApplyOutcome {
     /// A delta arrived for a pool whose base snapshot is no longer trusted.
     /// Dropped rather than applied: see the guard in the Mint/Burn path.
     UntrustedBase,
+    /// A log older than the pool's own snapshot — normally because an anchor
+    /// has already carried that pool past this point, and an end-of-block RPC
+    /// read already includes every log in its block.
+    ///
+    /// Deliberately NOT `ContinuityBroken`: that path calls
+    /// `break_continuity`, which invalidates every pool at once. This is
+    /// expected traffic on any anchored pool, so treating it as disorder would
+    /// make anchoring catastrophically worse than leaving pools untrusted.
+    Superseded,
     /// A topic no decoder recognises. This one is a real signal: some venue is
     /// emitting something we do not understand.
     Undecodable,
@@ -287,23 +309,52 @@ impl LiveState {
         Some(snap)
     }
 
-    pub fn anchor_v2(&self, pool: Address, state: UniV2PairState) {
+    pub fn anchor_v2(&self, pool: Address, block: u64, state: UniV2PairState) {
         let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
         self.next_anchor_id.fetch_add(1, Ordering::SeqCst);
-        let prov = self.provenance(version, None, TrustState::Anchored, SnapshotSource::Anchor);
+        let prov = self.provenance(
+            version,
+            Some(Ordinal::end_of_block(block)),
+            TrustState::Anchored,
+            SnapshotSource::Anchor,
+        );
         self.v2.insert(pool, Arc::new(V2Snapshot { state, prov }));
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
-    pub fn anchor_cl(&self, pool: Address, sqrt_price_x96: U256, liquidity: u128, tick: i32) {
+    pub fn anchor_cl(
+        &self,
+        pool: Address,
+        block: u64,
+        sqrt_price_x96: U256,
+        liquidity: u128,
+        tick: i32,
+    ) {
         let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
         self.next_anchor_id.fetch_add(1, Ordering::SeqCst);
-        let prov = self.provenance(version, None, TrustState::Anchored, SnapshotSource::Anchor);
+        let prov = self.provenance(
+            version,
+            Some(Ordinal::end_of_block(block)),
+            TrustState::Anchored,
+            SnapshotSource::Anchor,
+        );
         self.cl.insert(
             pool,
             Arc::new(ClSnapshot { sqrt_price_x96, liquidity, tick, prov }),
         );
         self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The position of whatever this pool currently holds, across both venue
+    /// families. A pool is in exactly one of the two maps.
+    fn current_ordinal(&self, pool: Address) -> Option<Ordinal> {
+        if let Some(s) = self.cl.get(&pool) {
+            return s.prov.ordinal;
+        }
+        if let Some(s) = self.v2.get(&pool) {
+            return s.prov.ordinal;
+        }
+        None
     }
 
     /// Decode a log and apply it.
@@ -334,6 +385,13 @@ impl LiveState {
         }
 
         let pool = log.address;
+        // Per-pool ordering. The global cursor guarantees the STREAM is
+        // ordered, which used to imply per-pool ordering because every update
+        // arrived through it. Anchors do not, so the implication has to become
+        // an explicit check.
+        if !supersedes(self.current_ordinal(pool), ordinal) {
+            return ApplyOutcome::Superseded;
+        }
         if let Some(d) = decode_v2_sync(log) {
             let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
             let existing = self.v2.get(&pool).map(|e| e.state.clone());
@@ -595,6 +653,61 @@ mod tests {
         assert_eq!(snap.liquidity, 2_000_000);
     }
 
+    /// A log the anchor already reflects must be DROPPED, not treated as
+    /// disorder. `Break(OutOfOrder)` calls `break_continuity`, which
+    /// invalidates all 683 pools — routing expected traffic through it would
+    /// make anchoring far worse than not anchoring.
+    #[test]
+    fn a_log_the_anchor_already_covers_is_superseded_not_disorder() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(21);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 5_000_000, 0);
+        let epoch_before = ls.continuity_epoch();
+
+        // A Mint from block 105 — already inside the anchor's end-of-block read.
+        let outcome = ls.apply_log(&liquidity_log(pool, true, -60, 60, 777, 105, 0));
+
+        assert_eq!(outcome, ApplyOutcome::Superseded);
+        assert_eq!(
+            ls.cl_snapshot(pool).unwrap().liquidity,
+            5_000_000,
+            "applying it would double-count a Mint the anchor already includes"
+        );
+        assert_eq!(
+            ls.continuity_epoch(),
+            epoch_before,
+            "this is expected traffic; it must not invalidate every pool"
+        );
+    }
+
+    /// The other half: a log from AFTER the anchor still applies normally,
+    /// otherwise anchoring would freeze the pool.
+    #[test]
+    fn a_log_after_the_anchor_still_applies() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(22);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 5_000_000, 0);
+
+        let outcome = ls.apply_log(&liquidity_log(pool, true, -60, 60, 777, 106, 0));
+
+        assert!(matches!(outcome, ApplyOutcome::Applied { .. }));
+        assert_eq!(ls.cl_snapshot(pool).unwrap().liquidity, 5_000_777);
+    }
+
+    #[test]
+    fn a_pool_with_no_snapshot_accepts_anything() {
+        assert!(supersedes(
+            None,
+            Ordinal {
+                block: 1,
+                tx_index: 0,
+                log_index: 0
+            }
+        ));
+    }
+
     /// One atomic increment invalidates every extant snapshot — no map sweep,
     /// which is what lets the searcher keep running during recovery.
     #[test]
@@ -753,7 +866,7 @@ mod tests {
     fn a_burn_spanning_the_current_tick_reduces_liquidity() {
         let ls = LiveState::new();
         let pool = Address::from_low_u64_be(1);
-        ls.anchor_cl(pool, U256::from(1u64), 10_000, 0);
+        ls.anchor_cl(pool, 1, U256::from(1u64), 10_000, 0);
         assert!(matches!(
             ls.apply_log(&liquidity_log(pool, false, -100, 100, 4_000, 100, 0)),
             ApplyOutcome::Applied { .. }
@@ -765,7 +878,7 @@ mod tests {
     fn a_mint_spanning_the_current_tick_increases_liquidity() {
         let ls = LiveState::new();
         let pool = Address::from_low_u64_be(2);
-        ls.anchor_cl(pool, U256::from(1u64), 10_000, 0);
+        ls.anchor_cl(pool, 1, U256::from(1u64), 10_000, 0);
         ls.apply_log(&liquidity_log(pool, true, -100, 100, 4_000, 100, 0));
         assert_eq!(ls.cl_snapshot(pool).unwrap().liquidity, 14_000);
     }
@@ -776,7 +889,7 @@ mod tests {
     fn a_position_outside_the_current_tick_does_not_change_liquidity() {
         let ls = LiveState::new();
         let pool = Address::from_low_u64_be(3);
-        ls.anchor_cl(pool, U256::from(1u64), 10_000, 0);
+        ls.anchor_cl(pool, 1, U256::from(1u64), 10_000, 0);
         ls.apply_log(&liquidity_log(pool, true, 500, 900, 4_000, 100, 0));
         assert_eq!(
             ls.cl_snapshot(pool).unwrap().liquidity,
@@ -791,12 +904,12 @@ mod tests {
     fn range_bounds_follow_the_half_open_convention() {
         let ls = LiveState::new();
         let a = Address::from_low_u64_be(4);
-        ls.anchor_cl(a, U256::from(1u64), 10_000, 100);
+        ls.anchor_cl(a, 1, U256::from(1u64), 10_000, 100);
         ls.apply_log(&liquidity_log(a, true, 100, 200, 1_000, 100, 0));
         assert_eq!(ls.cl_snapshot(a).unwrap().liquidity, 11_000, "lower bound is inclusive");
 
         let b = Address::from_low_u64_be(5);
-        ls.anchor_cl(b, U256::from(1u64), 10_000, 200);
+        ls.anchor_cl(b, 1, U256::from(1u64), 10_000, 200);
         ls.apply_log(&liquidity_log(b, true, 100, 200, 1_000, 100, 1));
         assert_eq!(ls.cl_snapshot(b).unwrap().liquidity, 10_000, "upper bound is exclusive");
     }
@@ -824,7 +937,7 @@ mod tests {
         let ls = LiveState::new();
         let pool = Address::from_low_u64_be(42);
 
-        ls.anchor_cl(pool, U256::from(1u64), 10_000, 0);
+        ls.anchor_cl(pool, 1, U256::from(1u64), 10_000, 0);
         assert_eq!(
             ls.cl_snapshot(pool).unwrap().prov.source,
             SnapshotSource::Anchor

@@ -700,6 +700,13 @@ where
                 }
                 // Expected traffic, not a coverage gap — see is_known_non_state_topic.
                 ApplyOutcome::NotStateBearing => {}
+                // The anchor already covered this log's block. Expected on any
+                // anchored pool; counted so an unexpected volume is visible.
+                ApplyOutcome::Superseded => {
+                    if let Some(m) = &self.metrics {
+                        m.live_state_superseded.inc();
+                    }
+                }
                 // A real coverage gap, unlike the above: we had the event and
                 // could not use it. Counts how much a websocket gap actually
                 // costs, which is the number that decides whether closing the

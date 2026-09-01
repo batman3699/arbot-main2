@@ -46,6 +46,10 @@ pub struct Metrics {
     /// Mint/Burn deltas dropped because the pool's base snapshot was
     /// invalidated by a websocket gap. The running cost of every gap.
     pub live_state_untrusted_base: Counter,
+    /// Logs dropped because an anchor had already carried the pool past them.
+    /// Expected traffic; a spike means anchoring is running too far ahead of
+    /// the log stream.
+    pub live_state_superseded: Counter,
     /// Reorgs and out-of-order logs. Frequent breaks invalidate the
     /// lossless-dirty-set argument.
     pub continuity_breaks: Counter,
@@ -199,6 +203,14 @@ impl Metrics {
         registry
             .register(Box::new(ingestion_ws_events.clone()))
             .context("register ingestion_ws_events_total counter")?;
+
+        let live_state_superseded = Counter::with_opts(Opts::new(
+            "live_state_superseded_total",
+            "Logs dropped because an anchor already covered their block",
+        ))?;
+        registry
+            .register(Box::new(live_state_superseded.clone()))
+            .context("register live_state_superseded_total counter")?;
 
         let ingestion_resubscribes_avoided = Counter::with_opts(Opts::new(
             "ingestion_resubscribes_avoided_total",
@@ -664,6 +676,7 @@ impl Metrics {
             ingestion_ws_events,
             ingestion_ws_stalls,
             live_state_untrusted_base,
+            live_state_superseded,
             ingestion_resubscribes_avoided,
             live_state_applied,
             live_state_undecodable,
