@@ -225,3 +225,56 @@ between its anchor's read and install.
 Do not enable local pricing on anchored lineage until this is resolved: the
 divergent snapshots reported `Derived`, so `may_price_locally` would have said
 yes to state that was wrong by up to 5559 bps.
+
+## 8. Probe result, 2026-09-01 — mechanism real, conclusion retracted
+
+Instrumented run: `CHAOS_WS_GAP_SECS=60`, 19m05s, 18 forced gaps, 11946
+anchors, 540 reconciliations.
+
+### The window is real
+
+**8 lost updates confirmed, and every single one at
+`dropped_block == anchor_block + 1`.** That is the window's exact signature: a
+delta arriving one block after the read, refused for want of a trusted base,
+and absent from the anchor because the anchor is end-of-block-N state. Not
+inference any more — a count, with the arithmetic to explain each one.
+
+### It does not explain the divergence
+
+8 events against 11946 anchors is 0.07%. This run produced **one** divergent
+record, on a pool that had **no** lost update. So the window exists, is rare,
+and was not the cause of what §7 attributed to it.
+
+### §7's conclusion is retracted
+
+| run | code | Liquidity divergence |
+|---|---|---|
+| r9 | pre-anchor | 1/69 (1.45%) |
+| r10 | anchor | 6/153 (3.92%) |
+| r11 | anchor + probe | **1/178 (0.56%)** |
+
+Pre-anchor against both anchor runs pooled: 7/331 vs 1/69, Fisher p = 0.586.
+**There is no established increase in divergence from anchoring.** §7 read a
+step change out of one noisy sample.
+
+The sharpest evidence is r10 against r11, which differ in no behavioural
+respect: Fisher p = **0.040**. Two runs of effectively identical code separate
+at p < 0.05 on this measure. That is the calibration to keep: at these sample
+sizes a p-value cannot distinguish a code change from run-to-run variance, so
+single-run comparisons must not be treated as findings. This is the third time
+in this project a conclusion has been drawn from one sample and then failed to
+reproduce.
+
+### Where that leaves the anchor path
+
+- Coverage recovery works: `untrusted_base` drops fell from 5194 to ~435.
+- Ordering works: 39 superseded, 0 anchored snapshots measured.
+- The lost-update window is real but marginal at 0.07% of anchors. Option 2
+  (re-anchor pools that dropped a delta above their anchor block) is now cheap
+  to implement, because `note_anchor_window` already detects exactly that case.
+- The residual ~0.5-1% Liquidity divergence is unchanged by any of this work and
+  remains unexplained. It predates anchoring: the same residual appeared as
+  1/224 in run 5, before any of it existed.
+
+Local pricing on anchored lineage is no longer blocked by §7's finding, but the
+unexplained residual is its own gate and has not moved.
