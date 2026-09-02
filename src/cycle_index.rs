@@ -315,6 +315,41 @@ impl CycleIndex {
         out
     }
 
+    /// Bounded hot-path lookup: the touched cycles worth pricing first, and how
+    /// many were touched in total.
+    ///
+    /// The plan specified `cycles_touching(..).take(limit)`. That would be an
+    /// ARBITRARY selection: `cycles_touching` sorts by `CycleId`, which is
+    /// enumeration order, so `take` keeps whichever cycles happened to be built
+    /// first. Calling the result "best" would be a claim the index cannot
+    /// support — it holds no prices and therefore cannot rank by profit.
+    ///
+    /// What it CAN rank by is length, and shorter is genuinely better on the
+    /// hot path: fewer legs is less gas, fewer swaps to fail, and less chance a
+    /// leg moves between quote and execution. So the cap keeps the shortest
+    /// cycles, breaking ties by id for determinism.
+    ///
+    /// Returns the total touched count as well, because a cap that silently
+    /// drops candidates reads as "these are all of them". Ranking by expected
+    /// net profit is the caller's job, once quotes exist.
+    pub fn cycles_touching_limited(
+        &self,
+        hops: impl IntoIterator<Item = (Address, Address)>,
+        limit: usize,
+    ) -> (Vec<CycleId>, usize) {
+        let mut ids = self.cycles_touching(hops);
+        let total = ids.len();
+        ids.sort_by_key(|id| {
+            let len = self
+                .cycle(*id)
+                .map(|c| c.tokens.len())
+                .unwrap_or(usize::MAX);
+            (len, *id)
+        });
+        ids.truncate(limit);
+        (ids, total)
+    }
+
     /// Whether the token loop `tokens` (open or closed, any rotation) is in the
     /// index.
     pub fn contains_tokens(&self, tokens: &[Address]) -> bool {
@@ -825,6 +860,60 @@ mod tests {
         );
     }
 
+
+    /// The cap must not be arbitrary. `cycles_touching` sorts by `CycleId`,
+    /// which is enumeration order, so a plain `.take(limit)` keeps whichever
+    /// cycles happened to be built first. Ranking by length is the only
+    /// ordering the index can actually justify — and shorter is genuinely
+    /// better on the hot path: less gas, fewer legs to fail.
+    #[test]
+    fn the_touched_cap_keeps_the_shortest_cycles() {
+        let graph = triangle_graph();
+        let idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], CycleIndexLimits::default());
+        let hop = (addr(1), addr(2));
+        let (all, total) = idx.cycles_touching_limited([hop], usize::MAX);
+        assert_eq!(all.len(), total, "an unbounded cap drops nothing");
+
+        let mut lens: Vec<usize> = all
+            .iter()
+            .map(|id| idx.cycle(*id).expect("cycle").tokens.len())
+            .collect();
+        let sorted = {
+            let mut v = lens.clone();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(lens, sorted, "selection order must be shortest-first");
+        lens.dedup();
+
+        if total > 1 {
+            let (one, total_again) = idx.cycles_touching_limited([hop], 1);
+            assert_eq!(one.len(), 1);
+            assert_eq!(
+                total_again, total,
+                "the total must survive truncation, or a cap reads as \
+                 'these are all of them'"
+            );
+            let shortest = idx.cycle(one[0]).expect("cycle").tokens.len();
+            for id in &all {
+                assert!(
+                    idx.cycle(*id).expect("cycle").tokens.len() >= shortest,
+                    "the kept cycle must be no longer than any dropped one"
+                );
+            }
+        }
+    }
+
+    /// A hop nothing traverses yields nothing, and says so rather than
+    /// reporting a truncated view of an empty set.
+    #[test]
+    fn an_untouched_hop_yields_no_cycles() {
+        let graph = triangle_graph();
+        let idx = CycleIndex::build(&universe_of(&graph), &[addr(1)], CycleIndexLimits::default());
+        let (ids, total) = idx.cycles_touching_limited([(addr(90), addr(91))], 32);
+        assert!(ids.is_empty());
+        assert_eq!(total, 0);
+    }
 
     #[test]
     fn contains_nodes_matches_closed_and_rotated_forms() {
