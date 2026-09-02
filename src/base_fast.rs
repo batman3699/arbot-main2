@@ -480,44 +480,71 @@ pub fn rate_from_live(
     from: Address,
     to: Address,
 ) -> Option<(f64, f64)> {
-    use crate::live_state::may_price_locally;
+    let mut best: Option<(f64, f64)> = None;
+    let mut best_rate = f64::NEG_INFINITY;
     for pool in candidate_pools {
         let Some(meta) = pool_tokens.get(pool) else {
             continue;
         };
-        let (token0, token1) = (meta.token0, meta.token1);
-        // Charged once, here, so `gross_bps` downstream is already net of pool
-        // fees. A cycle priced from raw ratios overstates every hop.
-        let keep = 1.0 - (f64::from(meta.fee_ppm) / 1_000_000.0);
-        if !(0.0..=1.0).contains(&keep) {
-            continue;
-        }
-        let forward = if from == token0 && to == token1 {
-            true
-        } else if from == token1 && to == token0 {
-            false
-        } else {
+        let Some((num, den)) = hop_rate(live, *pool, meta, from, to) else {
             continue;
         };
+        let rate = num / den;
+        // `>` not `>=`: on a tie the first pool wins, which keeps the result
+        // independent of the order `pools_for_hop` happens to return.
+        if rate.is_finite() && rate > best_rate {
+            best_rate = rate;
+            best = Some((num, den));
+        }
+    }
+    best
+}
 
-        if let Some(snap) = live.cl_snapshot(*pool) {
+/// One pool's rate for one hop, net of that pool's fee.
+///
+/// `None` when the pool does not serve the hop, its snapshot is missing or
+/// untrusted, or its curve is one this function cannot price.
+fn hop_rate(
+    live: &LiveState,
+    pool: Address,
+    meta: &PoolMeta,
+    from: Address,
+    to: Address,
+) -> Option<(f64, f64)> {
+    use crate::live_state::may_price_locally;
+    let (token0, token1) = (meta.token0, meta.token1);
+    // Charged once, here, so `gross_bps` downstream is already net of pool
+    // fees. A cycle priced from raw ratios overstates every hop.
+    let keep = 1.0 - (f64::from(meta.fee_ppm) / 1_000_000.0);
+    if !(0.0..=1.0).contains(&keep) {
+        return None;
+    }
+    let forward = if from == token0 && to == token1 {
+        true
+    } else if from == token1 && to == token0 {
+        false
+    } else {
+        return None;
+    };
+
+    match meta.kind {
+        PoolKind::ConcentratedLiquidity => {
+            let snap = live.cl_snapshot(pool)?;
             if !may_price_locally(&snap.prov.trust) {
-                continue;
+                return None;
             }
-            let Some(sp) = u256_to_f64(snap.sqrt_price_x96) else {
-                continue;
-            };
+            let sp = u256_to_f64(snap.sqrt_price_x96)?;
             let ratio = sp / 2f64.powi(96);
             let price = ratio * ratio; // token1 per token0
             if !price.is_finite() || price <= 0.0 {
-                continue;
+                return None;
             }
-            return Some(if forward { (price * keep, 1.0) } else { (keep, price) });
+            Some(if forward { (price * keep, 1.0) } else { (keep, price) })
         }
-
-        if let Some(snap) = live.v2_snapshot(*pool) {
+        PoolKind::ConstantProduct => {
+            let snap = live.v2_snapshot(pool)?;
             if !may_price_locally(&snap.prov.trust) {
-                continue;
+                return None;
             }
             let (r0, r1) = (
                 u256_to_f64(snap.state.reserve0)?,
@@ -526,12 +553,17 @@ pub fn rate_from_live(
             // Explicit, not `!(r > 0.0)`: NaN must reject and a negated
             // partial comparison hides that.
             if !(r0.is_finite() && r1.is_finite()) || r0 <= 0.0 || r1 <= 0.0 {
-                continue;
+                return None;
             }
-            return Some(if forward { (r1 * keep, r0) } else { (r0 * keep, r1) });
+            Some(if forward { (r1 * keep, r0) } else { (r0 * keep, r1) })
         }
+        // `r1/r0` is not this curve's marginal price. Applying it to a stable
+        // pool produced a 163% phantom edge in the 2026-09-01 spread census,
+        // and the correct form needs each token's decimals, which `PoolMeta`
+        // does not carry. Refusing costs coverage on the deepest pools on Base;
+        // pricing it wrongly costs money.
+        PoolKind::StableSwap => None,
     }
-    None
 }
 
 /// Simulate one call against preconfirmed state.
@@ -1842,7 +1874,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConcentratedLiquidity },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct },
         )]);
 
         let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1).expect("forward");
@@ -1863,7 +1895,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConcentratedLiquidity },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct },
         )]);
         let (a, b) = rate_from_live(&live, &[pool], &tokens, t0, t1).unwrap();
         let (c, d) = rate_from_live(&live, &[pool], &tokens, t1, t0).unwrap();
@@ -1882,7 +1914,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConcentratedLiquidity },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct },
         )]);
         assert!(rate_from_live(&live, &[pool], &tokens, t0, t1).is_some());
 
@@ -1904,7 +1936,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConcentratedLiquidity },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct },
         )]);
         assert!(rate_from_live(&live, &[pool], &tokens, t0, addr(99)).is_none());
         assert!(rate_from_live(&live, &[], &tokens, t0, t1).is_none());
@@ -2192,5 +2224,112 @@ mod tests {
             translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3 }]);
         assert!(ready.is_empty());
         assert_eq!(untranslatable, 1);
+    }
+
+    // ---- parallel pools ----
+
+    /// Every token pair on Base is served by several pools at several fee
+    /// tiers. Taking the FIRST one that prices is taking an arbitrary one:
+    /// `pools_for_hop` returns insertion order, so the route depended on the
+    /// order the inventory happened to load.
+    #[test]
+    fn the_best_of_several_pools_serving_a_hop_is_the_one_used() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (cheap, rich) = (addr(10), addr(11));
+        let live = LiveState::new();
+        // Same pair, same fee; `rich` simply holds a better price.
+        assert!(live.anchor_v2(cheap, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(1_000u64), reserve1: U256::from(1_000u64),
+        }));
+        assert!(live.anchor_v2(rich, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(1_000u64), reserve1: U256::from(1_500u64),
+        }));
+        let mut meta = std::collections::HashMap::new();
+        for p in [cheap, rich] {
+            meta.insert(p, PoolMeta {
+                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct,
+            });
+        }
+
+        let (n, d) = rate_from_live(&live, &[cheap, rich], &meta, t0, t1).expect("priced");
+        assert!((n / d - 1.5).abs() < 1e-9, "got {}", n / d);
+        // ...and it must not depend on which order the pools arrive in.
+        let (n2, d2) = rate_from_live(&live, &[rich, cheap], &meta, t0, t1).expect("priced");
+        assert!((n2 / d2 - n / d).abs() < 1e-12, "order changed the route");
+    }
+
+    /// A cheaper fee tier can beat a better raw ratio, and the comparison has to
+    /// happen AFTER the fee is charged or the ranking is on the wrong number.
+    #[test]
+    fn the_comparison_happens_after_fees_not_before() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (expensive, cheap) = (addr(10), addr(11));
+        let live = LiveState::new();
+        // `expensive` has the better ratio (1.10) but charges 1%; `cheap` has
+        // 1.05 and charges nothing. Net: 1.089 vs 1.05, so expensive still wins
+        // -- flip the fee and the answer must flip with it.
+        assert!(live.anchor_v2(expensive, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(1_000u64), reserve1: U256::from(1_100u64),
+        }));
+        assert!(live.anchor_v2(cheap, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(1_000u64), reserve1: U256::from(1_050u64),
+        }));
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(expensive, PoolMeta {
+            token0: t0, token1: t1, fee_ppm: 100_000, kind: PoolKind::ConstantProduct,
+        });
+        meta.insert(cheap, PoolMeta {
+            token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct,
+        });
+        let (n, d) = rate_from_live(&live, &[expensive, cheap], &meta, t0, t1).expect("priced");
+        // 1.10 * 0.90 = 0.99 < 1.05, so the cheap pool wins on NET.
+        assert!((n / d - 1.05).abs() < 1e-9, "fees were not charged before ranking: {}", n / d);
+    }
+
+    /// The Solidly stable curve is `x^3*y + x*y^3 = k`, so `r1/r0` is not its
+    /// marginal price. Pricing one as constant-product manufactured a 163%
+    /// phantom edge in the spread census. Until the decimals needed for the
+    /// real form are wired, the pool must be REFUSED, not approximated.
+    #[test]
+    fn a_stable_pool_is_refused_rather_than_priced_as_constant_product() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        assert!(live.anchor_v2(pool, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(1_000u64), reserve1: U256::from(2_000u64),
+        }));
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(pool, PoolMeta {
+            token0: t0, token1: t1, fee_ppm: 100, kind: PoolKind::StableSwap,
+        });
+        assert!(rate_from_live(&live, &[pool], &meta, t0, t1).is_none());
+    }
+
+    /// A pool whose snapshot is untrusted must not shadow a healthy pool
+    /// serving the same hop. The old loop returned `None` for the hop entirely
+    /// if the untrusted pool came first in some orderings.
+    #[test]
+    fn an_untrusted_pool_does_not_hide_a_healthy_one() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (dark, good) = (addr(10), addr(11));
+        let live = LiveState::new();
+        assert!(live.anchor_v2(good, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(1_000u64), reserve1: U256::from(1_200u64),
+        }));
+        let mut meta = std::collections::HashMap::new();
+        for p in [dark, good] {
+            meta.insert(p, PoolMeta {
+                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct,
+            });
+        }
+        // `dark` has no snapshot at all.
+        let (n, d) = rate_from_live(&live, &[dark, good], &meta, t0, t1).expect("priced");
+        assert!((n / d - 1.2).abs() < 1e-9);
     }
 }
