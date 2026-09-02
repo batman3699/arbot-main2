@@ -31,10 +31,15 @@
 //! its socket, and a feed that falls behind is worse than no feed — it reports
 //! stale state as fresh.
 
-// Staged, not yet wired: `main.rs` does not route Base through this module
-// until the socket task lands, so every item here is dead from the binary's
-// view. The allow goes when `spawn` is implemented and Base is routed through
-// `BaseFastPath` -- if it is still needed then, something did not get wired.
+// The feed is wired (main.rs routes Base through `spawn` behind
+// ARBOT_BASE_FAST), but the SCAN LOOP does not consume the dirty set yet, so
+// the accessors it will use -- `feed`, `pools`, `stall_limit`, `is_monitored`,
+// `mean_apply_micros` -- have no non-test caller.
+//
+// An earlier version of this comment claimed the allow could come off as soon
+// as the module was wired. That was wrong: wiring the FEED is not the same as
+// wiring the CONSUMER. It comes off when `process_base_flashblock` drains the
+// dirty set.
 #![allow(dead_code)]
 
 use std::collections::HashSet;

@@ -7638,6 +7638,23 @@ where
             metrics.record_stage_latency(&self.chain_name, "quote", latency_ms);
         }
 
+        // The decision-loop split, in the log rather than only in metrics.
+        //
+        // The loop was measured at 4.20s median (220 scans) against a 2s Base
+        // block and a 200ms flashblock. `populate_ms` accounted for 1.71s of
+        // that and the rest was invisible without scraping Prometheus, which
+        // made it impossible to say whether a faster FEED or a faster DECISION
+        // was the bigger win. search covers cycle discovery; quote covers
+        // candidate preparation, which is where sizing lives.
+        info!(
+            target: "latency",
+            chain = %self.chain_name,
+            search_ms = search_start.elapsed().saturating_sub(quote_start.elapsed()).as_millis(),
+            quote_and_size_ms = quote_start.elapsed().as_millis(),
+            candidates = ranked_candidates.len(),
+            "scan decision phases"
+        );
+
         let attempt_limit = ranked_candidates.len();
         let mut cascade_failures: Vec<String> = Vec::new();
         let mut selected_candidate: Option<CandidatePlan> = None;
@@ -12840,6 +12857,7 @@ async fn launch_chain_runtime(
                             "CHAOS_WS_GAP_SECS set; forcing websocket gaps. Test harness only"
                         );
                     }
+                    let fast_pools: Vec<Address> = cl_pools.iter().map(|p| p.pair).collect();
                     let monitor = monitor
                         .with_chaos_gap(chaos_gap)
                         .with_sticky_pools(cl_pools)
@@ -12883,6 +12901,48 @@ async fn launch_chain_runtime(
                                 }
                             },
                         );
+                        // Base flashblock fast path: preconfirmed logs into the
+                        // SAME LiveState the poll path writes, so both feed one
+                        // store and their latency is directly comparable.
+                        //
+                        // Off by default. The canonical loop measures 4.20s
+                        // median against a 200ms flashblock cadence; this exists
+                        // to produce the receive->applied number that says
+                        // whether that gap is closing, before anything is
+                        // rewired to depend on it.
+                        if cfg.chain_id == 8453
+                            && crate::util::env_flag("ARBOT_BASE_FAST", false)
+                        {
+                            if crate::base_fast::worth_subscribing(&fast_pools) {
+                                let fast = std::sync::Arc::new(
+                                    crate::base_fast::BaseFastPath::new(
+                                        crate::base_fast::FlashFeed::PendingLogs {
+                                            ws_url: ws_endpoints
+                                                .first()
+                                                .cloned()
+                                                .unwrap_or_default(),
+                                        },
+                                        fast_pools.clone(),
+                                        Arc::clone(&live),
+                                        std::sync::Arc::new(std::sync::Mutex::new(
+                                            std::collections::HashSet::new(),
+                                        )),
+                                        metrics.clone(),
+                                    )
+                                    .with_ws_reconnect(ws_endpoints.clone(), ws_backoff),
+                                );
+                                info!(
+                                    pools = fast_pools.len(),
+                                    "base fast path enabled (pendingLogs)"
+                                );
+                                fast.spawn();
+                            } else {
+                                warn!(
+                                    "ARBOT_BASE_FAST set but no CL pools to subscribe; \
+                                     pendingLogs with no address filter is every log on Base"
+                                );
+                            }
+                        }
                         monitor.with_live_state(live)
                     } else {
                         monitor
