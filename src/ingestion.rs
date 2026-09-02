@@ -1271,7 +1271,7 @@ where
             if head_tx.borrow().number.as_u64() != number.as_u64() {
                 if let Some(age_ms) = block_age_ms(block.timestamp) {
                     info!(
-                        target: "latency",
+                        target: "arb_exec::latency",
                         block = number.as_u64(),
                         age_ms,
                         source = "http_poll",
@@ -1369,7 +1369,7 @@ pub async fn spawn_block_head_monitor<C>(
                     if let Some(number) = block.number {
                         if let Some(age_ms) = block_age_ms(block.timestamp) {
                             info!(
-                                target: "latency",
+                                target: "arb_exec::latency",
                                 block = number.as_u64(),
                                 age_ms,
                                 source = "ws_newheads",

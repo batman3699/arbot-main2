@@ -1244,7 +1244,7 @@ impl BaseFastPath {
                 let out = self.seed_from_chain(&provider, &stale, block).await;
                 let cov = self.publish_coverage();
                 info!(
-                    target: "latency",
+                    target: "arb_exec::latency",
                     block = out.block,
                     requested = stale.len(),
                     anchored = out.anchored,
@@ -1308,6 +1308,13 @@ impl BaseFastPath {
     }
 
     /// Drain the dirty set on a fixed cadence and resolve it to cycles.
+    ///
+    /// Logs go to `arb_exec::latency`, NOT a bare `latency` target. HANDOFF.md
+    /// section 1 runs the bot with `RUST_LOG=arb_exec=info`, and an
+    /// `EnvFilter` built from that directive enables only the `arb_exec` tree
+    /// -- so every measurement this module produces was silently dropped by the
+    /// project's own documented run recipe. Verified 2026-09-03: a startup run
+    /// under that recipe emitted zero lines on the bare target.
     ///
     /// This is the join step: the feed writes dirty pools at 3us and, until
     /// now, nothing read them — `dirty_pools` climbed monotonically to 159 in a
@@ -1462,7 +1469,7 @@ impl BaseFastPath {
                     .map(|c| costs.net_bps(c.gross_bps))
                     .unwrap_or(f64::NAN);
                 info!(
-                    target: "latency",
+                    target: "arb_exec::latency",
                     dirty_pools = pools,
                     cycles = out.cycles.len(),
                     priced = priced.len(),
@@ -1523,7 +1530,7 @@ impl BaseFastPath {
             let dirty = self.touched.lock().map(|g| g.len()).unwrap_or(0);
             let cov = self.publish_coverage();
             info!(
-                target: "latency",
+                target: "arb_exec::latency",
                 seen,
                 coverage_pct = cov.pct().round() as u64,
                 priceable = cov.priceable,

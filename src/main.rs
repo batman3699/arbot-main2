@@ -7761,7 +7761,7 @@ where
         // was the bigger win. search covers cycle discovery; quote covers
         // candidate preparation, which is where sizing lives.
         info!(
-            target: "latency",
+            target: "arb_exec::latency",
             chain = %self.chain_name,
             search_ms = search_start.elapsed().saturating_sub(quote_start.elapsed()).as_millis(),
             quote_and_size_ms = quote_start.elapsed().as_millis(),
@@ -14006,7 +14006,7 @@ async fn launch_chain_runtime(
                                     }
                                 }
                                 info!(
-                                    target: "latency",
+                                    target: "arb_exec::latency",
                                     gross_bps = priced.gross_bps,
                                     hops = priced.hops,
                                     amount_in = %sized.sizing.amount_in,
