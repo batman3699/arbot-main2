@@ -264,6 +264,95 @@ impl BaseFastPath {
     }
 }
 
+/// Result of simulating a candidate against preconfirmed state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreconfSimResult {
+    pub success: bool,
+    pub gas_used: u64,
+    /// Revert reason or error text when `success` is false. Kept because a
+    /// candidate that fails simulation is the cheapest signal available about
+    /// WHY, and discarding it turns a diagnosable reject into a silent one.
+    pub failure: Option<String>,
+}
+
+/// `eth_simulateV1` request body for one candidate against `"pending"`.
+///
+/// Split out so the payload shape is testable without a provider. Verified
+/// against the configured provider 2026-09-02: `eth_simulateV1` and
+/// `eth_estimateGas`, both with a `"pending"` block parameter, are supported —
+/// checked before writing this, because the plan names a different endpoint for
+/// production than the public preconf RPC that was verified earlier, and
+/// assuming the two have the same capabilities is how the last endpoint
+/// mistake happened.
+///
+/// `validation: true` matters: without it the node skips the checks that make a
+/// pass mean the transaction would actually be accepted, which turns the
+/// simulation into an expensive no-op.
+pub fn simulate_v1_params(
+    from: Address,
+    to: Address,
+    data: &[u8],
+    max_fee_per_gas: u128,
+) -> Value {
+    json!([
+        {
+            "blockStateCalls": [{
+                "calls": [{
+                    "from": format!("{from:#x}"),
+                    "to": format!("{to:#x}"),
+                    "data": format!("0x{}", hex::encode(data)),
+                    "maxFeePerGas": format!("{max_fee_per_gas:#x}"),
+                }],
+                "stateOverrides": {},
+            }],
+            "validation": true,
+            "traceTransfers": false,
+        },
+        "pending"
+    ])
+}
+
+/// Interpret an `eth_simulateV1` response for a single call.
+///
+/// A missing or malformed response is a FAILURE, never a pass. Treating an
+/// unparseable simulation as success is how an unverified candidate reaches
+/// broadcast, which is the one thing simulation exists to prevent.
+pub fn parse_simulate_v1(value: &Value) -> PreconfSimResult {
+    let call = value
+        .as_array()
+        .and_then(|blocks| blocks.first())
+        .and_then(|b| b.get("calls"))
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first());
+    let Some(call) = call else {
+        return PreconfSimResult {
+            success: false,
+            gas_used: 0,
+            failure: Some("no call result in eth_simulateV1 response".into()),
+        };
+    };
+    let status = call.get("status").and_then(|v| v.as_str()).unwrap_or("0x0");
+    let gas_used = call
+        .get("gasUsed")
+        .and_then(|v| v.as_str())
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    let success = status == "0x1";
+    PreconfSimResult {
+        success,
+        gas_used,
+        failure: if success {
+            None
+        } else {
+            Some(
+                call.get("error")
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| format!("status {status}")),
+            )
+        },
+    }
+}
+
 /// What one flashblock's worth of dirty pools resolved to.
 ///
 /// Deliberately reports what was DROPPED as well as what was selected: a hot
@@ -849,6 +938,81 @@ mod tests {
             "interleaved orderings must trip the cursor -- this is why the fast \
              path gets its own LiveState instead of the pool monitor's"
         );
+    }
+
+    /// `validation: true` and the `"pending"` block tag are the two things that
+    /// make this a preconfirmed check rather than an expensive no-op. Without
+    /// validation the node skips the checks that make a pass mean the
+    /// transaction would actually be accepted.
+    #[test]
+    fn the_simulation_targets_preconfirmed_state_with_validation_on() {
+        let p = simulate_v1_params(addr(1), addr(2), &[0xde, 0xad], 1_000_000_000);
+        assert_eq!(p[1], "pending", "simulating against latest measures the past");
+        assert_eq!(p[0]["validation"], true);
+        let call = &p[0]["blockStateCalls"][0]["calls"][0];
+        assert_eq!(call["data"], "0xdead");
+        assert!(call["maxFeePerGas"].as_str().unwrap().starts_with("0x"));
+    }
+
+    #[test]
+    fn a_successful_simulation_reports_gas() {
+        let ok = json!([{"calls": [{"status": "0x1", "gasUsed": "0x64e0"}]}]);
+        let r = parse_simulate_v1(&ok);
+        assert!(r.success);
+        assert_eq!(r.gas_used, 0x64e0);
+        assert!(r.failure.is_none());
+    }
+
+    /// A revert must carry its reason forward: a candidate that fails
+    /// simulation is the cheapest available signal about WHY, and discarding it
+    /// turns a diagnosable reject into a silent one.
+    #[test]
+    fn a_reverted_simulation_keeps_the_reason() {
+        let rv = json!([{"calls": [
+            {"status": "0x0", "gasUsed": "0x10", "error": "execution reverted"}
+        ]}]);
+        let r = parse_simulate_v1(&rv);
+        assert!(!r.success);
+        assert_eq!(r.gas_used, 0x10);
+        assert!(r.failure.unwrap().contains("reverted"));
+    }
+
+    /// A pass must be positively proven. An unparseable or empty response is a
+    /// FAILURE -- treating it as success is how an unverified candidate reaches
+    /// broadcast, which is the one thing simulation exists to prevent.
+    #[test]
+    fn an_unreadable_simulation_response_is_a_failure_not_a_pass() {
+        for v in [
+            serde_json::json!([]),
+            serde_json::json!([{"calls": []}]),
+            serde_json::json!({"unexpected": true}),
+        ] {
+            let r = parse_simulate_v1(&v);
+            assert!(!r.success, "malformed response must never read as success");
+            assert!(r.failure.is_some());
+        }
+    }
+
+    #[test]
+    fn a_successful_call_reports_its_gas() {
+        let v = serde_json::json!([{"calls":[{"status":"0x1","gasUsed":"0x5208"}]}]);
+        let r = parse_simulate_v1(&v);
+        assert!(r.success);
+        assert_eq!(r.gas_used, 21_000);
+        assert!(r.failure.is_none());
+    }
+
+    /// A revert must carry its reason forward: a failed candidate is the
+    /// cheapest signal available about WHY, and dropping it turns a diagnosable
+    /// reject into a silent one.
+    #[test]
+    fn a_reverted_call_keeps_its_reason() {
+        let v = serde_json::json!([{"calls":[
+            {"status":"0x0","gasUsed":"0x10","error":{"message":"execution reverted"}}
+        ]}]);
+        let r = parse_simulate_v1(&v);
+        assert!(!r.success);
+        assert!(r.failure.unwrap().contains("execution reverted"));
     }
 
     /// The feed is an enum so the documented Denim migration — native 200ms
