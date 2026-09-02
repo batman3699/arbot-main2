@@ -12858,6 +12858,18 @@ async fn launch_chain_runtime(
                         );
                     }
                     let fast_pools: Vec<Address> = cl_pools.iter().map(|p| p.pair).collect();
+                    // Token pairs for the same pools, so the drain loop can map
+                    // a dirty POOL to the token HOP the cycle index is keyed by.
+                    let fast_universe: Vec<(Address, Address, Address)> = cl_pools
+                        .iter()
+                        .map(|p| (p.pair, p.token_in, p.token_out))
+                        .collect();
+                    let fast_starts: Vec<Address> = {
+                        let mut t: Vec<Address> = cl_pools.iter().map(|p| p.token_in).collect();
+                        t.sort_unstable();
+                        t.dedup();
+                        t
+                    };
                     let monitor = monitor
                         .with_chaos_gap(chaos_gap)
                         .with_sticky_pools(cl_pools)
@@ -12950,7 +12962,37 @@ async fn launch_chain_runtime(
                                     pools = fast_pools.len(),
                                     "base fast path enabled (pendingLogs)"
                                 );
-                                fast.spawn();
+                                fast.clone().spawn();
+                                // The consumer. Without it the dirty set has a
+                                // writer and no reader: it climbed to 159 pools
+                                // and never fell in the previous run.
+                                // Index built from the SAME pools the feed
+                                // subscribes to, so a dirty pool always resolves
+                                // to a hop this index knows. Sharing the scan
+                                // loop's index instead would reintroduce the
+                                // two-writers problem in a different place: it
+                                // is rebuilt every scan from a different pool
+                                // set.
+                                let fast_uni = std::sync::Arc::new(
+                                    crate::cycle_index::PoolUniverse::from_pools(fast_universe),
+                                );
+                                let fast_index = crate::cycle_index::CycleIndex::build(
+                                    &fast_uni,
+                                    &fast_starts,
+                                    crate::cycle_index::CycleIndexLimits::default(),
+                                );
+                                info!(
+                                    cycles = fast_index.len(),
+                                    truncated = fast_index.truncated,
+                                    starts = fast_starts.len(),
+                                    "base fast path cycle index built"
+                                );
+                                fast.spawn_drain(
+                                    fast_uni,
+                                    std::sync::Arc::new(std::sync::Mutex::new(Some(fast_index))),
+                                    Duration::from_millis(200),
+                                    32,
+                                );
                             } else {
                                 warn!(
                                     "ARBOT_BASE_FAST set but no CL pools to subscribe; \

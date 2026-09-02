@@ -377,6 +377,73 @@ impl BaseFastPath {
         tokio::spawn(async move { self.run().await })
     }
 
+    /// Drain the dirty set on a fixed cadence and resolve it to cycles.
+    ///
+    /// This is the join step: the feed writes dirty pools at 3us and, until
+    /// now, nothing read them — `dirty_pools` climbed monotonically to 159 in a
+    /// six-minute run because the set had a writer and no consumer.
+    ///
+    /// Timed and reported because "flashblock -> candidate" is the first row of
+    /// the acceptance table, and the drain latency is the part this project can
+    /// control. Repricing and execution hang off the returned cycle ids; they
+    /// are not done here, so the measurement stays free of quoting cost.
+    pub fn spawn_drain(
+        self: Arc<Self>,
+        universe: Arc<crate::cycle_index::PoolUniverse>,
+        index: Arc<StdMutex<Option<crate::cycle_index::CycleIndex>>>,
+        cadence: Duration,
+        max_cycles: usize,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tick = interval(cadence);
+            tick.tick().await; // immediate first tick; discard
+            let mut drains: u64 = 0;
+            let mut pools_total: u64 = 0;
+            let mut cycles_total: u64 = 0;
+            let mut micros_total: u64 = 0;
+            let mut unresolved_total: u64 = 0;
+            let mut capped: u64 = 0;
+            loop {
+                tick.tick().await;
+                let Some(idx) = index.lock().ok().and_then(|g| g.clone()) else {
+                    // No index yet: still drain, or the set grows unbounded
+                    // while the graph is warming up.
+                    if let Ok(mut g) = self.touched.lock() {
+                        g.clear();
+                    }
+                    continue;
+                };
+                let (out, pools, elapsed) =
+                    drain_and_resolve(&self.touched, &universe, &idx, max_cycles);
+                if pools == 0 {
+                    continue;
+                }
+                drains += 1;
+                pools_total += pools as u64;
+                cycles_total += out.cycles.len() as u64;
+                unresolved_total += out.unresolved_pools as u64;
+                micros_total += elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+                if out.total_touched > out.cycles.len() {
+                    capped += 1;
+                }
+                info!(
+                    target: "latency",
+                    dirty_pools = pools,
+                    cycles = out.cycles.len(),
+                    total_touched = out.total_touched,
+                    unresolved_pools = out.unresolved_pools,
+                    drain_us = elapsed.as_micros(),
+                    mean_drain_us = micros_total / drains.max(1),
+                    mean_cycles = cycles_total / drains.max(1),
+                    mean_pools = pools_total / drains.max(1),
+                    capped_drains = capped,
+                    unresolved_total,
+                    "flashblock to candidate"
+                );
+            }
+        })
+    }
+
     /// Print what the feed is actually doing, every 15s.
     ///
     /// Reports the DECLINE breakdown, not just the applies. A feed delivering
