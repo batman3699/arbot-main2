@@ -1039,6 +1039,9 @@ impl Graph {
     /// `None` when any token is absent from the graph or any hop has no edge.
     /// A partial translation is worse than none: it would produce a plan whose
     /// steps do not compose.
+    // No caller in the bin until the fast path hands cycles to
+    // prepare_candidate; the allow goes with that wiring.
+    #[allow(dead_code)]
     pub fn indexed_cycle_for_tokens(&self, tokens: &[Address]) -> Option<IndexedCycle> {
         if tokens.len() < 2 {
             return None;
