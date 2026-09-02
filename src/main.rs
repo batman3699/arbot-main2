@@ -12987,11 +12987,22 @@ async fn launch_chain_runtime(
                                     starts = fast_starts.len(),
                                     "base fast path cycle index built"
                                 );
+                                // 32 discarded 98.2% of touched cycles: the
+                                // index is 6-hop (7,858 cycles), not the 2-hop
+                                // ~536 the cap was sized against, and it bound
+                                // on 85% of drains. Resolution costs 141us
+                                // median against a 200ms flashblock, so the
+                                // constraint was the cap, not the clock.
+                                let max_touched = crate::util::env_parse_opt::<usize>(
+                                    "ARBOT_BASE_FAST_MAX_CYCLES",
+                                )
+                                .filter(|v| *v > 0)
+                                .unwrap_or(512);
                                 fast.spawn_drain(
                                     fast_uni,
                                     std::sync::Arc::new(std::sync::Mutex::new(Some(fast_index))),
                                     Duration::from_millis(200),
-                                    32,
+                                    max_touched,
                                 );
                             } else {
                                 warn!(
