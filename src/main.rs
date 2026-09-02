@@ -9248,10 +9248,11 @@ where
         // which is what would make the replay round trip unnecessary. Until
         // then HANDOFF.md's shadow recipe sets the flag and expects the file.
         //
-        // Writes are best-effort and silent: a diagnostic must not be able to
-        // fail a simulation. The cost is that a bad path or a full disk yields
-        // an empty file and no explanation, so confirm the file has grown
-        // before concluding a run produced no frames.
+        // Writes are best-effort: a diagnostic must not be able to fail a
+        // simulation, so a write error is not propagated. It IS reported --
+        // once, at the first failure -- because the alternative is an operator
+        // finishing a shadow pass, reaching for the replay, and finding an
+        // empty file with nothing anywhere saying why.
         if std::env::var("ARBOT_DUMP_CALLDATA").ok().as_deref() == Some("1") {
             let path = std::env::var("ARBOT_DUMP_CALLDATA_PATH")
                 .unwrap_or_else(|_| "/tmp/arbot_failing_calldata.jsonl".to_string());
@@ -9296,8 +9297,27 @@ where
                 plan.cycle_slippage_bps,
                 data
             );
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-                let _ = f.write_all(line.as_bytes());
+            // Warned ONCE, not per candidate: this runs on every simulated
+            // candidate, so a warning per frame would bury the log it exists to
+            // protect. Still a warning and not a silent skip -- the failure mode
+            // being guarded against is an operator running a whole shadow pass,
+            // reaching for the replay in HANDOFF.md section 3, and finding an
+            // empty file with nothing anywhere saying why.
+            static DUMP_WRITE_WARNED: std::sync::Once = std::sync::Once::new();
+            let wrote = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| f.write_all(line.as_bytes()));
+            if let Err(err) = wrote {
+                DUMP_WRITE_WARNED.call_once(|| {
+                    warn!(
+                        path = %path,
+                        error = %err,
+                        "ARBOT_DUMP_CALLDATA is set but the capture cannot be \
+                         written; replay diagnosis will have no frames"
+                    );
+                });
             }
         }
         // ===== end calldata capture =====
