@@ -31,15 +31,11 @@
 //! its socket, and a feed that falls behind is worse than no feed — it reports
 //! stale state as fresh.
 
-// The feed is wired (main.rs routes Base through `spawn` behind
-// ARBOT_BASE_FAST), but the SCAN LOOP does not consume the dirty set yet, so
-// the accessors it will use -- `feed`, `pools`, `stall_limit`, `is_monitored`,
-// `mean_apply_micros` -- have no non-test caller.
-//
-// An earlier version of this comment claimed the allow could come off as soon
-// as the module was wired. That was wrong: wiring the FEED is not the same as
-// wiring the CONSUMER. It comes off when `process_base_flashblock` drains the
-// dirty set.
+// The feed, the drain and the candidate handoff are all wired now. What is
+// still unused are the individual accessors a caller would reach for at a
+// console -- `feed`, `is_monitored`, `mean_apply_micros` -- and the
+// simulation helpers, which have no call site until a real candidate's
+// calldata is simulated instead of an empty probe.
 #![allow(dead_code)]
 
 use std::collections::HashSet;
@@ -787,6 +783,41 @@ pub fn translate_for_prep(
     (out, untranslatable)
 }
 
+/// What the sink did with one batch of ranked candidates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrepReport {
+    /// Candidates that came back sized, with a plan.
+    pub sized: usize,
+    /// Candidates the economics rejected. The expected outcome, not a fault.
+    pub rejected: usize,
+    /// Candidates the quote budget ran out before reaching.
+    pub budgeted: usize,
+    /// The scan has not published a pricing context yet, so nothing could be
+    /// prepared at all. Distinct from `rejected`: one is an answer and the
+    /// other is the absence of one.
+    pub no_context: bool,
+}
+
+/// Where the fast path hands its ranked candidates.
+///
+/// A callback because `prepare_candidate` lives on the binary's `Runner` and
+/// this module is in the library. The separation is worth having regardless:
+/// the fast path's job ends at "these cycles, in this order", and every
+/// question about sizing, flash fees, gas and minimum profit belongs to
+/// whoever implements this.
+/// The `Arc<Graph>` is passed IN, never re-read by the implementation. Node
+/// indices are assigned in first-seen order and the scan rebuilds the graph
+/// every pass, so an `IndexedCycle` translated against one graph silently
+/// repoints if it is resolved against the next one.
+pub type CandidateSink = Arc<
+    dyn Fn(
+            Arc<crate::graph::Graph>,
+            Vec<(PricedCycle, crate::graph::IndexedCycle)>,
+        ) -> futures_util::future::BoxFuture<'static, PrepReport>
+        + Send
+        + Sync,
+>;
+
 /// How many ranked cycles are handed to `prepare_candidate` each drain.
 ///
 /// Was 4 behind a 32 bps gate that cleared nothing for a whole run. The gate is
@@ -1254,11 +1285,26 @@ impl BaseFastPath {
         universe: Arc<crate::cycle_index::PoolUniverse>,
         index: Arc<StdMutex<Option<crate::cycle_index::CycleIndex>>>,
         graph: Arc<StdMutex<Option<Arc<crate::graph::Graph>>>>,
+        sink: Option<CandidateSink>,
         cadence: Duration,
         max_cycles: usize,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let costs = CostStack::from_env();
+            // One batch in preparation at a time, and NEVER awaited on this
+            // task. `prepare_candidate` is RPC-bound and one round trip to the
+            // configured provider measured 250-293ms -- longer than the whole
+            // drain cadence. Awaiting it here would stop the drain, and a feed
+            // whose consumer has stopped reports stale state as fresh. So the
+            // batch goes to its own task, and a drain arriving while one is
+            // still in flight is DROPPED and counted: the newer flashblock
+            // carries better prices than the one being worked on anyway.
+            let prep_slot = Arc::new(tokio::sync::Semaphore::new(1));
+            let prep_sized = Arc::new(AtomicU64::new(0));
+            let prep_rejected = Arc::new(AtomicU64::new(0));
+            let prep_no_context = Arc::new(AtomicU64::new(0));
+            let mut prep_busy: u64 = 0;
+            let mut prep_sent: u64 = 0;
             info!(
                 gas_bps = costs.gas_bps,
                 flash_fee_bps = costs.flash_fee_bps,
@@ -1339,6 +1385,29 @@ impl BaseFastPath {
                     let (ready, bad) = translate_for_prep(&idx, g, &priced);
                     translated = ready.len();
                     untranslatable = bad;
+                    if let (Some(sink), false) = (sink.as_ref(), ready.is_empty()) {
+                        match Arc::clone(&prep_slot).try_acquire_owned() {
+                            Ok(permit) => {
+                                prep_sent += 1;
+                                let call = sink(Arc::clone(g), ready);
+                                let (sz, rj, nc) = (
+                                    Arc::clone(&prep_sized),
+                                    Arc::clone(&prep_rejected),
+                                    Arc::clone(&prep_no_context),
+                                );
+                                tokio::spawn(async move {
+                                    let r = call.await;
+                                    sz.fetch_add(r.sized as u64, Ordering::Relaxed);
+                                    rj.fetch_add(r.rejected as u64, Ordering::Relaxed);
+                                    if r.no_context {
+                                        nc.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    drop(permit);
+                                });
+                            }
+                            Err(_) => prep_busy += 1,
+                        }
+                    }
                 }
 
                 let mut sim_us: u128 = 0;
@@ -1375,6 +1444,11 @@ impl BaseFastPath {
                     translated,
                     untranslatable,
                     graph_snapshot = snapshot.is_some(),
+                    prep_sent,
+                    prep_busy,
+                    prep_sized = prep_sized.load(Ordering::Relaxed),
+                    prep_rejected = prep_rejected.load(Ordering::Relaxed),
+                    prep_no_context = prep_no_context.load(Ordering::Relaxed),
                     price_us,
                     sim_probe_us = sim_us,
                     total_touched = out.total_touched,

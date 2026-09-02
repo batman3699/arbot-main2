@@ -1596,6 +1596,30 @@ fn sim_cascade_depth() -> usize {
 }
 
 /// Shared read-only inputs for concurrent candidate preparation.
+/// An owned `CandidatePrepCtx`, published once per scan for readers that run
+/// between scans.
+///
+/// Everything in it is slow-moving relative to a 200ms flashblock -- native
+/// prices, gas parameters, capital and competition all come from the same
+/// per-scan RPC work -- so a reader gets numbers up to one scan old. That is
+/// acceptable for SIZING, which is what these drive. It is not acceptable for
+/// prices, which is why the fast path reads its own live state for those and
+/// only borrows this for the economics.
+///
+/// `block_number` is the exception worth watching: it is the sealed block the
+/// scan saw, so a fast-path candidate prepared against it is judged against a
+/// block that may already be one or two old.
+#[derive(Clone)]
+struct PrepContextSnapshot {
+    native_prices_map: Arc<HashMap<Address, NativePrice>>,
+    base_profiles_map: Arc<HashMap<Address, TradeSizing>>,
+    capital_snapshot: CapitalSnapshot,
+    competition_snapshot: CompetitionSnapshot,
+    gas_parameters: FeeEstimate,
+    executor_address: Address,
+    block_number: U64,
+}
+
 struct CandidatePrepCtx<'a> {
     native_prices_map: &'a HashMap<Address, NativePrice>,
     base_profiles_map: &'a HashMap<Address, TradeSizing>,
@@ -3475,6 +3499,9 @@ where
     /// Immutable graph snapshot published after each scan, for readers that
     /// must not wait 4.2s for the next one. Written only here.
     graph_snapshot: Arc<StdMutex<Option<Arc<Graph>>>>,
+    /// The economics half of what a reader needs to size a candidate,
+    /// published alongside the graph. Written only in `scan_once`.
+    prep_context: Arc<StdMutex<Option<Arc<PrepContextSnapshot>>>>,
     /// Long-lived tick-ladder cache for the multi-tick CL simulator
     /// (`ARBOT_CL_MULTI_TICK`). Built once here and reused across every
     /// `scan_once()` call for this chain, so `CachedTickSource`'s epoch cache
@@ -3786,6 +3813,7 @@ where
             flash_capacity: Arc::new(StdMutex::new(FlashCapacityCache::default())),
             cycle_index: Arc::new(StdMutex::new(None)),
             graph_snapshot: Arc::new(StdMutex::new(None)),
+            prep_context: Arc::new(StdMutex::new(None)),
             cl_tick_cache,
         }
     }
@@ -5472,6 +5500,11 @@ where
         Arc::clone(&self.graph_snapshot)
     }
 
+    /// The published pricing context, for readers running between scans.
+    fn prep_context(&self) -> Arc<StdMutex<Option<Arc<PrepContextSnapshot>>>> {
+        Arc::clone(&self.prep_context)
+    }
+
     async fn prepare_candidate(
         &self,
         graph: &Graph,
@@ -7078,6 +7111,19 @@ where
             block_number,
             edges_scanned,
         };
+        // Published for the fast path, which prepares candidates between scans
+        // and cannot rebuild any of this itself -- it is all RPC-derived.
+        if let Ok(mut c) = self.prep_context.lock() {
+            *c = Some(Arc::new(PrepContextSnapshot {
+                native_prices_map: Arc::clone(&native_prices_map),
+                base_profiles_map: Arc::clone(&base_profiles_map),
+                capital_snapshot,
+                competition_snapshot: competition_snapshot.clone(),
+                gas_parameters: gas_parameters.clone(),
+                executor_address,
+                block_number,
+            }));
+        }
         let prep_ctx_ref = &prep_ctx;
         let graph_ref = &graph;
         let prepared_candidates: Vec<CandidatePrep> = stream::iter(
@@ -9324,7 +9370,7 @@ where
     }
 
     async fn run(
-        self,
+        self: Arc<Self>,
         mut cmd_rx: mpsc::Receiver<Command>,
         status_tx: watch::Sender<StatusSnapshot>,
     ) -> Result<()> {
@@ -13778,17 +13824,76 @@ async fn launch_chain_runtime(
         bf_skip_on_stable_graph,
     };
 
-    let runner = Runner::new(runner_config, executor);
+    let runner = Arc::new(Runner::new(runner_config, executor));
 
     // Now the runner exists, the fast path can read its published graph
     // snapshot. Read-only: the runner is the sole writer, which is what makes
     // this safe where sharing LiveState was not -- that had two writers and one
     // global ordinal cursor, and cost 584 continuity breaks.
     if let (Some((fast, uni, cap)), Some(index)) = (base_fast_drain, base_fast_index) {
+        // How many ranked cycles are actually SIZED per flashblock. Each one is
+        // several RPC round trips and one round trip to the configured provider
+        // measured 250-293ms on 2026-09-02, so this is an RPC-budget decision
+        // and not a ranking one. The ranking already happened upstream.
+        let prepare_top = crate::util::env_parse_opt::<usize>("ARBOT_BASE_FAST_PREPARE")
+            .filter(|v| *v > 0)
+            .unwrap_or(2);
+        let sink_runner = Arc::clone(&runner);
+        let sink: crate::base_fast::CandidateSink =
+            Arc::new(move |graph: Arc<Graph>, ready| {
+                let runner = Arc::clone(&sink_runner);
+                Box::pin(async move {
+                    let mut report = crate::base_fast::PrepReport::default();
+                    // The economics are all RPC-derived and the fast path cannot
+                    // rebuild them; without a published context there is nothing
+                    // to size against, which is not the same as rejecting.
+                    let snap = runner.prep_context().lock().ok().and_then(|c| c.clone());
+                    let Some(snap) = snap else {
+                        report.no_context = true;
+                        return report;
+                    };
+                    let ctx = CandidatePrepCtx {
+                        native_prices_map: snap.native_prices_map.as_ref(),
+                        base_profiles_map: snap.base_profiles_map.as_ref(),
+                        capital_snapshot: &snap.capital_snapshot,
+                        competition_snapshot: &snap.competition_snapshot,
+                        gas_parameters: &snap.gas_parameters,
+                        executor_address: snap.executor_address,
+                        block_number: snap.block_number,
+                        // A diagnostic field on the scan's own logs. The fast
+                        // path did not scan edges, and claiming a number here
+                        // would put a fiction in the candidate record.
+                        edges_scanned: 0,
+                    };
+                    for (priced, indexed) in ready.into_iter().take(prepare_top) {
+                        match runner.prepare_candidate(&graph, indexed, &ctx).await {
+                            CandidatePrep::Sized(sized) => {
+                                report.sized += 1;
+                                info!(
+                                    target: "latency",
+                                    gross_bps = priced.gross_bps,
+                                    hops = priced.hops,
+                                    amount_in = %sized.sizing.amount_in,
+                                    gross = %sized.sizing.gross,
+                                    flash_fee = %sized.sizing.flash_fee,
+                                    net = %sized.sizing.net_after_fee_and_gas,
+                                    quotes = sized.sizing.quote_count,
+                                    gas = sized.adjusted_cycle_gas,
+                                    "flashblock candidate sized"
+                                );
+                            }
+                            CandidatePrep::Rejected { .. } => report.rejected += 1,
+                            CandidatePrep::Budgeted => report.budgeted += 1,
+                        }
+                    }
+                    report
+                }) as futures_util::future::BoxFuture<'static, crate::base_fast::PrepReport>
+            });
         fast.spawn_drain(
             uni,
             index,
             runner.graph_snapshot(),
+            Some(sink),
             Duration::from_millis(200),
             cap,
         );
