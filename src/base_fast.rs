@@ -298,6 +298,33 @@ pub struct CostStack {
 }
 
 impl CostStack {
+    /// Defaults are ASSUMPTIONS, not measurements, and the log says so.
+    ///
+    /// `gas_bps` is the weakest: gas is a fixed cost, so its bps share depends
+    /// on notional, and a single number here silently assumes one. It is a
+    /// prefilter input only -- the real figure comes from `eth_estimateGas`
+    /// against "pending" per candidate, which is step 9 and is not wired.
+    /// `flash_fee_bps` defaults to 9 (Aave); Balancer is 0, so this is the
+    /// conservative side.
+    ///
+    /// Every field is env-tunable because none of them is knowable from here,
+    /// and burying a guess in a constant is what `ARBOT_MAX_CYCLE_FEE_BPS = 60`
+    /// did.
+    pub fn from_env() -> Self {
+        let f = |k: &str, d: f64| {
+            crate::util::env_parse_opt::<f64>(k)
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(d)
+        };
+        Self {
+            gas_bps: f("ARBOT_COST_GAS_BPS", 5.0),
+            flash_fee_bps: f("ARBOT_COST_FLASH_FEE_BPS", 9.0),
+            execution_buffer_bps: f("ARBOT_COST_EXEC_BUFFER_BPS", 3.0),
+            competition_bid_bps: f("ARBOT_COST_COMPETITION_BPS", 10.0),
+            risk_premium_bps: f("ARBOT_COST_RISK_BPS", 5.0),
+        }
+    }
+
     pub fn total_bps(&self) -> f64 {
         self.gas_bps
             + self.flash_fee_bps
@@ -735,6 +762,17 @@ impl BaseFastPath {
         max_cycles: usize,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
+            let costs = CostStack::from_env();
+            info!(
+                gas_bps = costs.gas_bps,
+                flash_fee_bps = costs.flash_fee_bps,
+                execution_buffer_bps = costs.execution_buffer_bps,
+                competition_bid_bps = costs.competition_bid_bps,
+                risk_premium_bps = costs.risk_premium_bps,
+                total_bps = costs.total_bps(),
+                "base fast path cost stack (ASSUMED, not measured -- gas is a \
+                 fixed cost and its bps share depends on notional)"
+            );
             let mut tick = interval(cadence);
             tick.tick().await; // immediate first tick; discard
             let mut drains: u64 = 0;
@@ -785,6 +823,14 @@ impl BaseFastPath {
                 );
                 let price_us = priced_at.elapsed().as_micros();
                 let best = priced.first().map(|c| c.gross_bps).unwrap_or(f64::NAN);
+                // Net of everything the pool fees do not already cover. Pool
+                // fees are inside gross_bps already; adding them here would
+                // charge them twice.
+                let clearing = priced.iter().filter(|c| costs.clears(c.gross_bps)).count();
+                let best_net = priced
+                    .first()
+                    .map(|c| costs.net_bps(c.gross_bps))
+                    .unwrap_or(f64::NAN);
                 info!(
                     target: "latency",
                     dirty_pools = pools,
@@ -792,6 +838,8 @@ impl BaseFastPath {
                     priced = priced.len(),
                     unpriceable,
                     best_gross_bps = best,
+                    best_net_bps = best_net,
+                    clearing_costs = clearing,
                     price_us,
                     total_touched = out.total_touched,
                     unresolved_pools = out.unresolved_pools,
