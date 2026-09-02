@@ -154,6 +154,8 @@ pub struct BaseFastPath {
     /// pool -> (token0, token1), ORDERED. Required to price a hop in the
     /// direction asked for; without it `sqrtPriceX96` would be applied blind.
     pool_tokens: std::collections::HashMap<Address, PoolMeta>,
+    /// HTTP endpoint for `eth_simulateV1`. `None` disables the probe.
+    sim_http: Option<Arc<ethers::providers::Provider<ethers::providers::Http>>>,
     pub stats: Arc<FastPathStats>,
 }
 
@@ -182,6 +184,7 @@ impl BaseFastPath {
             ws_endpoints: Vec::new(),
             ws_backoff: Duration::from_secs(5),
             pool_tokens: std::collections::HashMap::new(),
+            sim_http: None,
             stats: Arc::new(FastPathStats::default()),
         }
     }
@@ -439,6 +442,25 @@ pub fn rate_from_live(
         }
     }
     None
+}
+
+/// Simulate one call against preconfirmed state.
+///
+/// Returns `Err` only for transport failures. A response that arrives and says
+/// the call reverted is `Ok(PreconfSimResult { success: false, .. })` — a
+/// revert is information, and collapsing it into an error throws away the
+/// reason.
+pub async fn simulate_preconf(
+    http: &ethers::providers::Provider<ethers::providers::Http>,
+    params: Value,
+) -> anyhow::Result<PreconfSimResult> {
+    use ethers::providers::Middleware;
+    let raw: Value = http
+        .provider()
+        .request("eth_simulateV1", params)
+        .await
+        .map_err(|e| anyhow::anyhow!("eth_simulateV1 transport: {e}"))?;
+    Ok(parse_simulate_v1(&raw))
 }
 
 /// A cycle priced from cached edges, before costs.
@@ -726,6 +748,17 @@ impl BaseFastPath {
         self
     }
 
+    /// Endpoint for the preconfirmed-simulation round trip.
+    pub fn with_sim_http(mut self, url: &str) -> Self {
+        self.sim_http = ethers::providers::Provider::<ethers::providers::Http>::try_from(url)
+            .ok()
+            .map(Arc::new);
+        if self.sim_http.is_none() {
+            warn!(url, "base fast path could not build a simulation provider");
+        }
+        self
+    }
+
     pub fn with_ws_reconnect(mut self, endpoints: Vec<String>, backoff: Duration) -> Self {
         self.ws_endpoints = endpoints;
         self.ws_backoff = backoff;
@@ -822,6 +855,29 @@ impl BaseFastPath {
                     4,
                 );
                 let price_us = priced_at.elapsed().as_micros();
+
+                // Endpoint round-trip probe, NOT candidate verification.
+                //
+                // Verifying a candidate needs its calldata, which comes from
+                // the plan builder the fast path does not have. What this
+                // measures is the acceptance table's candidate->simulation
+                // latency against the real provider, with an empty call so the
+                // result carries no claim about any candidate. Reporting a
+                // benign call's `success` as a candidate's would be exactly the
+                // kind of number that reads as progress and means nothing.
+                let mut sim_us: u128 = 0;
+                if let (Some(http), true) = (self.sim_http.as_ref(), !priced.is_empty()) {
+                    let started = Instant::now();
+                    let probe = json!([
+                        {"blockStateCalls": [{"calls": []}], "validation": true,
+                         "traceTransfers": false},
+                        "pending"
+                    ]);
+                    match simulate_preconf(http, probe).await {
+                        Ok(_) => sim_us = started.elapsed().as_micros(),
+                        Err(e) => warn!(error = %e, "preconf simulation probe failed"),
+                    }
+                }
                 let best = priced.first().map(|c| c.gross_bps).unwrap_or(f64::NAN);
                 // Net of everything the pool fees do not already cover. Pool
                 // fees are inside gross_bps already; adding them here would
@@ -841,6 +897,7 @@ impl BaseFastPath {
                     best_net_bps = best_net,
                     clearing_costs = clearing,
                     price_us,
+                    sim_probe_us = sim_us,
                     total_touched = out.total_touched,
                     unresolved_pools = out.unresolved_pools,
                     drain_us = elapsed.as_micros(),

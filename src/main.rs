@@ -12976,6 +12976,13 @@ async fn launch_chain_runtime(
                                         metrics.clone(),
                                     )
                                     .with_pool_tokens(fast_meta)
+                                    .with_sim_http(
+                                        &std::env::var("BASE_FLASHBLOCK_HTTP_URL")
+                                            .ok()
+                                            .unwrap_or_else(|| {
+                                                http_endpoints.first().cloned().unwrap_or_default()
+                                            }),
+                                    )
                                     .with_ws_reconnect(ws_endpoints.clone(), ws_backoff),
                                 );
                                 info!(
