@@ -43,18 +43,49 @@ pub struct Metrics {
     /// a venue is emitting something we do not understand — most likely
     /// PancakeSwap V3, which is deliberately not decoded.
     pub live_state_undecodable: Counter,
-    /// Mint/Burn deltas dropped because the pool's base snapshot was
-    /// invalidated by a websocket gap. The running cost of every gap.
+    /// Mint/Burn deltas DEFERRED because the pool's base snapshot was
+    /// invalidated by a websocket gap. Since the delta buffer landed these are
+    /// held and replayed by the next anchor, not discarded -- only the
+    /// buffer-overflow path loses one, and `live_state_lost_updates` counts
+    /// that. Do not read this as data loss.
     pub live_state_untrusted_base: Counter,
+    /// Pools restored to trust by an RPC read rather than by trading.
+    pub live_state_anchors: Counter,
+    /// ANCHORS that found at least one delta lost to their window -- a per-anchor
+    /// flag, not a delta count. One anchor that lost fifty deltas increments this
+    /// once. Named for what it counts, because an error bound computed from it as
+    /// though it were a delta count would be wrong.
+    pub live_state_lost_updates: Gauge,
+    /// Deltas replayed onto an anchor because they arrived during its read and
+    /// are outside its end-of-block state.
+    pub live_state_replayed_deltas: Gauge,
+    /// Swaps that served as a free audit of the Mint/Burn arithmetic — tick
+    /// unchanged, so only a Mint/Burn could have moved liquidity.
+    pub live_state_swap_audits: Gauge,
+    /// Audits where our accumulated liquidity disagreed with the swap's
+    /// absolute value. This is the residual, measured continuously instead of
+    /// waiting for the sampled validator to happen upon it.
+    pub live_state_swap_audit_mismatches: Gauge,
+    /// Audits that actually had accumulated Mint/Burn to test. The ONLY valid
+    /// denominator for an arithmetic error bound -- `live_state_swap_audits`
+    /// includes consecutive swaps that compare a value against itself.
+    pub live_state_swap_audits_accumulated: Gauge,
+    /// Logs dropped because an anchor had already carried the pool past them.
+    /// Expected traffic; a spike means anchoring is running too far ahead of
+    /// the log stream.
+    pub live_state_superseded: Counter,
     /// Reorgs and out-of-order logs. Frequent breaks invalidate the
     /// lossless-dirty-set argument.
     pub continuity_breaks: Counter,
     /// Signed divergence of log-derived state from a fresh RPC read, by venue.
     pub live_state_divergence_bps: HistogramVec,
     /// Validation attempts by outcome: measured, unreachable, unsettled,
+    /// not_independent,
     /// skipped_lag, no_ordinal. `unsettled` means the snapshot's block may still
     /// receive more logs, so comparing it against end-of-block chain state
-    /// would manufacture a divergence.
+    /// would manufacture a divergence. `not_independent` means the snapshot IS
+    /// an RPC read, so measuring it would compare an `eth_call` against the
+    /// `eth_call` it came from and pass by construction.
     pub live_state_checks: CounterVec,
     pub live_state_trusted: Gauge,
     /// MEASURED AND FAILED only. Not "everything that is not trusted" — an
@@ -200,6 +231,62 @@ impl Metrics {
             .register(Box::new(ingestion_ws_events.clone()))
             .context("register ingestion_ws_events_total counter")?;
 
+        let live_state_lost_updates = Gauge::with_opts(Opts::new(
+            "live_state_lost_updates",
+            "Anchors that found at least one delta lost to the anchor window",
+        ))?;
+        registry
+            .register(Box::new(live_state_lost_updates.clone()))
+            .context("register live_state_lost_updates gauge")?;
+
+        let live_state_replayed_deltas = Gauge::with_opts(Opts::new(
+            "live_state_replayed_deltas",
+            "Deltas replayed after an anchor closed its read window",
+        ))?;
+        registry
+            .register(Box::new(live_state_replayed_deltas.clone()))
+            .context("register live_state_replayed_deltas gauge")?;
+
+        let live_state_swap_audits = Gauge::with_opts(Opts::new(
+            "live_state_swap_audits",
+            "Swaps usable as an audit of accumulated liquidity",
+        ))?;
+        registry
+            .register(Box::new(live_state_swap_audits.clone()))
+            .context("register live_state_swap_audits gauge")?;
+
+        let live_state_swap_audit_mismatches = Gauge::with_opts(Opts::new(
+            "live_state_swap_audit_mismatches",
+            "Audits where accumulated liquidity disagreed with the swap",
+        ))?;
+        registry
+            .register(Box::new(live_state_swap_audit_mismatches.clone()))
+            .context("register live_state_swap_audit_mismatches gauge")?;
+
+        let live_state_swap_audits_accumulated = Gauge::with_opts(Opts::new(
+            "live_state_swap_audits_accumulated",
+            "Audits with accumulated Mint/Burn to test; the valid error-bound denominator",
+        ))?;
+        registry
+            .register(Box::new(live_state_swap_audits_accumulated.clone()))
+            .context("register live_state_swap_audits_accumulated gauge")?;
+
+        let live_state_anchors = Counter::with_opts(Opts::new(
+            "live_state_anchors_total",
+            "Pools anchored from a block-pinned RPC read",
+        ))?;
+        registry
+            .register(Box::new(live_state_anchors.clone()))
+            .context("register live_state_anchors_total counter")?;
+
+        let live_state_superseded = Counter::with_opts(Opts::new(
+            "live_state_superseded_total",
+            "Logs dropped because an anchor already covered their block",
+        ))?;
+        registry
+            .register(Box::new(live_state_superseded.clone()))
+            .context("register live_state_superseded_total counter")?;
+
         let ingestion_resubscribes_avoided = Counter::with_opts(Opts::new(
             "ingestion_resubscribes_avoided_total",
             "Pool-list refreshes that needed no new subscription",
@@ -210,7 +297,7 @@ impl Metrics {
 
         let live_state_untrusted_base = Counter::with_opts(Opts::new(
             "live_state_untrusted_base_total",
-            "Liquidity deltas dropped because the base snapshot was invalidated by a gap",
+            "Liquidity deltas DEFERRED for replay because the base was invalidated by a gap",
         ))?;
         registry
             .register(Box::new(live_state_untrusted_base.clone()))
@@ -664,6 +751,13 @@ impl Metrics {
             ingestion_ws_events,
             ingestion_ws_stalls,
             live_state_untrusted_base,
+            live_state_superseded,
+            live_state_anchors,
+            live_state_lost_updates,
+            live_state_replayed_deltas,
+            live_state_swap_audits,
+            live_state_swap_audit_mismatches,
+            live_state_swap_audits_accumulated,
             ingestion_resubscribes_avoided,
             live_state_applied,
             live_state_undecodable,

@@ -45,14 +45,21 @@ pub(crate) fn validatable<F>(
     pools: Vec<Address>,
     head: u64,
     settled_through: u64,
-    ordinal_of: F,
+    position_of: F,
 ) -> Vec<Address>
 where
-    F: Fn(Address) -> Option<crate::continuity::Ordinal>,
+    F: Fn(Address) -> Option<crate::validation_select::SnapshotPosition>,
 {
     pools
         .into_iter()
-        .filter(|p| matches!(select(ordinal_of(*p), head, settled_through), SelectOutcome::Check { .. }))
+        .filter(|p| {
+            position_of(*p).is_some_and(|pos| {
+                matches!(
+                    select(pos, head, settled_through),
+                    SelectOutcome::Check { .. }
+                )
+            })
+        })
         .collect()
 }
 
@@ -130,16 +137,31 @@ where
     };
 
     let v2_candidates = validatable(live.tracked_v2(), head, settled, |p| {
-        live.v2_snapshot(p).and_then(|s| s.prov.ordinal)
+        live.v2_snapshot(p)
+            .map(|s| crate::validation_select::SnapshotPosition {
+                ordinal: s.prov.ordinal,
+                source: s.prov.source,
+            })
     });
     for pool in gate.due_for_check(v2_candidates) {
         let Some(snap) = live.v2_snapshot(pool) else {
             continue;
         };
-        let block = match select(snap.prov.ordinal, head, settled) {
+        let block = match select(
+            crate::validation_select::SnapshotPosition {
+                ordinal: snap.prov.ordinal,
+                source: snap.prov.source,
+            },
+            head,
+            settled,
+        ) {
             SelectOutcome::Check { block } => block,
             SelectOutcome::NoOrdinal => {
                 count("no_ordinal");
+                continue;
+            }
+            SelectOutcome::NotIndependent => {
+                count("not_independent");
                 continue;
             }
             SelectOutcome::Unsettled => {
@@ -174,16 +196,31 @@ where
     }
 
     let cl_candidates = validatable(live.tracked_cl(), head, settled, |p| {
-        live.cl_snapshot(p).and_then(|s| s.prov.ordinal)
+        live.cl_snapshot(p)
+            .map(|s| crate::validation_select::SnapshotPosition {
+                ordinal: s.prov.ordinal,
+                source: s.prov.source,
+            })
     });
     for pool in gate.due_for_check(cl_candidates) {
         let Some(snap) = live.cl_snapshot(pool) else {
             continue;
         };
-        let block = match select(snap.prov.ordinal, head, settled) {
+        let block = match select(
+            crate::validation_select::SnapshotPosition {
+                ordinal: snap.prov.ordinal,
+                source: snap.prov.source,
+            },
+            head,
+            settled,
+        ) {
             SelectOutcome::Check { block } => block,
             SelectOutcome::NoOrdinal => {
                 count("no_ordinal");
+                continue;
+            }
+            SelectOutcome::NotIndependent => {
+                count("not_independent");
                 continue;
             }
             SelectOutcome::Unsettled => {
@@ -217,6 +254,12 @@ where
 
     if let Some(m) = metrics {
         let st = gate.stats();
+        m.live_state_lost_updates.set(live.lost_updates() as f64);
+        m.live_state_replayed_deltas.set(live.replayed_deltas() as f64);
+        let (audits, mismatches, accumulated) = live.swap_audit_counts();
+        m.live_state_swap_audits.set(audits as f64);
+        m.live_state_swap_audit_mismatches.set(mismatches as f64);
+        m.live_state_swap_audits_accumulated.set(accumulated as f64);
         m.live_state_trusted.set(st.trusted as f64);
         // FAILED only. An expired pass is not evidence of anything wrong.
         m.live_state_untrusted.set(st.failed as f64);
@@ -290,29 +333,72 @@ mod tests {
     /// `due_for_check` picks by TTL alone, so a pool whose snapshot has aged
     /// past the lag budget is still "due" — it consumes a slot every pass and
     /// is then discarded by `select`. Measured live: 58 of every 61 outcomes
+    /// A log-derived snapshot at `block`. Provenance only matters to the
+    /// anchor tests; everything else here is about ordering and age.
+    fn logged_at(block: u64) -> crate::validation_select::SnapshotPosition {
+        crate::validation_select::SnapshotPosition {
+            ordinal: Some(crate::continuity::Ordinal {
+                block,
+                tx_index: 0,
+                log_index: 0,
+            }),
+            source: crate::live_state::SnapshotSource::Swap,
+        }
+    }
+
     /// were skips, i.e. the slots were ~10% productive. Filter first.
     #[test]
     fn only_validatable_pools_are_offered_for_checking() {
-        use crate::continuity::Ordinal;
         let head = 10_000u64;
         let fresh = ethers::types::Address::from_low_u64_be(1);
         let stale = ethers::types::Address::from_low_u64_be(2);
         let anchored = ethers::types::Address::from_low_u64_be(3);
 
-        let ordinal_of = |p: ethers::types::Address| {
+        // An anchor now CARRIES an ordinal — it is excluded by its source, not
+        // by lacking a position. Modelling it as `None` would no longer test
+        // anything real.
+        let position_of = |p: ethers::types::Address| {
             if p == fresh {
-                Some(Ordinal { block: head - 10, tx_index: 0, log_index: 0 })
+                Some(logged_at(head - 10))
             } else if p == stale {
-                Some(Ordinal { block: head - 5_000, tx_index: 0, log_index: 0 })
+                Some(logged_at(head - 5_000))
             } else {
-                None
+                Some(crate::validation_select::SnapshotPosition {
+                    ordinal: Some(crate::continuity::Ordinal::end_of_block(head - 10)),
+                    source: crate::live_state::SnapshotSource::Anchor,
+                })
             }
         };
 
         // settled_through = head+1: every snapshot's block is settled here, so the
-        // filter is exercising staleness alone.
-        let out = validatable(vec![fresh, stale, anchored], head, head + 1, ordinal_of);
+        // filter is exercising staleness and provenance, not settledness.
+        let out = validatable(vec![fresh, stale, anchored], head, head + 1, position_of);
         assert_eq!(out, vec![fresh], "stale and anchored pools must not take slots");
+    }
+
+    /// The exclusion has to hold in the pre-filter too. `validatable` and
+    /// `validate_once` are two doors into the same decision, and a rule
+    /// enforced at only one of them is the shape of bug this repo has shipped
+    /// before.
+    #[test]
+    fn validatable_drops_anchored_pools() {
+        let anchored = ethers::types::Address::from_low_u64_be(1);
+        let logged = ethers::types::Address::from_low_u64_be(2);
+        let head = 1_000u64;
+        let position_of = |p: ethers::types::Address| {
+            if p == anchored {
+                Some(crate::validation_select::SnapshotPosition {
+                    ordinal: Some(crate::continuity::Ordinal::end_of_block(900)),
+                    source: crate::live_state::SnapshotSource::Anchor,
+                })
+            } else {
+                Some(logged_at(900))
+            }
+        };
+        assert_eq!(
+            validatable(vec![anchored, logged], head, head, position_of),
+            vec![logged]
+        );
     }
 
     /// A snapshot whose block is not yet settled must not take a slot: it could
@@ -320,10 +406,9 @@ mod tests {
     /// manufactures a divergence that is not there.
     #[test]
     fn validatable_excludes_unsettled_snapshots() {
-        use crate::continuity::Ordinal;
         let head = 10_000u64;
         let pool = ethers::types::Address::from_low_u64_be(1);
-        let at_head = |_p| Some(Ordinal { block: head, tx_index: 0, log_index: 0 });
+        let at_head = |_p| Some(logged_at(head));
 
         assert!(
             validatable(vec![pool], head, head, at_head).is_empty(),
@@ -338,12 +423,9 @@ mod tests {
 
     #[test]
     fn validatable_keeps_everything_when_all_snapshots_are_fresh() {
-        use crate::continuity::Ordinal;
         let head = 10_000u64;
         let pools: Vec<_> = (1..=5).map(ethers::types::Address::from_low_u64_be).collect();
-        let out = validatable(pools.clone(), head, head + 1, |_| {
-            Some(Ordinal { block: head, tx_index: 0, log_index: 0 })
-        });
+        let out = validatable(pools.clone(), head, head + 1, |_| Some(logged_at(head)));
         assert_eq!(out, pools);
     }
 

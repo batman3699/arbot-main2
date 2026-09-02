@@ -5,6 +5,20 @@
 //! market movement and calls it decoder divergence.
 
 use crate::continuity::Ordinal;
+use crate::live_state::SnapshotSource;
+
+/// Everything validation needs to decide whether a snapshot is checkable.
+///
+/// A struct rather than loose arguments so `select` CANNOT be called without a
+/// source. The source is what separates an independent measurement from a
+/// circular one, and a call site that omits it fails silently by passing —
+/// this repo has already shipped one bug of exactly that shape, a fix applied
+/// at one construction site and missed at the refresh path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotPosition {
+    pub ordinal: Option<Ordinal>,
+    pub source: SnapshotSource,
+}
 
 /// How far back a snapshot may be and still be validated.
 ///
@@ -18,6 +32,10 @@ pub enum SelectOutcome {
     Check { block: u64 },
     /// Anchored snapshot: came from RPC, nothing to compare.
     NoOrdinal,
+    /// The snapshot IS an RPC read. Comparing it against `eth_call` compares
+    /// that read with itself, so it says nothing about decoder correctness and
+    /// inflates the measured pass rate.
+    NotIndependent,
     /// The snapshot's block may still receive more logs for this pool, so the
     /// snapshot could be a MID-block state. Comparing it against `eth_call`,
     /// which returns END-of-block state, would compare different instants.
@@ -38,8 +56,14 @@ pub enum SelectOutcome {
 /// A snapshot at block N is comparable only once that exceeds N: the cursor
 /// guarantees ordering, so seeing block N+1 means every block-N log was
 /// delivered and our snapshot is the end-of-block state for that pool.
-pub fn select(ordinal: Option<Ordinal>, head_block: u64, settled_through: u64) -> SelectOutcome {
-    let Some(o) = ordinal else {
+pub fn select(pos: SnapshotPosition, head_block: u64, settled_through: u64) -> SelectOutcome {
+    // First, ahead of every other exclusion: an anchor is not evidence about
+    // our own arithmetic, whatever its block or age. Ordering this after the
+    // lag check would attribute anchor traffic to staleness in the metric.
+    if matches!(pos.source, SnapshotSource::Anchor) {
+        return SelectOutcome::NotIndependent;
+    }
+    let Some(o) = pos.ordinal else {
         return SelectOutcome::NoOrdinal;
     };
     // Checked before the lag budget so an unsettled snapshot is never
@@ -69,13 +93,77 @@ mod tests {
         })
     }
 
+    /// Existing contracts here are about ordering and age, not provenance, so
+    /// they run through a log source. Only the anchor tests vary it.
+    fn logged(ordinal: Option<Ordinal>) -> SnapshotPosition {
+        SnapshotPosition {
+            ordinal,
+            source: SnapshotSource::Swap,
+        }
+    }
+
+    fn pos(block: u64, source: SnapshotSource) -> SnapshotPosition {
+        SnapshotPosition {
+            ordinal: Some(Ordinal {
+                block,
+                tx_index: 0,
+                log_index: 0,
+            }),
+            source,
+        }
+    }
+
+    /// An anchored snapshot IS an `eth_call` result. Validating it compares an
+    /// `eth_call` against the `eth_call` it came from: it passes every time, by
+    /// construction, and drives the observed divergence rate toward zero
+    /// regardless of whether decoding works. Two conclusions in this project
+    /// have already been produced by artefacts of exactly this shape.
+    #[test]
+    fn an_anchored_snapshot_is_never_measured() {
+        assert_eq!(
+            select(pos(1_000, SnapshotSource::Anchor), 1_050, 1_049),
+            SelectOutcome::NotIndependent
+        );
+    }
+
+    /// Independence is checked FIRST. An anchor that is also unsettled or too
+    /// old must still report why it is really excluded, or the metric will
+    /// attribute anchor traffic to lag.
+    #[test]
+    fn independence_outranks_every_other_exclusion() {
+        assert_eq!(
+            select(pos(1_050, SnapshotSource::Anchor), 1_050, 1_050),
+            SelectOutcome::NotIndependent
+        );
+        assert_eq!(
+            select(pos(1, SnapshotSource::Anchor), 100_000, 99_999),
+            SelectOutcome::NotIndependent
+        );
+    }
+
+    /// Log-derived snapshots are unaffected, including one built on an anchored
+    /// base — that is still the Mint/Burn arithmetic under test.
+    #[test]
+    fn log_derived_snapshots_are_still_measured() {
+        for source in [
+            SnapshotSource::Swap,
+            SnapshotSource::Liquidity,
+            SnapshotSource::Sync,
+        ] {
+            assert_eq!(
+                select(pos(1_000, source), 1_050, 1_049),
+                SelectOutcome::Check { block: 1_000 }
+            );
+        }
+    }
+
     /// The read MUST be pinned to the snapshot's own block. Comparing against
     /// `latest` measures how much the pool moved since, not whether the
     /// decoder is right.
     #[test]
     fn selects_the_snapshots_own_block_not_the_head() {
         assert_eq!(
-            select(ord(1_000), 1_050, 1_050),
+            select(logged(ord(1_000)), 1_050, 1_050),
             SelectOutcome::Check { block: 1_000 }
         );
     }
@@ -86,9 +174,9 @@ mod tests {
     /// state. It becomes comparable one block later.
     #[test]
     fn a_snapshot_at_the_settled_frontier_waits_one_block() {
-        assert_eq!(select(ord(1_050), 1_050, 1_050), SelectOutcome::Unsettled);
+        assert_eq!(select(logged(ord(1_050)), 1_050, 1_050), SelectOutcome::Unsettled);
         assert_eq!(
-            select(ord(1_050), 1_051, 1_051),
+            select(logged(ord(1_050)), 1_051, 1_051),
             SelectOutcome::Check { block: 1_050 }
         );
     }
@@ -110,13 +198,13 @@ mod tests {
     fn a_snapshot_in_an_unsettled_block_is_not_comparable() {
         // settled_through == the snapshot's own block: more logs from that
         // block may still arrive.
-        assert_eq!(select(ord(1_000), 1_050, 1_000), SelectOutcome::Unsettled);
+        assert_eq!(select(logged(ord(1_000)), 1_050, 1_000), SelectOutcome::Unsettled);
     }
 
     #[test]
     fn a_snapshot_becomes_comparable_once_a_later_block_is_applied() {
         assert_eq!(
-            select(ord(1_000), 1_050, 1_001),
+            select(logged(ord(1_000)), 1_050, 1_001),
             SelectOutcome::Check { block: 1_000 }
         );
     }
@@ -124,7 +212,7 @@ mod tests {
     /// Fails closed at startup: nothing applied yet means nothing is settled.
     #[test]
     fn nothing_is_settled_before_any_log_is_applied() {
-        assert_eq!(select(ord(1_000), 1_050, 0), SelectOutcome::Unsettled);
+        assert_eq!(select(logged(ord(1_000)), 1_050, 0), SelectOutcome::Unsettled);
     }
 
     /// Settledness is checked BEFORE the lag budget, so an unsettled snapshot
@@ -133,12 +221,12 @@ mod tests {
     fn unsettled_outranks_too_old() {
         let head = 10_000;
         let old = head - MAX_VALIDATION_LAG_BLOCKS - 1;
-        assert_eq!(select(ord(old), head, old), SelectOutcome::Unsettled);
+        assert_eq!(select(logged(ord(old)), head, old), SelectOutcome::Unsettled);
     }
 
     #[test]
     fn a_snapshot_without_an_ordinal_is_not_checkable() {
-        assert_eq!(select(None, 1_050, 1_050), SelectOutcome::NoOrdinal);
+        assert_eq!(select(logged(None), 1_050, 1_050), SelectOutcome::NoOrdinal);
     }
 
     /// Reading far-back state needs deep archive. Decline rather than depend
@@ -148,7 +236,7 @@ mod tests {
         let head = 10_000;
         let old = head - MAX_VALIDATION_LAG_BLOCKS - 1;
         assert_eq!(
-            select(ord(old), head, head),
+            select(logged(ord(old)), head, head),
             SelectOutcome::TooOld {
                 lag: MAX_VALIDATION_LAG_BLOCKS + 1
             }
@@ -159,7 +247,7 @@ mod tests {
     fn a_snapshot_exactly_at_the_lag_budget_is_still_checked() {
         let head = 10_000;
         let edge = head - MAX_VALIDATION_LAG_BLOCKS;
-        assert_eq!(select(ord(edge), head, head), SelectOutcome::Check { block: edge });
+        assert_eq!(select(logged(ord(edge)), head, head), SelectOutcome::Check { block: edge });
     }
 
     /// A snapshot ahead of our notion of the head is not an error — heads and
@@ -167,6 +255,6 @@ mod tests {
     /// which is a "come back later", not a rejection.
     #[test]
     fn a_snapshot_ahead_of_the_head_is_unsettled_not_rejected() {
-        assert_eq!(select(ord(1_051), 1_050, 1_050), SelectOutcome::Unsettled);
+        assert_eq!(select(logged(ord(1_051)), 1_050, 1_050), SelectOutcome::Unsettled);
     }
 }

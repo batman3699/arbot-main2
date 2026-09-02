@@ -160,3 +160,512 @@ suspect masking before celebrating.
   into provenance, but nothing reads it. Either give it a consumer — lineage
   attribution in the reconciliation record would be the obvious one — or drop
   it rather than carry a third never-wired field.
+
+## 7. Field result, 2026-09-01 — the design has a lost-update window
+
+Run: `CHAOS_WS_GAP_SECS=60`, 17m14s, 16 forced gaps, 538 reconciliations.
+
+| metric | predicted | measured | |
+|---|---|---|---|
+| `live_state_anchors_total` | > 0 | 10788 | met |
+| `live_state_untrusted_base_total` | far below 5194 | **472** | met — an 11x fall |
+| `live_state_superseded_total` | small, non-zero | 128 | met — anchors do race logs |
+| records with `source=Anchor` | 0 | **0** | met — §3.3 holds |
+| Liquidity divergence | unchanged | **6/153 (3.92%)** vs 1/69 (1.45%) | **MISSED** |
+
+The exclusion, the ordering and the coverage recovery all work. The divergence
+rate does not: it went UP, and rising divergence was flagged in §4 as the
+signal to stop and look rather than celebrate.
+
+### The mechanism
+
+An anchor read is not instantaneous. Between reading state at block N and
+installing it, in-flight logs for blocks > N arrive for that pool. The pool is
+still `Unknown` at that moment, so a Mint/Burn is dropped as `UntrustedBase` —
+and the anchor, being end-of-block-N state, does not contain it either. The
+event is lost from both paths. Subsequent deltas then build on a base that is
+short by exactly that event.
+
+Every observable matches:
+
+- all six divergences are `Liquidity`-sourced, `Derived`, with `anchor_id > 0`,
+  so all descend from an anchor;
+- `sqrt_price_x96` and `tick` are exact in all six — the anchor is authoritative
+  for those, and only the accumulated `liquidity` is wrong;
+- five are LOW (a missed Mint) and one is HIGH (+2262 bps, a missed Burn), which
+  is the symmetry a lost-update window predicts and a decoder bug would not;
+- all six land 10–55s after a forced gap, inside the re-anchoring window;
+- the rate rose while dropped deltas fell 11x, so this is not merely
+  pre-existing error becoming visible — that would leave the rate flat.
+
+A Swap during the window is harmless: it writes absolutely, restores trust, and
+the anchor guard then refuses the now-older read. Only Mint/Burn-only pools lose
+events.
+
+### Not proven
+
+The mechanism is inferred from provenance, sign symmetry and timing, not
+observed directly. The decisive test is to log the pool and block of every
+`UntrustedBase` drop and check that a divergent pool had one for a block > N
+between its anchor's read and install.
+
+### Options
+
+1. **Buffer, don't drop.** Queue Mint/Burn for a pool with an anchor in flight
+   and replay after it installs. Correct, and the most machinery.
+2. **Re-anchor pools that dropped a delta during their window.** Track the drop,
+   re-anchor next cycle. Converges, cheap, leaves a transient wrong state.
+3. **Anchor only quiescent pools** — no dropped delta since the last cycle.
+   Slowest recovery, no wrong state.
+4. **Accept it in production.** The window scales with anchor rate, and this run
+   anchored 10788 times in 17 minutes because forced gaps invalidate everything
+   every 60s. After `c706157` real gaps are rare, so real anchor volume is a
+   fraction of this. Needs measuring, not assuming.
+
+Do not enable local pricing on anchored lineage until this is resolved: the
+divergent snapshots reported `Derived`, so `may_price_locally` would have said
+yes to state that was wrong by up to 5559 bps.
+
+## 8. Probe result, 2026-09-01 — mechanism real, conclusion retracted
+
+Instrumented run: `CHAOS_WS_GAP_SECS=60`, 19m05s, 18 forced gaps, 11946
+anchors, 540 reconciliations.
+
+### The window is real
+
+**8 lost updates confirmed, and every single one at
+`dropped_block == anchor_block + 1`.** That is the window's exact signature: a
+delta arriving one block after the read, refused for want of a trusted base,
+and absent from the anchor because the anchor is end-of-block-N state. Not
+inference any more — a count, with the arithmetic to explain each one.
+
+### It does not explain the divergence
+
+8 events against 11946 anchors is 0.07%. This run produced **one** divergent
+record, on a pool that had **no** lost update. So the window exists, is rare,
+and was not the cause of what §7 attributed to it.
+
+### §7's conclusion is retracted
+
+| run | code | Liquidity divergence |
+|---|---|---|
+| r9 | pre-anchor | 1/69 (1.45%) |
+| r10 | anchor | 6/153 (3.92%) |
+| r11 | anchor + probe | **1/178 (0.56%)** |
+
+Pre-anchor against both anchor runs pooled: 7/331 vs 1/69, Fisher p = 0.586.
+**There is no established increase in divergence from anchoring.** §7 read a
+step change out of one noisy sample.
+
+The sharpest evidence is r10 against r11, which differ in no behavioural
+respect: Fisher p = **0.040**. Two runs of effectively identical code separate
+at p < 0.05 on this measure. That is the calibration to keep: at these sample
+sizes a p-value cannot distinguish a code change from run-to-run variance, so
+single-run comparisons must not be treated as findings. This is the third time
+in this project a conclusion has been drawn from one sample and then failed to
+reproduce.
+
+### Where that leaves the anchor path
+
+- Coverage recovery works: `untrusted_base` drops fell from 5194 to ~435.
+- Ordering works: 39 superseded, 0 anchored snapshots measured.
+- The lost-update window is real but marginal at 0.07% of anchors. Option 2
+  (re-anchor pools that dropped a delta above their anchor block) is now cheap
+  to implement, because `note_anchor_window` already detects exactly that case.
+- The residual ~0.5-1% Liquidity divergence is unchanged by any of this work and
+  remains unexplained. It predates anchoring: the same residual appeared as
+  1/224 in run 5, before any of it existed.
+
+Local pricing on anchored lineage is no longer blocked by §7's finding, but the
+unexplained residual is its own gate and has not moved.
+
+## 9. Going after the residual, 2026-09-01 — the arithmetic is exonerated
+
+The residual had been chased across five runs at roughly one observation per
+178 validations, which is why it was never characterised: the sampled validator
+is too slow an instrument for a sub-1% effect.
+
+`audit_against_swap` replaces sampling with a census. A CL `Swap` carries
+ABSOLUTE in-range liquidity, so when the tick has not moved it is a free,
+exact check on everything the Mint/Burn path accumulated since the last
+absolute write. No RPC, no sampling, and exact equality rather than a bps
+threshold.
+
+Run: 22m24s, no forced gaps.
+
+| | |
+|---|---|
+| swap audits | **3664** |
+| audit mismatches | **0** |
+| validator reconciliations | 751 |
+| validator divergences | 0 |
+| `live_state_untrusted_base_total` | 0 |
+| `live_state_lost_updates` | 0 |
+
+**The Mint/Burn arithmetic is correct.** By the rule of three, 0 mismatches in
+3664 trials bounds the true error rate below **0.082%** at 95% confidence —
+roughly six times below the LOW end of the 0.5–3.9% residual the validator has
+reported. Whatever the residual is, it is very unlikely to be the accumulation
+arithmetic, and a lost Mint/Burn log would also have shown here.
+
+### What this does not settle
+
+The residual did not occur at all in this run, so it has not been caught by the
+new instrument — only made catchable. The audit is also blind to a pool that
+diverges and never afterwards receives a tick-unchanged swap.
+
+What it does give is discrimination. If the residual recurs while
+`live_state_swap_audit_mismatches` stays 0, the fault is in the comparison or
+the validator, not in local state — which inverts where to look, and is exactly
+the question five runs of sampling could not answer.
+
+### Incidental: anchoring bootstraps pools that never trade
+
+636 anchors with zero continuity breaks. These are pools with no snapshot at
+all: previously a pool that emitted no event never entered `LiveState`, because
+a delta with no base returns `NotStateBearing`. The anchor path now gives them a
+base. That is a coverage gain independent of gap recovery, and it was not a
+stated goal of the design.
+
+## 10. The residual, characterised — 2026-09-01
+
+A 30-minute run (the first to exceed 25 minutes) plus the swap audit finally
+produced a characterisation. Two of my hypotheses died on the way.
+
+### Established
+
+- **Every pool that has ever diverged is an Aerodrome Slipstream GAUGE pool.**
+  8 of 8, against a base rate of 140/414 = 33.8% of validated pools.
+  p = 1.7e-4. This is the strongest signal in the whole investigation.
+- **The Mint/Burn arithmetic is correct.** 4224 swap audits across two runs,
+  1 mismatch. `ours == liquidity()` EXACTLY in 5 of 6 observations of the pool
+  that did diverge.
+- **Gauge pools do carry a second bucket.** `stakedLiquidity()` on the
+  divergent pool returned 11797183206753424888 against `liquidity()`'s
+  12431930927139055136 — nearly half the pool.
+- **The 25-minute socket rotation works.** Connected 06:13:54, rotated
+  06:38:54.585967, reconnected 1.9s later, `ingestion_ws_stalls_total` = 0.
+  BlockPI never got to close it.
+
+### Refuted, both mine
+
+- **"We track total liquidity; the validator reads unstaked."** No. In 5 of 6
+  observations `ours == liquidity()` exactly, so our value tracks the unstaked
+  figure and the validator's reference is right.
+- **"There is an undecoded event type on gauge pools."** No. `eth_getLogs` over
+  the window returned only Mint, Burn and Collect. Nothing arrives that we fail
+  to recognise.
+
+### What the log replay actually shows
+
+The divergent pool runs an **auto-compounding position**: a burn and re-mint of
+~1.0007e19 every one to two blocks, each cycle slightly larger as fees compound.
+Blocks 50727005-50727016 contain 10 in-range Mint/Burn events, and the position
+is roughly 80% of the pool's unstaked liquidity.
+
+Our excess at block 50727016 was 10007271035074632970. The final Burn in that
+block, which has no matching Mint, was 10007339507485756762 — the same value to
+within 0.0007%. Our snapshot behaved as though that last Burn had not been
+applied.
+
+### Where that points
+
+Not at staking. At **event density**. A gauge pool hosting an auto-compounder
+gets ~10 in-range position events per block, each worth ~80% of pool liquidity,
+so any residual mid-block or ordering effect is both far more likely to occur
+and enormously amplified when it does. That reframes the gauge correlation:
+gauge pools are not special because of `stakedLiquidity`, but because they are
+where the auto-compounders live.
+
+The 0.0007% shortfall against a clean "we missed exactly that Burn" is not
+explained and matters — an exact miss would be exact.
+
+### Next
+
+Replay this pool from a known anchor across the full lineage, event by event,
+and find the first transition where our value parts from `liquidity()`. The
+tooling now exists: `BASE_RPC_URLS` works, and both detectors agree on which
+pool and block to examine.
+
+**Note on the RPC:** `BASE_RPC_URLS` was never misconfigured. BlockPI returns
+403 to requests carrying Python's default `urllib` User-Agent; the endpoint and
+key are fine, and the bot has used them all along. An earlier claim in this
+project that the key had been rotated was wrong.
+
+## 11. Lineage replay — the algorithm is correct, the live path is not
+
+Replayed pool `0xbe00ff35af70` from ground truth at block 50726990
+(`liquidity()` + `slot0()`), applying every Mint, Burn and Swap in stream order
+with the same rules the live decoder uses, and compared against `liquidity()` at
+every block.
+
+**23 of 23 blocks reconstruct chain liquidity EXACTLY**, straight through the
+window where the live system diverged — including block 50727016 itself, and
+through swings from 50.7e18 to 53.8e18 to 37.8e18 to 16.1e18 to 12.4e18 to
+22.4e18 and back to 12.4e18.
+
+So the decoders, the half-open in-range rule `[lower, upper)`, the int24 sign
+extension, the Mint/Burn word offsets and the Swap absolute-write are all
+correct. **The divergence is not arithmetic and never was.**
+
+### Where the live value actually came from
+
+| | |
+|---|---|
+| chain at 50727013 (replay == chain) | 12431930927139055136 |
+| chain Mint in block 50727014 | 10007336648694251113 |
+| chain at 50727014 | 22439267575833306249 |
+| **what the live system held**, stamped block 50727016 | **22439201962213688106** |
+| delta the live system actually applied | 10007271035074632970 |
+
+The live system applied a delta of 10007271035074632970 onto the correct base.
+That value **matches no Mint anywhere in the window** — the six Mints present
+are 10007330450692602954, 10007331623130153497, 10007333298317981031,
+10007334973506013570, 10007336648694251113 and 10007339507485756762.
+
+So it is **not** a missed event, and **not** a stale block: it is a different
+number, 65613619618143 below the Mint the chain applied. A missed event would
+leave the base untouched; a stale block would match some earlier block exactly.
+Neither happened.
+
+The auto-compounder grows its position by roughly 1.2e12 per cycle, and the
+shortfall is ~55 cycles of that growth — suggestive, not conclusive.
+
+### What this rules in and out
+
+- OUT: decoder, in-range test, arithmetic, missed log, stale-block snapshot.
+- IN: something in the LIVE path produced a delta that the chain never emitted.
+  The candidates are a stale `existing.liquidity` read under concurrency (the
+  Mint/Burn path does read-modify-write on a `DashMap` entry without holding a
+  per-pool lock across the read and the insert), or a lost update to a
+  concurrent writer.
+
+That last one is worth stating plainly: `apply_log` clones the existing snapshot,
+computes `existing.liquidity + delta`, and inserts. Two deltas for the same pool
+applied concurrently can both read the same base and the second can overwrite
+the first — a classic lost update. The loom model proved the DIRTY SET is
+lossless; it never covered the snapshot read-modify-write. On a pool receiving
+~10 in-range position events per block, this is exactly where it would show, and
+it would produce a value that matches no single event — which is what we see.
+
+### Next
+
+Extend the loom model to two concurrent `apply_log` calls on the SAME pool and
+assert the final liquidity equals the sum of both deltas. If it fails, the
+residual is a concurrency bug in the delta path and has nothing to do with
+gauges, staking, or Slipstream at all — those pools simply have the event
+density to expose it.
+
+## 12. The pre-anchor path was single-writer — confirmed
+
+The race in section 11 is real and fixed, but it cannot explain the residual it
+was found while hunting. Checked at `81bf4df`, the last commit before the anchor
+path:
+
+**Static.** The only mutators of `LiveState` snapshots are `apply_log`,
+`anchor_cl` and `anchor_v2`. Outside `live_state.rs`, the only callers anywhere
+in the tree are in `ingestion.rs`: `apply_log` from `handle_log`, and
+`break_continuity` from `note_ws_gap`. `main.rs`, `state_validation.rs` and
+`state_gate.rs` call none of them. `anchor_cl`/`anchor_v2` had no callers at
+all — the dead-code finding that started this work.
+
+Both live callers sit inside `run_ws`, which `PoolMonitor::spawn` starts
+exactly once, and `main.rs` constructs exactly one `PoolMonitor`. `handle_log`
+is awaited sequentially inside that task's loop. `break_continuity` writes no
+snapshot — it bumps an epoch and resets the cursor.
+
+So there was **one writer, on one task, applying logs in stream order**.
+
+**Empirical.** Two concurrent `apply_log` calls would race the global cursor,
+and the loser's lower ordinal would be reported as `OutOfOrder`, breaking
+continuity loudly. Across all eight recorded runs:
+`OutOfOrder`/`Reorg` breaks = **0**. Consistent with a single ordered writer,
+and inconsistent with concurrent log application.
+
+### Consequence
+
+The concurrency line is closed for the historical residual. Run 5's 1/224 had no
+second writer to race. Section 11's bug was introduced by the anchor path in
+this session, and its scope is the anchor path alone.
+
+The residual therefore remains open, with the following now ruled out: decoder,
+half-open in-range rule, int24 sign extension, Mint/Burn word offsets, Swap
+absolute-write, arithmetic (23/23 replay, 4224 audits), missed log, stale-block
+snapshot, undecoded event type, staked-liquidity accounting, and concurrency.
+
+What survives: it is specific to gauge pools hosting auto-compounders (8/8,
+p = 1.7e-4), it is rare, it self-heals on the next Swap, and the live system
+once applied a delta matching no event the chain emitted. The last of those is
+the sharpest remaining clue and is not yet explained.
+
+## 13. Field run 31m36s — and a much sharper constraint on the residual
+
+Binary as of `f18afcf` (so budget 16, no V2 anchoring — both landed after this
+run started).
+
+| | |
+|---|---|
+| socket rotation | fired at 09:43:55.919, **25m00.001s** after connect; reconnect 2.0s |
+| `ingestion_ws_stalls_total` | 0 — the provider close was pre-empted again |
+| validator reconciliations | 973, **0 divergent** across Liquidity/Swap/Sync |
+| swap audits | 5240, **2 mismatches** |
+| `live_state_replayed_deltas` | 0 |
+| `live_state_lost_updates` | 0 |
+
+The rotation is now confirmed twice, to the millisecond.
+
+### The audit found what the validator could not
+
+973 validations found nothing. 5240 audits found two. That is the instrument
+paying for itself: five times the sample rate, exact equality rather than a bps
+threshold, and it surfaces signal in a run the validator calls perfectly clean.
+Both flagged pools — `0x70acdf2ad0bf` and `0x3fe04a59ebd3` — are in the 8/8
+gauge set, so the venue concentration now stands at 8/8 across two detectors.
+
+### `blocks_since=0` — the sharpest constraint yet
+
+| time | pool | bps | blocks_since | since_source |
+|---|---|---|---|---|
+| 09:28:05 | 0x70acdf2ad0bf | **-2900** | **0** | Liquidity |
+| 09:44:29 | 0x3fe04a59ebd3 | +27 | 1 | Liquidity |
+
+The first mismatch happened with `blocks_since = 0`: the previous absolute write
+and the disagreeing swap are **in the same block**, with the tick unchanged
+throughout.
+
+That rules out every cross-block explanation still standing — websocket gaps,
+anchors, the rotation, settledness, delivery order across blocks. Whatever this
+is, it happens **inside a single block**, between two events we both received
+and applied.
+
+With the tick unchanged, in-range liquidity can only move via a Mint or Burn.
+So either an in-range position event occurred within that block that we did not
+apply, or the swap's `liquidity` field does not mean what the decoder assumes at
+that instant. Both are testable against the block's own logs, and the earlier
+lineage replay reconstructs blocks exactly — so the next step is to replay
+*within* the block rather than across blocks.
+
+### Replay path still unexercised
+
+`live_state_replayed_deltas` = 0, but that is expected rather than suspicious:
+one gap in 31 minutes, against a measured rate of ~0.44 lost updates per gap
+under forced conditions. Exercising it needs `CHAOS_WS_GAP_SECS`, not a longer
+natural run.
+
+## 14. Intra-block replay — the fault is delivery, and the design predicted it
+
+Replayed pool `0x70acdf2ad0bf` event by event through blocks 50732766-50732772,
+the window containing the -2900 bps audit mismatch, starting from `liquidity()`
+and `slot0()` at 50732765.
+
+The window holds exactly one Swap, at block 50732769 log index 429. At that
+Swap:
+
+```
+ourL = 497075495346543070
+evL  = 497075495346543070      agree = True
+```
+
+**Replaying the chain's own event stream reproduces the Swap's liquidity
+exactly. The live system did not.** Swaps where a tick-preserving audit would
+have fired, replaying from chain data: **0**.
+
+So the chain data is consistent with our rules, and the live system's state at
+that instant was not what the event stream implies. The fault is in the LIVE
+path's handling of the stream — not the decoder, not the in-range rule, not the
+arithmetic, all of which the replay exercises identically.
+
+### Which brings it back to something already written down
+
+`continuity.rs` opens with this:
+
+> Detects duplicates, backwards movement and reorgs. It deliberately does NOT
+> detect MISSING logs: the subscription is filtered, so consecutive `log_index`
+> values are not expected and a gap carries no information. A dropped log is
+> caught downstream by `state_gate` divergence, not here.
+
+A missed delivery is the one fault the cursor is documented as unable to see,
+and the sign and magnitude fit: the live value was HIGH by ~29%, and not having
+applied the in-range Burn at log index 115 would read -3002 bps against an
+observed -2900. Same sign, same order. Not exact, so not proof of that
+particular event.
+
+### The gauge concentration probably needs no venue explanation
+
+If loss is per-event with some small probability, a pool emitting ten in-range
+position events per block loses roughly ten times as often as one emitting one —
+and on an auto-compounder each event is a large fraction of pool liquidity, so a
+loss is both more likely and far more visible. The 8/8 gauge concentration then
+follows from event VOLUME, not from `stakedLiquidity`, gauge semantics, or
+anything Slipstream-specific. That is a simpler explanation than any venue
+mechanism and it fits every observation.
+
+Testable: gauge pools should account for a share of applied events far above
+their 33.8% share of validated pools.
+
+### Status
+
+The residual is a delivery fault the design anticipated and routed to a
+downstream detector. `audit_against_swap` is that detector, working — it caught
+what 973 validations missed. What remains is to confirm loss directly, which
+means logging enough per-event provenance to compare our applied sequence
+against `eth_getLogs` for the same block, rather than inferring from the
+aggregate.
+
+## 15. The residual is confirmed log loss — with the missing events named
+
+40-minute chaos run (`CHAOS_WS_GAP_SECS=60`, 39 forced gaps), with the
+provenance dump enabled. The dump did exactly what it was built for.
+
+### The replay fix, measured
+
+| | pre-fix (19min, 18 gaps) | now (40min, 39 gaps) |
+|---|---|---|
+| lost updates | 8 | **1** |
+| deltas rescued by replay | 0 (feature absent) | **206** across 64 anchors |
+| loss rate per gap | 0.444 | **0.026** — a 17x reduction |
+
+The replay path fired in the field for the first time.
+
+### The residual, resolved
+
+Audit mismatch on pool `0x6c561b44...`, dump showing `applied_count=1`,
+`applied=50735233:46:241=+0`. Reconstructing from chain logs:
+
+```
+SWAP  50735201     L = 30514808821339110725
+Mint  50735205       +889000024081024   ticks[-198900,-197700)  in range
+                   = 30515697821363191749  == OURS, to the unit
+Burn  50735220:166   -469782971221337   ticks[-198420,-198060)  IN RANGE
+Burn  50735220:171   -175391105569075   ticks[-198420,-198300)  out of range
+Mint  50735220:178   +469783456747593   ticks[-198420,-198060)  IN RANGE
+Mint  50735220:180   +175545911012367   ticks[-198420,-198300)  out of range
+        in-range net = +485526256
+SWAP  50735237     L = 30515697821848718005
+        chain - ours = +485526256        EXACT MATCH
+```
+
+Our value is right to the unit for every event we received. The block-50735220
+burn/remint pair nets exactly the drift, and we never applied it. The pool was
+`Derived` throughout — the audit skips untrusted bases, so it could not have
+fired otherwise — which rules out the gap, buffering and anchor paths.
+
+**Four events were emitted by the chain and never delivered to us.** That is
+websocket log loss, the one fault `continuity.rs` states it cannot detect and
+deliberately routes to a downstream detector. `audit_against_swap` is that
+detector, and the provenance dump is what turned "delivery fault, inferred" into
+named events with matching arithmetic.
+
+It also explains the gauge concentration without any venue mechanism: loss is
+per-event, so a pool emitting ten in-range events per block loses ten times as
+often, and on an auto-compounder each event is large enough to see.
+
+### Consequence
+
+This is a property of the feed, not a defect in our code. The design already
+anticipated it. What it changes is the question: not "how do we fix the
+arithmetic" — the arithmetic is exact — but "what divergence rate is tolerable,
+and should the audit force a re-anchor when it fires?" A pool with a detected
+mismatch is knowably wrong and cheap to correct, since `audit_against_swap`
+already runs on the write path and the Swap it fires on restores the value
+absolutely a moment later.

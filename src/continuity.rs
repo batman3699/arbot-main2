@@ -19,6 +19,23 @@ pub struct Ordinal {
     pub log_index: u64,
 }
 
+impl Ordinal {
+    /// Position of end-of-block state, as returned by an `eth_call` pinned to
+    /// `block`.
+    ///
+    /// Saturating tx_index and log_index puts this above every log in that
+    /// block under `derive(Ord)`, which is not a trick: end-of-block state
+    /// genuinely comes after all of them. It is what lets an RPC read be
+    /// ordered against the log stream instead of sitting outside it.
+    pub fn end_of_block(block: u64) -> Self {
+        Ordinal {
+            block,
+            tx_index: u64::MAX,
+            log_index: u64::MAX,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BreakReason {
     OutOfOrder,
@@ -86,6 +103,24 @@ mod tests {
             tx_index: t,
             log_index: l,
         }
+    }
+
+    /// An `eth_call` pinned to block N returns state as of the END of N, so its
+    /// position is above every log in that block. This is what makes an RPC
+    /// read and the log stream comparable at all.
+    #[test]
+    fn an_anchor_sorts_after_every_log_in_its_block() {
+        let anchor = Ordinal::end_of_block(100);
+        for (t, l) in [(0u64, 0u64), (5, 3), (u64::MAX - 1, u64::MAX)] {
+            assert!(
+                ord(100, t, l) < anchor,
+                "a log at tx {t} log {l} must precede end-of-block state"
+            );
+        }
+        assert!(
+            anchor < ord(101, 0, 0),
+            "but the next block's first log must still come after"
+        );
     }
 
     #[test]
