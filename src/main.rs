@@ -9223,10 +9223,35 @@ where
         }
         apply_gas_parameters(&mut call.tx, gas);
         let tx = call.tx.clone();
-        // ===== TEMPORARY DEBUG INSTRUMENTATION — REMOVE BEFORE COMMIT =====
-        // Gated on ARBOT_DUMP_CALLDATA=1. Appends the exact startV2 calldata
-        // (plus to/from/block) for every simulated candidate so the frame that
-        // reverts with InvalidGenericAction() can be decoded offline.
+        // Calldata capture for offline replay. Off unless ARBOT_DUMP_CALLDATA=1.
+        //
+        // NOT temporary, despite what this comment said for several commits.
+        // The candidate log records only `failed` with no reason, so replaying
+        // a captured frame is the only way to get a real revert string, and
+        // HANDOFF.md section 3 -- "Replay a failing plan to get the REAL revert
+        // reason", which calls itself the first step of every diagnosis -- is
+        // built directly on this file.
+        //
+        // The bug it was originally written for is closed, and it closed BOTH
+        // mechanisms behind `InvalidGenericAction()` using these frames:
+        //   - a transposed Slipstream router selector, 0xc04b8d70 for
+        //     0xc04b8d59, which reverts with empty data (see plan.rs; pinned
+        //     now by `slipstream_step_targets_the_routers_real_exact_input`);
+        //   - an out-of-gas that also returns empty data and so reads as a plan
+        //     defect rather than a budget -- ops/inputs.yaml records "verified
+        //     by replaying captured calldata at block 50222943: 450k/3M ->
+        //     0xf19db938, 4M+ -> the real router error".
+        // Both are fixed. The capture outlived them because it is not specific
+        // to either: it is how any revert gets diagnosed here.
+        //
+        // Delete it when the candidate log carries real revert reasons itself,
+        // which is what would make the replay round trip unnecessary. Until
+        // then HANDOFF.md's shadow recipe sets the flag and expects the file.
+        //
+        // Writes are best-effort and silent: a diagnostic must not be able to
+        // fail a simulation. The cost is that a bad path or a full disk yields
+        // an empty file and no explanation, so confirm the file has grown
+        // before concluding a run produced no frames.
         if std::env::var("ARBOT_DUMP_CALLDATA").ok().as_deref() == Some("1") {
             let path = std::env::var("ARBOT_DUMP_CALLDATA_PATH")
                 .unwrap_or_else(|_| "/tmp/arbot_failing_calldata.jsonl".to_string());
@@ -9275,7 +9300,7 @@ where
                 let _ = f.write_all(line.as_bytes());
             }
         }
-        // ===== END TEMPORARY DEBUG INSTRUMENTATION =====
+        // ===== end calldata capture =====
         let client = self.executor.client();
         let executor_address = self.executor.address();
 
