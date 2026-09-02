@@ -631,6 +631,42 @@ pub enum HopSelect {
     FirstMatch,
 }
 
+/// Everything a hop needs to be priced and chosen.
+///
+/// Bundled because these must agree across a whole cycle: pricing one hop at
+/// the margin and its neighbour at size, or valuing hops against price maps
+/// from two different scans, produces a number describing no market.
+#[derive(Clone, Copy)]
+pub struct PricingCtx<'a> {
+    pub fresh: Freshness,
+    pub select: HopSelect,
+    pub prices: Option<&'a TokenPrices>,
+    /// Native-denominated probe size for impact-aware pricing. `0.0` prices at
+    /// the margin, which is the old behaviour and is what made a pool holding
+    /// forty dollars look identical to one holding four million.
+    pub ref_native: f64,
+}
+
+impl PricingCtx<'_> {
+    /// The probe size in raw units of `token`, or `0.0` when it has no price.
+    ///
+    /// Falling back to the margin rather than guessing a size: a made-up
+    /// notional would produce a made-up impact, and an unpriced token is
+    /// exactly the case where that error would be largest.
+    fn reference_in(&self, token: Address) -> f64 {
+        if self.ref_native <= 0.0 {
+            return 0.0;
+        }
+        match self.prices.and_then(|p| p.get(&token)).copied() {
+            Some(px) if px.is_finite() && px > 0.0 => {
+                let r = self.ref_native / px;
+                if r.is_finite() && r > 0.0 { r } else { 0.0 }
+            }
+            _ => 0.0,
+        }
+    }
+}
+
 /// Freshness bound for local pricing: refuse any pool unchecked for longer.
 #[derive(Debug, Clone, Copy)]
 pub struct Freshness {
@@ -653,67 +689,56 @@ pub fn rate_from_live(
     pool_tokens: &dashmap::DashMap<Address, PoolMeta>,
     from: Address,
     to: Address,
-    fresh: Freshness,
+    ctx: PricingCtx<'_>,
 ) -> Option<(f64, f64)> {
-    rate_from_live_with(
-        live,
-        candidate_pools,
-        pool_tokens,
-        from,
-        to,
-        fresh,
-        HopSelect::BestNet,
-    )
-}
-
-pub fn rate_from_live_with(
-    live: &LiveState,
-    candidate_pools: &[Address],
-    pool_tokens: &dashmap::DashMap<Address, PoolMeta>,
-    from: Address,
-    to: Address,
-    fresh: Freshness,
-    select: HopSelect,
-) -> Option<(f64, f64)> {
-    hop_quote_from_live(live, candidate_pools, pool_tokens, from, to, fresh, select)
+    hop_quote_from_live(live, candidate_pools, pool_tokens, from, to, ctx)
         .map(|q| (q.num, q.den))
 }
 
-/// As `rate_from_live_with`, keeping the depth behind the chosen pool.
-#[allow(clippy::too_many_arguments)]
+/// Choose the pool that serves this hop best, and keep the depth behind it.
+///
+/// The choice is made on the rate AT `ctx.ref_native` OF SIZE, not at the
+/// margin. That is the whole point. A marginal rate says nothing about how much
+/// a pool can absorb, so maximising it picks whichever pool is most mispriced --
+/// reliably the thinnest, because thin pools stay mispriced precisely because
+/// nobody bothers to correct them. Measured 2026-09-03: choosing on marginal
+/// rate accounted for 80.6% of all reported gross, a median 48 bps of pure
+/// selection artefact on the same cycle.
+///
+/// At a real size the same comparison penalises thin pools on its own: as the
+/// probe approaches a pool's input reserve the effective rate collapses. No
+/// separate depth heuristic is needed, and none is used -- depth still only
+/// BOUNDS the cycle afterwards.
+///
+/// With `ref_native = 0`, or for a token with no price, this degrades exactly
+/// to the old marginal behaviour rather than to a guess.
 pub fn hop_quote_from_live(
     live: &LiveState,
     candidate_pools: &[Address],
     pool_tokens: &dashmap::DashMap<Address, PoolMeta>,
     from: Address,
     to: Address,
-    fresh: Freshness,
-    select: HopSelect,
+    ctx: PricingCtx<'_>,
 ) -> Option<HopQuote> {
+    let reference_in = ctx.reference_in(from);
     let mut best: Option<HopQuote> = None;
     let mut best_rate = f64::NEG_INFINITY;
     for pool in candidate_pools {
         let Some(meta) = pool_tokens.get(pool) else {
             continue;
         };
-        if !fresh.allows(meta.confirmed_at) {
+        if !ctx.fresh.allows(meta.confirmed_at) {
             continue;
         }
-        let Some(q) = hop_rate(live, *pool, &meta, from, to) else {
+        let Some(q) = hop_rate(live, *pool, &meta, from, to, reference_in) else {
             continue;
         };
-        if select == HopSelect::FirstMatch {
+        if ctx.select == HopSelect::FirstMatch {
             return Some(q);
         }
         let rate = q.num / q.den;
         // `>` not `>=`: on a tie the first pool wins, which keeps the result
         // independent of the order `pools_for_hop` happens to return.
-        //
-        // Note this still maximises RATE, not value. Depth does not choose the
-        // pool; it bounds the cycle afterwards. Rate-blind pool choice is a
-        // deliberate limit -- picking the deepest pool per hop would trade away
-        // the edge, and picking on value needs a numeraire this function does
-        // not have. The bound is what stops a dust pool topping the ranking.
         if rate.is_finite() && rate > best_rate {
             best_rate = rate;
             best = Some(q);
@@ -732,6 +757,7 @@ fn hop_rate(
     meta: &PoolMeta,
     from: Address,
     to: Address,
+    reference_in: f64,
 ) -> Option<HopQuote> {
     use crate::live_state::may_price_locally;
     let (token0, token1) = (meta.token0, meta.token1);
@@ -756,11 +782,24 @@ fn hop_rate(
                 return None;
             }
             let sp = u256_to_f64(snap.sqrt_price_x96)?;
-            let ratio = sp / 2f64.powi(96);
-            let price = ratio * ratio; // token1 per token0
-            if !price.is_finite() || price <= 0.0 {
+            let root = sp / 2f64.powi(96);
+            if !root.is_finite() || root <= 0.0 {
                 return None;
             }
+            // VIRTUAL reserves, and only for impact. `x = L/sqrt(P)`,
+            // `y = L*sqrt(P)` describe the constant-product curve the pool is
+            // tangent to, which is the correct local model for how far a swap
+            // moves the price INSIDE the current tick. They are the wrong thing
+            // entirely for capacity -- they run 0..infinity and overstate real
+            // holdings by 16-56x -- so capacity still comes from `balances`
+            // below, and the two must not be confused.
+            let l = f64::from_bits(0) + snap.liquidity as f64;
+            if !l.is_finite() || l <= 0.0 {
+                return None;
+            }
+            let (v0, v1) = (l / root, l * root);
+            let (r_in, r_out) = if forward { (v0, v1) } else { (v1, v0) };
+            let (num, den) = effective_rate(r_in, r_out, keep, reference_in)?;
             // Unknown balances bound nothing: `INFINITY` lets another hop
             // bind the cycle, and `price_cycle_sized` refuses a cycle no hop
             // bounds at all rather than calling it infinitely large.
@@ -771,7 +810,6 @@ fn hop_rate(
                 }
                 None => f64::INFINITY,
             };
-            let (num, den) = if forward { (price * keep, 1.0) } else { (keep, price) };
             Some(HopQuote { num, den, cap_out })
         }
         PoolKind::ConstantProduct => {
@@ -797,11 +835,11 @@ fn hop_rate(
             if !(r0.is_finite() && r1.is_finite()) || r0 <= 0.0 || r1 <= 0.0 {
                 return None;
             }
+            let (r_in, r_out) = if forward { (r0, r1) } else { (r1, r0) };
+            let (num, den) = effective_rate(r_in, r_out, keep, reference_in)?;
             // A V2 pool's reserves are its holdings, so the output side is
             // the bound directly -- and it is live, not rotation-stale.
-            let cap_out = if forward { r1 } else { r0 };
-            let (num, den) = if forward { (r1 * keep, r0) } else { (r0 * keep, r1) };
-            Some(HopQuote { num, den, cap_out })
+            Some(HopQuote { num, den, cap_out: r_out })
         }
         // `r1/r0` is not this curve's marginal price. Applying it to a stable
         // pool produced a 163% phantom edge in the 2026-09-01 spread census,
@@ -810,6 +848,31 @@ fn hop_rate(
         // pricing it wrongly costs money.
         PoolKind::StableSwap => None,
     }
+}
+
+/// Output per unit input for a constant-product hop of size `reference_in`.
+///
+/// `out = r_out * (x*keep) / (r_in + x*keep)`, so the rate is
+/// `r_out*keep / (r_in + x*keep)`. At `x = 0` this is the marginal rate and the
+/// impact term vanishes, which is what makes a zero reference size mean
+/// "price at the margin" rather than "price wrong".
+///
+/// This is the whole fix for pool CHOICE. A marginal rate says nothing about
+/// how much a pool can absorb, so maximising it picks whichever pool is most
+/// mispriced -- reliably the thinnest one, because thin pools are mispriced
+/// precisely because nobody bothers to correct them. At a real size the same
+/// comparison penalises thin pools automatically: as `x` approaches `r_in` the
+/// effective rate collapses toward zero.
+fn effective_rate(r_in: f64, r_out: f64, keep: f64, reference_in: f64) -> Option<(f64, f64)> {
+    if !(r_in.is_finite() && r_out.is_finite()) || r_in <= 0.0 || r_out <= 0.0 {
+        return None;
+    }
+    let x = if reference_in.is_finite() && reference_in > 0.0 { reference_in } else { 0.0 };
+    let den = r_in + x * keep;
+    if !den.is_finite() || den <= 0.0 {
+        return None;
+    }
+    Some((r_out * keep, den))
 }
 
 /// Simulate one call against preconfirmed state.
@@ -1797,6 +1860,17 @@ impl BaseFastPath {
                 "base fast path cost stack (ASSUMED, not measured -- gas is a \
                  fixed cost and its bps share depends on notional)"
             );
+            // Probe size for impact-aware pool choice, in wei of native.
+            // Choosing on the MARGINAL rate accounted for 80.6% of reported
+            // gross on 2026-09-03; choosing on the rate at a real size is what
+            // removes that. Zero restores the marginal behaviour exactly.
+            let ref_native = crate::util::env_parse_opt::<f64>("ARBOT_BASE_FAST_REF_NATIVE")
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(1e17); // 0.1 native
+            info!(
+                ref_native,
+                "base fast path prices hops at this probe size, not at the margin"
+            );
             let mut tick = interval(cadence);
             tick.tick().await; // immediate first tick; discard
             let mut drains: u64 = 0;
@@ -1833,6 +1907,12 @@ impl BaseFastPath {
                 let priced_at = Instant::now();
                 let fresh = self.freshness();
                 let px = prices.lock().ok().and_then(|g| g.clone());
+                let ctx = PricingCtx {
+                    fresh,
+                    select: HopSelect::BestNet,
+                    prices: px.as_deref(),
+                    ref_native,
+                };
                 let (priced, unpriceable, basis) = price_touched(
                     &idx,
                     &out.cycles,
@@ -1843,8 +1923,7 @@ impl BaseFastPath {
                             &self.pool_tokens,
                             from,
                             to,
-                            fresh,
-                            HopSelect::BestNet,
+                            ctx,
                         )
                     },
                     px.as_deref(),
@@ -1862,14 +1941,16 @@ impl BaseFastPath {
                     .and_then(|c| idx.cycle(c.id))
                     .and_then(|c| {
                         price_cycle(&c.tokens, |from, to| {
-                            rate_from_live_with(
+                            rate_from_live(
                                 &self.live,
                                 universe.pools_for_hop(from, to),
                                 &self.pool_tokens,
                                 from,
                                 to,
-                                fresh,
-                                HopSelect::FirstMatch,
+                                // Same context, ONE field different. Any gap
+                                // between the two numbers is the selection rule
+                                // and nothing else.
+                                PricingCtx { select: HopSelect::FirstMatch, ..ctx },
                             )
                         })
                     })
@@ -1938,6 +2019,7 @@ impl BaseFastPath {
                     unpriceable,
                     best_gross_bps = best,
                     rank_basis = ?basis,
+                    ref_native,
                     best_notional_in = priced.first().map(|c| c.notional_in).unwrap_or(f64::NAN),
                     best_profit_native = priced
                         .first()
@@ -2164,6 +2246,14 @@ mod tests {
     /// the TTL set their own.
     fn fresh() -> Freshness {
         Freshness { now: Instant::now(), ttl: Duration::from_secs(3600) }
+    }
+
+    /// The MARGINAL context: `ref_native` of zero. Most tests are about
+    /// direction, fees or trust, and pricing those at size would fold impact
+    /// into every expected value for no benefit. Tests about pool CHOICE set a
+    /// real probe size, because that is the thing they are testing.
+    fn marginal() -> PricingCtx<'static> {
+        PricingCtx { fresh: fresh(), select: HopSelect::BestNet, prices: None, ref_native: 0.0 }
     }
 
     fn addr(n: u64) -> Address {
@@ -2609,10 +2699,10 @@ mod tests {
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]);
 
-        let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).expect("forward");
+        let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1, marginal()).expect("forward");
         assert!((n / d - 4.0).abs() < 1e-9, "t0->t1 must be 4.0, got {}", n / d);
 
-        let (n, d) = rate_from_live(&live, &[pool], &tokens, t1, t0, fresh()).expect("reverse");
+        let (n, d) = rate_from_live(&live, &[pool], &tokens, t1, t0, marginal()).expect("reverse");
         assert!((n / d - 0.25).abs() < 1e-9, "t1->t0 must be 0.25, got {}", n / d);
     }
 
@@ -2630,8 +2720,8 @@ mod tests {
             // fee is held out rather than folded into every expected value.
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]);
-        let (a, b) = rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).unwrap();
-        let (c, d) = rate_from_live(&live, &[pool], &tokens, t1, t0, fresh()).unwrap();
+        let (a, b) = rate_from_live(&live, &[pool], &tokens, t0, t1, marginal()).unwrap();
+        let (c, d) = rate_from_live(&live, &[pool], &tokens, t1, t0, marginal()).unwrap();
         let round = (a / b) * (c / d);
         assert!((round - 1.0).abs() < 1e-9, "round trip must be 1.0, got {round}");
     }
@@ -2650,11 +2740,11 @@ mod tests {
             // fee is held out rather than folded into every expected value.
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]);
-        assert!(rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).is_some());
+        assert!(rate_from_live(&live, &[pool], &tokens, t0, t1, marginal()).is_some());
 
         live.break_continuity(UnknownReason::WsUnavailable);
         assert!(
-            rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).is_none(),
+            rate_from_live(&live, &[pool], &tokens, t0, t1, marginal()).is_none(),
             "invalidated state must not be priced from"
         );
     }
@@ -2673,8 +2763,8 @@ mod tests {
             // fee is held out rather than folded into every expected value.
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]);
-        assert!(rate_from_live(&live, &[pool], &tokens, t0, addr(99), fresh()).is_none());
-        assert!(rate_from_live(&live, &[], &tokens, t0, t1, fresh()).is_none());
+        assert!(rate_from_live(&live, &[pool], &tokens, t0, addr(99), marginal()).is_none());
+        assert!(rate_from_live(&live, &[], &tokens, t0, t1, marginal()).is_none());
     }
 
     /// `as_u128` would truncate a sqrtPriceX96 silently and yield a plausible
@@ -2700,7 +2790,7 @@ mod tests {
             pool,
             PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]);
-        let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).expect("priced");
+        let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1, marginal()).expect("priced");
         let r = n / d;
         assert!(
             (r - 3.988).abs() < 1e-6,
@@ -2727,7 +2817,7 @@ mod tests {
         ]);
         let bps = price_cycle(&[t0, t1], |f, t| {
             let pools = if f == t0 { [p1] } else { [p2] };
-            rate_from_live(&live, &pools, &tokens, f, t, fresh())
+            rate_from_live(&live, &pools, &tokens, f, t, marginal())
         })
         .expect("priceable");
         assert!(
@@ -3004,10 +3094,10 @@ mod tests {
             });
         }
 
-        let (n, d) = rate_from_live(&live, &[cheap, rich], &meta, t0, t1, fresh()).expect("priced");
+        let (n, d) = rate_from_live(&live, &[cheap, rich], &meta, t0, t1, marginal()).expect("priced");
         assert!((n / d - 1.5).abs() < 1e-9, "got {}", n / d);
         // ...and it must not depend on which order the pools arrive in.
-        let (n2, d2) = rate_from_live(&live, &[rich, cheap], &meta, t0, t1, fresh()).expect("priced");
+        let (n2, d2) = rate_from_live(&live, &[rich, cheap], &meta, t0, t1, marginal()).expect("priced");
         assert!((n2 / d2 - n / d).abs() < 1e-12, "order changed the route");
     }
 
@@ -3036,7 +3126,7 @@ mod tests {
         meta.insert(cheap, PoolMeta {
             token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None,
         });
-        let (n, d) = rate_from_live(&live, &[expensive, cheap], &meta, t0, t1, fresh()).expect("priced");
+        let (n, d) = rate_from_live(&live, &[expensive, cheap], &meta, t0, t1, marginal()).expect("priced");
         // 1.10 * 0.90 = 0.99 < 1.05, so the cheap pool wins on NET.
         assert!((n / d - 1.05).abs() < 1e-9, "fees were not charged before ranking: {}", n / d);
     }
@@ -3058,7 +3148,7 @@ mod tests {
         meta.insert(pool, PoolMeta {
             token0: t0, token1: t1, fee_ppm: 100, kind: PoolKind::StableSwap, verified: true, confirmed_at: Some(Instant::now()), balances: None,
         });
-        assert!(rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).is_none());
+        assert!(rate_from_live(&live, &[pool], &meta, t0, t1, marginal()).is_none());
     }
 
     /// A pool whose snapshot is untrusted must not shadow a healthy pool
@@ -3080,7 +3170,7 @@ mod tests {
             });
         }
         // `dark` has no snapshot at all.
-        let (n, d) = rate_from_live(&live, &[dark, good], &meta, t0, t1, fresh()).expect("priced");
+        let (n, d) = rate_from_live(&live, &[dark, good], &meta, t0, t1, marginal()).expect("priced");
         assert!((n / d - 1.2).abs() < 1e-9);
     }
 
@@ -3137,7 +3227,7 @@ mod tests {
             token0: t1, token1: t0,
             reserve0: U256::from(1_000u64), reserve1: U256::from(4_000u64),
         }));
-        let (n, d) = rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).expect("priced");
+        let (n, d) = rate_from_live(&live, &[pool], &meta, t0, t1, marginal()).expect("priced");
         assert!(
             (n / d - 0.25).abs() < 1e-9,
             "config ordering was trusted: got {}, the reciprocal is 4.0",
@@ -3176,12 +3266,12 @@ mod tests {
                        kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()), balances: None },
         )]);
         assert!(
-            rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).is_none(),
+            rate_from_live(&live, &[pool], &meta, t0, t1, marginal()).is_none(),
             "an unconfirmed pair must be refused, not guessed"
         );
         // The seed confirms it, and the same state prices.
         assert!(!adopt_chain_pair(&meta, pool, t0, t1));
-        let (n, d) = rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).expect("priced once verified");
+        let (n, d) = rate_from_live(&live, &[pool], &meta, t0, t1, marginal()).expect("priced once verified");
         assert!((n / d - 4.0).abs() < 1e-9, "got {}", n / d);
     }
 
@@ -3231,7 +3321,7 @@ mod tests {
         seeded_v2(&live, pool, t0, t1);
         live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
         let meta = dashmap::DashMap::from_iter([(pool, cp_meta(t0, t1, None))]);
-        assert!(rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).is_none());
+        assert!(rate_from_live(&live, &[pool], &meta, t0, t1, marginal()).is_none());
     }
 
     /// The backstop. A pool checked long enough ago stops being priced, because
@@ -3251,12 +3341,12 @@ mod tests {
 
         let inside = Freshness { now, ttl: Duration::from_secs(600) };
         assert!(
-            rate_from_live(&live, &[pool], &meta, t0, t1, inside).is_some(),
+            rate_from_live(&live, &[pool], &meta, t0, t1, PricingCtx { fresh: inside, ..marginal() }).is_some(),
             "300s old under a 600s ttl must still price"
         );
         let outside = Freshness { now, ttl: Duration::from_secs(120) };
         assert!(
-            rate_from_live(&live, &[pool], &meta, t0, t1, outside).is_none(),
+            rate_from_live(&live, &[pool], &meta, t0, t1, PricingCtx { fresh: outside, ..marginal() }).is_none(),
             "300s old under a 120s ttl must not"
         );
     }
@@ -3304,14 +3394,10 @@ mod tests {
         ]);
         let pools = [first, better];
 
-        let (n, d) = rate_from_live_with(
-            &live, &pools, &meta, t0, t1, fresh(), HopSelect::BestNet,
-        ).expect("best");
+        let (n, d) = rate_from_live(&live, &pools, &meta, t0, t1, PricingCtx { select: HopSelect::BestNet, ..marginal() }).expect("best");
         assert!((n / d - 1.5).abs() < 1e-9, "best takes the better pool");
 
-        let (n, d) = rate_from_live_with(
-            &live, &pools, &meta, t0, t1, fresh(), HopSelect::FirstMatch,
-        ).expect("first");
+        let (n, d) = rate_from_live(&live, &pools, &meta, t0, t1, PricingCtx { select: HopSelect::FirstMatch, ..marginal() }).expect("first");
         assert!((n / d - 1.0).abs() < 1e-9, "first takes whichever came first");
     }
 
@@ -3330,7 +3416,7 @@ mod tests {
         let meta = dashmap::DashMap::from_iter([(pool, cp_meta(t0, t1, None))]);
         for rule in [HopSelect::BestNet, HopSelect::FirstMatch] {
             assert!(
-                rate_from_live_with(&live, &[pool], &meta, t0, t1, fresh(), rule).is_none(),
+                rate_from_live(&live, &[pool], &meta, t0, t1, PricingCtx { select: rule, ..marginal() }).is_none(),
                 "{rule:?} priced an unconfirmed pool"
             );
         }
@@ -3481,23 +3567,132 @@ mod tests {
                 confirmed_at: Some(Instant::now()), balances: None,
             },
         )]);
-        let q = hop_quote_from_live(
-            &live, &[pool], &meta, t0, t1, fresh(), HopSelect::BestNet,
-        )
+        let q = hop_quote_from_live(&live, &[pool], &meta, t0, t1, marginal())
         .expect("priced");
         assert!(q.cap_out.is_infinite(), "unknown depth must not be a number");
 
         // With balances, the OUTPUT side is the bound and direction matters.
         meta.get_mut(&pool).expect("present").balances = Some((7.0, 11.0));
-        let fwd = hop_quote_from_live(
-            &live, &[pool], &meta, t0, t1, fresh(), HopSelect::BestNet,
-        )
+        let fwd = hop_quote_from_live(&live, &[pool], &meta, t0, t1, marginal())
         .expect("priced");
         assert_eq!(fwd.cap_out, 11.0, "t0->t1 pays out token1");
-        let rev = hop_quote_from_live(
-            &live, &[pool], &meta, t1, t0, fresh(), HopSelect::BestNet,
-        )
+        let rev = hop_quote_from_live(&live, &[pool], &meta, t1, t0, marginal())
         .expect("priced");
         assert_eq!(rev.cap_out, 7.0, "t1->t0 pays out token0");
+    }
+
+    // ---- pool choice at size ----
+
+    /// The fix, stated as a test. Two pools on the same pair: a thin one at a
+    /// better MARGINAL price, and a deep one. At the margin the thin pool wins
+    /// and the trade is a fiction. At a real size it loses, because its price
+    /// moves under the trade and the deep pool's does not.
+    #[test]
+    fn at_a_real_size_the_deep_pool_wins_the_hop() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (thin, deep) = (addr(10), addr(11));
+        let live = LiveState::new();
+        // thin: 1000 in / 1100 out  -> marginal 1.10, and tiny
+        assert!(live.anchor_v2(thin, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(1_000u64), reserve1: U256::from(1_100u64),
+        }));
+        // deep: 10^9 in / 1.05*10^9 out -> marginal 1.05, and enormous
+        assert!(live.anchor_v2(deep, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(1_000_000_000u64), reserve1: U256::from(1_050_000_000u64),
+        }));
+        let meta = dashmap::DashMap::from_iter([
+            (thin, cp_meta(t0, t1, Some(Instant::now()))),
+            (deep, cp_meta(t0, t1, Some(Instant::now()))),
+        ]);
+        let pools = [thin, deep];
+
+        // At the margin the thin pool's 1.10 beats the deep pool's 1.05.
+        let (n, d) = rate_from_live(&live, &pools, &meta, t0, t1, marginal()).expect("marginal");
+        assert!((n / d - 1.10).abs() < 1e-9, "marginal choice takes the thin pool: {}", n / d);
+
+        // Priced at 500 units -- half the thin pool's entire input reserve --
+        // the thin pool's effective rate collapses and the deep one wins.
+        let prices = std::collections::HashMap::from([(t0, 1.0f64)]);
+        let sized = PricingCtx {
+            fresh: fresh(), select: HopSelect::BestNet,
+            prices: Some(&prices), ref_native: 500.0,
+        };
+        let (n, d) = rate_from_live(&live, &pools, &meta, t0, t1, sized).expect("sized");
+        let rate = n / d;
+        assert!(
+            (rate - 1.05).abs() < 1e-3,
+            "at size the deep pool must win; got {rate}"
+        );
+    }
+
+    /// The effective rate has to reduce to the marginal one as size goes to
+    /// zero, or a zero probe would silently mean something other than "price at
+    /// the margin".
+    #[test]
+    fn a_zero_probe_prices_exactly_at_the_margin() {
+        let (num, den) = effective_rate(1_000.0, 2_000.0, 1.0, 0.0).expect("rate");
+        assert!((num / den - 2.0).abs() < 1e-12);
+        // and a size big enough to matter must move it DOWN, never up
+        let (n2, d2) = effective_rate(1_000.0, 2_000.0, 1.0, 1_000.0).expect("rate");
+        assert!(n2 / d2 < num / den, "impact must reduce the rate");
+        assert!((n2 / d2 - 1.0).abs() < 1e-12, "x = r_in halves the output rate");
+    }
+
+    /// A token with no price cannot be given a probe size, and a made-up one
+    /// would produce a made-up impact on precisely the pools we know least
+    /// about. It falls back to the margin rather than to a guess.
+    #[test]
+    fn an_unpriced_token_falls_back_to_marginal_pricing() {
+        let (t0, t1) = (addr(1), addr(2));
+        let empty = std::collections::HashMap::new();
+        let ctx = PricingCtx {
+            fresh: fresh(), select: HopSelect::BestNet,
+            prices: Some(&empty), ref_native: 1e17,
+        };
+        assert_eq!(ctx.reference_in(t0), 0.0, "no price, no probe size");
+
+        let prices = std::collections::HashMap::from([(t1, 2.0f64)]);
+        let ctx = PricingCtx { prices: Some(&prices), ..ctx };
+        assert_eq!(ctx.reference_in(t1), 1e17 / 2.0, "probe size is native / price");
+        assert_eq!(ctx.reference_in(t0), 0.0);
+    }
+
+    /// A CL pool's impact comes from VIRTUAL reserves and its capacity from
+    /// REAL balances. Confusing the two is what makes a dust pool look deep:
+    /// virtual reserves overstate real holdings by 16-56x on Base.
+    #[test]
+    fn a_cl_hop_takes_impact_from_virtual_reserves_and_capacity_from_real_ones() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        // sqrtPriceX96 = 2^96 means price 1.0, so virtual reserves are (L, L).
+        assert!(live.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000_000, 0));
+        let meta = dashmap::DashMap::from_iter([(
+            pool,
+            PoolMeta {
+                token0: t0, token1: t1, fee_ppm: 0,
+                kind: PoolKind::ConcentratedLiquidity, verified: true,
+                confirmed_at: Some(Instant::now()),
+                // Real holdings are far smaller than the virtual reserves.
+                balances: Some((10.0, 20.0)),
+            },
+        )]);
+
+        let q = hop_quote_from_live(&live, &[pool], &meta, t0, t1, marginal()).expect("marginal");
+        assert!((q.num / q.den - 1.0).abs() < 1e-9, "price 1.0 at the margin");
+        assert_eq!(q.cap_out, 20.0, "capacity is the REAL token1 balance");
+
+        // A probe of 1,000,000 equals the virtual input reserve, so the
+        // effective rate must halve. Capacity is unchanged by the probe.
+        let prices = std::collections::HashMap::from([(t0, 1.0f64)]);
+        let sized = PricingCtx {
+            fresh: fresh(), select: HopSelect::BestNet,
+            prices: Some(&prices), ref_native: 1_000_000.0,
+        };
+        let q = hop_quote_from_live(&live, &[pool], &meta, t0, t1, sized).expect("sized");
+        assert!((q.num / q.den - 0.5).abs() < 1e-9, "got {}", q.num / q.den);
+        assert_eq!(q.cap_out, 20.0, "impact must not touch capacity");
     }
 }
