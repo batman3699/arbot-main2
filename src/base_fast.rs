@@ -264,6 +264,93 @@ impl BaseFastPath {
     }
 }
 
+/// A cycle priced from cached edges, before costs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PricedCycle {
+    pub id: crate::cycle_index::CycleId,
+    /// Product of the loop's rates minus one, in basis points. GROSS: no fees
+    /// beyond what the edge rates already carry, no gas, no flash fee. A
+    /// positive value is a candidate, not a profit.
+    pub gross_bps: f64,
+    pub hops: usize,
+}
+
+/// Price one token loop from cached edges.
+///
+/// `tokens` is the OPEN form the index stores — the closing hop back to
+/// `tokens[0]` is implied, and pricing it is not optional: a loop priced
+/// without its closing hop is not a cycle, it is a path, and its product means
+/// nothing.
+///
+/// Returns `None` when ANY hop has no edge. That is the §7 rule applied here:
+/// unknown state rejects rather than approximating. Substituting a default rate
+/// for a missing hop is precisely how this project manufactured phantom
+/// profits before -- a quote claiming more output than the pool held.
+pub fn price_cycle<F>(tokens: &[Address], rate_of: F) -> Option<f64>
+where
+    F: Fn(Address, Address) -> Option<(f64, f64)>,
+{
+    if tokens.len() < 2 {
+        return None;
+    }
+    let mut product = 1.0f64;
+    for i in 0..tokens.len() {
+        let from = tokens[i];
+        let to = tokens[(i + 1) % tokens.len()];
+        let (num, den) = rate_of(from, to)?;
+        if !(den > 0.0) || !num.is_finite() || !den.is_finite() {
+            return None;
+        }
+        product *= num / den;
+        if !product.is_finite() {
+            return None;
+        }
+    }
+    Some((product - 1.0) * 10_000.0)
+}
+
+/// Price the touched cycles and return the best `top_n`, most profitable first.
+///
+/// Cycles that cannot be priced are DROPPED, and the count is returned
+/// separately: a cycle silently missing from the output is indistinguishable
+/// from one that priced badly, and those need different responses -- the first
+/// is a coverage gap, the second is the market.
+pub fn price_touched<F>(
+    index: &crate::cycle_index::CycleIndex,
+    ids: &[crate::cycle_index::CycleId],
+    rate_of: F,
+    top_n: usize,
+) -> (Vec<PricedCycle>, usize)
+where
+    F: Fn(Address, Address) -> Option<(f64, f64)>,
+{
+    let mut priced = Vec::with_capacity(ids.len().min(top_n * 4));
+    let mut unpriceable = 0usize;
+    for id in ids {
+        let Some(cycle) = index.cycle(*id) else {
+            unpriceable += 1;
+            continue;
+        };
+        match price_cycle(&cycle.tokens, &rate_of) {
+            Some(gross_bps) => priced.push(PricedCycle {
+                id: *id,
+                gross_bps,
+                hops: cycle.tokens.len(),
+            }),
+            None => unpriceable += 1,
+        }
+    }
+    priced.sort_by(|a, b| {
+        b.gross_bps
+            .partial_cmp(&a.gross_bps)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            // Shorter loops break ties: less gas, fewer legs to fail.
+            .then(a.hops.cmp(&b.hops))
+    });
+    priced.truncate(top_n);
+    (priced, unpriceable)
+}
+
 /// Result of simulating a candidate against preconfirmed state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreconfSimResult {
@@ -1013,6 +1100,111 @@ mod tests {
         let r = parse_simulate_v1(&v);
         assert!(!r.success);
         assert!(r.failure.unwrap().contains("execution reverted"));
+    }
+
+    /// The closing hop is not optional. A loop priced without it is a PATH,
+    /// and its product means nothing -- 2.0 * 0.5 around a closed triangle is
+    /// break-even, but the same two hops open look like a doubling.
+    #[test]
+    fn the_closing_hop_is_priced() {
+        let (a, b) = (addr(1), addr(2));
+        // a->b doubles, b->a halves: a closed loop is exactly break-even.
+        let rate = |from: Address, _to: Address| {
+            if from == a {
+                Some((2.0, 1.0))
+            } else {
+                Some((1.0, 2.0))
+            }
+        };
+        let bps = price_cycle(&[a, b], rate).expect("priceable");
+        assert!(
+            bps.abs() < 1e-9,
+            "closed loop must be break-even, got {bps} bps -- the closing hop was skipped"
+        );
+    }
+
+    #[test]
+    fn a_profitable_loop_reports_positive_bps() {
+        let (a, b) = (addr(1), addr(2));
+        // 1% edge around the loop.
+        let rate = |from: Address, _to: Address| {
+            if from == a {
+                Some((2.02, 1.0))
+            } else {
+                Some((1.0, 2.0))
+            }
+        };
+        let bps = price_cycle(&[a, b], rate).expect("priceable");
+        assert!((bps - 100.0).abs() < 1e-6, "expected ~100 bps, got {bps}");
+    }
+
+    /// §7's rule, applied to pricing: a hop with no edge REJECTS the cycle.
+    /// Substituting a default rate is precisely how this project manufactured
+    /// phantom profits -- a quote claiming more output than the pool held.
+    #[test]
+    fn a_missing_hop_rejects_the_cycle_rather_than_assuming_a_rate() {
+        let (a, b) = (addr(1), addr(2));
+        let rate = |from: Address, _to: Address| {
+            if from == a {
+                Some((2.0, 1.0))
+            } else {
+                None // no edge back
+            }
+        };
+        assert!(
+            price_cycle(&[a, b], rate).is_none(),
+            "an unpriceable hop must reject, never approximate"
+        );
+    }
+
+    #[test]
+    fn degenerate_rates_reject_rather_than_producing_infinities() {
+        let (a, b) = (addr(1), addr(2));
+        for bad in [(1.0, 0.0), (f64::INFINITY, 1.0), (f64::NAN, 1.0)] {
+            let rate = move |_f: Address, _t: Address| Some(bad);
+            assert!(price_cycle(&[a, b], rate).is_none(), "bad rate {bad:?} must reject");
+        }
+    }
+
+    /// Unpriceable cycles are counted, not silently absent. A cycle missing
+    /// from the output is otherwise indistinguishable from one that priced
+    /// badly, and those need different responses: a coverage gap versus the
+    /// market simply not offering anything.
+    #[test]
+    fn unpriceable_cycles_are_counted_separately_from_unprofitable_ones() {
+        use crate::cycle_index::{CycleIndex, CycleIndexLimits, PoolUniverse};
+        let (t1, t2, t3) = (addr(1), addr(2), addr(3));
+        let universe = PoolUniverse::from_pools([
+            (addr(11), t1, t2),
+            (addr(12), t2, t3),
+            (addr(13), t3, t1),
+        ]);
+        let index = CycleIndex::build(&universe, &[t1], CycleIndexLimits::default());
+        let ids: Vec<_> = (0..index.len() as u32).collect();
+
+        // No rates at all: everything is unpriceable, nothing is "unprofitable".
+        let (priced, unpriceable) = price_touched(&index, &ids, |_, _| None, 8);
+        assert!(priced.is_empty());
+        assert_eq!(unpriceable, ids.len());
+    }
+
+    /// Ranking must put the most profitable first, and break ties toward
+    /// shorter loops -- fewer legs is less gas and less to go wrong.
+    #[test]
+    fn pricing_ranks_by_profit_then_prefers_shorter_loops() {
+        let a = PricedCycle { id: 0, gross_bps: 5.0, hops: 4 };
+        let b = PricedCycle { id: 1, gross_bps: 50.0, hops: 6 };
+        let c = PricedCycle { id: 2, gross_bps: 50.0, hops: 2 };
+        let mut v = vec![a, b, c];
+        v.sort_by(|x, y| {
+            y.gross_bps
+                .partial_cmp(&x.gross_bps)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(x.hops.cmp(&y.hops))
+        });
+        assert_eq!(v[0].id, 2, "same profit, shorter loop wins");
+        assert_eq!(v[1].id, 1);
+        assert_eq!(v[2].id, 0);
     }
 
     /// The feed is an enum so the documented Denim migration — native 200ms
