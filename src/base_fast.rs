@@ -298,7 +298,9 @@ where
         let from = tokens[i];
         let to = tokens[(i + 1) % tokens.len()];
         let (num, den) = rate_of(from, to)?;
-        if !(den > 0.0) || !num.is_finite() || !den.is_finite() {
+        // Explicit rather than `!(den > 0.0)`: NaN must reject, and a negated
+        // partial comparison hides that intent.
+        if !den.is_finite() || !num.is_finite() || den <= 0.0 {
             return None;
         }
         product *= num / den;
@@ -1195,7 +1197,7 @@ mod tests {
         let a = PricedCycle { id: 0, gross_bps: 5.0, hops: 4 };
         let b = PricedCycle { id: 1, gross_bps: 50.0, hops: 6 };
         let c = PricedCycle { id: 2, gross_bps: 50.0, hops: 2 };
-        let mut v = vec![a, b, c];
+        let mut v = [a, b, c];
         v.sort_by(|x, y| {
             y.gross_bps
                 .partial_cmp(&x.gross_bps)
