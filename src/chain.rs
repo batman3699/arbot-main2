@@ -178,7 +178,13 @@ fn build_chain_cfg_from_env(name: &str, config: ChainEnvConfig) -> Result<ChainC
         .ok_or_else(|| anyhow!("environment variable {} is not set", config.bal_vault_env))?,
         aave_pool: env_addr_optional(config.aave_pool_env)?,
         bal_flashloan_tokens: parse_optional_token_list(config.bal_flashloan_env)?,
-        aave_flashloan_tokens: None,
+        // See `load_chain_from_registry`: without a list Aave is never offered,
+        // because its gate is `.unwrap_or(false)` where Balancer's is
+        // `.unwrap_or(true)`. Unset keeps the provider off.
+        aave_flashloan_tokens: parse_optional_token_list(&format!(
+            "{}_AAVE_FLASHLOAN_TOKENS",
+            config.env_prefix
+        ))?,
         erc3156_flashloan_tokens: None,
         univ2_flashloan_tokens: None,
         univ3_flashloan_tokens: None,
@@ -580,6 +586,9 @@ pub fn load_chain_from_registry(
     };
 
     let validation = parse_validation_override(name, &env_prefix)?;
+    // Read before `env_prefix` is moved into the struct below.
+    let aave_flashloan_tokens =
+        parse_optional_token_list(&format!("{env_prefix}_AAVE_FLASHLOAN_TOKENS"))?;
 
     let cfg = ChainCfg {
         name: name.to_string(),
@@ -630,7 +639,19 @@ pub fn load_chain_from_registry(
                     .collect::<Result<Vec<_>>>()?,
             )
         },
-        aave_flashloan_tokens: None,
+        // Aave was UNREACHABLE while this was a hardcoded `None`.
+        // `flash_loan_quotes` gates it on `.unwrap_or(false)` -- unlike
+        // Balancer's `.unwrap_or(true)` -- so no allowlist means the provider
+        // is never offered, however well `aave_pool` is configured and probed
+        // at startup. Measured 2026-09-03: `no_flashloan_provider` was 438 of
+        // 850 prepared candidates, because only the two tokens on Base's
+        // Balancer list could fund anything at all.
+        //
+        // Still `None` unless the operator sets the list. That preserves
+        // today's behaviour exactly, and it should: enabling a provider that
+        // charges a fee and has never executed is a decision to make
+        // deliberately, not one to inherit from a default.
+        aave_flashloan_tokens,
         erc3156_flashloan_tokens: None,
         univ2_flashloan_tokens: None,
         univ3_flashloan_tokens: None,

@@ -1603,6 +1603,9 @@ fn sim_cascade_depth() -> usize {
 struct BaseFastDrain {
     fast: std::sync::Arc<crate::base_fast::BaseFastPath>,
     universe: std::sync::Arc<crate::cycle_index::PoolUniverse>,
+    /// Candidate cycle starts, BEFORE the flash-fundability filter. Filtered
+    /// once the runner exists, because only it knows the loan allowlists.
+    starts: Vec<Address>,
     max_cycles: usize,
     venues: std::sync::Arc<HashMap<Address, crate::base_fast::FastVenue>>,
 }
@@ -13002,9 +13005,6 @@ async fn launch_chain_runtime(
     // Declared out here so the drain can be spawned AFTER the runner exists:
     // it needs the runner's graph snapshot, and the monitor is built first.
     let mut base_fast_drain: Option<BaseFastDrain> = None;
-    let mut base_fast_index: Option<
-        std::sync::Arc<std::sync::Mutex<Option<crate::cycle_index::CycleIndex>>>,
-    > = None;
     let pool_monitor = {
         let poll_ms = crate::util::env_parse_opt::<u64>("POOL_MONITOR_POLL_MS")
             .unwrap_or(1_200);
@@ -13326,17 +13326,16 @@ async fn launch_chain_runtime(
                                         fast_universe.clone(),
                                     ),
                                 );
-                                let fast_index = crate::cycle_index::CycleIndex::build(
-                                    &fast_uni,
-                                    &fast_starts,
-                                    crate::cycle_index::CycleIndexLimits::default(),
-                                );
-                                info!(
-                                    cycles = fast_index.len(),
-                                    truncated = fast_index.truncated,
-                                    starts = fast_starts.len(),
-                                    "base fast path cycle index built"
-                                );
+                                // NOT built here. Cycle STARTS must be
+                                // restricted to tokens a flash loan can fund,
+                                // and that is a runner question. Skipping it is
+                                // the same defect the Bellman-Ford path had:
+                                // cycles anchored at an unfundable token are
+                                // generated, priced, routed and sized, and only
+                                // then rejected as no_flashloan_provider.
+                                // Measured 2026-09-03: 438 of 850 prepared
+                                // candidates, 52% of the sample, discarded
+                                // before any economics happened.
                                 // 32 discarded 98.2% of touched cycles: the
                                 // index is 6-hop (7,858 cycles), not the 2-hop
                                 // ~536 the cap was sized against, and it bound
@@ -13348,10 +13347,6 @@ async fn launch_chain_runtime(
                                 )
                                 .filter(|v| *v > 0)
                                 .unwrap_or(512);
-                                base_fast_index =
-                                    Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
-                                        fast_index,
-                                    ))));
                                 let mut all_venues = fast_venues.clone();
                                 all_venues.extend(v2_venues.clone());
                                 info!(
@@ -13362,6 +13357,7 @@ async fn launch_chain_runtime(
                                 base_fast_drain = Some(BaseFastDrain {
                                     fast: fast.clone(),
                                     universe: fast_uni.clone(),
+                                    starts: fast_starts.clone(),
                                     max_cycles: max_touched,
                                     venues: std::sync::Arc::new(all_venues),
                                 });
@@ -14023,8 +14019,37 @@ async fn launch_chain_runtime(
     // snapshot. Read-only: the runner is the sole writer, which is what makes
     // this safe where sharing LiveState was not -- that had two writers and one
     // global ordinal cursor, and cost 584 continuity breaks.
-    if let (Some(bf), Some(index)) = (base_fast_drain, base_fast_index) {
-        let BaseFastDrain { fast, universe: uni, max_cycles: cap, venues } = bf;
+    if let Some(bf) = base_fast_drain {
+        let BaseFastDrain { fast, universe: uni, starts, max_cycles: cap, venues } = bf;
+        // Cycles may only START where a flash loan can fund them. Without this
+        // the fast path repeats the Bellman-Ford defect: it prices, routes and
+        // sizes cycles anchored at tokens no provider will lend, and learns
+        // that only at the end. Measured 2026-09-03, that was 438 of 850
+        // prepared candidates -- 52% of the sample deleted after all the work,
+        // and before any economic question was asked.
+        let fundable: Vec<Address> = starts
+            .iter()
+            .copied()
+            .filter(|t| runner.can_flash_fund(*t))
+            .collect();
+        info!(
+            starts = starts.len(),
+            fundable = fundable.len(),
+            dropped = starts.len().saturating_sub(fundable.len()),
+            "base fast path cycle starts restricted to flash-fundable tokens"
+        );
+        let fast_index = crate::cycle_index::CycleIndex::build(
+            &uni,
+            &fundable,
+            crate::cycle_index::CycleIndexLimits::default(),
+        );
+        info!(
+            cycles = fast_index.len(),
+            truncated = fast_index.truncated,
+            starts = fundable.len(),
+            "base fast path cycle index built"
+        );
+        let index = std::sync::Arc::new(std::sync::Mutex::new(Some(fast_index)));
         // How many ranked cycles are actually SIZED per flashblock. Each one is
         // several RPC round trips and one round trip to the configured provider
         // measured 250-293ms on 2026-09-02, so this is an RPC-budget decision
