@@ -792,6 +792,18 @@ pub struct PrepReport {
     pub rejected: usize,
     /// Candidates the quote budget ran out before reaching.
     pub budgeted: usize,
+    /// Sized candidates whose executor calldata simulated successfully against
+    /// preconfirmed state.
+    pub sim_ok: usize,
+    /// Sized candidates whose simulation reverted. A real answer about a real
+    /// candidate, unlike the empty probe this replaced.
+    pub sim_failed: usize,
+    /// Simulation round-trip microseconds, summed, and the count -- so the mean
+    /// is derivable without a histogram.
+    pub sim_micros: u64,
+    pub sim_samples: u64,
+    /// Gas the successful simulations actually reported.
+    pub gas_used: u64,
     /// The scan has not published a pricing context yet, so nothing could be
     /// prepared at all. Distinct from `rejected`: one is an answer and the
     /// other is the absence of one.
@@ -1258,6 +1270,31 @@ impl BaseFastPath {
         cov
     }
 
+    /// Simulate one prepared candidate against preconfirmed state.
+    ///
+    /// `None` when no simulation endpoint is configured -- distinct from a
+    /// simulation that ran and failed, which is `Some(success: false)` with the
+    /// revert reason. Collapsing those would make a missing endpoint look like
+    /// a bad candidate.
+    pub async fn simulate_candidate(
+        &self,
+        from: Address,
+        to: Address,
+        data: &[u8],
+        max_fee_per_gas: u128,
+    ) -> Option<(PreconfSimResult, Duration)> {
+        let http = self.sim_http.as_ref()?;
+        let started = Instant::now();
+        let params = simulate_v1_params(from, to, data, max_fee_per_gas);
+        match simulate_preconf(http, params).await {
+            Ok(r) => Some((r, started.elapsed())),
+            Err(e) => {
+                warn!(error = %e, "preconf simulation transport failed");
+                None
+            }
+        }
+    }
+
     /// Start the feed. Returns immediately; the socket runs on its own task.
     ///
     /// Also starts a reporter. `FastPathStats` was collected for two runs
@@ -1303,6 +1340,10 @@ impl BaseFastPath {
             let prep_sized = Arc::new(AtomicU64::new(0));
             let prep_rejected = Arc::new(AtomicU64::new(0));
             let prep_no_context = Arc::new(AtomicU64::new(0));
+            let sim_ok = Arc::new(AtomicU64::new(0));
+            let sim_failed = Arc::new(AtomicU64::new(0));
+            let sim_micros = Arc::new(AtomicU64::new(0));
+            let sim_samples = Arc::new(AtomicU64::new(0));
             let mut prep_busy: u64 = 0;
             let mut prep_sent: u64 = 0;
             info!(
@@ -1365,15 +1406,6 @@ impl BaseFastPath {
                 );
                 let price_us = priced_at.elapsed().as_micros();
 
-                // Endpoint round-trip probe, NOT candidate verification.
-                //
-                // Verifying a candidate needs its calldata, which comes from
-                // the plan builder the fast path does not have. What this
-                // measures is the acceptance table's candidate->simulation
-                // latency against the real provider, with an empty call so the
-                // result carries no claim about any candidate. Reporting a
-                // benign call's `success` as a candidate's would be exactly the
-                // kind of number that reads as progress and means nothing.
                 // Translate the RANKED candidates -- all of them, not the ones
                 // clearing a bps bar. Reads an immutable snapshot the scan
                 // publishes, never the live graph, which the scan rebuilds
@@ -1395,10 +1427,20 @@ impl BaseFastPath {
                                     Arc::clone(&prep_rejected),
                                     Arc::clone(&prep_no_context),
                                 );
+                                let (so, sf, sm, ss) = (
+                                    Arc::clone(&sim_ok),
+                                    Arc::clone(&sim_failed),
+                                    Arc::clone(&sim_micros),
+                                    Arc::clone(&sim_samples),
+                                );
                                 tokio::spawn(async move {
                                     let r = call.await;
                                     sz.fetch_add(r.sized as u64, Ordering::Relaxed);
                                     rj.fetch_add(r.rejected as u64, Ordering::Relaxed);
+                                    so.fetch_add(r.sim_ok as u64, Ordering::Relaxed);
+                                    sf.fetch_add(r.sim_failed as u64, Ordering::Relaxed);
+                                    sm.fetch_add(r.sim_micros, Ordering::Relaxed);
+                                    ss.fetch_add(r.sim_samples, Ordering::Relaxed);
                                     if r.no_context {
                                         nc.fetch_add(1, Ordering::Relaxed);
                                     }
@@ -1410,19 +1452,6 @@ impl BaseFastPath {
                     }
                 }
 
-                let mut sim_us: u128 = 0;
-                if let (Some(http), true) = (self.sim_http.as_ref(), !priced.is_empty()) {
-                    let started = Instant::now();
-                    let probe = json!([
-                        {"blockStateCalls": [{"calls": []}], "validation": true,
-                         "traceTransfers": false},
-                        "pending"
-                    ]);
-                    match simulate_preconf(http, probe).await {
-                        Ok(_) => sim_us = started.elapsed().as_micros(),
-                        Err(e) => warn!(error = %e, "preconf simulation probe failed"),
-                    }
-                }
                 let best = priced.first().map(|c| c.gross_bps).unwrap_or(f64::NAN);
                 // Net of everything the pool fees do not already cover. Pool
                 // fees are inside gross_bps already; adding them here would
@@ -1449,8 +1478,11 @@ impl BaseFastPath {
                     prep_sized = prep_sized.load(Ordering::Relaxed),
                     prep_rejected = prep_rejected.load(Ordering::Relaxed),
                     prep_no_context = prep_no_context.load(Ordering::Relaxed),
+                    sim_ok = sim_ok.load(Ordering::Relaxed),
+                    sim_failed = sim_failed.load(Ordering::Relaxed),
+                    mean_sim_us = sim_micros.load(Ordering::Relaxed)
+                        / sim_samples.load(Ordering::Relaxed).max(1),
                     price_us,
-                    sim_probe_us = sim_us,
                     total_touched = out.total_touched,
                     unresolved_pools = out.unresolved_pools,
                     drain_us = elapsed.as_micros(),

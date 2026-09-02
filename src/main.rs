@@ -3543,6 +3543,57 @@ where
     M: Middleware + 'static,
     C: JsonRpcClient + Clone + Send + Sync + 'static,
 {
+    /// Executor calldata for a sized candidate, for preconfirmed simulation.
+    ///
+    /// Uses the RELAXED plan -- per-hop minimums and `min_profit` zeroed --
+    /// which is the same diagnostic form `scan_once` builds alongside the
+    /// enforced one. That choice is deliberate and it bounds what the result
+    /// means: a success says the ROUTE EXECUTES against preconfirmed state and
+    /// reports what it really costs in gas. It says nothing about whether the
+    /// trade clears its profit threshold, because that threshold is computed
+    /// downstream of this seam. Sizing already answered the profit question;
+    /// this answers the one sizing cannot, which is whether the chain agrees.
+    ///
+    /// A simulation built with the ENFORCED minimums would conflate the two:
+    /// a revert would mean either a broken route or an unprofitable one, and
+    /// those need different responses.
+    fn simulation_calldata(&self, sized: &SizedCandidate) -> Option<(Address, Address, Vec<u8>)> {
+        let relaxed = sized.plan.with_relaxed_min_outs();
+        let loans: Vec<ExecutorLoan> = sized
+            .sizing
+            .allocations
+            .iter()
+            .map(|alloc| ExecutorLoan {
+                token: sized.cycle_start,
+                amount: alloc.amount,
+                provider: alloc.provider.as_id(),
+                provider_addr: alloc.provider_addr.unwrap_or_else(|| match alloc.provider {
+                    FlashLoanProvider::Balancer => self.bal_vault,
+                    FlashLoanProvider::AaveV3 => self.aave_pool.unwrap_or_default(),
+                    FlashLoanProvider::Erc3156 => Address::zero(),
+                    FlashLoanProvider::Univ2Flashswap => Address::zero(),
+                    FlashLoanProvider::Univ3Flash => Address::zero(),
+                }),
+            })
+            .collect();
+        let plan_args = ExecutorPlan {
+            loans,
+            cycle_slippage_bps: sized.sizing.max_slippage_bps.min(u32::from(u16::MAX)) as u16,
+            steps: encode_plan_steps(relaxed.steps),
+            min_profit: U256::zero(),
+        };
+        let call = self.build_executor_call(&plan_args)?;
+        let to = match call.tx.to() {
+            Some(ethers::types::NameOrAddress::Address(a)) => *a,
+            _ => return None,
+        };
+        // `from` must be the signing EOA, not the executor. The executor
+        // allowlists its callers, so simulating from the wrong account reverts
+        // on authorisation and the result would read as a broken route.
+        let from = self.wallet.as_ref()?.address();
+        Some((from, to, call.calldata()?.to_vec()))
+    }
+
     fn build_executor_call(&self, plan_args: &ExecutorPlan) -> Option<ContractCall<M, U256>> {
         if plan_args.loans.len() != 1 {
             warn!(
@@ -13839,9 +13890,11 @@ async fn launch_chain_runtime(
             .filter(|v| *v > 0)
             .unwrap_or(2);
         let sink_runner = Arc::clone(&runner);
+        let fast_sim_src = Arc::clone(&fast);
         let sink: crate::base_fast::CandidateSink =
             Arc::new(move |graph: Arc<Graph>, ready| {
                 let runner = Arc::clone(&sink_runner);
+                let fast_sim = Arc::clone(&fast_sim_src);
                 Box::pin(async move {
                     let mut report = crate::base_fast::PrepReport::default();
                     // The economics are all RPC-derived and the fast path cannot
@@ -13869,6 +13922,44 @@ async fn launch_chain_runtime(
                         match runner.prepare_candidate(&graph, indexed, &ctx).await {
                             CandidatePrep::Sized(sized) => {
                                 report.sized += 1;
+                                // The real candidate, against preconfirmed
+                                // state: real calldata, real loan amount, real
+                                // swap path, real gasUsed. What it does NOT
+                                // enforce is min_profit -- see
+                                // `simulation_calldata`.
+                                let mut sim_gas = 0u64;
+                                let mut sim_verdict = "not_simulated";
+                                let mut sim_reason = String::new();
+                                if let Some((from, to, data)) =
+                                    runner.simulation_calldata(&sized)
+                                {
+                                    let max_fee = snap
+                                        .gas_parameters
+                                        .max_fee_per_gas
+                                        .unwrap_or(snap.gas_parameters.gas_price)
+                                        .min(U256::from(u128::MAX))
+                                        .as_u128();
+                                    if let Some((r, took)) = fast_sim
+                                        .simulate_candidate(from, to, &data, max_fee)
+                                        .await
+                                    {
+                                        report.sim_micros = report
+                                            .sim_micros
+                                            .saturating_add(took.as_micros().min(
+                                                u128::from(u64::MAX),
+                                            ) as u64);
+                                        report.sim_samples += 1;
+                                        sim_gas = r.gas_used;
+                                        if r.success {
+                                            report.sim_ok += 1;
+                                            sim_verdict = "ok";
+                                        } else {
+                                            report.sim_failed += 1;
+                                            sim_verdict = "reverted";
+                                            sim_reason = r.failure.clone().unwrap_or_default();
+                                        }
+                                    }
+                                }
                                 info!(
                                     target: "latency",
                                     gross_bps = priced.gross_bps,
@@ -13878,7 +13969,10 @@ async fn launch_chain_runtime(
                                     flash_fee = %sized.sizing.flash_fee,
                                     net = %sized.sizing.net_after_fee_and_gas,
                                     quotes = sized.sizing.quote_count,
-                                    gas = sized.adjusted_cycle_gas,
+                                    est_gas = sized.adjusted_cycle_gas,
+                                    sim = sim_verdict,
+                                    sim_gas,
+                                    sim_reason = %sim_reason,
                                     "flashblock candidate sized"
                                 );
                             }
