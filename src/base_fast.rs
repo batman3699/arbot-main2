@@ -153,7 +153,7 @@ pub struct BaseFastPath {
     ws_backoff: Duration,
     /// pool -> (token0, token1), ORDERED. Required to price a hop in the
     /// direction asked for; without it `sqrtPriceX96` would be applied blind.
-    pool_tokens: std::collections::HashMap<Address, PoolMeta>,
+    pool_tokens: Arc<dashmap::DashMap<Address, PoolMeta>>,
     /// HTTP endpoint for `eth_simulateV1`. `None` disables the probe.
     sim_http: Option<Arc<ethers::providers::Provider<ethers::providers::Http>>>,
     pub stats: Arc<FastPathStats>,
@@ -183,7 +183,7 @@ impl BaseFastPath {
             metrics,
             ws_endpoints: Vec::new(),
             ws_backoff: Duration::from_secs(5),
-            pool_tokens: std::collections::HashMap::new(),
+            pool_tokens: Arc::new(dashmap::DashMap::new()),
             sim_http: None,
             stats: Arc::new(FastPathStats::default()),
         }
@@ -283,6 +283,19 @@ pub struct PoolMeta {
     pub token1: Address,
     pub fee_ppm: u32,
     pub kind: PoolKind,
+    /// Whether `token0`/`token1` came from the CHAIN rather than from config.
+    ///
+    /// CL records carry the pair straight out of the factory's `PoolCreated`
+    /// event, so they are verified on construction. V2 metadata is not:
+    /// `config/base_aerodrome_pools.json` lists every pair in both directions
+    /// and `or_insert` keeps whichever line came first, so the recorded
+    /// `token0` need not be the token `reserve0` counts. The seed reads
+    /// `token0()`/`token1()` and flips this.
+    ///
+    /// Unverified V2 pools are REFUSED, not guessed. An inverted pair does not
+    /// fail loudly — it returns the reciprocal rate, and a reciprocal around a
+    /// loop manufactures a phantom edge.
+    pub verified: bool,
 }
 
 /// Which curve a pool trades on.
@@ -303,6 +316,35 @@ pub enum PoolKind {
     ConstantProduct,
     /// Solidly *stable*. `x^3*y + x*y^3 = k`.
     StableSwap,
+}
+
+/// Which unit a venue's declared fee is expressed in.
+///
+/// Both sources call the field `fee_bps` and they mean different things.
+/// Verified against the Base inventories on 2026-09-03:
+/// - `data/base/uniswap_v3` (1,881,808 pools): fees 100 / 500 / 3000 / 10000
+///   — the UniV3 ppm tiers. `aerodrome_slipstream` and `pancakeswap_v3` match.
+/// - `data/base/uniswap_v2` (141,364 pools): fee 30 for **every one of them**,
+///   and `config/base_aerodrome_pools.json` carries `feeBps: 30`. Basis points.
+///
+/// Reading bps as ppm undercharges by 100x: `keep` becomes 0.99997 instead of
+/// 0.997, crediting 29.1 bps of profit per hop that does not exist — about
+/// 87 bps around a triangle. That is indistinguishable from a fat tail of
+/// genuine opportunities, which is what makes it dangerous rather than merely
+/// wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeUnit {
+    /// UniV3 / Slipstream / PancakeSwap V3 records: raw pool fee, already ppm.
+    Ppm,
+    /// UniV2 records and Aerodrome/Solidly config: real basis points.
+    Bps,
+}
+
+pub fn fee_to_ppm(unit: FeeUnit, declared: u32) -> u32 {
+    match unit {
+        FeeUnit::Ppm => declared,
+        FeeUnit::Bps => declared.saturating_mul(100),
+    }
 }
 
 /// How much of the fast path's universe can be priced right now.
@@ -344,7 +386,7 @@ pub type ClSeedTarget = (Address, Option<u32>, Address, Address);
 /// state against the wrong pair.
 pub fn seed_targets(
     pools: &[Address],
-    meta: &std::collections::HashMap<Address, PoolMeta>,
+    meta: &dashmap::DashMap<Address, PoolMeta>,
 ) -> (Vec<ClSeedTarget>, Vec<Address>) {
     let mut cl: Vec<ClSeedTarget> = Vec::new();
     let mut v2 = Vec::new();
@@ -360,6 +402,30 @@ pub fn seed_targets(
     (cl, v2)
 }
 
+/// Record a pool's real `token0`/`token1` and mark the pair verified.
+///
+/// Returns whether the chain disagreed with what config claimed. That is the
+/// number worth surfacing: `config/base_aerodrome_pools.json` lists every pair
+/// in BOTH directions and `or_insert` keeps whichever line came first, so a
+/// disagreement means the inventory would have priced that pool backwards. It
+/// is not an error here — the chain's answer simply wins — but a silent win
+/// hides a broken inventory.
+pub fn adopt_chain_pair(
+    meta: &dashmap::DashMap<Address, PoolMeta>,
+    pool: Address,
+    token0: Address,
+    token1: Address,
+) -> bool {
+    let Some(mut m) = meta.get_mut(&pool) else {
+        return false;
+    };
+    let mismatch = (m.token0, m.token1) != (token0, token1);
+    m.token0 = token0;
+    m.token1 = token1;
+    m.verified = true;
+    mismatch
+}
+
 /// What one reconciliation pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SeedOutcome {
@@ -371,6 +437,11 @@ pub struct SeedOutcome {
     /// multicall result is a real gap — it stays unpriceable — so it is counted
     /// rather than folded into the anchored total.
     pub missing: usize,
+    /// V2 pools whose config token order disagreed with the chain's. Pricing
+    /// takes the chain's, so this is a warning about the inventory, not a
+    /// failure -- but an inverted pair silently reports the reciprocal rate,
+    /// and a reciprocal around a loop manufactures a phantom edge.
+    pub order_mismatch: usize,
     pub block: u64,
 }
 
@@ -476,7 +547,7 @@ fn u256_to_f64(v: U256) -> Option<f64> {
 pub fn rate_from_live(
     live: &LiveState,
     candidate_pools: &[Address],
-    pool_tokens: &std::collections::HashMap<Address, PoolMeta>,
+    pool_tokens: &dashmap::DashMap<Address, PoolMeta>,
     from: Address,
     to: Address,
 ) -> Option<(f64, f64)> {
@@ -486,7 +557,7 @@ pub fn rate_from_live(
         let Some(meta) = pool_tokens.get(pool) else {
             continue;
         };
-        let Some((num, den)) = hop_rate(live, *pool, meta, from, to) else {
+        let Some((num, den)) = hop_rate(live, *pool, &meta, from, to) else {
             continue;
         };
         let rate = num / den;
@@ -519,13 +590,13 @@ fn hop_rate(
     if !(0.0..=1.0).contains(&keep) {
         return None;
     }
-    let forward = if from == token0 && to == token1 {
-        true
-    } else if from == token1 && to == token0 {
-        false
-    } else {
+    // A cheap structural guard: the pool must serve this pair at all. Which
+    // way round it serves it is decided per curve below, because only the V2
+    // snapshot carries an authoritative ordering.
+    if !((from == token0 && to == token1) || (from == token1 && to == token0)) {
         return None;
-    };
+    }
+    let forward = from == token0;
 
     match meta.kind {
         PoolKind::ConcentratedLiquidity => {
@@ -544,6 +615,15 @@ fn hop_rate(
         PoolKind::ConstantProduct => {
             let snap = live.v2_snapshot(pool)?;
             if !may_price_locally(&snap.prov.trust) {
+                return None;
+            }
+            // The direction must come from a CHAIN-read pair. Config lists
+            // every Aerodrome pair in both directions and keeps whichever line
+            // came first, so its `token0` need not be the token `reserve0`
+            // counts. An inverted V2 rate does not fail loudly -- it returns the
+            // reciprocal, and a reciprocal around a loop manufactures a phantom
+            // edge. Unverified is REFUSED; the seed flips this within a pass.
+            if !meta.verified {
                 return None;
             }
             let (r0, r1) = (
@@ -907,8 +987,13 @@ impl BaseFastPath {
         mut self,
         tokens: std::collections::HashMap<Address, PoolMeta>,
     ) -> Self {
-        self.pool_tokens = tokens;
+        self.pool_tokens = Arc::new(tokens.into_iter().collect());
         self
+    }
+
+    /// The pool metadata, for the drain loop's pricing closure.
+    pub fn pool_tokens(&self) -> Arc<dashmap::DashMap<Address, PoolMeta>> {
+        Arc::clone(&self.pool_tokens)
     }
 
     /// Endpoint for the preconfirmed-simulation round trip.
@@ -947,13 +1032,33 @@ impl BaseFastPath {
     /// curve or the other and a fallthrough would price it on the wrong one.
     fn pool_priceable(&self, pool: Address) -> bool {
         use crate::live_state::may_price_locally;
-        if let Some(s) = self.live.cl_snapshot(pool) {
-            return may_price_locally(&s.prov.trust);
+        let Some(meta) = self.pool_tokens.get(&pool) else {
+            // No metadata: `hop_rate` cannot price it in any direction.
+            return false;
+        };
+        match meta.kind {
+            PoolKind::ConcentratedLiquidity => self
+                .live
+                .cl_snapshot(pool)
+                .is_some_and(|s| may_price_locally(&s.prov.trust)),
+            // `verified` is checked HERE and not only in the pricer for a
+            // reason worth naming. A hot V2 pool acquires a Derived snapshot
+            // from its first Sync log, which would have satisfied a
+            // trust-only test -- so coverage would have read 100% for exactly
+            // the busiest pools while `hop_rate` refused every one of them for
+            // want of a token order. A gauge that disagrees with the pricer is
+            // worse than no gauge.
+            PoolKind::ConstantProduct => {
+                meta.verified
+                    && self
+                        .live
+                        .v2_snapshot(pool)
+                        .is_some_and(|s| may_price_locally(&s.prov.trust))
+            }
+            // Refused by `hop_rate` until the stable invariant is wired, so it
+            // is not coverage no matter how good its state is.
+            PoolKind::StableSwap => false,
         }
-        if let Some(s) = self.live.v2_snapshot(pool) {
-            return may_price_locally(&s.prov.trust);
-        }
-        false
     }
 
     /// Seed local state from canonical reads at a SEALED block.
@@ -1018,6 +1123,22 @@ impl BaseFastPath {
             for pool in &v2_targets {
                 match states.get(pool) {
                     Some(st) => {
+                        // The one place both orderings are in hand. Config
+                        // lists every Aerodrome pair in BOTH directions and
+                        // `or_insert` keeps whichever line came first, so this
+                        // disagreement is possible and silent. Pricing uses the
+                        // chain's answer either way; counting it is what makes
+                        // a bad inventory visible instead of merely harmless.
+                        // Applied BEFORE the anchor and regardless of whether
+                        // it installs. A pool that traded in a preconfirmed
+                        // block ahead of `block` has its anchor refused by the
+                        // `supersedes` guard -- correctly, its state is newer --
+                        // and those are precisely the hot pools. Tying the
+                        // ordering to a successful anchor would leave the
+                        // busiest pools permanently unpriceable.
+                        if adopt_chain_pair(&self.pool_tokens, *pool, st.token0, st.token1) {
+                            out.order_mismatch += 1;
+                        }
                         if self.live.anchor_v2(*pool, block, st.clone()) {
                             out.anchored += 1;
                         }
@@ -1070,6 +1191,8 @@ impl BaseFastPath {
                     .copied()
                     .filter(|p| !self.pool_priceable(*p))
                     .collect();
+                // `pool_priceable` is false for every unverified V2 pool, so
+                // this set already contains them; no separate pass is needed.
                 if stale.is_empty() {
                     self.publish_coverage();
                     continue;
@@ -1083,6 +1206,7 @@ impl BaseFastPath {
                     requested = stale.len(),
                     anchored = out.anchored,
                     missing = out.missing,
+                    order_mismatch = out.order_mismatch,
                     coverage_pct = cov.pct().round() as u64,
                     priceable = cov.priceable,
                     pools = cov.total,
@@ -1861,6 +1985,23 @@ mod tests {
         sync_log(pool, r0, r1, block, 0)
     }
 
+    /// A V2 pool as production actually sees it: SEEDED from chain -- which is
+    /// the only place the token ordering comes from -- and then moved by Sync
+    /// logs. A bare Sync carries reserves and no tokens, so a pool built from
+    /// logs alone cannot say which token `reserve0` counts.
+    fn seeded_v2(live: &LiveState, pool: Address, t0: Address, t1: Address) {
+        assert!(live.anchor_v2(
+            pool,
+            99,
+            crate::quote_univ2::UniV2PairState {
+                token0: t0,
+                token1: t1,
+                reserve0: U256::from(1u64),
+                reserve1: U256::from(1u64),
+            }
+        ));
+    }
+
     /// Direction is the dangerous part. `sqrtPriceX96` is token1-per-token0, so
     /// pricing a hop backwards does not fail -- it silently returns the
     /// reciprocal, and a reciprocal around a loop manufactures a phantom edge.
@@ -1869,12 +2010,13 @@ mod tests {
         let (t0, t1, pool) = (addr(1), addr(2), addr(11));
         let live = LiveState::new();
         // reserves 1000 / 4000 -> 4 token1 per token0
+        seeded_v2(&live, pool, t0, t1);
         live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
-        let tokens = std::collections::HashMap::from([(
+        let tokens = dashmap::DashMap::from_iter([(
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true },
         )]);
 
         let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1).expect("forward");
@@ -1890,12 +2032,13 @@ mod tests {
     fn the_two_directions_are_reciprocal() {
         let (t0, t1, pool) = (addr(1), addr(2), addr(11));
         let live = LiveState::new();
+        seeded_v2(&live, pool, t0, t1);
         live.apply_log(&v2_sync(pool, 7_919, 104_729, 100));
-        let tokens = std::collections::HashMap::from([(
+        let tokens = dashmap::DashMap::from_iter([(
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true },
         )]);
         let (a, b) = rate_from_live(&live, &[pool], &tokens, t0, t1).unwrap();
         let (c, d) = rate_from_live(&live, &[pool], &tokens, t1, t0).unwrap();
@@ -1909,12 +2052,13 @@ mod tests {
     fn an_untrusted_snapshot_is_not_priced() {
         let (t0, t1, pool) = (addr(1), addr(2), addr(11));
         let live = LiveState::new();
+        seeded_v2(&live, pool, t0, t1);
         live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
-        let tokens = std::collections::HashMap::from([(
+        let tokens = dashmap::DashMap::from_iter([(
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true },
         )]);
         assert!(rate_from_live(&live, &[pool], &tokens, t0, t1).is_some());
 
@@ -1931,12 +2075,13 @@ mod tests {
     fn a_pool_that_does_not_serve_the_hop_is_skipped() {
         let (t0, t1, pool) = (addr(1), addr(2), addr(11));
         let live = LiveState::new();
+        seeded_v2(&live, pool, t0, t1);
         live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
-        let tokens = std::collections::HashMap::from([(
+        let tokens = dashmap::DashMap::from_iter([(
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true },
         )]);
         assert!(rate_from_live(&live, &[pool], &tokens, t0, addr(99)).is_none());
         assert!(rate_from_live(&live, &[], &tokens, t0, t1).is_none());
@@ -1958,11 +2103,12 @@ mod tests {
     fn pool_fees_are_charged_in_ppm_not_bps() {
         let (t0, t1, pool) = (addr(1), addr(2), addr(11));
         let live = LiveState::new();
+        seeded_v2(&live, pool, t0, t1);
         live.apply_log(&sync_log(pool, 1_000, 4_000, 100, 0));
         // 3_000 ppm = 0.30%, so 4.0 becomes 4.0 * 0.997 = 3.988.
-        let tokens = std::collections::HashMap::from([(
+        let tokens = dashmap::DashMap::from_iter([(
             pool,
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true },
         )]);
         let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1).expect("priced");
         let r = n / d;
@@ -1981,11 +2127,13 @@ mod tests {
         let (p1, p2) = (addr(11), addr(12));
         let live = LiveState::new();
         // Two pools at the same price: a round trip is break-even before fees.
+        seeded_v2(&live, p1, t0, t1);
+        seeded_v2(&live, p2, t0, t1);
         live.apply_log(&sync_log(p1, 1_000, 2_000, 100, 0));
         live.apply_log(&sync_log(p2, 1_000, 2_000, 100, 1));
-        let tokens = std::collections::HashMap::from([
-            (p1, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct }),
-            (p2, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct }),
+        let tokens = dashmap::DashMap::from_iter([
+            (p1, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true }),
+            (p2, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true }),
         ]);
         let bps = price_cycle(&[t0, t1], |f, t| {
             let pools = if f == t0 { [p1] } else { [p2] };
@@ -2073,6 +2221,14 @@ mod tests {
     fn coverage_counts_only_what_the_pricer_would_accept() {
         let (cl, v2, dark) = (addr(1), addr(2), addr(3));
         let (f, _t) = fast(vec![cl, v2, dark]);
+        let f = f.with_pool_tokens(std::collections::HashMap::from([
+            (cl, PoolMeta { token0: addr(80), token1: addr(81), fee_ppm: 500,
+                            kind: PoolKind::ConcentratedLiquidity, verified: true }),
+            (v2, PoolMeta { token0: addr(90), token1: addr(91), fee_ppm: 3_000,
+                            kind: PoolKind::ConstantProduct, verified: true }),
+            (dark, PoolMeta { token0: addr(92), token1: addr(93), fee_ppm: 3_000,
+                              kind: PoolKind::ConstantProduct, verified: true }),
+        ]));
         assert_eq!(f.coverage().priceable, 0, "nothing seeded yet");
         assert_eq!(f.coverage().total, 3);
 
@@ -2101,6 +2257,11 @@ mod tests {
     fn a_feed_gap_collapses_coverage() {
         let pool = addr(1);
         let (f, _t) = fast(vec![pool]);
+        let f = f.with_pool_tokens(std::collections::HashMap::from([(
+            pool,
+            PoolMeta { token0: addr(80), token1: addr(81), fee_ppm: 500,
+                       kind: PoolKind::ConcentratedLiquidity, verified: true },
+        )]));
         assert!(f.live.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000, 0));
         assert_eq!(f.coverage().priceable, 1);
         f.note_gap();
@@ -2124,10 +2285,10 @@ mod tests {
     #[test]
     fn the_seed_routes_each_pool_to_the_loader_for_its_curve() {
         let (cl, vol, stable) = (addr(1), addr(2), addr(3));
-        let mut meta = std::collections::HashMap::new();
-        meta.insert(cl, PoolMeta { token0: addr(10), token1: addr(11), fee_ppm: 500, kind: PoolKind::ConcentratedLiquidity });
-        meta.insert(vol, PoolMeta { token0: addr(12), token1: addr(13), fee_ppm: 3_000, kind: PoolKind::ConstantProduct });
-        meta.insert(stable, PoolMeta { token0: addr(14), token1: addr(15), fee_ppm: 100, kind: PoolKind::StableSwap });
+        let meta = dashmap::DashMap::new();
+        meta.insert(cl, PoolMeta { token0: addr(10), token1: addr(11), fee_ppm: 500, kind: PoolKind::ConcentratedLiquidity, verified: true });
+        meta.insert(vol, PoolMeta { token0: addr(12), token1: addr(13), fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true });
+        meta.insert(stable, PoolMeta { token0: addr(14), token1: addr(15), fee_ppm: 100, kind: PoolKind::StableSwap, verified: true });
 
         let (cl_targets, v2_targets) = seed_targets(&[cl, vol, stable], &meta);
         assert_eq!(cl_targets.len(), 1);
@@ -2144,7 +2305,7 @@ mod tests {
     /// pool against the wrong tokens.
     #[test]
     fn a_pool_without_metadata_is_not_seeded() {
-        let meta = std::collections::HashMap::new();
+        let meta = dashmap::DashMap::new();
         let (cl, v2) = seed_targets(&[addr(1)], &meta);
         assert!(cl.is_empty() && v2.is_empty());
     }
@@ -2246,10 +2407,10 @@ mod tests {
             token0: t0, token1: t1,
             reserve0: U256::from(1_000u64), reserve1: U256::from(1_500u64),
         }));
-        let mut meta = std::collections::HashMap::new();
+        let meta = dashmap::DashMap::new();
         for p in [cheap, rich] {
             meta.insert(p, PoolMeta {
-                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct,
+                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true,
             });
         }
 
@@ -2278,12 +2439,12 @@ mod tests {
             token0: t0, token1: t1,
             reserve0: U256::from(1_000u64), reserve1: U256::from(1_050u64),
         }));
-        let mut meta = std::collections::HashMap::new();
+        let meta = dashmap::DashMap::new();
         meta.insert(expensive, PoolMeta {
-            token0: t0, token1: t1, fee_ppm: 100_000, kind: PoolKind::ConstantProduct,
+            token0: t0, token1: t1, fee_ppm: 100_000, kind: PoolKind::ConstantProduct, verified: true,
         });
         meta.insert(cheap, PoolMeta {
-            token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct,
+            token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true,
         });
         let (n, d) = rate_from_live(&live, &[expensive, cheap], &meta, t0, t1).expect("priced");
         // 1.10 * 0.90 = 0.99 < 1.05, so the cheap pool wins on NET.
@@ -2303,9 +2464,9 @@ mod tests {
             token0: t0, token1: t1,
             reserve0: U256::from(1_000u64), reserve1: U256::from(2_000u64),
         }));
-        let mut meta = std::collections::HashMap::new();
+        let meta = dashmap::DashMap::new();
         meta.insert(pool, PoolMeta {
-            token0: t0, token1: t1, fee_ppm: 100, kind: PoolKind::StableSwap,
+            token0: t0, token1: t1, fee_ppm: 100, kind: PoolKind::StableSwap, verified: true,
         });
         assert!(rate_from_live(&live, &[pool], &meta, t0, t1).is_none());
     }
@@ -2322,14 +2483,140 @@ mod tests {
             token0: t0, token1: t1,
             reserve0: U256::from(1_000u64), reserve1: U256::from(1_200u64),
         }));
-        let mut meta = std::collections::HashMap::new();
+        let meta = dashmap::DashMap::new();
         for p in [dark, good] {
             meta.insert(p, PoolMeta {
-                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct,
+                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true,
             });
         }
         // `dark` has no snapshot at all.
         let (n, d) = rate_from_live(&live, &[dark, good], &meta, t0, t1).expect("priced");
         assert!((n / d - 1.2).abs() < 1e-9);
+    }
+
+    // ---- fee units ----
+
+    /// The 100x trap. Both inventories call the field `fee_bps`; only one of
+    /// them means it. Verified on 2026-09-03 against the Base data: every one
+    /// of the 141,364 `uniswap_v2` records carries `fee: 30`, and
+    /// `config/base_aerodrome_pools.json` carries `feeBps: 30` -- both real
+    /// basis points. `uniswap_v3` carries 100/500/3000/10000, the ppm tiers.
+    #[test]
+    fn a_venue_fee_is_converted_by_its_source_not_its_curve() {
+        assert_eq!(fee_to_ppm(FeeUnit::Ppm, 3_000), 3_000, "UniV3 0.30% is ppm already");
+        assert_eq!(fee_to_ppm(FeeUnit::Bps, 30), 3_000, "Aerodrome 0.30% is 30 bps");
+        assert_eq!(fee_to_ppm(FeeUnit::Bps, 5), 500, "a 5 bps stable pool");
+        // Both spellings of 0.30% must land on the same `keep`.
+        let keep = |ppm: u32| 1.0 - f64::from(ppm) / 1_000_000.0;
+        assert!((keep(fee_to_ppm(FeeUnit::Ppm, 3_000)) - keep(fee_to_ppm(FeeUnit::Bps, 30))).abs() < 1e-12);
+        // And reading bps as ppm is the 100x error, spelled out.
+        assert!((keep(30) - 0.99997).abs() < 1e-9, "the wrong reading keeps 99.997%");
+        assert!((keep(3_000) - 0.997).abs() < 1e-9, "the right one keeps 99.7%");
+    }
+
+    // ---- token ordering ----
+
+    /// Config lists each Aerodrome pair in BOTH directions; `or_insert` keeps
+    /// whichever came first. When that disagrees with the pool's real
+    /// `token0()`, pricing from config does not fail -- it returns the
+    /// RECIPROCAL, and a reciprocal around a loop manufactures a phantom edge.
+    /// The seed reads the pair and overwrites the claim.
+    #[test]
+    fn the_seed_overwrites_a_config_pair_the_chain_disagrees_with() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let meta: dashmap::DashMap<Address, PoolMeta> = dashmap::DashMap::from_iter([(
+            pool,
+            // Config claims t0 is token0, unverified.
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
+                       kind: PoolKind::ConstantProduct, verified: false },
+        )]);
+
+        // The chain says the opposite way round.
+        assert!(
+            adopt_chain_pair(&meta, pool, t1, t0),
+            "the disagreement must be reported, not silently corrected"
+        );
+        let m = *meta.get(&pool).expect("still present");
+        assert_eq!((m.token0, m.token1), (t1, t0), "the chain's answer wins");
+        assert!(m.verified);
+
+        // Reserves (t1: 1000, t0: 4000), so t0 -> t1 is 1000/4000 = 0.25.
+        let live = LiveState::new();
+        assert!(live.anchor_v2(pool, 100, crate::quote_univ2::UniV2PairState {
+            token0: t1, token1: t0,
+            reserve0: U256::from(1_000u64), reserve1: U256::from(4_000u64),
+        }));
+        let (n, d) = rate_from_live(&live, &[pool], &meta, t0, t1).expect("priced");
+        assert!(
+            (n / d - 0.25).abs() < 1e-9,
+            "config ordering was trusted: got {}, the reciprocal is 4.0",
+            n / d
+        );
+    }
+
+    /// Agreement is not a mismatch, and it still verifies the pair.
+    #[test]
+    fn a_config_pair_the_chain_confirms_is_not_reported_as_a_mismatch() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let meta: dashmap::DashMap<Address, PoolMeta> = dashmap::DashMap::from_iter([(
+            pool,
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
+                       kind: PoolKind::ConstantProduct, verified: false },
+        )]);
+        assert!(!adopt_chain_pair(&meta, pool, t0, t1));
+        assert!(meta.get(&pool).expect("present").verified);
+    }
+
+    /// A Sync log carries reserves and no tokens, so a pool seen only through
+    /// logs cannot say which token `reserve0` counts. Guessing is what the seed
+    /// exists to make unnecessary.
+    #[test]
+    fn a_v2_pool_never_seeded_is_refused_rather_than_guessed() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        seeded_v2(&live, pool, t0, t1);
+        live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
+        // State is perfectly good; only the token ORDER is unconfirmed.
+        let meta: dashmap::DashMap<Address, PoolMeta> = dashmap::DashMap::from_iter([(
+            pool,
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
+                       kind: PoolKind::ConstantProduct, verified: false },
+        )]);
+        assert!(
+            rate_from_live(&live, &[pool], &meta, t0, t1).is_none(),
+            "an unconfirmed pair must be refused, not guessed"
+        );
+        // The seed confirms it, and the same state prices.
+        assert!(!adopt_chain_pair(&meta, pool, t0, t1));
+        let (n, d) = rate_from_live(&live, &[pool], &meta, t0, t1).expect("priced once verified");
+        assert!((n / d - 4.0).abs() < 1e-9, "got {}", n / d);
+    }
+
+    /// The trap that made the `verified` flag part of `pool_priceable` and not
+    /// only of the pricer. A hot V2 pool acquires a Derived snapshot from its
+    /// first Sync log, so a trust-only coverage test would have called it
+    /// covered -- for exactly the busiest pools, which the pricer was refusing.
+    #[test]
+    fn an_unverified_pool_with_good_state_is_not_counted_as_coverage() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let (f, _t) = fast(vec![pool]);
+        let f = f.with_pool_tokens(std::collections::HashMap::from([(
+            pool,
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
+                       kind: PoolKind::ConstantProduct, verified: false },
+        )]));
+        seeded_v2(&f.live, pool, t0, t1);
+        f.live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
+        assert_eq!(
+            f.coverage().priceable,
+            0,
+            "trusted state with an unconfirmed pair is not coverage"
+        );
+        adopt_chain_pair(&f.pool_tokens, pool, t0, t1);
+        assert_eq!(f.coverage().priceable, 1, "confirming the pair is what covers it");
     }
 }

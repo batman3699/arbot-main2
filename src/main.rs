@@ -12834,6 +12834,11 @@ async fn launch_chain_runtime(
             monitored_pools_from_configs(&pools),
             solidly_pools,
         );
+        // Cloned before PoolMonitor::new takes ownership: the Base fast path
+        // needs the SAME V2 set. Until now its universe was CL-only, so every
+        // cycle through an Aerodrome or UniV2 pool was structurally unpriceable
+        // no matter how good the CL state was.
+        let v2_pools: Vec<MonitoredPool> = monitored.clone();
 
         // CL pools are subscribed for logs but never polled. Without them the
         // Swap decoder never sees a log: the subscription carried 23 of ~985
@@ -12884,45 +12889,82 @@ async fn launch_chain_runtime(
                             "CHAOS_WS_GAP_SECS set; forcing websocket gaps. Test harness only"
                         );
                     }
-                    let fast_pools: Vec<Address> = cl_pools.iter().map(|p| p.pair).collect();
+                    // CL and V2 together. Every pool the fast path subscribes
+                    // to, prices from, and resolves cycles through.
+                    let fast_all: Vec<&MonitoredPool> =
+                        cl_pools.iter().chain(v2_pools.iter()).collect();
+                    let fast_pools: Vec<Address> =
+                        fast_all.iter().map(|p| p.pair).collect();
                     // Token pairs for the same pools, so the drain loop can map
                     // a dirty POOL to the token HOP the cycle index is keyed by.
-                    let fast_universe: Vec<(Address, Address, Address)> = cl_pools
+                    let fast_universe: Vec<(Address, Address, Address)> = fast_all
                         .iter()
                         .map(|p| (p.pair, p.token_in, p.token_out))
                         .collect();
-                    // fee_ppm, NOT fee_bps: MonitoredPool.fee_bps is populated
-                    // from the raw pool fee, which is parts-per-million for
-                    // UniV3-style venues -- 3_000 is 0.30%, not 30%.
+                    // `MonitoredPool.fee_bps` is a lie by omission: it holds
+                    // whatever unit its SOURCE used. Verified 2026-09-03 against
+                    // the Base inventories -- all 141,364 uniswap_v2 records
+                    // carry fee 30 and config/base_aerodrome_pools.json carries
+                    // feeBps 30 (basis points), while uniswap_v3 carries
+                    // 100/500/3000/10000 (ppm). Reading bps as ppm undercharges
+                    // by 100x, which is ~87 bps of fabricated edge on a triangle.
                     let fast_meta: std::collections::HashMap<
                         Address,
                         crate::base_fast::PoolMeta,
-                    > = cl_pools
+                    > = fast_all
                         .iter()
                         .map(|p| {
+                            let cl = matches!(
+                                p.kind,
+                                ingestion::PoolMonitorKind::ConcentratedLiquidity
+                            );
+                            let (kind, unit) = if cl {
+                                (
+                                    crate::base_fast::PoolKind::ConcentratedLiquidity,
+                                    crate::base_fast::FeeUnit::Ppm,
+                                )
+                            } else if p.stable {
+                                (
+                                    crate::base_fast::PoolKind::StableSwap,
+                                    crate::base_fast::FeeUnit::Bps,
+                                )
+                            } else {
+                                (
+                                    crate::base_fast::PoolKind::ConstantProduct,
+                                    crate::base_fast::FeeUnit::Bps,
+                                )
+                            };
                             (
                                 p.pair,
                                 crate::base_fast::PoolMeta {
                                     token0: p.token_in,
                                     token1: p.token_out,
-                                    fee_ppm: p.fee_bps,
-                                    kind: match p.kind {
-                                        ingestion::PoolMonitorKind::ConcentratedLiquidity => {
-                                            crate::base_fast::PoolKind::ConcentratedLiquidity
-                                        }
-                                        _ if p.stable => crate::base_fast::PoolKind::StableSwap,
-                                        _ => crate::base_fast::PoolKind::ConstantProduct,
-                                    },
+                                    fee_ppm: crate::base_fast::fee_to_ppm(unit, p.fee_bps),
+                                    kind,
+                                    // CL pairs come straight from the factory's
+                                    // PoolCreated event, so they are already
+                                    // chain-ordered. V2 metadata is collapsed
+                                    // from a both-directions config list and
+                                    // has to be read from the pool itself.
+                                    verified: cl,
                                 },
                             )
                         })
                         .collect();
                     let fast_starts: Vec<Address> = {
-                        let mut t: Vec<Address> = cl_pools.iter().map(|p| p.token_in).collect();
+                        let mut t: Vec<Address> = fast_all.iter().map(|p| p.token_in).collect();
                         t.sort_unstable();
                         t.dedup();
                         t
                     };
+                    info!(
+                        cl = cl_pools.len(),
+                        v2 = v2_pools.len(),
+                        stable = v2_pools.iter().filter(|p| p.stable).count(),
+                        total = fast_pools.len(),
+                        starts = fast_starts.len(),
+                        "base fast path universe"
+                    );
                     let monitor = monitor
                         .with_chaos_gap(chaos_gap)
                         .with_sticky_pools(cl_pools)
