@@ -4196,13 +4196,10 @@ async fn collect_univ4_edges(
 }
 
 pub fn edge_pool_address(edge: &Edge) -> Option<Address> {
-    match &edge.venue {
-        VenueEdge::UniV3 { pool, .. } => Some(*pool),
-        VenueEdge::Slipstream { pool, .. } => Some(*pool),
-        VenueEdge::UniV2 { pair, .. } => Some(*pair),
-        VenueEdge::SolidlyV2 { pair, .. } => Some(*pair),
-        _ => None,
-    }
+    // One definition, on the venue itself. Two copies of this drifting apart
+    // would mean requoting and route matching disagreed about which pool an
+    // edge trades through.
+    edge.venue.pool_address()
 }
 
 fn edge_touches_pools(edge: &Edge, touched: &HashSet<Address>) -> bool {

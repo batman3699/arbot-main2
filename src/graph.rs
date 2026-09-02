@@ -1136,6 +1136,26 @@ impl Graph {
         Some(IndexedCycle { cycle, edge_indices })
     }
 
+    /// Node index for a token, if the graph knows it.
+    pub fn node_index(&self, token: Address) -> Option<usize> {
+        self.ix.get(&token).copied()
+    }
+
+    /// Whether any ACTIVE edge for this hop trades through `pool`.
+    pub fn has_edge_on_pool(&self, from: Address, to: Address, pool: Address) -> bool {
+        self.edge_lookup
+            .get(&(from, to))
+            .is_some_and(|idxs| {
+                idxs.iter().any(|&e| {
+                    self.edges
+                        .get(e)
+                        .filter(|edge| edge.active)
+                        .and_then(|edge| edge.venue.pool_address())
+                        == Some(pool)
+                })
+            })
+    }
+
     pub fn edge_between(&self, from: Address, to: Address) -> Option<&Edge> {
         self.best_edge_index(from, to).map(|idx| &self.edges[idx])
     }

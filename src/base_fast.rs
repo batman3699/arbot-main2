@@ -1141,9 +1141,10 @@ pub fn translate_for_prep(
     index: &crate::cycle_index::CycleIndex,
     graph: &crate::graph::Graph,
     priced: &[PricedCycle],
-) -> (Vec<(PricedCycle, crate::graph::IndexedCycle)>, usize) {
+) -> (Vec<(PricedCycle, crate::graph::IndexedCycle)>, TranslateStats) {
     let mut out = Vec::with_capacity(priced.len());
     let mut untranslatable = 0usize;
+    let (mut no_pair, mut other_pool, mut unknown_token) = (0usize, 0usize, 0usize);
     for c in priced {
         let Some(tokens) = index.cycle(c.id).map(|t| t.tokens.clone()) else {
             untranslatable += 1;
@@ -1158,10 +1159,76 @@ pub fn translate_for_prep(
         // means the priced route is not executable through this graph.
         match graph.indexed_cycle_for_pools(&tokens, &c.pools) {
             Some(ic) => out.push((c.clone(), ic)),
-            None => untranslatable += 1,
+            None => {
+                untranslatable += 1;
+                // WHY it failed decides what to build next, and the two causes
+                // want opposite fixes. "No edge for the pair at all" is a
+                // topology gap in the scan graph. "An edge, on another pool" is
+                // the substitution this function exists to refuse -- and means
+                // the route must be constructed rather than looked up.
+                match route_gap(graph, &tokens, &c.pools) {
+                    RouteGap::NoPair => no_pair += 1,
+                    RouteGap::OtherPool => other_pool += 1,
+                    RouteGap::UnknownToken => unknown_token += 1,
+                }
+            }
         }
     }
-    (out, untranslatable)
+    (
+        out,
+        TranslateStats { untranslatable, no_pair, other_pool, unknown_token },
+    )
+}
+
+/// Why one hop could not be translated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteGap {
+    /// A token in the cycle is absent from the graph entirely.
+    UnknownToken,
+    /// The graph has no edge for some hop's token pair, in either venue.
+    NoPair,
+    /// The graph HAS an edge for every pair but not on the pools that were
+    /// priced. This is the case that says the route must be built rather than
+    /// looked up.
+    OtherPool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranslateStats {
+    pub untranslatable: usize,
+    pub no_pair: usize,
+    pub other_pool: usize,
+    pub unknown_token: usize,
+}
+
+/// Classify the FIRST hop that stops a route from translating.
+pub fn route_gap(
+    graph: &crate::graph::Graph,
+    tokens: &[Address],
+    pools: &[Address],
+) -> RouteGap {
+    if tokens.len() != pools.len() || tokens.len() < 2 {
+        return RouteGap::UnknownToken;
+    }
+    for t in tokens {
+        if graph.node_index(*t).is_none() {
+            return RouteGap::UnknownToken;
+        }
+    }
+    for i in 0..tokens.len() {
+        let from = tokens[i];
+        let to = tokens[(i + 1) % tokens.len()];
+        match graph.edge_between(from, to) {
+            None => return RouteGap::NoPair,
+            Some(_) => {
+                if !graph.has_edge_on_pool(from, to, pools[i]) {
+                    return RouteGap::OtherPool;
+                }
+            }
+        }
+    }
+    // Every hop matched individually, so the failure was arity or ordering.
+    RouteGap::UnknownToken
 }
 
 /// What the sink did with one batch of ranked candidates.
@@ -1992,11 +2059,11 @@ impl BaseFastPath {
                 // underneath it.
                 let snapshot = graph.lock().ok().and_then(|g| g.clone());
                 let mut translated = 0usize;
-                let mut untranslatable = 0usize;
+                let mut tstats = TranslateStats::default();
                 if let Some(g) = snapshot.as_ref() {
                     let (ready, bad) = translate_for_prep(&idx, g, &priced);
                     translated = ready.len();
-                    untranslatable = bad;
+                    tstats = bad;
                     if let (Some(sink), false) = (sink.as_ref(), ready.is_empty()) {
                         match Arc::clone(&prep_slot).try_acquire_owned() {
                             Ok(permit) => {
@@ -2060,7 +2127,10 @@ impl BaseFastPath {
                     best_net_bps = best_net,
                     clearing_costs = clearing,
                     translated,
-                    untranslatable,
+                    untranslatable = tstats.untranslatable,
+                    gap_no_pair = tstats.no_pair,
+                    gap_other_pool = tstats.other_pool,
+                    gap_unknown_token = tstats.unknown_token,
                     graph_snapshot = snapshot.is_some(),
                     prep_sent,
                     prep_busy,
@@ -3086,7 +3156,7 @@ mod tests {
         );
 
         let (ready, untranslatable) = translate_for_prep(&idx, &g, &[thin]);
-        assert_eq!(untranslatable, 0);
+        assert_eq!(untranslatable.untranslatable, 0);
         assert_eq!(ready.len(), 1, "the bps bar must not delete it");
         assert_eq!(ready[0].0.gross_bps, 12.0);
         assert!(ready[0].1.cycle.first() == ready[0].1.cycle.last(), "closed loop");
@@ -3101,7 +3171,8 @@ mod tests {
         let (ready, untranslatable) =
             translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3, notional_in: 1.0, profit_native: None, pools: Vec::new() }]);
         assert!(ready.is_empty());
-        assert_eq!(untranslatable, 1);
+        assert_eq!(untranslatable.untranslatable, 1);
+        assert_eq!(untranslatable.unknown_token, 1, "the graph knows none of these tokens");
     }
 
     // ---- parallel pools ----
@@ -3732,5 +3803,68 @@ mod tests {
         let q = hop_quote_from_live(&live, &[pool], &meta, t0, t1, sized).expect("sized");
         assert!((q.num / q.den - 0.5).abs() < 1e-9, "got {}", q.num / q.den);
         assert_eq!(q.cap_out, 20.0, "impact must not touch capacity");
+    }
+
+    // ---- translation failure attribution ----
+
+    /// The two causes want opposite fixes, so they must be counted apart. "No
+    /// edge for the pair" is a topology gap in the scan graph. "An edge, on
+    /// another pool" means the route has to be BUILT rather than looked up --
+    /// and it is the case that was silently succeeding before, by substituting
+    /// a route nobody had priced.
+    #[test]
+    fn a_pair_served_by_the_wrong_pool_is_distinguished_from_a_missing_pair() {
+        let (a, b, c) = (addr(1), addr(2), addr(3));
+        let (mine, theirs) = (addr(90), addr(91));
+        let mut g = crate::graph::Graph::default();
+        let edge = |f, t, pool| crate::graph::Edge {
+            from: f,
+            to: t,
+            rate_num: U256::from(1u64),
+            rate_den: U256::from(1u64),
+            venue: crate::graph::VenueEdge::UniV3 {
+                path: vec![(f, None), (t, Some(500))],
+                pool,
+                fee: 500,
+                state: None,
+            },
+            estimated_gas: 0,
+            weight: 0,
+            max_input: U256::from(1_000u64),
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+            tick_ladder: None,
+        };
+        // Every hop exists, but on `theirs`.
+        for (f, t) in [(a, b), (b, c), (c, a)] {
+            g.add_edge(edge(f, t, theirs));
+        }
+        assert_eq!(
+            route_gap(&g, &[a, b, c], &[mine, mine, mine]),
+            RouteGap::OtherPool,
+            "the pair is served, just not by the pool we priced"
+        );
+        assert_eq!(
+            route_gap(&g, &[a, b, c], &[theirs, theirs, theirs]),
+            RouteGap::UnknownToken,
+            "every hop matches, so nothing here explains a failure"
+        );
+
+        // Drop one hop entirely: now it is a topology gap, not a pool mismatch.
+        let mut sparse = crate::graph::Graph::default();
+        sparse.add_edge(edge(a, b, theirs));
+        sparse.add_node(c);
+        assert_eq!(
+            route_gap(&sparse, &[a, b, c], &[theirs, theirs, theirs]),
+            RouteGap::NoPair
+        );
+
+        // A token the graph has never seen is neither of the above.
+        assert_eq!(
+            route_gap(&g, &[a, b, addr(999)], &[mine, mine, mine]),
+            RouteGap::UnknownToken
+        );
     }
 }
