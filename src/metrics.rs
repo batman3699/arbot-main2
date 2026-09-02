@@ -43,13 +43,18 @@ pub struct Metrics {
     /// a venue is emitting something we do not understand — most likely
     /// PancakeSwap V3, which is deliberately not decoded.
     pub live_state_undecodable: Counter,
-    /// Mint/Burn deltas dropped because the pool's base snapshot was
-    /// invalidated by a websocket gap. The running cost of every gap.
+    /// Mint/Burn deltas DEFERRED because the pool's base snapshot was
+    /// invalidated by a websocket gap. Since the delta buffer landed these are
+    /// held and replayed by the next anchor, not discarded -- only the
+    /// buffer-overflow path loses one, and `live_state_lost_updates` counts
+    /// that. Do not read this as data loss.
     pub live_state_untrusted_base: Counter,
     /// Pools restored to trust by an RPC read rather than by trading.
     pub live_state_anchors: Counter,
-    /// Deltas confirmed lost to the anchor window: dropped for want of a
-    /// trusted base at a block ABOVE the anchor's, so contained in neither.
+    /// ANCHORS that found at least one delta lost to their window -- a per-anchor
+    /// flag, not a delta count. One anchor that lost fifty deltas increments this
+    /// once. Named for what it counts, because an error bound computed from it as
+    /// though it were a delta count would be wrong.
     pub live_state_lost_updates: Gauge,
     /// Deltas replayed onto an anchor because they arrived during its read and
     /// are outside its end-of-block state.
@@ -61,6 +66,10 @@ pub struct Metrics {
     /// absolute value. This is the residual, measured continuously instead of
     /// waiting for the sampled validator to happen upon it.
     pub live_state_swap_audit_mismatches: Gauge,
+    /// Audits that actually had accumulated Mint/Burn to test. The ONLY valid
+    /// denominator for an arithmetic error bound -- `live_state_swap_audits`
+    /// includes consecutive swaps that compare a value against itself.
+    pub live_state_swap_audits_accumulated: Gauge,
     /// Logs dropped because an anchor had already carried the pool past them.
     /// Expected traffic; a spike means anchoring is running too far ahead of
     /// the log stream.
@@ -224,7 +233,7 @@ impl Metrics {
 
         let live_state_lost_updates = Gauge::with_opts(Opts::new(
             "live_state_lost_updates",
-            "Deltas lost between an anchor's read block and its install",
+            "Anchors that found at least one delta lost to the anchor window",
         ))?;
         registry
             .register(Box::new(live_state_lost_updates.clone()))
@@ -254,6 +263,14 @@ impl Metrics {
             .register(Box::new(live_state_swap_audit_mismatches.clone()))
             .context("register live_state_swap_audit_mismatches gauge")?;
 
+        let live_state_swap_audits_accumulated = Gauge::with_opts(Opts::new(
+            "live_state_swap_audits_accumulated",
+            "Audits with accumulated Mint/Burn to test; the valid error-bound denominator",
+        ))?;
+        registry
+            .register(Box::new(live_state_swap_audits_accumulated.clone()))
+            .context("register live_state_swap_audits_accumulated gauge")?;
+
         let live_state_anchors = Counter::with_opts(Opts::new(
             "live_state_anchors_total",
             "Pools anchored from a block-pinned RPC read",
@@ -280,7 +297,7 @@ impl Metrics {
 
         let live_state_untrusted_base = Counter::with_opts(Opts::new(
             "live_state_untrusted_base_total",
-            "Liquidity deltas dropped because the base snapshot was invalidated by a gap",
+            "Liquidity deltas DEFERRED for replay because the base was invalidated by a gap",
         ))?;
         registry
             .register(Box::new(live_state_untrusted_base.clone()))
@@ -740,6 +757,7 @@ impl Metrics {
             live_state_replayed_deltas,
             live_state_swap_audits,
             live_state_swap_audit_mismatches,
+            live_state_swap_audits_accumulated,
             ingestion_resubscribes_avoided,
             live_state_applied,
             live_state_undecodable,

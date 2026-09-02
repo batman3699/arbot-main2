@@ -300,6 +300,14 @@ where
     /// shrinking pool set is adopted without resubscribing, so the filter stays
     /// wider than the list until something genuinely new appears.
     subscribed: Arc<RwLock<HashSet<Address>>>,
+    /// Where the next anchor scan starts.
+    ///
+    /// `load_cl_pool_states_batched` silently omits any pool it cannot read --
+    /// notably one whose in-range liquidity is 0, a self-sustaining state on a
+    /// quiet pool. Such a pool never gains trust, so a fixed-order prefix scan
+    /// re-selects it every cycle forever and the pools behind it are never
+    /// reached. Rotating means no pool can hold a slot permanently.
+    anchor_cursor: Arc<std::sync::atomic::AtomicUsize>,
     /// Pools that survive every `set_pools`.
     ///
     /// The univ2 hot-pool refresh rebuilds the monitored set from scratch and
@@ -345,6 +353,7 @@ where
             ws_backoff: Duration::from_secs(5),
             chaos_gap_interval: None,
             subscribed: Arc::new(RwLock::new(HashSet::new())),
+            anchor_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -681,8 +690,13 @@ where
         cap: usize,
     ) -> Vec<MonitoredPool> {
         use crate::live_state::may_price_locally;
-        pools
+        if pools.is_empty() {
+            return Vec::new();
+        }
+        let start = self.anchor_cursor.load(Ordering::Relaxed) % pools.len();
+        let picked: Vec<MonitoredPool> = pools[start..]
             .iter()
+            .chain(pools[..start].iter())
             .filter(|p| matches!(p.kind, PoolMonitorKind::ConcentratedLiquidity))
             .filter(|p| match live.cl_snapshot(p.pair) {
                 None => true,
@@ -690,7 +704,12 @@ where
             })
             .take(cap)
             .cloned()
-            .collect()
+            .collect();
+        // Advance past this window so the next cycle cannot re-pick the same
+        // prefix, whether or not these pools end up readable.
+        self.anchor_cursor
+            .store(start + cap.max(1), Ordering::Relaxed);
+        picked
     }
 
     /// Anchor V2 pools that cannot recover on their own.
@@ -717,8 +736,7 @@ where
                 None => true,
                 Some(s) => !may_price_locally(&s.prov.trust),
             };
-            if needs {
-                live.anchor_v2(*pair, block.as_u64(), state.clone());
+            if needs && live.anchor_v2(*pair, block.as_u64(), state.clone()) {
                 if let Some(m) = &self.metrics {
                     m.live_state_anchors.inc();
                 }
@@ -753,15 +771,17 @@ where
             crate::cl_sim::load_cl_pool_states_batched(self.provider.clone(), &request, block)
                 .await;
         for (pool, state) in states.iter() {
-            live.anchor_cl(
+            let installed = live.anchor_cl(
                 *pool,
                 block.as_u64(),
                 state.sqrt_price_x96,
                 state.liquidity,
                 state.tick,
             );
-            if let Some(m) = &self.metrics {
-                m.live_state_anchors.inc();
+            if installed {
+                if let Some(m) = &self.metrics {
+                    m.live_state_anchors.inc();
+                }
             }
         }
         debug!(
@@ -1855,12 +1875,14 @@ mod tests {
         // Measured 2026-09-01 on the divergent pool: ~10 in-range position
         // events per block, Base blocks ~2s.
         const DELTAS_PER_SEC: f64 = 5.0;
-        const CAP: f64 = 256.0;
+        // Read the REAL constant, not a copy: the invariant binds the budget to
+        // the buffer, so a change to either must be able to break this test.
+        let cap = crate::live_state::PENDING_DELTA_CAP as f64;
 
         let cycles_per_sec = 1000.0 / POLL_MS;
         let drain_secs = POOLS / (PoolMonitor::<MockProvider>::ANCHOR_BUDGET_PER_CYCLE as f64
             * cycles_per_sec);
-        let headroom_secs = CAP / DELTAS_PER_SEC;
+        let headroom_secs = cap / DELTAS_PER_SEC;
         assert!(
             drain_secs < headroom_secs,
             "a full drain takes {drain_secs:.0}s but the hottest pool overflows its \

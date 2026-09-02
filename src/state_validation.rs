@@ -256,9 +256,10 @@ where
         let st = gate.stats();
         m.live_state_lost_updates.set(live.lost_updates() as f64);
         m.live_state_replayed_deltas.set(live.replayed_deltas() as f64);
-        let (audits, mismatches) = live.swap_audit_counts();
+        let (audits, mismatches, accumulated) = live.swap_audit_counts();
         m.live_state_swap_audits.set(audits as f64);
         m.live_state_swap_audit_mismatches.set(mismatches as f64);
+        m.live_state_swap_audits_accumulated.set(accumulated as f64);
         m.live_state_trusted.set(st.trusted as f64);
         // FAILED only. An expired pass is not evidence of anything wrong.
         m.live_state_untrusted.set(st.failed as f64);

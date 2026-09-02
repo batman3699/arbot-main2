@@ -69,7 +69,7 @@ pub enum TrustState {
 /// Bounds memory against a pool that never regains trust. Past it we fall back
 /// to dropping, and `live_state_lost_updates` counts what that costs -- so the
 /// number means "genuinely lost", not "briefly deferred".
-const PENDING_DELTA_CAP: usize = 256;
+pub(crate) const PENDING_DELTA_CAP: usize = 256;
 
 /// Ceiling on the per-pool applied-delta trace. Bounds memory on a pool that
 /// goes a long time without an absolute write; past it the dump says so rather
@@ -203,6 +203,7 @@ pub struct LiveState {
     lost_updates: AtomicU64,
     replayed_deltas: AtomicU64,
     swap_audits: AtomicU64,
+    swap_audits_accumulated: AtomicU64,
     swap_audit_mismatches: AtomicU64,
     /// Bumped on every accepted application and on every epoch change. Phase 2
     /// uses this for `ScanSnapshot` generation validation (spec §4.2).
@@ -376,7 +377,8 @@ impl LiveState {
         Some(snap)
     }
 
-    pub fn anchor_v2(&self, pool: Address, block: u64, state: UniV2PairState) {
+    /// Returns whether the anchor was actually installed. See `anchor_cl`.
+    pub fn anchor_v2(&self, pool: Address, block: u64, state: UniV2PairState) -> bool {
         // The only writer that does not pass through `apply_log`, so it needs
         // the same per-pool ordering check AND the same serialisation: without
         // the lock a concurrent delta can pass its own check against the
@@ -391,7 +393,7 @@ impl LiveState {
                 block,
                 "anchor refused: the pool already holds newer state"
             );
-            return;
+            return false;
         }
         self.note_anchor_window(pool, block);
         let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
@@ -404,8 +406,11 @@ impl LiveState {
         );
         self.v2.insert(pool, Arc::new(V2Snapshot { state, prov }));
         self.generation.fetch_add(1, Ordering::SeqCst);
+        true
     }
 
+    /// Returns whether the anchor was actually installed; a refusal by the
+    /// `supersedes` guard is not an anchor and must not be counted as one.
     pub fn anchor_cl(
         &self,
         pool: Address,
@@ -413,7 +418,7 @@ impl LiveState {
         sqrt_price_x96: U256,
         liquidity: u128,
         tick: i32,
-    ) {
+    ) -> bool {
         // The only writer that does not pass through `apply_log`, so it needs
         // the same per-pool ordering check AND the same serialisation: without
         // the lock a concurrent delta can pass its own check against the
@@ -428,7 +433,7 @@ impl LiveState {
                 block,
                 "anchor refused: the pool already holds newer state"
             );
-            return;
+            return false;
         }
         self.note_anchor_window(pool, block);
         let version = self.next_version.fetch_add(1, Ordering::SeqCst) + 1;
@@ -449,6 +454,7 @@ impl LiveState {
         // want of a trusted base. Without this the anchor closes the trust gap
         // and opens a correctness one.
         self.replay_pending(pool, block);
+        true
     }
 
     /// Re-apply deltas the anchor does not already contain.
@@ -503,6 +509,15 @@ impl LiveState {
             );
             self.generation.fetch_add(1, Ordering::SeqCst);
             self.note_applied_block(ordinal.block);
+            // Mirrors apply_log's push. Without it the FIRST audit after an
+            // anchor -- the one that puts the anchor+replay arithmetic on trial
+            // -- prints a trace missing precisely the replayed deltas, and a
+            // dump that under-reports reads as "we applied nothing".
+            let mut trace = self.applied_since_absolute.entry(pool).or_default();
+            if trace.len() < APPLIED_TRACE_CAP {
+                trace.push((ordinal, d.liquidity_delta));
+            }
+            drop(trace);
             self.publish(pool, version);
             applied += 1;
         }
@@ -575,6 +590,13 @@ impl LiveState {
             return;
         }
         self.swap_audits.fetch_add(1, Ordering::SeqCst);
+        // A rule-of-three bound on the Mint/Burn arithmetic is only valid over
+        // audits that actually TESTED that arithmetic. Two consecutive Swaps
+        // with nothing between them compare a value against itself and pass by
+        // construction, inflating the denominator.
+        if existing.prov.source == SnapshotSource::Liquidity {
+            self.swap_audits_accumulated.fetch_add(1, Ordering::SeqCst);
+        }
         if existing.liquidity == d.liquidity {
             return;
         }
@@ -613,11 +635,16 @@ impl LiveState {
         );
     }
 
-    /// Swaps that qualified as an audit, and how many disagreed.
-    pub fn swap_audit_counts(&self) -> (u64, u64) {
+    /// Swaps that qualified as an audit, how many disagreed, and how many
+    /// actually had accumulated Mint/Burn to test.
+    ///
+    /// The third is the only valid denominator for an error bound: the others
+    /// include comparisons of a value against itself.
+    pub fn swap_audit_counts(&self) -> (u64, u64, u64) {
         (
             self.swap_audits.load(Ordering::SeqCst),
             self.swap_audit_mismatches.load(Ordering::SeqCst),
+            self.swap_audits_accumulated.load(Ordering::SeqCst),
         )
     }
 
@@ -1000,6 +1027,16 @@ mod tests {
         let snap = ls.cl_snapshot(pool).unwrap();
         assert!(may_price_locally(&snap.prov.trust));
         assert_eq!(snap.liquidity, 2_000_000);
+        // The Swap landed on an INVALIDATED base, so the audit must have
+        // declined it. Without this assertion the untrusted-base exclusion in
+        // `audit_against_swap` could be deleted and no test would fail, while
+        // the mismatch metric silently filled with disagreements the gap
+        // already explains.
+        assert_eq!(
+            ls.swap_audit_counts(),
+            (0, 0, 0),
+            "a stale base disagrees for reasons that are not the arithmetic"
+        );
     }
 
     /// When the audit fires, the dump must name exactly the deltas applied
@@ -1062,11 +1099,21 @@ mod tests {
 
         // The chain says 1_000_500 too: our accumulation was right.
         ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_500, 0, 102, 0));
-        assert_eq!(ls.swap_audit_counts(), (1, 0));
+        assert_eq!(
+            ls.swap_audit_counts(),
+            (1, 0, 1),
+            "one audit, no mismatch, and it DID have accumulation to test"
+        );
 
         // Now the chain disagrees — exactly what a lost Mint looks like.
         ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_777_000, 0, 103, 0));
-        assert_eq!(ls.swap_audit_counts(), (2, 1));
+        let (audits, mismatches, accumulated) = ls.swap_audit_counts();
+        assert_eq!((audits, mismatches), (2, 1));
+        assert_eq!(
+            accumulated, 1,
+            "the second audit followed a Swap with nothing between, so it tested \
+             nothing and must not inflate the error-bound denominator"
+        );
     }
 
     /// A moved tick means a boundary was crossed, which changes in-range
@@ -1080,7 +1127,7 @@ mod tests {
         ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 4_000_000, 7, 101, 0));
         assert_eq!(
             ls.swap_audit_counts(),
-            (0, 0),
+            (0, 0, 0),
             "a tick crossing legitimately changes liquidity"
         );
     }
@@ -1093,7 +1140,7 @@ mod tests {
         let pool = Address::from_low_u64_be(63);
         ls.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000_000, 0);
         ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 9_999_999, 0, 101, 0));
-        assert_eq!(ls.swap_audit_counts(), (0, 0));
+        assert_eq!(ls.swap_audit_counts(), (0, 0, 0));
     }
 
     /// Deadlock guard for the widened lock. `apply_log` takes state_write then
@@ -1224,6 +1271,21 @@ mod tests {
         );
         assert_eq!(ls.replayed_deltas(), 1);
         assert_eq!(ls.lost_updates(), 0, "nothing was lost");
+        // The trace must include the REPLAYED delta. Without this the first
+        // audit after an anchor -- the one that puts anchor+replay arithmetic
+        // on trial -- dumps a window missing precisely what replay applied.
+        assert_eq!(
+            ls.applied_trace(pool),
+            vec![(
+                Ordinal {
+                    block: 106,
+                    tx_index: 0,
+                    log_index: 0
+                },
+                500i128
+            )],
+            "a replayed delta belongs in the audit window it will be audited in"
+        );
     }
 
     /// The other half, and the one that would double-count if got wrong: a
@@ -1258,13 +1320,20 @@ mod tests {
         let pool = Address::from_low_u64_be(83);
         ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
         ls.break_continuity(UnknownReason::WsUnavailable);
-        for (blk, amt) in [(106u64, 500u128), (107, 700), (108, 900)] {
-            ls.apply_log(&liquidity_log(pool, true, -60, 60, amt, blk, 0));
-        }
+        // A sum of positive Mints is commutative, so it cannot detect
+        // misordering. The middle Burn is large enough to CLAMP at zero if it
+        // is replayed before the Mint below it, which makes the final value
+        // order-sensitive: in order 1_000, any other order 1_400.
+        ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 106, 0));
+        ls.apply_log(&liquidity_log(pool, false, -60, 60, 2_000_400, 107, 0));
+        ls.apply_log(&liquidity_log(pool, true, -60, 60, 900, 108, 0));
         ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 2_000_000, 0);
 
         let snap = ls.cl_snapshot(pool).unwrap();
-        assert_eq!(snap.liquidity, 2_000_000 + 500 + 700 + 900);
+        assert_eq!(
+            snap.liquidity, 1_000,
+            "2_000_000 +500 -2_000_400 +900; any other order clamps and gives 1_400"
+        );
         assert_eq!(ls.replayed_deltas(), 3);
         assert_eq!(snap.prov.ordinal.unwrap().block, 108);
     }
@@ -1315,16 +1384,26 @@ mod tests {
         ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
         ls.break_continuity(UnknownReason::WsUnavailable);
 
-        assert_eq!(
-            ls.apply_log(&liquidity_log(pool, true, -60, 60, 500, 104, 0)),
-            ApplyOutcome::UntrustedBase
-        );
+        // Overflow the buffer so `dropped_while_untrusted` is actually
+        // populated -- otherwise the assertion below holds because nothing was
+        // ever recorded, not because the boundary classified it correctly.
+        // Every evicted block is AT OR BELOW the anchor's, so the anchor's
+        // end-of-block read contains them and nothing is lost.
+        for i in 0..(PENDING_DELTA_CAP as u64 + 10) {
+            ls.apply_log(&liquidity_log(pool, true, -60, 60, 1, 90 + (i % 15), 0));
+        }
         ls.anchor_cl(pool, 105, U256::from(1u64) << 96, 2_000_000, 0);
 
         assert_eq!(
             ls.lost_updates(),
             0,
-            "a block-104 delta is inside end-of-block-105 state"
+            "every dropped block is at or below 105, so end-of-block-105 state \
+             already contains them"
+        );
+        assert_eq!(
+            ls.cl_snapshot(pool).unwrap().liquidity,
+            2_000_000,
+            "and nothing above the anchor exists to replay"
         );
     }
 
@@ -1347,6 +1426,7 @@ mod tests {
         const TRIALS: usize = 500;
         let mut violations = 0;
         let mut observed = std::collections::BTreeMap::new();
+        let mut outcomes = std::collections::BTreeMap::new();
         for _ in 0..TRIALS {
             let ls = StdArc::new(LiveState::new());
             let pool = Address::from_low_u64_be(70);
@@ -1357,14 +1437,15 @@ mod tests {
             let (g1, g2) = (gate.clone(), gate.clone());
             let t1 = std::thread::spawn(move || {
                 g1.wait();
-                a.apply_log(&liquidity_log(pool, true, -60, 60, 500, 101, 0));
+                a.apply_log(&liquidity_log(pool, true, -60, 60, 500, 101, 0))
             });
             let t2 = std::thread::spawn(move || {
                 g2.wait();
                 b.anchor_cl(pool, 200, U256::from(1u64) << 96, 9_000_000, 0);
             });
-            t1.join().unwrap();
+            let mint_outcome = t1.join().unwrap();
             t2.join().unwrap();
+            *outcomes.entry(format!("{mint_outcome:?}")).or_insert(0usize) += 1;
 
             let snap = ls.cl_snapshot(pool).unwrap();
             *observed.entry(snap.liquidity).or_insert(0usize) += 1;
@@ -1376,6 +1457,14 @@ mod tests {
             violations, 0,
             "{violations}/{TRIALS} interleavings lost the anchor. \
              Final liquidity values seen: {observed:?}"
+        );
+        // Witness that a race was actually exercised. Both interleavings
+        // converge on the same final state, so without this the test would pass
+        // unchanged against a single-threaded stub that never raced at all.
+        assert!(
+            outcomes.len() > 1,
+            "every trial took the same path ({outcomes:?}); the race was never \
+             exercised and this test proves nothing"
         );
     }
 
