@@ -287,7 +287,7 @@ impl BaseFastPath {
 /// pool fee, which for UniV3-style venues is PARTS PER MILLION -- 3_000 means
 /// 0.30%, not 30%. The existing field name is a 10x error waiting to be made,
 /// so this one states its unit and converts explicitly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PoolMeta {
     pub token0: Address,
     pub token1: Address,
@@ -320,6 +320,20 @@ pub struct PoolMeta {
     /// only move on events this feed subscribes to. What this bounds is how
     /// long an UNCHECKED assumption is allowed to stand.
     pub confirmed_at: Option<Instant>,
+    /// A CL pool's real `balanceOf` holdings, `(token0, token1)`, as of the
+    /// last chain read. `None` means unknown, and unknown must bound nothing.
+    ///
+    /// Balances and not `liquidity`. `liquidity` with `sqrt_price_x96` gives
+    /// the VIRTUAL reserves of the constant-product curve the pool is tangent
+    /// to, which runs 0..infinity far outside the ticks actually holding
+    /// anything -- measured on Base it overstates real holdings by 16-56x on
+    /// deep WETH/USDC and by orders of magnitude on thin pools. Using it as
+    /// depth would re-create the exact bias this ranking exists to remove, and
+    /// would do it worst on precisely the dust pools.
+    ///
+    /// V2 pools carry no balances here: their reserves ARE their holdings and
+    /// come off the live snapshot, always fresher than a rotation pass.
+    pub balances: Option<(f64, f64)>,
 }
 
 /// Which curve a pool trades on.
@@ -661,7 +675,22 @@ pub fn rate_from_live_with(
     fresh: Freshness,
     select: HopSelect,
 ) -> Option<(f64, f64)> {
-    let mut best: Option<(f64, f64)> = None;
+    hop_quote_from_live(live, candidate_pools, pool_tokens, from, to, fresh, select)
+        .map(|q| (q.num, q.den))
+}
+
+/// As `rate_from_live_with`, keeping the depth behind the chosen pool.
+#[allow(clippy::too_many_arguments)]
+pub fn hop_quote_from_live(
+    live: &LiveState,
+    candidate_pools: &[Address],
+    pool_tokens: &dashmap::DashMap<Address, PoolMeta>,
+    from: Address,
+    to: Address,
+    fresh: Freshness,
+    select: HopSelect,
+) -> Option<HopQuote> {
+    let mut best: Option<HopQuote> = None;
     let mut best_rate = f64::NEG_INFINITY;
     for pool in candidate_pools {
         let Some(meta) = pool_tokens.get(pool) else {
@@ -670,18 +699,24 @@ pub fn rate_from_live_with(
         if !fresh.allows(meta.confirmed_at) {
             continue;
         }
-        let Some((num, den)) = hop_rate(live, *pool, &meta, from, to) else {
+        let Some(q) = hop_rate(live, *pool, &meta, from, to) else {
             continue;
         };
         if select == HopSelect::FirstMatch {
-            return Some((num, den));
+            return Some(q);
         }
-        let rate = num / den;
+        let rate = q.num / q.den;
         // `>` not `>=`: on a tie the first pool wins, which keeps the result
         // independent of the order `pools_for_hop` happens to return.
+        //
+        // Note this still maximises RATE, not value. Depth does not choose the
+        // pool; it bounds the cycle afterwards. Rate-blind pool choice is a
+        // deliberate limit -- picking the deepest pool per hop would trade away
+        // the edge, and picking on value needs a numeraire this function does
+        // not have. The bound is what stops a dust pool topping the ranking.
         if rate.is_finite() && rate > best_rate {
             best_rate = rate;
-            best = Some((num, den));
+            best = Some(q);
         }
     }
     best
@@ -697,7 +732,7 @@ fn hop_rate(
     meta: &PoolMeta,
     from: Address,
     to: Address,
-) -> Option<(f64, f64)> {
+) -> Option<HopQuote> {
     use crate::live_state::may_price_locally;
     let (token0, token1) = (meta.token0, meta.token1);
     // Charged once, here, so `gross_bps` downstream is already net of pool
@@ -726,7 +761,18 @@ fn hop_rate(
             if !price.is_finite() || price <= 0.0 {
                 return None;
             }
-            Some(if forward { (price * keep, 1.0) } else { (keep, price) })
+            // Unknown balances bound nothing: `INFINITY` lets another hop
+            // bind the cycle, and `price_cycle_sized` refuses a cycle no hop
+            // bounds at all rather than calling it infinitely large.
+            let cap_out = match meta.balances {
+                Some((b0, b1)) => {
+                    let c = if forward { b1 } else { b0 };
+                    if c.is_finite() && c > 0.0 { c } else { return None }
+                }
+                None => f64::INFINITY,
+            };
+            let (num, den) = if forward { (price * keep, 1.0) } else { (keep, price) };
+            Some(HopQuote { num, den, cap_out })
         }
         PoolKind::ConstantProduct => {
             let snap = live.v2_snapshot(pool)?;
@@ -751,7 +797,11 @@ fn hop_rate(
             if !(r0.is_finite() && r1.is_finite()) || r0 <= 0.0 || r1 <= 0.0 {
                 return None;
             }
-            Some(if forward { (r1 * keep, r0) } else { (r0 * keep, r1) })
+            // A V2 pool's reserves are its holdings, so the output side is
+            // the bound directly -- and it is live, not rotation-stale.
+            let cap_out = if forward { r1 } else { r0 };
+            let (num, den) = if forward { (r1 * keep, r0) } else { (r0 * keep, r1) };
+            Some(HopQuote { num, den, cap_out })
         }
         // `r1/r0` is not this curve's marginal price. Applying it to a stable
         // pool produced a 163% phantom edge in the 2026-09-01 spread census,
@@ -781,6 +831,89 @@ pub async fn simulate_preconf(
     Ok(parse_simulate_v1(&raw))
 }
 
+/// One hop's rate and the depth behind it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HopQuote {
+    pub num: f64,
+    pub den: f64,
+    /// Raw units of the OUTPUT token the pool actually holds.
+    ///
+    /// `f64::INFINITY` means unknown, and that has to be a deliberate choice at
+    /// the call site rather than a default: an unbounded hop cannot bind the
+    /// cycle's size, so an unknown depth silently makes a cycle look as large
+    /// as its second-thinnest hop allows.
+    pub cap_out: f64,
+}
+
+/// Share of a pool's holdings treated as reachable.
+///
+/// NOT a sizing model -- `prepare_candidate` owns that, with real quotes. This
+/// is a bound whose only job is to stop the ranker preferring dust. Taking a
+/// whole pool would move its price to the point where the edge is gone, so a
+/// small fraction is the honest reading of "how much of this pool is usable".
+pub const DEPTH_FRACTION: f64 = 0.01;
+
+/// What one cycle looks like once depth is accounted for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SizedCycle {
+    /// Product of the loop's rates minus one, in bps. Unchanged by depth.
+    pub gross_bps: f64,
+    /// Largest input, in units of `tokens[0]`, that no hop's depth forbids.
+    pub notional_in: f64,
+}
+
+/// Price a loop AND bound how much it can carry.
+///
+/// The size question is the one bps cannot answer. Walking forward with input
+/// `x`, the amount arriving at hop `i` is `x * R_i` where `R_i` is the product
+/// of rates up to that hop, and it cannot exceed what that pool holds of the
+/// token it must pay out. So `x <= cap_i / R_i` for every hop, and the binding
+/// one is the minimum.
+///
+/// This is what separates a 12 bps edge on a deep pool from a 120 bps edge on
+/// one holding forty dollars. Measured on 2026-09-03, ranking without it made
+/// the selection rule responsible for 70.8% of reported gross: taking the best
+/// rate at each hop reliably found the thinnest pool on every pair.
+pub fn price_cycle_sized<F>(tokens: &[Address], quote_of: F) -> Option<SizedCycle>
+where
+    F: Fn(Address, Address) -> Option<HopQuote>,
+{
+    if tokens.len() < 2 {
+        return None;
+    }
+    let mut product = 1.0f64;
+    let mut notional = f64::INFINITY;
+    for i in 0..tokens.len() {
+        let from = tokens[i];
+        let to = tokens[(i + 1) % tokens.len()];
+        let q = quote_of(from, to)?;
+        if !q.den.is_finite() || !q.num.is_finite() || q.den <= 0.0 {
+            return None;
+        }
+        product *= q.num / q.den;
+        if !product.is_finite() || product <= 0.0 {
+            return None;
+        }
+        // `cap_out` is a bound on the amount LEAVING this hop, and `product`
+        // is exactly the amount leaving it per unit of input.
+        if q.cap_out.is_finite() {
+            let allowed = q.cap_out * DEPTH_FRACTION / product;
+            if allowed.is_finite() {
+                notional = notional.min(allowed);
+            }
+        }
+    }
+    // An entirely unbounded cycle is not "infinitely large", it is unmeasured.
+    // Reporting infinity here would rank it above every real opportunity.
+    if !notional.is_finite() || notional <= 0.0 {
+        return None;
+    }
+    Some(SizedCycle {
+        gross_bps: (product - 1.0) * 10_000.0,
+        notional_in: notional,
+    })
+}
+
 /// A cycle priced from cached edges, before costs.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PricedCycle {
@@ -790,6 +923,26 @@ pub struct PricedCycle {
     /// positive value is a candidate, not a profit.
     pub gross_bps: f64,
     pub hops: usize,
+    /// Largest input, in raw units of the start token, that no hop's depth
+    /// forbids.
+    pub notional_in: f64,
+    /// `notional_in * gross` converted to native units, or `None` when the
+    /// start token has no reliable price. A percentage cannot be compared
+    /// across cycles that start in different tokens; this can.
+    pub profit_native: Option<f64>,
+}
+
+/// What a ranking was actually sorted by.
+///
+/// Reported because the two are not interchangeable and a run sorted by
+/// percentage must never be read as one sorted by value. Percentage ranking is
+/// what made the selection rule responsible for 70.8% of reported gross.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankBasis {
+    /// Expected gross profit in native units.
+    Native,
+    /// Basis points only: no start token had a reliable price.
+    Bps,
 }
 
 /// Price one token loop from cached edges.
@@ -837,11 +990,12 @@ where
 pub fn price_touched<F>(
     index: &crate::cycle_index::CycleIndex,
     ids: &[crate::cycle_index::CycleId],
-    rate_of: F,
+    quote_of: F,
+    prices: Option<&std::collections::HashMap<Address, f64>>,
     top_n: usize,
-) -> (Vec<PricedCycle>, usize)
+) -> (Vec<PricedCycle>, usize, RankBasis)
 where
-    F: Fn(Address, Address) -> Option<(f64, f64)>,
+    F: Fn(Address, Address) -> Option<HopQuote>,
 {
     let mut priced = Vec::with_capacity(ids.len().min(top_n * 4));
     let mut unpriceable = 0usize;
@@ -850,24 +1004,49 @@ where
             unpriceable += 1;
             continue;
         };
-        match price_cycle(&cycle.tokens, &rate_of) {
-            Some(gross_bps) => priced.push(PricedCycle {
-                id: *id,
-                gross_bps,
-                hops: cycle.tokens.len(),
-            }),
+        match price_cycle_sized(&cycle.tokens, &quote_of) {
+            Some(sized) => {
+                let start = cycle.tokens[0];
+                let profit_native = prices
+                    .and_then(|p| p.get(&start).copied())
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .map(|px| sized.notional_in * (sized.gross_bps / 10_000.0) * px)
+                    .filter(|v| v.is_finite());
+                priced.push(PricedCycle {
+                    id: *id,
+                    gross_bps: sized.gross_bps,
+                    hops: cycle.tokens.len(),
+                    notional_in: sized.notional_in,
+                    profit_native,
+                });
+            }
             None => unpriceable += 1,
         }
     }
+
+    // Value if any cycle can be valued, percentage only if none can. Mixing the
+    // two would rank a large number of a worthless token above a small number
+    // of a valuable one, which is the failure this replaces in a new costume.
+    let basis = if priced.iter().any(|c| c.profit_native.is_some()) {
+        RankBasis::Native
+    } else {
+        RankBasis::Bps
+    };
     priced.sort_by(|a, b| {
-        b.gross_bps
-            .partial_cmp(&a.gross_bps)
+        let key = |c: &PricedCycle| match basis {
+            // Unvalued cycles sort last under a Native basis rather than being
+            // dropped: they are a coverage gap in the price map, not bad trades.
+            RankBasis::Native => c.profit_native.unwrap_or(f64::NEG_INFINITY),
+            RankBasis::Bps => c.gross_bps,
+        };
+        key(b)
+            .partial_cmp(&key(a))
             .unwrap_or(std::cmp::Ordering::Equal)
             // Shorter loops break ties: less gas, fewer legs to fail.
             .then(a.hops.cmp(&b.hops))
     });
     priced.truncate(top_n);
-    (priced, unpriceable)
+    (priced, unpriceable, basis)
 }
 
 /// Translate priced cycles into the indexed form `prepare_candidate` takes.
@@ -928,6 +1107,24 @@ pub struct PrepReport {
     /// prepared at all. Distinct from `rejected`: one is an answer and the
     /// other is the absence of one.
     pub no_context: bool,
+}
+
+/// A value the scan publishes once per pass for readers running between scans.
+///
+/// `Option` because nothing is published until the first scan completes, and
+/// the inner `Arc` so a reader takes a consistent snapshot without holding the
+/// lock across its work.
+pub type Published<T> = Arc<StdMutex<Option<Arc<T>>>>;
+
+/// Native (wei) per RAW unit of each token.
+pub type TokenPrices = std::collections::HashMap<Address, f64>;
+
+/// The scan-published inputs the drain reads each pass.
+pub struct DrainFeeds {
+    pub graph: Published<crate::graph::Graph>,
+    /// Without prices, cycles starting in different tokens can only be compared
+    /// by percentage -- which is the thing depth ranking exists to stop.
+    pub prices: Published<TokenPrices>,
 }
 
 /// Where the fast path hands its ranked candidates.
@@ -1288,6 +1485,19 @@ impl BaseFastPath {
                         ) {
                             out.anchored += 1;
                         }
+                        // Real holdings, for the depth bound. Fails closed:
+                        // a balance read that did not come back leaves `None`,
+                        // and `None` bounds nothing rather than bounding wrong.
+                        let bal = match (st.balance0, st.balance1) {
+                            (Some(b0), Some(b1)) => match (u256_to_f64(b0), u256_to_f64(b1)) {
+                                (Some(a), Some(b)) => Some((a, b)),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(mut m) = self.pool_tokens.get_mut(pool) {
+                            m.balances = bal;
+                        }
                         self.mark_confirmed(*pool);
                     }
                     None => out.missing += 1,
@@ -1518,6 +1728,18 @@ impl BaseFastPath {
         tokio::spawn(async move { self.run().await })
     }
 
+    /// What the scan publishes for the drain to read.
+    ///
+    /// Grouped rather than passed separately because they must be read
+    /// TOGETHER: a cycle translated against one graph and valued against a
+    /// price map from a different scan is two inconsistent views of one market.
+    pub fn drain_feeds(
+        graph: Published<crate::graph::Graph>,
+        prices: Published<TokenPrices>,
+    ) -> DrainFeeds {
+        DrainFeeds { graph, prices }
+    }
+
     /// Drain the dirty set on a fixed cadence and resolve it to cycles.
     ///
     /// Logs go to `arb_exec::latency`, NOT a bare `latency` target. HANDOFF.md
@@ -1539,11 +1761,12 @@ impl BaseFastPath {
         self: Arc<Self>,
         universe: Arc<crate::cycle_index::PoolUniverse>,
         index: Arc<StdMutex<Option<crate::cycle_index::CycleIndex>>>,
-        graph: Arc<StdMutex<Option<Arc<crate::graph::Graph>>>>,
+        feeds: DrainFeeds,
         sink: Option<CandidateSink>,
         cadence: Duration,
         max_cycles: usize,
     ) -> JoinHandle<()> {
+        let DrainFeeds { graph, prices } = feeds;
         tokio::spawn(async move {
             let costs = CostStack::from_env();
             // One batch in preparation at a time, and NEVER awaited on this
@@ -1609,19 +1832,22 @@ impl BaseFastPath {
                 // own live state. No Graph, so no shared-state question.
                 let priced_at = Instant::now();
                 let fresh = self.freshness();
-                let (priced, unpriceable) = price_touched(
+                let px = prices.lock().ok().and_then(|g| g.clone());
+                let (priced, unpriceable, basis) = price_touched(
                     &idx,
                     &out.cycles,
                     |from, to| {
-                        rate_from_live(
+                        hop_quote_from_live(
                             &self.live,
                             universe.pools_for_hop(from, to),
                             &self.pool_tokens,
                             from,
                             to,
                             fresh,
+                            HopSelect::BestNet,
                         )
                     },
+                    px.as_deref(),
                     FAST_PATH_RANKED,
                 );
                 let price_us = priced_at.elapsed().as_micros();
@@ -1711,6 +1937,13 @@ impl BaseFastPath {
                     priced = priced.len(),
                     unpriceable,
                     best_gross_bps = best,
+                    rank_basis = ?basis,
+                    best_notional_in = priced.first().map(|c| c.notional_in).unwrap_or(f64::NAN),
+                    best_profit_native = priced
+                        .first()
+                        .and_then(|c| c.profit_native)
+                        .unwrap_or(f64::NAN),
+                    unvalued = priced.iter().filter(|c| c.profit_native.is_none()).count(),
                     first_match_bps,
                     best_net_bps = best_net,
                     clearing_costs = clearing,
@@ -2313,19 +2546,20 @@ mod tests {
         let ids: Vec<_> = (0..index.len() as u32).collect();
 
         // No rates at all: everything is unpriceable, nothing is "unprofitable".
-        let (priced, unpriceable) = price_touched(&index, &ids, |_, _| None, 8);
+        let (priced, unpriceable, basis) = price_touched(&index, &ids, |_, _| None, None, 8);
         assert!(priced.is_empty());
         assert_eq!(unpriceable, ids.len());
+        assert_eq!(basis, RankBasis::Bps, "nothing priced, so nothing valued");
     }
 
     /// Ranking must put the most profitable first, and break ties toward
     /// shorter loops -- fewer legs is less gas and less to go wrong.
     #[test]
     fn pricing_ranks_by_profit_then_prefers_shorter_loops() {
-        let a = PricedCycle { id: 0, gross_bps: 5.0, hops: 4 };
-        let b = PricedCycle { id: 1, gross_bps: 50.0, hops: 6 };
-        let c = PricedCycle { id: 2, gross_bps: 50.0, hops: 2 };
-        let mut v = [a, b, c];
+        let mk = |id, bps, hops| PricedCycle {
+            id, gross_bps: bps, hops, notional_in: 1.0, profit_native: None,
+        };
+        let mut v = [mk(0, 5.0, 4), mk(1, 50.0, 6), mk(2, 50.0, 2)];
         v.sort_by(|x, y| {
             y.gross_bps
                 .partial_cmp(&x.gross_bps)
@@ -2372,7 +2606,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]);
 
         let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).expect("forward");
@@ -2394,7 +2628,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]);
         let (a, b) = rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).unwrap();
         let (c, d) = rate_from_live(&live, &[pool], &tokens, t1, t0, fresh()).unwrap();
@@ -2414,7 +2648,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]);
         assert!(rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).is_some());
 
@@ -2437,7 +2671,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]);
         assert!(rate_from_live(&live, &[pool], &tokens, t0, addr(99), fresh()).is_none());
         assert!(rate_from_live(&live, &[], &tokens, t0, t1, fresh()).is_none());
@@ -2464,7 +2698,7 @@ mod tests {
         // 3_000 ppm = 0.30%, so 4.0 becomes 4.0 * 0.997 = 3.988.
         let tokens = dashmap::DashMap::from_iter([(
             pool,
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]);
         let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).expect("priced");
         let r = n / d;
@@ -2488,8 +2722,8 @@ mod tests {
         live.apply_log(&sync_log(p1, 1_000, 2_000, 100, 0));
         live.apply_log(&sync_log(p2, 1_000, 2_000, 100, 1));
         let tokens = dashmap::DashMap::from_iter([
-            (p1, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) }),
-            (p2, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) }),
+            (p1, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None }),
+            (p2, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None }),
         ]);
         let bps = price_cycle(&[t0, t1], |f, t| {
             let pools = if f == t0 { [p1] } else { [p2] };
@@ -2579,11 +2813,11 @@ mod tests {
         let (f, _t) = fast(vec![cl, v2, dark]);
         let f = f.with_pool_tokens(std::collections::HashMap::from([
             (cl, PoolMeta { token0: addr(80), token1: addr(81), fee_ppm: 500,
-                            kind: PoolKind::ConcentratedLiquidity, verified: true, confirmed_at: Some(Instant::now()) }),
+                            kind: PoolKind::ConcentratedLiquidity, verified: true, confirmed_at: Some(Instant::now()), balances: None }),
             (v2, PoolMeta { token0: addr(90), token1: addr(91), fee_ppm: 3_000,
-                            kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) }),
+                            kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None }),
             (dark, PoolMeta { token0: addr(92), token1: addr(93), fee_ppm: 3_000,
-                              kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) }),
+                              kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None }),
         ]));
         assert_eq!(f.coverage().priceable, 0, "nothing seeded yet");
         assert_eq!(f.coverage().total, 3);
@@ -2616,7 +2850,7 @@ mod tests {
         let f = f.with_pool_tokens(std::collections::HashMap::from([(
             pool,
             PoolMeta { token0: addr(80), token1: addr(81), fee_ppm: 500,
-                       kind: PoolKind::ConcentratedLiquidity, verified: true, confirmed_at: Some(Instant::now()) },
+                       kind: PoolKind::ConcentratedLiquidity, verified: true, confirmed_at: Some(Instant::now()), balances: None },
         )]));
         assert!(f.live.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000, 0));
         assert_eq!(f.coverage().priceable, 1);
@@ -2642,9 +2876,9 @@ mod tests {
     fn the_seed_routes_each_pool_to_the_loader_for_its_curve() {
         let (cl, vol, stable) = (addr(1), addr(2), addr(3));
         let meta = dashmap::DashMap::new();
-        meta.insert(cl, PoolMeta { token0: addr(10), token1: addr(11), fee_ppm: 500, kind: PoolKind::ConcentratedLiquidity, verified: true, confirmed_at: Some(Instant::now()) });
-        meta.insert(vol, PoolMeta { token0: addr(12), token1: addr(13), fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) });
-        meta.insert(stable, PoolMeta { token0: addr(14), token1: addr(15), fee_ppm: 100, kind: PoolKind::StableSwap, verified: true, confirmed_at: Some(Instant::now()) });
+        meta.insert(cl, PoolMeta { token0: addr(10), token1: addr(11), fee_ppm: 500, kind: PoolKind::ConcentratedLiquidity, verified: true, confirmed_at: Some(Instant::now()), balances: None });
+        meta.insert(vol, PoolMeta { token0: addr(12), token1: addr(13), fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None });
+        meta.insert(stable, PoolMeta { token0: addr(14), token1: addr(15), fee_ppm: 100, kind: PoolKind::StableSwap, verified: true, confirmed_at: Some(Instant::now()), balances: None });
 
         let (cl_targets, v2_targets) = seed_targets(&[cl, vol, stable], &meta);
         assert_eq!(cl_targets.len(), 1);
@@ -2718,7 +2952,7 @@ mod tests {
     #[test]
     fn a_candidate_below_the_cost_stack_still_reaches_preparation() {
         let (idx, g, id) = triangle_for_translation();
-        let thin = PricedCycle { id, gross_bps: 12.0, hops: 3 };
+        let thin = PricedCycle { id, gross_bps: 12.0, hops: 3, notional_in: 1.0, profit_native: None };
         assert!(
             !CostStack::from_env().clears(thin.gross_bps),
             "the premise: 12 bps does not clear a 32 bps stack"
@@ -2738,7 +2972,7 @@ mod tests {
         let (idx, _g, id) = triangle_for_translation();
         let empty = crate::graph::Graph::default();
         let (ready, untranslatable) =
-            translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3 }]);
+            translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3, notional_in: 1.0, profit_native: None }]);
         assert!(ready.is_empty());
         assert_eq!(untranslatable, 1);
     }
@@ -2766,7 +3000,7 @@ mod tests {
         let meta = dashmap::DashMap::new();
         for p in [cheap, rich] {
             meta.insert(p, PoolMeta {
-                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()),
+                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None,
             });
         }
 
@@ -2797,10 +3031,10 @@ mod tests {
         }));
         let meta = dashmap::DashMap::new();
         meta.insert(expensive, PoolMeta {
-            token0: t0, token1: t1, fee_ppm: 100_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()),
+            token0: t0, token1: t1, fee_ppm: 100_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None,
         });
         meta.insert(cheap, PoolMeta {
-            token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()),
+            token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None,
         });
         let (n, d) = rate_from_live(&live, &[expensive, cheap], &meta, t0, t1, fresh()).expect("priced");
         // 1.10 * 0.90 = 0.99 < 1.05, so the cheap pool wins on NET.
@@ -2822,7 +3056,7 @@ mod tests {
         }));
         let meta = dashmap::DashMap::new();
         meta.insert(pool, PoolMeta {
-            token0: t0, token1: t1, fee_ppm: 100, kind: PoolKind::StableSwap, verified: true, confirmed_at: Some(Instant::now()),
+            token0: t0, token1: t1, fee_ppm: 100, kind: PoolKind::StableSwap, verified: true, confirmed_at: Some(Instant::now()), balances: None,
         });
         assert!(rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).is_none());
     }
@@ -2842,7 +3076,7 @@ mod tests {
         let meta = dashmap::DashMap::new();
         for p in [dark, good] {
             meta.insert(p, PoolMeta {
-                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()),
+                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()), balances: None,
             });
         }
         // `dark` has no snapshot at all.
@@ -2885,7 +3119,7 @@ mod tests {
             pool,
             // Config claims t0 is token0, unverified.
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
-                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()) },
+                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()), balances: None },
         )]);
 
         // The chain says the opposite way round.
@@ -2919,7 +3153,7 @@ mod tests {
         let meta: dashmap::DashMap<Address, PoolMeta> = dashmap::DashMap::from_iter([(
             pool,
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
-                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()) },
+                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()), balances: None },
         )]);
         assert!(!adopt_chain_pair(&meta, pool, t0, t1));
         assert!(meta.get(&pool).expect("present").verified);
@@ -2939,7 +3173,7 @@ mod tests {
         let meta: dashmap::DashMap<Address, PoolMeta> = dashmap::DashMap::from_iter([(
             pool,
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
-                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()) },
+                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()), balances: None },
         )]);
         assert!(
             rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).is_none(),
@@ -2963,7 +3197,7 @@ mod tests {
         let f = f.with_pool_tokens(std::collections::HashMap::from([(
             pool,
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
-                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()) },
+                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()), balances: None },
         )]));
         seeded_v2(&f.live, pool, t0, t1);
         f.live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
@@ -2982,6 +3216,8 @@ mod tests {
         PoolMeta {
             token0: t0, token1: t1, fee_ppm: 0,
             kind: PoolKind::ConstantProduct, verified: true, confirmed_at,
+            // V2 depth comes off the live snapshot's reserves, not from here.
+            balances: None,
         }
     }
 
@@ -3113,5 +3349,155 @@ mod tests {
         assert!((down + 100.0).abs() < 1e-6, "1% below is -100 bps, got {down}");
         assert!(divergence_bps(0.0, 1.0).is_none(), "a zero price is not a price");
         assert!(divergence_bps(f64::NAN, 1.0).is_none());
+    }
+
+    // ---- depth-weighted ranking ----
+
+    /// The failure this exists to fix, in miniature. Two cycles: one with a
+    /// huge percentage edge through a pool holding almost nothing, one with a
+    /// small edge through a deep pool. Percentage ranking prefers the first;
+    /// value ranking prefers the second, and the second is the one worth doing.
+    #[test]
+    fn a_deep_thin_edge_outranks_a_shallow_fat_one() {
+        let q = |num: f64, cap: f64| Some(HopQuote { num, den: 1.0, cap_out: cap });
+        // 100 bps round trip, but the pool can only pay out 100 units.
+        let dust = price_cycle_sized(&[addr(1), addr(2)], |from, _| {
+            if from == addr(1) { q(1.01, 100.0) } else { q(1.0, 100.0) }
+        })
+        .expect("priced");
+        // 10 bps round trip through a pool holding 100 million units.
+        let deep = price_cycle_sized(&[addr(1), addr(2)], |from, _| {
+            if from == addr(1) { q(1.001, 100_000_000.0) } else { q(1.0, 100_000_000.0) }
+        })
+        .expect("priced");
+
+        assert!(dust.gross_bps > deep.gross_bps, "the dust pool wins on percentage");
+        let profit = |c: SizedCycle| c.notional_in * c.gross_bps / 10_000.0;
+        assert!(
+            profit(deep) > profit(dust),
+            "and loses on value: deep {} vs dust {}",
+            profit(deep),
+            profit(dust)
+        );
+    }
+
+    /// The binding hop is the one that runs out first, and it is not
+    /// necessarily the thinnest in raw units -- what matters is depth relative
+    /// to the amount ARRIVING there, which the rates upstream determine.
+    #[test]
+    fn the_binding_hop_is_the_one_that_runs_out_first() {
+        // Hop 1 multiplies by 1000, so hop 2's 1000 units of headroom are
+        // reached by an input of only 1.
+        let sized = price_cycle_sized(&[addr(1), addr(2)], |from, _| {
+            if from == addr(1) {
+                Some(HopQuote { num: 1000.0, den: 1.0, cap_out: 1_000.0 })
+            } else {
+                Some(HopQuote { num: 0.001, den: 1.0, cap_out: 1e12 })
+            }
+        })
+        .expect("priced");
+        // x * 1000 <= 1000 * DEPTH_FRACTION  ->  x <= 0.01
+        let expected = 1_000.0 * DEPTH_FRACTION / 1000.0;
+        assert!(
+            (sized.notional_in - expected).abs() < 1e-9,
+            "expected {expected}, got {}",
+            sized.notional_in
+        );
+    }
+
+    /// A cycle no hop bounds is UNMEASURED, not infinitely large. Returning
+    /// infinity would put it above every real opportunity forever.
+    #[test]
+    fn a_cycle_with_no_known_depth_is_refused_not_ranked_first() {
+        let out = price_cycle_sized(&[addr(1), addr(2)], |_, _| {
+            Some(HopQuote { num: 2.0, den: 1.0, cap_out: f64::INFINITY })
+        });
+        assert!(out.is_none(), "unbounded must not mean unbeatable");
+    }
+
+    /// Value ranking needs a numeraire. Cycles starting in different tokens
+    /// cannot be compared by percentage OR by raw notional -- a million units
+    /// of a worthless token is not a bigger trade than one unit of WETH.
+    #[test]
+    fn ranking_uses_value_when_prices_are_known_and_says_so_when_not() {
+        use crate::cycle_index::{CycleIndex, CycleIndexLimits, PoolUniverse};
+        let (t1, t2, t3) = (addr(1), addr(2), addr(3));
+        let uni = PoolUniverse::from_pools([
+            (addr(11), t1, t2), (addr(12), t2, t3), (addr(13), t3, t1),
+        ]);
+        let idx = CycleIndex::build(&uni, &[t1], CycleIndexLimits::default());
+        let ids: Vec<_> = (0..idx.len() as u32).collect();
+        let quote = |_: Address, _: Address| {
+            Some(HopQuote { num: 1.05, den: 1.0, cap_out: 1_000_000.0 })
+        };
+
+        let (priced, _, basis) = price_touched(&idx, &ids, quote, None, 8);
+        assert_eq!(basis, RankBasis::Bps, "no price map means no value ranking");
+        assert!(priced.iter().all(|c| c.profit_native.is_none()));
+
+        let prices = std::collections::HashMap::from([(t1, 2.0f64)]);
+        let (priced, _, basis) = price_touched(&idx, &ids, quote, Some(&prices), 8);
+        assert_eq!(basis, RankBasis::Native);
+        let top = priced.first().expect("one cycle");
+        let want = top.notional_in * (top.gross_bps / 10_000.0) * 2.0;
+        assert!(
+            (top.profit_native.expect("valued") - want).abs() < 1e-6,
+            "profit must be notional x edge x price"
+        );
+    }
+
+    /// An unreliable or missing price must not silently become 1:1. A cycle
+    /// that cannot be valued sorts LAST under a value ranking, rather than
+    /// being dropped -- it is a gap in the price map, not a bad trade.
+    #[test]
+    fn an_unvalued_cycle_sorts_last_rather_than_vanishing() {
+        let mk = |id, profit: Option<f64>| PricedCycle {
+            id, gross_bps: 10.0, hops: 2, notional_in: 1.0, profit_native: profit,
+        };
+        let mut v = [mk(0, None), mk(1, Some(5.0)), mk(2, Some(50.0))];
+        v.sort_by(|a, b| {
+            let k = |c: &PricedCycle| c.profit_native.unwrap_or(f64::NEG_INFINITY);
+            k(b).partial_cmp(&k(a)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        assert_eq!(v.iter().map(|c| c.id).collect::<Vec<_>>(), vec![2, 1, 0]);
+        assert_eq!(v.len(), 3, "the unvalued cycle is still present");
+    }
+
+    /// A CL pool whose balance read failed must bound nothing rather than
+    /// bounding wrong. `liquidity` is NOT a substitute: with sqrt_price it
+    /// gives virtual reserves that overstate real holdings by 16-56x on deep
+    /// pools and by orders of magnitude on thin ones.
+    #[test]
+    fn a_cl_pool_without_balances_reports_unknown_depth() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        assert!(live.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000, 0));
+        let meta = dashmap::DashMap::from_iter([(
+            pool,
+            PoolMeta {
+                token0: t0, token1: t1, fee_ppm: 0,
+                kind: PoolKind::ConcentratedLiquidity, verified: true,
+                confirmed_at: Some(Instant::now()), balances: None,
+            },
+        )]);
+        let q = hop_quote_from_live(
+            &live, &[pool], &meta, t0, t1, fresh(), HopSelect::BestNet,
+        )
+        .expect("priced");
+        assert!(q.cap_out.is_infinite(), "unknown depth must not be a number");
+
+        // With balances, the OUTPUT side is the bound and direction matters.
+        meta.get_mut(&pool).expect("present").balances = Some((7.0, 11.0));
+        let fwd = hop_quote_from_live(
+            &live, &[pool], &meta, t0, t1, fresh(), HopSelect::BestNet,
+        )
+        .expect("priced");
+        assert_eq!(fwd.cap_out, 11.0, "t0->t1 pays out token1");
+        let rev = hop_quote_from_live(
+            &live, &[pool], &meta, t1, t0, fresh(), HopSelect::BestNet,
+        )
+        .expect("priced");
+        assert_eq!(rev.cap_out, 7.0, "t1->t0 pays out token0");
     }
 }

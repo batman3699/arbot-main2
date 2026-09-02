@@ -3501,7 +3501,12 @@ where
     graph_snapshot: Arc<StdMutex<Option<Arc<Graph>>>>,
     /// The economics half of what a reader needs to size a candidate,
     /// published alongside the graph. Written only in `scan_once`.
-    prep_context: Arc<StdMutex<Option<Arc<PrepContextSnapshot>>>>,
+    prep_context: crate::base_fast::Published<PrepContextSnapshot>,
+    /// Native (wei) per RAW unit of each token, for readers that must compare
+    /// value across tokens. Only reliable prices are published: an unreliable
+    /// one is a "no information" sentinel and would rank a worthless token's
+    /// large numbers above a valuable token's small ones.
+    token_native_prices: crate::base_fast::Published<crate::base_fast::TokenPrices>,
     /// Long-lived tick-ladder cache for the multi-tick CL simulator
     /// (`ARBOT_CL_MULTI_TICK`). Built once here and reused across every
     /// `scan_once()` call for this chain, so `CachedTickSource`'s epoch cache
@@ -3865,6 +3870,7 @@ where
             cycle_index: Arc::new(StdMutex::new(None)),
             graph_snapshot: Arc::new(StdMutex::new(None)),
             prep_context: Arc::new(StdMutex::new(None)),
+            token_native_prices: Arc::new(StdMutex::new(None)),
             cl_tick_cache,
         }
     }
@@ -5552,8 +5558,12 @@ where
     }
 
     /// The published pricing context, for readers running between scans.
-    fn prep_context(&self) -> Arc<StdMutex<Option<Arc<PrepContextSnapshot>>>> {
+    fn prep_context(&self) -> crate::base_fast::Published<PrepContextSnapshot> {
         Arc::clone(&self.prep_context)
+    }
+
+    fn token_native_prices(&self) -> crate::base_fast::Published<crate::base_fast::TokenPrices> {
+        Arc::clone(&self.token_native_prices)
     }
 
     async fn prepare_candidate(
@@ -7162,6 +7172,29 @@ where
             block_number,
             edges_scanned,
         };
+        // Native value per raw token unit, for readers ranking across tokens.
+        // Unreliable entries are dropped rather than defaulted: NativePrice's
+        // "no information" sentinel is a 1:1 rate, and publishing that would
+        // make every unpriced token look like the native asset.
+        if let Ok(mut p) = self.token_native_prices.lock() {
+            let mut out: crate::base_fast::TokenPrices =
+                HashMap::with_capacity(native_prices_map.len());
+            for (token, np) in native_prices_map.iter() {
+                if !np.is_reliable() {
+                    continue;
+                }
+                let (t, n) = (
+                    np.token_amount.to_string().parse::<f64>(),
+                    np.native_amount.to_string().parse::<f64>(),
+                );
+                if let (Ok(t), Ok(n)) = (t, n) {
+                    if t > 0.0 && n > 0.0 && (n / t).is_finite() {
+                        out.insert(*token, n / t);
+                    }
+                }
+            }
+            *p = Some(Arc::new(out));
+        }
         // Published for the fast path, which prepares candidates between scans
         // and cannot rebuild any of this itself -- it is all RPC-derived.
         if let Ok(mut c) = self.prep_context.lock() {
@@ -13094,6 +13127,10 @@ async fn launch_chain_runtime(
                                     // is a claim about the pool, not a look at
                                     // its current state.
                                     confirmed_at: None,
+                                    // Filled by the reconcile's balanceOf
+                                    // reads. Nothing here is depth until the
+                                    // chain has been asked.
+                                    balances: None,
                                 },
                             )
                         })
@@ -14036,7 +14073,10 @@ async fn launch_chain_runtime(
         fast.spawn_drain(
             uni,
             index,
-            runner.graph_snapshot(),
+            crate::base_fast::BaseFastPath::drain_feeds(
+                runner.graph_snapshot(),
+                runner.token_native_prices(),
+            ),
             Some(sink),
             Duration::from_millis(200),
             cap,
