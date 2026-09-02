@@ -97,6 +97,25 @@ pub enum VenueEdge {
     },
 }
 
+impl VenueEdge {
+    /// The pool this edge trades through, when it has a single one.
+    ///
+    /// `None` for venues that cannot be identified by a pool address -- a
+    /// Balancer edge is keyed by `pool_id`, and a UniV4 `pool_manager` is not
+    /// the pool. Those hops cannot be matched by pool identity, and saying so
+    /// is better than returning a plausible wrong address.
+    pub fn pool_address(&self) -> Option<Address> {
+        match self {
+            VenueEdge::UniV3 { pool, .. }
+            | VenueEdge::Slipstream { pool, .. }
+            | VenueEdge::Curve { pool, .. } => Some(*pool),
+            VenueEdge::UniV2 { pair, .. } | VenueEdge::SolidlyV2 { pair, .. } => Some(*pair),
+            _ => None,
+        }
+    }
+}
+
+
 #[derive(Clone, Debug)]
 pub struct Edge {
     pub from: Address,
@@ -1046,6 +1065,12 @@ impl Graph {
     /// `None` when any token is absent from the graph or any hop has no edge.
     /// A partial translation is worse than none: it would produce a plan whose
     /// steps do not compose.
+    // Test-only since the fast path moved to `indexed_cycle_for_pools`. Kept,
+    // not deleted: the tests use it to prove the premise of that change -- that
+    // left to itself the graph picks a DIFFERENT pool from the one a caller
+    // priced. It must never become a fallback for a failed pool match, because
+    // silently substituting a route is the bug.
+    #[allow(dead_code)]
     pub fn indexed_cycle_for_tokens(&self, tokens: &[Address]) -> Option<IndexedCycle> {
         if tokens.len() < 2 {
             return None;
@@ -1060,6 +1085,55 @@ impl Graph {
             cycle,
             edge_indices,
         })
+    }
+
+    /// Translate a token loop into an `IndexedCycle` that uses THESE pools.
+    ///
+    /// `indexed_cycle_for_tokens` asks the graph for its own best edge per hop,
+    /// which is chosen from the scan's quotes. When the caller has already
+    /// decided which pool it priced -- as the flashblock fast path has, from
+    /// preconfirmed state the scan has never seen -- that is a silent
+    /// substitution: the profitability claim describes one route and the plan
+    /// executes another. Neither side reports anything wrong.
+    ///
+    /// `pools[i]` is the pool for the hop `tokens[i] -> tokens[i+1]`, with the
+    /// closing hop last. `None` when any hop has no edge on the named pool,
+    /// which is a real answer: the caller priced a pool this graph cannot
+    /// execute through, and substituting a different one would hide that.
+    pub fn indexed_cycle_for_pools(
+        &self,
+        tokens: &[Address],
+        pools: &[Address],
+    ) -> Option<IndexedCycle> {
+        if tokens.len() < 2 || pools.len() != tokens.len() {
+            return None;
+        }
+        let mut cycle: Vec<usize> = Vec::with_capacity(tokens.len() + 1);
+        for t in tokens {
+            cycle.push(*self.ix.get(t)?);
+        }
+        cycle.push(cycle[0]);
+
+        let mut edge_indices = Vec::with_capacity(tokens.len());
+        for (i, window) in cycle.windows(2).enumerate() {
+            let &from = self.nodes.get(window[0])?;
+            let &to = self.nodes.get(window[1])?;
+            let want = pools[i];
+            let idx = self
+                .edge_lookup
+                .get(&(from, to))?
+                .iter()
+                .copied()
+                .find(|&e| {
+                    self.edges
+                        .get(e)
+                        .filter(|edge| edge.active)
+                        .and_then(|edge| edge.venue.pool_address())
+                        == Some(want)
+                })?;
+            edge_indices.push(idx);
+        }
+        Some(IndexedCycle { cycle, edge_indices })
     }
 
     pub fn edge_between(&self, from: Address, to: Address) -> Option<&Edge> {
@@ -2098,6 +2172,75 @@ mod tests {
             g.add_edge(hop_edge(f, t));
         }
         (g, a, b, c)
+    }
+
+    /// The substitution this exists to prevent.
+    ///
+    /// A caller that priced a cycle through specific pools -- as the fast path
+    /// does, from preconfirmed state this graph has never seen -- must execute
+    /// through THOSE pools. `indexed_cycle_for_tokens` picks the graph's own
+    /// best edge per hop from the SCAN's quotes, so the plan would trade a
+    /// different route from the one judged profitable, with nothing on either
+    /// side reporting a problem.
+    #[test]
+    fn a_route_priced_on_one_pool_is_not_translated_onto_another() {
+        let (a, b, c) = (addr(1), addr(2), addr(3));
+        let (cheap, rich) = (addr(90), addr(91));
+        let mut g = Graph::default();
+        // Two pools serve a->b. The graph prefers `rich` on rate.
+        let mut e = hop_edge(a, b);
+        if let VenueEdge::UniV3 { ref mut pool, .. } = e.venue {
+            *pool = cheap;
+        }
+        g.add_edge(e);
+        let mut e = hop_edge(a, b);
+        if let VenueEdge::UniV3 { ref mut pool, .. } = e.venue {
+            *pool = rich;
+        }
+        e.rate_num = U256::from(100u64);
+        g.add_edge(e);
+        for (f, t) in [(b, c), (c, a)] {
+            let mut e = hop_edge(f, t);
+            if let VenueEdge::UniV3 { ref mut pool, .. } = e.venue {
+                *pool = cheap;
+            }
+            g.add_edge(e);
+        }
+
+        // Asked for `cheap`, we must get the edge on `cheap` -- not the edge
+        // the graph would have chosen for itself.
+        let ic = g
+            .indexed_cycle_for_pools(&[a, b, c], &[cheap, cheap, cheap])
+            .expect("every hop has an edge on `cheap`");
+        let chosen = g.edges[ic.edge_indices[0]].venue.pool_address();
+        assert_eq!(chosen, Some(cheap), "the priced pool must be the executed pool");
+
+        // And the graph's own preference really would have differed, or this
+        // test proves nothing.
+        let free = g
+            .indexed_cycle_for_tokens(&[a, b, c])
+            .expect("translatable");
+        assert_eq!(
+            g.edges[free.edge_indices[0]].venue.pool_address(),
+            Some(rich),
+            "premise: left to itself the graph picks the other pool"
+        );
+    }
+
+    /// A pool the graph cannot execute through is a REFUSAL, not an invitation
+    /// to substitute. The caller priced something this graph cannot trade.
+    #[test]
+    fn a_route_through_an_unknown_pool_is_refused() {
+        let (g, a, b, c) = closed_triangle();
+        assert!(
+            g.indexed_cycle_for_pools(&[a, b, c], &[addr(777), addr(777), addr(777)])
+                .is_none(),
+            "no edge uses that pool, so there is no executable route"
+        );
+        assert!(
+            g.indexed_cycle_for_pools(&[a, b, c], &[Address::zero()]).is_none(),
+            "one pool for a three-hop loop is not a route"
+        );
     }
 
     /// The boundary the flashblock fast path hands cycles across. `CycleIndex`

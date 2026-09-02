@@ -810,7 +810,7 @@ fn hop_rate(
                 }
                 None => f64::INFINITY,
             };
-            Some(HopQuote { num, den, cap_out })
+            Some(HopQuote { pool, num, den, cap_out })
         }
         PoolKind::ConstantProduct => {
             let snap = live.v2_snapshot(pool)?;
@@ -839,7 +839,7 @@ fn hop_rate(
             let (num, den) = effective_rate(r_in, r_out, keep, reference_in)?;
             // A V2 pool's reserves are its holdings, so the output side is
             // the bound directly -- and it is live, not rotation-stale.
-            Some(HopQuote { num, den, cap_out: r_out })
+            Some(HopQuote { pool, num, den, cap_out: r_out })
         }
         // `r1/r0` is not this curve's marginal price. Applying it to a stable
         // pool produced a 163% phantom edge in the 2026-09-01 spread census,
@@ -897,6 +897,9 @@ pub async fn simulate_preconf(
 /// One hop's rate and the depth behind it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HopQuote {
+    /// The pool this quote came from. Carried, not recomputed: the whole point
+    /// is that the route executed is the route priced.
+    pub pool: Address,
     pub num: f64,
     pub den: f64,
     /// Raw units of the OUTPUT token the pool actually holds.
@@ -917,12 +920,15 @@ pub struct HopQuote {
 pub const DEPTH_FRACTION: f64 = 0.01;
 
 /// What one cycle looks like once depth is accounted for.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SizedCycle {
     /// Product of the loop's rates minus one, in bps. Unchanged by depth.
     pub gross_bps: f64,
     /// Largest input, in units of `tokens[0]`, that no hop's depth forbids.
     pub notional_in: f64,
+    /// The pool chosen for each hop, in order, closing hop last. This is the
+    /// route the numbers above describe, and the route that must be executed.
+    pub pools: Vec<Address>,
 }
 
 /// Price a loop AND bound how much it can carry.
@@ -946,10 +952,12 @@ where
     }
     let mut product = 1.0f64;
     let mut notional = f64::INFINITY;
+    let mut pools = Vec::with_capacity(tokens.len());
     for i in 0..tokens.len() {
         let from = tokens[i];
         let to = tokens[(i + 1) % tokens.len()];
         let q = quote_of(from, to)?;
+        pools.push(q.pool);
         if !q.den.is_finite() || !q.num.is_finite() || q.den <= 0.0 {
             return None;
         }
@@ -974,11 +982,12 @@ where
     Some(SizedCycle {
         gross_bps: (product - 1.0) * 10_000.0,
         notional_in: notional,
+        pools,
     })
 }
 
 /// A cycle priced from cached edges, before costs.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PricedCycle {
     pub id: crate::cycle_index::CycleId,
     /// Product of the loop's rates minus one, in basis points. GROSS: no fees
@@ -993,6 +1002,8 @@ pub struct PricedCycle {
     /// start token has no reliable price. A percentage cannot be compared
     /// across cycles that start in different tokens; this can.
     pub profit_native: Option<f64>,
+    /// The pools this cycle was priced through, in hop order.
+    pub pools: Vec<Address>,
 }
 
 /// What a ranking was actually sorted by.
@@ -1081,6 +1092,7 @@ where
                     hops: cycle.tokens.len(),
                     notional_in: sized.notional_in,
                     profit_native,
+                    pools: sized.pools,
                 });
             }
             None => unpriceable += 1,
@@ -1137,8 +1149,15 @@ pub fn translate_for_prep(
             untranslatable += 1;
             continue;
         };
-        match graph.indexed_cycle_for_tokens(&tokens) {
-            Some(ic) => out.push((*c, ic)),
+        // The pools THIS cycle was priced through, not whichever edge the graph
+        // would pick. `indexed_cycle_for_tokens` asks the graph for its own best
+        // edge per hop, chosen from the SCAN's quotes -- so the route executed
+        // would be a different route from the one the fast path judged
+        // profitable, using pools it never looked at, with nothing on either
+        // side reporting a problem. Failing here is the correct outcome: it
+        // means the priced route is not executable through this graph.
+        match graph.indexed_cycle_for_pools(&tokens, &c.pools) {
+            Some(ic) => out.push((c.clone(), ic)),
             None => untranslatable += 1,
         }
     }
@@ -1840,7 +1859,18 @@ impl BaseFastPath {
             // batch goes to its own task, and a drain arriving while one is
             // still in flight is DROPPED and counted: the newer flashblock
             // carries better prices than the one being worked on anyway.
-            let prep_slot = Arc::new(tokio::sync::Semaphore::new(1));
+            // One permit was right when translation succeeded 2.4% of the
+            // time. At 36.4% it became the binding constraint: measured
+            // 2026-09-03, 704 batches were DROPPED against 7 sent, so the
+            // sizing stage saw 1% of what the ranker produced and prep_sized=0
+            // was drawn from ten samples. The drain still never awaits these --
+            // that part is not negotiable, because a stalled consumer makes
+            // stale state look fresh -- but several may be in flight at once.
+            let prep_slots = crate::util::env_parse_opt::<usize>("ARBOT_BASE_FAST_PREP_SLOTS")
+                .filter(|v| *v > 0)
+                .unwrap_or(6);
+            info!(prep_slots, "base fast path candidate preparation concurrency");
+            let prep_slot = Arc::new(tokio::sync::Semaphore::new(prep_slots));
             let prep_sized = Arc::new(AtomicU64::new(0));
             let prep_rejected = Arc::new(AtomicU64::new(0));
             let prep_no_context = Arc::new(AtomicU64::new(0));
@@ -2648,6 +2678,7 @@ mod tests {
     fn pricing_ranks_by_profit_then_prefers_shorter_loops() {
         let mk = |id, bps, hops| PricedCycle {
             id, gross_bps: bps, hops, notional_in: 1.0, profit_native: None,
+            pools: Vec::new(),
         };
         let mut v = [mk(0, 5.0, 4), mk(1, 50.0, 6), mk(2, 50.0, 2)];
         v.sort_by(|x, y| {
@@ -3042,7 +3073,13 @@ mod tests {
     #[test]
     fn a_candidate_below_the_cost_stack_still_reaches_preparation() {
         let (idx, g, id) = triangle_for_translation();
-        let thin = PricedCycle { id, gross_bps: 12.0, hops: 3, notional_in: 1.0, profit_native: None };
+        // The pools the cycle was priced through, one per hop. Sized from the
+        // cycle itself rather than assumed: the index may return a 2-cycle.
+        let hops = idx.cycle(id).expect("cycle").tokens.len();
+        let thin = PricedCycle {
+            id, gross_bps: 12.0, hops, notional_in: 1.0, profit_native: None,
+            pools: vec![Address::zero(); hops],
+        };
         assert!(
             !CostStack::from_env().clears(thin.gross_bps),
             "the premise: 12 bps does not clear a 32 bps stack"
@@ -3062,7 +3099,7 @@ mod tests {
         let (idx, _g, id) = triangle_for_translation();
         let empty = crate::graph::Graph::default();
         let (ready, untranslatable) =
-            translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3, notional_in: 1.0, profit_native: None }]);
+            translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3, notional_in: 1.0, profit_native: None, pools: Vec::new() }]);
         assert!(ready.is_empty());
         assert_eq!(untranslatable, 1);
     }
@@ -3445,7 +3482,7 @@ mod tests {
     /// value ranking prefers the second, and the second is the one worth doing.
     #[test]
     fn a_deep_thin_edge_outranks_a_shallow_fat_one() {
-        let q = |num: f64, cap: f64| Some(HopQuote { num, den: 1.0, cap_out: cap });
+        let q = |num: f64, cap: f64| Some(HopQuote { pool: Address::zero(), num, den: 1.0, cap_out: cap });
         // 100 bps round trip, but the pool can only pay out 100 units.
         let dust = price_cycle_sized(&[addr(1), addr(2)], |from, _| {
             if from == addr(1) { q(1.01, 100.0) } else { q(1.0, 100.0) }
@@ -3458,12 +3495,12 @@ mod tests {
         .expect("priced");
 
         assert!(dust.gross_bps > deep.gross_bps, "the dust pool wins on percentage");
-        let profit = |c: SizedCycle| c.notional_in * c.gross_bps / 10_000.0;
+        let profit = |c: &SizedCycle| c.notional_in * c.gross_bps / 10_000.0;
         assert!(
-            profit(deep) > profit(dust),
+            profit(&deep) > profit(&dust),
             "and loses on value: deep {} vs dust {}",
-            profit(deep),
-            profit(dust)
+            profit(&deep),
+            profit(&dust)
         );
     }
 
@@ -3476,9 +3513,9 @@ mod tests {
         // reached by an input of only 1.
         let sized = price_cycle_sized(&[addr(1), addr(2)], |from, _| {
             if from == addr(1) {
-                Some(HopQuote { num: 1000.0, den: 1.0, cap_out: 1_000.0 })
+                Some(HopQuote { pool: Address::zero(), num: 1000.0, den: 1.0, cap_out: 1_000.0 })
             } else {
-                Some(HopQuote { num: 0.001, den: 1.0, cap_out: 1e12 })
+                Some(HopQuote { pool: Address::zero(), num: 0.001, den: 1.0, cap_out: 1e12 })
             }
         })
         .expect("priced");
@@ -3496,7 +3533,7 @@ mod tests {
     #[test]
     fn a_cycle_with_no_known_depth_is_refused_not_ranked_first() {
         let out = price_cycle_sized(&[addr(1), addr(2)], |_, _| {
-            Some(HopQuote { num: 2.0, den: 1.0, cap_out: f64::INFINITY })
+            Some(HopQuote { pool: Address::zero(), num: 2.0, den: 1.0, cap_out: f64::INFINITY })
         });
         assert!(out.is_none(), "unbounded must not mean unbeatable");
     }
@@ -3514,7 +3551,7 @@ mod tests {
         let idx = CycleIndex::build(&uni, &[t1], CycleIndexLimits::default());
         let ids: Vec<_> = (0..idx.len() as u32).collect();
         let quote = |_: Address, _: Address| {
-            Some(HopQuote { num: 1.05, den: 1.0, cap_out: 1_000_000.0 })
+            Some(HopQuote { pool: Address::zero(), num: 1.05, den: 1.0, cap_out: 1_000_000.0 })
         };
 
         let (priced, _, basis) = price_touched(&idx, &ids, quote, None, 8);
@@ -3539,6 +3576,7 @@ mod tests {
     fn an_unvalued_cycle_sorts_last_rather_than_vanishing() {
         let mk = |id, profit: Option<f64>| PricedCycle {
             id, gross_bps: 10.0, hops: 2, notional_in: 1.0, profit_native: profit,
+            pools: Vec::new(),
         };
         let mut v = [mk(0, None), mk(1, Some(5.0)), mk(2, Some(50.0))];
         v.sort_by(|a, b| {
