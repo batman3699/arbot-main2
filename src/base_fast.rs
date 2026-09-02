@@ -42,13 +42,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
 use ethers::types::{Address, Log, H256};
 use serde_json::{json, Value};
 
-use crate::ingestion::{idle_action, IdleAction, SUBSCRIPTION_STALL_LIMIT};
-use crate::live_state::{ApplyOutcome, LiveState};
+use ethers::providers::Middleware;
+use tokio::task::JoinHandle;
+use tokio::time::{interval, sleep};
+use tracing::{debug, info, warn};
+
+use crate::ingestion::{
+    idle_action, next_before_stall, IdleAction, StreamStep, SUBSCRIPTION_IDLE_TICK,
+    SUBSCRIPTION_STALL_LIMIT, WS_MAX_CONNECTION_AGE,
+};
+use crate::live_state::{ApplyOutcome, LiveState, UnknownReason};
 use crate::metrics::Metrics;
+use crate::util::connect_ws_provider_with_fallbacks;
 
 /// How the fast path receives preconfirmed logs.
 ///
@@ -136,6 +144,8 @@ pub struct BaseFastPath {
     /// collect-then-clear form loses any insert landing between the two.
     touched: Arc<StdMutex<HashSet<Address>>>,
     metrics: Option<Arc<Metrics>>,
+    ws_endpoints: Vec<String>,
+    ws_backoff: Duration,
     pub stats: Arc<FastPathStats>,
 }
 
@@ -153,6 +163,8 @@ impl BaseFastPath {
             live,
             touched,
             metrics,
+            ws_endpoints: Vec::new(),
+            ws_backoff: Duration::from_secs(5),
             stats: Arc::new(FastPathStats::default()),
         }
     }
@@ -249,13 +261,162 @@ pub fn subscribed_topics() -> Vec<H256> {
     crate::log_decode::monitored_topics()
 }
 
-/// Placeholder for the socket task, deliberately not wired yet.
-///
-/// Returning an error rather than silently doing nothing: a fast path that
-/// reports success while consuming no logs is exactly the failure this module's
-/// documentation exists to prevent.
-pub async fn spawn(_fast: Arc<BaseFastPath>) -> Result<()> {
-    anyhow::bail!("base_fast::spawn is not wired yet; apply() is the tested entry point")
+impl BaseFastPath {
+    /// Endpoints for rebuilding the transport, and the backoff between tries.
+    ///
+    /// Without these the task holds one `Provider<Ws>` for the life of the
+    /// process, and once that socket is closed every resubscribe is against a
+    /// corpse. The pool monitor shipped exactly that bug: it could detect the
+    /// stall and never recover from it.
+    pub fn with_ws_reconnect(mut self, endpoints: Vec<String>, backoff: Duration) -> Self {
+        self.ws_endpoints = endpoints;
+        self.ws_backoff = backoff;
+        self
+    }
+
+    /// Start the feed. Returns immediately; the socket runs on its own task.
+    pub fn spawn(self: Arc<Self>) -> JoinHandle<()> {
+        tokio::spawn(async move { self.run().await })
+    }
+
+    async fn run(&self) {
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+        if !worth_subscribing(&self.pools) {
+            warn!("base fast path has no pools; refusing to subscribe (pendingLogs with no \
+                   address filter is every log on Base)");
+            return;
+        }
+        loop {
+            // Built fresh every iteration: a socket we suspect is dead must
+            // never be reused, and only a new transport recovers one.
+            let provider = {
+                {
+                    if self.ws_endpoints.is_empty() {
+                        warn!("base fast path has no websocket endpoints; stopping");
+                        return;
+                    }
+                    let connect = connect_ws_provider_with_fallbacks(
+                        "base-fast-rpc",
+                        &self.ws_endpoints,
+                        self.ws_backoff,
+                    );
+                    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+                        Ok(Ok(p)) => Arc::new(p),
+                        Ok(Err(err)) => {
+                            warn!(error = %err, "base fast path websocket connect failed");
+                            sleep(self.ws_backoff).await;
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!("base fast path websocket connect timed out");
+                            sleep(self.ws_backoff).await;
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            let params = pending_logs_params(&self.pools);
+            let mut sub = match provider
+                .subscribe::<serde_json::Value, Log>(params)
+                .await
+            {
+                Ok(s) => {
+                    info!(
+                        pools = self.pools.len(),
+                        "base fast path subscribed to pendingLogs"
+                    );
+                    s
+                }
+                Err(err) => {
+                    warn!(error = %err, "pendingLogs subscription failed");
+                    self.note_gap();
+                    sleep(self.ws_backoff).await;
+                    continue;
+                }
+            };
+
+            let connected_at = Instant::now();
+            let mut last_event = connected_at;
+            let mut events_seen: u64 = 0;
+            let mut never_warned = false;
+            // An `Interval`, never a `sleep` in the `select!`: select rebuilds
+            // its branch futures each iteration, so a sleep restarts on every
+            // log and never fires on a feed carrying hundreds per minute.
+            let mut lifetime = interval(WS_MAX_CONNECTION_AGE);
+            lifetime.tick().await; // immediate first tick; discard
+
+            // Every exit below wants a FRESH transport: a stall and a stream
+            // end are faults, and the rotation exists precisely to replace the
+            // socket before the provider closes it. So the provider is never
+            // put back, which also keeps `sub`'s borrow of it uncontested.
+            loop {
+                tokio::select! {
+                    step = async { next_before_stall!(sub, SUBSCRIPTION_IDLE_TICK) } => {
+                        match step {
+                            StreamStep::Item(log) => {
+                                events_seen = events_seen.saturating_add(1);
+                                last_event = Instant::now();
+                                self.apply(&log, last_event);
+                            }
+                            StreamStep::Ended => {
+                                warn!("pendingLogs stream ended; reconnecting");
+                                break;
+                            }
+                            StreamStep::Stalled => {
+                                match idle_action(events_seen, last_event.elapsed(), connected_at.elapsed()) {
+                                    IdleAction::Wait => {}
+                                    IdleAction::WarnNeverDelivered => {
+                                        if !never_warned {
+                                            never_warned = true;
+                                            warn!(
+                                                pools = self.pools.len(),
+                                                "pendingLogs subscribed but has delivered NOTHING; \
+                                                 check the address filter and topics. Not \
+                                                 reconnecting -- a new socket carries the same filter"
+                                            );
+                                        }
+                                    }
+                                    IdleAction::Reconnect => {
+                                        warn!(
+                                            idle_secs = last_event.elapsed().as_secs(),
+                                            events_seen,
+                                            "pendingLogs stalled; socket open but no longer \
+                                             delivering. Reconnecting"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ = lifetime.tick() => {
+                        warn!(
+                            age_secs = connected_at.elapsed().as_secs(),
+                            events_seen,
+                            "rotating the base fast path socket before the provider closes it"
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // Every exit is a hole in the log stream, so local state derived
+            // from it can no longer be trusted.
+            self.note_gap();
+            sleep(self.ws_backoff).await;
+        }
+    }
+
+    /// Invalidate local state after a break in the feed.
+    ///
+    /// The continuity cursor cannot detect a missing log — a filtered
+    /// subscription has meaningless index gaps — so an interruption has to
+    /// invalidate explicitly or snapshots keep their trust across the hole.
+    fn note_gap(&self) {
+        let epoch = self.live.break_continuity(UnknownReason::WsUnavailable);
+        debug!(epoch, "base fast path gap; local state invalidated");
+    }
 }
 
 #[cfg(test)]
@@ -437,9 +598,19 @@ mod tests {
     /// rather than return Ok and consume nothing — a fast path that reports
     /// success while delivering no logs is the exact failure this module is
     /// written to prevent.
-    #[tokio::test]
-    async fn spawn_refuses_rather_than_pretending() {
+    #[test]
+    fn without_endpoints_the_task_cannot_rebuild_a_dead_socket() {
         let (f, _t) = fast(vec![addr(1)]);
-        assert!(spawn(Arc::new(f)).await.is_err());
+        assert!(f.ws_endpoints.is_empty(), "the default is the trapped state");
+        let f = f.with_ws_reconnect(vec!["wss://example.invalid".into()], Duration::from_secs(5));
+        assert_eq!(f.ws_endpoints.len(), 1);
+    }
+
+    /// Rotation must beat the provider's own close. BlockPI closes websockets
+    /// at 30 minutes and the original incident was that close arriving
+    /// unannounced at 28.
+    #[test]
+    fn the_socket_rotates_before_the_provider_closes_it() {
+        assert!(WS_MAX_CONNECTION_AGE < Duration::from_secs(30 * 60));
     }
 }
