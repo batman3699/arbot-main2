@@ -12923,7 +12923,22 @@ async fn launch_chain_runtime(
                                                 .unwrap_or_default(),
                                         },
                                         fast_pools.clone(),
-                                        Arc::clone(&live),
+                                        // Its OWN LiveState, never the pool
+                                        // monitor's. Sharing one was measured
+                                        // 2026-09-02: 27,085 pendingLogs events
+                                        // produced 37 applies and 584 continuity
+                                        // breaks, because preconfirmed and
+                                        // sealed delivery are two ORDERINGS of
+                                        // the same stream and LiveState has one
+                                        // global cursor demanding monotonic
+                                        // ordinals. Each break invalidates all
+                                        // 683 pools, so the fast path did not
+                                        // merely fail to help -- it destroyed
+                                        // the state the canonical path was
+                                        // maintaining, and candidates went to 0.
+                                        std::sync::Arc::new(
+                                            crate::live_state::LiveState::new(),
+                                        ),
                                         std::sync::Arc::new(std::sync::Mutex::new(
                                             std::collections::HashSet::new(),
                                         )),

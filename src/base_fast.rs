@@ -155,6 +155,14 @@ pub struct BaseFastPath {
 }
 
 impl BaseFastPath {
+    /// `live` MUST have no other writer.
+    ///
+    /// `LiveState` holds one global cursor and requires monotonic ordinals.
+    /// Preconfirmed and sealed delivery are two orderings of the same log
+    /// stream, so pointing this at the pool monitor's state makes every
+    /// interleaving look like disorder. Measured 2026-09-02 when they shared
+    /// one: 27,085 events, 37 applies, 584 continuity breaks, each invalidating
+    /// all 683 pools -- the canonical path's candidate count fell to zero.
     pub fn new(
         feed: FlashFeed,
         pools: Vec<Address>,
@@ -704,6 +712,30 @@ mod tests {
         assert!(
             touched.lock().unwrap().is_empty(),
             "a drain that leaves the set populated reprocesses forever"
+        );
+    }
+
+    /// Why the fast path must own its `LiveState`, as a test rather than a
+    /// comment. Two feeds delivering the same logs in different orders — which
+    /// is exactly preconfirmed vs sealed — drive the single global cursor into
+    /// repeated breaks, and each break invalidates every pool.
+    #[test]
+    fn two_orderings_of_one_stream_destroy_a_shared_live_state() {
+        let shared = Arc::new(LiveState::new());
+        let pool = addr(11);
+        let before = shared.continuity_epoch();
+
+        // Feed A is ahead (preconfirmed); feed B replays the same blocks behind
+        // it (sealed). Interleaved, they are not monotonic.
+        for block in [10u64, 11, 12] {
+            shared.apply_log(&sync_log(pool, 1, 2, block + 5, 0));
+            shared.apply_log(&sync_log(pool, 1, 2, block, 0));
+        }
+
+        assert!(
+            shared.continuity_epoch() > before,
+            "interleaved orderings must trip the cursor -- this is why the fast \
+             path gets its own LiveState instead of the pool monitor's"
         );
     }
 
