@@ -152,6 +152,12 @@ pub struct BaseFastPath {
     pool_tokens: Arc<dashmap::DashMap<Address, PoolMeta>>,
     /// HTTP endpoint for `eth_simulateV1`. `None` disables the probe.
     sim_http: Option<Arc<ethers::providers::Provider<ethers::providers::Http>>>,
+    /// How long a pool may go unchecked against chain before it stops being
+    /// priced. A backstop, not the mechanism: the rolling verification pass is
+    /// what keeps pools inside it.
+    verify_ttl: Duration,
+    /// Pools re-read per verification pass.
+    verify_batch: usize,
     pub stats: Arc<FastPathStats>,
 }
 
@@ -181,6 +187,14 @@ impl BaseFastPath {
             ws_backoff: Duration::from_secs(5),
             pool_tokens: Arc::new(dashmap::DashMap::new()),
             sim_http: None,
+            verify_ttl: Duration::from_secs(
+                crate::util::env_parse_opt::<u64>("ARBOT_BASE_FAST_VERIFY_TTL_SECS")
+                    .filter(|v| *v > 0)
+                    .unwrap_or(120),
+            ),
+            verify_batch: crate::util::env_parse_opt::<usize>("ARBOT_BASE_FAST_VERIFY_BATCH")
+                .filter(|v| *v > 0)
+                .unwrap_or(64),
             stats: Arc::new(FastPathStats::default()),
         }
     }
@@ -292,6 +306,20 @@ pub struct PoolMeta {
     /// fail loudly — it returns the reciprocal rate, and a reciprocal around a
     /// loop manufactures a phantom edge.
     pub verified: bool,
+    /// When this pool's state was last READ FROM CHAIN. `None` means never.
+    ///
+    /// Deliberately not `Provenance.anchored_at`, which a preconfirmed log also
+    /// refreshes -- a pool whose every update arrived over `pendingLogs` has
+    /// never been checked against a sealed block. That matters because the
+    /// continuity cursor cannot see a MISSING log on a filtered subscription:
+    /// a preconfirmed log that is dropped, or one that never lands in the
+    /// sealed block, leaves state wrong with no signal at all.
+    ///
+    /// Age alone is not evidence of wrongness. A pool that has not traded has
+    /// correct state however old it is, because reserves and `sqrtPriceX96`
+    /// only move on events this feed subscribes to. What this bounds is how
+    /// long an UNCHECKED assumption is allowed to stand.
+    pub confirmed_at: Option<Instant>,
 }
 
 /// Which curve a pool trades on.
@@ -423,7 +451,7 @@ pub fn adopt_chain_pair(
 }
 
 /// What one reconciliation pass did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SeedOutcome {
     /// Anchors actually installed. NOT the number attempted: `anchor_*` refuses
     /// any pool already holding newer state, and counting refusals as successes
@@ -438,7 +466,42 @@ pub struct SeedOutcome {
     /// failure -- but an inverted pair silently reports the reciprocal rate,
     /// and a reciprocal around a loop manufactures a phantom edge.
     pub order_mismatch: usize,
+    /// Pools where local state and the fresh read could both be priced, so the
+    /// two were actually comparable.
+    pub compared: usize,
+    /// Of those, how many disagreed by more than `DIVERGENCE_BPS`. This is the
+    /// number that says whether preconfirmed state is drifting from the chain --
+    /// the question age alone cannot answer, because a pool that has not traded
+    /// has correct state however old it is.
+    pub diverged: usize,
+    pub max_divergence_bps: f64,
     pub block: u64,
+}
+
+/// Price disagreement above which local state is considered to have drifted.
+///
+/// Not zero: a CL price is compared through an f64 square of a 160-bit integer,
+/// and a sealed read races preconfirmed updates by construction, so exact
+/// equality would report drift on every busy pool. One basis point is far below
+/// any spread worth trading and far above that noise.
+pub const DIVERGENCE_BPS: f64 = 1.0;
+
+/// Price implied by a CL `sqrtPriceX96`, as token1 per token0.
+fn cl_price(sqrt_price_x96: U256) -> Option<f64> {
+    let sp = u256_to_f64(sqrt_price_x96)?;
+    let r = sp / 2f64.powi(96);
+    let p = r * r;
+    (p.is_finite() && p > 0.0).then_some(p)
+}
+
+/// Relative gap between two prices in basis points, or `None` if either is
+/// unusable. Signed, so the direction of a drift is visible.
+fn divergence_bps(local: f64, chain: f64) -> Option<f64> {
+    if !(local.is_finite() && chain.is_finite()) || local <= 0.0 || chain <= 0.0 {
+        return None;
+    }
+    let d = (local / chain - 1.0) * 10_000.0;
+    d.is_finite().then_some(d)
 }
 
 /// The costs a gross edge must clear before it is a candidate.
@@ -540,12 +603,63 @@ fn u256_to_f64(v: U256) -> Option<f64> {
 /// inverting it does not fail, it silently reports the reciprocal — and a
 /// reciprocal rate around a loop manufactures exactly the phantom edge the
 /// closing-hop test exists to catch.
+/// Which pool to take when several serve the same hop.
+///
+/// `FirstMatch` is not a mode anyone should run: it exists so a single drain
+/// can price the SAME cycle both ways and attribute how much of the reported
+/// gross comes from the selection rule rather than from the market. Taking the
+/// maximum of several noisy estimates is an upward-biased estimator, and
+/// compounding that bias around a loop is indistinguishable from profit unless
+/// the two are measured side by side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HopSelect {
+    BestNet,
+    FirstMatch,
+}
+
+/// Freshness bound for local pricing: refuse any pool unchecked for longer.
+#[derive(Debug, Clone, Copy)]
+pub struct Freshness {
+    pub now: Instant,
+    pub ttl: Duration,
+}
+
+impl Freshness {
+    fn allows(&self, confirmed_at: Option<Instant>) -> bool {
+        match confirmed_at {
+            Some(t) => self.now.saturating_duration_since(t) <= self.ttl,
+            None => false,
+        }
+    }
+}
+
 pub fn rate_from_live(
     live: &LiveState,
     candidate_pools: &[Address],
     pool_tokens: &dashmap::DashMap<Address, PoolMeta>,
     from: Address,
     to: Address,
+    fresh: Freshness,
+) -> Option<(f64, f64)> {
+    rate_from_live_with(
+        live,
+        candidate_pools,
+        pool_tokens,
+        from,
+        to,
+        fresh,
+        HopSelect::BestNet,
+    )
+}
+
+pub fn rate_from_live_with(
+    live: &LiveState,
+    candidate_pools: &[Address],
+    pool_tokens: &dashmap::DashMap<Address, PoolMeta>,
+    from: Address,
+    to: Address,
+    fresh: Freshness,
+    select: HopSelect,
 ) -> Option<(f64, f64)> {
     let mut best: Option<(f64, f64)> = None;
     let mut best_rate = f64::NEG_INFINITY;
@@ -553,9 +667,15 @@ pub fn rate_from_live(
         let Some(meta) = pool_tokens.get(pool) else {
             continue;
         };
+        if !fresh.allows(meta.confirmed_at) {
+            continue;
+        }
         let Some((num, den)) = hop_rate(live, *pool, &meta, from, to) else {
             continue;
         };
+        if select == HopSelect::FirstMatch {
+            return Some((num, den));
+        }
         let rate = num / den;
         // `>` not `>=`: on a tie the first pool wins, which keeps the result
         // independent of the order `pools_for_hop` happens to return.
@@ -1141,6 +1261,24 @@ impl BaseFastPath {
             for (pool, _, _, _) in &cl_targets {
                 match states.get(pool) {
                     Some(st) => {
+                        // Compared BEFORE the anchor overwrites it. This is the
+                        // only place local state and a sealed read exist side by
+                        // side, and it answers the question age cannot: has the
+                        // preconfirmed stream actually drifted?
+                        if let (Some(local), Some(chain)) = (
+                            self.live.cl_snapshot(*pool).and_then(|s| cl_price(s.sqrt_price_x96)),
+                            cl_price(st.sqrt_price_x96),
+                        ) {
+                            if let Some(d) = divergence_bps(local, chain) {
+                                out.compared += 1;
+                                if d.abs() > DIVERGENCE_BPS {
+                                    out.diverged += 1;
+                                }
+                                if d.abs() > out.max_divergence_bps.abs() {
+                                    out.max_divergence_bps = d;
+                                }
+                            }
+                        }
                         if self.live.anchor_cl(
                             *pool,
                             block,
@@ -1150,6 +1288,7 @@ impl BaseFastPath {
                         ) {
                             out.anchored += 1;
                         }
+                        self.mark_confirmed(*pool);
                     }
                     None => out.missing += 1,
                 }
@@ -1182,15 +1321,73 @@ impl BaseFastPath {
                         if adopt_chain_pair(&self.pool_tokens, *pool, st.token0, st.token1) {
                             out.order_mismatch += 1;
                         }
+                        if let (Some(local), Some(chain)) = (
+                            self.live.v2_snapshot(*pool).and_then(|s| {
+                                let r0 = u256_to_f64(s.state.reserve0)?;
+                                let r1 = u256_to_f64(s.state.reserve1)?;
+                                (r0 > 0.0).then(|| r1 / r0)
+                            }),
+                            (|| {
+                                let r0 = u256_to_f64(st.reserve0)?;
+                                let r1 = u256_to_f64(st.reserve1)?;
+                                (r0 > 0.0).then(|| r1 / r0)
+                            })(),
+                        ) {
+                            if let Some(d) = divergence_bps(local, chain) {
+                                out.compared += 1;
+                                if d.abs() > DIVERGENCE_BPS {
+                                    out.diverged += 1;
+                                }
+                                if d.abs() > out.max_divergence_bps.abs() {
+                                    out.max_divergence_bps = d;
+                                }
+                            }
+                        }
                         if self.live.anchor_v2(*pool, block, st.clone()) {
                             out.anchored += 1;
                         }
+                        self.mark_confirmed(*pool);
                     }
                     None => out.missing += 1,
                 }
             }
         }
         out
+    }
+
+    /// Stamp a pool as confirmed against chain, as of now.
+    fn mark_confirmed(&self, pool: Address) {
+        if let Some(mut m) = self.pool_tokens.get_mut(&pool) {
+            m.confirmed_at = Some(Instant::now());
+        }
+    }
+
+    /// The `verify_batch` pools whose confirmation is oldest, excluding any
+    /// already queued for repair.
+    ///
+    /// Oldest-first and bounded, so the whole universe rotates through
+    /// verification at a fixed RPC cost rather than in one spike. A pool never
+    /// confirmed sorts first: it has the weakest claim to being priced.
+    fn oldest_unconfirmed(&self, skip: &HashSet<Address>, limit: usize) -> Vec<Address> {
+        let mut aged: Vec<(Option<Instant>, Address)> = self
+            .pools
+            .iter()
+            .filter(|p| !skip.contains(*p))
+            .map(|p| (self.pool_tokens.get(p).and_then(|m| m.confirmed_at), *p))
+            .collect();
+        // `None` first, then oldest `Some` first.
+        aged.sort_by(|a, b| match (a.0, b.0) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => x.cmp(&y),
+        });
+        aged.into_iter().take(limit).map(|(_, p)| p).collect()
+    }
+
+    /// The freshness bound this path prices under.
+    pub fn freshness(&self) -> Freshness {
+        Freshness { now: Instant::now(), ttl: self.verify_ttl }
     }
 
     /// Seed at startup, then keep repairing coverage against sealed blocks.
@@ -1228,28 +1425,42 @@ impl BaseFastPath {
                         continue;
                     }
                 };
-                let stale: Vec<Address> = self
+                let broken: Vec<Address> = self
                     .pools
                     .iter()
                     .copied()
                     .filter(|p| !self.pool_priceable(*p))
                     .collect();
-                // `pool_priceable` is false for every unverified V2 pool, so
-                // this set already contains them; no separate pass is needed.
-                if stale.is_empty() {
+                // Plus a rotating slice of pools that ARE priceable but have
+                // gone longest without a check. Repairing only what is already
+                // broken leaves an unchecked assumption standing indefinitely:
+                // the continuity cursor cannot see a missing log on a filtered
+                // subscription, so a preconfirmed update that never lands in
+                // the sealed block is wrong with no signal anywhere. This pass
+                // is what turns that into a measured number.
+                let skip: HashSet<Address> = broken.iter().copied().collect();
+                let mut targets = broken;
+                let rotate = self.oldest_unconfirmed(&skip, self.verify_batch);
+                let rotated = rotate.len();
+                targets.extend(rotate);
+                if targets.is_empty() {
                     self.publish_coverage();
                     continue;
                 }
                 let started = Instant::now();
-                let out = self.seed_from_chain(&provider, &stale, block).await;
+                let out = self.seed_from_chain(&provider, &targets, block).await;
                 let cov = self.publish_coverage();
                 info!(
                     target: "arb_exec::latency",
                     block = out.block,
-                    requested = stale.len(),
+                    requested = targets.len(),
+                    rotated,
                     anchored = out.anchored,
                     missing = out.missing,
                     order_mismatch = out.order_mismatch,
+                    compared = out.compared,
+                    diverged = out.diverged,
+                    max_divergence_bps = out.max_divergence_bps,
                     coverage_pct = cov.pct().round() as u64,
                     priceable = cov.priceable,
                     pools = cov.total,
@@ -1397,6 +1608,7 @@ impl BaseFastPath {
                 // The join: cycle ids -> priced candidates, from this path's
                 // own live state. No Graph, so no shared-state question.
                 let priced_at = Instant::now();
+                let fresh = self.freshness();
                 let (priced, unpriceable) = price_touched(
                     &idx,
                     &out.cycles,
@@ -1407,11 +1619,35 @@ impl BaseFastPath {
                             &self.pool_tokens,
                             from,
                             to,
+                            fresh,
                         )
                     },
                     FAST_PATH_RANKED,
                 );
                 let price_us = priced_at.elapsed().as_micros();
+
+                // The SAME winning cycle, priced again taking the first pool
+                // that serves each hop instead of the best. Holding the cycle
+                // fixed isolates the selection rule: any gap between these two
+                // numbers is manufactured by taking a maximum over parallel
+                // pools, not by the market. One cycle, so the cost is nothing.
+                let first_match_bps = priced
+                    .first()
+                    .and_then(|c| idx.cycle(c.id))
+                    .and_then(|c| {
+                        price_cycle(&c.tokens, |from, to| {
+                            rate_from_live_with(
+                                &self.live,
+                                universe.pools_for_hop(from, to),
+                                &self.pool_tokens,
+                                from,
+                                to,
+                                fresh,
+                                HopSelect::FirstMatch,
+                            )
+                        })
+                    })
+                    .unwrap_or(f64::NAN);
 
                 // Translate the RANKED candidates -- all of them, not the ones
                 // clearing a bps bar. Reads an immutable snapshot the scan
@@ -1475,6 +1711,7 @@ impl BaseFastPath {
                     priced = priced.len(),
                     unpriceable,
                     best_gross_bps = best,
+                    first_match_bps,
                     best_net_bps = best_net,
                     clearing_costs = clearing,
                     translated,
@@ -1689,6 +1926,12 @@ impl BaseFastPath {
 mod tests {
     use super::*;
     use ethers::types::Bytes;
+
+    /// Freshness that accepts anything a test has just confirmed. Tests about
+    /// the TTL set their own.
+    fn fresh() -> Freshness {
+        Freshness { now: Instant::now(), ttl: Duration::from_secs(3600) }
+    }
 
     fn addr(n: u64) -> Address {
         Address::from_low_u64_be(n)
@@ -2129,13 +2372,13 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) },
         )]);
 
-        let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1).expect("forward");
+        let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).expect("forward");
         assert!((n / d - 4.0).abs() < 1e-9, "t0->t1 must be 4.0, got {}", n / d);
 
-        let (n, d) = rate_from_live(&live, &[pool], &tokens, t1, t0).expect("reverse");
+        let (n, d) = rate_from_live(&live, &[pool], &tokens, t1, t0, fresh()).expect("reverse");
         assert!((n / d - 0.25).abs() < 1e-9, "t1->t0 must be 0.25, got {}", n / d);
     }
 
@@ -2151,10 +2394,10 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) },
         )]);
-        let (a, b) = rate_from_live(&live, &[pool], &tokens, t0, t1).unwrap();
-        let (c, d) = rate_from_live(&live, &[pool], &tokens, t1, t0).unwrap();
+        let (a, b) = rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).unwrap();
+        let (c, d) = rate_from_live(&live, &[pool], &tokens, t1, t0, fresh()).unwrap();
         let round = (a / b) * (c / d);
         assert!((round - 1.0).abs() < 1e-9, "round trip must be 1.0, got {round}");
     }
@@ -2171,13 +2414,13 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) },
         )]);
-        assert!(rate_from_live(&live, &[pool], &tokens, t0, t1).is_some());
+        assert!(rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).is_some());
 
         live.break_continuity(UnknownReason::WsUnavailable);
         assert!(
-            rate_from_live(&live, &[pool], &tokens, t0, t1).is_none(),
+            rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).is_none(),
             "invalidated state must not be priced from"
         );
     }
@@ -2194,10 +2437,10 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) },
         )]);
-        assert!(rate_from_live(&live, &[pool], &tokens, t0, addr(99)).is_none());
-        assert!(rate_from_live(&live, &[], &tokens, t0, t1).is_none());
+        assert!(rate_from_live(&live, &[pool], &tokens, t0, addr(99), fresh()).is_none());
+        assert!(rate_from_live(&live, &[], &tokens, t0, t1, fresh()).is_none());
     }
 
     /// `as_u128` would truncate a sqrtPriceX96 silently and yield a plausible
@@ -2221,9 +2464,9 @@ mod tests {
         // 3_000 ppm = 0.30%, so 4.0 becomes 4.0 * 0.997 = 3.988.
         let tokens = dashmap::DashMap::from_iter([(
             pool,
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) },
         )]);
-        let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1).expect("priced");
+        let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1, fresh()).expect("priced");
         let r = n / d;
         assert!(
             (r - 3.988).abs() < 1e-6,
@@ -2245,12 +2488,12 @@ mod tests {
         live.apply_log(&sync_log(p1, 1_000, 2_000, 100, 0));
         live.apply_log(&sync_log(p2, 1_000, 2_000, 100, 1));
         let tokens = dashmap::DashMap::from_iter([
-            (p1, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true }),
-            (p2, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true }),
+            (p1, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) }),
+            (p2, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) }),
         ]);
         let bps = price_cycle(&[t0, t1], |f, t| {
             let pools = if f == t0 { [p1] } else { [p2] };
-            rate_from_live(&live, &pools, &tokens, f, t)
+            rate_from_live(&live, &pools, &tokens, f, t, fresh())
         })
         .expect("priceable");
         assert!(
@@ -2336,11 +2579,11 @@ mod tests {
         let (f, _t) = fast(vec![cl, v2, dark]);
         let f = f.with_pool_tokens(std::collections::HashMap::from([
             (cl, PoolMeta { token0: addr(80), token1: addr(81), fee_ppm: 500,
-                            kind: PoolKind::ConcentratedLiquidity, verified: true }),
+                            kind: PoolKind::ConcentratedLiquidity, verified: true, confirmed_at: Some(Instant::now()) }),
             (v2, PoolMeta { token0: addr(90), token1: addr(91), fee_ppm: 3_000,
-                            kind: PoolKind::ConstantProduct, verified: true }),
+                            kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) }),
             (dark, PoolMeta { token0: addr(92), token1: addr(93), fee_ppm: 3_000,
-                              kind: PoolKind::ConstantProduct, verified: true }),
+                              kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) }),
         ]));
         assert_eq!(f.coverage().priceable, 0, "nothing seeded yet");
         assert_eq!(f.coverage().total, 3);
@@ -2373,7 +2616,7 @@ mod tests {
         let f = f.with_pool_tokens(std::collections::HashMap::from([(
             pool,
             PoolMeta { token0: addr(80), token1: addr(81), fee_ppm: 500,
-                       kind: PoolKind::ConcentratedLiquidity, verified: true },
+                       kind: PoolKind::ConcentratedLiquidity, verified: true, confirmed_at: Some(Instant::now()) },
         )]));
         assert!(f.live.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000, 0));
         assert_eq!(f.coverage().priceable, 1);
@@ -2399,9 +2642,9 @@ mod tests {
     fn the_seed_routes_each_pool_to_the_loader_for_its_curve() {
         let (cl, vol, stable) = (addr(1), addr(2), addr(3));
         let meta = dashmap::DashMap::new();
-        meta.insert(cl, PoolMeta { token0: addr(10), token1: addr(11), fee_ppm: 500, kind: PoolKind::ConcentratedLiquidity, verified: true });
-        meta.insert(vol, PoolMeta { token0: addr(12), token1: addr(13), fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true });
-        meta.insert(stable, PoolMeta { token0: addr(14), token1: addr(15), fee_ppm: 100, kind: PoolKind::StableSwap, verified: true });
+        meta.insert(cl, PoolMeta { token0: addr(10), token1: addr(11), fee_ppm: 500, kind: PoolKind::ConcentratedLiquidity, verified: true, confirmed_at: Some(Instant::now()) });
+        meta.insert(vol, PoolMeta { token0: addr(12), token1: addr(13), fee_ppm: 3_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()) });
+        meta.insert(stable, PoolMeta { token0: addr(14), token1: addr(15), fee_ppm: 100, kind: PoolKind::StableSwap, verified: true, confirmed_at: Some(Instant::now()) });
 
         let (cl_targets, v2_targets) = seed_targets(&[cl, vol, stable], &meta);
         assert_eq!(cl_targets.len(), 1);
@@ -2523,14 +2766,14 @@ mod tests {
         let meta = dashmap::DashMap::new();
         for p in [cheap, rich] {
             meta.insert(p, PoolMeta {
-                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true,
+                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()),
             });
         }
 
-        let (n, d) = rate_from_live(&live, &[cheap, rich], &meta, t0, t1).expect("priced");
+        let (n, d) = rate_from_live(&live, &[cheap, rich], &meta, t0, t1, fresh()).expect("priced");
         assert!((n / d - 1.5).abs() < 1e-9, "got {}", n / d);
         // ...and it must not depend on which order the pools arrive in.
-        let (n2, d2) = rate_from_live(&live, &[rich, cheap], &meta, t0, t1).expect("priced");
+        let (n2, d2) = rate_from_live(&live, &[rich, cheap], &meta, t0, t1, fresh()).expect("priced");
         assert!((n2 / d2 - n / d).abs() < 1e-12, "order changed the route");
     }
 
@@ -2554,12 +2797,12 @@ mod tests {
         }));
         let meta = dashmap::DashMap::new();
         meta.insert(expensive, PoolMeta {
-            token0: t0, token1: t1, fee_ppm: 100_000, kind: PoolKind::ConstantProduct, verified: true,
+            token0: t0, token1: t1, fee_ppm: 100_000, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()),
         });
         meta.insert(cheap, PoolMeta {
-            token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true,
+            token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()),
         });
-        let (n, d) = rate_from_live(&live, &[expensive, cheap], &meta, t0, t1).expect("priced");
+        let (n, d) = rate_from_live(&live, &[expensive, cheap], &meta, t0, t1, fresh()).expect("priced");
         // 1.10 * 0.90 = 0.99 < 1.05, so the cheap pool wins on NET.
         assert!((n / d - 1.05).abs() < 1e-9, "fees were not charged before ranking: {}", n / d);
     }
@@ -2579,9 +2822,9 @@ mod tests {
         }));
         let meta = dashmap::DashMap::new();
         meta.insert(pool, PoolMeta {
-            token0: t0, token1: t1, fee_ppm: 100, kind: PoolKind::StableSwap, verified: true,
+            token0: t0, token1: t1, fee_ppm: 100, kind: PoolKind::StableSwap, verified: true, confirmed_at: Some(Instant::now()),
         });
-        assert!(rate_from_live(&live, &[pool], &meta, t0, t1).is_none());
+        assert!(rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).is_none());
     }
 
     /// A pool whose snapshot is untrusted must not shadow a healthy pool
@@ -2599,11 +2842,11 @@ mod tests {
         let meta = dashmap::DashMap::new();
         for p in [dark, good] {
             meta.insert(p, PoolMeta {
-                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true,
+                token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConstantProduct, verified: true, confirmed_at: Some(Instant::now()),
             });
         }
         // `dark` has no snapshot at all.
-        let (n, d) = rate_from_live(&live, &[dark, good], &meta, t0, t1).expect("priced");
+        let (n, d) = rate_from_live(&live, &[dark, good], &meta, t0, t1, fresh()).expect("priced");
         assert!((n / d - 1.2).abs() < 1e-9);
     }
 
@@ -2642,7 +2885,7 @@ mod tests {
             pool,
             // Config claims t0 is token0, unverified.
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
-                       kind: PoolKind::ConstantProduct, verified: false },
+                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()) },
         )]);
 
         // The chain says the opposite way round.
@@ -2660,7 +2903,7 @@ mod tests {
             token0: t1, token1: t0,
             reserve0: U256::from(1_000u64), reserve1: U256::from(4_000u64),
         }));
-        let (n, d) = rate_from_live(&live, &[pool], &meta, t0, t1).expect("priced");
+        let (n, d) = rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).expect("priced");
         assert!(
             (n / d - 0.25).abs() < 1e-9,
             "config ordering was trusted: got {}, the reciprocal is 4.0",
@@ -2676,7 +2919,7 @@ mod tests {
         let meta: dashmap::DashMap<Address, PoolMeta> = dashmap::DashMap::from_iter([(
             pool,
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
-                       kind: PoolKind::ConstantProduct, verified: false },
+                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()) },
         )]);
         assert!(!adopt_chain_pair(&meta, pool, t0, t1));
         assert!(meta.get(&pool).expect("present").verified);
@@ -2696,15 +2939,15 @@ mod tests {
         let meta: dashmap::DashMap<Address, PoolMeta> = dashmap::DashMap::from_iter([(
             pool,
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
-                       kind: PoolKind::ConstantProduct, verified: false },
+                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()) },
         )]);
         assert!(
-            rate_from_live(&live, &[pool], &meta, t0, t1).is_none(),
+            rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).is_none(),
             "an unconfirmed pair must be refused, not guessed"
         );
         // The seed confirms it, and the same state prices.
         assert!(!adopt_chain_pair(&meta, pool, t0, t1));
-        let (n, d) = rate_from_live(&live, &[pool], &meta, t0, t1).expect("priced once verified");
+        let (n, d) = rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).expect("priced once verified");
         assert!((n / d - 4.0).abs() < 1e-9, "got {}", n / d);
     }
 
@@ -2720,7 +2963,7 @@ mod tests {
         let f = f.with_pool_tokens(std::collections::HashMap::from([(
             pool,
             PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
-                       kind: PoolKind::ConstantProduct, verified: false },
+                       kind: PoolKind::ConstantProduct, verified: false, confirmed_at: Some(Instant::now()) },
         )]));
         seeded_v2(&f.live, pool, t0, t1);
         f.live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
@@ -2731,5 +2974,144 @@ mod tests {
         );
         adopt_chain_pair(&f.pool_tokens, pool, t0, t1);
         assert_eq!(f.coverage().priceable, 1, "confirming the pair is what covers it");
+    }
+
+    // ---- freshness ----
+
+    fn cp_meta(t0: Address, t1: Address, confirmed_at: Option<Instant>) -> PoolMeta {
+        PoolMeta {
+            token0: t0, token1: t1, fee_ppm: 0,
+            kind: PoolKind::ConstantProduct, verified: true, confirmed_at,
+        }
+    }
+
+    /// A pool nobody has ever read from chain is not priced, however good its
+    /// state looks. Inventory metadata is a claim about a pool, not a look at it.
+    #[test]
+    fn a_pool_never_confirmed_against_chain_is_not_priced() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        seeded_v2(&live, pool, t0, t1);
+        live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
+        let meta = dashmap::DashMap::from_iter([(pool, cp_meta(t0, t1, None))]);
+        assert!(rate_from_live(&live, &[pool], &meta, t0, t1, fresh()).is_none());
+    }
+
+    /// The backstop. A pool checked long enough ago stops being priced, because
+    /// the continuity cursor cannot see a MISSING log on a filtered
+    /// subscription -- a preconfirmed update that never lands in the sealed
+    /// block leaves state wrong with no signal at all.
+    #[test]
+    fn a_pool_unchecked_for_longer_than_the_ttl_is_not_priced() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        seeded_v2(&live, pool, t0, t1);
+        live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
+        let now = Instant::now();
+        let checked = now - Duration::from_secs(300);
+        let meta = dashmap::DashMap::from_iter([(pool, cp_meta(t0, t1, Some(checked)))]);
+
+        let inside = Freshness { now, ttl: Duration::from_secs(600) };
+        assert!(
+            rate_from_live(&live, &[pool], &meta, t0, t1, inside).is_some(),
+            "300s old under a 600s ttl must still price"
+        );
+        let outside = Freshness { now, ttl: Duration::from_secs(120) };
+        assert!(
+            rate_from_live(&live, &[pool], &meta, t0, t1, outside).is_none(),
+            "300s old under a 120s ttl must not"
+        );
+    }
+
+    /// Rotation order. Never-confirmed first -- it has the weakest claim to
+    /// being priced -- then oldest first, so the universe rotates through
+    /// verification at a bounded RPC cost instead of in one spike.
+    #[test]
+    fn verification_rotates_through_the_least_recently_checked() {
+        let (never, old, recent) = (addr(1), addr(2), addr(3));
+        let (f, _t) = fast(vec![never, old, recent]);
+        let now = Instant::now();
+        let f = f.with_pool_tokens(std::collections::HashMap::from([
+            (never, cp_meta(addr(90), addr(91), None)),
+            (old, cp_meta(addr(92), addr(93), Some(now - Duration::from_secs(300)))),
+            (recent, cp_meta(addr(94), addr(95), Some(now))),
+        ]));
+        let order = f.oldest_unconfirmed(&HashSet::new(), 3);
+        assert_eq!(order, vec![never, old, recent]);
+        assert_eq!(f.oldest_unconfirmed(&HashSet::new(), 1), vec![never], "bounded");
+
+        // Pools already queued for repair are not re-requested in the same pass.
+        let skip: HashSet<Address> = [never].into_iter().collect();
+        assert_eq!(f.oldest_unconfirmed(&skip, 3), vec![old, recent]);
+    }
+
+    // ---- selection-rule attribution ----
+
+    /// The diagnostic that separates a real spread from one manufactured by
+    /// taking a maximum over parallel pools. Same cycle, same state, two rules.
+    #[test]
+    fn first_match_and_best_net_disagree_by_exactly_the_selection_rule() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (first, better) = (addr(10), addr(11));
+        let live = LiveState::new();
+        for (p, r1) in [(first, 1_000u128), (better, 1_500u128)] {
+            assert!(live.anchor_v2(p, 100, crate::quote_univ2::UniV2PairState {
+                token0: t0, token1: t1,
+                reserve0: U256::from(1_000u64), reserve1: U256::from(r1),
+            }));
+        }
+        let meta = dashmap::DashMap::from_iter([
+            (first, cp_meta(t0, t1, Some(Instant::now()))),
+            (better, cp_meta(t0, t1, Some(Instant::now()))),
+        ]);
+        let pools = [first, better];
+
+        let (n, d) = rate_from_live_with(
+            &live, &pools, &meta, t0, t1, fresh(), HopSelect::BestNet,
+        ).expect("best");
+        assert!((n / d - 1.5).abs() < 1e-9, "best takes the better pool");
+
+        let (n, d) = rate_from_live_with(
+            &live, &pools, &meta, t0, t1, fresh(), HopSelect::FirstMatch,
+        ).expect("first");
+        assert!((n / d - 1.0).abs() < 1e-9, "first takes whichever came first");
+    }
+
+    /// A stale pool must not be silently skipped by first-match either, or the
+    /// two rules would be measuring different pool sets and the comparison
+    /// between them would mean nothing.
+    #[test]
+    fn both_selection_rules_honour_the_same_freshness_bound() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        assert!(live.anchor_v2(pool, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(1_000u64), reserve1: U256::from(2_000u64),
+        }));
+        let meta = dashmap::DashMap::from_iter([(pool, cp_meta(t0, t1, None))]);
+        for rule in [HopSelect::BestNet, HopSelect::FirstMatch] {
+            assert!(
+                rate_from_live_with(&live, &[pool], &meta, t0, t1, fresh(), rule).is_none(),
+                "{rule:?} priced an unconfirmed pool"
+            );
+        }
+    }
+
+    // ---- divergence ----
+
+    /// The measurement that answers what age cannot: has preconfirmed state
+    /// actually drifted from the chain?
+    #[test]
+    fn divergence_is_signed_and_relative() {
+        assert!(divergence_bps(1.0, 1.0).expect("equal").abs() < 1e-9);
+        let up = divergence_bps(1.01, 1.0).expect("above");
+        assert!((up - 100.0).abs() < 1e-6, "1% above is +100 bps, got {up}");
+        let down = divergence_bps(0.99, 1.0).expect("below");
+        assert!((down + 100.0).abs() < 1e-6, "1% below is -100 bps, got {down}");
+        assert!(divergence_bps(0.0, 1.0).is_none(), "a zero price is not a price");
+        assert!(divergence_bps(f64::NAN, 1.0).is_none());
     }
 }

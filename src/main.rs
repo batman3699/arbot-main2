@@ -13089,6 +13089,11 @@ async fn launch_chain_runtime(
                                     // from a both-directions config list and
                                     // has to be read from the pool itself.
                                     verified: cl,
+                                    // Nothing is confirmed until the reconcile
+                                    // reads it. Metadata from an inventory file
+                                    // is a claim about the pool, not a look at
+                                    // its current state.
+                                    confirmed_at: None,
                                 },
                             )
                         })
