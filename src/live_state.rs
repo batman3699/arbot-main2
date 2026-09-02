@@ -320,7 +320,20 @@ impl LiveState {
     /// No map sweep and no per-pool writes: snapshots carry the epoch they were
     /// applied under, so bumping it makes all of them `Unknown` at once. That is
     /// what lets recovery be background work while the searcher keeps running.
+    /// Invalidate everything, taking `state_write` first.
+    ///
+    /// The lock ORDER is load-bearing: every writer takes `state_write` before
+    /// `cursor`, never the reverse, or `apply_log` and this deadlock.
     pub fn break_continuity(&self, reason: UnknownReason) -> u64 {
+        let _write = match self.state_write.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        self.break_continuity_locked(reason)
+    }
+
+    /// Caller already holds `state_write`.
+    fn break_continuity_locked(&self, reason: UnknownReason) -> u64 {
         let epoch = self.continuity_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut c) = self.cursor.lock() {
@@ -661,6 +674,18 @@ impl LiveState {
         };
         let removed = log.removed.unwrap_or(false);
 
+        // Taken BEFORE the cursor, and held to the write. Two independent
+        // reviews found the same race here: the cursor was observed outside
+        // this lock, so `break_continuity` could bump the epoch between the
+        // observation and the commit, and the log would be written stamped with
+        // the NEW epoch though it was accepted under the old continuity
+        // assumption. Validation and commit have to be one transition.
+        //
+        // Lock order is state_write -> cursor everywhere, never the reverse.
+        let _write = match self.state_write.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
         let observation = match self.cursor.lock() {
             Ok(mut c) => c.observe(ordinal, removed),
             Err(_) => return ApplyOutcome::Undecodable,
@@ -672,19 +697,13 @@ impl LiveState {
                     BreakReason::Reorg => UnknownReason::Reorg,
                     BreakReason::OutOfOrder => UnknownReason::ContinuityBreak,
                 };
-                self.break_continuity(r);
+                self.break_continuity_locked(r);
                 return ApplyOutcome::ContinuityBroken(reason);
             }
             Observation::Accept => {}
         }
 
         let pool = log.address;
-        // Held from the ordering check through every write below: the check is
-        // only meaningful if nothing can write between it and the insert.
-        let _write = match self.state_write.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
         // Per-pool ordering. The global cursor guarantees the STREAM is
         // ordered, which used to imply per-pool ordering because every update
         // arrived through it. Anchors do not, so the implication has to become
@@ -1075,6 +1094,31 @@ mod tests {
         ls.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000_000, 0);
         ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 9_999_999, 0, 101, 0));
         assert_eq!(ls.swap_audit_counts(), (0, 0));
+    }
+
+    /// Deadlock guard for the widened lock. `apply_log` takes state_write then
+    /// cursor; `break_continuity` must take them in the SAME order, and the
+    /// internal break inside apply_log must not re-acquire. A regression here
+    /// hangs the ingest task rather than failing, so it is worth a test that
+    /// would time out loudly.
+    #[test]
+    fn breaking_continuity_from_inside_and_outside_apply_log_does_not_deadlock() {
+        let ls = LiveState::new();
+        let pool = Address::from_low_u64_be(96);
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+
+        // Outside path: takes state_write itself.
+        ls.break_continuity(UnknownReason::WsUnavailable);
+
+        // Inside path: an out-of-order log makes apply_log break continuity
+        // while it already holds state_write.
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 100, 0));
+        let out = ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 1_000_000, 0, 99, 0));
+        assert_eq!(out, ApplyOutcome::ContinuityBroken(BreakReason::OutOfOrder));
+
+        // Still usable afterwards.
+        ls.apply_log(&cl_swap_log(pool, 1u128 << 96, 2_000_000, 0, 200, 0));
+        assert_eq!(ls.cl_snapshot(pool).unwrap().liquidity, 2_000_000);
     }
 
     /// The buffer was inverted under exactly the pressure it exists for.

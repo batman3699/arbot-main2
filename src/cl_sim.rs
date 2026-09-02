@@ -154,7 +154,7 @@ fn decode_int24(word: &[u8]) -> i32 {
 /// cost 256 round-trips, which at a 15 req/s provider limit is ~17s of pure
 /// network wait — measured populate times were 43-48s against a 200ms budget.
 ///
-/// This issues `4 * pools` sub-calls inside a single `aggregate3`, chunked so
+/// This issues `6 * pools` sub-calls inside a single `aggregate3`, chunked so
 /// one batch stays within node `eth_call` gas limits. Pools whose sub-calls
 /// revert or return zero liquidity are simply absent from the result, and the
 /// caller falls back to the per-pool path for those.
