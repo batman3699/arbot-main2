@@ -12864,6 +12864,25 @@ async fn launch_chain_runtime(
                         .iter()
                         .map(|p| (p.pair, p.token_in, p.token_out))
                         .collect();
+                    // fee_ppm, NOT fee_bps: MonitoredPool.fee_bps is populated
+                    // from the raw pool fee, which is parts-per-million for
+                    // UniV3-style venues -- 3_000 is 0.30%, not 30%.
+                    let fast_meta: std::collections::HashMap<
+                        Address,
+                        crate::base_fast::PoolMeta,
+                    > = cl_pools
+                        .iter()
+                        .map(|p| {
+                            (
+                                p.pair,
+                                crate::base_fast::PoolMeta {
+                                    token0: p.token_in,
+                                    token1: p.token_out,
+                                    fee_ppm: p.fee_bps,
+                                },
+                            )
+                        })
+                        .collect();
                     let fast_starts: Vec<Address> = {
                         let mut t: Vec<Address> = cl_pools.iter().map(|p| p.token_in).collect();
                         t.sort_unstable();
@@ -12956,12 +12975,7 @@ async fn launch_chain_runtime(
                                         )),
                                         metrics.clone(),
                                     )
-                                    .with_pool_tokens(
-                                        fast_universe
-                                            .iter()
-                                            .map(|(p, t0, t1)| (*p, (*t0, *t1)))
-                                            .collect(),
-                                    )
+                                    .with_pool_tokens(fast_meta)
                                     .with_ws_reconnect(ws_endpoints.clone(), ws_backoff),
                                 );
                                 info!(

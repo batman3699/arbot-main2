@@ -153,7 +153,7 @@ pub struct BaseFastPath {
     ws_backoff: Duration,
     /// pool -> (token0, token1), ORDERED. Required to price a hop in the
     /// direction asked for; without it `sqrtPriceX96` would be applied blind.
-    pool_tokens: std::collections::HashMap<Address, (Address, Address)>,
+    pool_tokens: std::collections::HashMap<Address, PoolMeta>,
     pub stats: Arc<FastPathStats>,
 }
 
@@ -268,6 +268,60 @@ impl BaseFastPath {
     }
 }
 
+/// What the fast path knows about a pool, for directional and net pricing.
+///
+/// `fee_ppm`, not `fee_bps`. `MonitoredPool.fee_bps` is populated from the raw
+/// pool fee, which for UniV3-style venues is PARTS PER MILLION -- 3_000 means
+/// 0.30%, not 30%. The existing field name is a 10x error waiting to be made,
+/// so this one states its unit and converts explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolMeta {
+    pub token0: Address,
+    pub token1: Address,
+    pub fee_ppm: u32,
+}
+
+/// The costs a gross edge must clear before it is a candidate.
+///
+/// Replaces a hardcoded `ARBOT_MAX_CYCLE_FEE_BPS = 60`. A constant fee ceiling
+/// rejects a profitable dislocation purely because its nominal fee stack is
+/// large, which is not an economic law -- a 100 bps dislocation through two
+/// 30 bps pools is profitable and a 60 bps ceiling deletes it. The pool fees are
+/// already inside `gross_bps`; these are the costs that are not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CostStack {
+    pub gas_bps: f64,
+    pub flash_fee_bps: f64,
+    pub execution_buffer_bps: f64,
+    pub competition_bid_bps: f64,
+    pub risk_premium_bps: f64,
+}
+
+impl CostStack {
+    pub fn total_bps(&self) -> f64 {
+        self.gas_bps
+            + self.flash_fee_bps
+            + self.execution_buffer_bps
+            + self.competition_bid_bps
+            + self.risk_premium_bps
+    }
+
+    /// Net edge after everything. `gross_bps` must ALREADY be net of pool fees,
+    /// which `rate_from_live` applies per hop -- adding them here as well would
+    /// charge them twice.
+    pub fn net_bps(&self, gross_bps: f64) -> f64 {
+        gross_bps - self.total_bps()
+    }
+
+    /// Gas is a fixed cost, so its bps share depends on notional: the same
+    /// trade is unprofitable small and profitable large. A ceiling expressed in
+    /// bps alone cannot express that, which is the deeper reason the constant
+    /// had to go.
+    pub fn clears(&self, gross_bps: f64) -> bool {
+        self.net_bps(gross_bps) > 0.0
+    }
+}
+
 /// `U256` to `f64` for ratio arithmetic.
 ///
 /// Via decimal string rather than `as_u128`, which truncates silently: a
@@ -302,15 +356,22 @@ fn u256_to_f64(v: U256) -> Option<f64> {
 pub fn rate_from_live(
     live: &LiveState,
     candidate_pools: &[Address],
-    pool_tokens: &std::collections::HashMap<Address, (Address, Address)>,
+    pool_tokens: &std::collections::HashMap<Address, PoolMeta>,
     from: Address,
     to: Address,
 ) -> Option<(f64, f64)> {
     use crate::live_state::may_price_locally;
     for pool in candidate_pools {
-        let Some(&(token0, token1)) = pool_tokens.get(pool) else {
+        let Some(meta) = pool_tokens.get(pool) else {
             continue;
         };
+        let (token0, token1) = (meta.token0, meta.token1);
+        // Charged once, here, so `gross_bps` downstream is already net of pool
+        // fees. A cycle priced from raw ratios overstates every hop.
+        let keep = 1.0 - (f64::from(meta.fee_ppm) / 1_000_000.0);
+        if !(0.0..=1.0).contains(&keep) {
+            continue;
+        }
         let forward = if from == token0 && to == token1 {
             true
         } else if from == token1 && to == token0 {
@@ -331,7 +392,7 @@ pub fn rate_from_live(
             if !price.is_finite() || price <= 0.0 {
                 continue;
             }
-            return Some(if forward { (price, 1.0) } else { (1.0, price) });
+            return Some(if forward { (price * keep, 1.0) } else { (keep, price) });
         }
 
         if let Some(snap) = live.v2_snapshot(*pool) {
@@ -347,7 +408,7 @@ pub fn rate_from_live(
             if !(r0.is_finite() && r1.is_finite()) || r0 <= 0.0 || r1 <= 0.0 {
                 continue;
             }
-            return Some(if forward { (r1, r0) } else { (r0, r1) });
+            return Some(if forward { (r1 * keep, r0) } else { (r0 * keep, r1) });
         }
     }
     None
@@ -632,7 +693,7 @@ impl BaseFastPath {
     /// guessing a direction.
     pub fn with_pool_tokens(
         mut self,
-        tokens: std::collections::HashMap<Address, (Address, Address)>,
+        tokens: std::collections::HashMap<Address, PoolMeta>,
     ) -> Self {
         self.pool_tokens = tokens;
         self
@@ -1346,7 +1407,12 @@ mod tests {
         let live = LiveState::new();
         // reserves 1000 / 4000 -> 4 token1 per token0
         live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
-        let tokens = std::collections::HashMap::from([(pool, (t0, t1))]);
+        let tokens = std::collections::HashMap::from([(
+            pool,
+            // Zero fee: these tests are about DIRECTION and reciprocity, so the
+            // fee is held out rather than folded into every expected value.
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0 },
+        )]);
 
         let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1).expect("forward");
         assert!((n / d - 4.0).abs() < 1e-9, "t0->t1 must be 4.0, got {}", n / d);
@@ -1362,7 +1428,12 @@ mod tests {
         let (t0, t1, pool) = (addr(1), addr(2), addr(11));
         let live = LiveState::new();
         live.apply_log(&v2_sync(pool, 7_919, 104_729, 100));
-        let tokens = std::collections::HashMap::from([(pool, (t0, t1))]);
+        let tokens = std::collections::HashMap::from([(
+            pool,
+            // Zero fee: these tests are about DIRECTION and reciprocity, so the
+            // fee is held out rather than folded into every expected value.
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0 },
+        )]);
         let (a, b) = rate_from_live(&live, &[pool], &tokens, t0, t1).unwrap();
         let (c, d) = rate_from_live(&live, &[pool], &tokens, t1, t0).unwrap();
         let round = (a / b) * (c / d);
@@ -1376,7 +1447,12 @@ mod tests {
         let (t0, t1, pool) = (addr(1), addr(2), addr(11));
         let live = LiveState::new();
         live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
-        let tokens = std::collections::HashMap::from([(pool, (t0, t1))]);
+        let tokens = std::collections::HashMap::from([(
+            pool,
+            // Zero fee: these tests are about DIRECTION and reciprocity, so the
+            // fee is held out rather than folded into every expected value.
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0 },
+        )]);
         assert!(rate_from_live(&live, &[pool], &tokens, t0, t1).is_some());
 
         live.break_continuity(UnknownReason::WsUnavailable);
@@ -1393,7 +1469,12 @@ mod tests {
         let (t0, t1, pool) = (addr(1), addr(2), addr(11));
         let live = LiveState::new();
         live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
-        let tokens = std::collections::HashMap::from([(pool, (t0, t1))]);
+        let tokens = std::collections::HashMap::from([(
+            pool,
+            // Zero fee: these tests are about DIRECTION and reciprocity, so the
+            // fee is held out rather than folded into every expected value.
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0 },
+        )]);
         assert!(rate_from_live(&live, &[pool], &tokens, t0, addr(99)).is_none());
         assert!(rate_from_live(&live, &[], &tokens, t0, t1).is_none());
     }
@@ -1405,6 +1486,74 @@ mod tests {
         let wide = U256::from(1u64) << 200;
         let f = u256_to_f64(wide).expect("finite");
         assert!(f > 1e60, "a 200-bit value must not truncate to something small");
+    }
+
+    /// The unit trap: `MonitoredPool.fee_bps` holds PPM. Reading 3_000 as bps
+    /// charges 30% instead of 0.30% -- a 10x error that would reject every real
+    /// candidate while looking like conservatism.
+    #[test]
+    fn pool_fees_are_charged_in_ppm_not_bps() {
+        let (t0, t1, pool) = (addr(1), addr(2), addr(11));
+        let live = LiveState::new();
+        live.apply_log(&sync_log(pool, 1_000, 4_000, 100, 0));
+        // 3_000 ppm = 0.30%, so 4.0 becomes 4.0 * 0.997 = 3.988.
+        let tokens = std::collections::HashMap::from([(
+            pool,
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000 },
+        )]);
+        let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1).expect("priced");
+        let r = n / d;
+        assert!(
+            (r - 3.988).abs() < 1e-6,
+            "0.30% fee on 4.0 must give 3.988, got {r} -- 30% would give 2.8"
+        );
+    }
+
+    /// Pool fees belong INSIDE gross_bps, charged once per hop. A two-hop loop
+    /// through two 30bps pools loses ~60bps to fees alone, which is why raw
+    /// ratios overstated every candidate in the last run.
+    #[test]
+    fn a_two_hop_loop_pays_both_pool_fees() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (p1, p2) = (addr(11), addr(12));
+        let live = LiveState::new();
+        // Two pools at the same price: a round trip is break-even before fees.
+        live.apply_log(&sync_log(p1, 1_000, 2_000, 100, 0));
+        live.apply_log(&sync_log(p2, 1_000, 2_000, 100, 1));
+        let tokens = std::collections::HashMap::from([
+            (p1, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000 }),
+            (p2, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000 }),
+        ]);
+        let bps = price_cycle(&[t0, t1], |f, t| {
+            let pools = if f == t0 { [p1] } else { [p2] };
+            rate_from_live(&live, &pools, &tokens, f, t)
+        })
+        .expect("priceable");
+        assert!(
+            (bps + 59.91).abs() < 0.5,
+            "two 0.30% fees should cost ~60 bps, got {bps}"
+        );
+    }
+
+    /// The constant this replaces rejected on the fee stack alone. A 100bps
+    /// dislocation through two 30bps pools is profitable, and a 60bps ceiling
+    /// deleted it.
+    #[test]
+    fn the_cost_stack_judges_net_not_nominal_fees() {
+        let costs = CostStack {
+            gas_bps: 5.0,
+            flash_fee_bps: 9.0,
+            execution_buffer_bps: 3.0,
+            competition_bid_bps: 10.0,
+            risk_premium_bps: 5.0,
+        };
+        assert!((costs.total_bps() - 32.0).abs() < 1e-9);
+        // 40 bps gross (already net of pool fees) clears a 32 bps stack.
+        assert!(costs.clears(40.0));
+        assert!((costs.net_bps(40.0) - 8.0).abs() < 1e-9);
+        // 30 does not, and break-even does not count as profit.
+        assert!(!costs.clears(30.0));
+        assert!(!costs.clears(32.0), "break-even is not a candidate");
     }
 
     /// The feed is an enum so the documented Denim migration — native 200ms
