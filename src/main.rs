@@ -12,6 +12,7 @@ mod cl_swap;
 mod cl_ticks;
 #[cfg(test)]
 mod config_validation;
+mod base_fast;
 mod cycle_index;
 mod discovery;
 mod fees;
