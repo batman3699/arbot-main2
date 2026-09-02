@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use ethers::types::{Address, Log, H256};
+use ethers::types::{Address, Log, H256, U256};
 use serde_json::{json, Value};
 
 use ethers::providers::Middleware;
@@ -151,6 +151,9 @@ pub struct BaseFastPath {
     metrics: Option<Arc<Metrics>>,
     ws_endpoints: Vec<String>,
     ws_backoff: Duration,
+    /// pool -> (token0, token1), ORDERED. Required to price a hop in the
+    /// direction asked for; without it `sqrtPriceX96` would be applied blind.
+    pool_tokens: std::collections::HashMap<Address, (Address, Address)>,
     pub stats: Arc<FastPathStats>,
 }
 
@@ -178,6 +181,7 @@ impl BaseFastPath {
             metrics,
             ws_endpoints: Vec::new(),
             ws_backoff: Duration::from_secs(5),
+            pool_tokens: std::collections::HashMap::new(),
             stats: Arc::new(FastPathStats::default()),
         }
     }
@@ -262,6 +266,91 @@ impl BaseFastPath {
     pub fn stall_limit(&self) -> Duration {
         SUBSCRIPTION_STALL_LIMIT
     }
+}
+
+/// `U256` to `f64` for ratio arithmetic.
+///
+/// Via decimal string rather than `as_u128`, which truncates silently: a
+/// `sqrtPriceX96` routinely exceeds 128 bits, and a truncated one produces a
+/// plausible-looking wrong price rather than an obvious failure.
+fn u256_to_f64(v: U256) -> Option<f64> {
+    let f: f64 = v.to_string().parse().ok()?;
+    f.is_finite().then_some(f)
+}
+
+/// Rate for one hop, priced from the fast path's OWN live state.
+///
+/// This is the plan's tier-1 local quote, and it needs no `Graph`: the feed
+/// already maintains CL and V2 snapshots for every pool it subscribes to. A
+/// shared graph would raise the same question sharing `LiveState` did, and that
+/// cost 584 continuity breaks.
+///
+/// Returns `(numerator, denominator)` such that `num/den` is output-per-input
+/// for `from -> to`.
+///
+/// Three ways this returns `None`, all deliberate:
+/// - no pool serves the hop;
+/// - every candidate pool's snapshot fails `may_price_locally` — §7's
+///   "untrusted -> do not price locally", not "price it anyway";
+/// - the hop's tokens do not match the pool's recorded pair, which would mean
+///   pricing in an unknown direction.
+///
+/// Direction is the dangerous part: `sqrtPriceX96` gives token1-per-token0, so
+/// inverting it does not fail, it silently reports the reciprocal — and a
+/// reciprocal rate around a loop manufactures exactly the phantom edge the
+/// closing-hop test exists to catch.
+pub fn rate_from_live(
+    live: &LiveState,
+    candidate_pools: &[Address],
+    pool_tokens: &std::collections::HashMap<Address, (Address, Address)>,
+    from: Address,
+    to: Address,
+) -> Option<(f64, f64)> {
+    use crate::live_state::may_price_locally;
+    for pool in candidate_pools {
+        let Some(&(token0, token1)) = pool_tokens.get(pool) else {
+            continue;
+        };
+        let forward = if from == token0 && to == token1 {
+            true
+        } else if from == token1 && to == token0 {
+            false
+        } else {
+            continue;
+        };
+
+        if let Some(snap) = live.cl_snapshot(*pool) {
+            if !may_price_locally(&snap.prov.trust) {
+                continue;
+            }
+            let Some(sp) = u256_to_f64(snap.sqrt_price_x96) else {
+                continue;
+            };
+            let ratio = sp / 2f64.powi(96);
+            let price = ratio * ratio; // token1 per token0
+            if !price.is_finite() || price <= 0.0 {
+                continue;
+            }
+            return Some(if forward { (price, 1.0) } else { (1.0, price) });
+        }
+
+        if let Some(snap) = live.v2_snapshot(*pool) {
+            if !may_price_locally(&snap.prov.trust) {
+                continue;
+            }
+            let (r0, r1) = (
+                u256_to_f64(snap.state.reserve0)?,
+                u256_to_f64(snap.state.reserve1)?,
+            );
+            // Explicit, not `!(r > 0.0)`: NaN must reject and a negated
+            // partial comparison hides that.
+            if !(r0.is_finite() && r1.is_finite()) || r0 <= 0.0 || r1 <= 0.0 {
+                continue;
+            }
+            return Some(if forward { (r1, r0) } else { (r0, r1) });
+        }
+    }
+    None
 }
 
 /// A cycle priced from cached edges, before costs.
@@ -537,6 +626,18 @@ impl BaseFastPath {
     /// process, and once that socket is closed every resubscribe is against a
     /// corpse. The pool monitor shipped exactly that bug: it could detect the
     /// stall and never recover from it.
+    /// Ordered `(token0, token1)` per pool, for directional pricing.
+    ///
+    /// Empty means no cycle can be priced -- every hop rejects rather than
+    /// guessing a direction.
+    pub fn with_pool_tokens(
+        mut self,
+        tokens: std::collections::HashMap<Address, (Address, Address)>,
+    ) -> Self {
+        self.pool_tokens = tokens;
+        self
+    }
+
     pub fn with_ws_reconnect(mut self, endpoints: Vec<String>, backoff: Duration) -> Self {
         self.ws_endpoints = endpoints;
         self.ws_backoff = backoff;
@@ -604,10 +705,33 @@ impl BaseFastPath {
                 if out.total_touched > out.cycles.len() {
                     capped += 1;
                 }
+                // The join: cycle ids -> priced candidates, from this path's
+                // own live state. No Graph, so no shared-state question.
+                let priced_at = Instant::now();
+                let (priced, unpriceable) = price_touched(
+                    &idx,
+                    &out.cycles,
+                    |from, to| {
+                        rate_from_live(
+                            &self.live,
+                            universe.pools_for_hop(from, to),
+                            &self.pool_tokens,
+                            from,
+                            to,
+                        )
+                    },
+                    4,
+                );
+                let price_us = priced_at.elapsed().as_micros();
+                let best = priced.first().map(|c| c.gross_bps).unwrap_or(f64::NAN);
                 info!(
                     target: "latency",
                     dirty_pools = pools,
                     cycles = out.cycles.len(),
+                    priced = priced.len(),
+                    unpriceable,
+                    best_gross_bps = best,
+                    price_us,
                     total_touched = out.total_touched,
                     unresolved_pools = out.unresolved_pools,
                     drain_us = elapsed.as_micros(),
@@ -1207,6 +1331,80 @@ mod tests {
         assert_eq!(v[0].id, 2, "same profit, shorter loop wins");
         assert_eq!(v[1].id, 1);
         assert_eq!(v[2].id, 0);
+    }
+
+    fn v2_sync(pool: Address, r0: u128, r1: u128, block: u64) -> Log {
+        sync_log(pool, r0, r1, block, 0)
+    }
+
+    /// Direction is the dangerous part. `sqrtPriceX96` is token1-per-token0, so
+    /// pricing a hop backwards does not fail -- it silently returns the
+    /// reciprocal, and a reciprocal around a loop manufactures a phantom edge.
+    #[test]
+    fn a_hop_is_priced_in_the_direction_it_is_asked_for() {
+        let (t0, t1, pool) = (addr(1), addr(2), addr(11));
+        let live = LiveState::new();
+        // reserves 1000 / 4000 -> 4 token1 per token0
+        live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
+        let tokens = std::collections::HashMap::from([(pool, (t0, t1))]);
+
+        let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1).expect("forward");
+        assert!((n / d - 4.0).abs() < 1e-9, "t0->t1 must be 4.0, got {}", n / d);
+
+        let (n, d) = rate_from_live(&live, &[pool], &tokens, t1, t0).expect("reverse");
+        assert!((n / d - 0.25).abs() < 1e-9, "t1->t0 must be 0.25, got {}", n / d);
+    }
+
+    /// A round trip through one pool must be break-even, which is only true if
+    /// the two directions are exact reciprocals.
+    #[test]
+    fn the_two_directions_are_reciprocal() {
+        let (t0, t1, pool) = (addr(1), addr(2), addr(11));
+        let live = LiveState::new();
+        live.apply_log(&v2_sync(pool, 7_919, 104_729, 100));
+        let tokens = std::collections::HashMap::from([(pool, (t0, t1))]);
+        let (a, b) = rate_from_live(&live, &[pool], &tokens, t0, t1).unwrap();
+        let (c, d) = rate_from_live(&live, &[pool], &tokens, t1, t0).unwrap();
+        let round = (a / b) * (c / d);
+        assert!((round - 1.0).abs() < 1e-9, "round trip must be 1.0, got {round}");
+    }
+
+    /// §7: an untrusted snapshot is NOT priced locally. Pricing it anyway is
+    /// the optimistic fallback the parity gate exists to forbid.
+    #[test]
+    fn an_untrusted_snapshot_is_not_priced() {
+        let (t0, t1, pool) = (addr(1), addr(2), addr(11));
+        let live = LiveState::new();
+        live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
+        let tokens = std::collections::HashMap::from([(pool, (t0, t1))]);
+        assert!(rate_from_live(&live, &[pool], &tokens, t0, t1).is_some());
+
+        live.break_continuity(UnknownReason::WsUnavailable);
+        assert!(
+            rate_from_live(&live, &[pool], &tokens, t0, t1).is_none(),
+            "invalidated state must not be priced from"
+        );
+    }
+
+    /// A hop whose tokens do not match the pool's recorded pair would be priced
+    /// in an unknown direction; it must be skipped, not guessed.
+    #[test]
+    fn a_pool_that_does_not_serve_the_hop_is_skipped() {
+        let (t0, t1, pool) = (addr(1), addr(2), addr(11));
+        let live = LiveState::new();
+        live.apply_log(&v2_sync(pool, 1_000, 4_000, 100));
+        let tokens = std::collections::HashMap::from([(pool, (t0, t1))]);
+        assert!(rate_from_live(&live, &[pool], &tokens, t0, addr(99)).is_none());
+        assert!(rate_from_live(&live, &[], &tokens, t0, t1).is_none());
+    }
+
+    /// `as_u128` would truncate a sqrtPriceX96 silently and yield a plausible
+    /// wrong price; the decimal-string path must survive full-width values.
+    #[test]
+    fn wide_u256_values_convert_without_truncating() {
+        let wide = U256::from(1u64) << 200;
+        let f = u256_to_f64(wide).expect("finite");
+        assert!(f > 1e60, "a 200-bit value must not truncate to something small");
     }
 
     /// The feed is an enum so the documented Denim migration — native 200ms

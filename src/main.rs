@@ -12956,6 +12956,12 @@ async fn launch_chain_runtime(
                                         )),
                                         metrics.clone(),
                                     )
+                                    .with_pool_tokens(
+                                        fast_universe
+                                            .iter()
+                                            .map(|(p, t0, t1)| (*p, (*t0, *t1)))
+                                            .collect(),
+                                    )
                                     .with_ws_reconnect(ws_endpoints.clone(), ws_backoff),
                                 );
                                 info!(
@@ -12974,7 +12980,9 @@ async fn launch_chain_runtime(
                                 // is rebuilt every scan from a different pool
                                 // set.
                                 let fast_uni = std::sync::Arc::new(
-                                    crate::cycle_index::PoolUniverse::from_pools(fast_universe),
+                                    crate::cycle_index::PoolUniverse::from_pools(
+                                        fast_universe.clone(),
+                                    ),
                                 );
                                 let fast_index = crate::cycle_index::CycleIndex::build(
                                     &fast_uni,
