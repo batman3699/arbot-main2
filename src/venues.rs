@@ -4220,8 +4220,10 @@ pub struct PopulateResult {
     pub digest: EdgeDigest,
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Outcome of repricing one edge whose pool moved.
+// No non-test caller until `process_base_flashblock` drives the requote; the
+// allow goes with it, as it did for base_fast.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepriceOutcome {
     /// Pool did not move; the cached edge stands.
@@ -4240,6 +4242,7 @@ pub enum RepriceOutcome {
 /// moved. An edge with no resolvable pool address — a bridge, a multi-hop path —
 /// is never selected, so it keeps its cached quote rather than being silently
 /// treated as fresh.
+#[allow(dead_code)]
 pub fn edges_touching(edges: &[Edge], touched: &HashSet<Address>) -> Vec<usize> {
     edges
         .iter()
@@ -4258,6 +4261,7 @@ pub fn edges_touching(edges: &[Edge], touched: &HashSet<Address>) -> Vec<usize> 
 /// dropping the candidate: the searcher would price a cycle through a pool we
 /// could not read, and the failure would surface as a reverted trade instead of
 /// a skipped one.
+#[allow(dead_code)]
 pub fn apply_reprice(edges: &mut [Edge], index: usize, quoted: Option<Edge>) -> RepriceOutcome {
     match (edges.get_mut(index), quoted) {
         (Some(slot), Some(fresh)) => {
@@ -4279,12 +4283,14 @@ pub fn apply_reprice(edges: &mut [Edge], index: usize, quoted: Option<Edge>) -> 
 /// checks still apply to it. Nothing here mutates a reused edge — an edge that
 /// silently kept a fresh `quote_block` without being requoted would defeat
 /// `max_quote_block_lag`.
+#[allow(dead_code)]
 pub fn reprice_touched(edges: &[Edge], touched: &HashSet<Address>) -> (Vec<usize>, usize) {
     let hot = edges_touching(edges, touched);
     let reused = edges.len().saturating_sub(hot.len());
     (hot, reused)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn populate_edges<C>(
     g: &mut Graph,
     provider: Arc<Provider<C>>,
