@@ -282,6 +282,96 @@ pub struct PoolMeta {
     pub token0: Address,
     pub token1: Address,
     pub fee_ppm: u32,
+    pub kind: PoolKind,
+}
+
+/// Which curve a pool trades on.
+///
+/// Needed for two separate reasons, and both are load-bearing:
+/// - the SEED must read each pool with the loader for its storage layout;
+/// - the PRICER must use each pool's actual invariant.
+///
+/// `StableSwap` is split out because `r1/r0` is not the marginal price of the
+/// Solidly stable curve. Pricing one as constant-product produced a 163%
+/// phantom edge in the 2026-09-01 spread census. This enum exists so that
+/// mistake is unrepresentable rather than merely discouraged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolKind {
+    /// UniV3 / Aerodrome Slipstream. Priced from `sqrtPriceX96`.
+    ConcentratedLiquidity,
+    /// UniV2 and Solidly *volatile*. `x * y = k`, so `r1/r0` is the price.
+    ConstantProduct,
+    /// Solidly *stable*. `x^3*y + x*y^3 = k`.
+    StableSwap,
+}
+
+/// How much of the fast path's universe can be priced right now.
+///
+/// The denominator is the SUBSCRIBED pool set, never the set that happens to
+/// hold a snapshot: a path that has heard from 40 of 683 pools has 6% coverage,
+/// and measuring against 40 would report 100% at the moment it is most blind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastCoverage {
+    pub priceable: usize,
+    pub total: usize,
+}
+
+impl FastCoverage {
+    /// An empty universe is 0%, not 100%. `0/0` reported as complete would let
+    /// a fast path with no pools at all pass a >95% production gate.
+    pub fn pct(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        self.priceable as f64 * 100.0 / self.total as f64
+    }
+}
+
+/// One CL pool as `load_cl_pool_states_batched` wants it:
+/// `(pool, fee_hint, token0, token1)`.
+pub type ClSeedTarget = (Address, Option<u32>, Address, Address);
+
+/// Split a pool set into the reads each curve needs.
+///
+/// CL entries carry `(pool, fee_hint, token0, token1)` because
+/// `load_cl_pool_states_batched` reads each pool's token BALANCES for its depth
+/// bound, and cannot do that without knowing the pair. Both Solidly curves keep
+/// plain reserves, so both seed through the pair loader — the invariant
+/// difference is a pricing concern, not a storage one.
+///
+/// Pools with no metadata are returned in NEITHER list. The CL loader cannot
+/// read a pool whose tokens are unknown, and substituting a guess would anchor
+/// state against the wrong pair.
+pub fn seed_targets(
+    pools: &[Address],
+    meta: &std::collections::HashMap<Address, PoolMeta>,
+) -> (Vec<ClSeedTarget>, Vec<Address>) {
+    let mut cl: Vec<ClSeedTarget> = Vec::new();
+    let mut v2 = Vec::new();
+    for pool in pools {
+        let Some(m) = meta.get(pool) else { continue };
+        match m.kind {
+            PoolKind::ConcentratedLiquidity => {
+                cl.push((*pool, Some(m.fee_ppm), m.token0, m.token1))
+            }
+            PoolKind::ConstantProduct | PoolKind::StableSwap => v2.push(*pool),
+        }
+    }
+    (cl, v2)
+}
+
+/// What one reconciliation pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SeedOutcome {
+    /// Anchors actually installed. NOT the number attempted: `anchor_*` refuses
+    /// any pool already holding newer state, and counting refusals as successes
+    /// would report a seed that changed nothing as a full one.
+    pub anchored: usize,
+    /// Pools asked for that the reads did not return. A pool absent from the
+    /// multicall result is a real gap — it stays unpriceable — so it is counted
+    /// rather than folded into the anchored total.
+    pub missing: usize,
+    pub block: u64,
 }
 
 /// The costs a gross edge must clear before it is a candidate.
@@ -765,6 +855,181 @@ impl BaseFastPath {
         self
     }
 
+    /// Fraction of the subscribed universe the pricer would accept right now.
+    ///
+    /// Goes through `cl_snapshot`/`v2_snapshot` and `may_price_locally` — the
+    /// same two calls `rate_from_live` makes — so the gauge and the pricer
+    /// cannot drift apart. A cheaper `tracked_cl().len()` would keep reading
+    /// full coverage straight through a continuity break.
+    pub fn coverage(&self) -> FastCoverage {
+        FastCoverage {
+            priceable: self.pools.iter().filter(|p| self.pool_priceable(**p)).count(),
+            total: self.pools.len(),
+        }
+    }
+
+    /// Mirrors `rate_from_live`'s acceptance test for a single pool, including
+    /// its order: a pool holding an untrusted CL snapshot is rejected outright
+    /// rather than falling through to the V2 branch, because a pool is one
+    /// curve or the other and a fallthrough would price it on the wrong one.
+    fn pool_priceable(&self, pool: Address) -> bool {
+        use crate::live_state::may_price_locally;
+        if let Some(s) = self.live.cl_snapshot(pool) {
+            return may_price_locally(&s.prov.trust);
+        }
+        if let Some(s) = self.live.v2_snapshot(pool) {
+            return may_price_locally(&s.prov.trust);
+        }
+        false
+    }
+
+    /// Seed local state from canonical reads at a SEALED block.
+    ///
+    /// Without this the fast path starts empty and learns a pool only when that
+    /// pool happens to trade. Measured in the 2026-09-02 bridge run: **90.1% of
+    /// touched cycles were unpriceable**, because a cycle needs every hop and
+    /// per-pool coverage compounds — at 68% per pool a 6-hop loop prices 10% of
+    /// the time (`0.68^6`). That exponent is why the acceptance bar is 95% per
+    /// pool and not 80%: `0.95^6` is 74%, `0.80^6` is 26%.
+    ///
+    /// Sealed, never `"pending"`: the loaders pin every sub-call to one block
+    /// number so the whole seed is one consistent snapshot, and a pending block
+    /// is not a stable pin.
+    ///
+    /// **Safe to run while the feed is live.** `anchor_*` refuses any pool
+    /// already holding newer state, and `anchor_cl` replays deltas buffered
+    /// during the read's flight, so a seed racing a preconfirmed log cannot roll
+    /// state backwards.
+    pub async fn seed_from_chain<C>(
+        &self,
+        provider: &Arc<ethers::providers::Provider<C>>,
+        pools: &[Address],
+        block: u64,
+    ) -> SeedOutcome
+    where
+        C: ethers::providers::JsonRpcClient + Clone + Send + Sync + 'static,
+    {
+        let (cl_targets, v2_targets) = seed_targets(pools, &self.pool_tokens);
+        let mut out = SeedOutcome { block, ..Default::default() };
+        let at = ethers::types::U64::from(block);
+
+        if !cl_targets.is_empty() {
+            let states =
+                crate::cl_sim::load_cl_pool_states_batched(Arc::clone(provider), &cl_targets, at)
+                    .await;
+            for (pool, _, _, _) in &cl_targets {
+                match states.get(pool) {
+                    Some(st) => {
+                        if self.live.anchor_cl(
+                            *pool,
+                            block,
+                            st.sqrt_price_x96,
+                            st.liquidity,
+                            st.tick,
+                        ) {
+                            out.anchored += 1;
+                        }
+                    }
+                    None => out.missing += 1,
+                }
+            }
+        }
+
+        if !v2_targets.is_empty() {
+            let states = crate::quote_univ2::load_pair_states_batched(
+                Arc::clone(provider),
+                &v2_targets,
+                at,
+            )
+            .await;
+            for pool in &v2_targets {
+                match states.get(pool) {
+                    Some(st) => {
+                        if self.live.anchor_v2(*pool, block, st.clone()) {
+                            out.anchored += 1;
+                        }
+                    }
+                    None => out.missing += 1,
+                }
+            }
+        }
+        out
+    }
+
+    /// Seed at startup, then keep repairing coverage against sealed blocks.
+    ///
+    /// Runs on its own task with its own RPC budget. The feed must never block
+    /// on a read: a socket task waiting on a 29-multicall seed stops draining,
+    /// and a feed that falls behind reports stale state as fresh.
+    ///
+    /// Each pass targets only the pools the pricer currently REJECTS, so the
+    /// first pass is the whole universe and later ones are the handful that
+    /// went untrusted. That bounds the steady-state cost to roughly nothing
+    /// while still converging after a gap, which invalidates everything at once.
+    ///
+    /// What this does NOT do: detect a preconfirmed snapshot that is *present
+    /// and wrong*. Anchoring at sealed block N is refused for any pool already
+    /// holding state from N+1, which is exactly the pool a divergence check
+    /// would care about. Measuring that is `state_validation`'s comparison, and
+    /// pointing it at this state is a separate change.
+    pub fn spawn_reconcile<C>(
+        self: Arc<Self>,
+        provider: Arc<ethers::providers::Provider<C>>,
+        cadence: Duration,
+    ) -> JoinHandle<()>
+    where
+        C: ethers::providers::JsonRpcClient + Clone + Send + Sync + 'static,
+    {
+        tokio::spawn(async move {
+            let mut tick = interval(cadence);
+            loop {
+                tick.tick().await;
+                let block = match provider.get_block_number().await {
+                    Ok(b) => b.as_u64(),
+                    Err(err) => {
+                        warn!(error = %err, "fast path reconcile: no block number");
+                        continue;
+                    }
+                };
+                let stale: Vec<Address> = self
+                    .pools
+                    .iter()
+                    .copied()
+                    .filter(|p| !self.pool_priceable(*p))
+                    .collect();
+                if stale.is_empty() {
+                    self.publish_coverage();
+                    continue;
+                }
+                let started = Instant::now();
+                let out = self.seed_from_chain(&provider, &stale, block).await;
+                let cov = self.publish_coverage();
+                info!(
+                    target: "latency",
+                    block = out.block,
+                    requested = stale.len(),
+                    anchored = out.anchored,
+                    missing = out.missing,
+                    coverage_pct = cov.pct().round() as u64,
+                    priceable = cov.priceable,
+                    pools = cov.total,
+                    seed_ms = started.elapsed().as_millis(),
+                    "fast state reconcile"
+                );
+            }
+        })
+    }
+
+    /// Publish coverage to the gauge and return it, so the caller logs exactly
+    /// what was exported rather than recomputing and reporting a second number.
+    fn publish_coverage(&self) -> FastCoverage {
+        let cov = self.coverage();
+        if let Some(m) = &self.metrics {
+            m.fast_state_coverage_pct.set(cov.pct());
+        }
+        cov
+    }
+
     /// Start the feed. Returns immediately; the socket runs on its own task.
     ///
     /// Also starts a reporter. `FastPathStats` was collected for two runs
@@ -960,9 +1225,12 @@ impl BaseFastPath {
                 continue;
             }
             let dirty = self.touched.lock().map(|g| g.len()).unwrap_or(0);
+            let cov = self.publish_coverage();
             info!(
                 target: "latency",
                 seen,
+                coverage_pct = cov.pct().round() as u64,
+                priceable = cov.priceable,
                 applied,
                 declined,
                 undecodable,
@@ -1540,7 +1808,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0 },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConcentratedLiquidity },
         )]);
 
         let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1).expect("forward");
@@ -1561,7 +1829,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0 },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConcentratedLiquidity },
         )]);
         let (a, b) = rate_from_live(&live, &[pool], &tokens, t0, t1).unwrap();
         let (c, d) = rate_from_live(&live, &[pool], &tokens, t1, t0).unwrap();
@@ -1580,7 +1848,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0 },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConcentratedLiquidity },
         )]);
         assert!(rate_from_live(&live, &[pool], &tokens, t0, t1).is_some());
 
@@ -1602,7 +1870,7 @@ mod tests {
             pool,
             // Zero fee: these tests are about DIRECTION and reciprocity, so the
             // fee is held out rather than folded into every expected value.
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 0 },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 0, kind: PoolKind::ConcentratedLiquidity },
         )]);
         assert!(rate_from_live(&live, &[pool], &tokens, t0, addr(99)).is_none());
         assert!(rate_from_live(&live, &[], &tokens, t0, t1).is_none());
@@ -1628,7 +1896,7 @@ mod tests {
         // 3_000 ppm = 0.30%, so 4.0 becomes 4.0 * 0.997 = 3.988.
         let tokens = std::collections::HashMap::from([(
             pool,
-            PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000 },
+            PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct },
         )]);
         let (n, d) = rate_from_live(&live, &[pool], &tokens, t0, t1).expect("priced");
         let r = n / d;
@@ -1650,8 +1918,8 @@ mod tests {
         live.apply_log(&sync_log(p1, 1_000, 2_000, 100, 0));
         live.apply_log(&sync_log(p2, 1_000, 2_000, 100, 1));
         let tokens = std::collections::HashMap::from([
-            (p1, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000 }),
-            (p2, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000 }),
+            (p1, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct }),
+            (p2, PoolMeta { token0: t0, token1: t1, fee_ppm: 3_000, kind: PoolKind::ConstantProduct }),
         ]);
         let bps = price_cycle(&[t0, t1], |f, t| {
             let pools = if f == t0 { [p1] } else { [p2] };
@@ -1726,5 +1994,92 @@ mod tests {
     #[test]
     fn the_socket_rotates_before_the_provider_closes_it() {
         assert!(WS_MAX_CONNECTION_AGE < Duration::from_secs(30 * 60));
+    }
+
+    // ---- state coverage (the seeding gap) ----
+
+    /// Coverage must be measured through the SAME gate the pricer uses.
+    ///
+    /// A count of "pools holding any snapshot" would have read 100% in the
+    /// 2026-09-02 bridge run, where `rate_from_live` priced 9.9% of touched
+    /// cycles. The number that matters is what the pricer would ACCEPT.
+    #[test]
+    fn coverage_counts_only_what_the_pricer_would_accept() {
+        let (cl, v2, dark) = (addr(1), addr(2), addr(3));
+        let (f, _t) = fast(vec![cl, v2, dark]);
+        assert_eq!(f.coverage().priceable, 0, "nothing seeded yet");
+        assert_eq!(f.coverage().total, 3);
+
+        assert!(f.live.anchor_cl(cl, 100, U256::from(1u64) << 96, 1_000, 0));
+        assert!(f.live.anchor_v2(
+            v2,
+            100,
+            crate::quote_univ2::UniV2PairState {
+                token0: addr(90),
+                token1: addr(91),
+                reserve0: U256::from(1_000u64),
+                reserve1: U256::from(2_000u64),
+            }
+        ));
+
+        let c = f.coverage();
+        assert_eq!(c.priceable, 2);
+        assert_eq!(c.total, 3, "the denominator is the SUBSCRIBED set");
+        assert!((c.pct() - 66.667).abs() < 0.01, "got {}", c.pct());
+    }
+
+    /// A feed gap invalidates local state, and the gauge has to fall with it.
+    /// One that stayed high across a break would report the fast path as
+    /// production-ready at the moment it went blind.
+    #[test]
+    fn a_feed_gap_collapses_coverage() {
+        let pool = addr(1);
+        let (f, _t) = fast(vec![pool]);
+        assert!(f.live.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000, 0));
+        assert_eq!(f.coverage().priceable, 1);
+        f.note_gap();
+        assert_eq!(
+            f.coverage().priceable,
+            0,
+            "a continuity break must not leave state priceable"
+        );
+    }
+
+    /// An empty universe is 0% covered, not 100%. `0/0` reported as complete
+    /// would let a fast path with no pools pass a >95% production gate.
+    #[test]
+    fn an_empty_universe_is_uncovered_not_complete() {
+        assert_eq!(FastCoverage { priceable: 0, total: 0 }.pct(), 0.0);
+    }
+
+    /// The seed has to read each pool with the loader for ITS curve. Sending a
+    /// V2 pair to the CL loader returns nothing, and the pool stays dark
+    /// forever while the log says the seed succeeded.
+    #[test]
+    fn the_seed_routes_each_pool_to_the_loader_for_its_curve() {
+        let (cl, vol, stable) = (addr(1), addr(2), addr(3));
+        let mut meta = std::collections::HashMap::new();
+        meta.insert(cl, PoolMeta { token0: addr(10), token1: addr(11), fee_ppm: 500, kind: PoolKind::ConcentratedLiquidity });
+        meta.insert(vol, PoolMeta { token0: addr(12), token1: addr(13), fee_ppm: 3_000, kind: PoolKind::ConstantProduct });
+        meta.insert(stable, PoolMeta { token0: addr(14), token1: addr(15), fee_ppm: 100, kind: PoolKind::StableSwap });
+
+        let (cl_targets, v2_targets) = seed_targets(&[cl, vol, stable], &meta);
+        assert_eq!(cl_targets.len(), 1);
+        assert_eq!(cl_targets[0].0, cl);
+        assert_eq!(cl_targets[0].2, addr(10), "token0 is needed for the balance read");
+        // Both Solidly curves store plain reserves, so both seed through the
+        // pair loader; the curve difference is a PRICING concern, not a read.
+        assert_eq!(v2_targets.len(), 2);
+        assert!(v2_targets.contains(&vol) && v2_targets.contains(&stable));
+    }
+
+    /// A pool the fast path has no metadata for cannot be seeded: the CL loader
+    /// needs its token pair to read balances, and guessing one would anchor a
+    /// pool against the wrong tokens.
+    #[test]
+    fn a_pool_without_metadata_is_not_seeded() {
+        let meta = std::collections::HashMap::new();
+        let (cl, v2) = seed_targets(&[addr(1)], &meta);
+        assert!(cl.is_empty() && v2.is_empty());
     }
 }

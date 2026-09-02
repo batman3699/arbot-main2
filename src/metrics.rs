@@ -97,6 +97,11 @@ pub struct Metrics {
     pub ingestion_poll_refresh: Counter,
     pub ingestion_stale_pools: Gauge,
     pub ingestion_active_pools: Gauge,
+    /// Percentage of the Base fast path's subscribed pools whose local snapshot
+    /// the pricer would actually accept. Measured through `may_price_locally`,
+    /// not "has a snapshot" — the two disagreed by 90 points in the 2026-09-02
+    /// bridge run.
+    pub fast_state_coverage_pct: Gauge,
     pub mempool_txs_observed: Counter,
     pub sizing_quote_requests: Counter,
     pub multi_loan_rejections: CounterVec,
@@ -407,6 +412,14 @@ impl Metrics {
         registry
             .register(Box::new(ingestion_active_pools.clone()))
             .context("register ingestion_active_pools gauge")?;
+
+        let fast_state_coverage_pct = Gauge::with_opts(Opts::new(
+            "fast_state_coverage_pct",
+            "Percent of Base fast-path pools with locally priceable state",
+        ))?;
+        registry
+            .register(Box::new(fast_state_coverage_pct.clone()))
+            .context("register fast_state_coverage_pct gauge")?;
 
         let mempool_txs_observed = Counter::with_opts(Opts::new(
             "mempool_txs_observed_total",
@@ -770,6 +783,7 @@ impl Metrics {
             ingestion_poll_refresh,
             ingestion_stale_pools,
             ingestion_active_pools,
+            fast_state_coverage_pct,
             mempool_txs_observed,
             sizing_quote_requests,
             multi_loan_rejections,

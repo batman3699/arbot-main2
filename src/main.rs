@@ -12906,6 +12906,13 @@ async fn launch_chain_runtime(
                                     token0: p.token_in,
                                     token1: p.token_out,
                                     fee_ppm: p.fee_bps,
+                                    kind: match p.kind {
+                                        ingestion::PoolMonitorKind::ConcentratedLiquidity => {
+                                            crate::base_fast::PoolKind::ConcentratedLiquidity
+                                        }
+                                        _ if p.stable => crate::base_fast::PoolKind::StableSwap,
+                                        _ => crate::base_fast::PoolKind::ConstantProduct,
+                                    },
                                 },
                             )
                         })
@@ -13017,6 +13024,23 @@ async fn launch_chain_runtime(
                                     "base fast path enabled (pendingLogs)"
                                 );
                                 fast.clone().spawn();
+                                // Seed local state instead of waiting for every
+                                // pool to trade. Measured in the 2026-09-02
+                                // bridge run: 90.1% of touched cycles were
+                                // unpriceable, because a cycle needs EVERY hop
+                                // and per-pool coverage compounds -- at 68% per
+                                // pool a 6-hop loop prices 10% of the time.
+                                // The same loop repairs coverage after a gap,
+                                // which invalidates all of it at once.
+                                let reconcile_secs = crate::util::env_parse_opt::<u64>(
+                                    "ARBOT_BASE_FAST_RECONCILE_SECS",
+                                )
+                                .filter(|v| *v > 0)
+                                .unwrap_or(2);
+                                fast.clone().spawn_reconcile(
+                                    provider.clone(),
+                                    Duration::from_secs(reconcile_secs),
+                                );
                                 // The consumer. Without it the dirty set has a
                                 // writer and no reader: it climbed to 159 pools
                                 // and never fell in the previous run.
