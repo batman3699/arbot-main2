@@ -183,6 +183,15 @@ impl PoolUniverse {
     /// A pool trades both directions, so the lookup is direction-insensitive.
     /// Returns all parallel pools: a hint on WETH/USDC must dirty every fee
     /// tier, not whichever one happened to be found first.
+    /// The unordered token pair a pool serves, if the universe knows it.
+    ///
+    /// The hot path needs pool -> hop: `pendingLogs` reports which POOL moved,
+    /// while `CycleIndex` is keyed by token hop, because a fourth WETH/USDC fee
+    /// tier is a new pool but not a new edge in the token graph.
+    pub fn pair_of(&self, pool: Address) -> Option<(Address, Address)> {
+        self.pools.get(&pool).copied()
+    }
+
     pub fn pools_for_hop(&self, from: Address, to: Address) -> &[Address] {
         let key = if from <= to { (from, to) } else { (to, from) };
         self.by_pair.get(&key).map(|v| v.as_slice()).unwrap_or(&[])

@@ -144,7 +144,7 @@ pub struct BaseFastPath {
     feed: FlashFeed,
     pools: Vec<Address>,
     live: Arc<LiveState>,
-    /// Shared with the scan loop, which drains it. A `Mutex<HashSet>` rather
+    /// Shared with the scan loop, which drains it via `drain_and_resolve`. A `Mutex<HashSet>` rather
     /// than a `DashMap` because the drain must be a single atomic swap — the
     /// collect-then-clear form loses any insert landing between the two.
     touched: Arc<StdMutex<HashSet<Address>>>,
@@ -180,6 +180,11 @@ impl BaseFastPath {
 
     pub fn pools(&self) -> &[Address] {
         &self.pools
+    }
+
+    /// The dirty set, for the scan loop to drain.
+    pub fn touched(&self) -> Arc<StdMutex<HashSet<Address>>> {
+        Arc::clone(&self.touched)
     }
 
     /// Apply one preconfirmed log.
@@ -249,6 +254,79 @@ impl BaseFastPath {
     pub fn stall_limit(&self) -> Duration {
         SUBSCRIPTION_STALL_LIMIT
     }
+}
+
+/// What one flashblock's worth of dirty pools resolved to.
+///
+/// Deliberately reports what was DROPPED as well as what was selected: a hot
+/// path that returns 32 cycles without saying it considered 400 reads as
+/// exhaustive, and the whole point of the cap is that it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TouchedCycles {
+    /// Cycles to reprice, shortest first.
+    pub cycles: Vec<crate::cycle_index::CycleId>,
+    /// Cycles touched in total, before the cap.
+    pub total_touched: usize,
+    /// Dirty pools the universe could not resolve to a token hop. Non-zero
+    /// means the fast path is marking pools the search graph does not know
+    /// about, so their moves can never become candidates.
+    pub unresolved_pools: usize,
+}
+
+/// Dirty pools -> token hops -> affected cycles.
+///
+/// This is the join the whole fast path exists for: `pendingLogs` reports which
+/// POOL moved, `CycleIndex` is keyed by token HOP, and the canonical loop
+/// bridged them by rebuilding everything. Both hop directions are queried
+/// because a pool serves an unordered pair while cycles traverse a direction.
+///
+/// Pure and synchronous on purpose — no quoting, no RPC. It is the measurable
+/// stage between "a log arrived" and "there is something to price", and keeping
+/// it free of I/O is what makes that measurement mean anything.
+pub fn touched_cycles(
+    universe: &crate::cycle_index::PoolUniverse,
+    index: &crate::cycle_index::CycleIndex,
+    dirty: &HashSet<Address>,
+    max_cycles: usize,
+) -> TouchedCycles {
+    let mut hops: Vec<(Address, Address)> = Vec::with_capacity(dirty.len() * 2);
+    let mut unresolved = 0usize;
+    for pool in dirty {
+        match universe.pair_of(*pool) {
+            Some((a, b)) => {
+                hops.push((a, b));
+                hops.push((b, a));
+            }
+            None => unresolved += 1,
+        }
+    }
+    let (cycles, total_touched) = index.cycles_touching_limited(hops, max_cycles);
+    TouchedCycles {
+        cycles,
+        total_touched,
+        unresolved_pools: unresolved,
+    }
+}
+
+/// Drain the dirty set and resolve it, timing the whole stage.
+///
+/// The drain is a single atomic swap, so a log landing mid-drain is not lost.
+/// Returns the elapsed time because "flashblock -> candidate" is the first row
+/// of the acceptance table and nothing else measures it.
+pub fn drain_and_resolve(
+    touched: &StdMutex<HashSet<Address>>,
+    universe: &crate::cycle_index::PoolUniverse,
+    index: &crate::cycle_index::CycleIndex,
+    max_cycles: usize,
+) -> (TouchedCycles, usize, Duration) {
+    let started = Instant::now();
+    let dirty = match touched.lock() {
+        Ok(mut g) => std::mem::take(&mut *g),
+        Err(p) => std::mem::take(&mut *p.into_inner()),
+    };
+    let pools = dirty.len();
+    let out = touched_cycles(universe, index, &dirty, max_cycles);
+    (out, pools, started.elapsed())
 }
 
 /// Decode-only helper: which monitored pool a log belongs to, if any.
@@ -574,6 +652,59 @@ mod tests {
         let pools: HashSet<Address> = [addr(1), addr(2)].into_iter().collect();
         assert!(is_monitored(&sync_log(addr(1), 1, 2, 1, 0), &pools));
         assert!(!is_monitored(&sync_log(addr(99), 1, 2, 1, 0), &pools));
+    }
+
+    /// The join the fast path exists for: a dirty POOL becomes affected CYCLES
+    /// without rebuilding the universe. Both hop directions must be queried --
+    /// a pool serves an unordered pair, cycles traverse a direction.
+    #[test]
+    fn dirty_pools_resolve_to_the_cycles_that_traverse_them() {
+        use crate::cycle_index::{CycleIndex, CycleIndexLimits, PoolUniverse};
+        let (t1, t2, t3) = (addr(1), addr(2), addr(3));
+        let (p12, p23, p31) = (addr(11), addr(12), addr(13));
+        let universe = PoolUniverse::from_pools([(p12, t1, t2), (p23, t2, t3), (p31, t3, t1)]);
+        let index = CycleIndex::build(&universe, &[t1], CycleIndexLimits::default());
+
+        let dirty: HashSet<Address> = [p12].into_iter().collect();
+        let out = touched_cycles(&universe, &index, &dirty, 32);
+        assert!(
+            !out.cycles.is_empty(),
+            "the triangle traverses this pool's hop; it must be selected"
+        );
+        assert_eq!(out.unresolved_pools, 0);
+        assert_eq!(out.total_touched, out.cycles.len());
+    }
+
+    /// A dirty pool the search graph does not know about can never become a
+    /// candidate. Counting it is how that shows up as a number instead of as
+    /// mysteriously absent opportunities.
+    #[test]
+    fn pools_the_universe_does_not_know_are_counted_not_hidden() {
+        use crate::cycle_index::{CycleIndex, CycleIndexLimits, PoolUniverse};
+        let universe = PoolUniverse::from_pools([(addr(11), addr(1), addr(2))]);
+        let index = CycleIndex::build(&universe, &[addr(1)], CycleIndexLimits::default());
+        let dirty: HashSet<Address> = [addr(99)].into_iter().collect();
+        let out = touched_cycles(&universe, &index, &dirty, 32);
+        assert!(out.cycles.is_empty());
+        assert_eq!(out.unresolved_pools, 1);
+    }
+
+    /// The drain must be a single atomic swap, and must empty the set — a
+    /// collect-then-clear loses anything landing between the two, and leaving
+    /// the set populated reprocesses the same pools every cycle.
+    #[test]
+    fn draining_empties_the_dirty_set_and_reports_its_size() {
+        use crate::cycle_index::{CycleIndex, CycleIndexLimits, PoolUniverse};
+        let universe = PoolUniverse::from_pools([(addr(11), addr(1), addr(2))]);
+        let index = CycleIndex::build(&universe, &[addr(1)], CycleIndexLimits::default());
+        let touched = StdMutex::new(HashSet::from([addr(11), addr(12)]));
+
+        let (_out, pools, _elapsed) = drain_and_resolve(&touched, &universe, &index, 32);
+        assert_eq!(pools, 2);
+        assert!(
+            touched.lock().unwrap().is_empty(),
+            "a drain that leaves the set populated reprocesses forever"
+        );
     }
 
     /// The feed is an enum so the documented Denim migration — native 200ms
