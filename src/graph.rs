@@ -671,6 +671,13 @@ type AdjacencyMap = DashMap<NodeIx, AdjacencyList>;
 /// `(weight, cycle, edge_indices, start_priority, estimated_profit_bps)`.
 type DiscoveredCycle = (EdgeWeight, Vec<NodeIx>, Vec<usize>, i128, i64);
 
+/// Cloneable so the scan can publish an immutable snapshot for readers.
+///
+/// The flashblock fast path reads a snapshot; it never mutates the graph. That
+/// is what makes sharing safe here where sharing `LiveState` was not: LiveState
+/// has one global ordinal cursor and two writers broke it, while a graph
+/// snapshot has exactly one writer and any number of readers.
+#[derive(Clone)]
 pub struct Graph {
     pub nodes: Vec<Address>,
     pub ix: HashMap<Address, usize>,

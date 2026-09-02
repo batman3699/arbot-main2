@@ -3472,6 +3472,9 @@ where
     /// Precomputed cycle set, rebuilt only when graph STRUCTURE changes.
     /// Populated only under ARBOT_CYCLE_INDEX_COMPARE; `None` otherwise.
     cycle_index: Arc<StdMutex<Option<crate::cycle_index::CycleIndex>>>,
+    /// Immutable graph snapshot published after each scan, for readers that
+    /// must not wait 4.2s for the next one. Written only here.
+    graph_snapshot: Arc<StdMutex<Option<Arc<Graph>>>>,
     /// Long-lived tick-ladder cache for the multi-tick CL simulator
     /// (`ARBOT_CL_MULTI_TICK`). Built once here and reused across every
     /// `scan_once()` call for this chain, so `CachedTickSource`'s epoch cache
@@ -3782,6 +3785,7 @@ where
             populate_cache: Arc::new(Mutex::new(PopulateCacheState::default())),
             flash_capacity: Arc::new(StdMutex::new(FlashCapacityCache::default())),
             cycle_index: Arc::new(StdMutex::new(None)),
+            graph_snapshot: Arc::new(StdMutex::new(None)),
             cl_tick_cache,
         }
     }
@@ -5461,6 +5465,13 @@ where
     /// concurrently across candidates (only shared reads; quote concurrency is
     /// bounded by the UniV3 semaphore). Rejections emit their candidate-stage
     /// logs and zero-loss metrics here, exactly as the sequential pipeline did.
+    /// Handle to the immutable graph snapshot this runner publishes each scan.
+    ///
+    /// Readers get a consistent `Arc<Graph>`; the runner is the only writer.
+    fn graph_snapshot(&self) -> Arc<StdMutex<Option<Arc<Graph>>>> {
+        Arc::clone(&self.graph_snapshot)
+    }
+
     async fn prepare_candidate(
         &self,
         graph: &Graph,
@@ -6589,6 +6600,12 @@ where
         }
 
         let edges_scanned = graph.edges.iter().filter(|edge| edge.active).count();
+        // Publish before the search: readers want the priced graph, and a
+        // snapshot taken after the search would be one scan stale by the time
+        // anyone read it.
+        if let Ok(mut g) = self.graph_snapshot.lock() {
+            *g = Some(Arc::new(graph.clone()));
+        }
         let current_digest = graph_digest(&graph);
         let significant_change = {
             let mut guard = self.last_graph_digest.lock().await;
@@ -12796,6 +12813,16 @@ async fn launch_chain_runtime(
     let hot_pancakeswap_by_venue = Arc::new(tokio::sync::RwLock::new(hot_pancakeswap_by_venue));
     let hot_slipstream_by_venue = Arc::new(tokio::sync::RwLock::new(hot_slipstream_by_venue));
 
+    // Declared out here so the drain can be spawned AFTER the runner exists:
+    // it needs the runner's graph snapshot, and the monitor is built first.
+    let mut base_fast_drain: Option<(
+        std::sync::Arc<crate::base_fast::BaseFastPath>,
+        std::sync::Arc<crate::cycle_index::PoolUniverse>,
+        usize,
+    )> = None;
+    let mut base_fast_index: Option<
+        std::sync::Arc<std::sync::Mutex<Option<crate::cycle_index::CycleIndex>>>,
+    > = None;
     let pool_monitor = {
         let poll_ms = crate::util::env_parse_opt::<u64>("POOL_MONITOR_POLL_MS")
             .unwrap_or(1_200);
@@ -13027,12 +13054,12 @@ async fn launch_chain_runtime(
                                 )
                                 .filter(|v| *v > 0)
                                 .unwrap_or(512);
-                                fast.spawn_drain(
-                                    fast_uni,
-                                    std::sync::Arc::new(std::sync::Mutex::new(Some(fast_index))),
-                                    Duration::from_millis(200),
-                                    max_touched,
-                                );
+                                base_fast_index =
+                                    Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                                        fast_index,
+                                    ))));
+                                base_fast_drain =
+                                    Some((fast.clone(), fast_uni.clone(), max_touched));
                             } else {
                                 warn!(
                                     "ARBOT_BASE_FAST set but no CL pools to subscribe; \
@@ -13686,6 +13713,20 @@ async fn launch_chain_runtime(
     };
 
     let runner = Runner::new(runner_config, executor);
+
+    // Now the runner exists, the fast path can read its published graph
+    // snapshot. Read-only: the runner is the sole writer, which is what makes
+    // this safe where sharing LiveState was not -- that had two writers and one
+    // global ordinal cursor, and cost 584 continuity breaks.
+    if let (Some((fast, uni, cap)), Some(index)) = (base_fast_drain, base_fast_index) {
+        fast.spawn_drain(
+            uni,
+            index,
+            runner.graph_snapshot(),
+            Duration::from_millis(200),
+            cap,
+        );
+    }
 
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
     let (status_tx, status_rx) =

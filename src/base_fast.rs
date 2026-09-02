@@ -791,6 +791,7 @@ impl BaseFastPath {
         self: Arc<Self>,
         universe: Arc<crate::cycle_index::PoolUniverse>,
         index: Arc<StdMutex<Option<crate::cycle_index::CycleIndex>>>,
+        graph: Arc<StdMutex<Option<Arc<crate::graph::Graph>>>>,
         cadence: Duration,
         max_cycles: usize,
     ) -> JoinHandle<()> {
@@ -865,6 +866,26 @@ impl BaseFastPath {
                 // result carries no claim about any candidate. Reporting a
                 // benign call's `success` as a candidate's would be exactly the
                 // kind of number that reads as progress and means nothing.
+                // Translate the clearing candidates into the form the existing
+                // plan and calldata machinery takes. Reads an immutable
+                // snapshot the scan publishes -- never the live graph, which
+                // the scan rebuilds underneath it.
+                let snapshot = graph.lock().ok().and_then(|g| g.clone());
+                let mut translated = 0usize;
+                let mut untranslatable = 0usize;
+                if let Some(g) = snapshot.as_ref() {
+                    for c in priced.iter().filter(|c| costs.clears(c.gross_bps)) {
+                        let Some(tokens) = idx.cycle(c.id).map(|t| t.tokens.clone()) else {
+                            untranslatable += 1;
+                            continue;
+                        };
+                        match g.indexed_cycle_for_tokens(&tokens) {
+                            Some(_ic) => translated += 1,
+                            None => untranslatable += 1,
+                        }
+                    }
+                }
+
                 let mut sim_us: u128 = 0;
                 if let (Some(http), true) = (self.sim_http.as_ref(), !priced.is_empty()) {
                     let started = Instant::now();
@@ -896,6 +917,9 @@ impl BaseFastPath {
                     best_gross_bps = best,
                     best_net_bps = best_net,
                     clearing_costs = clearing,
+                    translated,
+                    untranslatable,
+                    graph_snapshot = snapshot.is_some(),
                     price_us,
                     sim_probe_us = sim_us,
                     total_touched = out.total_touched,
