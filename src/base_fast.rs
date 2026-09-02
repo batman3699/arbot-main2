@@ -642,6 +642,47 @@ where
     (priced, unpriceable)
 }
 
+/// Translate priced cycles into the indexed form `prepare_candidate` takes.
+///
+/// **No profitability filter.** An earlier version gated this on
+/// `CostStack::clears`, which was wrong for a reason worth stating: gas is a
+/// fixed native cost, so its share of a trade in basis points depends entirely
+/// on notional. A 12 bps edge on a $2M-deep pool is worth far more than a 40 bps
+/// edge on a $5k one, and a flat 32 bps bar deletes exactly the first kind. The
+/// fast path RANKS; `prepare_candidate` does the real sizing, the real flash
+/// fee, the real gas and the real minimum-profit test.
+///
+/// Untranslatable cycles are counted, not dropped silently: a cycle the graph
+/// cannot express is a coverage gap between the fast index and the scan graph,
+/// and it needs a different response from a cycle that simply priced badly.
+pub fn translate_for_prep(
+    index: &crate::cycle_index::CycleIndex,
+    graph: &crate::graph::Graph,
+    priced: &[PricedCycle],
+) -> (Vec<(PricedCycle, crate::graph::IndexedCycle)>, usize) {
+    let mut out = Vec::with_capacity(priced.len());
+    let mut untranslatable = 0usize;
+    for c in priced {
+        let Some(tokens) = index.cycle(c.id).map(|t| t.tokens.clone()) else {
+            untranslatable += 1;
+            continue;
+        };
+        match graph.indexed_cycle_for_tokens(&tokens) {
+            Some(ic) => out.push((*c, ic)),
+            None => untranslatable += 1,
+        }
+    }
+    (out, untranslatable)
+}
+
+/// How many ranked cycles are handed to `prepare_candidate` each drain.
+///
+/// Was 4 behind a 32 bps gate that cleared nothing for a whole run. The gate is
+/// gone, so the depth has to carry the selection instead — 8 gives the real
+/// sizing something to choose between without turning each drain into eight
+/// quote round trips.
+pub const FAST_PATH_RANKED: usize = 8;
+
 /// Result of simulating a candidate against preconfirmed state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreconfSimResult {
@@ -1118,7 +1159,7 @@ impl BaseFastPath {
                             to,
                         )
                     },
-                    4,
+                    FAST_PATH_RANKED,
                 );
                 let price_us = priced_at.elapsed().as_micros();
 
@@ -1131,24 +1172,17 @@ impl BaseFastPath {
                 // result carries no claim about any candidate. Reporting a
                 // benign call's `success` as a candidate's would be exactly the
                 // kind of number that reads as progress and means nothing.
-                // Translate the clearing candidates into the form the existing
-                // plan and calldata machinery takes. Reads an immutable
-                // snapshot the scan publishes -- never the live graph, which
-                // the scan rebuilds underneath it.
+                // Translate the RANKED candidates -- all of them, not the ones
+                // clearing a bps bar. Reads an immutable snapshot the scan
+                // publishes, never the live graph, which the scan rebuilds
+                // underneath it.
                 let snapshot = graph.lock().ok().and_then(|g| g.clone());
                 let mut translated = 0usize;
                 let mut untranslatable = 0usize;
                 if let Some(g) = snapshot.as_ref() {
-                    for c in priced.iter().filter(|c| costs.clears(c.gross_bps)) {
-                        let Some(tokens) = idx.cycle(c.id).map(|t| t.tokens.clone()) else {
-                            untranslatable += 1;
-                            continue;
-                        };
-                        match g.indexed_cycle_for_tokens(&tokens) {
-                            Some(_ic) => translated += 1,
-                            None => untranslatable += 1,
-                        }
-                    }
+                    let (ready, bad) = translate_for_prep(&idx, g, &priced);
+                    translated = ready.len();
+                    untranslatable = bad;
                 }
 
                 let mut sim_us: u128 = 0;
@@ -2081,5 +2115,82 @@ mod tests {
         let meta = std::collections::HashMap::new();
         let (cl, v2) = seed_targets(&[addr(1)], &meta);
         assert!(cl.is_empty() && v2.is_empty());
+    }
+
+    /// A triangle the graph can express, and the cycle index's id for it.
+    fn triangle_for_translation() -> (
+        crate::cycle_index::CycleIndex,
+        crate::graph::Graph,
+        crate::cycle_index::CycleId,
+    ) {
+        use crate::cycle_index::{CycleIndex, CycleIndexLimits, PoolUniverse};
+        let (t1, t2, t3) = (addr(1), addr(2), addr(3));
+        let (p12, p23, p31) = (addr(11), addr(12), addr(13));
+        let uni = PoolUniverse::from_pools([(p12, t1, t2), (p23, t2, t3), (p31, t3, t1)]);
+        let idx = CycleIndex::build(&uni, &[t1], CycleIndexLimits::default());
+        let dirty: HashSet<Address> = [p12].into_iter().collect();
+        let id = *touched_cycles(&uni, &idx, &dirty, 32)
+            .cycles
+            .first()
+            .expect("the triangle traverses p12");
+
+        let mut g = crate::graph::Graph::default();
+        for (f, t) in [(t1, t2), (t2, t3), (t3, t1), (t2, t1), (t3, t2), (t1, t3)] {
+            g.add_edge(crate::graph::Edge {
+                from: f,
+                to: t,
+                rate_num: U256::from(1u64),
+                rate_den: U256::from(1u64),
+                venue: crate::graph::VenueEdge::UniV3 {
+                    path: vec![(f, None), (t, Some(500))],
+                    pool: Address::zero(),
+                    fee: 500,
+                    state: None,
+                },
+                estimated_gas: 0,
+                weight: 0,
+                max_input: U256::from(1_000u64),
+                tolerance_bps: 0,
+                observed_slippage_bps: 0,
+                quote_block: None,
+                active: true,
+                tick_ladder: None,
+            });
+        }
+        (idx, g, id)
+    }
+
+    /// The whole point of removing the gate: a candidate the 32 bps cost stack
+    /// would have deleted must still reach `prepare_candidate`.
+    ///
+    /// Gas is a fixed native cost, so a bps bar is a bar on TRADE SIZE wearing a
+    /// percentage costume. The run that motivated this had a best gross of 21.54
+    /// bps against a 32 bps stack and translated nothing for five minutes.
+    #[test]
+    fn a_candidate_below_the_cost_stack_still_reaches_preparation() {
+        let (idx, g, id) = triangle_for_translation();
+        let thin = PricedCycle { id, gross_bps: 12.0, hops: 3 };
+        assert!(
+            !CostStack::from_env().clears(thin.gross_bps),
+            "the premise: 12 bps does not clear a 32 bps stack"
+        );
+
+        let (ready, untranslatable) = translate_for_prep(&idx, &g, &[thin]);
+        assert_eq!(untranslatable, 0);
+        assert_eq!(ready.len(), 1, "the bps bar must not delete it");
+        assert_eq!(ready[0].0.gross_bps, 12.0);
+        assert!(ready[0].1.cycle.first() == ready[0].1.cycle.last(), "closed loop");
+    }
+
+    /// A cycle the scan graph cannot express is a coverage gap, not a bad price.
+    /// Counting it separately is what makes the two distinguishable in the log.
+    #[test]
+    fn a_cycle_the_graph_cannot_express_is_counted_not_dropped() {
+        let (idx, _g, id) = triangle_for_translation();
+        let empty = crate::graph::Graph::default();
+        let (ready, untranslatable) =
+            translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3 }]);
+        assert!(ready.is_empty());
+        assert_eq!(untranslatable, 1);
     }
 }
