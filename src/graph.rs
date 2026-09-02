@@ -1119,19 +1119,7 @@ impl Graph {
             let &from = self.nodes.get(window[0])?;
             let &to = self.nodes.get(window[1])?;
             let want = pools[i];
-            let idx = self
-                .edge_lookup
-                .get(&(from, to))?
-                .iter()
-                .copied()
-                .find(|&e| {
-                    self.edges
-                        .get(e)
-                        .filter(|edge| edge.active)
-                        .and_then(|edge| edge.venue.pool_address())
-                        == Some(want)
-                })?;
-            edge_indices.push(idx);
+            edge_indices.push(self.best_edge_index_on_pool(from, to, want)?);
         }
         Some(IndexedCycle { cycle, edge_indices })
     }
@@ -1141,19 +1129,25 @@ impl Graph {
         self.ix.get(&token).copied()
     }
 
+    /// Index of the active edge for this hop on `pool`, if there is one.
+    pub fn best_edge_index_on_pool(
+        &self,
+        from: Address,
+        to: Address,
+        pool: Address,
+    ) -> Option<usize> {
+        self.edge_lookup.get(&(from, to))?.iter().copied().find(|&e| {
+            self.edges
+                .get(e)
+                .filter(|edge| edge.active)
+                .and_then(|edge| edge.venue.pool_address())
+                == Some(pool)
+        })
+    }
+
     /// Whether any ACTIVE edge for this hop trades through `pool`.
     pub fn has_edge_on_pool(&self, from: Address, to: Address, pool: Address) -> bool {
-        self.edge_lookup
-            .get(&(from, to))
-            .is_some_and(|idxs| {
-                idxs.iter().any(|&e| {
-                    self.edges
-                        .get(e)
-                        .filter(|edge| edge.active)
-                        .and_then(|edge| edge.venue.pool_address())
-                        == Some(pool)
-                })
-            })
+        self.best_edge_index_on_pool(from, to, pool).is_some()
     }
 
     pub fn edge_between(&self, from: Address, to: Address) -> Option<&Edge> {

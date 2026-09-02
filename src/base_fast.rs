@@ -1124,7 +1124,218 @@ where
     (priced, unpriceable, basis)
 }
 
-/// Translate priced cycles into the indexed form `prepare_candidate` takes.
+/// Enough about a pool to BUILD an executable edge for it.
+///
+/// The fast path prices pools the scan graph has no edge for. Measured
+/// 2026-09-03: requiring the executed route to use the priced pools dropped
+/// translation to 0.1%, because the graph holds one edge per pair chosen from
+/// its OWN quotes. Looking a route up in that graph therefore either fails or
+/// silently substitutes; constructing it is the only honest option.
+///
+/// Populated where the venue is still known -- `hot_univ3_pools` and
+/// `hot_slipstream_pools` are separate lists before they are merged into
+/// `cl_pools`, and by then the distinction is gone. Getting it wrong would put
+/// a UniV3 path through the Slipstream router, so it is not inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastVenue {
+    UniV3 { fee: u32 },
+    /// `tick_spacing`, NOT a fee: Slipstream stores spacing in the same field
+    /// UniV3 uses for its fee tier, and the router reads it as spacing.
+    Slipstream { tick_spacing: u32 },
+    /// Solidly-family, which covers Aerodrome. `stable` selects the invariant
+    /// and must come from config, never be guessed: a stable pool routed as
+    /// volatile prices on the wrong curve.
+    Solidly { stable: bool, fee_bps: u32, decimals0: u8, decimals1: u8 },
+}
+
+/// Build the edge for one hop through one pool, in the direction asked.
+///
+/// Direction is rebuilt rather than copied: a UniV3 `path` is directional, and
+/// reusing one from the opposite direction would encode the swap backwards.
+///
+/// Reserves for Solidly hops come from LIVE state, not from the template --
+/// they move on every trade, and sizing quotes against them.
+pub struct LiveHop<'a> {
+    pub venue: FastVenue,
+    pub pool: Address,
+    pub meta: &'a PoolMeta,
+    pub from: Address,
+    pub to: Address,
+    /// Depth bound for this hop, in input units. Sizing will not propose more.
+    pub max_input: U256,
+}
+
+pub fn live_edge(
+    hop: LiveHop<'_>,
+    live: &LiveState,
+    slipstream_router: Address,
+) -> Option<crate::graph::Edge> {
+    use crate::graph::VenueEdge;
+    let LiveHop { venue, pool, meta, from, to, max_input } = hop;
+    let (token0, token1) = (meta.token0, meta.token1);
+    let forward = if from == token0 && to == token1 {
+        true
+    } else if from == token1 && to == token0 {
+        false
+    } else {
+        return None;
+    };
+
+    let venue_edge = match venue {
+        FastVenue::UniV3 { fee } => VenueEdge::UniV3 {
+            path: vec![(from, None), (to, Some(fee))],
+            pool,
+            fee,
+            // No cached tick ladder: sizing requotes on chain, and a stale
+            // ladder would be worse than none.
+            state: None,
+        },
+        FastVenue::Slipstream { tick_spacing } => VenueEdge::Slipstream {
+            path: vec![(from, None), (to, Some(tick_spacing))],
+            pool,
+            tick_spacing,
+            router: slipstream_router,
+            state: None,
+        },
+        FastVenue::Solidly { stable, fee_bps, decimals0, decimals1 } => {
+            let snap = live.v2_snapshot(pool)?;
+            let (r0, r1) = (snap.state.reserve0, snap.state.reserve1);
+            let (reserve_in, reserve_out) = if forward { (r0, r1) } else { (r1, r0) };
+            if reserve_in.is_zero() || reserve_out.is_zero() {
+                return None;
+            }
+            VenueEdge::SolidlyV2 {
+                pair: pool,
+                token_out: to,
+                token0,
+                token1,
+                stable,
+                reserve_in,
+                reserve_out,
+                fee_bps,
+                decimals0,
+                decimals1,
+            }
+        }
+    };
+
+    let estimated_gas = match venue {
+        FastVenue::UniV3 { .. } => crate::venues::ESTIMATED_GAS_UNIV3,
+        FastVenue::Slipstream { .. } => crate::venues::ESTIMATED_GAS_SLIPSTREAM,
+        FastVenue::Solidly { .. } => crate::venues::ESTIMATED_GAS_SOLIDLYV2,
+    };
+
+    Some(crate::graph::Edge {
+        from,
+        to,
+        // A placeholder ratio. Sizing requotes every hop on chain, so this is
+        // never the number a trade is judged on -- but it must not be zero,
+        // which would read as an impossible edge.
+        rate_num: U256::one(),
+        rate_den: U256::one(),
+        venue: venue_edge,
+        estimated_gas,
+        // Search weight, unused downstream of the search this route skipped.
+        weight: 0,
+        max_input,
+        tolerance_bps: 0,
+        observed_slippage_bps: 0,
+        quote_block: None,
+        active: true,
+        tick_ladder: None,
+    })
+}
+
+/// Builds executable routes from the pools the fast path actually priced.
+///
+/// This is the replacement for looking a route up in the scan's graph. That
+/// graph holds one edge per token pair, chosen from the SCAN's quotes over a
+/// pool selection the fast path does not share -- so a lookup either fails or
+/// substitutes a route nobody priced. Measured 2026-09-03: requiring the priced
+/// pools dropped translation to 0.1%, which is the honest rate for a lookup.
+///
+/// The graph returned contains exactly one cycle. It is not a view of the
+/// market; it is a carrier for `prepare_candidate`, which indexes nodes and
+/// edges and then requotes every hop on chain anyway.
+pub struct LiveRouter {
+    /// Venue parameters per pool, captured where UniV3 and Slipstream are still
+    /// distinguishable. Inferring that later is not possible and guessing it
+    /// would route a UniV3 path through the Slipstream router.
+    pub venues: Arc<std::collections::HashMap<Address, FastVenue>>,
+    pub slipstream_router: Address,
+}
+
+impl LiveRouter {
+    /// A one-cycle graph plus the indexed cycle through it.
+    ///
+    /// `None` when any hop cannot be built: an unknown pool, a venue whose
+    /// parameters were never captured, or a pool whose live state has gone.
+    /// Refusing beats emitting a route with one substituted leg, which is a
+    /// plan that does not compose and reverts for a reason nobody can read.
+    pub fn route(
+        &self,
+        tokens: &[Address],
+        pools: &[Address],
+        meta: &dashmap::DashMap<Address, PoolMeta>,
+        live: &LiveState,
+        notional_in: f64,
+    ) -> Option<(crate::graph::Graph, crate::graph::IndexedCycle)> {
+        if tokens.len() < 2 || pools.len() != tokens.len() {
+            return None;
+        }
+        let mut g = crate::graph::Graph::default();
+        // Nodes first and in cycle order, so the indices this returns match the
+        // graph it returns. `prepare_candidate` reads `graph.nodes[ix]`.
+        for t in tokens {
+            g.add_node(*t);
+        }
+        let max_input = f64_to_u256(notional_in);
+
+        let mut edge_indices = Vec::with_capacity(tokens.len());
+        for i in 0..tokens.len() {
+            let from = tokens[i];
+            let to = tokens[(i + 1) % tokens.len()];
+            let pool = pools[i];
+            let venue = *self.venues.get(&pool)?;
+            let m = *meta.get(&pool)?;
+            let edge = live_edge(
+                LiveHop { venue, pool, meta: &m, from, to, max_input },
+                live,
+                self.slipstream_router,
+            )?;
+            g.add_edge(edge);
+            // `add_edge` de-duplicates by signature, so the index has to be
+            // looked up rather than assumed to be the loop counter.
+            edge_indices.push(g.best_edge_index_on_pool(from, to, pool)?);
+        }
+
+        let mut cycle: Vec<usize> = tokens
+            .iter()
+            .map(|t| g.node_index(*t))
+            .collect::<Option<Vec<_>>>()?;
+        cycle.push(cycle[0]);
+        Some((g, crate::graph::IndexedCycle { cycle, edge_indices }))
+    }
+}
+
+/// Saturating `f64` to `U256` for a capacity bound.
+///
+/// Saturating and not wrapping: a bound that wraps to a small number would
+/// silently shrink a trade, and one that wraps to a huge number would remove
+/// the bound entirely. Non-finite or negative means "no usable bound", which is
+/// zero here -- sizing treats that as a pool it cannot draw on.
+fn f64_to_u256(v: f64) -> U256 {
+    if !v.is_finite() || v <= 0.0 {
+        return U256::zero();
+    }
+    // Above 2^256 there is no representable answer; clamp rather than wrap.
+    if v >= 1.157_920_892_373_162e77 {
+        return U256::MAX;
+    }
+    U256::from_dec_str(&format!("{:.0}", v)).unwrap_or_else(|_| U256::zero())
+}
+
+/// Translate priced cycles into the indexed form `prepare_candidate` takes./// Translate priced cycles into the indexed form `prepare_candidate` takes./// Translate priced cycles into the indexed form `prepare_candidate` takes.
 ///
 /// **No profitability filter.** An earlier version gated this on
 /// `CostStack::clears`, which was wrong for a reason worth stating: gas is a
@@ -1268,6 +1479,17 @@ pub type Published<T> = Arc<StdMutex<Option<Arc<T>>>>;
 /// Native (wei) per RAW unit of each token.
 pub type TokenPrices = std::collections::HashMap<Address, f64>;
 
+/// Where a drain's ranked candidates go.
+///
+/// The router builds the executable route from the pools that were PRICED; the
+/// sink sizes and simulates it. Grouped because neither is useful alone -- a
+/// route with nowhere to go, or a sink with no route to send.
+#[derive(Default)]
+pub struct DrainConsumer {
+    pub router: Option<Arc<LiveRouter>>,
+    pub sink: Option<CandidateSink>,
+}
+
 /// The scan-published inputs the drain reads each pass.
 pub struct DrainFeeds {
     pub graph: Published<crate::graph::Graph>,
@@ -1303,6 +1525,13 @@ pub type CandidateSink = Arc<
 /// sizing something to choose between without turning each drain into eight
 /// quote round trips.
 pub const FAST_PATH_RANKED: usize = 8;
+
+/// How many ranked cycles a drain will try to build an executable route for.
+///
+/// One batch carries one route, because a batch shares one graph and an
+/// `IndexedCycle` is only meaningful against the graph it was built for. This
+/// bounds the work spent looking for a buildable one.
+pub const FAST_PATH_PREPARE: usize = 8;
 
 /// Result of simulating a candidate against preconfirmed state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1911,11 +2140,12 @@ impl BaseFastPath {
         universe: Arc<crate::cycle_index::PoolUniverse>,
         index: Arc<StdMutex<Option<crate::cycle_index::CycleIndex>>>,
         feeds: DrainFeeds,
-        sink: Option<CandidateSink>,
+        consumer: DrainConsumer,
         cadence: Duration,
         max_cycles: usize,
     ) -> JoinHandle<()> {
         let DrainFeeds { graph, prices } = feeds;
+        let DrainConsumer { router, sink } = consumer;
         tokio::spawn(async move {
             let costs = CostStack::from_env();
             // One batch in preparation at a time, and NEVER awaited on this
@@ -2060,15 +2290,43 @@ impl BaseFastPath {
                 let snapshot = graph.lock().ok().and_then(|g| g.clone());
                 let mut translated = 0usize;
                 let mut tstats = TranslateStats::default();
+                let mut routed = 0usize;
+                // Lookup against the scan graph is kept as a MEASUREMENT only:
+                // it is what the bridge used to do, and its gap breakdown says
+                // how far the two pool sets have drifted. Execution no longer
+                // depends on it.
                 if let Some(g) = snapshot.as_ref() {
-                    let (ready, bad) = translate_for_prep(&idx, g, &priced);
-                    translated = ready.len();
+                    let (_, bad) = translate_for_prep(&idx, g, &priced);
                     tstats = bad;
-                    if let (Some(sink), false) = (sink.as_ref(), ready.is_empty()) {
+                }
+                // The executable route, built from the pools that were priced.
+                if let (Some(r), Some(sink)) = (router.as_ref(), sink.as_ref()) {
+                    let mut ready: Vec<(PricedCycle, crate::graph::IndexedCycle)> = Vec::new();
+                    let mut route_graph: Option<Arc<crate::graph::Graph>> = None;
+                    for c in priced.iter().take(FAST_PATH_PREPARE) {
+                        let Some(tokens) = idx.cycle(c.id).map(|t| t.tokens.clone()) else {
+                            continue;
+                        };
+                        if let Some((g, ic)) =
+                            r.route(&tokens, &c.pools, &self.pool_tokens, &self.live, c.notional_in)
+                        {
+                            // One graph per batch, so `IndexedCycle` indices and
+                            // the graph handed to the sink always agree. Mixing
+                            // a cycle from one graph with another's node table
+                            // is the substitution this whole change removes.
+                            ready.clear();
+                            ready.push((c.clone(), ic));
+                            route_graph = Some(Arc::new(g));
+                            break;
+                        }
+                    }
+                    routed = ready.len();
+                    translated = routed;
+                    if let (Some(g), false) = (route_graph, ready.is_empty()) {
                         match Arc::clone(&prep_slot).try_acquire_owned() {
                             Ok(permit) => {
                                 prep_sent += 1;
-                                let call = sink(Arc::clone(g), ready);
+                                let call = sink(g, ready);
                                 let (sz, rj, nc) = (
                                     Arc::clone(&prep_sized),
                                     Arc::clone(&prep_rejected),
@@ -2127,6 +2385,8 @@ impl BaseFastPath {
                     best_net_bps = best_net,
                     clearing_costs = clearing,
                     translated,
+                    routed,
+                    lookup_translated = priced.len().saturating_sub(tstats.untranslatable),
                     untranslatable = tstats.untranslatable,
                     gap_no_pair = tstats.no_pair,
                     gap_other_pool = tstats.other_pool,
@@ -3866,5 +4126,158 @@ mod tests {
             route_gap(&g, &[a, b, addr(999)], &[mine, mine, mine]),
             RouteGap::UnknownToken
         );
+    }
+
+    // ---- live routes ----
+
+    fn cl_meta_at(t0: Address, t1: Address) -> PoolMeta {
+        PoolMeta {
+            token0: t0, token1: t1, fee_ppm: 500,
+            kind: PoolKind::ConcentratedLiquidity, verified: true,
+            confirmed_at: Some(Instant::now()), balances: Some((1e18, 1e18)),
+        }
+    }
+
+    /// The whole point: a route through pools the SCAN GRAPH has never heard
+    /// of. Looking these up returned nothing 99.9% of the time; building them
+    /// works because the fast path already knows everything an edge needs.
+    #[test]
+    fn a_route_is_built_from_pools_no_scan_graph_contains() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (p_a, p_b) = (addr(10), addr(11));
+        let meta = dashmap::DashMap::from_iter([
+            (p_a, cl_meta_at(t0, t1)),
+            (p_b, cl_meta_at(t0, t1)),
+        ]);
+        let venues = std::collections::HashMap::from([
+            (p_a, FastVenue::UniV3 { fee: 500 }),
+            (p_b, FastVenue::Slipstream { tick_spacing: 100 }),
+        ]);
+        let router = LiveRouter {
+            venues: Arc::new(venues),
+            slipstream_router: addr(77),
+        };
+        let live = LiveState::new();
+
+        let (g, ic) = router
+            .route(&[t0, t1], &[p_a, p_b], &meta, &live, 1e18)
+            .expect("both hops buildable");
+
+        assert_eq!(ic.cycle.len(), 3, "closed two-hop loop");
+        assert_eq!(ic.cycle.first(), ic.cycle.last());
+        assert_eq!(ic.edge_indices.len(), 2);
+        // Each hop must be on the pool that was priced, and on ITS venue.
+        let e0 = &g.edges[ic.edge_indices[0]];
+        assert_eq!(e0.venue.pool_address(), Some(p_a));
+        assert!(matches!(e0.venue, crate::graph::VenueEdge::UniV3 { .. }));
+        let e1 = &g.edges[ic.edge_indices[1]];
+        assert_eq!(e1.venue.pool_address(), Some(p_b));
+        match &e1.venue {
+            crate::graph::VenueEdge::Slipstream { router, tick_spacing, .. } => {
+                assert_eq!(*router, addr(77), "slipstream hops need their own router");
+                assert_eq!(*tick_spacing, 100, "spacing, not a fee tier");
+            }
+            other => panic!("expected Slipstream, got {other:?}"),
+        }
+    }
+
+    /// A UniV3 path is directional. Reusing one built for the other direction
+    /// would encode the swap backwards, which the router would happily execute.
+    #[test]
+    fn each_hop_encodes_its_own_direction() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let meta = dashmap::DashMap::from_iter([(pool, cl_meta_at(t0, t1))]);
+        let router = LiveRouter {
+            venues: Arc::new(std::collections::HashMap::from([(
+                pool,
+                FastVenue::UniV3 { fee: 500 },
+            )])),
+            slipstream_router: Address::zero(),
+        };
+        let live = LiveState::new();
+        let (g, ic) = router
+            .route(&[t0, t1], &[pool, pool], &meta, &live, 1e18)
+            .expect("routable");
+        let dir = |i: usize| match &g.edges[ic.edge_indices[i]].venue {
+            crate::graph::VenueEdge::UniV3 { path, .. } => (path[0].0, path[1].0),
+            _ => unreachable!(),
+        };
+        assert_eq!(dir(0), (t0, t1));
+        assert_eq!(dir(1), (t1, t0), "the closing hop runs the other way");
+    }
+
+    /// One unbuildable hop kills the route. A plan with a substituted leg does
+    /// not compose, and it reverts for a reason nobody can read afterwards.
+    #[test]
+    fn a_route_missing_any_hop_is_refused_whole() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (known, unknown) = (addr(10), addr(11));
+        let meta = dashmap::DashMap::from_iter([(known, cl_meta_at(t0, t1))]);
+        let router = LiveRouter {
+            venues: Arc::new(std::collections::HashMap::from([(
+                known,
+                FastVenue::UniV3 { fee: 500 },
+            )])),
+            slipstream_router: Address::zero(),
+        };
+        let live = LiveState::new();
+        assert!(
+            router.route(&[t0, t1], &[known, unknown], &meta, &live, 1e18).is_none(),
+            "no venue for the second pool"
+        );
+        assert!(
+            router.route(&[t0, t1], &[known], &meta, &live, 1e18).is_none(),
+            "one pool is not a two-hop route"
+        );
+    }
+
+    /// A Solidly hop needs LIVE reserves, not template ones -- they move on
+    /// every trade and sizing quotes against them.
+    #[test]
+    fn a_solidly_hop_carries_live_reserves_in_hop_order() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        assert!(live.anchor_v2(pool, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(1_000u64), reserve1: U256::from(4_000u64),
+        }));
+        let m = PoolMeta {
+            token0: t0, token1: t1, fee_ppm: 3_000,
+            kind: PoolKind::ConstantProduct, verified: true,
+            confirmed_at: Some(Instant::now()), balances: None,
+        };
+        let e = live_edge(
+            LiveHop {
+                venue: FastVenue::Solidly { stable: false, fee_bps: 30, decimals0: 18, decimals1: 6 },
+                pool, meta: &m, from: t0, to: t1, max_input: U256::from(500u64),
+            },
+            &live,
+            Address::zero(),
+        )
+        .expect("buildable");
+        match e.venue {
+            crate::graph::VenueEdge::SolidlyV2 { reserve_in, reserve_out, stable, decimals0, decimals1, .. } => {
+                assert_eq!(reserve_in, U256::from(1_000u64), "t0 in");
+                assert_eq!(reserve_out, U256::from(4_000u64), "t1 out");
+                assert!(!stable, "the curve must come from config, never a guess");
+                assert_eq!((decimals0, decimals1), (18, 6));
+            }
+            other => panic!("expected SolidlyV2, got {other:?}"),
+        }
+        assert_eq!(e.max_input, U256::from(500u64));
+    }
+
+    /// The capacity bound must saturate rather than wrap. A wrapped bound
+    /// either shrinks a trade silently or removes the limit entirely.
+    #[test]
+    fn a_capacity_bound_saturates_rather_than_wrapping() {
+        assert_eq!(f64_to_u256(-1.0), U256::zero());
+        assert_eq!(f64_to_u256(f64::NAN), U256::zero());
+        assert_eq!(f64_to_u256(0.0), U256::zero());
+        assert_eq!(f64_to_u256(1e18), U256::exp10(18));
+        assert_eq!(f64_to_u256(f64::INFINITY), U256::zero(), "not finite, not a bound");
+        assert_eq!(f64_to_u256(1e90), U256::MAX, "beyond 2^256 clamps");
     }
 }

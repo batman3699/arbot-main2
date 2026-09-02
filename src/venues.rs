@@ -41,11 +41,14 @@ use rust_decimal::{Decimal, MathematicalOps};
 use serde::de::DeserializeOwned;
 use tracing::{debug, error, info, warn};
 
-const ESTIMATED_GAS_UNIV3: u64 = 140_000;
+// Public so the fast path's constructed edges carry the SAME per-hop gas
+// estimate as the scan's. Two numbers for one venue would make the two paths
+// disagree about whether the same cycle clears its gas cost.
+pub const ESTIMATED_GAS_UNIV3: u64 = 140_000;
 const ESTIMATED_GAS_BAL: u64 = 155_000;
 const ESTIMATED_GAS_CURVE: u64 = 180_000;
 const ESTIMATED_GAS_UNIV2: u64 = 130_000;
-const ESTIMATED_GAS_SOLIDLYV2: u64 = 135_000;
+pub const ESTIMATED_GAS_SOLIDLYV2: u64 = 135_000;
 const ESTIMATED_GAS_UNIV4: u64 = 160_000;
 
 fn univ2_load_concurrency() -> usize {
@@ -1660,7 +1663,7 @@ where
     tick_cache: Arc<crate::cl_ticks::CachedTickSource<crate::cl_ticks::RpcTickSource<C>>>,
 }
 
-const ESTIMATED_GAS_SLIPSTREAM: u64 = ESTIMATED_GAS_UNIV3;
+pub const ESTIMATED_GAS_SLIPSTREAM: u64 = ESTIMATED_GAS_UNIV3;
 
 struct SlipstreamEdgeContext<C>
 where

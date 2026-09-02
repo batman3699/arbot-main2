@@ -1596,6 +1596,17 @@ fn sim_cascade_depth() -> usize {
 }
 
 /// Shared read-only inputs for concurrent candidate preparation.
+/// Everything the Base fast path's drain needs, held until the runner exists.
+///
+/// Declared out here because the drain reads the runner's published snapshots
+/// and the monitor is built first.
+struct BaseFastDrain {
+    fast: std::sync::Arc<crate::base_fast::BaseFastPath>,
+    universe: std::sync::Arc<crate::cycle_index::PoolUniverse>,
+    max_cycles: usize,
+    venues: std::sync::Arc<HashMap<Address, crate::base_fast::FastVenue>>,
+}
+
 /// An owned `CandidatePrepCtx`, published once per scan for readers that run
 /// between scans.
 ///
@@ -12990,11 +13001,7 @@ async fn launch_chain_runtime(
 
     // Declared out here so the drain can be spawned AFTER the runner exists:
     // it needs the runner's graph snapshot, and the monitor is built first.
-    let mut base_fast_drain: Option<(
-        std::sync::Arc<crate::base_fast::BaseFastPath>,
-        std::sync::Arc<crate::cycle_index::PoolUniverse>,
-        usize,
-    )> = None;
+    let mut base_fast_drain: Option<BaseFastDrain> = None;
     let mut base_fast_index: Option<
         std::sync::Arc<std::sync::Mutex<Option<crate::cycle_index::CycleIndex>>>,
     > = None;
@@ -13014,6 +13021,25 @@ async fn launch_chain_runtime(
         // cycle through an Aerodrome or UniV2 pool was structurally unpriceable
         // no matter how good the CL state was.
         let v2_pools: Vec<MonitoredPool> = monitored.clone();
+        // Solidly-family venue parameters. `stable` selects the invariant and
+        // comes from config -- a stable pool routed as volatile prices on the
+        // wrong curve. Decimals matter for the same reason and are hinted, not
+        // guessed: a missing hint takes 18, which is the Base default for
+        // everything except the stablecoins, so it is recorded as a known risk
+        // rather than a silent one.
+        let mut v2_venues: HashMap<Address, crate::base_fast::FastVenue> = HashMap::new();
+        for p in &v2_pools {
+            let d = |t: &Address| token_decimals_hint.get(t).copied().unwrap_or(18);
+            v2_venues.insert(
+                p.pair,
+                crate::base_fast::FastVenue::Solidly {
+                    stable: p.stable,
+                    fee_bps: p.fee_bps,
+                    decimals0: d(&p.token_in),
+                    decimals1: d(&p.token_out),
+                },
+            );
+        }
 
         // CL pools are subscribed for logs but never polled. Without them the
         // Swap decoder never sees a log: the subscription carried 23 of ~985
@@ -13023,7 +13049,14 @@ async fn launch_chain_runtime(
         // calls set_pools with a set rebuilt from scratch, which dropped these
         // and silently reverted the subscription to 23 pools after 5 minutes.
         let mut cl_pools: Vec<MonitoredPool> = Vec::new();
-        for records in [&hot_univ3_pools, &hot_slipstream_pools] {
+        // Venue parameters captured HERE, where UniV3 and Slipstream are still
+        // separate lists. Once they merge into `cl_pools` the distinction is
+        // gone, and it cannot be recovered: routing a UniV3 path through the
+        // Slipstream router would build calldata for the wrong contract.
+        let mut fast_venues: HashMap<Address, crate::base_fast::FastVenue> = HashMap::new();
+        for (records, is_slipstream) in
+            [(&hot_univ3_pools, false), (&hot_slipstream_pools, true)]
+        {
             for r in records.read().await.iter() {
                 cl_pools.push(MonitoredPool {
                     pair: r.pool,
@@ -13033,6 +13066,17 @@ async fn launch_chain_runtime(
                     stable: false,
                     kind: ingestion::PoolMonitorKind::ConcentratedLiquidity,
                 });
+                fast_venues.insert(
+                    r.pool,
+                    if is_slipstream {
+                        // Slipstream stores TICK SPACING in the field UniV3
+                        // uses for its fee tier, and its router reads it as
+                        // spacing. Same number, different meaning.
+                        crate::base_fast::FastVenue::Slipstream { tick_spacing: r.fee }
+                    } else {
+                        crate::base_fast::FastVenue::UniV3 { fee: r.fee }
+                    },
+                );
             }
         }
 
@@ -13308,8 +13352,19 @@ async fn launch_chain_runtime(
                                     Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
                                         fast_index,
                                     ))));
-                                base_fast_drain =
-                                    Some((fast.clone(), fast_uni.clone(), max_touched));
+                                let mut all_venues = fast_venues.clone();
+                                all_venues.extend(v2_venues.clone());
+                                info!(
+                                    venues = all_venues.len(),
+                                    pools = fast_pools.len(),
+                                    "base fast path venue parameters captured"
+                                );
+                                base_fast_drain = Some(BaseFastDrain {
+                                    fast: fast.clone(),
+                                    universe: fast_uni.clone(),
+                                    max_cycles: max_touched,
+                                    venues: std::sync::Arc::new(all_venues),
+                                });
                             } else {
                                 warn!(
                                     "ARBOT_BASE_FAST set but no CL pools to subscribe; \
@@ -13968,7 +14023,8 @@ async fn launch_chain_runtime(
     // snapshot. Read-only: the runner is the sole writer, which is what makes
     // this safe where sharing LiveState was not -- that had two writers and one
     // global ordinal cursor, and cost 584 continuity breaks.
-    if let (Some((fast, uni, cap)), Some(index)) = (base_fast_drain, base_fast_index) {
+    if let (Some(bf), Some(index)) = (base_fast_drain, base_fast_index) {
+        let BaseFastDrain { fast, universe: uni, max_cycles: cap, venues } = bf;
         // How many ranked cycles are actually SIZED per flashblock. Each one is
         // several RPC round trips and one round trip to the configured provider
         // measured 250-293ms on 2026-09-02, so this is an RPC-budget decision
@@ -14077,7 +14133,13 @@ async fn launch_chain_runtime(
                 runner.graph_snapshot(),
                 runner.token_native_prices(),
             ),
-            Some(sink),
+            crate::base_fast::DrainConsumer {
+                router: Some(std::sync::Arc::new(crate::base_fast::LiveRouter {
+                    venues,
+                    slipstream_router: runner.slipstream_router,
+                })),
+                sink: Some(sink),
+            },
             Duration::from_millis(200),
             cap,
         );
