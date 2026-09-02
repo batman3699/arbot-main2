@@ -366,8 +366,53 @@ impl BaseFastPath {
     }
 
     /// Start the feed. Returns immediately; the socket runs on its own task.
+    ///
+    /// Also starts a reporter. `FastPathStats` was collected for two runs
+    /// before anything printed it, so the receive->applied number the module
+    /// exists to produce was invisible in both -- the same miss as adding a
+    /// counter and then killing the process without scraping it.
     pub fn spawn(self: Arc<Self>) -> JoinHandle<()> {
+        let reporter = Arc::clone(&self);
+        tokio::spawn(async move { reporter.report_loop().await });
         tokio::spawn(async move { self.run().await })
+    }
+
+    /// Print what the feed is actually doing, every 15s.
+    ///
+    /// Reports the DECLINE breakdown, not just the applies. A feed delivering
+    /// thousands of events that apply almost none is the shape of the shared
+    /// LiveState failure, and it is only distinguishable from a healthy feed by
+    /// looking at the ratio.
+    async fn report_loop(&self) {
+        let mut tick = interval(Duration::from_secs(15));
+        tick.tick().await; // immediate first tick; discard
+        loop {
+            tick.tick().await;
+            let applied = self.stats.applied.load(Ordering::Relaxed);
+            let declined = self.stats.declined.load(Ordering::Relaxed);
+            let undecodable = self.stats.undecodable.load(Ordering::Relaxed);
+            let seen = applied + declined + undecodable;
+            if seen == 0 {
+                warn!(
+                    pools = self.pools.len(),
+                    "base fast path has received NOTHING; the subscription is \
+                     accepted but dead"
+                );
+                continue;
+            }
+            let dirty = self.touched.lock().map(|g| g.len()).unwrap_or(0);
+            info!(
+                target: "latency",
+                seen,
+                applied,
+                declined,
+                undecodable,
+                applied_pct = (applied as f64 * 100.0 / seen as f64).round() as u64,
+                mean_apply_us = self.stats.mean_apply_micros().unwrap_or(0),
+                dirty_pools = dirty,
+                "base fast path"
+            );
+        }
     }
 
     async fn run(&self) {
