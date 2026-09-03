@@ -243,20 +243,24 @@ chains:
   # Left as univ3_like it was equally broken and silently so: op
   # EXECUTOR_OP_UNIV3 sends it to the executor's Uniswap router.
   #
-  # Re-enable by making the router travel PER POOL rather than per chain, then
-  # restore this block. 63 executable pools are worth that; guessing which
-  # router to use is not.
-#  - name: aerodrome_slipstream_v3
-#    kind: univ3_like
-#    factory: '0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef'
-#    router: '0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F'
-#    quoter: '0xCd2A7D98e82D6107eac1828ce8DeAA6acB65b555'
-#    fee_tiers:
-#    - 1
-#    - 50
-#    - 100
-#    - 200
-#    - 2000
+  # RE-ENABLED 2026-09-03. The fast path now carries each pool's router in
+  # FastVenue::RoutedCl, so this venue's 63 pools build calldata against
+  # 0x698Cb2b6 rather than inheriting another venue's router. Kept as
+  # univ3_like, NOT slipstream_like: resolve_slipstream_venue() still returns a
+  # single venue, so a second slipstream_like entry would take the first one's
+  # router in the SCAN path. Under univ3_like the fast path routes it correctly
+  # and the scan treats it as it always has.
+  - name: aerodrome_slipstream_v3
+    kind: univ3_like
+    factory: '0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef'
+    router: '0x698Cb2b6dd822994581fEa6eA4Fc755d1363A92F'
+    quoter: '0xCd2A7D98e82D6107eac1828ce8DeAA6acB65b555'
+    fee_tiers:
+    - 1
+    - 50
+    - 100
+    - 200
+    - 2000
    # PancakeSwap V3 — UniV3-compatible CL pools (separate factory/quoter from Base UniV3).
   # Pool inventory: data/base/pancakeswap_v3/pools.jsonl (build_pancakeswap_pools.py).
   - name: pancakeswap_v3

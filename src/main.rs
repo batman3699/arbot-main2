@@ -13068,10 +13068,40 @@ async fn launch_chain_runtime(
         // separate lists. Once they merge into `cl_pools` the distinction is
         // gone, and it cannot be recovered: routing a UniV3 path through the
         // Slipstream router would build calldata for the wrong contract.
+        // Venue routers, resolved here because venue identity is still known.
+        // `cfg.univ3_router` is the contract the executor itself uses for
+        // `op: EXECUTOR_OP_UNIV3`; anything else has to be named explicitly in
+        // the calldata. Zero means unresolved, which is treated as "use the
+        // built-in one" -- the pre-existing behaviour, not a new guess.
+        let univ3_router_address = cfg.univ3_router;
+        let slipstream_router_for_fast = resolve_slipstream_venue(ops_inputs, &cfg.name)
+            .map(|(_, router, _)| router)
+            .unwrap_or_else(Address::zero);
+        let pancakeswap_router_for_fast = resolve_pancakeswap_venue(ops_inputs, &cfg.name)
+            .map(|(_, router, _)| router)
+            .unwrap_or_else(Address::zero);
+        info!(
+            univ3_router = %format!("{univ3_router_address:#x}"),
+            slipstream_router = %format!("{slipstream_router_for_fast:#x}"),
+            pancakeswap_router = %format!("{pancakeswap_router_for_fast:#x}"),
+            "base fast path venue routers"
+        );
         let mut fast_venues: HashMap<Address, crate::base_fast::FastVenue> = HashMap::new();
-        for (records, is_slipstream) in
-            [(&hot_univ3_pools, false), (&hot_slipstream_pools, true)]
-        {
+        // One rule, no per-venue special cases: a pool may use the executor's
+        // BUILT-IN UniV3 router only if that is genuinely its venue's router.
+        // `StepData::Uniswap` carries no target, so the executor chooses --
+        // correct for Uniswap, and silently wrong for every fork. Aerodrome
+        // Slipstream shipped that way until 2026-09-03 and every cycle through
+        // its 84 pools would have reverted. Anything else routes explicitly.
+        //
+        // Applied by comparing addresses rather than venue names, so a new fork
+        // is handled by configuring it, not by editing this match.
+        let builtin_univ3_router = univ3_router_address;
+        for (records, venue_router) in [
+            (&hot_univ3_pools, univ3_router_address),
+            (&hot_slipstream_pools, slipstream_router_for_fast),
+            (&hot_pancakeswap_pools, pancakeswap_router_for_fast),
+        ] {
             for r in records.read().await.iter() {
                 cl_pools.push(MonitoredPool {
                     pair: r.pool,
@@ -13083,13 +13113,16 @@ async fn launch_chain_runtime(
                 });
                 fast_venues.insert(
                     r.pool,
-                    if is_slipstream {
-                        // Slipstream stores TICK SPACING in the field UniV3
-                        // uses for its fee tier, and its router reads it as
-                        // spacing. Same number, different meaning.
-                        crate::base_fast::FastVenue::Slipstream { tick_spacing: r.fee }
-                    } else {
+                    if venue_router == builtin_univ3_router || venue_router.is_zero() {
                         crate::base_fast::FastVenue::UniV3 { fee: r.fee }
+                    } else {
+                        // `r.fee` verbatim: a fee tier for Pancake, a tick
+                        // spacing for Slipstream. Both occupy the same path
+                        // field and each router reads its own meaning.
+                        crate::base_fast::FastVenue::RoutedCl {
+                            path_param: r.fee,
+                            router: venue_router,
+                        }
                     },
                 );
             }
@@ -14176,7 +14209,6 @@ async fn launch_chain_runtime(
             crate::base_fast::DrainConsumer {
                 router: Some(std::sync::Arc::new(crate::base_fast::LiveRouter {
                     venues,
-                    slipstream_router: runner.slipstream_router,
                 })),
                 sink: Some(sink),
             },

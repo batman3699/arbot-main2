@@ -1138,10 +1138,28 @@ where
 /// a UniV3 path through the Slipstream router, so it is not inferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastVenue {
+    /// A pool reached through the executor's BUILT-IN UniV3 router.
+    ///
+    /// Only correct when the venue's router is that same contract.
+    /// `StepData::Uniswap` encodes `op: EXECUTOR_OP_UNIV3` and carries no
+    /// target, so the executor picks the router itself -- which is why a fork
+    /// with its own router must never take this variant.
     UniV3 { fee: u32 },
-    /// `tick_spacing`, NOT a fee: Slipstream stores spacing in the same field
-    /// UniV3 uses for its fee tier, and the router reads it as spacing.
-    Slipstream { tick_spacing: u32 },
+    /// A UniV3-fork pool reached through an EXPLICIT router.
+    ///
+    /// Aerodrome Slipstream, PancakeSwap V3, and any other fork. They share one
+    /// encoding -- `exactInput` on their own router, selector 0xc04b8d59,
+    /// verified present in the bytecode of Slipstream's 0xBE6D8f0d (9,908
+    /// bytes) and Pancake's 0x1b81D678 (12,154 bytes) on 2026-09-03 -- and
+    /// differ only in what the middle path field means: a fee tier for Pancake,
+    /// a tick spacing for Slipstream. The router reads whichever its own pools
+    /// use, so the value is carried verbatim and deliberately not named
+    /// `fee` or `tick_spacing`.
+    ///
+    /// The router travels with the POOL. A chain-wide router cannot serve two
+    /// deployments of the same family, which is what kept a second Slipstream
+    /// venue disabled and PancakeSwap out of the fast path entirely.
+    RoutedCl { path_param: u32, router: Address },
     /// Solidly-family, which covers Aerodrome. `stable` selects the invariant
     /// and must come from config, never be guessed: a stable pool routed as
     /// volatile prices on the wrong curve.
@@ -1165,11 +1183,7 @@ pub struct LiveHop<'a> {
     pub max_input: U256,
 }
 
-pub fn live_edge(
-    hop: LiveHop<'_>,
-    live: &LiveState,
-    slipstream_router: Address,
-) -> Option<crate::graph::Edge> {
+pub fn live_edge(hop: LiveHop<'_>, live: &LiveState) -> Option<crate::graph::Edge> {
     use crate::graph::VenueEdge;
     let LiveHop { venue, pool, meta, from, to, max_input } = hop;
     let (token0, token1) = (meta.token0, meta.token1);
@@ -1190,11 +1204,11 @@ pub fn live_edge(
             // ladder would be worse than none.
             state: None,
         },
-        FastVenue::Slipstream { tick_spacing } => VenueEdge::Slipstream {
-            path: vec![(from, None), (to, Some(tick_spacing))],
+        FastVenue::RoutedCl { path_param, router } => VenueEdge::Slipstream {
+            path: vec![(from, None), (to, Some(path_param))],
             pool,
-            tick_spacing,
-            router: slipstream_router,
+            tick_spacing: path_param,
+            router,
             state: None,
         },
         FastVenue::Solidly { stable, fee_bps, decimals0, decimals1 } => {
@@ -1221,7 +1235,7 @@ pub fn live_edge(
 
     let estimated_gas = match venue {
         FastVenue::UniV3 { .. } => crate::venues::ESTIMATED_GAS_UNIV3,
-        FastVenue::Slipstream { .. } => crate::venues::ESTIMATED_GAS_SLIPSTREAM,
+        FastVenue::RoutedCl { .. } => crate::venues::ESTIMATED_GAS_SLIPSTREAM,
         FastVenue::Solidly { .. } => crate::venues::ESTIMATED_GAS_SOLIDLYV2,
     };
 
@@ -1262,7 +1276,6 @@ pub struct LiveRouter {
     /// distinguishable. Inferring that later is not possible and guessing it
     /// would route a UniV3 path through the Slipstream router.
     pub venues: Arc<std::collections::HashMap<Address, FastVenue>>,
-    pub slipstream_router: Address,
 }
 
 impl LiveRouter {
@@ -1298,11 +1311,7 @@ impl LiveRouter {
             let pool = pools[i];
             let venue = *self.venues.get(&pool)?;
             let m = *meta.get(&pool)?;
-            let edge = live_edge(
-                LiveHop { venue, pool, meta: &m, from, to, max_input },
-                live,
-                self.slipstream_router,
-            )?;
+            let edge = live_edge(LiveHop { venue, pool, meta: &m, from, to, max_input }, live)?;
             g.add_edge(edge);
             // `add_edge` de-duplicates by signature, so the index has to be
             // looked up rather than assumed to be the loop counter.
@@ -4151,11 +4160,10 @@ mod tests {
         ]);
         let venues = std::collections::HashMap::from([
             (p_a, FastVenue::UniV3 { fee: 500 }),
-            (p_b, FastVenue::Slipstream { tick_spacing: 100 }),
+            (p_b, FastVenue::RoutedCl { path_param: 100, router: addr(77) }),
         ]);
         let router = LiveRouter {
             venues: Arc::new(venues),
-            slipstream_router: addr(77),
         };
         let live = LiveState::new();
 
@@ -4193,7 +4201,6 @@ mod tests {
                 pool,
                 FastVenue::UniV3 { fee: 500 },
             )])),
-            slipstream_router: Address::zero(),
         };
         let live = LiveState::new();
         let (g, ic) = router
@@ -4219,7 +4226,6 @@ mod tests {
                 known,
                 FastVenue::UniV3 { fee: 500 },
             )])),
-            slipstream_router: Address::zero(),
         };
         let live = LiveState::new();
         assert!(
@@ -4254,7 +4260,6 @@ mod tests {
                 pool, meta: &m, from: t0, to: t1, max_input: U256::from(500u64),
             },
             &live,
-            Address::zero(),
         )
         .expect("buildable");
         match e.venue {
@@ -4279,5 +4284,80 @@ mod tests {
         assert_eq!(f64_to_u256(1e18), U256::exp10(18));
         assert_eq!(f64_to_u256(f64::INFINITY), U256::zero(), "not finite, not a bound");
         assert_eq!(f64_to_u256(1e90), U256::MAX, "beyond 2^256 clamps");
+    }
+
+    // ---- per-pool routers ----
+
+    /// Two CL forks in ONE route, each through its OWN router. A chain-wide
+    /// router cannot express this, which is why a second Slipstream deployment
+    /// stayed disabled and PancakeSwap never entered the fast path at all.
+    #[test]
+    fn each_fork_hop_targets_its_own_router() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (aero, pancake) = (addr(10), addr(11));
+        let (aero_router, pancake_router) = (addr(70), addr(71));
+        let meta = dashmap::DashMap::from_iter([
+            (aero, cl_meta_at(t0, t1)),
+            (pancake, cl_meta_at(t0, t1)),
+        ]);
+        let router = LiveRouter {
+            venues: Arc::new(std::collections::HashMap::from([
+                (aero, FastVenue::RoutedCl { path_param: 100, router: aero_router }),
+                (pancake, FastVenue::RoutedCl { path_param: 500, router: pancake_router }),
+            ])),
+        };
+        let live = LiveState::new();
+        let (g, ic) = router
+            .route(&[t0, t1], &[aero, pancake], &meta, &live, 1e18)
+            .expect("both hops buildable");
+
+        let router_of = |i: usize| match &g.edges[ic.edge_indices[i]].venue {
+            crate::graph::VenueEdge::Slipstream { router, tick_spacing, .. } => {
+                (*router, *tick_spacing)
+            }
+            other => panic!("expected an explicitly routed hop, got {other:?}"),
+        };
+        assert_eq!(router_of(0), (aero_router, 100));
+        assert_eq!(router_of(1), (pancake_router, 500), "not the first hop's router");
+    }
+
+    /// The built-in path is for pools whose venue router IS the executor's.
+    /// `StepData::Uniswap` carries no target, so taking this variant for a fork
+    /// silently sends its calldata to Uniswap's router -- the defect that made
+    /// every Aerodrome Slipstream cycle unexecutable until 2026-09-03.
+    #[test]
+    fn only_a_builtin_router_pool_omits_its_target() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let meta = dashmap::DashMap::from_iter([(pool, cl_meta_at(t0, t1))]);
+        let live = LiveState::new();
+
+        let builtin = LiveRouter {
+            venues: Arc::new(std::collections::HashMap::from([(
+                pool,
+                FastVenue::UniV3 { fee: 500 },
+            )])),
+        };
+        let (g, ic) = builtin.route(&[t0, t1], &[pool, pool], &meta, &live, 1e18).expect("built");
+        assert!(
+            matches!(g.edges[ic.edge_indices[0]].venue, crate::graph::VenueEdge::UniV3 { .. }),
+            "a built-in-router pool takes the targetless step"
+        );
+
+        let forked = LiveRouter {
+            venues: Arc::new(std::collections::HashMap::from([(
+                pool,
+                FastVenue::RoutedCl { path_param: 500, router: addr(99) },
+            )])),
+        };
+        let (g, ic) = forked.route(&[t0, t1], &[pool, pool], &meta, &live, 1e18).expect("built");
+        assert_eq!(
+            match &g.edges[ic.edge_indices[0]].venue {
+                crate::graph::VenueEdge::Slipstream { router, .. } => Some(*router),
+                _ => None,
+            },
+            Some(addr(99)),
+            "a fork must name its router in the calldata"
+        );
     }
 }
