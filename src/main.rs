@@ -6265,6 +6265,7 @@ where
             min_amount: min_amount_in_start_token,
             max_amount: trade_cap,
             gas_price: ctx.gas_parameters.gas_price,
+            base_fee_per_gas: ctx.gas_parameters.base_fee_per_gas,
             estimated_gas: adjusted_cycle_gas,
             l1_data_fee: ctx.gas_parameters.l1_data_fee,
             native_price,
@@ -16503,6 +16504,7 @@ chains:
             curve_quote: &curve_quote,
             block_number,
             local_gross_bps: f64::NAN,
+            base_fee_per_gas: None,
         })
         .await
         .expect("expected non-zero profitable size");

@@ -800,6 +800,174 @@ pub fn hop_quote_from_live(
     best
 }
 
+/// One route the census will sweep, chosen structurally rather than by rank.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CensusRoute {
+    pub tokens: Vec<Address>,
+    pub pools: Vec<Address>,
+    /// How many DISTINCT venues the route touches.
+    pub venues: usize,
+    /// How many DISTINCT pools. A 2-hop loop through one pool is not a trade.
+    pub distinct_pools: usize,
+    /// Smallest depth on any hop, in raw units of that hop's output token.
+    /// The route cannot carry more than its thinnest leg.
+    pub min_depth: f64,
+    /// Touches a major or stable. Kept as a field rather than a filter so the
+    /// exotic routes stay in the table and can be compared against.
+    pub major: bool,
+}
+
+impl CensusRoute {
+    /// same_pool < same_venue < multi_venue. Reported separately, never
+    /// discarded: "the same-venue loops all lose" is a result, and dropping
+    /// them would leave nothing to compare the multi-venue ones against.
+    pub fn stratum(&self) -> &'static str {
+        if self.distinct_pools < self.tokens.len() {
+            "same_pool"
+        } else if self.venues < 2 {
+            "same_venue"
+        } else {
+            "multi_venue"
+        }
+    }
+}
+
+/// Choose a representative route set from the STRUCTURAL index.
+///
+/// The previous census sampled whatever the ranker surfaced, which turned out
+/// to be 14 same-venue Slipstream loops out of 18 routes -- it measured the
+/// ranker's preferences and could say nothing about the universe. This walks
+/// the index itself, so 2-, 3- and 4-hop routes are sampled independently of
+/// what the ranker happens to like.
+///
+/// Within each hop count, ordered by: at least two venues, then at least two
+/// pools, then depth, then whether it touches a major. Ties break on the
+/// cycle's own order so the sample is stable across runs.
+///
+/// `per_hops` routes are taken for EACH of 2, 3 and 4 hops.
+pub fn census_cohort(
+    idx: &crate::cycle_index::CycleIndex,
+    universe: &crate::cycle_index::PoolUniverse,
+    venues: &std::collections::HashMap<Address, FastVenue>,
+    pool_tokens: &dashmap::DashMap<Address, PoolMeta>,
+    majors: &std::collections::HashSet<Address>,
+    per_hops: usize,
+) -> Vec<CensusRoute> {
+    let mut by_hops: std::collections::HashMap<usize, Vec<CensusRoute>> =
+        std::collections::HashMap::new();
+
+    for cycle in idx.cycles() {
+        let hops = cycle.tokens.len();
+        if !(2..=4).contains(&hops) {
+            continue;
+        }
+        let bucket = by_hops.entry(hops).or_default();
+        // Enough candidates to rank well without walking a 62k index in full.
+        if bucket.len() >= per_hops.saturating_mul(40) {
+            continue;
+        }
+        let Some(route) = build_census_route(&cycle.tokens, universe, venues, pool_tokens, majors)
+        else {
+            continue;
+        };
+        bucket.push(route);
+    }
+
+    let mut out = Vec::new();
+    for hops in [2usize, 3, 4] {
+        let Some(mut bucket) = by_hops.remove(&hops) else {
+            continue;
+        };
+        bucket.sort_by(|a, b| {
+            // Venue diversity first: a route through one venue cannot show a
+            // cross-venue dislocation, which is the thing being looked for.
+            (b.venues.min(2), b.distinct_pools.min(2))
+                .cmp(&(a.venues.min(2), a.distinct_pools.min(2)))
+                .then_with(|| {
+                    b.min_depth
+                        .partial_cmp(&a.min_depth)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| b.major.cmp(&a.major))
+        });
+        bucket.truncate(per_hops);
+        out.extend(bucket);
+    }
+    out
+}
+
+/// Pick one pool per hop, preferring depth, then a venue not already used.
+///
+/// `None` when any hop has no priceable pool: a route the census cannot quote
+/// is not a route.
+fn build_census_route(
+    tokens: &[Address],
+    universe: &crate::cycle_index::PoolUniverse,
+    venues: &std::collections::HashMap<Address, FastVenue>,
+    pool_tokens: &dashmap::DashMap<Address, PoolMeta>,
+    majors: &std::collections::HashSet<Address>,
+) -> Option<CensusRoute> {
+    let mut pools = Vec::with_capacity(tokens.len());
+    let mut seen_venues: Vec<std::mem::Discriminant<FastVenue>> = Vec::new();
+    let mut min_depth = f64::INFINITY;
+
+    for i in 0..tokens.len() {
+        let (from, to) = (tokens[i], tokens[(i + 1) % tokens.len()]);
+        let candidates = universe.pools_for_hop(from, to);
+        if candidates.is_empty() {
+            return None;
+        }
+        let mut best: Option<(Address, f64, bool)> = None;
+        for pool in candidates {
+            let Some(meta) = pool_tokens.get(pool) else {
+                continue;
+            };
+            let Some(venue) = venues.get(pool) else {
+                continue;
+            };
+            let depth = match meta.balances {
+                Some((b0, b1)) => {
+                    let out_side = if from == meta.token0 { b1 } else { b0 };
+                    if out_side.is_finite() && out_side > 0.0 { out_side } else { continue }
+                }
+                // Unknown depth sorts last but is not disqualifying: the
+                // reconcile fills balances in over time and refusing here
+                // would bias the sample toward whatever was read first.
+                None => 0.0,
+            };
+            let novel = !seen_venues.contains(&std::mem::discriminant(venue));
+            // A new venue outranks depth, since venue diversity is the axis
+            // this census exists to cover.
+            let better = match &best {
+                None => true,
+                Some((_, bd, bn)) => (novel, depth) > (*bn, *bd),
+            };
+            if better {
+                best = Some((*pool, depth, novel));
+            }
+        }
+        let (pool, depth, _) = best?;
+        if let Some(v) = venues.get(&pool) {
+            let d = std::mem::discriminant(v);
+            if !seen_venues.contains(&d) {
+                seen_venues.push(d);
+            }
+        }
+        min_depth = min_depth.min(depth);
+        pools.push(pool);
+    }
+
+    let distinct_pools = pools.iter().collect::<std::collections::HashSet<_>>().len();
+    Some(CensusRoute {
+        venues: seen_venues.len(),
+        distinct_pools,
+        min_depth: if min_depth.is_finite() { min_depth } else { 0.0 },
+        major: tokens.iter().any(|t| majors.contains(t)),
+        tokens: tokens.to_vec(),
+        pools,
+    })
+}
+
 /// Whether a hop with no priceable input token may still be ranked.
 ///
 /// Off by default: see `hop_quote_from_live`. Read once, because this is on the
@@ -2542,6 +2710,24 @@ impl BaseFastPath {
                 ref_native,
                 "base fast path prices hops at this probe size, not at the margin"
             );
+            // CENSUS COHORT. Built once, from the structural index, and only
+            // when the census is on. The production ranker is untouched: this
+            // replaces which routes are HANDED to the sweep, not how the live
+            // path ranks anything.
+            let census_on = std::env::var("ARBOT_CENSUS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let census_per_hops = crate::util::env_parse_opt::<usize>("ARBOT_CENSUS_PER_HOPS")
+                .filter(|v| *v > 0)
+                .unwrap_or(100);
+            let mut census_queue: Vec<CensusRoute> = Vec::new();
+            let mut census_built = false;
+            // A census with no router has no venue map and so no way to tell
+            // the strata apart; it still runs, and every route reports as
+            // single-venue rather than silently vanishing.
+            let empty_venues: std::collections::HashMap<Address, FastVenue> =
+                std::collections::HashMap::new();
+
             let mut tick = interval(cadence);
             tick.tick().await; // immediate first tick; discard
             let mut drains: u64 = 0;
@@ -2617,6 +2803,68 @@ impl BaseFastPath {
                     FAST_PATH_RANKED,
                 );
                 let price_us = priced_at.elapsed().as_micros();
+
+                // CENSUS SUBSTITUTION. Under the flag only, the ranked list is
+                // replaced by the next slice of the structural cohort, so the
+                // sweep covers 2/3/4 hops and every venue stratum instead of
+                // whatever the ranker preferred. Nothing else in this loop
+                // changes, and with the flag off the branch never runs.
+                let mut priced = priced;
+                if census_on {
+                    if !census_built {
+                        census_queue = census_cohort(
+                            &idx,
+                            &universe,
+                            router
+                                .as_ref()
+                                .map(|r| r.venues.as_ref())
+                                .unwrap_or(&empty_venues),
+                            &self.pool_tokens,
+                            &fundable,
+                            census_per_hops,
+                        );
+                        census_built = true;
+                        let mut strata: std::collections::HashMap<&str, usize> =
+                            std::collections::HashMap::new();
+                        let mut hops: std::collections::HashMap<usize, usize> =
+                            std::collections::HashMap::new();
+                        for r in &census_queue {
+                            *strata.entry(r.stratum()).or_default() += 1;
+                            *hops.entry(r.tokens.len()).or_default() += 1;
+                        }
+                        info!(
+                            routes = census_queue.len(),
+                            multi_venue = strata.get("multi_venue").copied().unwrap_or(0),
+                            same_venue = strata.get("same_venue").copied().unwrap_or(0),
+                            same_pool = strata.get("same_pool").copied().unwrap_or(0),
+                            two_hop = hops.get(&2).copied().unwrap_or(0),
+                            three_hop = hops.get(&3).copied().unwrap_or(0),
+                            four_hop = hops.get(&4).copied().unwrap_or(0),
+                            "census cohort selected from the structural index"
+                        );
+                    }
+                    let take = census_queue.len().min(FAST_PATH_RANKED);
+                    let batch: Vec<CensusRoute> = census_queue.drain(..take).collect();
+                    if batch.is_empty() {
+                        info!("census cohort exhausted; no further routes to sweep");
+                    }
+                    priced = batch
+                        .into_iter()
+                        .map(|r| PricedCycle {
+                            id: 0,
+                            // The census reports realised net from real quotes,
+                            // so a local gross would only be a number nothing
+                            // downstream reads.
+                            gross_bps: f64::NAN,
+                            hops: r.tokens.len(),
+                            notional_in: 0.0,
+                            profit_native: None,
+                            pools: r.pools,
+                            tokens: r.tokens,
+                            priced_at: Instant::now(),
+                        })
+                        .collect();
+                }
 
                 // The SAME winning cycle, priced again taking the first pool
                 // that serves each hop instead of the best. Holding the cycle
@@ -5063,6 +5311,37 @@ mod tests {
             })
         });
         assert!(out.is_none(), "pass one's gross must not stand in for pass two's");
+    }
+
+    /// Strata are reported, never filtered.
+    ///
+    /// The first census sampled the ranker and got 14 same-venue Slipstream
+    /// loops out of 18 routes, which says nothing about the universe. The
+    /// classification exists so those routes can be COMPARED against the
+    /// multi-venue ones rather than dropped -- "the same-venue loops all lose"
+    /// is a finding, and without them there is nothing to measure against.
+    #[test]
+    fn census_routes_are_classified_not_filtered() {
+        let mk = |tokens: Vec<Address>, pools: Vec<Address>, venues| CensusRoute {
+            tokens, pools, venues, distinct_pools: 0, min_depth: 1.0, major: true,
+        };
+        let mut r = mk(vec![addr(1), addr(2)], vec![addr(10), addr(10)], 1);
+        r.distinct_pools = 1;
+        assert_eq!(r.stratum(), "same_pool", "one pool both ways is not a trade");
+
+        let mut r = mk(vec![addr(1), addr(2)], vec![addr(10), addr(11)], 1);
+        r.distinct_pools = 2;
+        assert_eq!(r.stratum(), "same_venue");
+
+        let mut r = mk(vec![addr(1), addr(2)], vec![addr(10), addr(11)], 2);
+        r.distinct_pools = 2;
+        assert_eq!(r.stratum(), "multi_venue");
+
+        // A 3-hop route through only two distinct pools reuses one, so it is
+        // still same_pool however many venues it claims.
+        let mut r = mk(vec![addr(1), addr(2), addr(3)], vec![addr(10), addr(11), addr(10)], 2);
+        r.distinct_pools = 2;
+        assert_eq!(r.stratum(), "same_pool");
     }
 
     /// A hop the probe size cannot reach is refused, not priced at the margin.

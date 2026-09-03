@@ -816,6 +816,14 @@ where
     pub bal_quote: &'a BalQuote<C>,
     pub curve_quote: &'a CurveQuote<C>,
     pub block_number: U64,
+    /// Chain base fee, kept SEPARATE from `gas_price`.
+    ///
+    /// `gas_price` is base + our configured priority bid, and that bid is a
+    /// choice rather than a market fact: measured 2026-09-04 it was 1 gwei
+    /// against a 0.006 gwei base, so it set the effective price 166x above the
+    /// floor. A census that folds the two together cannot tell a route that
+    /// loses from a bid that is too high.
+    pub base_fee_per_gas: Option<U256>,
     /// What the fast path's LOCAL pricing claimed for this cycle, in bps.
     ///
     /// Diagnostic only -- never read by the search. It exists so a refusal can
@@ -1239,6 +1247,23 @@ async fn census_sweep<C>(
     let route_json = format!("[{}]", route.join(","));
     let start = params.edges.first().map(|e| e.from).unwrap_or_default();
 
+    // Gas, decomposed. `gas_cost` is what the runner would charge at its own
+    // bid; `gas_cost_at_base` is the same trade at the chain's base fee with no
+    // priority. Both are recorded so a route that loses can be told apart from
+    // a bid that is too high.
+    let gas_units = params.estimated_gas;
+    let eff_price = params.gas_price;
+    let base_fee = params.base_fee_per_gas.unwrap_or(eff_price);
+    let l1 = params.l1_data_fee;
+    let l2 = eff_price.saturating_mul(U256::from(gas_units));
+    let gas_at_base = base_fee
+        .saturating_mul(U256::from(gas_units))
+        .saturating_add(l1);
+    let gas_at_base_tokens = params
+        .native_price
+        .tokens_for_native_strict(gas_at_base)
+        .unwrap_or(gas_cost);
+
     let mut rows = String::new();
     for native in CENSUS_LADDER_NATIVE {
         // The ladder is in native; the trade is denominated in the start token.
@@ -1306,10 +1331,18 @@ async fn census_sweep<C>(
         )
         .unwrap_or(i128::MAX);
         let net = gross - costs;
+        let costs_at_base = i128::try_from(
+            flash_fee
+                .saturating_add(gas_at_base_tokens)
+                .min(U256::from(u128::MAX))
+                .as_u128(),
+        )
+        .unwrap_or(i128::MAX);
+        let net_at_base = gross - costs_at_base;
         let amt_f = u256_to_f64(amount);
         let net_bps = if amt_f > 0.0 { net as f64 / amt_f * 10_000.0 } else { f64::NAN };
         rows.push_str(&format!(
-            "{{\"route\":{route_json},\"hops\":{},\"start\":\"{start:#x}\",             \"amount_in\":\"{amount}\",\"amount_out\":\"{out}\",             \"gross\":{gross},\"flash_fee\":\"{flash_fee}\",\"gas_cost\":\"{gas_cost}\",             \"net\":{net},\"net_bps\":{net_bps:.4},\"max_slippage_bps\":{slip},             \"refused\":false}}\n",
+            "{{\"route\":{route_json},\"hops\":{},\"start\":\"{start:#x}\",             \"amount_in\":\"{amount}\",\"amount_out\":\"{out}\",             \"gross\":{gross},\"flash_fee\":\"{flash_fee}\",             \"gas_units\":{gas_units},\"effective_gas_price\":\"{eff_price}\",             \"base_fee_per_gas\":\"{base_fee}\",\"l1_fee\":\"{l1}\",\"l2_fee\":\"{l2}\",             \"gas_cost\":\"{gas_cost}\",\"gas_cost_at_base\":\"{gas_at_base}\",             \"net\":{net},\"net_at_base_fee\":{net_at_base},\"net_bps\":{net_bps:.4},             \"max_slippage_bps\":{slip},\"refused\":false}}\n",
             params.edges.len(),
         ));
     }
@@ -1424,6 +1457,7 @@ mod tests {
             curve_quote: &curve_quote,
             block_number: U64::zero(),
             local_gross_bps: f64::NAN,
+            base_fee_per_gas: None,
         })
         .await
         .unwrap();
@@ -1479,6 +1513,7 @@ mod tests {
             curve_quote: &curve_quote,
             block_number: U64::zero(),
             local_gross_bps: f64::NAN,
+            base_fee_per_gas: None,
         })
         .await
         .unwrap();
@@ -1525,6 +1560,7 @@ mod tests {
             curve_quote: &curve_quote,
             block_number: U64::zero(),
             local_gross_bps: f64::NAN,
+            base_fee_per_gas: None,
         })
         .await;
 
