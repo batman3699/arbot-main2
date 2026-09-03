@@ -731,12 +731,27 @@ pub fn hop_quote_from_live(
     // A hop whose input token has no price is priced at the margin, which
     // means it contributes NO slippage to the cycle. That is invisible in the
     // gross and is exactly where a thin pool hides.
+    //
+    // Measured 2026-09-03: 21.2% of hops in steady state. Ranking is what makes
+    // that fatal rather than merely lossy -- a missing slippage term can only
+    // RAISE a cycle's gross, so maximising gross selects for the hops it could
+    // not price. Every one of 392 sizing refusals in the run before this was
+    // `cycle output <= input`: the quoter charging slippage the ranking never
+    // saw. A marginal rate and an at-size rate are different quantities and
+    // ranking them against each other is the defect.
+    //
+    // So the cycle is refused, not guessed at. Set
+    // `ARBOT_BASE_FAST_ALLOW_MARGIN_HOPS=1` to restore the old behaviour for
+    // comparison; it is not a mode to run on.
     if ctx.ref_native > 0.0 {
         use std::sync::atomic::Ordering::Relaxed;
         if reference_in > 0.0 {
             crate::util::FAST_HOPS_AT_SIZE.fetch_add(1, Relaxed);
         } else {
             crate::util::FAST_HOPS_AT_MARGIN.fetch_add(1, Relaxed);
+            if !allow_margin_hops() {
+                return None;
+            }
         }
     }
     let mut best: Option<HopQuote> = None;
@@ -763,6 +778,19 @@ pub fn hop_quote_from_live(
         }
     }
     best
+}
+
+/// Whether a hop with no priceable input token may still be ranked.
+///
+/// Off by default: see `hop_quote_from_live`. Read once, because this is on the
+/// pricing hot path and an env lookup per hop would cost more than the check.
+fn allow_margin_hops() -> bool {
+    static ALLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOW.get_or_init(|| {
+        std::env::var("ARBOT_BASE_FAST_ALLOW_MARGIN_HOPS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 /// One pool's rate for one hop, net of that pool's fee.
@@ -4783,6 +4811,47 @@ mod tests {
         let after = f.reprice_now(&[t0, t1], &[a, b]).expect("repriced");
         assert!(after < before, "decay must be visible: {before} -> {after}");
         assert!(after.abs() < 1.0, "edge should be gone, got {after}");
+    }
+
+    /// A hop the probe size cannot reach is refused, not priced at the margin.
+    ///
+    /// Pricing it marginally reports zero slippage for that hop, and because
+    /// ranking maximises gross, a missing slippage term promotes exactly the
+    /// cycles whose depth is unknown. Measured 2026-09-03: 21.2% of hops, and
+    /// 392 of 392 sizing refusals were the quoter charging slippage the
+    /// ranking never saw.
+    #[test]
+    fn an_unpriceable_hop_is_refused_rather_than_priced_at_the_margin() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let (f, _t) = fast(vec![pool]);
+        let meta = PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
+                              kind: PoolKind::ConstantProduct, verified: true,
+                              confirmed_at: Some(Instant::now()), balances: None };
+        let f = f.with_pool_tokens(std::collections::HashMap::from([(pool, meta)]));
+        assert!(f.live.anchor_v2(pool, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::from(100u64) * U256::exp10(18),
+            reserve1: U256::from(200u64) * U256::exp10(18),
+        }));
+        let priced: TokenPrices = [(t0, 1.0)].into_iter().collect();
+        let empty: TokenPrices = TokenPrices::new();
+        let quote = |px: &TokenPrices, refn: f64| {
+            hop_quote_from_live(&f.live, &[pool], &f.pool_tokens, t0, t1,
+                PricingCtx { fresh: f.freshness(), select: HopSelect::BestNet,
+                             prices: Some(px), ref_native: refn })
+        };
+        // Priced token, real probe size: quoted, and the impact term is in it.
+        let at_size = quote(&priced, 1e17).expect("priced token quotes");
+        // Unpriced token at the same probe size: refused, NOT quoted at the margin.
+        assert!(quote(&empty, 1e17).is_none(), "unpriceable hop must not be ranked");
+        // ref_native = 0 asks for marginal pricing explicitly, which stays legal.
+        let marginal = quote(&empty, 0.0).expect("explicit marginal pricing still works");
+        assert!(
+            at_size.num / at_size.den < marginal.num / marginal.den,
+            "the at-size rate must be the worse one: {} vs {}",
+            at_size.num / at_size.den, marginal.num / marginal.den
+        );
     }
 
     /// A cycle whose pools it cannot price yields no number rather than a
