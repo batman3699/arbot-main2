@@ -575,6 +575,24 @@ where
         crate::util::GRID_HOPS_INTACT.fetch_add(1, Ordering::Relaxed);
     }
 
+    // Substituting another size's quote is NOT free: `amount_out` is then the
+    // output for a DIFFERENT input, and the caller uses it as the output for
+    // this one. `fallback` is the first sample that quoted and the grid is
+    // sorted ascending, so the substitute is the smallest surviving size --
+    // as little as amount_in/4. Counted before it is used, because it reads
+    // downstream as an unprofitable cycle rather than an unfillable size.
+    if current_quote.is_some() {
+        crate::util::HOP_QUOTE_EXACT.fetch_add(1, Ordering::Relaxed);
+    } else if fallback.is_some() {
+        crate::util::HOP_QUOTE_SIZE_SUBSTITUTED.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            requested = ?amount_in,
+            venue = venue_kind(edge),
+            attempted,
+            refused,
+            "exact size refused; substituting another size's quote for this hop"
+        );
+    }
     // Only a grid where NOTHING quoted is unquotable.
     let Some(quote) = current_quote.or(fallback) else {
         if refused > 0 {

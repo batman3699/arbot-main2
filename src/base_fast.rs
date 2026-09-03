@@ -2633,6 +2633,13 @@ impl BaseFastPath {
                         crate::util::FAST_HOPS_AT_SIZE.load(Ordering::Relaxed),
                     hops_at_margin =
                         crate::util::FAST_HOPS_AT_MARGIN.load(Ordering::Relaxed),
+                    // A substituted hop quote answers for a size nobody asked
+                    // about, so the cycle arithmetic downstream is not about
+                    // the trade being considered.
+                    hop_quote_exact =
+                        crate::util::HOP_QUOTE_EXACT.load(Ordering::Relaxed),
+                    hop_quote_substituted =
+                        crate::util::HOP_QUOTE_SIZE_SUBSTITUTED.load(Ordering::Relaxed),
                     sim_ok = sim_ok.load(Ordering::Relaxed),
                     sim_failed = sim_failed.load(Ordering::Relaxed),
                     mean_sim_us = sim_micros.load(Ordering::Relaxed)

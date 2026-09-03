@@ -772,6 +772,17 @@ pub static GRID_HOPS_SINGLE_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::
 pub static GRID_HOPS_INTACT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Fast-path hops priced WITH an impact term, i.e. the input token had a price.
 pub static FAST_HOPS_AT_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Hops whose EXACT requested size was refused, so a different size's quote
+/// was substituted for it.
+///
+/// `quote_edge_with_curve` falls back to the first sample that quoted, which
+/// after sorting is the SMALLEST -- as little as a quarter of the amount asked
+/// for. Its `amount_out` is then used as the output for the full amount, which
+/// understates the hop by up to 4x and reads downstream as an unprofitable
+/// cycle rather than as an unfillable size.
+pub static HOP_QUOTE_SIZE_SUBSTITUTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Hops answered by the quote for the size actually requested.
+pub static HOP_QUOTE_EXACT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Fast-path hops priced at the MARGIN because the input token had no price.
 ///
 /// A marginal hop contributes zero slippage to the cycle's gross, so a cycle
