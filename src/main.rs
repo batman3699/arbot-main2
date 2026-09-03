@@ -5973,10 +5973,17 @@ where
         // them through unconverted is what zeroed every 6-decimal start token.
         // Fail closed when the start token cannot be priced — an unconverted
         // fallback would silently reinstate the bug.
-        let quotes = match native_price
+        // Two very different failures used to share one label. "The start
+        // token's native price could not be converted" is a PRICING gap and
+        // says nothing about funding; "no provider had capacity" is a funding
+        // answer. Measured 2026-09-03: 351 rejections carried this label after
+        // the allowlist filter already removed the unfundable starts, and
+        // there was no way to tell which of the two they were.
+        let converted = native_price
             .tokens_for_native_strict(ctx.capital_snapshot.min_flash_loan)
-            .zip(native_price.tokens_for_native_strict(ctx.capital_snapshot.max_flash_loan))
-        {
+            .zip(native_price.tokens_for_native_strict(ctx.capital_snapshot.max_flash_loan));
+        let price_conversion_failed = converted.is_none();
+        let quotes = match converted {
             Some((min_in_token, max_in_token)) => {
                 self.flash_loan_quotes(cycle_start, trade_cap, min_in_token, max_in_token)
             }
@@ -5996,7 +6003,15 @@ where
                 None,
                 pricing_reliable,
                 None,
-                Some("no_flashloan_provider"),
+                Some(if price_conversion_failed {
+                    // The token passed `pricing_reliable` but its native price
+                    // still would not convert the native-denominated loan
+                    // bounds into token units. That is a pricing defect, not a
+                    // statement about any lender.
+                    "no_flashloan_price_conversion"
+                } else {
+                    "no_flashloan_capacity"
+                }),
                 None,
                 has_bridge_step,
                 false,
