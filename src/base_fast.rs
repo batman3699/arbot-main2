@@ -2771,7 +2771,17 @@ impl BaseFastPath {
                 };
                 let (out, pools, elapsed) =
                     drain_and_resolve(&self.touched, &universe, &idx, max_cycles);
-                if pools == 0 {
+                // An empty touched set means the feed delivered nothing, which
+                // for the LIVE path is nothing to do. The census is different:
+                // its routes come from the structural index, not from what just
+                // traded, so it must not be gated on a websocket.
+                //
+                // Measured 2026-09-04, that gating silently produced three
+                // censuses with zero cohort lines: free WS endpoints cannot
+                // hold a 1,357-pool `pendingLogs` subscription (1,543
+                // "Websocket closed unexpectedly", 59 subscription failures, 0
+                // drains), while HTTP quoting was working the whole time.
+                if pools == 0 && !census_on {
                     continue;
                 }
                 drains += 1;
