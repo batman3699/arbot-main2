@@ -671,6 +671,13 @@ type AdjacencyMap = DashMap<NodeIx, AdjacencyList>;
 /// `(weight, cycle, edge_indices, start_priority, estimated_profit_bps)`.
 type DiscoveredCycle = (EdgeWeight, Vec<NodeIx>, Vec<usize>, i128, i64);
 
+/// Cloneable so the scan can publish an immutable snapshot for readers.
+///
+/// The flashblock fast path reads a snapshot; it never mutates the graph. That
+/// is what makes sharing safe here where sharing `LiveState` was not: LiveState
+/// has one global ordinal cursor and two writers broke it, while a graph
+/// snapshot has exactly one writer and any number of readers.
+#[derive(Clone)]
 pub struct Graph {
     pub nodes: Vec<Address>,
     pub ix: HashMap<Address, usize>,
@@ -1021,6 +1028,41 @@ impl Graph {
             edge_indices.push(self.best_edge_index(from_addr, to_addr)?);
         }
         Some(edge_indices)
+    }
+
+    /// Translate a token loop into an `IndexedCycle` this graph can price.
+    ///
+    /// `CycleIndex` stores loops as ADDRESSES in OPEN form, deliberately: node
+    /// indices are assigned in first-seen order and the graph is rebuilt every
+    /// scan, so an index-keyed cycle silently refers to different tokens after a
+    /// rebuild. This is the translation across that boundary, and it is where
+    /// the flashblock fast path hands a cycle to the existing plan machinery.
+    ///
+    /// The loop is CLOSED here — `IndexedCycle.cycle` carries the return to
+    /// `tokens[0]` and `hops()` is `len - 1`. Passing the open form would build
+    /// a plan one hop short, which is a path that ends holding the wrong token,
+    /// not a cycle.
+    ///
+    /// `None` when any token is absent from the graph or any hop has no edge.
+    /// A partial translation is worse than none: it would produce a plan whose
+    /// steps do not compose.
+    // No caller in the bin until the fast path hands cycles to
+    // prepare_candidate; the allow goes with that wiring.
+    #[allow(dead_code)]
+    pub fn indexed_cycle_for_tokens(&self, tokens: &[Address]) -> Option<IndexedCycle> {
+        if tokens.len() < 2 {
+            return None;
+        }
+        let mut cycle: Vec<usize> = Vec::with_capacity(tokens.len() + 1);
+        for t in tokens {
+            cycle.push(*self.ix.get(t)?);
+        }
+        cycle.push(cycle[0]);
+        let edge_indices = self.best_edge_indices_for_node_path(&cycle)?;
+        Some(IndexedCycle {
+            cycle,
+            edge_indices,
+        })
     }
 
     pub fn edge_between(&self, from: Address, to: Address) -> Option<&Edge> {
@@ -2024,6 +2066,82 @@ mod tests {
 
     fn addr(id: u64) -> Address {
         Address::from_low_u64_be(id)
+    }
+
+    fn hop_edge(from: Address, to: Address) -> Edge {
+        Edge {
+            from,
+            to,
+            rate_num: U256::from(1u64),
+            rate_den: U256::from(1u64),
+            venue: VenueEdge::UniV3 {
+                path: vec![(from, None), (to, Some(500))],
+                pool: Address::zero(),
+                fee: 500,
+                state: None,
+            },
+            estimated_gas: 0,
+            weight: 0,
+            max_input: U256::from(1_000u64),
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+            tick_ladder: None,
+        }
+    }
+
+    fn closed_triangle() -> (Graph, Address, Address, Address) {
+        let mut g = Graph::default();
+        let (a, b, c) = (addr(1), addr(2), addr(3));
+        for t in [a, b, c] {
+            g.add_node(t);
+        }
+        for (f, t) in [(a, b), (b, c), (c, a)] {
+            g.add_edge(hop_edge(f, t));
+        }
+        (g, a, b, c)
+    }
+
+    /// The boundary the flashblock fast path hands cycles across. `CycleIndex`
+    /// stores ADDRESSES in OPEN form on purpose -- node indices are assigned in
+    /// first-seen order and the graph is rebuilt every scan, so an index-keyed
+    /// cycle silently repoints after a rebuild.
+    ///
+    /// The loop must be CLOSED here. An open path builds a plan one hop short,
+    /// which ends holding the wrong token.
+    #[test]
+    fn a_token_loop_translates_to_a_closed_indexed_cycle() {
+        let (g, a, b, c) = closed_triangle();
+        let ic = g
+            .indexed_cycle_for_tokens(&[a, b, c])
+            .expect("triangle is fully connected");
+        assert_eq!(ic.hops(), 3, "three hops: a->b, b->c, c->a");
+        assert_eq!(ic.cycle.len(), 4, "closed form carries the return to start");
+        assert_eq!(
+            ic.cycle.first(),
+            ic.cycle.last(),
+            "the path must return to where it began"
+        );
+        assert_eq!(ic.edge_indices.len(), 3);
+        assert!(ic.edge_indices_valid());
+    }
+
+    /// A partial translation is worse than none: a plan whose steps do not
+    /// compose would be built and only fail at execution.
+    #[test]
+    fn a_missing_hop_or_token_refuses_to_translate() {
+        let (mut g, a, b, c) = closed_triangle();
+        // A token the graph has never seen.
+        assert!(g.indexed_cycle_for_tokens(&[a, b, addr(99)]).is_none());
+        // A hop with no edge: add an isolated node.
+        let d = addr(4);
+        g.add_node(d);
+        assert!(
+            g.indexed_cycle_for_tokens(&[a, b, c, d]).is_none(),
+            "d has no edges; the loop cannot close"
+        );
+        assert!(g.indexed_cycle_for_tokens(&[a]).is_none(), "one token is not a loop");
     }
 
     /// The rescue path in `main.rs` re-anchors an unfundable cycle onto a

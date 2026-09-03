@@ -83,7 +83,7 @@ pub(crate) const SUBSCRIPTION_STALL_LIMIT: Duration = Duration::from_secs(90);
 
 /// How often the idle timer wakes to evaluate the above. Bounds detection
 /// latency to `SUBSCRIPTION_STALL_LIMIT + SUBSCRIPTION_IDLE_TICK`.
-const SUBSCRIPTION_IDLE_TICK: Duration = Duration::from_secs(15);
+pub(crate) const SUBSCRIPTION_IDLE_TICK: Duration = Duration::from_secs(15);
 
 /// `newHeads` is the strongest liveness signal available: blocks arrive on a
 /// schedule whether or not the market is busy, so silence here is never
@@ -123,7 +123,7 @@ pub(crate) const LOW_TRAFFIC_STALL_LIMIT: Duration = Duration::from_secs(25 * 60
 /// NEVER delivered is deliberately not reconnected, because a new socket
 /// carries the same deaf filter -- but the provider still closes that socket,
 /// and nothing would ever have replaced it.
-const WS_MAX_CONNECTION_AGE: Duration = Duration::from_secs(25 * 60);
+pub(crate) const WS_MAX_CONNECTION_AGE: Duration = Duration::from_secs(25 * 60);
 
 /// Outcome of awaiting the next item from a subscription.
 #[derive(Debug, PartialEq, Eq)]

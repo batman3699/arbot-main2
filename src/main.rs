@@ -12,6 +12,7 @@ mod cl_swap;
 mod cl_ticks;
 #[cfg(test)]
 mod config_validation;
+mod base_fast;
 mod cycle_index;
 mod discovery;
 mod fees;
@@ -3471,6 +3472,9 @@ where
     /// Precomputed cycle set, rebuilt only when graph STRUCTURE changes.
     /// Populated only under ARBOT_CYCLE_INDEX_COMPARE; `None` otherwise.
     cycle_index: Arc<StdMutex<Option<crate::cycle_index::CycleIndex>>>,
+    /// Immutable graph snapshot published after each scan, for readers that
+    /// must not wait 4.2s for the next one. Written only here.
+    graph_snapshot: Arc<StdMutex<Option<Arc<Graph>>>>,
     /// Long-lived tick-ladder cache for the multi-tick CL simulator
     /// (`ARBOT_CL_MULTI_TICK`). Built once here and reused across every
     /// `scan_once()` call for this chain, so `CachedTickSource`'s epoch cache
@@ -3781,6 +3785,7 @@ where
             populate_cache: Arc::new(Mutex::new(PopulateCacheState::default())),
             flash_capacity: Arc::new(StdMutex::new(FlashCapacityCache::default())),
             cycle_index: Arc::new(StdMutex::new(None)),
+            graph_snapshot: Arc::new(StdMutex::new(None)),
             cl_tick_cache,
         }
     }
@@ -5460,6 +5465,13 @@ where
     /// concurrently across candidates (only shared reads; quote concurrency is
     /// bounded by the UniV3 semaphore). Rejections emit their candidate-stage
     /// logs and zero-loss metrics here, exactly as the sequential pipeline did.
+    /// Handle to the immutable graph snapshot this runner publishes each scan.
+    ///
+    /// Readers get a consistent `Arc<Graph>`; the runner is the only writer.
+    fn graph_snapshot(&self) -> Arc<StdMutex<Option<Arc<Graph>>>> {
+        Arc::clone(&self.graph_snapshot)
+    }
+
     async fn prepare_candidate(
         &self,
         graph: &Graph,
@@ -6588,6 +6600,12 @@ where
         }
 
         let edges_scanned = graph.edges.iter().filter(|edge| edge.active).count();
+        // Publish before the search: readers want the priced graph, and a
+        // snapshot taken after the search would be one scan stale by the time
+        // anyone read it.
+        if let Ok(mut g) = self.graph_snapshot.lock() {
+            *g = Some(Arc::new(graph.clone()));
+        }
         let current_digest = graph_digest(&graph);
         let significant_change = {
             let mut guard = self.last_graph_digest.lock().await;
@@ -7636,6 +7654,23 @@ where
             let latency_ms = quote_start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
             metrics.record_stage_latency(&self.chain_name, "quote", latency_ms);
         }
+
+        // The decision-loop split, in the log rather than only in metrics.
+        //
+        // The loop was measured at 4.20s median (220 scans) against a 2s Base
+        // block and a 200ms flashblock. `populate_ms` accounted for 1.71s of
+        // that and the rest was invisible without scraping Prometheus, which
+        // made it impossible to say whether a faster FEED or a faster DECISION
+        // was the bigger win. search covers cycle discovery; quote covers
+        // candidate preparation, which is where sizing lives.
+        info!(
+            target: "latency",
+            chain = %self.chain_name,
+            search_ms = search_start.elapsed().saturating_sub(quote_start.elapsed()).as_millis(),
+            quote_and_size_ms = quote_start.elapsed().as_millis(),
+            candidates = ranked_candidates.len(),
+            "scan decision phases"
+        );
 
         let attempt_limit = ranked_candidates.len();
         let mut cascade_failures: Vec<String> = Vec::new();
@@ -12778,6 +12813,16 @@ async fn launch_chain_runtime(
     let hot_pancakeswap_by_venue = Arc::new(tokio::sync::RwLock::new(hot_pancakeswap_by_venue));
     let hot_slipstream_by_venue = Arc::new(tokio::sync::RwLock::new(hot_slipstream_by_venue));
 
+    // Declared out here so the drain can be spawned AFTER the runner exists:
+    // it needs the runner's graph snapshot, and the monitor is built first.
+    let mut base_fast_drain: Option<(
+        std::sync::Arc<crate::base_fast::BaseFastPath>,
+        std::sync::Arc<crate::cycle_index::PoolUniverse>,
+        usize,
+    )> = None;
+    let mut base_fast_index: Option<
+        std::sync::Arc<std::sync::Mutex<Option<crate::cycle_index::CycleIndex>>>,
+    > = None;
     let pool_monitor = {
         let poll_ms = crate::util::env_parse_opt::<u64>("POOL_MONITOR_POLL_MS")
             .unwrap_or(1_200);
@@ -12839,6 +12884,38 @@ async fn launch_chain_runtime(
                             "CHAOS_WS_GAP_SECS set; forcing websocket gaps. Test harness only"
                         );
                     }
+                    let fast_pools: Vec<Address> = cl_pools.iter().map(|p| p.pair).collect();
+                    // Token pairs for the same pools, so the drain loop can map
+                    // a dirty POOL to the token HOP the cycle index is keyed by.
+                    let fast_universe: Vec<(Address, Address, Address)> = cl_pools
+                        .iter()
+                        .map(|p| (p.pair, p.token_in, p.token_out))
+                        .collect();
+                    // fee_ppm, NOT fee_bps: MonitoredPool.fee_bps is populated
+                    // from the raw pool fee, which is parts-per-million for
+                    // UniV3-style venues -- 3_000 is 0.30%, not 30%.
+                    let fast_meta: std::collections::HashMap<
+                        Address,
+                        crate::base_fast::PoolMeta,
+                    > = cl_pools
+                        .iter()
+                        .map(|p| {
+                            (
+                                p.pair,
+                                crate::base_fast::PoolMeta {
+                                    token0: p.token_in,
+                                    token1: p.token_out,
+                                    fee_ppm: p.fee_bps,
+                                },
+                            )
+                        })
+                        .collect();
+                    let fast_starts: Vec<Address> = {
+                        let mut t: Vec<Address> = cl_pools.iter().map(|p| p.token_in).collect();
+                        t.sort_unstable();
+                        t.dedup();
+                        t
+                    };
                     let monitor = monitor
                         .with_chaos_gap(chaos_gap)
                         .with_sticky_pools(cl_pools)
@@ -12882,6 +12959,114 @@ async fn launch_chain_runtime(
                                 }
                             },
                         );
+                        // Base flashblock fast path: preconfirmed logs into the
+                        // SAME LiveState the poll path writes, so both feed one
+                        // store and their latency is directly comparable.
+                        //
+                        // Off by default. The canonical loop measures 4.20s
+                        // median against a 200ms flashblock cadence; this exists
+                        // to produce the receive->applied number that says
+                        // whether that gap is closing, before anything is
+                        // rewired to depend on it.
+                        if cfg.chain_id == 8453
+                            && crate::util::env_flag("ARBOT_BASE_FAST", false)
+                        {
+                            if crate::base_fast::worth_subscribing(&fast_pools) {
+                                let fast = std::sync::Arc::new(
+                                    crate::base_fast::BaseFastPath::new(
+                                        crate::base_fast::FlashFeed::PendingLogs {
+                                            ws_url: ws_endpoints
+                                                .first()
+                                                .cloned()
+                                                .unwrap_or_default(),
+                                        },
+                                        fast_pools.clone(),
+                                        // Its OWN LiveState, never the pool
+                                        // monitor's. Sharing one was measured
+                                        // 2026-09-02: 27,085 pendingLogs events
+                                        // produced 37 applies and 584 continuity
+                                        // breaks, because preconfirmed and
+                                        // sealed delivery are two ORDERINGS of
+                                        // the same stream and LiveState has one
+                                        // global cursor demanding monotonic
+                                        // ordinals. Each break invalidates all
+                                        // 683 pools, so the fast path did not
+                                        // merely fail to help -- it destroyed
+                                        // the state the canonical path was
+                                        // maintaining, and candidates went to 0.
+                                        std::sync::Arc::new(
+                                            crate::live_state::LiveState::new(),
+                                        ),
+                                        std::sync::Arc::new(std::sync::Mutex::new(
+                                            std::collections::HashSet::new(),
+                                        )),
+                                        metrics.clone(),
+                                    )
+                                    .with_pool_tokens(fast_meta)
+                                    .with_sim_http(
+                                        &std::env::var("BASE_FLASHBLOCK_HTTP_URL")
+                                            .ok()
+                                            .unwrap_or_else(|| {
+                                                http_endpoints.first().cloned().unwrap_or_default()
+                                            }),
+                                    )
+                                    .with_ws_reconnect(ws_endpoints.clone(), ws_backoff),
+                                );
+                                info!(
+                                    pools = fast_pools.len(),
+                                    "base fast path enabled (pendingLogs)"
+                                );
+                                fast.clone().spawn();
+                                // The consumer. Without it the dirty set has a
+                                // writer and no reader: it climbed to 159 pools
+                                // and never fell in the previous run.
+                                // Index built from the SAME pools the feed
+                                // subscribes to, so a dirty pool always resolves
+                                // to a hop this index knows. Sharing the scan
+                                // loop's index instead would reintroduce the
+                                // two-writers problem in a different place: it
+                                // is rebuilt every scan from a different pool
+                                // set.
+                                let fast_uni = std::sync::Arc::new(
+                                    crate::cycle_index::PoolUniverse::from_pools(
+                                        fast_universe.clone(),
+                                    ),
+                                );
+                                let fast_index = crate::cycle_index::CycleIndex::build(
+                                    &fast_uni,
+                                    &fast_starts,
+                                    crate::cycle_index::CycleIndexLimits::default(),
+                                );
+                                info!(
+                                    cycles = fast_index.len(),
+                                    truncated = fast_index.truncated,
+                                    starts = fast_starts.len(),
+                                    "base fast path cycle index built"
+                                );
+                                // 32 discarded 98.2% of touched cycles: the
+                                // index is 6-hop (7,858 cycles), not the 2-hop
+                                // ~536 the cap was sized against, and it bound
+                                // on 85% of drains. Resolution costs 141us
+                                // median against a 200ms flashblock, so the
+                                // constraint was the cap, not the clock.
+                                let max_touched = crate::util::env_parse_opt::<usize>(
+                                    "ARBOT_BASE_FAST_MAX_CYCLES",
+                                )
+                                .filter(|v| *v > 0)
+                                .unwrap_or(512);
+                                base_fast_index =
+                                    Some(std::sync::Arc::new(std::sync::Mutex::new(Some(
+                                        fast_index,
+                                    ))));
+                                base_fast_drain =
+                                    Some((fast.clone(), fast_uni.clone(), max_touched));
+                            } else {
+                                warn!(
+                                    "ARBOT_BASE_FAST set but no CL pools to subscribe; \
+                                     pendingLogs with no address filter is every log on Base"
+                                );
+                            }
+                        }
                         monitor.with_live_state(live)
                     } else {
                         monitor
@@ -13528,6 +13713,20 @@ async fn launch_chain_runtime(
     };
 
     let runner = Runner::new(runner_config, executor);
+
+    // Now the runner exists, the fast path can read its published graph
+    // snapshot. Read-only: the runner is the sole writer, which is what makes
+    // this safe where sharing LiveState was not -- that had two writers and one
+    // global ordinal cursor, and cost 584 continuity breaks.
+    if let (Some((fast, uni, cap)), Some(index)) = (base_fast_drain, base_fast_index) {
+        fast.spawn_drain(
+            uni,
+            index,
+            runner.graph_snapshot(),
+            Duration::from_millis(200),
+            cap,
+        );
+    }
 
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
     let (status_tx, status_rx) =

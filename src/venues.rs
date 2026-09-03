@@ -4220,6 +4220,76 @@ pub struct PopulateResult {
     pub digest: EdgeDigest,
 }
 
+/// Outcome of repricing one edge whose pool moved.
+// No non-test caller until `process_base_flashblock` drives the requote; the
+// allow goes with it, as it did for base_fast.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepriceOutcome {
+    /// Pool did not move; the cached edge stands.
+    Reused,
+    /// Requoted successfully; the edge was replaced.
+    Replaced,
+    /// Requote failed. The edge is DEACTIVATED, not dropped and not left
+    /// standing: a stale quote that still reads `active` is how a dead pool
+    /// gets priced as if it were live.
+    Deactivated,
+}
+
+/// Edge indices whose pool is in `touched`.
+///
+/// The hot path exists to avoid rebuilding a 683-pool universe because one pool
+/// moved. An edge with no resolvable pool address — a bridge, a multi-hop path —
+/// is never selected, so it keeps its cached quote rather than being silently
+/// treated as fresh.
+#[allow(dead_code)]
+pub fn edges_touching(edges: &[Edge], touched: &HashSet<Address>) -> Vec<usize> {
+    edges
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match edge_pool_address(e) {
+            Some(pool) if touched.contains(&pool) => Some(i),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Apply one requote result to the cached edge set.
+///
+/// `Some(edge)` replaces; `None` means the quote failed and the cached edge is
+/// deactivated rather than kept. Leaving a failed pool active is worse than
+/// dropping the candidate: the searcher would price a cycle through a pool we
+/// could not read, and the failure would surface as a reverted trade instead of
+/// a skipped one.
+#[allow(dead_code)]
+pub fn apply_reprice(edges: &mut [Edge], index: usize, quoted: Option<Edge>) -> RepriceOutcome {
+    match (edges.get_mut(index), quoted) {
+        (Some(slot), Some(fresh)) => {
+            *slot = fresh;
+            RepriceOutcome::Replaced
+        }
+        (Some(slot), None) => {
+            slot.active = false;
+            RepriceOutcome::Deactivated
+        }
+        (None, _) => RepriceOutcome::Reused,
+    }
+}
+
+/// Mark every edge NOT touched as reusable, and report the split.
+///
+/// Returns `(to_requote, reused)`. The caller requotes only the first list; the
+/// second keeps its cached quote and its `quote_block`, so downstream staleness
+/// checks still apply to it. Nothing here mutates a reused edge — an edge that
+/// silently kept a fresh `quote_block` without being requoted would defeat
+/// `max_quote_block_lag`.
+#[allow(dead_code)]
+pub fn reprice_touched(edges: &[Edge], touched: &HashSet<Address>) -> (Vec<usize>, usize) {
+    let hot = edges_touching(edges, touched);
+    let reused = edges.len().saturating_sub(hot.len());
+    (hot, reused)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn populate_edges<C>(
     g: &mut Graph,
@@ -5186,6 +5256,90 @@ impl Drop for RpcEnvGuard {
 
         let other = anyhow::anyhow!("some other revert");
         assert!(!is_balancer_small_trade_error(&other));
+    }
+
+    fn v2_edge(pair: Address) -> Edge {
+        Edge {
+            from: Address::zero(),
+            to: Address::zero(),
+            rate_num: U256::one(),
+            rate_den: U256::one(),
+            venue: VenueEdge::UniV2 {
+                pair,
+                token_out: Address::zero(),
+                token0: Address::zero(),
+                token1: Address::zero(),
+                reserve_in: U256::from(1u64),
+                reserve_out: U256::from(1u64),
+                fee_bps: 30,
+            },
+            estimated_gas: 0,
+            weight: 0,
+            max_input: U256::from(1u64),
+            tolerance_bps: 0,
+            observed_slippage_bps: 0,
+            quote_block: Some(U64::from(100u64)),
+            active: true,
+            tick_ladder: None,
+        }
+    }
+
+    /// The whole point of the hot path: one pool moving must not requote the
+    /// other 682. The canonical loop rebuilt the universe every scan, which is
+    /// 1.71s of a 4.20s decision against a 200ms flashblock cadence.
+    #[test]
+    fn only_edges_on_a_moved_pool_are_requoted() {
+        let moved = Address::from_low_u64_be(1);
+        let edges = vec![
+            v2_edge(moved),
+            v2_edge(Address::from_low_u64_be(2)),
+            v2_edge(Address::from_low_u64_be(3)),
+        ];
+        let touched: HashSet<Address> = [moved].into_iter().collect();
+        let (hot, reused) = reprice_touched(&edges, &touched);
+        assert_eq!(hot, vec![0]);
+        assert_eq!(reused, 2, "untouched edges keep their cached quote");
+    }
+
+    /// A failed requote must DEACTIVATE, never leave the stale quote standing.
+    /// An edge we could not read but that still reads `active` gets priced as
+    /// if it were live, and the failure surfaces as a reverted trade instead of
+    /// a skipped candidate.
+    #[test]
+    fn a_failed_requote_deactivates_rather_than_keeping_a_stale_quote() {
+        let mut edges = vec![v2_edge(Address::from_low_u64_be(1))];
+        assert!(edges[0].active);
+        assert_eq!(apply_reprice(&mut edges, 0, None), RepriceOutcome::Deactivated);
+        assert!(
+            !edges[0].active,
+            "a pool we could not read must not stay priceable"
+        );
+    }
+
+    #[test]
+    fn a_successful_requote_replaces_the_cached_edge() {
+        let mut edges = vec![v2_edge(Address::from_low_u64_be(1))];
+        let mut fresh = v2_edge(Address::from_low_u64_be(1));
+        fresh.quote_block = Some(U64::from(200u64));
+        assert_eq!(
+            apply_reprice(&mut edges, 0, Some(fresh)),
+            RepriceOutcome::Replaced
+        );
+        assert_eq!(edges[0].quote_block, Some(U64::from(200u64)));
+    }
+
+    /// Reused edges must keep their ORIGINAL quote_block. Refreshing it without
+    /// requoting would make a stale edge look fresh and defeat
+    /// max_quote_block_lag entirely.
+    #[test]
+    fn reuse_does_not_forge_freshness() {
+        let edges = vec![v2_edge(Address::from_low_u64_be(2))];
+        let before = edges[0].quote_block;
+        let touched: HashSet<Address> = [Address::from_low_u64_be(1)].into_iter().collect();
+        let (hot, reused) = reprice_touched(&edges, &touched);
+        assert!(hot.is_empty());
+        assert_eq!(reused, 1);
+        assert_eq!(edges[0].quote_block, before, "reuse must not touch the edge");
     }
 
     #[test]
