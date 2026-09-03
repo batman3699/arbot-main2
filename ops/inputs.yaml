@@ -150,6 +150,14 @@ chains:
   rpc_http_urls:
   - https://base.blockpi.network/v1/rpc/${BLOCKPI_KEY}
   - https://base-rpc.publicnode.com
+  # Free public endpoints, rotated when the paid one is exhausted or rate
+  # limited. Verified 2026-09-04 answering real quoter eth_calls at head.
+  # They are slower (~350ms vs ~250ms) and rate limit individually, which the
+  # rotation absorbs -- adequate for measurement, NOT for live execution.
+  - https://mainnet.base.org
+  - https://base.gateway.tenderly.co
+  - https://1rpc.io/base
+  - https://base-mainnet.public.blastapi.io
   rpc_ws_urls:
   - wss://base.blockpi.network/v1/ws/${BLOCKPI_KEY}
   gas_model: op_stack

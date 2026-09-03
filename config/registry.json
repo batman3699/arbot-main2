@@ -138,7 +138,11 @@
       "chain_id": 8453,
       "rpc_http": [
         "https://base.blockpi.network/v1/rpc/${BLOCKPI_KEY}",
-        "https://base-rpc.publicnode.com"
+        "https://base-rpc.publicnode.com",
+        "https://mainnet.base.org",
+        "https://base.gateway.tenderly.co",
+        "https://1rpc.io/base",
+        "https://base-mainnet.public.blastapi.io"
       ],
       "rpc_ws": [
         "wss://base.blockpi.network/v1/ws/${BLOCKPI_KEY}"
