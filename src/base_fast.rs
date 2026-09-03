@@ -2876,11 +2876,21 @@ impl BaseFastPath {
                             "census cohort selected from the structural index"
                         );
                     }
+                    // ROTATE, do not consume. A route only yields rows if the
+                    // live state happens to be trusted when its turn comes, and
+                    // that state is repeatedly invalidated: measured 85
+                    // `continuity broken ... reason=WsUnavailable` events in one
+                    // run, coverage flapping 99 -> 0 -> 94 -> 99 -> 5 -> 99.
+                    // Draining destructively burned the whole 300-route cohort
+                    // through the broken windows in the first seconds and left
+                    // nothing to sweep for the remaining forty minutes.
+                    //
+                    // Taking from the front and pushing to the back retries
+                    // every route until it lands. Repeats are harmless: the rows
+                    // carry the route, so the analysis deduplicates.
                     let take = census_queue.len().min(FAST_PATH_RANKED);
-                    let batch: Vec<CensusRoute> = census_queue.drain(..take).collect();
-                    if batch.is_empty() {
-                        info!("census cohort exhausted; no further routes to sweep");
-                    }
+                    let batch: Vec<CensusRoute> = census_queue[..take].to_vec();
+                    census_queue.rotate_left(take);
                     priced = batch
                         .into_iter()
                         .map(|r| PricedCycle {
