@@ -798,6 +798,30 @@ where
     pub bal_quote: &'a BalQuote<C>,
     pub curve_quote: &'a CurveQuote<C>,
     pub block_number: U64,
+    /// What the fast path's LOCAL pricing claimed for this cycle, in bps.
+    ///
+    /// Diagnostic only -- never read by the search. It exists so a refusal can
+    /// be paired with the claim that produced it: local pricing and the quoter
+    /// disagreeing is the open question, and a refusal that does not carry the
+    /// claim it contradicts cannot answer it. `NaN` from the scan path, which
+    /// has no such claim.
+    pub local_gross_bps: f64,
+}
+
+/// `out/in - 1` in basis points, as an f64, for diagnostics only.
+///
+/// U256 has no fractional part, so the ratio is taken after converting to f64
+/// rather than before: `out * 10_000 / amount` in integer arithmetic would
+/// truncate every sub-basis-point difference to zero.
+fn u256_ratio_bps(out: U256, amount: U256) -> f64 {
+    let (o, a) = (
+        out.to_string().parse::<f64>().unwrap_or(f64::NAN),
+        amount.to_string().parse::<f64>().unwrap_or(f64::NAN),
+    );
+    if !(a.is_finite() && a > 0.0) {
+        return f64::NAN;
+    }
+    (o / a - 1.0) * 10_000.0
 }
 
 pub async fn optimize_trade_size<C>(params: OptimizeTradeParams<'_, C>) -> Option<SizingResult>
@@ -908,7 +932,14 @@ where
             )
             .await?;
             if out <= amount {
-                debug!(?amount, ?out, "rejecting candidate: cycle output <= input");
+                let quoted_bps = u256_ratio_bps(out, amount);
+                debug!(
+                    ?amount, ?out, quoted_bps,
+                    local_gross_bps = params.local_gross_bps,
+                    disagreement_bps = params.local_gross_bps - quoted_bps,
+                    hops = params.edges.len(),
+                    "rejecting candidate: cycle output <= input"
+                );
                 return None;
             }
             let gross = out.saturating_sub(amount);
@@ -981,7 +1012,14 @@ where
             )
             .await?;
             if out <= candidate {
-                debug!(?candidate, ?out, "rejecting newton candidate: cycle output <= input");
+                let quoted_bps = u256_ratio_bps(out, candidate);
+                debug!(
+                    ?candidate, ?out, quoted_bps,
+                    local_gross_bps = params.local_gross_bps,
+                    disagreement_bps = params.local_gross_bps - quoted_bps,
+                    hops = params.edges.len(),
+                    "rejecting newton candidate: cycle output <= input"
+                );
                 return None;
             }
             let gross = out.saturating_sub(candidate);
@@ -1106,6 +1144,7 @@ mod tests {
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number: U64::zero(),
+            local_gross_bps: f64::NAN,
         })
         .await
         .unwrap();
@@ -1160,6 +1199,7 @@ mod tests {
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number: U64::zero(),
+            local_gross_bps: f64::NAN,
         })
         .await
         .unwrap();
@@ -1205,6 +1245,7 @@ mod tests {
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number: U64::zero(),
+            local_gross_bps: f64::NAN,
         })
         .await;
 

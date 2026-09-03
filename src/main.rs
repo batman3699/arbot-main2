@@ -1679,6 +1679,9 @@ struct CandidatePrepCtx<'a> {
     executor_address: Address,
     block_number: U64,
     edges_scanned: usize,
+    /// The fast path's local gross for this cycle, in bps; `NaN` from the scan.
+    /// Diagnostic only -- see `OptimizeTradeParams::local_gross_bps`.
+    local_gross_bps: f64,
 }
 
 /// Result of the RPC-heavy candidate preparation stage (validation, flash
@@ -6197,6 +6200,7 @@ where
             bal_quote: self.bal_quote.as_ref(),
             curve_quote: self.curve_quote.as_ref(),
             block_number: ctx.block_number,
+            local_gross_bps: ctx.local_gross_bps,
         })
         .await
         else {
@@ -7264,6 +7268,9 @@ where
             executor_address,
             block_number,
             edges_scanned,
+            // The scan prices through the graph, not the fast path, so it has
+            // no local claim to contradict.
+            local_gross_bps: f64::NAN,
         };
         // Native value per raw token unit, for readers ranking across tokens.
         // Unreliable entries are dropped rather than defaulted: NativePrice's
@@ -14247,7 +14254,10 @@ async fn launch_chain_runtime(
                         // path did not scan edges, and claiming a number here
                         // would put a fiction in the candidate record.
                         edges_scanned: 0,
+                        // Set per candidate in the loop below.
+                        local_gross_bps: f64::NAN,
                     };
+                    let mut ctx = ctx;
                     for (priced, indexed) in ready.into_iter().take(prepare_top) {
                         // LATENCY DECAY. The same cycle, the same pools, priced
                         // again from current state immediately before the
@@ -14273,6 +14283,11 @@ async fn launch_chain_runtime(
                             hops = priced.hops,
                             "edge decay between detection and sizing"
                         );
+                        // Pair the sizer's verdict with the claim that produced
+                        // it. A refusal alone says the cycle is unprofitable; a
+                        // refusal carrying the local gross says by how much the
+                        // two models disagree, which is the open question.
+                        ctx.local_gross_bps = priced.gross_bps;
                         match runner.prepare_candidate(&graph, indexed, &ctx).await {
                             CandidatePrep::Sized(sized) => {
                                 report.sized += 1;
@@ -16274,6 +16289,7 @@ chains:
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number,
+            local_gross_bps: f64::NAN,
         })
         .await
         .expect("expected non-zero profitable size");
