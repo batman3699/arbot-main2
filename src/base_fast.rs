@@ -1038,26 +1038,36 @@ pub fn rotate_to_fundable(tokens: &[Address], fundable: &HashSet<Address>) -> Op
 /// 82x, 627 at 510x -- because a gross measured at 0.1 native was being
 /// multiplied by a notional up to 2000x larger.
 ///
-/// `quote_of` takes the input size in raw units of `from`. A zero means "price
-/// at the margin" and is what pass one passes when the probe is unavailable.
+/// Pass two PINS pass one's route rather than choosing again. Re-selecting at
+/// the new size mixes two routes into one answer: pass one's notional bounds
+/// the pools pass one picked, and reporting it beside a gross measured on
+/// different pools is the same category of error in a new place. Measured when
+/// pass two was allowed to re-select, `best_gross_bps` p50 fell 20.2 -> 9.2 as
+/// intended but p90 ROSE 31.2 -> 45.6, and ranking takes the maximum.
+///
+/// Pool CHOICE therefore stays with pass one, where the probe already makes it
+/// impact-aware; pass two only re-prices what pass one chose.
 pub fn price_cycle_sized<F>(tokens: &[Address], quote_of: F) -> Option<SizedCycle>
 where
-    F: Fn(Address, Address, f64) -> Option<HopQuote>,
+    F: Fn(HopAsk) -> Option<HopQuote>,
 {
     if tokens.len() < 2 {
         return None;
     }
     // Pass one: the probe. `0.0` lets the closure choose its own reference
     // size, which is what it did before this was two-pass.
-    let first = walk_cycle(tokens, |from, to, _| quote_of(from, to, 0.0))?;
+    let first = walk_cycle(tokens, None, |ask| quote_of(HopAsk { size: 0.0, ..ask }))?;
 
-    // Pass two: re-price each hop at the amount `first.notional_in` actually
-    // delivers to it. `carry` is the running product, so the input to hop `i`
-    // is `notional * carry` in raw units of that hop's input token.
+    // Pass two: the SAME pools, re-priced at the amount `first.notional_in`
+    // actually delivers to each. `carry` is the running product, so the input
+    // to hop `i` is `notional * carry` in raw units of that hop's input token.
     let notional = first.notional_in;
-    let second = walk_cycle(tokens, |from, to, carry| {
-        let size = notional * carry;
-        quote_of(from, to, if size.is_finite() && size > 0.0 { size } else { 0.0 })
+    let second = walk_cycle(tokens, Some(&first.pools), |ask| {
+        let size = notional * ask.size;
+        quote_of(HopAsk {
+            size: if size.is_finite() && size > 0.0 { size } else { 0.0 },
+            ..ask
+        })
     });
 
     match second {
@@ -1077,22 +1087,41 @@ where
     }
 }
 
+/// One hop's pricing request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HopAsk {
+    pub from: Address,
+    pub to: Address,
+    /// Input size in raw units of `from`. Zero means "price at the probe".
+    ///
+    /// On the way IN to `walk_cycle`'s closure this carries the running product
+    /// of rates before the hop, which a caller pricing at size multiplies by
+    /// the notional; on the way out to `quote_of` it is the size itself.
+    pub size: f64,
+    /// Price THIS pool rather than the best one serving the pair.
+    pub pin: Option<Address>,
+}
+
 /// One walk of a cycle: rates in, gross and capacity bound out.
 ///
-/// `quote_of` receives the running product of rates BEFORE each hop, so a
-/// caller that wants to price at size can convert it into that hop's input
-/// amount. It is 1.0 at the first hop.
-fn walk_cycle<F>(tokens: &[Address], quote_of: F) -> Option<SizedCycle>
+/// `pins`, when given, fixes the pool for each hop so the walk re-prices a
+/// known route instead of choosing a new one.
+fn walk_cycle<F>(tokens: &[Address], pins: Option<&[Address]>, quote_of: F) -> Option<SizedCycle>
 where
-    F: Fn(Address, Address, f64) -> Option<HopQuote>,
+    F: Fn(HopAsk) -> Option<HopQuote>,
 {
+    if let Some(p) = pins {
+        if p.len() != tokens.len() {
+            return None;
+        }
+    }
     let mut product = 1.0f64;
     let mut notional = f64::INFINITY;
     let mut pools = Vec::with_capacity(tokens.len());
     for i in 0..tokens.len() {
         let from = tokens[i];
         let to = tokens[(i + 1) % tokens.len()];
-        let q = quote_of(from, to, product)?;
+        let q = quote_of(HopAsk { from, to, size: product, pin: pins.map(|p| p[i]) })?;
         pools.push(q.pool);
         if !q.den.is_finite() || !q.num.is_finite() || q.den <= 0.0 {
             return None;
@@ -1217,7 +1246,7 @@ pub fn price_touched<F>(
     top_n: usize,
 ) -> (Vec<PricedCycle>, usize, RankBasis)
 where
-    F: Fn(Address, Address, f64) -> Option<HopQuote>,
+    F: Fn(HopAsk) -> Option<HopQuote>,
 {
     let mut priced = Vec::with_capacity(ids.len().min(top_n * 4));
     let mut unpriceable = 0usize;
@@ -2535,15 +2564,23 @@ impl BaseFastPath {
                 let (priced, unpriceable, basis) = price_touched(
                     &idx,
                     &out.cycles,
-                    |from, to, size| {
+                    |ask: HopAsk| {
+                        // A pinned hop is re-priced on exactly that pool, so
+                        // the candidate slice is the pin itself.
+                        let pinned = ask.pin.map(|p| [p]);
+                        let candidates: &[Address] = match pinned {
+                            Some(ref one) => one,
+                            None => universe.pools_for_hop(ask.from, ask.to),
+                        };
                         hop_quote_from_live(
                             &self.live,
-                            universe.pools_for_hop(from, to),
+                            candidates,
                             &self.pool_tokens,
-                            from,
-                            to,
+                            ask.from,
+                            ask.to,
                             PricingCtx {
-                                size_in: (size.is_finite() && size > 0.0).then_some(size),
+                                size_in: (ask.size.is_finite() && ask.size > 0.0)
+                                    .then_some(ask.size),
                                 ..ctx
                             },
                         )
@@ -3329,7 +3366,7 @@ mod tests {
         let ids: Vec<_> = (0..index.len() as u32).collect();
 
         // No rates at all: everything is unpriceable, nothing is "unprofitable".
-        let (priced, unpriceable, basis) = price_touched(&index, &ids, |_, _, _| None, None, &all_fundable(&index, &ids), 8);
+        let (priced, unpriceable, basis) = price_touched(&index, &ids, |_: HopAsk| None, None, &all_fundable(&index, &ids), 8);
         assert!(priced.is_empty());
         assert_eq!(unpriceable, ids.len());
         assert_eq!(basis, RankBasis::Bps, "nothing priced, so nothing valued");
@@ -4151,13 +4188,13 @@ mod tests {
     fn a_deep_thin_edge_outranks_a_shallow_fat_one() {
         let q = |num: f64, cap: f64| Some(HopQuote { pool: Address::zero(), num, den: 1.0, cap_out: cap });
         // 100 bps round trip, but the pool can only pay out 100 units.
-        let dust = price_cycle_sized(&[addr(1), addr(2)], |from, _, _| {
-            if from == addr(1) { q(1.01, 100.0) } else { q(1.0, 100.0) }
+        let dust = price_cycle_sized(&[addr(1), addr(2)], |a: HopAsk| {
+            if a.from == addr(1) { q(1.01, 100.0) } else { q(1.0, 100.0) }
         })
         .expect("priced");
         // 10 bps round trip through a pool holding 100 million units.
-        let deep = price_cycle_sized(&[addr(1), addr(2)], |from, _, _| {
-            if from == addr(1) { q(1.001, 100_000_000.0) } else { q(1.0, 100_000_000.0) }
+        let deep = price_cycle_sized(&[addr(1), addr(2)], |a: HopAsk| {
+            if a.from == addr(1) { q(1.001, 100_000_000.0) } else { q(1.0, 100_000_000.0) }
         })
         .expect("priced");
 
@@ -4178,8 +4215,8 @@ mod tests {
     fn the_binding_hop_is_the_one_that_runs_out_first() {
         // Hop 1 multiplies by 1000, so hop 2's 1000 units of headroom are
         // reached by an input of only 1.
-        let sized = price_cycle_sized(&[addr(1), addr(2)], |from, _, _| {
-            if from == addr(1) {
+        let sized = price_cycle_sized(&[addr(1), addr(2)], |a: HopAsk| {
+            if a.from == addr(1) {
                 Some(HopQuote { pool: Address::zero(), num: 1000.0, den: 1.0, cap_out: 1_000.0 })
             } else {
                 Some(HopQuote { pool: Address::zero(), num: 0.001, den: 1.0, cap_out: 1e12 })
@@ -4199,7 +4236,7 @@ mod tests {
     /// infinity would put it above every real opportunity forever.
     #[test]
     fn a_cycle_with_no_known_depth_is_refused_not_ranked_first() {
-        let out = price_cycle_sized(&[addr(1), addr(2)], |_, _, _| {
+        let out = price_cycle_sized(&[addr(1), addr(2)], |_: HopAsk| {
             Some(HopQuote { pool: Address::zero(), num: 2.0, den: 1.0, cap_out: f64::INFINITY })
         });
         assert!(out.is_none(), "unbounded must not mean unbeatable");
@@ -4217,7 +4254,7 @@ mod tests {
         ]);
         let idx = CycleIndex::build(&uni, &[t1], CycleIndexLimits::default());
         let ids: Vec<_> = (0..idx.len() as u32).collect();
-        let quote = |_: Address, _: Address, _: f64| {
+        let quote = |_: HopAsk| {
             Some(HopQuote { pool: Address::zero(), num: 1.05, den: 1.0, cap_out: 1_000_000.0 })
         };
 
@@ -4918,18 +4955,26 @@ mod tests {
                        cap_out: r_out }
         };
         let seen = std::cell::RefCell::new(Vec::new());
-        let sized = price_cycle_sized(&[t0, t1], |from, _to, size| {
-            seen.borrow_mut().push(size);
+        let sized = price_cycle_sized(&[t0, t1], |a: HopAsk| {
+            seen.borrow_mut().push((a.size, a.pin));
             // A round trip that is profitable at zero size and loses at scale.
-            Some(if from == t0 {
-                quote_at(size, 1_000.0, 2_020.0)
+            Some(if a.from == t0 {
+                quote_at(a.size, 1_000.0, 2_020.0)
             } else {
-                quote_at(size, 2_000.0, 1_000.0)
+                quote_at(a.size, 2_000.0, 1_000.0)
             })
         })
         .expect("prices");
 
-        let sizes = seen.into_inner();
+        let asks = seen.into_inner();
+        // Pass one chooses, pass two re-prices what it chose. Letting pass two
+        // choose again mixes one route's notional with another's gross.
+        assert!(asks[..2].iter().all(|(_, pin)| pin.is_none()), "pass one is free");
+        assert!(
+            asks[2..].iter().all(|(_, pin)| *pin == Some(addr(10))),
+            "pass two must pin pass one's pools: {asks:?}"
+        );
+        let sizes: Vec<f64> = asks.iter().map(|(s, _)| *s).collect();
         assert_eq!(sizes.len(), 4, "two passes over two hops: {sizes:?}");
         assert_eq!(&sizes[..2], &[0.0, 0.0], "pass one prices at the probe");
         assert!(sizes[2] > 0.0, "pass two prices hop 0 at the notional");
@@ -4943,8 +4988,8 @@ mod tests {
 
         // The same walk priced ONLY at the margin is the old behaviour, and it
         // is the optimistic one. That gap is the defect being removed.
-        let marginal = walk_cycle(&[t0, t1], |from, _to, _| {
-            Some(if from == t0 {
+        let marginal = walk_cycle(&[t0, t1], None, |a: HopAsk| {
+            Some(if a.from == t0 {
                 quote_at(0.0, 1_000.0, 2_020.0)
             } else {
                 quote_at(0.0, 2_000.0, 1_000.0)
@@ -4969,9 +5014,9 @@ mod tests {
     #[test]
     fn a_cycle_that_will_not_price_at_its_own_size_is_refused() {
         let (t0, t1) = (addr(1), addr(2));
-        let out = price_cycle_sized(&[t0, t1], |_from, _to, size| {
+        let out = price_cycle_sized(&[t0, t1], |a: HopAsk| {
             // Quotes at the probe, refuses at any real size.
-            (size == 0.0).then_some(HopQuote {
+            (a.size == 0.0).then_some(HopQuote {
                 pool: addr(10), num: 1_010.0, den: 1_000.0, cap_out: 5_000.0,
             })
         });
