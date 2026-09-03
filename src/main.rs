@@ -1134,6 +1134,17 @@ fn venue_quoter_by_name(
     venue.quoter.as_ref()?.parse().ok()
 }
 
+/// Gas limit for the preconfirmed simulation: generous, never the estimate.
+///
+/// A simulation is a question about whether the plan is VALID. Asking it under
+/// the plan's own tight budget answers a different question, and answers it
+/// with a selector that looks like a plan defect.
+fn preconf_sim_gas(estimated: u64) -> u64 {
+    const FLOOR: u64 = 4_000_000;
+    const CEILING: u64 = 30_000_000;
+    estimated.saturating_mul(4).clamp(FLOOR, CEILING)
+}
+
 fn venue_factory_by_name(
     ops_inputs: &crate::ops_inputs::OpsInputs,
     chain_name: &str,
@@ -10519,6 +10530,28 @@ mod runner_tests {
         );
     }
 
+    /// A simulation run at the plan's own budget reports the budget.
+    ///
+    /// Out-of-gas returns EMPTY revert data, which the executor turns into
+    /// `InvalidGenericAction()` (0xf19db938) -- indistinguishable from a real
+    /// plan defect. Measured 2026-09-04: a 2-hop plan simulated at its 280k
+    /// estimate consumed 263,594 and reverted with exactly that selector.
+    /// HANDOFF.md records the same signature from replayed calldata, with the
+    /// real router error only appearing above 4M.
+    #[test]
+    fn the_simulation_gets_headroom_not_the_estimate() {
+        // The measured case: 280k estimate must not simulate at 280k.
+        assert!(preconf_sim_gas(280_000) > 280_000);
+        // and must clear the 4M threshold where real errors start appearing.
+        assert!(preconf_sim_gas(280_000) >= 4_000_000);
+        // A large plan scales past the floor rather than being clamped to it.
+        assert_eq!(preconf_sim_gas(2_000_000), 8_000_000);
+        // But never past a block's worth.
+        assert_eq!(preconf_sim_gas(u64::MAX), 30_000_000);
+        // A zero estimate still gets a usable budget rather than zero.
+        assert_eq!(preconf_sim_gas(0), 4_000_000);
+    }
+
     /// The path's int24 field selects the factory, and a bare tick spacing
     /// picks the wrong one.
     ///
@@ -14417,7 +14450,31 @@ async fn launch_chain_runtime(
                                             to,
                                             &data,
                                             max_fee,
-                                            sized.adjusted_cycle_gas,
+                                            // HEADROOM, not the estimate. The
+                                            // per-hop figure is 140k, so a
+                                            // 2-hop plan simulates at 280k and
+                                            // dies at 263,594 used -- and an
+                                            // out-of-gas returns EMPTY revert
+                                            // data, which the executor turns
+                                            // into `InvalidGenericAction()`
+                                            // (0xf19db938). Measured
+                                            // 2026-09-04, and HANDOFF.md
+                                            // records the same signature from
+                                            // replayed calldata: 450k/3M ->
+                                            // 0xf19db938, 4M+ -> the real
+                                            // router error. Simulating at the
+                                            // estimate therefore reports the
+                                            // BUDGET as the plan's verdict and
+                                            // hides every actual defect behind
+                                            // one selector.
+                                            //
+                                            // The simulation is free and does
+                                            // not spend the limit it is given,
+                                            // so it is given room. `sim_gas`
+                                            // then reports what the plan really
+                                            // costs, which is the number a
+                                            // broadcast should be sized from.
+                                            preconf_sim_gas(sized.adjusted_cycle_gas),
                                         )
                                         .await
                                     {
