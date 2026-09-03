@@ -539,8 +539,23 @@ where
     let mut current_quote: Option<QuoteValue> = None;
     let mut fallback: Option<QuoteValue> = None;
 
+    let mut attempted = 0usize;
+    let mut refused = 0usize;
     for sample in samples {
-        let quote = quote_edge_amount(edge, sample, block, ctx).await?;
+        attempted += 1;
+        // A sample that will not quote is SKIPPED, not fatal. The grid probes
+        // up to 4x the base amount deliberately, so the largest sizes are
+        // expected to exceed what some pools can fill -- that is what the
+        // search is for. Aborting the hop on the first refusal threw away every
+        // size that DID quote, and `current_quote`/`fallback` below exist
+        // precisely to tolerate a partial grid; the `?` here meant they were
+        // never reached. Measured 2026-09-03: a Slipstream pool refused a 124
+        // WETH probe and the hop was declared unquotable, which is then
+        // recorded as no_profitable_size.
+        let Some(quote) = quote_edge_amount(edge, sample, block, ctx).await else {
+            refused += 1;
+            continue;
+        };
         if fallback.is_none() {
             fallback = Some(quote.clone());
         }
@@ -551,7 +566,19 @@ where
         max_slippage = max_slippage.max(quote.slippage_bps);
     }
 
-    let quote = current_quote.or(fallback)?;
+    // Only a grid where NOTHING quoted is unquotable.
+    let Some(quote) = current_quote.or(fallback) else {
+        if refused > 0 {
+            debug!(
+                target: "arb_exec::latency",
+                attempted,
+                refused,
+                venue = venue_kind(edge),
+                "every size in the grid was refused"
+            );
+        }
+        return None;
+    };
     let curvature_bps = max_slippage.saturating_sub(min_slippage);
     Some((quote, curvature_bps))
 }
