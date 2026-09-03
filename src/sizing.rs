@@ -1086,9 +1086,102 @@ where
         }
     }
 
+    // FORCED ATTEMPT. Off unless `ARBOT_FORCE_ATTEMPT=1`.
+    //
+    // Every sizing refusal measured so far is `cycle output <= input`, so the
+    // search has never once returned a size and the whole path beyond it --
+    // plan construction, router encoding, the flash-loan callback, gas
+    // estimation, dispatch -- has never executed. An unprofitable trade that
+    // is BUILT and rejected on chain tells us more about that path than
+    // another profitable-trade hunt that never reaches it.
+    //
+    // Sized at `min_amount`, the smallest legal notional, from the real quote
+    // at that size. Nothing here fabricates a profit: `net_after_fee_and_gas`
+    // is zero, so the caller's own `net_profit < min_profit` gate still sees an
+    // unprofitable trade and every downstream check runs on true numbers.
+    if result.is_none() && force_attempt() {
+        let allocations = match best_single_provider(params.min_amount, params.quotes) {
+            Some(selection) => vec![selection],
+            None => {
+                warn!("forced attempt: no flash loan provider at min_amount");
+                return None;
+            }
+        };
+        let quoted = simulate_cycle_with_quotes(
+            params.min_amount,
+            params.edges,
+            params.block_number,
+            &QuoteContext {
+                quoter: params.quoter,
+                slipstream_quoter: params.slipstream_quoter,
+                pancakeswap_quoter: params.pancakeswap_quoter,
+                pancakeswap_pools: params.pancakeswap_pools,
+                slipstream_quoters: params.slipstream_quoters,
+                bal_quote: params.bal_quote,
+                curve_quote: params.curve_quote,
+                cache: quote_cache.as_ref(),
+                quote_count: quote_count_total.as_ref(),
+            },
+        )
+        .await;
+        let (out, max_slippage_bps) = match quoted {
+            Some(v) => v,
+            None => {
+                warn!("forced attempt: the cycle would not quote at min_amount");
+                return None;
+            }
+        };
+        let fee = allocations.iter().fold(U256::zero(), |acc, alloc| {
+            acc.saturating_add(flash_fee_for_provider(
+                alloc.provider,
+                alloc.amount,
+                alloc.fee_bps,
+            ))
+        });
+        warn!(
+            amount_in = ?params.min_amount,
+            ?out,
+            ?gas_cost,
+            ?fee,
+            "FORCED ATTEMPT: sizing an unprofitable cycle to exercise the \
+             execution path. This is expected to revert."
+        );
+        return Some(SizingResult {
+            amount_in: params.min_amount,
+            allocations,
+            gross: out.saturating_sub(params.min_amount),
+            flash_fee: fee,
+            max_slippage_bps,
+            net_after_fee_and_gas: U256::zero(),
+            quote_count: quote_count_total.load(Ordering::Relaxed),
+        });
+    }
+
     result.map(|result| SizingResult {
         quote_count: quote_count_total.load(Ordering::Relaxed),
         ..result
+    })
+}
+
+/// Whether to size a cycle the search rejected, so the execution path runs.
+///
+/// Read once. This is an operator switch for a deliberate, loss-making probe
+/// of the pipeline, never a trading mode: it sizes at the smallest legal
+/// notional and reports zero net profit, so nothing downstream mistakes the
+/// result for an opportunity.
+fn force_attempt() -> bool {
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE.get_or_init(|| {
+        let on = std::env::var("ARBOT_FORCE_ATTEMPT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if on {
+            warn!(
+                "ARBOT_FORCE_ATTEMPT is set: unprofitable cycles will be sized at \
+                 the minimum notional to exercise the execution path"
+            );
+        }
+        on
     })
 }
 
