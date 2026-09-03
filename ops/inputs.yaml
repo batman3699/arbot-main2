@@ -160,6 +160,10 @@ chains:
   - https://base-mainnet.public.blastapi.io
   rpc_ws_urls:
   - wss://base.blockpi.network/v1/ws/${BLOCKPI_KEY}
+  # The only free Base endpoint that answers a websocket upgrade. The fast
+  # path's `pendingLogs` feed drives the touched set, and without it the drain
+  # never fires -- which is what silently produced a census with zero rows.
+  - wss://base-rpc.publicnode.com
   gas_model: op_stack
   executor_address: '0xDbFB219b4F1CE08fA61C5cD3c08C1307760cAec6'
   executor_owner: '0xD7A4D612E572B5877b0E2fC7cE8683e36360f04c'

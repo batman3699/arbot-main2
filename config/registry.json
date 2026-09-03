@@ -145,7 +145,8 @@
         "https://base-mainnet.public.blastapi.io"
       ],
       "rpc_ws": [
-        "wss://base.blockpi.network/v1/ws/${BLOCKPI_KEY}"
+        "wss://base.blockpi.network/v1/ws/${BLOCKPI_KEY}",
+        "wss://base-rpc.publicnode.com"
       ],
       "tokens": [
         "0x4200000000000000000000000000000000000006",
