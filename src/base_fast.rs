@@ -1840,7 +1840,23 @@ pub fn simulate_v1_params(
                     // magnitude below Base's block limit.
                     "gas": format!("{gas_limit:#x}"),
                 }],
-                "stateOverrides": {},
+                // Fund the SENDER for the duration of the simulation.
+                //
+                // `validation: true` checks balance >= gas * maxFeePerGas, and
+                // that check is about the wallet, not about the plan. Measured
+                // 2026-09-04 it stopped the simulation twice for two different
+                // reasons that were both solvency: at the block gas limit it
+                // wanted 0.402278 ETH, and at a 4M diagnostic limit 0.004020,
+                // against 0.001506 held. Neither number came from the trade.
+                //
+                // The override makes this a question about whether the plan
+                // executes. Whether the wallet can pay for it is a real and
+                // separate constraint -- it currently cannot at 4M -- and
+                // belongs to the broadcast decision, on the gas the simulation
+                // reports rather than on a diagnostic ceiling.
+                "stateOverrides": {
+                    format!("{from:#x}"): { "balance": "0xde0b6b3a7640000" },
+                },
             }],
             "validation": true,
             "traceTransfers": false,
@@ -3242,6 +3258,12 @@ mod tests {
         assert_eq!(u64::from_str_radix(
             call["gas"].as_str().unwrap().trim_start_matches("0x"), 16
         ).unwrap(), 420_000);
+        // The sender is funded for the simulation, or `validation: true`
+        // answers a question about the wallet instead of about the plan.
+        // Measured 2026-09-04 it refused twice on solvency alone, wanting
+        // 0.402278 ETH and then 0.004020 against 0.001506 held.
+        let ov = &p[0]["blockStateCalls"][0]["stateOverrides"];
+        assert_eq!(ov[format!("{:#x}", addr(1))]["balance"], "0xde0b6b3a7640000");
     }
 
     #[test]
