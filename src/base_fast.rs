@@ -728,6 +728,17 @@ pub fn hop_quote_from_live(
     ctx: PricingCtx<'_>,
 ) -> Option<HopQuote> {
     let reference_in = ctx.reference_in(from);
+    // A hop whose input token has no price is priced at the margin, which
+    // means it contributes NO slippage to the cycle. That is invisible in the
+    // gross and is exactly where a thin pool hides.
+    if ctx.ref_native > 0.0 {
+        use std::sync::atomic::Ordering::Relaxed;
+        if reference_in > 0.0 {
+            crate::util::FAST_HOPS_AT_SIZE.fetch_add(1, Relaxed);
+        } else {
+            crate::util::FAST_HOPS_AT_MARGIN.fetch_add(1, Relaxed);
+        }
+    }
     let mut best: Option<HopQuote> = None;
     let mut best_rate = f64::NEG_INFINITY;
     for pool in candidate_pools {
@@ -2587,6 +2598,13 @@ impl BaseFastPath {
                         crate::util::GRID_HOPS_INTACT.load(Ordering::Relaxed),
                     grid_hops_single =
                         crate::util::GRID_HOPS_SINGLE_SAMPLE.load(Ordering::Relaxed),
+                    // Hops priced at the margin carry no slippage into the
+                    // gross, so a cycle containing one reports an upper bound
+                    // on its profit rather than an estimate of it.
+                    hops_at_size =
+                        crate::util::FAST_HOPS_AT_SIZE.load(Ordering::Relaxed),
+                    hops_at_margin =
+                        crate::util::FAST_HOPS_AT_MARGIN.load(Ordering::Relaxed),
                     sim_ok = sim_ok.load(Ordering::Relaxed),
                     sim_failed = sim_failed.load(Ordering::Relaxed),
                     mean_sim_us = sim_micros.load(Ordering::Relaxed)

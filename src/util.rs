@@ -770,6 +770,13 @@ pub static GRID_SAMPLES_REFUSED: std::sync::atomic::AtomicUsize = std::sync::ato
 pub static GRID_HOPS_SINGLE_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Hops that quoted on a full grid, nothing refused.
 pub static GRID_HOPS_INTACT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Fast-path hops priced WITH an impact term, i.e. the input token had a price.
+pub static FAST_HOPS_AT_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Fast-path hops priced at the MARGIN because the input token had no price.
+///
+/// A marginal hop contributes zero slippage to the cycle's gross, so a cycle
+/// containing one is an upper bound on its own profit, not an estimate.
+pub static FAST_HOPS_AT_MARGIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(test)]
 mod tests {
