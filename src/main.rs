@@ -161,6 +161,21 @@ abigen!(
     ]"#
 );
 
+/// Gas the transaction spends OUTSIDE its swaps: the flash-loan borrow and
+/// repay, and the executor's own dispatch.
+///
+/// The cycle estimate used to be the sum of per-hop swap costs and nothing
+/// else, so it omitted this entirely. Measured 2026-09-04 by simulation, a
+/// 2-hop cycle really costs 453,112 gas against a 280,000 estimate -- the
+/// difference is this, and it is charged once per transaction rather than per
+/// hop.
+///
+/// The measurement is a LOWER BOUND: those simulations reverted on a swap's
+/// min-out ("Too little received"), so execution stopped early and a fully
+/// settling trade costs at least this much. Erring high is the safe direction
+/// for both a gas limit and a profitability floor.
+const FLASH_LOAN_EXECUTOR_GAS: u64 = 175_000;
+
 const JIT_PRESWAP_ESTIMATED_GAS: u64 = 160_000;
 const JIT_LP_ADD_ESTIMATED_GAS: u64 = 260_000;
 const JIT_LP_REMOVE_ESTIMATED_GAS: u64 = 220_000;
@@ -6191,7 +6206,13 @@ where
             }
         };
 
-        let mut adjusted_cycle_gas = estimated_cycle_gas;
+        // Charged ONCE, not per hop: the loan and the executor dispatch happen
+        // a single time however many swaps sit between them. Measured 2026-09-04,
+        // a 2-hop cycle cost 453,112 gas and a 3-hop 465,615 -- an extra hop
+        // added ~12k, not the 140k a per-hop model predicts, because the fixed
+        // part dominates.
+        let mut adjusted_cycle_gas =
+            estimated_cycle_gas.saturating_add(FLASH_LOAN_EXECUTOR_GAS);
         if self
             .jit_config
             .as_ref()
@@ -10528,6 +10549,32 @@ mod runner_tests {
             !send_called.load(Ordering::SeqCst),
             "gas estimation should not broadcast transactions"
         );
+    }
+
+    /// The cycle estimate must include what happens outside the swaps.
+    ///
+    /// Summing per-hop costs alone omits the flash-loan borrow and repay and
+    /// the executor's dispatch, which are charged once per transaction. That
+    /// gap was measured by simulation on 2026-09-04: a 2-hop cycle estimated
+    /// at 280,000 really cost 453,112.
+    #[test]
+    fn the_cycle_estimate_charges_the_loan_and_dispatch_once() {
+        let per_hop = crate::venues::ESTIMATED_GAS_UNIV3;
+        let two_hops = per_hop * 2 + FLASH_LOAN_EXECUTOR_GAS;
+        let three_hops = per_hop * 3 + FLASH_LOAN_EXECUTOR_GAS;
+
+        // The 2-hop estimate now lands on the measured 453,112 rather than
+        // 60% below it.
+        assert!(
+            (two_hops as i64 - 453_112).abs() < 5_000,
+            "2-hop estimate {two_hops} should track the measured 453,112"
+        );
+        // The overhead is charged ONCE: a third hop adds one hop's gas, not a
+        // second copy of the fixed part.
+        assert_eq!(three_hops - two_hops, per_hop);
+        // And it is never simply dropped, which is what produced the old
+        // 280,000.
+        assert!(two_hops > per_hop * 2);
     }
 
     /// A simulation run at the plan's own budget reports the budget.
