@@ -365,10 +365,28 @@ where
             } else {
                 ctx.quoter
             };
-            let out = quoter
-                .quote_path(path.clone(), amount_in, block)
-                .await
-                .ok()?;
+            // The error was swallowed by `.ok()?`, which made every failure
+            // here indistinguishable and surfaced only as `cycle unquotable`
+            // -- 2,401 of them in one five-minute run on 2026-09-03, against
+            // 512 real rejections, with no way to tell why. The path encoding
+            // and fee tier were ruled out by calling this quoter directly with
+            // the same bytes (0.1 WETH -> 240 USDC at every tier), so whatever
+            // remains is in this call's arguments or its block pin.
+            let out = match quoter.quote_path(path.clone(), amount_in, block).await {
+                Ok(out) => out,
+                Err(err) => {
+                    warn!(
+                        target: "arb_exec::latency",
+                        error = %err,
+                        pool = %format!("{pool:#x}"),
+                        amount_in = %amount_in,
+                        block = %block,
+                        path_hops = path.len(),
+                        "univ3 quote failed"
+                    );
+                    return None;
+                }
+            };
             let expected = mul_div(amount_in, edge.rate_num, edge.rate_den);
             QuoteValue {
                 amount_out: out,
