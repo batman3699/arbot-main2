@@ -1027,6 +1027,10 @@ pub struct PricedCycle {
     /// the route is built and executed from the same entry point that was
     /// valued. Not the index's canonical form.
     pub tokens: Vec<Address>,
+    /// When this was priced. The edge is only worth what it is worth WHEN the
+    /// trade lands, and everything downstream -- the permit queue, sizing's
+    /// round trips -- happens after this instant.
+    pub priced_at: Instant,
 }
 
 /// What a ranking was actually sorted by.
@@ -1127,6 +1131,7 @@ where
                     profit_native,
                     pools: sized.pools,
                     tokens,
+                    priced_at: Instant::now(),
                 });
             }
             None => unpriceable += 1,
@@ -2173,6 +2178,37 @@ impl BaseFastPath {
         cov
     }
 
+    /// Re-price a cycle NOW, through the pools it was originally priced on.
+    ///
+    /// Deliberately fixed to the same pools rather than re-selecting: the
+    /// question is how the EDGE moved, not whether a different route opened.
+    /// Comparing this against the gross recorded at detection measures how fast
+    /// an opportunity decays while the candidate queues and quotes -- if it is
+    /// gone by the time we could act, the constraint is latency and no amount
+    /// of extra pools or cleverer ranking changes that.
+    ///
+    /// Local state only, so it costs no RPC and adds nothing to the very
+    /// latency it is measuring.
+    pub fn reprice_now(&self, tokens: &[Address], pools: &[Address]) -> Option<f64> {
+        if tokens.len() < 2 || pools.len() != tokens.len() {
+            return None;
+        }
+        let mut product = 1.0f64;
+        for i in 0..tokens.len() {
+            let (from, to) = (tokens[i], tokens[(i + 1) % tokens.len()]);
+            let meta = *self.pool_tokens.get(&pools[i])?;
+            let q = hop_rate(&self.live, pools[i], &meta, from, to, 0.0)?;
+            if !q.den.is_finite() || q.den <= 0.0 {
+                return None;
+            }
+            product *= q.num / q.den;
+            if !product.is_finite() || product <= 0.0 {
+                return None;
+            }
+        }
+        Some((product - 1.0) * 10_000.0)
+    }
+
     /// Simulate one prepared candidate against preconfirmed state.
     ///
     /// `None` when no simulation endpoint is configured -- distinct from a
@@ -3143,7 +3179,7 @@ mod tests {
         let mk = |id, bps, hops| PricedCycle {
             id, gross_bps: bps, hops, notional_in: 1.0, profit_native: None,
             pools: Vec::new(),
-            tokens: Vec::new(),
+            tokens: Vec::new(), priced_at: Instant::now(),
         };
         let mut v = [mk(0, 5.0, 4), mk(1, 50.0, 6), mk(2, 50.0, 2)];
         v.sort_by(|x, y| {
@@ -3545,6 +3581,7 @@ mod tests {
             id, gross_bps: 12.0, hops, notional_in: 1.0, profit_native: None,
             pools: vec![Address::zero(); hops],
             tokens: idx.cycle(id).expect("cycle").tokens.clone(),
+            priced_at: Instant::now(),
         };
         assert!(
             !CostStack::from_env().clears(thin.gross_bps),
@@ -3565,7 +3602,7 @@ mod tests {
         let (idx, _g, id) = triangle_for_translation();
         let empty = crate::graph::Graph::default();
         let (ready, untranslatable) =
-            translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3, notional_in: 1.0, profit_native: None, pools: Vec::new(), tokens: Vec::new() }]);
+            translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3, notional_in: 1.0, profit_native: None, pools: Vec::new(), tokens: Vec::new(), priced_at: Instant::now() }]);
         assert!(ready.is_empty());
         assert_eq!(untranslatable.untranslatable, 1);
         assert_eq!(untranslatable.unknown_token, 1, "the graph knows none of these tokens");
@@ -4043,7 +4080,7 @@ mod tests {
     fn an_unvalued_cycle_sorts_last_rather_than_vanishing() {
         let mk = |id, profit: Option<f64>| PricedCycle {
             id, gross_bps: 10.0, hops: 2, notional_in: 1.0, profit_native: profit,
-            pools: Vec::new(), tokens: Vec::new(),
+            pools: Vec::new(), tokens: Vec::new(), priced_at: Instant::now(),
         };
         let mut v = [mk(0, None), mk(1, Some(5.0)), mk(2, Some(50.0))];
         v.sort_by(|a, b| {
@@ -4658,5 +4695,50 @@ mod tests {
         let fundable: HashSet<Address> = [c].into_iter().collect();
         assert_eq!(rotate_to_fundable(&[a, b, c], &fundable).unwrap(), vec![c, a, b]);
         assert_eq!(rotate_to_fundable(&[a, c, b], &fundable).unwrap(), vec![c, b, a]);
+    }
+
+    /// The decay measurement itself. Re-pricing must follow the SAME pools, or
+    /// it would report a different route opening rather than this edge moving.
+    #[test]
+    fn repricing_follows_the_original_pools_and_sees_state_move() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (a, b) = (addr(10), addr(11));
+        let (f, _t) = fast(vec![a, b]);
+        let f = f.with_pool_tokens(std::collections::HashMap::from([
+            (a, PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
+                           kind: PoolKind::ConstantProduct, verified: true,
+                           confirmed_at: Some(Instant::now()), balances: None }),
+            (b, PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
+                           kind: PoolKind::ConstantProduct, verified: true,
+                           confirmed_at: Some(Instant::now()), balances: None }),
+        ]));
+        let anchor = |pool, r0: u64, r1: u64, blk| {
+            f.live.anchor_v2(pool, blk, crate::quote_univ2::UniV2PairState {
+                token0: t0, token1: t1,
+                reserve0: U256::from(r0) * U256::exp10(18),
+                reserve1: U256::from(r1) * U256::exp10(18),
+            })
+        };
+        // a: 1 t0 -> 2 t1.  b: 2 t1 -> 1.02 t0.  Round trip is +2%.
+        assert!(anchor(a, 100, 200, 100));
+        assert!(anchor(b, 102, 200, 100));
+        let before = f.reprice_now(&[t0, t1], &[a, b]).expect("priced");
+        assert!((before - 200.0).abs() < 1.0, "expected ~200 bps, got {before}");
+
+        // The market moves: b's edge disappears.
+        assert!(anchor(b, 100, 200, 101));
+        let after = f.reprice_now(&[t0, t1], &[a, b]).expect("repriced");
+        assert!(after < before, "decay must be visible: {before} -> {after}");
+        assert!(after.abs() < 1.0, "edge should be gone, got {after}");
+    }
+
+    /// A cycle whose pools it cannot price yields no number rather than a
+    /// misleading zero -- a decay reading of "0 bps" and "unknown" are
+    /// different findings.
+    #[test]
+    fn repricing_an_unknown_pool_reports_nothing() {
+        let (f, _t) = fast(vec![addr(10)]);
+        assert!(f.reprice_now(&[addr(1), addr(2)], &[addr(99), addr(98)]).is_none());
+        assert!(f.reprice_now(&[addr(1)], &[addr(99)]).is_none(), "not a loop");
     }
 }

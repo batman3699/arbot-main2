@@ -14249,6 +14249,30 @@ async fn launch_chain_runtime(
                         edges_scanned: 0,
                     };
                     for (priced, indexed) in ready.into_iter().take(prepare_top) {
+                        // LATENCY DECAY. The same cycle, the same pools, priced
+                        // again from current state immediately before the
+                        // economics run. Everything between the two instants is
+                        // ours: the permit queue and the trip to the sink.
+                        //
+                        // If the edge is materially smaller here than at
+                        // detection, the opportunity is being taken while we
+                        // queue, and no widening of the universe or sharpening
+                        // of the ranking recovers it -- only being closer does.
+                        // If it is unchanged, latency is not what stands
+                        // between this system and a profitable trade.
+                        let age_ms = priced.priced_at.elapsed().as_millis();
+                        let now_bps = fast_sim.reprice_now(&priced.tokens, &priced.pools);
+                        info!(
+                            target: "arb_exec::latency",
+                            gross_bps_at_detection = priced.gross_bps,
+                            gross_bps_now = now_bps.unwrap_or(f64::NAN),
+                            decay_bps = now_bps
+                                .map(|n| priced.gross_bps - n)
+                                .unwrap_or(f64::NAN),
+                            age_ms,
+                            hops = priced.hops,
+                            "edge decay between detection and sizing"
+                        );
                         match runner.prepare_candidate(&graph, indexed, &ctx).await {
                             CandidatePrep::Sized(sized) => {
                                 report.sized += 1;
