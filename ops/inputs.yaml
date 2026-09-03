@@ -284,11 +284,19 @@ chains:
       - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
       - '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' # cbBTC
       - '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22' # cbETH
+      - '0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42' # EURC
+      - '0x236aa50979d5f3de3bd1eeb40e81137f22ab794b' # tBTC
+      - '0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452' # wstETH
+      - '0x04c0599ae5a44757c0af6f9ec3b93da8976c150a' # weETH
     allowlist_tokens:
       - '0x4200000000000000000000000000000000000006' # WETH
       - '0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913' # USDC
       - '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf' # cbBTC
       - '0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22' # cbETH
+      - '0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42' # EURC
+      - '0x236aa50979d5f3de3bd1eeb40e81137f22ab794b' # tBTC
+      - '0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452' # wstETH
+      - '0x04c0599ae5a44757c0af6f9ec3b93da8976c150a' # weETH
   - name: balancer_v2
     kind: balancer_vault_like
     vault: '0xBA12222222228d8Ba445958a75a0704d566BF2C8'
