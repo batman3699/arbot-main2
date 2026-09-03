@@ -1179,13 +1179,11 @@ pub struct LiveHop<'a> {
     pub meta: &'a PoolMeta,
     pub from: Address,
     pub to: Address,
-    /// Depth bound for this hop, in input units. Sizing will not propose more.
-    pub max_input: U256,
 }
 
 pub fn live_edge(hop: LiveHop<'_>, live: &LiveState) -> Option<crate::graph::Edge> {
     use crate::graph::VenueEdge;
-    let LiveHop { venue, pool, meta, from, to, max_input } = hop;
+    let LiveHop { venue, pool, meta, from, to } = hop;
     let (token0, token1) = (meta.token0, meta.token1);
     let forward = if from == token0 && to == token1 {
         true
@@ -1239,6 +1237,40 @@ pub fn live_edge(hop: LiveHop<'_>, live: &LiveState) -> Option<crate::graph::Edg
         FastVenue::Solidly { .. } => crate::venues::ESTIMATED_GAS_SOLIDLYV2,
     };
 
+    // Capacity is a fact about THIS pool's input side, on the same convention
+    // the scan uses -- `edge_capacity_from_reserve`, 33.33% of the holding.
+    //
+    // It is deliberately NOT the cycle's depth-bounded notional. That figure is
+    // 1% of the OUTPUT side and applies to the whole loop; passing it here made
+    // the fast path's ranking approximation govern execution sizing, ~33x
+    // tighter than the scan and on the wrong side of the pool. The visible cost
+    // was that any cycle whose thinnest hop held under ~10 WETH produced a
+    // trade cap below `min_flash_loan` (0.1 WETH), so `capacity_capped_amount`
+    // refused it -- 202 of 363 rejections on 2026-09-03 were that collision
+    // between two of this module's own constants, not a funding shortfall.
+    // Aave held 9,922 WETH at the time.
+    //
+    // The depth bound keeps its real job, which is RANKING: see
+    // `price_cycle_sized`. Sizing belongs to `prepare_candidate`.
+    let capacity_in = match venue {
+        FastVenue::Solidly { .. } => {
+            let snap = live.v2_snapshot(pool)?;
+            if forward { snap.state.reserve0 } else { snap.state.reserve1 }
+        }
+        _ => {
+            let (b0, b1) = meta.balances?;
+            let raw = if forward { b0 } else { b1 };
+            f64_to_u256(raw)
+        }
+    };
+    if capacity_in.is_zero() {
+        return None;
+    }
+    let max_input = crate::venues::edge_capacity_from_reserve(capacity_in);
+    if max_input.is_zero() {
+        return None;
+    }
+
     Some(crate::graph::Edge {
         from,
         to,
@@ -1291,7 +1323,6 @@ impl LiveRouter {
         pools: &[Address],
         meta: &dashmap::DashMap<Address, PoolMeta>,
         live: &LiveState,
-        notional_in: f64,
     ) -> Option<(crate::graph::Graph, crate::graph::IndexedCycle)> {
         if tokens.len() < 2 || pools.len() != tokens.len() {
             return None;
@@ -1302,8 +1333,6 @@ impl LiveRouter {
         for t in tokens {
             g.add_node(*t);
         }
-        let max_input = f64_to_u256(notional_in);
-
         let mut edge_indices = Vec::with_capacity(tokens.len());
         for i in 0..tokens.len() {
             let from = tokens[i];
@@ -1311,7 +1340,7 @@ impl LiveRouter {
             let pool = pools[i];
             let venue = *self.venues.get(&pool)?;
             let m = *meta.get(&pool)?;
-            let edge = live_edge(LiveHop { venue, pool, meta: &m, from, to, max_input }, live)?;
+            let edge = live_edge(LiveHop { venue, pool, meta: &m, from, to }, live)?;
             g.add_edge(edge);
             // `add_edge` de-duplicates by signature, so the index has to be
             // looked up rather than assumed to be the loop counter.
@@ -2323,7 +2352,7 @@ impl BaseFastPath {
                             continue;
                         };
                         if let Some((g, ic)) =
-                            r.route(&tokens, &c.pools, &self.pool_tokens, &self.live, c.notional_in)
+                            r.route(&tokens, &c.pools, &self.pool_tokens, &self.live)
                         {
                             // One graph per batch, so `IndexedCycle` indices and
                             // the graph handed to the sink always agree. Mixing
@@ -4174,7 +4203,7 @@ mod tests {
         let live = LiveState::new();
 
         let (g, ic) = router
-            .route(&[t0, t1], &[p_a, p_b], &meta, &live, 1e18)
+            .route(&[t0, t1], &[p_a, p_b], &meta, &live)
             .expect("both hops buildable");
 
         assert_eq!(ic.cycle.len(), 3, "closed two-hop loop");
@@ -4210,7 +4239,7 @@ mod tests {
         };
         let live = LiveState::new();
         let (g, ic) = router
-            .route(&[t0, t1], &[pool, pool], &meta, &live, 1e18)
+            .route(&[t0, t1], &[pool, pool], &meta, &live)
             .expect("routable");
         let dir = |i: usize| match &g.edges[ic.edge_indices[i]].venue {
             crate::graph::VenueEdge::UniV3 { path, .. } => (path[0].0, path[1].0),
@@ -4235,11 +4264,11 @@ mod tests {
         };
         let live = LiveState::new();
         assert!(
-            router.route(&[t0, t1], &[known, unknown], &meta, &live, 1e18).is_none(),
+            router.route(&[t0, t1], &[known, unknown], &meta, &live).is_none(),
             "no venue for the second pool"
         );
         assert!(
-            router.route(&[t0, t1], &[known], &meta, &live, 1e18).is_none(),
+            router.route(&[t0, t1], &[known], &meta, &live).is_none(),
             "one pool is not a two-hop route"
         );
     }
@@ -4263,7 +4292,7 @@ mod tests {
         let e = live_edge(
             LiveHop {
                 venue: FastVenue::Solidly { stable: false, fee_bps: 30, decimals0: 18, decimals1: 6 },
-                pool, meta: &m, from: t0, to: t1, max_input: U256::from(500u64),
+                pool, meta: &m, from: t0, to: t1,
             },
             &live,
         )
@@ -4277,7 +4306,13 @@ mod tests {
             }
             other => panic!("expected SolidlyV2, got {other:?}"),
         }
-        assert_eq!(e.max_input, U256::from(500u64));
+        // Capacity now comes from the POOL's input side on the scan's own
+        // convention (33.33% of the holding), not from a cycle-wide bound.
+        assert_eq!(
+            e.max_input,
+            crate::venues::edge_capacity_from_reserve(U256::from(1_000u64)),
+            "t0-side reserve is 1000, so capacity is its 33.33% share"
+        );
     }
 
     /// The capacity bound must saturate rather than wrap. A wrapped bound
@@ -4314,7 +4349,7 @@ mod tests {
         };
         let live = LiveState::new();
         let (g, ic) = router
-            .route(&[t0, t1], &[aero, pancake], &meta, &live, 1e18)
+            .route(&[t0, t1], &[aero, pancake], &meta, &live)
             .expect("both hops buildable");
 
         let router_of = |i: usize| match &g.edges[ic.edge_indices[i]].venue {
@@ -4344,7 +4379,7 @@ mod tests {
                 FastVenue::UniV3 { fee: 500 },
             )])),
         };
-        let (g, ic) = builtin.route(&[t0, t1], &[pool, pool], &meta, &live, 1e18).expect("built");
+        let (g, ic) = builtin.route(&[t0, t1], &[pool, pool], &meta, &live).expect("built");
         assert!(
             matches!(g.edges[ic.edge_indices[0]].venue, crate::graph::VenueEdge::UniV3 { .. }),
             "a built-in-router pool takes the targetless step"
@@ -4356,7 +4391,7 @@ mod tests {
                 FastVenue::RoutedCl { path_param: 500, router: addr(99) },
             )])),
         };
-        let (g, ic) = forked.route(&[t0, t1], &[pool, pool], &meta, &live, 1e18).expect("built");
+        let (g, ic) = forked.route(&[t0, t1], &[pool, pool], &meta, &live).expect("built");
         assert_eq!(
             match &g.edges[ic.edge_indices[0]].venue {
                 crate::graph::VenueEdge::Slipstream { router, .. } => Some(*router),
@@ -4365,5 +4400,71 @@ mod tests {
             Some(addr(99)),
             "a fork must name its router in the calldata"
         );
+    }
+
+    /// The collision this fixes. A cycle's depth-bounded notional is 1% of the
+    /// OUTPUT side; an edge's capacity is 33.33% of the INPUT side. Using the
+    /// first as the second made any cycle through a modest pool produce a trade
+    /// cap under min_flash_loan (0.1 WETH), which capacity_capped_amount
+    /// refuses -- 202 of 363 rejections on 2026-09-03, while Aave held 9,922
+    /// WETH. Capacity must describe the pool, not the loop.
+    #[test]
+    fn edge_capacity_describes_the_pool_not_the_cycle() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        // 30 WETH on the input side; a cycle bound would have been ~1% of the
+        // other side, far below the 0.1 WETH flash-loan minimum.
+        let thirty = U256::from(30u64) * U256::exp10(18);
+        assert!(live.anchor_v2(pool, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: thirty, reserve1: U256::from(60u64) * U256::exp10(18),
+        }));
+        let m = PoolMeta {
+            token0: t0, token1: t1, fee_ppm: 3_000,
+            kind: PoolKind::ConstantProduct, verified: true,
+            confirmed_at: Some(Instant::now()), balances: None,
+        };
+        let e = live_edge(
+            LiveHop {
+                venue: FastVenue::Solidly { stable: false, fee_bps: 30, decimals0: 18, decimals1: 18 },
+                pool, meta: &m, from: t0, to: t1,
+            },
+            &live,
+        )
+        .expect("buildable");
+        let min_flash_loan = U256::exp10(17); // 0.1 WETH
+        assert!(
+            e.max_input > min_flash_loan,
+            "capacity {} must clear the flash-loan minimum {}",
+            e.max_input, min_flash_loan
+        );
+        assert_eq!(e.max_input, crate::venues::edge_capacity_from_reserve(thirty));
+    }
+
+    /// Direction matters: capacity is the side being spent, not received.
+    #[test]
+    fn capacity_is_taken_from_the_input_side() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        let (r0, r1) = (U256::from(7u64) * U256::exp10(18), U256::from(90u64) * U256::exp10(18));
+        assert!(live.anchor_v2(pool, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1, reserve0: r0, reserve1: r1,
+        }));
+        let m = PoolMeta {
+            token0: t0, token1: t1, fee_ppm: 0,
+            kind: PoolKind::ConstantProduct, verified: true,
+            confirmed_at: Some(Instant::now()), balances: None,
+        };
+        let mk = |from, to| live_edge(
+            LiveHop {
+                venue: FastVenue::Solidly { stable: false, fee_bps: 0, decimals0: 18, decimals1: 18 },
+                pool, meta: &m, from, to,
+            },
+            &live,
+        ).expect("buildable").max_input;
+        assert_eq!(mk(t0, t1), crate::venues::edge_capacity_from_reserve(r0));
+        assert_eq!(mk(t1, t0), crate::venues::edge_capacity_from_reserve(r1));
     }
 }

@@ -525,7 +525,7 @@ struct QuoteComputation {
 /// Share of a constant-product reserve treated as usable input. Beyond roughly a
 /// third of the reserve the marginal rate collapses and the sizer rejects the
 /// candidate anyway, so this bounds the search without deciding economics.
-const EDGE_CAPACITY_RESERVE_BPS: u32 = 3_333;
+pub(crate) const EDGE_CAPACITY_RESERVE_BPS: u32 = 3_333;
 
 /// How far past the probe size a quote-backed edge may be scaled when the probe
 /// registered no measurable price impact. Deep pools are common on Base majors;
@@ -533,7 +533,7 @@ const EDGE_CAPACITY_RESERVE_BPS: u32 = 3_333;
 const EDGE_CAPACITY_PROBE_MULTIPLIER: u64 = 256;
 
 /// Capacity of a reserve-backed edge (UniV2 / Solidly), in `from`-token units.
-fn edge_capacity_from_reserve(reserve_in: U256) -> U256 {
+pub(crate) fn edge_capacity_from_reserve(reserve_in: U256) -> U256 {
     reserve_in.saturating_mul(U256::from(EDGE_CAPACITY_RESERVE_BPS)) / U256::from(10_000u32)
 }
 
