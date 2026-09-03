@@ -931,6 +931,25 @@ pub struct SizedCycle {
     pub pools: Vec<Address>,
 }
 
+/// Rotate a cycle so it begins at a token a flash loan can fund.
+///
+/// `CycleIndex` canonicalises every cycle to start at its LOWEST ADDRESS, which
+/// is right for deduplication and wrong for execution: the loan is taken in
+/// `tokens[0]`. A cycle seeded from WETH is stored starting at whatever token
+/// happens to sort first, and if that token has no lender the candidate is
+/// refused as `no_flashloan_capacity` -- 419 of 434 such rejections on
+/// 2026-09-03 started at VIRTUAL, which no provider lends.
+///
+/// A cycle is a loop, so entering it at a different token is the SAME trade.
+/// `None` only when the loop touches no fundable token at all, which is a real
+/// exclusion rather than a rotation problem.
+pub fn rotate_to_fundable(tokens: &[Address], fundable: &HashSet<Address>) -> Option<Vec<Address>> {
+    let at = tokens.iter().position(|t| fundable.contains(t))?;
+    let mut out = tokens.to_vec();
+    out.rotate_left(at);
+    Some(out)
+}
+
 /// Price a loop AND bound how much it can carry.
 ///
 /// The size question is the one bps cannot answer. Walking forward with input
@@ -1004,6 +1023,10 @@ pub struct PricedCycle {
     pub profit_native: Option<f64>,
     /// The pools this cycle was priced through, in hop order.
     pub pools: Vec<Address>,
+    /// The cycle's tokens as PRICED -- rotated to begin at a fundable token, so
+    /// the route is built and executed from the same entry point that was
+    /// valued. Not the index's canonical form.
+    pub tokens: Vec<Address>,
 }
 
 /// What a ranking was actually sorted by.
@@ -1066,6 +1089,10 @@ pub fn price_touched<F>(
     ids: &[crate::cycle_index::CycleId],
     quote_of: F,
     prices: Option<&std::collections::HashMap<Address, f64>>,
+    // Tokens a flash loan can start in. Cycles are rotated to begin at one;
+    // a cycle touching none is dropped, because the loan has to be taken in
+    // `tokens[0]` and nothing else can fund it.
+    fundable: &HashSet<Address>,
     top_n: usize,
 ) -> (Vec<PricedCycle>, usize, RankBasis)
 where
@@ -1078,9 +1105,15 @@ where
             unpriceable += 1;
             continue;
         };
-        match price_cycle_sized(&cycle.tokens, &quote_of) {
+        // Rotated BEFORE pricing, so notional and profit are denominated in the
+        // token the trade will actually be funded and settled in.
+        let Some(tokens) = rotate_to_fundable(&cycle.tokens, fundable) else {
+            unpriceable += 1;
+            continue;
+        };
+        match price_cycle_sized(&tokens, &quote_of) {
             Some(sized) => {
-                let start = cycle.tokens[0];
+                let start = tokens[0];
                 let profit_native = prices
                     .and_then(|p| p.get(&start).copied())
                     .filter(|v| v.is_finite() && *v > 0.0)
@@ -1093,6 +1126,7 @@ where
                     notional_in: sized.notional_in,
                     profit_native,
                     pools: sized.pools,
+                    tokens,
                 });
             }
             None => unpriceable += 1,
@@ -1554,6 +1588,10 @@ pub type TokenPrices = std::collections::HashMap<Address, f64>;
 pub struct DrainConsumer {
     pub router: Option<Arc<LiveRouter>>,
     pub sink: Option<CandidateSink>,
+    /// Tokens a flash loan can start in. Cycles are ROTATED to begin at one --
+    /// the loan is taken in `tokens[0]`, and `CycleIndex` canonicalises to the
+    /// lowest address, which is unrelated to what any lender holds.
+    pub fundable: Arc<HashSet<Address>>,
 }
 
 /// The scan-published inputs the drain reads each pass.
@@ -2211,7 +2249,7 @@ impl BaseFastPath {
         max_cycles: usize,
     ) -> JoinHandle<()> {
         let DrainFeeds { graph, prices } = feeds;
-        let DrainConsumer { router, sink } = consumer;
+        let DrainConsumer { router, sink, fundable } = consumer;
         tokio::spawn(async move {
             let costs = CostStack::from_env();
             // One batch in preparation at a time, and NEVER awaited on this
@@ -2326,6 +2364,7 @@ impl BaseFastPath {
                         )
                     },
                     px.as_deref(),
+                    &fundable,
                     FAST_PATH_RANKED,
                 );
                 let price_us = priced_at.elapsed().as_micros();
@@ -2376,11 +2415,11 @@ impl BaseFastPath {
                     let mut ready: Vec<(PricedCycle, crate::graph::IndexedCycle)> = Vec::new();
                     let mut route_graph: Option<Arc<crate::graph::Graph>> = None;
                     for c in priced.iter().take(FAST_PATH_PREPARE) {
-                        let Some(tokens) = idx.cycle(c.id).map(|t| t.tokens.clone()) else {
-                            continue;
-                        };
+                        // `c.tokens`, not the index's canonical rotation: the
+                        // route must be entered where the cycle was priced and
+                        // where the loan can be taken.
                         if let Some((g, ic)) =
-                            r.route(&tokens, &c.pools, &self.pool_tokens, &self.live)
+                            r.route(&c.tokens, &c.pools, &self.pool_tokens, &self.live)
                         {
                             // One graph per batch, so `IndexedCycle` indices and
                             // the graph handed to the sink always agree. Mixing
@@ -2697,6 +2736,18 @@ mod tests {
     /// real probe size, because that is the thing they are testing.
     fn marginal() -> PricingCtx<'static> {
         PricingCtx { fresh: fresh(), select: HopSelect::BestNet, prices: None, ref_native: 0.0 }
+    }
+
+    /// Every token in the index, so a test that is not about fundability is
+    /// not silently filtered by it.
+    fn all_fundable(
+        idx: &crate::cycle_index::CycleIndex,
+        ids: &[crate::cycle_index::CycleId],
+    ) -> HashSet<Address> {
+        ids.iter()
+            .filter_map(|i| idx.cycle(*i))
+            .flat_map(|c| c.tokens.iter().copied())
+            .collect()
     }
 
     fn addr(n: u64) -> Address {
@@ -3079,7 +3130,7 @@ mod tests {
         let ids: Vec<_> = (0..index.len() as u32).collect();
 
         // No rates at all: everything is unpriceable, nothing is "unprofitable".
-        let (priced, unpriceable, basis) = price_touched(&index, &ids, |_, _| None, None, 8);
+        let (priced, unpriceable, basis) = price_touched(&index, &ids, |_, _| None, None, &all_fundable(&index, &ids), 8);
         assert!(priced.is_empty());
         assert_eq!(unpriceable, ids.len());
         assert_eq!(basis, RankBasis::Bps, "nothing priced, so nothing valued");
@@ -3092,6 +3143,7 @@ mod tests {
         let mk = |id, bps, hops| PricedCycle {
             id, gross_bps: bps, hops, notional_in: 1.0, profit_native: None,
             pools: Vec::new(),
+            tokens: Vec::new(),
         };
         let mut v = [mk(0, 5.0, 4), mk(1, 50.0, 6), mk(2, 50.0, 2)];
         v.sort_by(|x, y| {
@@ -3492,6 +3544,7 @@ mod tests {
         let thin = PricedCycle {
             id, gross_bps: 12.0, hops, notional_in: 1.0, profit_native: None,
             pools: vec![Address::zero(); hops],
+            tokens: idx.cycle(id).expect("cycle").tokens.clone(),
         };
         assert!(
             !CostStack::from_env().clears(thin.gross_bps),
@@ -3512,7 +3565,7 @@ mod tests {
         let (idx, _g, id) = triangle_for_translation();
         let empty = crate::graph::Graph::default();
         let (ready, untranslatable) =
-            translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3, notional_in: 1.0, profit_native: None, pools: Vec::new() }]);
+            translate_for_prep(&idx, &empty, &[PricedCycle { id, gross_bps: 99.0, hops: 3, notional_in: 1.0, profit_native: None, pools: Vec::new(), tokens: Vec::new() }]);
         assert!(ready.is_empty());
         assert_eq!(untranslatable.untranslatable, 1);
         assert_eq!(untranslatable.unknown_token, 1, "the graph knows none of these tokens");
@@ -3968,12 +4021,12 @@ mod tests {
             Some(HopQuote { pool: Address::zero(), num: 1.05, den: 1.0, cap_out: 1_000_000.0 })
         };
 
-        let (priced, _, basis) = price_touched(&idx, &ids, quote, None, 8);
+        let (priced, _, basis) = price_touched(&idx, &ids, quote, None, &all_fundable(&idx, &ids), 8);
         assert_eq!(basis, RankBasis::Bps, "no price map means no value ranking");
         assert!(priced.iter().all(|c| c.profit_native.is_none()));
 
         let prices = std::collections::HashMap::from([(t1, 2.0f64)]);
-        let (priced, _, basis) = price_touched(&idx, &ids, quote, Some(&prices), 8);
+        let (priced, _, basis) = price_touched(&idx, &ids, quote, Some(&prices), &all_fundable(&idx, &ids), 8);
         assert_eq!(basis, RankBasis::Native);
         let top = priced.first().expect("one cycle");
         let want = top.notional_in * (top.gross_bps / 10_000.0) * 2.0;
@@ -3990,7 +4043,7 @@ mod tests {
     fn an_unvalued_cycle_sorts_last_rather_than_vanishing() {
         let mk = |id, profit: Option<f64>| PricedCycle {
             id, gross_bps: 10.0, hops: 2, notional_in: 1.0, profit_native: profit,
-            pools: Vec::new(),
+            pools: Vec::new(), tokens: Vec::new(),
         };
         let mut v = [mk(0, None), mk(1, Some(5.0)), mk(2, Some(50.0))];
         v.sort_by(|a, b| {
@@ -4568,5 +4621,42 @@ mod tests {
         assert!(!n.is_zero() && !d.is_zero());
         assert!(n > d, "above one, the numerator carries it");
         assert!(mk(0.0).is_none() && mk(f64::NAN).is_none());
+    }
+
+    /// The rejection this fixes. CycleIndex canonicalises every cycle to start
+    /// at its LOWEST ADDRESS -- right for dedup, wrong for execution, because
+    /// the flash loan is taken in tokens[0]. Measured 2026-09-03: 419 of 434
+    /// no_flashloan_capacity rejections started at VIRTUAL, which no provider
+    /// lends, on cycles that also contained WETH.
+    #[test]
+    fn a_cycle_is_entered_where_it_can_be_funded() {
+        let (low, weth, other) = (addr(1), addr(9_000), addr(500));
+        let fundable: HashSet<Address> = [weth].into_iter().collect();
+        // Canonical form leads with the lowest address, which is unfundable.
+        let canonical = [low, other, weth];
+        let rotated = rotate_to_fundable(&canonical, &fundable).expect("weth is in the loop");
+        assert_eq!(rotated[0], weth, "must enter where the loan can be taken");
+        // Same loop, same order, different entry point.
+        assert_eq!(rotated, vec![weth, low, other]);
+        assert_eq!(rotated.len(), canonical.len());
+    }
+
+    /// Rotation cannot invent fundability. A loop touching no fundable token is
+    /// genuinely unexecutable and must be dropped, not rotated arbitrarily.
+    #[test]
+    fn a_cycle_with_no_fundable_token_is_dropped() {
+        let fundable: HashSet<Address> = [addr(9_000)].into_iter().collect();
+        assert!(rotate_to_fundable(&[addr(1), addr(2), addr(3)], &fundable).is_none());
+        assert!(rotate_to_fundable(&[], &fundable).is_none());
+    }
+
+    /// Direction is preserved. A->B->C and A->C->B are different trades, and a
+    /// rotation that reversed one would price a route nobody could execute.
+    #[test]
+    fn rotation_preserves_direction() {
+        let (a, b, c) = (addr(1), addr(2), addr(3));
+        let fundable: HashSet<Address> = [c].into_iter().collect();
+        assert_eq!(rotate_to_fundable(&[a, b, c], &fundable).unwrap(), vec![c, a, b]);
+        assert_eq!(rotate_to_fundable(&[a, c, b], &fundable).unwrap(), vec![c, b, a]);
     }
 }

@@ -10348,6 +10348,7 @@ mod runner_tests {
                 slipstream_quoter_addr: Address::zero(),
                 slipstream_factory: Address::zero(),
                 slipstream_router: Address::zero(),
+                cl_quoter_by_pool: Arc::new(HashMap::new()),
                 slipstream_validation: None,
                 slipstream_tick_spacings: None,
                 hot_pancakeswap_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -10650,6 +10651,7 @@ mod runner_tests {
                 slipstream_quoter_addr: Address::zero(),
                 slipstream_factory: Address::zero(),
                 slipstream_router: Address::zero(),
+                cl_quoter_by_pool: Arc::new(HashMap::new()),
                 slipstream_validation: None,
                 slipstream_tick_spacings: None,
                 hot_pancakeswap_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -10840,6 +10842,7 @@ mod runner_tests {
                 slipstream_quoter_addr: Address::zero(),
                 slipstream_factory: Address::zero(),
                 slipstream_router: Address::zero(),
+                cl_quoter_by_pool: Arc::new(HashMap::new()),
                 slipstream_validation: None,
                 slipstream_tick_spacings: None,
                 hot_pancakeswap_pools: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -14306,6 +14309,9 @@ async fn launch_chain_runtime(
                 runner.token_native_prices(),
             ),
             crate::base_fast::DrainConsumer {
+                fundable: std::sync::Arc::new(
+                    fundable.iter().copied().collect::<std::collections::HashSet<_>>(),
+                ),
                 router: Some(std::sync::Arc::new(crate::base_fast::LiveRouter {
                     venues,
                 })),
@@ -16228,6 +16234,7 @@ chains:
             slipstream_quoter: None,
             pancakeswap_quoter: None,
             pancakeswap_pools: None,
+            slipstream_quoters: None,
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number,
