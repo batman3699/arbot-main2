@@ -6012,6 +6012,22 @@ where
             None => Vec::new(),
         };
         if quotes.is_empty() {
+            // The three inputs that decide this, because reasoning about them
+            // from the code has now been wrong twice. `trade_cap` is
+            // `cycle_base_amount.min(cycle_input_capacity(edges))`, and the
+            // rejection fires when it lands under `min_flash_loan` -- so these
+            // say which of the two caps bound, and whether capacity was even
+            // known.
+            warn!(
+                target: "flashcap",
+                %trade_cap,
+                %cycle_base_amount,
+                %cycle_max_input,
+                min_flash_loan = %ctx.capital_snapshot.min_flash_loan,
+                price_conversion_failed,
+                start = %format!("{cycle_start:#x}"),
+                "no flash-loan quote; recording which cap bound"
+            );
             self.log_candidate_stage(
                 "candidate_rejected_pre_sim",
                 &self.chain_name,
