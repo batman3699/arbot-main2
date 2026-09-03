@@ -1098,6 +1098,28 @@ fn collect_slipstream_tick_spacings(
     spacings
 }
 
+/// A venue's own router, looked up by NAME.
+///
+/// Venue KIND is not enough and grouping by hot-list is actively wrong. Base
+/// configures aerodrome_slipstream_v3 as `univ3_like`, so its pools arrive in
+/// the same hot list as Uniswap's -- and tagging that whole list with the
+/// Uniswap router sent tick-spacing values to a quoter that reads them as fee
+/// tiers. Measured 2026-09-03: pool 0x42d4a22c carries `fee: 10`, which is a
+/// spacing; Uniswap V3 has no fee tier 10, and the quoter answered
+/// `execution reverted` for every one of 194 attempts.
+fn venue_router_by_name(
+    ops_inputs: &crate::ops_inputs::OpsInputs,
+    chain_name: &str,
+    venue_name: &str,
+) -> Option<Address> {
+    let chain = ops_inputs.chain_inputs(chain_name)?;
+    let venue = chain
+        .venues
+        .iter()
+        .find(|v| v.name.eq_ignore_ascii_case(venue_name))?;
+    venue.router.as_ref()?.parse().ok()
+}
+
 fn resolve_slipstream_venue(
     ops_inputs: &crate::ops_inputs::OpsInputs,
     chain_name: &str,
@@ -13097,12 +13119,28 @@ async fn launch_chain_runtime(
         // Applied by comparing addresses rather than venue names, so a new fork
         // is handled by configuring it, not by editing this match.
         let builtin_univ3_router = univ3_router_address;
-        for (records, venue_router) in [
-            (&hot_univ3_pools, univ3_router_address),
-            (&hot_slipstream_pools, slipstream_router_for_fast),
-            (&hot_pancakeswap_pools, pancakeswap_router_for_fast),
-        ] {
-            for r in records.read().await.iter() {
+        // Iterated BY VENUE, not by hot list. Base configures
+        // aerodrome_slipstream_v3 as univ3_like, so its pools share a hot list
+        // with Uniswap's -- and tagging the list sent tick spacings to a quoter
+        // that reads them as fee tiers. Measured 2026-09-03: pool 0x42d4a22c
+        // has `fee: 10`, a spacing, and Uniswap V3 has no tier 10, so the
+        // quoter returned `execution reverted` on all 194 attempts. Every
+        // unquotable cycle in that capture was this, 1:1.
+        for by_venue in [&hot_univ3_by_venue, &hot_pancakeswap_by_venue, &hot_slipstream_by_venue]
+        {
+            for (venue_name, records) in by_venue.read().await.iter() {
+                let venue_router =
+                    venue_router_by_name(ops_inputs, &cfg.name, venue_name)
+                        .unwrap_or_else(Address::zero);
+                let explicit = venue_router != builtin_univ3_router && !venue_router.is_zero();
+                info!(
+                    venue = %venue_name,
+                    pools = records.len(),
+                    router = %format!("{venue_router:#x}"),
+                    routing = if explicit { "explicit" } else { "executor-builtin" },
+                    "base fast path venue routing"
+                );
+            for r in records.iter() {
                 cl_pools.push(MonitoredPool {
                     pair: r.pool,
                     token_in: r.token0,
@@ -13125,6 +13163,7 @@ async fn launch_chain_runtime(
                         }
                     },
                 );
+            }
             }
         }
 
