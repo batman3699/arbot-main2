@@ -1989,6 +1989,9 @@ pub fn simulate_v1_params(
     data: &[u8],
     max_fee_per_gas: u128,
     gas_limit: u64,
+    // The block the plan's `min_out` floors were QUOTED against. `None` means
+    // `"pending"`, which is head+1 and is the wrong block to judge them at.
+    quoted_block: Option<ethers::types::U64>,
 ) -> Value {
     json!([
         {
@@ -2029,7 +2032,25 @@ pub fn simulate_v1_params(
             "validation": true,
             "traceTransfers": false,
         },
-        "pending"
+        // Simulate at the block the plan was QUOTED against, never `"pending"`.
+        //
+        // `pending` is head+1, and the plan's `min_out` floors came from quotes
+        // at `quoted_block`. Judging them against newer state asks whether the
+        // price moved, not whether the plan is sound. That was measured before
+        // on this codebase and recorded in `simulate_plan_execution`: 100%
+        // "Too little received", INVARIANT to trade size, pricing model and
+        // min_out slack (tick buffer at 150 and 400 bps, execution buffer at
+        // 75), because the drift is time-dependent and SIGNED, so no buffer
+        // covers it. On the failing pair it ran +6.63 bps at 2 blocks, -23.70
+        // at 10 and -45.70 at 20, against an edge tolerance of 5 bps.
+        //
+        // The fast path was simulating at `pending` and reproduced the same
+        // revert, which was then read as the trade being unprofitable. It is
+        // not evidence of that either way.
+        match quoted_block {
+            Some(b) => Value::String(format!("{:#x}", b.as_u64())),
+            None => Value::String("pending".to_string()),
+        }
     ])
 }
 
@@ -2587,10 +2608,12 @@ impl BaseFastPath {
         data: &[u8],
         max_fee_per_gas: u128,
         gas_limit: u64,
+        quoted_block: Option<ethers::types::U64>,
     ) -> Option<(PreconfSimResult, Duration)> {
         let http = self.sim_http.as_ref()?;
         let started = Instant::now();
-        let params = simulate_v1_params(from, to, data, max_fee_per_gas, gas_limit);
+        let params =
+            simulate_v1_params(from, to, data, max_fee_per_gas, gas_limit, quoted_block);
         match simulate_preconf(http, params).await {
             Ok(r) => Some((r, started.elapsed())),
             Err(e) => {
@@ -3491,8 +3514,20 @@ mod tests {
     /// transaction would actually be accepted.
     #[test]
     fn the_simulation_targets_preconfirmed_state_with_validation_on() {
-        let p = simulate_v1_params(addr(1), addr(2), &[0xde, 0xad], 1_000_000_000, 420_000);
-        assert_eq!(p[1], "pending", "simulating against latest measures the past");
+        // No quoted block: the caller has not said what the plan was priced
+        // against, so `pending` is the only honest answer.
+        let p = simulate_v1_params(addr(1), addr(2), &[0xde, 0xad], 1_000_000_000, 420_000, None);
+        assert_eq!(p[1], "pending");
+        // With one, the simulation is pinned to it. `pending` is head+1, and
+        // the min_out floors came from the quoted block: judging them against
+        // newer state asks whether the price moved, not whether the plan is
+        // sound. Measured previously as 100% "Too little received", invariant
+        // to size, pricing model and every min_out buffer tried.
+        let pinned = simulate_v1_params(
+            addr(1), addr(2), &[0xde, 0xad], 1_000_000_000, 420_000, Some(ethers::types::U64::from(50_824_870u64)),
+        );
+        assert_eq!(pinned[1], format!("{:#x}", 50_824_870u64));
+        assert_ne!(pinned[1], "pending", "a quoted block must not fall back");
         assert_eq!(p[0]["validation"], true);
         let call = &p[0]["blockStateCalls"][0]["calls"][0];
         assert_eq!(call["data"], "0xdead");

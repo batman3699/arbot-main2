@@ -14523,6 +14523,9 @@ async fn launch_chain_runtime(
                                             // costs, which is the number a
                                             // broadcast should be sized from.
                                             preconf_sim_gas(sized.adjusted_cycle_gas),
+                                            // The block the quotes and the
+                                            // min_out floors came from.
+                                            Some(snap.block_number),
                                         )
                                         .await
                                     {
