@@ -14188,10 +14188,22 @@ async fn launch_chain_runtime(
             dropped = starts.len().saturating_sub(fundable.len()),
             "base fast path cycle starts restricted to flash-fundable tokens"
         );
+        // The default 20,000 cap TRUNCATED once the UniV3 inventory grew to
+        // 1,130 pools: which cycles survive then depends on enumeration order,
+        // not on which are worth trading. Raised for the fast path only -- the
+        // scan keeps the default -- and the log still reports `truncated` so a
+        // silent cut stays impossible.
+        let fast_index_cycles =
+            crate::util::env_parse_opt::<usize>("ARBOT_BASE_FAST_MAX_INDEX_CYCLES")
+                .filter(|v| *v > 0)
+                .unwrap_or(120_000);
         let fast_index = crate::cycle_index::CycleIndex::build(
             &uni,
             &fundable,
-            crate::cycle_index::CycleIndexLimits::default(),
+            crate::cycle_index::CycleIndexLimits {
+                max_cycles: fast_index_cycles,
+                ..crate::cycle_index::CycleIndexLimits::default()
+            },
         );
         info!(
             cycles = fast_index.len(),
