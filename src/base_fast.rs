@@ -1271,14 +1271,22 @@ pub fn live_edge(hop: LiveHop<'_>, live: &LiveState) -> Option<crate::graph::Edg
         return None;
     }
 
+    // The REAL marginal rate, not a placeholder. `cycle_input_capacity`
+    // projects each hop's max_input back into start-token units through these,
+    // BEFORE anything is requoted -- so a 1:1 stand-in does not merely lose
+    // precision, it converts across decimals wrongly. A USDC-denominated
+    // capacity (6 decimals) projected at 1:1 against WETH (18) collapses to a
+    // near-zero WETH figure, `trade_cap` lands under min_flash_loan, and the
+    // candidate is refused as no_flashloan_capacity. That was 202 of 363
+    // rejections on 2026-09-03, and my earlier comment here claimed the
+    // opposite -- that sizing requotes so the value never mattered.
+    let (rate_num, rate_den) = rate_pair(hop_rate(live, pool, meta, from, to, 0.0)?)?;
+
     Some(crate::graph::Edge {
         from,
         to,
-        // A placeholder ratio. Sizing requotes every hop on chain, so this is
-        // never the number a trade is judged on -- but it must not be zero,
-        // which would read as an impossible edge.
-        rate_num: U256::one(),
-        rate_den: U256::one(),
+        rate_num,
+        rate_den,
         venue: venue_edge,
         estimated_gas,
         // Search weight, unused downstream of the search this route skipped.
@@ -1354,6 +1362,26 @@ impl LiveRouter {
         cycle.push(cycle[0]);
         Some((g, crate::graph::IndexedCycle { cycle, edge_indices }))
     }
+}
+
+/// A hop's rate as an exact `U256` fraction.
+///
+/// Kept as a PAIR rather than a scaled integer so neither direction underflows:
+/// a rate far below one would floor to zero as `r * 1e18` for small `r`, and a
+/// rate far above one would overflow the same scaling. Above one the numerator
+/// carries the magnitude, below one the denominator does.
+fn rate_pair(q: HopQuote) -> Option<(U256, U256)> {
+    let r = q.num / q.den;
+    if !r.is_finite() || r <= 0.0 {
+        return None;
+    }
+    const SCALE: f64 = 1e18;
+    let (n, d) = if r >= 1.0 {
+        (f64_to_u256(r * SCALE), f64_to_u256(SCALE))
+    } else {
+        (f64_to_u256(SCALE), f64_to_u256(SCALE / r))
+    };
+    (!n.is_zero() && !d.is_zero()).then_some((n, d))
 }
 
 /// Saturating `f64` to `U256` for a capacity bound.
@@ -4174,6 +4202,13 @@ mod tests {
 
     // ---- live routes ----
 
+    /// A CL pool as production sees it: state anchored, so it has a price.
+    /// `live_edge` refuses an edge it cannot rate, which is why every routing
+    /// test has to seed first.
+    fn seed_cl(live: &LiveState, pool: Address) {
+        assert!(live.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000_000, 0));
+    }
+
     fn cl_meta_at(t0: Address, t1: Address) -> PoolMeta {
         PoolMeta {
             token0: t0, token1: t1, fee_ppm: 500,
@@ -4201,6 +4236,8 @@ mod tests {
             venues: Arc::new(venues),
         };
         let live = LiveState::new();
+        seed_cl(&live, p_a);
+        seed_cl(&live, p_b);
 
         let (g, ic) = router
             .route(&[t0, t1], &[p_a, p_b], &meta, &live)
@@ -4238,6 +4275,7 @@ mod tests {
             )])),
         };
         let live = LiveState::new();
+        seed_cl(&live, pool);
         let (g, ic) = router
             .route(&[t0, t1], &[pool, pool], &meta, &live)
             .expect("routable");
@@ -4348,6 +4386,8 @@ mod tests {
             ])),
         };
         let live = LiveState::new();
+        seed_cl(&live, aero);
+        seed_cl(&live, pancake);
         let (g, ic) = router
             .route(&[t0, t1], &[aero, pancake], &meta, &live)
             .expect("both hops buildable");
@@ -4372,6 +4412,7 @@ mod tests {
         let pool = addr(10);
         let meta = dashmap::DashMap::from_iter([(pool, cl_meta_at(t0, t1))]);
         let live = LiveState::new();
+        seed_cl(&live, pool);
 
         let builtin = LiveRouter {
             venues: Arc::new(std::collections::HashMap::from([(
@@ -4466,5 +4507,55 @@ mod tests {
         ).expect("buildable").max_input;
         assert_eq!(mk(t0, t1), crate::venues::edge_capacity_from_reserve(r0));
         assert_eq!(mk(t1, t0), crate::venues::edge_capacity_from_reserve(r1));
+    }
+
+    /// The projection bug. `cycle_input_capacity` converts each hop's max_input
+    /// back to start-token units through the edge rates, BEFORE any requote, so
+    /// a 1:1 placeholder converts across decimals wrongly -- a USDC capacity (6
+    /// decimals) becomes a near-zero WETH figure and the candidate is refused
+    /// for want of flash-loan capacity it actually has.
+    #[test]
+    fn an_edge_carries_its_real_rate_not_a_placeholder() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let live = LiveState::new();
+        // 1 WETH-ish : 2400 USDC-ish, i.e. rate 2400 with matching decimals.
+        assert!(live.anchor_v2(pool, 100, crate::quote_univ2::UniV2PairState {
+            token0: t0, token1: t1,
+            reserve0: U256::exp10(18), reserve1: U256::from(2_400u64) * U256::exp10(18),
+        }));
+        let m = PoolMeta {
+            token0: t0, token1: t1, fee_ppm: 0,
+            kind: PoolKind::ConstantProduct, verified: true,
+            confirmed_at: Some(Instant::now()), balances: None,
+        };
+        let e = live_edge(
+            LiveHop {
+                venue: FastVenue::Solidly { stable: false, fee_bps: 0, decimals0: 18, decimals1: 18 },
+                pool, meta: &m, from: t0, to: t1,
+            },
+            &live,
+        )
+        .expect("buildable");
+        assert!(e.rate_num > e.rate_den, "t0->t1 pays out 2400x, so num must exceed den");
+        // ~2400, within float tolerance of the fixed-point pair.
+        let ratio = e.rate_num.as_u128() as f64 / e.rate_den.as_u128() as f64;
+        assert!((ratio - 2_400.0).abs() < 1.0, "got {ratio}");
+        assert_ne!((e.rate_num, e.rate_den), (U256::one(), U256::one()));
+    }
+
+    /// Neither direction may collapse. A rate far below one would floor to zero
+    /// under a single scaling, and a rate far above one would overflow it, so
+    /// the magnitude moves between numerator and denominator instead.
+    #[test]
+    fn a_rate_pair_survives_both_extremes() {
+        let mk = |num: f64| rate_pair(HopQuote { pool: Address::zero(), num, den: 1.0, cap_out: 1.0 });
+        let (n, d) = mk(1e-12).expect("tiny rate");
+        assert!(!n.is_zero() && !d.is_zero(), "a tiny rate must not floor to zero");
+        assert!(d > n, "below one, the denominator carries it");
+        let (n, d) = mk(1e12).expect("huge rate");
+        assert!(!n.is_zero() && !d.is_zero());
+        assert!(n > d, "above one, the numerator carries it");
+        assert!(mk(0.0).is_none() && mk(f64::NAN).is_none());
     }
 }
