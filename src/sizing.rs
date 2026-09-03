@@ -242,6 +242,10 @@ where
     slipstream_quoter: Option<&'a SlipstreamQuoter<C>>,
     pancakeswap_quoter: Option<&'a UniQuoter<C>>,
     pancakeswap_pools: Option<&'a HashSet<Address>>,
+    /// pool -> the quoter that indexes it, for UniV3 forks sharing the
+    /// Slipstream branch. Absent means "use the one configured quoter", which
+    /// is correct only when a single fork venue is enabled.
+    slipstream_quoters: Option<&'a HashMap<Address, Address>>,
     bal_quote: &'a BalQuote<C>,
     curve_quote: &'a CurveQuote<C>,
     cache: &'a Mutex<HashMap<QuoteKey, QuoteValue>>,
@@ -394,13 +398,31 @@ where
                 block,
             }
         }
-        crate::graph::VenueEdge::Slipstream { path, .. } => {
+        crate::graph::VenueEdge::Slipstream { path, pool, .. } => {
             let slipstream = ctx.slipstream_quoter?;
             ctx.quote_count.fetch_add(1, Ordering::Relaxed);
-            let out = slipstream
-                .quote_path(path.clone(), amount_in, block)
-                .await
-                .ok()?;
+            // Each fork's quoter indexes only its OWN pools, so asking the
+            // wrong one is not an inaccurate quote -- it is a question about a
+            // pool that contract has never seen, and it reverts.
+            let out = match ctx.slipstream_quoters.and_then(|m| m.get(pool).copied()) {
+                Some(addr) => slipstream
+                    .quote_path_at(addr, path.clone(), amount_in, block)
+                    .await,
+                None => slipstream.quote_path(path.clone(), amount_in, block).await,
+            };
+            let out = match out {
+                Ok(v) => v,
+                Err(err) => {
+                    warn!(
+                        target: "arb_exec::latency",
+                        error = %err,
+                        pool = %format!("{pool:#x}"),
+                        amount_in = %amount_in,
+                        "slipstream quote failed"
+                    );
+                    return None;
+                }
+            };
             let expected = mul_div(amount_in, edge.rate_num, edge.rate_den);
             QuoteValue {
                 amount_out: out,
@@ -736,6 +758,7 @@ where
     pub slipstream_quoter: Option<&'a SlipstreamQuoter<C>>,
     pub pancakeswap_quoter: Option<&'a UniQuoter<C>>,
     pub pancakeswap_pools: Option<&'a HashSet<Address>>,
+    pub slipstream_quoters: Option<&'a HashMap<Address, Address>>,
     pub bal_quote: &'a BalQuote<C>,
     pub curve_quote: &'a CurveQuote<C>,
     pub block_number: U64,
@@ -840,6 +863,7 @@ where
                     slipstream_quoter: params.slipstream_quoter,
                     pancakeswap_quoter: params.pancakeswap_quoter,
                     pancakeswap_pools: params.pancakeswap_pools,
+                    slipstream_quoters: params.slipstream_quoters,
                     bal_quote: params.bal_quote,
                     curve_quote: params.curve_quote,
                     cache: cache.as_ref(),
@@ -912,6 +936,7 @@ where
                     slipstream_quoter: params.slipstream_quoter,
                     pancakeswap_quoter: params.pancakeswap_quoter,
                     pancakeswap_pools: params.pancakeswap_pools,
+                    slipstream_quoters: params.slipstream_quoters,
                     bal_quote: params.bal_quote,
                     curve_quote: params.curve_quote,
                     cache: cache.as_ref(),
@@ -1041,6 +1066,7 @@ mod tests {
             slipstream_quoter: None,
             pancakeswap_quoter: None,
             pancakeswap_pools: None,
+            slipstream_quoters: None,
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number: U64::zero(),
@@ -1094,6 +1120,7 @@ mod tests {
             slipstream_quoter: None,
             pancakeswap_quoter: None,
             pancakeswap_pools: None,
+            slipstream_quoters: None,
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number: U64::zero(),
@@ -1138,6 +1165,7 @@ mod tests {
             slipstream_quoter: None,
             pancakeswap_quoter: None,
             pancakeswap_pools: None,
+            slipstream_quoters: None,
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             block_number: U64::zero(),
@@ -1188,6 +1216,7 @@ mod tests {
             slipstream_quoter: None,
             pancakeswap_quoter: None,
             pancakeswap_pools: None,
+            slipstream_quoters: None,
             bal_quote: &bal_quote,
             curve_quote: &curve_quote,
             cache: &cache,

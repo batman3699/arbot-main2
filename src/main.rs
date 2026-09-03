@@ -1120,6 +1120,20 @@ fn venue_router_by_name(
     venue.router.as_ref()?.parse().ok()
 }
 
+/// A venue's own quoter, by NAME. Same reasoning as `venue_router_by_name`.
+fn venue_quoter_by_name(
+    ops_inputs: &crate::ops_inputs::OpsInputs,
+    chain_name: &str,
+    venue_name: &str,
+) -> Option<Address> {
+    let chain = ops_inputs.chain_inputs(chain_name)?;
+    let venue = chain
+        .venues
+        .iter()
+        .find(|v| v.name.eq_ignore_ascii_case(venue_name))?;
+    venue.quoter.as_ref()?.parse().ok()
+}
+
 fn resolve_slipstream_venue(
     ops_inputs: &crate::ops_inputs::OpsInputs,
     chain_name: &str,
@@ -3337,6 +3351,7 @@ where
     hot_slipstream_pools: Arc<tokio::sync::RwLock<Vec<PoolRecord>>>,
     slipstream_quoter_addr: Address,
     slipstream_factory: Address,
+    cl_quoter_by_pool: Arc<HashMap<Address, Address>>,
     slipstream_router: Address,
     slipstream_validation: Option<UniV3ValidationConfig>,
     slipstream_tick_spacings: Option<Arc<HashSet<u32>>>,
@@ -3543,6 +3558,10 @@ where
     /// one is a "no information" sentinel and would rank a worthless token's
     /// large numbers above a valuable token's small ones.
     token_native_prices: crate::base_fast::Published<crate::base_fast::TokenPrices>,
+    /// pool -> the quoter that indexes it, for UniV3 forks that share the
+    /// Slipstream quote path. Built where venue identity is still known; one
+    /// quoter for several deployments asks each about the others' pools.
+    cl_quoter_by_pool: Arc<HashMap<Address, Address>>,
     /// Long-lived tick-ladder cache for the multi-tick CL simulator
     /// (`ARBOT_CL_MULTI_TICK`). Built once here and reused across every
     /// `scan_once()` call for this chain, so `CachedTickSource`'s epoch cache
@@ -3685,6 +3704,7 @@ where
             slipstream_quoter_addr,
             slipstream_factory,
             slipstream_router,
+            cl_quoter_by_pool,
             slipstream_validation,
             slipstream_tick_spacings,
             hot_pancakeswap_pools,
@@ -3907,6 +3927,7 @@ where
             graph_snapshot: Arc::new(StdMutex::new(None)),
             prep_context: Arc::new(StdMutex::new(None)),
             token_native_prices: Arc::new(StdMutex::new(None)),
+            cl_quoter_by_pool: cl_quoter_by_pool.clone(),
             cl_tick_cache,
         }
     }
@@ -6167,6 +6188,11 @@ where
                 None
             } else {
                 Some(&pancakeswap_pool_set)
+            },
+            slipstream_quoters: if self.cl_quoter_by_pool.is_empty() {
+                None
+            } else {
+                Some(self.cl_quoter_by_pool.as_ref())
             },
             bal_quote: self.bal_quote.as_ref(),
             curve_quote: self.curve_quote.as_ref(),
@@ -13058,6 +13084,9 @@ async fn launch_chain_runtime(
     // Declared out here so the drain can be spawned AFTER the runner exists:
     // it needs the runner's graph snapshot, and the monitor is built first.
     let mut base_fast_drain: Option<BaseFastDrain> = None;
+    // Declared out here so RunnerConfig can carry it: it is built inside the
+    // pool-monitor block, where venue identity is still known.
+    let mut cl_quoter_by_pool: HashMap<Address, Address> = HashMap::new();
     let pool_monitor = {
         let poll_ms = crate::util::env_parse_opt::<u64>("POOL_MONITOR_POLL_MS")
             .unwrap_or(1_200);
@@ -13125,6 +13154,9 @@ async fn launch_chain_runtime(
             "base fast path venue routers"
         );
         let mut fast_venues: HashMap<Address, crate::base_fast::FastVenue> = HashMap::new();
+        // pool -> the quoter that indexes it. Each UniV3 fork's quoter knows
+        // only its own pools, so one quoter across several deployments asks
+        // each about the others' -- which reverts, not merely misprices.
         // One rule, no per-venue special cases: a pool may use the executor's
         // BUILT-IN UniV3 router only if that is genuinely its venue's router.
         // `StepData::Uniswap` carries no target, so the executor chooses --
@@ -13148,6 +13180,12 @@ async fn launch_chain_runtime(
                 let venue_router =
                     venue_router_by_name(ops_inputs, &cfg.name, venue_name)
                         .unwrap_or_else(Address::zero);
+                let venue_quoter = venue_quoter_by_name(ops_inputs, &cfg.name, venue_name);
+                if let Some(q) = venue_quoter {
+                    for r in records.iter() {
+                        cl_quoter_by_pool.insert(r.pool, q);
+                    }
+                }
                 let explicit = venue_router != builtin_univ3_router && !venue_router.is_zero();
                 info!(
                     venue = %venue_name,
@@ -14003,7 +14041,13 @@ async fn launch_chain_runtime(
         "resolved flash-swap borrow pools"
     );
 
+    let cl_quoter_by_pool = Arc::new(cl_quoter_by_pool);
+    info!(
+        pools = cl_quoter_by_pool.len(),
+        "cl pools with a venue-specific quoter"
+    );
     let runner_config = RunnerConfig {
+        cl_quoter_by_pool: cl_quoter_by_pool.clone(),
         univ2_flash_pool,
         univ2_flash_fee_bps,
         univ3_flash_pool,

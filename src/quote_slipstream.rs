@@ -76,6 +76,34 @@ where
         }
     }
 
+    /// As [`Self::quote_path`], but against a DIFFERENT quoter contract.
+    ///
+    /// Several UniV3 forks share this code path -- Aerodrome Slipstream, its v3
+    /// deployment, PancakeSwap V3 -- and each indexes only its own pools. Asking
+    /// one about another's pool is not a quote that returns a bad number; it is
+    /// a quote for a pool that contract has never heard of. Measured 2026-09-03:
+    /// 646 `cycle unquotable` events in five minutes, all on this branch.
+    ///
+    /// The provider and cache stay this instance's; only the address moves.
+    pub async fn quote_path_at(
+        &self,
+        quoter: Address,
+        path: Vec<(Address, Option<u32>)>,
+        amount_in: U256,
+        block: U64,
+    ) -> Result<U256> {
+        cl_quote_path(
+            &self.provider,
+            quoter,
+            &self.cache,
+            path,
+            amount_in,
+            block,
+            "slipstream quoter (per-venue)",
+        )
+        .await
+    }
+
     pub async fn quote_path(
         &self,
         path: Vec<(Address, Option<u32>)>,
