@@ -1134,6 +1134,48 @@ fn venue_quoter_by_name(
     venue.quoter.as_ref()?.parse().ok()
 }
 
+fn venue_factory_by_name(
+    ops_inputs: &crate::ops_inputs::OpsInputs,
+    chain_name: &str,
+    venue_name: &str,
+) -> Option<Address> {
+    let chain = ops_inputs.chain_inputs(chain_name)?;
+    let venue = chain
+        .venues
+        .iter()
+        .find(|v| v.name.eq_ignore_ascii_case(venue_name))?;
+    venue.factory.as_ref()?.parse().ok()
+}
+
+/// The factory selector Aerodrome's shared CL quoter reads out of the path.
+///
+/// That quoter (0xCd2A7D98..) serves THREE factories and picks between them
+/// using the high bits of the path's int24 field, masking them off with
+/// `~0x180000` afterwards to recover the real tick spacing. A path carrying a
+/// bare tick spacing therefore selects the fall-through factory, derives a
+/// pool address with no code, and reverts with no data.
+///
+/// Verified on chain 2026-09-04 against pool
+/// 0x4e506648d493c8870f55e870480f92f2f33ece51 (WETH/AERO, tick spacing 200,
+/// factory 0xf8f2eB49..), quoting 0.1 WETH:
+///   path field 0x0000c8  -> execution reverted
+///   path field 0x0800c8  -> 492.8 AERO
+/// That one pool produced 198 of the 198 quote failures in a 75-second run and
+/// sat on hop 0 of the top-ranked cycles, so every one of them was unquotable.
+fn slipstream_factory_flag(factory: Address) -> u32 {
+    const SLIPSTREAM_V3: &str = "f8f2eb4940cfe7d13603dddd87f123820fc061ef";
+    const SLIPSTREAM: &str = "5e7bb104d84c7cb9b682aac2f3d509f5f406809a";
+    let hex = hex::encode(factory.as_bytes());
+    if hex == SLIPSTREAM_V3 {
+        0x08_0000
+    } else if hex == SLIPSTREAM {
+        0x10_0000
+    } else {
+        // The third factory is the fall-through case and takes no flag.
+        0
+    }
+}
+
 fn resolve_slipstream_venue(
     ops_inputs: &crate::ops_inputs::OpsInputs,
     chain_name: &str,
@@ -10467,6 +10509,34 @@ mod runner_tests {
         );
     }
 
+    /// The path's int24 field selects the factory, and a bare tick spacing
+    /// picks the wrong one.
+    ///
+    /// Verified on chain against pool 0x4e506648..d, WETH/AERO, tick spacing
+    /// 200, factory 0xf8f2eB49.., quoting 0.1 WETH through quoter 0xCd2A7D98..:
+    /// `0x0000c8` reverted, `0x0800c8` returned 492.8 AERO. That single pool
+    /// produced every one of 198 quote failures in a 75-second run.
+    #[test]
+    fn the_cl_path_field_carries_aerodromes_factory_selector() {
+        let v3: Address = "0xf8f2eB4940CFE7d13603DDDD87f123820Fc061Ef".parse().unwrap();
+        let slipstream: Address = "0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A".parse().unwrap();
+        let univ3: Address = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD".parse().unwrap();
+
+        assert_eq!(slipstream_factory_flag(v3), 0x08_0000);
+        assert_eq!(slipstream_factory_flag(slipstream), 0x10_0000);
+        // Anything not in the family takes no flag, so the OR is a no-op and
+        // UniV3 and Pancake paths keep carrying a bare fee tier.
+        assert_eq!(slipstream_factory_flag(univ3), 0);
+
+        // The composed field is what the quoter actually accepted.
+        assert_eq!(200u32 | slipstream_factory_flag(v3), 0x0800c8);
+        // And the flag must not disturb the tick spacing the quoter recovers.
+        assert_eq!((200u32 | slipstream_factory_flag(v3)) & !0x18_0000, 200);
+        // Case must not decide it: config addresses are checksummed.
+        let lower: Address = "0xf8f2eb4940cfe7d13603dddd87f123820fc061ef".parse().unwrap();
+        assert_eq!(slipstream_factory_flag(lower), 0x08_0000);
+    }
+
     #[tokio::test]
     async fn ensure_contract_deployed_accepts_code() {
         let (provider, mock) = Provider::mocked();
@@ -13191,6 +13261,18 @@ async fn launch_chain_runtime(
                     venue_router_by_name(ops_inputs, &cfg.name, venue_name)
                         .unwrap_or_else(Address::zero);
                 let venue_quoter = venue_quoter_by_name(ops_inputs, &cfg.name, venue_name);
+                // Only meaningful for the shared Aerodrome CL quoter, and zero
+                // for everything else, so it is safe to OR in unconditionally.
+                let path_flag = venue_factory_by_name(ops_inputs, &cfg.name, venue_name)
+                    .map(slipstream_factory_flag)
+                    .unwrap_or(0);
+                if path_flag != 0 {
+                    info!(
+                        venue = %venue_name,
+                        flag = %format!("{path_flag:#08x}"),
+                        "CL path field carries a factory selector for this venue"
+                    );
+                }
                 if let Some(q) = venue_quoter {
                     for r in records.iter() {
                         cl_quoter_by_pool.insert(r.pool, q);
@@ -13222,7 +13304,7 @@ async fn launch_chain_runtime(
                         // spacing for Slipstream. Both occupy the same path
                         // field and each router reads its own meaning.
                         crate::base_fast::FastVenue::RoutedCl {
-                            path_param: r.fee,
+                            path_param: r.fee | path_flag,
                             router: venue_router,
                         }
                     },
