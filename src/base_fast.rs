@@ -1820,6 +1820,7 @@ pub fn simulate_v1_params(
     to: Address,
     data: &[u8],
     max_fee_per_gas: u128,
+    gas_limit: u64,
 ) -> Value {
     json!([
         {
@@ -1829,6 +1830,15 @@ pub fn simulate_v1_params(
                     "to": format!("{to:#x}"),
                     "data": format!("0x{}", hex::encode(data)),
                     "maxFeePerGas": format!("{max_fee_per_gas:#x}"),
+                    // REQUIRED under `validation: true`. Omitting it makes the
+                    // node default to the BLOCK gas limit and then check the
+                    // sender can pay for all of it: measured 2026-09-04, that
+                    // demanded 0.402278 ETH against a wallet holding 0.001506
+                    // and the simulation never ran, so `sim_ok` could never
+                    // leave zero no matter what the candidate was. The real
+                    // cost of this cycle is 420k gas, three orders of
+                    // magnitude below Base's block limit.
+                    "gas": format!("{gas_limit:#x}"),
                 }],
                 "stateOverrides": {},
             }],
@@ -2392,10 +2402,11 @@ impl BaseFastPath {
         to: Address,
         data: &[u8],
         max_fee_per_gas: u128,
+        gas_limit: u64,
     ) -> Option<(PreconfSimResult, Duration)> {
         let http = self.sim_http.as_ref()?;
         let started = Instant::now();
-        let params = simulate_v1_params(from, to, data, max_fee_per_gas);
+        let params = simulate_v1_params(from, to, data, max_fee_per_gas, gas_limit);
         match simulate_preconf(http, params).await {
             Ok(r) => Some((r, started.elapsed())),
             Err(e) => {
@@ -3216,12 +3227,21 @@ mod tests {
     /// transaction would actually be accepted.
     #[test]
     fn the_simulation_targets_preconfirmed_state_with_validation_on() {
-        let p = simulate_v1_params(addr(1), addr(2), &[0xde, 0xad], 1_000_000_000);
+        let p = simulate_v1_params(addr(1), addr(2), &[0xde, 0xad], 1_000_000_000, 420_000);
         assert_eq!(p[1], "pending", "simulating against latest measures the past");
         assert_eq!(p[0]["validation"], true);
         let call = &p[0]["blockStateCalls"][0]["calls"][0];
         assert_eq!(call["data"], "0xdead");
         assert!(call["maxFeePerGas"].as_str().unwrap().starts_with("0x"));
+        // The gas limit must be SENT. Without it the node substitutes the block
+        // gas limit and `validation: true` then requires the sender to hold
+        // fees for all of it -- measured 2026-09-04 as a demand for 0.402278
+        // ETH against a wallet holding 0.001506, which stopped every
+        // simulation before it ran.
+        assert_eq!(call["gas"], "0x668a0");
+        assert_eq!(u64::from_str_radix(
+            call["gas"].as_str().unwrap().trim_start_matches("0x"), 16
+        ).unwrap(), 420_000);
     }
 
     #[test]

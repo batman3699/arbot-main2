@@ -14412,7 +14412,13 @@ async fn launch_chain_runtime(
                                         .min(U256::from(u128::MAX))
                                         .as_u128();
                                     if let Some((r, took)) = fast_sim
-                                        .simulate_candidate(from, to, &data, max_fee)
+                                        .simulate_candidate(
+                                            from,
+                                            to,
+                                            &data,
+                                            max_fee,
+                                            sized.adjusted_cycle_gas,
+                                        )
                                         .await
                                     {
                                         report.sim_micros = report
