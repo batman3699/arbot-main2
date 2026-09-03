@@ -566,6 +566,15 @@ where
         max_slippage = max_slippage.max(quote.slippage_bps);
     }
 
+    crate::util::GRID_SAMPLES_ATTEMPTED.fetch_add(attempted, Ordering::Relaxed);
+    crate::util::GRID_SAMPLES_REFUSED.fetch_add(refused, Ordering::Relaxed);
+    let survivors = attempted.saturating_sub(refused);
+    if survivors == 1 {
+        crate::util::GRID_HOPS_SINGLE_SAMPLE.fetch_add(1, Ordering::Relaxed);
+    } else if refused == 0 {
+        crate::util::GRID_HOPS_INTACT.fetch_add(1, Ordering::Relaxed);
+    }
+
     // Only a grid where NOTHING quoted is unquotable.
     let Some(quote) = current_quote.or(fallback) else {
         if refused > 0 {

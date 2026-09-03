@@ -756,6 +756,21 @@ pub async fn connect_ws_provider_with_fallbacks(
     }
 }
 
+/// How wide the surviving quote grid actually is, process-wide.
+///
+/// The question these answer: when a candidate is rejected as
+/// `no_profitable_size`, did the sizer choose from a full grid or from a stub?
+/// A grid where four of five probes revert leaves the search picking among the
+/// smallest sizes only, and "no profitable size" then describes the probe range
+/// rather than the market. Measured 2026-09-03: 11,125 refusals in five
+/// minutes, which is too many to assume the range was intact.
+pub static GRID_SAMPLES_ATTEMPTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static GRID_SAMPLES_REFUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Hops that quoted, but on only ONE surviving sample.
+pub static GRID_HOPS_SINGLE_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Hops that quoted on a full grid, nothing refused.
+pub static GRID_HOPS_INTACT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2469,6 +2469,17 @@ impl BaseFastPath {
                     prep_sized = prep_sized.load(Ordering::Relaxed),
                     prep_rejected = prep_rejected.load(Ordering::Relaxed),
                     prep_no_context = prep_no_context.load(Ordering::Relaxed),
+                    // How wide the surviving quote grid is. A `no_profitable_size`
+                    // verdict reached from a stub grid describes the probe range,
+                    // not the market.
+                    grid_attempted =
+                        crate::util::GRID_SAMPLES_ATTEMPTED.load(Ordering::Relaxed),
+                    grid_refused =
+                        crate::util::GRID_SAMPLES_REFUSED.load(Ordering::Relaxed),
+                    grid_hops_intact =
+                        crate::util::GRID_HOPS_INTACT.load(Ordering::Relaxed),
+                    grid_hops_single =
+                        crate::util::GRID_HOPS_SINGLE_SAMPLE.load(Ordering::Relaxed),
                     sim_ok = sim_ok.load(Ordering::Relaxed),
                     sim_failed = sim_failed.load(Ordering::Relaxed),
                     mean_sim_us = sim_micros.load(Ordering::Relaxed)
