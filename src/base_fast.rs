@@ -158,6 +158,12 @@ pub struct BaseFastPath {
     verify_ttl: Duration,
     /// Pools re-read per verification pass.
     verify_batch: usize,
+    /// The probe size and price table the drain last priced with.
+    ///
+    /// Published so `reprice_now` can reproduce the detector's pricing exactly.
+    /// Re-pricing at the margin against a gross measured at size compares two
+    /// different quantities and reports the difference as movement.
+    pricing: PricingSnapshot,
     pub stats: Arc<FastPathStats>,
 }
 
@@ -195,6 +201,7 @@ impl BaseFastPath {
             verify_batch: crate::util::env_parse_opt::<usize>("ARBOT_BASE_FAST_VERIFY_BATCH")
                 .filter(|v| *v > 0)
                 .unwrap_or(64),
+            pricing: Arc::new(StdMutex::new(None)),
             stats: Arc::new(FastPathStats::default()),
         }
     }
@@ -1584,6 +1591,9 @@ pub type Published<T> = Arc<StdMutex<Option<Arc<T>>>>;
 /// Native (wei) per RAW unit of each token.
 pub type TokenPrices = std::collections::HashMap<Address, f64>;
 
+/// What the drain last priced with: its price table and its probe size.
+pub type PricingSnapshot = Arc<StdMutex<Option<(Option<Arc<TokenPrices>>, f64)>>>;
+
 /// Where a drain's ranked candidates go.
 ///
 /// The router builds the executable route from the pools that were PRICED; the
@@ -2187,17 +2197,36 @@ impl BaseFastPath {
     /// gone by the time we could act, the constraint is latency and no amount
     /// of extra pools or cleverer ranking changes that.
     ///
+    /// Priced at the SAME probe size the drain last used, not at the margin.
+    /// The marginal rate reads systematically higher -- 80.6% of reported gross
+    /// on 2026-09-03 -- so comparing a marginal "now" against a sized
+    /// "detection" reports that gap as a gain on every single cycle.
+    ///
     /// Local state only, so it costs no RPC and adds nothing to the very
-    /// latency it is measuring.
+    /// latency it is measuring. `None` before the first drain has priced
+    /// anything, or when a pool has gone stale since detection.
     pub fn reprice_now(&self, tokens: &[Address], pools: &[Address]) -> Option<f64> {
         if tokens.len() < 2 || pools.len() != tokens.len() {
             return None;
         }
+        let (prices, ref_native) = self.pricing.lock().ok().and_then(|g| g.clone())?;
+        let ctx = PricingCtx {
+            fresh: self.freshness(),
+            select: HopSelect::BestNet,
+            prices: prices.as_deref(),
+            ref_native,
+        };
         let mut product = 1.0f64;
         for i in 0..tokens.len() {
             let (from, to) = (tokens[i], tokens[(i + 1) % tokens.len()]);
             let meta = *self.pool_tokens.get(&pools[i])?;
-            let q = hop_rate(&self.live, pools[i], &meta, from, to, 0.0)?;
+            // A pool that went stale between detection and now cannot answer
+            // the question; reporting its last snapshot as "current" would
+            // manufacture a zero reading out of a missing one.
+            if !ctx.fresh.allows(meta.confirmed_at) {
+                return None;
+            }
+            let q = hop_rate(&self.live, pools[i], &meta, from, to, ctx.reference_in(from))?;
             if !q.den.is_finite() || q.den <= 0.0 {
                 return None;
             }
@@ -2386,6 +2415,9 @@ impl BaseFastPath {
                     prices: px.as_deref(),
                     ref_native,
                 };
+                if let Ok(mut g) = self.pricing.lock() {
+                    *g = Some((px.clone(), ref_native));
+                }
                 let (priced, unpriceable, basis) = price_touched(
                     &idx,
                     &out.cycles,
@@ -4722,6 +4754,9 @@ mod tests {
         // a: 1 t0 -> 2 t1.  b: 2 t1 -> 1.02 t0.  Round trip is +2%.
         assert!(anchor(a, 100, 200, 100));
         assert!(anchor(b, 102, 200, 100));
+        // Marginal, matching a drain that priced at the margin. The point of
+        // the field is that BOTH sides use whatever the drain used.
+        *f.pricing.lock().unwrap() = Some((None, 0.0));
         let before = f.reprice_now(&[t0, t1], &[a, b]).expect("priced");
         assert!((before - 200.0).abs() < 1.0, "expected ~200 bps, got {before}");
 
@@ -4738,7 +4773,43 @@ mod tests {
     #[test]
     fn repricing_an_unknown_pool_reports_nothing() {
         let (f, _t) = fast(vec![addr(10)]);
+        *f.pricing.lock().unwrap() = Some((None, 0.0));
         assert!(f.reprice_now(&[addr(1), addr(2)], &[addr(99), addr(98)]).is_none());
         assert!(f.reprice_now(&[addr(1)], &[addr(99)]).is_none(), "not a loop");
+    }
+
+    /// Before the drain has priced anything there is no probe size to reproduce.
+    ///
+    /// Falling back to the margin here is exactly the bug this field exists to
+    /// prevent: it would silently compare a marginal rate against a gross
+    /// measured at size and report the difference as decay. Measured on the
+    /// first instrumented run, that read as a gain on 78 of 78 cycles.
+    #[test]
+    fn repricing_before_the_first_drain_reports_nothing() {
+        let (t0, t1) = (addr(1), addr(2));
+        let (a, b) = (addr(10), addr(11));
+        let (f, _t) = fast(vec![a, b]);
+        let f = f.with_pool_tokens(std::collections::HashMap::from([
+            (a, PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
+                           kind: PoolKind::ConstantProduct, verified: true,
+                           confirmed_at: Some(Instant::now()), balances: None }),
+            (b, PoolMeta { token0: t0, token1: t1, fee_ppm: 0,
+                           kind: PoolKind::ConstantProduct, verified: true,
+                           confirmed_at: Some(Instant::now()), balances: None }),
+        ]));
+        let anchor = |pool, r0: u64, r1: u64| {
+            f.live.anchor_v2(pool, 100, crate::quote_univ2::UniV2PairState {
+                token0: t0, token1: t1,
+                reserve0: U256::from(r0) * U256::exp10(18),
+                reserve1: U256::from(r1) * U256::exp10(18),
+            })
+        };
+        assert!(anchor(a, 100, 200));
+        assert!(anchor(b, 102, 200));
+        // Fully priceable state, and still no reading: the missing input is
+        // the probe size, not the pools.
+        assert!(f.reprice_now(&[t0, t1], &[a, b]).is_none());
+        *f.pricing.lock().unwrap() = Some((None, 0.0));
+        assert!(f.reprice_now(&[t0, t1], &[a, b]).is_some(), "priced once published");
     }
 }
