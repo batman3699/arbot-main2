@@ -1086,6 +1086,24 @@ where
         }
     }
 
+    // PROFITABILITY CENSUS. Off unless `ARBOT_CENSUS=1`.
+    //
+    // Sweeps a fixed logarithmic ladder of sizes over THIS route, quoting each
+    // for real, and writes one row per (route, size). It answers the only
+    // question that decides whether this system can earn: across every viable
+    // cycle, what is the maximum realised net profit over trade size?
+    //
+    // Deliberately NOT the search. The optimiser returns the best size and
+    // discards every other point, and a route that loses at 0.1 WETH and wins
+    // at 3 tells you nothing through a single verdict. Ranking on
+    // `max realised net` needs the whole curve.
+    //
+    // Returns None so nothing executes: this is a measurement pass.
+    if census_enabled() {
+        census_sweep(&params, &quote_cache, &quote_count_total, gas_cost).await;
+        return None;
+    }
+
     // FORCED ATTEMPT. Off unless `ARBOT_FORCE_ATTEMPT=1`.
     //
     // Every sizing refusal measured so far is `cycle output <= input`, so the
@@ -1161,6 +1179,156 @@ where
         quote_count: quote_count_total.load(Ordering::Relaxed),
         ..result
     })
+}
+
+/// Whether to run the profitability census instead of the sizing search.
+fn census_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("ARBOT_CENSUS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if on {
+            warn!(
+                path = %census_path(),
+                "ARBOT_CENSUS is set: sweeping trade sizes and recording net \
+                 profit. Nothing will execute."
+            );
+        }
+        on
+    })
+}
+
+fn census_path() -> String {
+    std::env::var("ARBOT_CENSUS_PATH").unwrap_or_else(|_| "/tmp/arbot_census.jsonl".to_string())
+}
+
+/// The size ladder, in NATIVE wei. Logarithmic, because the profit curve is.
+///
+/// A cycle's net is `out(x) - x - fixed`, which rises then falls: too small and
+/// the fixed costs dominate, too large and price impact does. A linear sweep
+/// spends its points where nothing changes; a log sweep finds the peak.
+const CENSUS_LADDER_NATIVE: [f64; 10] = [
+    1e15, 3e15, 1e16, 3e16, 1e17, 3e17, 1e18, 3e18, 1e19, 3e19,
+];
+
+/// Quote one route across the whole ladder and record what it really earns.
+async fn census_sweep<C>(
+    params: &OptimizeTradeParams<'_, C>,
+    cache: &Arc<Mutex<HashMap<QuoteKey, QuoteValue>>>,
+    quote_count: &Arc<AtomicUsize>,
+    gas_cost: U256,
+) where
+    C: JsonRpcClient + Clone + Send + Sync + 'static,
+{
+    use std::io::Write;
+
+    let route: Vec<String> = params
+        .edges
+        .iter()
+        .map(|e| {
+            format!(
+                "{{\"venue\":\"{}\",\"pool\":\"{:#x}\",\"from\":\"{:#x}\",\"to\":\"{:#x}\"}}",
+                venue_kind(e),
+                e.venue.pool_address().unwrap_or_default(),
+                e.from,
+                e.to
+            )
+        })
+        .collect();
+    let route_json = format!("[{}]", route.join(","));
+    let start = params.edges.first().map(|e| e.from).unwrap_or_default();
+
+    let mut rows = String::new();
+    for native in CENSUS_LADDER_NATIVE {
+        // The ladder is in native; the trade is denominated in the start token.
+        let Some(amount) = params
+            .native_price
+            .tokens_for_native_strict(U256::from(native as u128))
+        else {
+            continue;
+        };
+        if amount.is_zero() {
+            continue;
+        }
+        // Capacity is a fact about the pools and the loan, not a preference.
+        // A size nothing can fund is recorded as refused rather than skipped,
+        // because "no provider at 10 WETH" is itself part of the answer.
+        let provider = best_single_provider(amount, params.quotes);
+        let (flash_fee, provider_ok) = match &provider {
+            Some(sel) => (
+                flash_fee_for_provider(sel.provider, sel.amount, sel.fee_bps),
+                sel.amount >= amount,
+            ),
+            None => (U256::zero(), false),
+        };
+        let quoted = if provider_ok {
+            simulate_cycle_with_quotes(
+                amount,
+                params.edges,
+                params.block_number,
+                &QuoteContext {
+                    quoter: params.quoter,
+                    slipstream_quoter: params.slipstream_quoter,
+                    pancakeswap_quoter: params.pancakeswap_quoter,
+                    pancakeswap_pools: params.pancakeswap_pools,
+                    slipstream_quoters: params.slipstream_quoters,
+                    bal_quote: params.bal_quote,
+                    curve_quote: params.curve_quote,
+                    cache: cache.as_ref(),
+                    quote_count: quote_count.as_ref(),
+                },
+            )
+            .await
+        } else {
+            None
+        };
+
+        let (out, slip) = match quoted {
+            Some((o, s)) => (o, s),
+            None => {
+                rows.push_str(&format!(
+                    "{{\"route\":{route_json},\"hops\":{},\"start\":\"{start:#x}\",                     \"amount_in\":\"{amount}\",\"refused\":true,                     \"reason\":\"{}\"}}\n",
+                    params.edges.len(),
+                    if provider_ok { "unquotable" } else { "no_flash_capacity" },
+                ));
+                continue;
+            }
+        };
+        // Signed, because most of these lose and the loss is the finding.
+        let gross = i128::try_from(out.min(U256::from(u128::MAX)).as_u128()).unwrap_or(i128::MAX)
+            - i128::try_from(amount.min(U256::from(u128::MAX)).as_u128()).unwrap_or(i128::MAX);
+        let costs = i128::try_from(
+            flash_fee
+                .saturating_add(gas_cost)
+                .min(U256::from(u128::MAX))
+                .as_u128(),
+        )
+        .unwrap_or(i128::MAX);
+        let net = gross - costs;
+        let amt_f = u256_to_f64(amount);
+        let net_bps = if amt_f > 0.0 { net as f64 / amt_f * 10_000.0 } else { f64::NAN };
+        rows.push_str(&format!(
+            "{{\"route\":{route_json},\"hops\":{},\"start\":\"{start:#x}\",             \"amount_in\":\"{amount}\",\"amount_out\":\"{out}\",             \"gross\":{gross},\"flash_fee\":\"{flash_fee}\",\"gas_cost\":\"{gas_cost}\",             \"net\":{net},\"net_bps\":{net_bps:.4},\"max_slippage_bps\":{slip},             \"refused\":false}}\n",
+            params.edges.len(),
+        ));
+    }
+
+    if rows.is_empty() {
+        return;
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(census_path())
+    {
+        Ok(mut f) => {
+            if let Err(err) = f.write_all(rows.as_bytes()) {
+                warn!(error = %err, "census row write failed");
+            }
+        }
+        Err(err) => warn!(error = %err, path = %census_path(), "census file open failed"),
+    }
 }
 
 /// Whether to size a cycle the search rejected, so the execution path runs.
