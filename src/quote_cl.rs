@@ -169,6 +169,15 @@ where
 /// once at `Latest` on a block-out-of-range error. Without that fallback a
 /// websocket head that leads the quoting node (e.g. during RPC failover) would
 /// fail the whole batch and force the slow per-amount path.
+/// CL quotes per `aggregate3`.
+///
+/// A ceiling on GAS, not on round trips: the batch has to fit inside the node's
+/// eth_call limit, and a CL quote's cost scales with how many ticks it crosses.
+/// Four keeps a wide-ladder grid comfortably under the 600M cap seen on Base
+/// while still batching the common case in one call -- most grids are small
+/// enough that this changes nothing.
+const CL_GRID_CALLS_PER_BATCH: usize = 4;
+
 pub(crate) async fn cl_quote_path_grid<C>(
     provider: &Arc<Provider<C>>,
     quoter_addr: Address,
@@ -193,7 +202,27 @@ where
         })
         .collect();
 
-    let results = multicall3_aggregate3(provider, &calls, block).await?;
+    // Chunked, because one CL quote is not a cheap sub-call. Each traverses the
+    // tick ladder, and ARBOT_CL_LADDER_WORDS=8 makes that traversal wide, so a
+    // whole size grid in ONE aggregate3 can exceed a node's gas cap for
+    // eth_call. Measured 2026-09-03 on a 726-pool universe: 47 responses of
+    // "out of gas: gas required exceeds: 600000000" in five minutes, each of
+    // which surfaced as `cycle unquotable` -- and an unquotable cycle is then
+    // rejected as `no_profitable_size`, so a node limit was being recorded as
+    // an economic verdict. 939 cycles were lost that way against 145 real
+    // rejections.
+    //
+    // Results are concatenated in order, so the caller's amount->result
+    // correspondence is unchanged.
+    let results = if calls.len() <= CL_GRID_CALLS_PER_BATCH {
+        multicall3_aggregate3(provider, &calls, block).await?
+    } else {
+        let mut acc = Vec::with_capacity(calls.len());
+        for chunk in calls.chunks(CL_GRID_CALLS_PER_BATCH) {
+            acc.extend(multicall3_aggregate3(provider, chunk, block).await?);
+        }
+        acc
+    };
     Ok(results
         .into_iter()
         .map(|ret| match ret {
@@ -291,6 +320,34 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chunking must preserve amount -> result correspondence. Callers zip
+    /// the returned vector against the grid they passed in, so a batch boundary
+    /// that reordered or dropped an entry would silently misprice every size
+    /// above it -- worse than the out-of-gas it exists to avoid, because it
+    /// would look like a successful quote.
+    #[test]
+    fn chunking_preserves_order_and_length() {
+        for n in [0usize, 1, 3, 4, 5, 9, 17] {
+            let calls: Vec<usize> = (0..n).collect();
+            let mut acc: Vec<usize> = Vec::new();
+            if calls.len() <= CL_GRID_CALLS_PER_BATCH {
+                acc.extend(calls.iter().copied());
+            } else {
+                for chunk in calls.chunks(CL_GRID_CALLS_PER_BATCH) {
+                    acc.extend(chunk.iter().copied());
+                }
+            }
+            assert_eq!(acc, calls, "n={n} lost or reordered an entry");
+        }
+    }
+
+    /// A batch of one defeats the batching; an unbounded batch is what blew the
+    /// node's gas cap. The value only has to stay between those.
+    #[test]
+    fn the_grid_batch_is_bounded_but_still_batches() {
+        assert!((2..=32).contains(&CL_GRID_CALLS_PER_BATCH));
+    }
 
     #[test]
     fn selector_matches_signature() {

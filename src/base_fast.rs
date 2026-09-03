@@ -2172,9 +2172,15 @@ impl BaseFastPath {
             // was drawn from ten samples. The drain still never awaits these --
             // that part is not negotiable, because a stalled consumer makes
             // stale state look fresh -- but several may be in flight at once.
+            // 6 saturated as soon as the universe grew. Measured 2026-09-03:
+            // at 620 pools 67 batches were dropped against 817 sent (8%); at
+            // 726 pools it was 769 against 177 (81%), so a LARGER universe
+            // produced a SMALLER sample and the expansion could not be judged.
+            // The drain still never awaits these -- that is what the permit
+            // protects -- so the only cost of more is concurrent RPC.
             let prep_slots = crate::util::env_parse_opt::<usize>("ARBOT_BASE_FAST_PREP_SLOTS")
                 .filter(|v| *v > 0)
-                .unwrap_or(6);
+                .unwrap_or(24);
             info!(prep_slots, "base fast path candidate preparation concurrency");
             let prep_slot = Arc::new(tokio::sync::Semaphore::new(prep_slots));
             let prep_sized = Arc::new(AtomicU64::new(0));
