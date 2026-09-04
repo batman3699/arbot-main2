@@ -812,8 +812,10 @@ pub struct CensusRoute {
     /// Smallest depth on any hop, in raw units of that hop's output token.
     /// The route cannot carry more than its thinnest leg.
     pub min_depth: f64,
-    /// Touches a major or stable. Kept as a field rather than a filter so the
-    /// exotic routes stay in the table and can be compared against.
+    /// Always true now: a route that cannot START at a fundable token is not
+    /// selected at all, because the loan is taken in `tokens[0]` and
+    /// `prepare_candidate` refuses a start it cannot price. Kept as a field so
+    /// the rows stay self-describing.
     pub major: bool,
 }
 
@@ -888,7 +890,7 @@ pub fn census_cohort(
                         .partial_cmp(&a.min_depth)
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
-                .then_with(|| b.major.cmp(&a.major))
+
         });
         bucket.truncate(per_hops);
         out.extend(bucket);
@@ -957,13 +959,27 @@ fn build_census_route(
         pools.push(pool);
     }
 
+    // ROTATE to a fundable start. The index stores a cycle in its canonical
+    // rotation -- lowest address first -- which is a dedup key, not a trading
+    // decision. The loan is taken in `tokens[0]`, and `prepare_candidate`
+    // refuses a start token it cannot price: measured 2026-09-04, every 4-hop
+    // route that survived capacity died on
+    // `unreliable_native_price_for_start_token` instead.
+    //
+    // `pools[i]` serves `tokens[i] -> tokens[i+1]`, so both rotate together or
+    // the route silently describes different hops.
+    let start = tokens.iter().position(|t| majors.contains(t))?;
+    let mut tokens: Vec<Address> = tokens.to_vec();
+    tokens.rotate_left(start);
+    pools.rotate_left(start);
+
     let distinct_pools = pools.iter().collect::<std::collections::HashSet<_>>().len();
     Some(CensusRoute {
         venues: seen_venues.len(),
         distinct_pools,
         min_depth: if min_depth.is_finite() { min_depth } else { 0.0 },
-        major: tokens.iter().any(|t| majors.contains(t)),
-        tokens: tokens.to_vec(),
+        major: true,
+        tokens,
         pools,
     })
 }
@@ -5517,6 +5533,46 @@ mod tests {
             })
         });
         assert!(out.is_none(), "pass one's gross must not stand in for pass two's");
+    }
+
+    /// A census route starts where the loan can be taken.
+    ///
+    /// The index stores a cycle in its canonical rotation -- lowest address
+    /// first -- which is a dedup key, not a trading decision. The loan is taken
+    /// in `tokens[0]` and `prepare_candidate` refuses a start it cannot price,
+    /// so an unrotated cohort dies on
+    /// `unreliable_native_price_for_start_token`. Measured 2026-09-04: that was
+    /// every 4-hop route which had survived the capacity gate.
+    #[test]
+    fn a_census_route_is_rotated_to_a_fundable_start() {
+        let (weth, mid, exotic) = (addr(0x42), addr(0x50), addr(0x99));
+        let pools = [addr(10), addr(11), addr(12)];
+        let meta = |t0, t1| PoolMeta { token0: t0, token1: t1, fee_ppm: 500,
+            kind: PoolKind::ConcentratedLiquidity, verified: true,
+            confirmed_at: Some(Instant::now()), balances: Some((1e20, 1e20)) };
+        let pt: dashmap::DashMap<Address, PoolMeta> = dashmap::DashMap::new();
+        pt.insert(pools[0], meta(exotic, weth));
+        pt.insert(pools[1], meta(weth, mid));
+        pt.insert(pools[2], meta(mid, exotic));
+        let venues: std::collections::HashMap<Address, FastVenue> =
+            pools.iter().map(|p| (*p, FastVenue::UniV3 { fee: 500 })).collect();
+        let uni = crate::cycle_index::PoolUniverse::from_pools([
+            (pools[0], exotic, weth),
+            (pools[1], weth, mid),
+            (pools[2], mid, exotic),
+        ]);
+        // Canonical order starts at the EXOTIC token; only WETH is fundable.
+        let fundable: std::collections::HashSet<Address> = [weth].into_iter().collect();
+        let r = build_census_route(&[exotic, weth, mid], &uni, &venues, &pt, &fundable)
+            .expect("rotates rather than refusing");
+        assert_eq!(r.tokens[0], weth, "the loan is taken in tokens[0]");
+        // Pools must rotate WITH the tokens or the route describes other hops.
+        assert_eq!(r.pools[0], pools[1], "pool serving weth -> mid leads");
+        assert_eq!(r.tokens.len(), r.pools.len());
+
+        // A cycle touching nothing fundable is not selected at all.
+        let none: std::collections::HashSet<Address> = std::collections::HashSet::new();
+        assert!(build_census_route(&[exotic, weth, mid], &uni, &venues, &pt, &none).is_none());
     }
 
     /// A census edge builds with no live state at all.
