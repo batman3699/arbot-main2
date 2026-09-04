@@ -1802,58 +1802,46 @@ impl Graph {
             .collect()
     }
 
+    /// The exact edge per hop from the search's predecessor chain, or `None`.
+    ///
+    /// This used to fall back to the token-pair lookup and take the
+    /// lowest-weight active edge whenever the predecessor edge did not match.
+    /// That is a substitution: the caller asked which edges this cycle was
+    /// found on and got a different route that happens to connect the same
+    /// tokens. On any pair served by more than one venue -- the case this bot
+    /// exists to exploit -- the substituted pool has its own price, fee,
+    /// reserves and router, so everything computed downstream describes a trade
+    /// the search never evaluated.
+    ///
+    /// It could also return FEWER indices than hops: when the lookup found no
+    /// candidate the branch pushed nothing and the length mismatch travelled on
+    /// silently. Both failures are now one `None`, and the caller drops the
+    /// candidate. A route that cannot be named exactly is not a route.
     fn resolve_edge_path_for_cycle(
         &self,
         cycle: &[usize],
         pred_edge: &[Option<usize>],
-    ) -> Vec<usize> {
+    ) -> Option<Vec<usize>> {
         if cycle.len() < 2 {
-            return Vec::new();
+            return None;
         }
         let hops = cycle.len().saturating_sub(1);
         let mut indices = Vec::with_capacity(hops);
         for window in cycle.windows(2) {
             let from_ix = window[0];
             let to_ix = window[1];
-            let mut matched = false;
-            if let Some(idx) = pred_edge.get(to_ix).copied().flatten() {
-                if self.edges.get(idx).is_some_and(|edge| {
-                    edge.active
-                        && self.ix.get(&edge.from) == Some(&from_ix)
-                        && self.ix.get(&edge.to) == Some(&to_ix)
-                }) {
-                    indices.push(idx);
-                    matched = true;
-                }
+            let idx = pred_edge.get(to_ix).copied().flatten()?;
+            if !self.edges.get(idx).is_some_and(|edge| {
+                edge.active
+                    && self.ix.get(&edge.from) == Some(&from_ix)
+                    && self.ix.get(&edge.to) == Some(&to_ix)
+            }) {
+                return None;
             }
-            if !matched {
-                let from_addr = self.nodes[from_ix];
-                let to_addr = self.nodes[to_ix];
-                let lookup = self.edge_lookup.get(&(from_addr, to_addr));
-                if let Some(candidates) = lookup {
-                    let mut best: Option<(i64, usize)> = None;
-                    for &idx in candidates {
-                        let Some(edge) = self.edges.get(idx) else {
-                            continue;
-                        };
-                        if !edge.active {
-                            continue;
-                        }
-                        match best {
-                            None => best = Some((edge.weight, idx)),
-                            Some((best_weight, _)) if edge.weight < best_weight => {
-                                best = Some((edge.weight, idx));
-                            }
-                            _ => {}
-                        }
-                    }
-                    if let Some((_, idx)) = best {
-                        indices.push(idx);
-                    }
-                }
-            }
+            indices.push(idx);
         }
-        indices
+        debug_assert_eq!(indices.len(), hops);
+        Some(indices)
     }
 
     fn extract_cycle_with_edges(
@@ -1912,7 +1900,7 @@ impl Graph {
                     .map(|offset| edges[(pos + offset) % hops])
                     .collect()
             } else {
-                self.resolve_edge_path_for_cycle(&rotated_nodes, pred_edge)
+                self.resolve_edge_path_for_cycle(&rotated_nodes, pred_edge)?
             };
 
             Some((rotated_nodes, rotated_edges))
@@ -1920,7 +1908,7 @@ impl Graph {
             let resolved_edges = if edges.len() == hops {
                 edges
             } else {
-                self.resolve_edge_path_for_cycle(&cycle, pred_edge)
+                self.resolve_edge_path_for_cycle(&cycle, pred_edge)?
             };
             Some((cycle, resolved_edges))
         }
@@ -2174,6 +2162,58 @@ mod tests {
             active: true,
             tick_ladder: None,
         }
+    }
+
+    /// A hop the search cannot name exactly is refused, never substituted.
+    ///
+    /// The old fallback searched the token-pair lookup and took the
+    /// lowest-weight active edge whenever the predecessor edge did not match,
+    /// so the caller asked "which edges was this cycle found on?" and received
+    /// a different route connecting the same tokens. With parallel venues on a
+    /// pair, that silently swaps the pool, fee and router underneath a priced
+    /// candidate.
+    #[test]
+    fn edge_resolution_refuses_rather_than_substituting() {
+        let (a, b) = (addr(1), addr(2));
+        let mut g = Graph::default();
+        // Two DISTINCT pools serve a->b, so a substitution has somewhere to go.
+        // `add_edge` dedups on venue signature, so the second needs its own
+        // pool or it is simply the first again.
+        g.add_edge(hop_edge(a, b));
+        let mut second = hop_edge(a, b);
+        second.weight = 1;
+        if let VenueEdge::UniV3 { pool, .. } = &mut second.venue {
+            *pool = addr(77);
+        }
+        g.add_edge(second);
+        g.add_edge(hop_edge(b, a));
+        assert_eq!(g.edges.len(), 3, "test needs two parallel a->b edges");
+        let (ai, bi) = (g.ix[&a], g.ix[&b]);
+
+        // A predecessor chain that names nothing for the hop into `b`.
+        let empty: Vec<Option<usize>> = vec![None; g.nodes.len()];
+        assert!(
+            g.resolve_edge_path_for_cycle(&[ai, bi, ai], &empty).is_none(),
+            "an unnamed hop must refuse, not fall back to the lookup"
+        );
+
+        // A predecessor edge that exists but does not serve this hop.
+        let mut wrong: Vec<Option<usize>> = vec![None; g.nodes.len()];
+        wrong[bi] = Some(2); // the b->a edge, offered for the a->b hop
+        wrong[ai] = Some(0);
+        assert!(
+            g.resolve_edge_path_for_cycle(&[ai, bi, ai], &wrong).is_none(),
+            "a mismatched predecessor edge must refuse"
+        );
+
+        // Correctly named hops resolve, and to exactly those indices.
+        let mut good: Vec<Option<usize>> = vec![None; g.nodes.len()];
+        good[bi] = Some(1); // the SECOND a->b edge, not the graph's first
+        good[ai] = Some(2);
+        let got = g
+            .resolve_edge_path_for_cycle(&[ai, bi, ai], &good)
+            .expect("named hops resolve");
+        assert_eq!(got, vec![1, 2], "must return the named edges verbatim");
     }
 
     fn closed_triangle() -> (Graph, Address, Address, Address) {
