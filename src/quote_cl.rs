@@ -16,7 +16,7 @@
 //! calldata directly. `quote_exact_input_calldata_matches_abigen` in
 //! `quote_univ3` pins that hand-built calldata to what abigen emits.
 
-use anyhow::{ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use ethers::abi::{ParamType, Token};
 use ethers::prelude::*;
 use ethers::providers::JsonRpcClient;
@@ -129,12 +129,25 @@ where
         .data(calldata)
         .into();
 
+    // A pinned block is pinned. When the node cannot serve it, the answer is
+    // "no quote", never "here is a different block".
+    //
+    // The old fallback re-asked at Latest and returned that as the answer to a
+    // question about block N. The value was then cached under the ORIGINAL
+    // block key, so one lagging provider could poison the cache with
+    // wrong-block quotes that every later caller read as block-N truth. Sizing,
+    // min_out floors and the profitability decision are all computed against a
+    // block; mixing two of them silently is how a candidate reverts on state it
+    // was never priced against.
+    //
+    // Failover belongs one layer up -- try the next PROVIDER at the same block,
+    // and drop the candidate if none can serve it.
     let raw = match provider.call(&tx, Some(block_id_for(block))).await {
         Ok(value) => value,
         Err(err) if !block.is_zero() && crate::quote_common::is_block_out_of_range_error(&err) => {
-            provider
-                .call(&tx, Some(BlockId::Number(BlockNumber::Latest)))
-                .await?
+            return Err(anyhow!(
+                "quote provider cannot serve pinned block {block}: {err}"
+            ));
         }
         Err(err) => return Err(err.into()),
     };
@@ -278,12 +291,25 @@ where
         .to(multicall3)
         .data(Bytes::from(data))
         .into();
+    // A pinned block is pinned. When the node cannot serve it, the answer is
+    // "no quote", never "here is a different block".
+    //
+    // The old fallback re-asked at Latest and returned that as the answer to a
+    // question about block N. The value was then cached under the ORIGINAL
+    // block key, so one lagging provider could poison the cache with
+    // wrong-block quotes that every later caller read as block-N truth. Sizing,
+    // min_out floors and the profitability decision are all computed against a
+    // block; mixing two of them silently is how a candidate reverts on state it
+    // was never priced against.
+    //
+    // Failover belongs one layer up -- try the next PROVIDER at the same block,
+    // and drop the candidate if none can serve it.
     let raw = match provider.call(&tx, Some(block_id_for(block))).await {
         Ok(value) => value,
         Err(err) if !block.is_zero() && crate::quote_common::is_block_out_of_range_error(&err) => {
-            provider
-                .call(&tx, Some(BlockId::Number(BlockNumber::Latest)))
-                .await?
+            return Err(anyhow!(
+                "quote provider cannot serve pinned block {block}: {err}"
+            ));
         }
         Err(err) => return Err(err.into()),
     };
@@ -320,6 +346,49 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pinned block is a hard requirement, not a preference.
+    ///
+    /// `block_id_for` is the only place Latest is legitimate, and only because
+    /// a zero block means the caller did not pin one. Everywhere else, "the
+    /// node cannot serve block N" must end the quote: the old code re-asked at
+    /// Latest and cached the answer under the ORIGINAL block key, so one
+    /// lagging provider could poison the cache with wrong-block quotes that
+    /// later callers read as block-N truth.
+    #[test]
+    fn a_pinned_block_never_degrades_to_latest() {
+        assert_eq!(
+            block_id_for(U64::zero()),
+            BlockId::Number(BlockNumber::Latest),
+            "an unpinned quote asks for Latest, which is the caller's intent"
+        );
+        let pinned = U64::from(21_000_000u64);
+        assert_eq!(
+            block_id_for(pinned),
+            BlockId::Number(BlockNumber::Number(pinned)),
+            "a pinned quote asks for exactly that block"
+        );
+
+        // The errors that used to trigger the silent downgrade are still
+        // recognised -- they now end the quote instead of changing the
+        // question, and the caller fails over to another PROVIDER at the same
+        // block.
+        for msg in [
+            "BlockOutOfRangeError: requested was 21000000",
+            "header not found",
+            "block out of range",
+        ] {
+            assert!(
+                crate::quote_common::is_block_out_of_range_error(&msg.to_string()),
+                "{msg:?} must still be recognised as unservable-block"
+            );
+        }
+        // An ordinary revert is NOT a block problem and must not be confused
+        // for one.
+        assert!(!crate::quote_common::is_block_out_of_range_error(
+            &"execution reverted".to_string()
+        ));
+    }
 
     /// The chunking must preserve amount -> result correspondence. Callers zip
     /// the returned vector against the grid they passed in, so a batch boundary
