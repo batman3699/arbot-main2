@@ -1653,6 +1653,143 @@ pub fn live_edge(hop: LiveHop<'_>, live: &LiveState) -> Option<crate::graph::Edg
     })
 }
 
+/// One census hop, built from POOL METADATA alone.
+///
+/// `live_edge` needs a LiveState snapshot per pool, and that state is thrown
+/// away wholesale whenever the websocket drops -- 85 `continuity broken; all
+/// local state untrusted` events in one run, coverage flapping 99 -> 0 -> 94
+/// -> 99 -> 5 -> 99. A route only builds when EVERY one of its pools is
+/// trusted at the same instant, so the chance of building falls with hop
+/// count: measured, 240 two-hop rows and 40 three-hop, and not one four-hop
+/// row ever. The census was being biased toward short routes by an
+/// infrastructure fault, which is the opposite of what it exists to measure.
+///
+/// Nothing about quoting needs that state. `simulate_cycle_with_quotes` calls
+/// the venue's quoter ON CHAIN; the edge only has to say which pool, which
+/// direction, and which venue parameters. All of that is in `FastVenue` and
+/// `PoolMeta`.
+///
+/// The fields a live edge derives from state are set so they cannot gate:
+///
+///   * `max_input` enormous, so `cycle_input_capacity` never binds. The census
+///     brings its own size ladder and records refusals per size itself, so a
+///     capacity gate here would only hide sizes it was asked to measure.
+///   * `rate_num`/`rate_den` 1:1. They feed that same capacity projection and
+///     a slippage DIAGNOSTIC, never the quoted output. The decimal-collapse
+///     this would normally cause -- 202 of 363 rejections on 2026-09-03 --
+///     cannot happen from a starting capacity of 2^128.
+///   * `tolerance_bps` and `observed_slippage_bps` zero, so the caller's
+///     min-out haircut does not shave the very number being measured.
+pub fn census_edge(
+    venue: FastVenue,
+    pool: Address,
+    meta: &PoolMeta,
+    from: Address,
+    to: Address,
+) -> Option<crate::graph::Edge> {
+    let (token0, token1) = (meta.token0, meta.token1);
+    if !((from == token0 && to == token1) || (from == token1 && to == token0)) {
+        return None;
+    }
+    let forward = from == token0;
+
+    let (venue_edge, estimated_gas) = match venue {
+        FastVenue::UniV3 { fee } => (
+            crate::graph::VenueEdge::UniV3 { path: vec![(from, None), (to, Some(fee))], pool, fee, state: None },
+            crate::venues::ESTIMATED_GAS_UNIV3,
+        ),
+        FastVenue::RoutedCl { path_param, router } => (
+            crate::graph::VenueEdge::Slipstream {
+                path: vec![(from, None), (to, Some(path_param))],
+                pool,
+                tick_spacing: path_param,
+                router,
+                state: None,
+            },
+            crate::venues::ESTIMATED_GAS_SLIPSTREAM,
+        ),
+        // Solidly is quoted from reserves rather than by a quoter contract, so
+        // it is the one venue that needs real numbers here. `balances` are
+        // chain `balanceOf` reads taken by the reconcile, which for a V2 pair
+        // ARE the reserves -- so the census can price it without the event
+        // stream, just not without the reconcile.
+        FastVenue::Solidly { stable, fee_bps, decimals0, decimals1 } => {
+            let (b0, b1) = meta.balances?;
+            let (rin, rout) = if forward { (b0, b1) } else { (b1, b0) };
+            let (reserve_in, reserve_out) = (f64_to_u256(rin), f64_to_u256(rout));
+            if reserve_in.is_zero() || reserve_out.is_zero() {
+                return None;
+            }
+            (
+                crate::graph::VenueEdge::SolidlyV2 {
+                    pair: pool,
+                    token_out: to,
+                    token0,
+                    token1,
+                    stable,
+                    reserve_in,
+                    reserve_out,
+                    fee_bps,
+                    decimals0,
+                    decimals1,
+                },
+                crate::venues::ESTIMATED_GAS_SOLIDLYV2,
+            )
+        }
+    };
+
+    Some(crate::graph::Edge {
+        from,
+        to,
+        // See the note above: diagnostic and capacity only, never the output.
+        rate_num: U256::one(),
+        rate_den: U256::one(),
+        venue: venue_edge,
+        estimated_gas,
+        weight: 0,
+        max_input: U256::from(u128::MAX),
+        tolerance_bps: 0,
+        observed_slippage_bps: 0,
+        quote_block: None,
+        active: true,
+        tick_ladder: None,
+    })
+}
+
+/// A one-cycle graph for the census, built without any live state.
+///
+/// Mirrors `LiveRouter::route` so `prepare_candidate` consumes it identically,
+/// and differs only in where the edges come from.
+pub fn census_route(
+    tokens: &[Address],
+    pools: &[Address],
+    venues: &std::collections::HashMap<Address, FastVenue>,
+    meta: &dashmap::DashMap<Address, PoolMeta>,
+) -> Option<(crate::graph::Graph, crate::graph::IndexedCycle)> {
+    if tokens.len() < 2 || pools.len() != tokens.len() {
+        return None;
+    }
+    let mut g = crate::graph::Graph::default();
+    for t in tokens {
+        g.add_node(*t);
+    }
+    let mut edge_indices = Vec::with_capacity(tokens.len());
+    for i in 0..tokens.len() {
+        let (from, to) = (tokens[i], tokens[(i + 1) % tokens.len()]);
+        let pool = pools[i];
+        let venue = *venues.get(&pool)?;
+        let m = *meta.get(&pool)?;
+        g.add_edge(census_edge(venue, pool, &m, from, to)?);
+        edge_indices.push(g.best_edge_index_on_pool(from, to, pool)?);
+    }
+    let mut cycle: Vec<usize> = tokens
+        .iter()
+        .map(|t| g.node_index(*t))
+        .collect::<Option<Vec<_>>>()?;
+    cycle.push(cycle[0]);
+    Some((g, crate::graph::IndexedCycle { cycle, edge_indices }))
+}
+
 /// Builds executable routes from the pools the fast path actually priced.
 ///
 /// This is the replacement for looking a route up in the scan's graph. That
@@ -2958,9 +3095,18 @@ impl BaseFastPath {
                         // `c.tokens`, not the index's canonical rotation: the
                         // route must be entered where the cycle was priced and
                         // where the loan can be taken.
-                        if let Some((g, ic)) =
+                        // The census builds its edges from pool METADATA, so a
+                        // route is not lost merely because the websocket dropped
+                        // and invalidated the snapshots. That fault falls on
+                        // longer routes hardest -- every pool must be trusted at
+                        // once -- and was biasing the census toward exactly the
+                        // short routes it exists to look past.
+                        let built = if census_on {
+                            census_route(&c.tokens, &c.pools, r.venues.as_ref(), &self.pool_tokens)
+                        } else {
                             r.route(&c.tokens, &c.pools, &self.pool_tokens, &self.live)
-                        {
+                        };
+                        if let Some((g, ic)) = built {
                             // One graph per batch, so `IndexedCycle` indices and
                             // the graph handed to the sink always agree. Mixing
                             // a cycle from one graph with another's node table
@@ -5366,6 +5512,45 @@ mod tests {
             })
         });
         assert!(out.is_none(), "pass one's gross must not stand in for pass two's");
+    }
+
+    /// A census edge builds with no live state at all.
+    ///
+    /// `live_edge` needs a trusted snapshot per pool, and a dropped websocket
+    /// discards every snapshot at once. A route then builds only if all its
+    /// pools are trusted simultaneously, so the failure lands hardest on the
+    /// longest routes -- measured, 240 two-hop rows, 40 three-hop, and zero
+    /// four-hop. Quoting is on chain and never needed the state.
+    #[test]
+    fn a_census_edge_needs_no_live_state() {
+        let (t0, t1) = (addr(1), addr(2));
+        let pool = addr(10);
+        let meta = PoolMeta { token0: t0, token1: t1, fee_ppm: 500,
+                              kind: PoolKind::ConcentratedLiquidity, verified: true,
+                              confirmed_at: Some(Instant::now()), balances: None };
+        // No LiveState anywhere in this call, and no balances either.
+        let e = census_edge(FastVenue::UniV3 { fee: 500 }, pool, &meta, t0, t1)
+            .expect("a CL edge needs only its venue parameters");
+        assert_eq!(e.from, t0);
+        assert_eq!(e.to, t1);
+        // Capacity must not gate: the census brings its own ladder and records
+        // refusals per size, so a bound here would hide sizes it was asked to
+        // measure.
+        assert_eq!(e.max_input, U256::from(u128::MAX));
+        // And no haircut, or the min-out buffer shaves the measurement itself.
+        assert_eq!(e.tolerance_bps, 0);
+        assert_eq!(e.observed_slippage_bps, 0);
+
+        // Direction is still enforced -- a pool that does not serve the pair is
+        // refused rather than quoted backwards.
+        assert!(census_edge(FastVenue::UniV3 { fee: 500 }, pool, &meta, t0, addr(9)).is_none());
+
+        // Solidly is the one venue quoted from reserves, so it needs the
+        // reconcile's balances and refuses without them.
+        let solidly = FastVenue::Solidly { stable: false, fee_bps: 30, decimals0: 18, decimals1: 6 };
+        assert!(census_edge(solidly, pool, &meta, t0, t1).is_none(), "no balances, no reserves");
+        let with_bal = PoolMeta { balances: Some((1e20, 2e20)), ..meta };
+        assert!(census_edge(solidly, pool, &with_bal, t0, t1).is_some());
     }
 
     /// Strata are reported, never filtered.
