@@ -328,7 +328,8 @@ async fn build_dry_run_plan(
         *graph.ix.get(&token_in).unwrap(),
     ];
 
-    build_plan_for_cycle(&graph, &cycle, amount_in, executor, None, None, U64::zero()).await
+    build_plan_for_cycle(&graph, &cycle,
+            &graph.best_edge_indices_for_node_path(&cycle).expect("edges for test cycle"), amount_in, executor, None, None, U64::zero()).await
 }
 
 fn encode_steps(steps: Vec<StepData>) -> Result<Vec<ExecutorStep>> {

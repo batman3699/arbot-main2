@@ -6167,6 +6167,10 @@ where
         let preview_plan = match build_plan_for_cycle(
             graph,
             &cycle_ix,
+            // The EXACT edges the search chose. Re-resolving by token pair
+            // here would let the plan name a different pool than the one
+            // sized, on any pair served by more than one venue.
+            &edge_indices,
             cycle_base_amount,
             ctx.executor_address,
             self.jit_config.as_ref(),
@@ -6319,6 +6323,10 @@ where
         let plan = match build_plan_for_cycle(
             graph,
             &cycle_ix,
+            // The EXACT edges the search chose. Re-resolving by token pair
+            // here would let the plan name a different pool than the one
+            // sized, on any pair served by more than one venue.
+            &edge_indices,
             trade_amount,
             ctx.executor_address,
             self.jit_config.as_ref(),

@@ -557,7 +557,20 @@ async fn build_dry_run_plan(
         *graph.ix.get(&token_in).unwrap(),
     ];
 
-    build_plan_for_cycle(&graph, &cycle, amount_in, executor, None, None, U64::zero()).await
+    build_plan_for_cycle(
+        &graph,
+        &cycle,
+        // The two edges this test added, in order. Named explicitly rather
+        // than re-resolved by token pair -- that re-resolution is exactly
+        // what the planner signature now prevents.
+        &[0usize, 1usize],
+        amount_in,
+        executor,
+        None,
+        None,
+        U64::zero(),
+    )
+    .await
 }
 
 fn encode_steps(steps: Vec<StepData>) -> Result<Vec<ExecutorStep>> {

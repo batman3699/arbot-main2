@@ -493,9 +493,29 @@ where
     }
 }
 
+/// `edge_indices` names the EXACT edge for each hop and is not advisory.
+///
+/// This used to re-resolve every hop with `graph.edge_between(from, to)`, which
+/// returns whichever edge the graph currently prefers for that token pair. With
+/// parallel venues on one pair -- the case this bot exists to exploit -- the
+/// detector can price WETH->USDC on Aerodrome while the planner builds calldata
+/// for Uniswap. Pool, fee, router and liquidity then describe a different trade
+/// than the one that was sized, and the identity the search had already
+/// computed was discarded one stage before it mattered.
+///
+/// A mismatch is a hard error. Emitting a plan for a route nobody priced is
+/// worse than emitting nothing: it reverts after paying gas, or it fills at a
+/// price that was never checked.
+///
+/// The argument count is over clippy's limit and stays that way deliberately:
+/// bundling these into a struct is the right end state, but it belongs with the
+/// `RouteSnapshot` work that carries one immutable route object through quote,
+/// size, plan, simulate and submit -- not as a drive-by rename here.
+#[allow(clippy::too_many_arguments)]
 pub async fn build_plan_for_cycle(
     graph: &Graph,
     cycle: &[usize],
+    edge_indices: &[usize],
     amount_in: U256,
     executor_address: Address,
     jit: Option<&JitConfig>,
@@ -503,17 +523,36 @@ pub async fn build_plan_for_cycle(
     block_number: U64,
 ) -> Result<Plan> {
     let _ = (jit_quoter, block_number);
+    if edge_indices.len() != cycle.len().saturating_sub(1) {
+        return Err(anyhow!(
+            "edge count {} does not match cycle of {} hops",
+            edge_indices.len(),
+            cycle.len().saturating_sub(1)
+        ));
+    }
     // PlanV2 execution currently supports a single flash loan. The planner must enforce the
     // single-loan invariant before building executor loan data.
     let mut steps = Vec::new();
     let mut current_amount = amount_in;
     let mut max_slippage_bps = 0u32;
-    for window in cycle.windows(2) {
+    for (hop, window) in cycle.windows(2).enumerate() {
         let from = graph.nodes[window[0]];
         let to = graph.nodes[window[1]];
-        let Some(edge) = graph.edge_between(from, to) else {
-            warn!(from = %from, to = %to, "Skipping plan build for missing edge");
-            return Err(anyhow!("missing edge between {from:?} and {to:?}"));
+        let Some(edge) = graph
+            .edge_by_index(edge_indices[hop])
+            .filter(|edge| edge.active && edge.from == from && edge.to == to)
+        else {
+            warn!(
+                hop,
+                edge_index = edge_indices[hop],
+                from = %from,
+                to = %to,
+                "plan build refused: edge index does not name this hop"
+            );
+            return Err(anyhow!(
+                "cycle edge mismatch at hop {hop}: {from:?}->{to:?} (edge index {})",
+                edge_indices[hop]
+            ));
         };
         if matches!(
             &edge.venue,
@@ -1050,6 +1089,7 @@ mod tests {
         let plan = build_plan_for_cycle(
             &graph,
             &[ai, bi, ai],
+            &graph.best_edge_indices_for_node_path(&[ai, bi, ai]).expect("edges for test cycle"),
             U256::from(1_000u64),
             addr(5),
             None,
@@ -1272,6 +1312,7 @@ mod tests {
         let plan = build_plan_for_cycle(
             &graph,
             &cycle,
+            &graph.best_edge_indices_for_node_path(&cycle).expect("edges for test cycle"),
             base_amount,
             executor,
             None,
@@ -1383,6 +1424,7 @@ mod tests {
         let plan = build_plan_for_cycle(
             &graph,
             &cycle,
+            &graph.best_edge_indices_for_node_path(&cycle).expect("edges for test cycle"),
             U256::from(1_000u64),
             addr(99),
             None,
@@ -1411,6 +1453,123 @@ mod tests {
         // Real constant-product output for 1_000 in @ 30bps on 1e6/1e6 reserves.
         // (Was 1_000 under the old linear extrapolation of rate_num/rate_den.)
         assert_eq!(amount1_out, U256::from(996u64));
+    }
+
+    /// The plan must use the edge the SEARCH chose, not whichever edge the
+    /// graph now prefers for that token pair.
+    ///
+    /// Two pools serve WETH->USDC here, which is the ordinary case on any chain
+    /// worth trading and the case this bot exists to exploit. Re-resolving by
+    /// (from, to) returns the graph's favourite, so the detector could price one
+    /// pool while the planner emitted calldata for the other -- different pool,
+    /// fee, reserves and router, and an economic calculation belonging to a
+    /// trade nobody is about to make.
+    #[tokio::test]
+    async fn the_plan_uses_the_edge_the_search_chose_not_the_graphs_favourite() {
+        let (token_in, token_out) = (addr(10), addr(11));
+        let (cheap_pair, rich_pair) = (addr(20), addr(21));
+
+        let leg = |pair, r_in: u64, r_out: u64, w| Edge {
+            from: token_in,
+            to: token_out,
+            rate_num: U256::from(r_out),
+            rate_den: U256::from(r_in),
+            venue: VenueEdge::UniV2 {
+                pair,
+                token_out,
+                token0: token_in,
+                token1: token_out,
+                reserve_in: U256::from(r_in),
+                reserve_out: U256::from(r_out),
+                fee_bps: 30,
+            },
+            estimated_gas: 0,
+            weight: w,
+            max_input: U256::MAX,
+            tolerance_bps: 100,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+            tick_ladder: None,
+        };
+
+        let mut graph = Graph::default();
+        // Index 0: the pool the graph prefers on weight.
+        graph.add_edge(leg(cheap_pair, 1_000_000, 1_010_000, fp_weight(1, 2)));
+        // Index 1: a DIFFERENT pool on the same pair, the one we will name.
+        graph.add_edge(leg(rich_pair, 5_000_000, 5_010_000, fp_weight(1, 1)));
+        // Return leg, index 2.
+        graph.add_edge(Edge {
+            from: token_out,
+            to: token_in,
+            rate_num: U256::from(1_000u64),
+            rate_den: U256::from(1_000u64),
+            venue: VenueEdge::UniV2 {
+                pair: addr(22),
+                token_out: token_in,
+                token0: token_out,
+                token1: token_in,
+                reserve_in: U256::from(9_000_000u64),
+                reserve_out: U256::from(9_000_000u64),
+                fee_bps: 30,
+            },
+            estimated_gas: 0,
+            weight: fp_weight(1, 1),
+            max_input: U256::MAX,
+            tolerance_bps: 100,
+            observed_slippage_bps: 0,
+            quote_block: None,
+            active: true,
+            tick_ladder: None,
+        });
+
+        let a = *graph.ix.get(&token_in).unwrap();
+        let b = *graph.ix.get(&token_out).unwrap();
+        let cycle = vec![a, b, a];
+
+        // Name the SECOND pool. The graph's own preference is the first.
+        let plan = build_plan_for_cycle(
+            &graph, &cycle, &[1usize, 2usize],
+            U256::from(1_000u64), addr(99), None, None, U64::zero(),
+        )
+        .await
+        .expect("plan builds on the named edges");
+
+        let pools: Vec<Address> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                // A UniV2 hop targets the PAIR directly, so the step names the
+                // pool and the substitution would be visible right here.
+                StepData::Generic { target, .. } => Some(*target),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            pools.contains(&rich_pair),
+            "plan must use the named pool {rich_pair:?}, got {pools:?}"
+        );
+        assert!(
+            !pools.contains(&cheap_pair),
+            "plan used the graph's preferred pool instead of the one priced"
+        );
+
+        // And an index that does not serve this hop is a hard error, never a
+        // silent substitution.
+        let wrong = build_plan_for_cycle(
+            &graph, &cycle, &[2usize, 1usize],
+            U256::from(1_000u64), addr(99), None, None, U64::zero(),
+        )
+        .await;
+        assert!(wrong.is_err(), "mismatched edge index must refuse to plan");
+
+        // So is the wrong number of indices.
+        let short = build_plan_for_cycle(
+            &graph, &cycle, &[1usize],
+            U256::from(1_000u64), addr(99), None, None, U64::zero(),
+        )
+        .await;
+        assert!(short.is_err(), "edge count must match hop count");
     }
 
     #[tokio::test]
@@ -1475,7 +1634,8 @@ mod tests {
             *graph.ix.get(&token_in).unwrap(),
         ];
         let trade = U256::from(100_000u64);
-        let plan = build_plan_for_cycle(&graph, &cycle, trade, addr(99), None, None, U64::zero())
+        let plan = build_plan_for_cycle(&graph, &cycle,
+            &graph.best_edge_indices_for_node_path(&cycle).expect("edges for test cycle"), trade, addr(99), None, None, U64::zero())
             .await
             .expect("plan should build");
 
@@ -1563,6 +1723,7 @@ mod tests {
         let plan = build_plan_for_cycle(
             &graph,
             &cycle,
+            &graph.best_edge_indices_for_node_path(&cycle).expect("edges for test cycle"),
             U256::from(100u64),
             addr(42),
             None,
@@ -1653,6 +1814,7 @@ mod tests {
         let plan = build_plan_for_cycle(
             &graph,
             &cycle,
+            &graph.best_edge_indices_for_node_path(&cycle).expect("edges for test cycle"),
             U256::from(1_000u64),
             addr(99),
             None,
@@ -1744,6 +1906,7 @@ mod tests {
         let plan = build_plan_for_cycle(
             &graph,
             &cycle,
+            &graph.best_edge_indices_for_node_path(&cycle).expect("edges for test cycle"),
             U256::from(500u64),
             addr(99),
             None,
@@ -1871,6 +2034,7 @@ mod tests {
         let plan = build_plan_for_cycle(
             &graph,
             &cycle,
+            &graph.best_edge_indices_for_node_path(&cycle).expect("edges for test cycle"),
             U256::from(100u64),
             addr(11),
             Some(&jit_cfg),
@@ -1990,6 +2154,7 @@ mod tests {
         let plan = build_plan_for_cycle(
             &graph,
             &cycle,
+            &graph.best_edge_indices_for_node_path(&cycle).expect("edges for test cycle"),
             base_amount,
             addr(99),
             None,
