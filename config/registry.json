@@ -36,17 +36,41 @@
       "pools": {
         "balancer": [
           {
-            "poolId": "0x32296969ef14eb0c6d29669c550d4a044913023000200000000000000000064",
-            "tokenIn": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-            "tokenOut": "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0"
+            "poolId": "0x5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014",
+            "tokenIn": "0xba100000625a3754423978a60c9317c58a424e3d",
+            "tokenOut": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
           },
           {
-            "poolId": "0x32296969ef14eb0c6d29669c550d4a044913023000200000000000000000064",
-            "tokenIn": "0x7f39C581F595B53c5cb19bD0b3f8dA6c935E2Ca0",
-            "tokenOut": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+            "poolId": "0x5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014",
+            "tokenIn": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            "tokenOut": "0xba100000625a3754423978a60c9317c58a424e3d"
           }
         ],
         "curve": [
+          {
+            "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",
+            "tokenIn": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+            "tokenOut": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "selector": "0x3df02124",
+            "i": 0,
+            "j": 1
+          },
+          {
+            "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",
+            "tokenIn": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+            "tokenOut": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+            "selector": "0x3df02124",
+            "i": 0,
+            "j": 2
+          },
+          {
+            "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",
+            "tokenIn": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+            "tokenOut": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+            "selector": "0x3df02124",
+            "i": 1,
+            "j": 0
+          },
           {
             "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",
             "tokenIn": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
@@ -54,6 +78,14 @@
             "selector": "0x3df02124",
             "i": 1,
             "j": 2
+          },
+          {
+            "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",
+            "tokenIn": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+            "tokenOut": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+            "selector": "0x3df02124",
+            "i": 2,
+            "j": 0
           },
           {
             "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",

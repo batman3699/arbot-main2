@@ -3,9 +3,18 @@ chains:
   chain_id: 1
   env_prefix: ETH
   rpc_http_urls:
-  - http://127.0.0.1:8565
+  # The local archive node belongs first whenever it is running -- restore
+  # `- http://127.0.0.1:8565` above these two at that point. It is omitted
+  # rather than listed-and-dead because the production check rejects a list
+  # containing ANY loopback placeholder, not merely an all-placeholder one.
+  # Free public fallbacks, verified 2026-09-04 answering real UniV3 pool
+  # eth_calls 3/3. Adequate for a census, which does not race; NOT adequate for
+  # live execution on the most contested chain there is.
+  - https://ethereum-rpc.publicnode.com
+  - https://eth.drpc.org
   rpc_ws_urls:
-  - ws://127.0.0.1:8566
+  # Same: restore `- ws://127.0.0.1:8566` first when the local node is up.
+  - wss://ethereum-rpc.publicnode.com
   gas_model: eip1559
   executor_address: '0x1c3d856D29eA2118c8d955070a6AD83C984586f3'
   executor_owner: '0x36C77CC277e73CCcd199d1989828739722Fe5450'
