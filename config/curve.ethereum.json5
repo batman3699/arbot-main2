@@ -1,63 +1,30 @@
 [
-  // Curve 3pool (DAI/USDC/USDT)
-  {
-    "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",
-    "tokenIn": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-    "tokenOut": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
-    "selector": "0x3df02124",
-    "i": 1,
-    "j": 2
-  },
-  {
-    "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",
-    "tokenIn": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
-    "tokenOut": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-    "selector": "0x3df02124",
-    "i": 2,
-    "j": 1
-  },
-  // stETH / ETH
-  {
-    "pool": "0xDC24316b9AE028F1497c275EB9192a3Ea0f67022",
-    "tokenIn": "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84",
-    "tokenOut": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-    "selector": "0x3df02124",
-    "i": 1,
-    "j": 0
-  },
-  // TriCrypto2 USDT/WBTC/WETH
-  {
-    "pool": "0xD51a44d3FaE010294C616388b506AcdA1bfAAE46",
-    "tokenIn": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
-    "tokenOut": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
-    "selector": "0x3df02124",
-    "i": 0,
-    "j": 1
-  },
-  {
-    "pool": "0xD51a44d3FaE010294C616388b506AcdA1bfAAE46",
-    "tokenIn": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
-    "tokenOut": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-    "selector": "0x3df02124",
-    "i": 1,
-    "j": 2
-  },
-  // crvUSD / USDC
-  {
-    "pool": "0x4dece678ceceb27446b35c672dc7d61f30bad69e",
-    "tokenIn": "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E",
-    "tokenOut": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-    "selector": "0x3df02124",
-    "i": 0,
-    "j": 1
-  },
-  // frxETH / ETH
-  {
-    "pool": "0xa1F8A6807c402E4A15ef4EBa36528A3FED24E577",
-    "tokenIn": "0x5E8422345238F34275888049021821E8E08CAa1f",
-    "tokenOut": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-    "selector": "0x3df02124",
-    "i": 1,
-    "j": 0
-  }
+  // Curve 3pool, all six directed pairs.
+  //
+  // Verified on chain 2026-09-04: coins(0)=DAI coins(1)=USDC coins(2)=USDT,
+  // and get_dy(int128,int128,uint256) returns 0.999753 USDT for 1 USDC.
+  //
+  // Stableswap ONLY. `quote_curve` implements just
+  // get_dy(int128,int128,uint256), so crypto pools are unusable here --
+  // tricrypto2 (USDT/WBTC/WETH) was the obvious pick for WETH exposure and
+  // returns empty calldata for that selector because it takes uint256 indices.
+  // Adding it would have failed silently at quote time.
+  // DAI -> USDC
+  { "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7", "tokenIn": "0x6B175474E89094C44Da98b954EedeAC495271d0F", "tokenOut": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "selector": "0x3df02124", "i": 0, "j": 1 },
+  // DAI -> USDT
+  { "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7", "tokenIn": "0x6B175474E89094C44Da98b954EedeAC495271d0F", "tokenOut": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "selector": "0x3df02124", "i": 0, "j": 2 },
+  // USDC -> DAI
+  { "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7", "tokenIn": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "tokenOut": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+    "selector": "0x3df02124", "i": 1, "j": 0 },
+  // USDC -> USDT
+  { "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7", "tokenIn": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "tokenOut": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+    "selector": "0x3df02124", "i": 1, "j": 2 },
+  // USDT -> DAI
+  { "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7", "tokenIn": "0xdAC17F958D2ee523a2206206994597C13D831ec7", "tokenOut": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+    "selector": "0x3df02124", "i": 2, "j": 0 },
+  // USDT -> USDC
+  { "pool": "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7", "tokenIn": "0xdAC17F958D2ee523a2206206994597C13D831ec7", "tokenOut": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+    "selector": "0x3df02124", "i": 2, "j": 1 }
 ]

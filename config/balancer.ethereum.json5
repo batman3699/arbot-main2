@@ -1,13 +1,18 @@
 [
-  // Balancer USDC/WETH 50/50
-  {
-    poolId: "0x96646936b91d6b9d7d0c47c496afbf3d6ec7b6f8000200000000000000000019",
-    tokenIn: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
-    tokenOut: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
-  },
-  {
-    poolId: "0x96646936b91d6b9d7d0c47c496afbf3d6ec7b6f8000200000000000000000019",
-    tokenIn: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
-    tokenOut: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-  }
+  // Balancer V2. Both pools verified to HOLD BALANCES on 2026-09-04 via
+  // Vault.getPoolTokens -- most WETH pools on Balancer V2 no longer do. The
+  // canonical wstETH/WETH and rETH/WETH composable stable pools each return
+  // 0.00 of both real tokens and only their own preminted BPT.
+  //
+  // Note BAL#304 = MAX_IN_RATIO: Balancer refuses a swap taking more than
+  // ~30% of a pool balance, so probes above that cap revert and the pool is
+  // disabled for the run. These are small pools; size accordingly.
+
+  // USDC/WETH 50/50 -- 97,377 USDC and 38.74 WETH
+  { poolId: "0x96646936b91d6b9d7d0c47c496afbf3d6ec7b6f8000200000000000000000019", tokenIn: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", tokenOut: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" },  // USDC -> WETH
+  { poolId: "0x96646936b91d6b9d7d0c47c496afbf3d6ec7b6f8000200000000000000000019", tokenIn: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", tokenOut: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" },  // WETH -> USDC
+
+  // 80BAL/20WETH -- 31,495,600 BAL and 342.13 WETH
+  { poolId: "0x5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014", tokenIn: "0xba100000625a3754423978a60c9317c58a424e3d", tokenOut: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" },  // BAL -> WETH
+  { poolId: "0x5c6ee304399dbdb9c8ef030ab642b10820db8f56000200000000000000000014", tokenIn: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", tokenOut: "0xba100000625a3754423978a60c9317c58a424e3d" },  // WETH -> BAL
 ]
