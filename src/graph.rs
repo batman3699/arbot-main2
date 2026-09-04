@@ -772,6 +772,48 @@ struct DetectedCycle {
     estimated_profit_bps: i64,
 }
 
+/// A dedup key naming the ROUTE, not just the tokens it visits.
+///
+/// Deduplicating on the token sequence alone collapses genuinely different
+/// trades. WETH->USDC->WETH via UniV3+Aerodrome and the same loop via
+/// UniV3+Pancake share every token, so the second was discarded as a repeat of
+/// the first -- and parallel venues on one pair are precisely the dislocation
+/// this bot exists to find. The cheapest route on paper is not always the one
+/// that sizes, funds or fills, so throwing the alternatives away costs real
+/// candidates.
+///
+/// Rotating the edges by the SAME offset the nodes were rotated by keeps the
+/// key rotation-invariant: one loop entered at a different token is still one
+/// route, while the same loop on different pools is not.
+pub(crate) fn canonicalize_route(
+    cycle: &[usize],
+    edge_indices: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
+    let nodes = canonicalize_cycle(cycle.to_vec());
+    // `canonicalize_cycle` returns the loop CLOSED, so a 3-hop cycle comes back
+    // as 4 entries. Hops is the open length.
+    let closed = nodes.len() > 1 && nodes.first() == nodes.last();
+    let hops = if closed { nodes.len() - 1 } else { nodes.len() };
+    // Edges are only meaningful when there is exactly one per hop. Anything
+    // else degrades to the node-only key rather than inventing an alignment.
+    if hops == 0 || edge_indices.len() != hops {
+        return (nodes, Vec::new());
+    }
+    let open: Vec<usize> = if cycle.first() == cycle.last() && cycle.len() > 1 {
+        cycle[..cycle.len() - 1].to_vec()
+    } else {
+        cycle.to_vec()
+    };
+    let offset = open
+        .iter()
+        .position(|n| *n == nodes[0])
+        .unwrap_or(0);
+    let rotated = (0..hops)
+        .map(|i| edge_indices[(offset + i) % hops])
+        .collect();
+    (nodes, rotated)
+}
+
 pub(crate) fn canonicalize_cycle(mut cycle: Vec<usize>) -> Vec<usize> {
     if cycle.len() <= 1 {
         return cycle;
@@ -1272,7 +1314,9 @@ impl Graph {
         }
 
         let mut by_color: HashMap<u64, Vec<ScoredCycle>> = HashMap::new();
-        let mut seen: HashSet<Vec<usize>> = HashSet::new();
+        // Route key: (canonical nodes, canonical edges). Nodes alone would
+        // collapse the same token loop through different pools.
+        let mut seen: HashSet<(Vec<usize>, Vec<usize>)> = HashSet::new();
 
         for (weight, mut cycle, edge_indices, priority, estimated_profit_bps) in discovered {
             if cycle.len() < 2 {
@@ -1284,8 +1328,9 @@ impl Graph {
                 }
             }
 
-            let canonical = canonicalize_cycle(cycle.clone());
-            if !seen.insert(canonical) {
+            // Keyed on the route, not the token loop: the same tokens through
+            // different pools are different trades.
+            if !seen.insert(canonicalize_route(&cycle, &edge_indices)) {
                 continue;
             }
 
@@ -1619,7 +1664,9 @@ impl Graph {
         // and consume budget per frontier processed (not per scanned adjacency edge).
         let max_relax_iterations = limits.max_relaxations.max(1);
         let mut cycles: Vec<DetectedCycle> = Vec::new();
-        let mut seen: HashSet<Vec<usize>> = HashSet::new();
+        // Route key: (canonical nodes, canonical edges). Nodes alone would
+        // collapse the same token loop through different pools.
+        let mut seen: HashSet<(Vec<usize>, Vec<usize>)> = HashSet::new();
 
         let mut record_cycle =
             |cycle: Vec<usize>, edge_path: Vec<usize>, store: &mut Vec<DetectedCycle>| {
@@ -1646,8 +1693,7 @@ impl Graph {
                 return;
             }
 
-            let canonical = canonicalize_cycle(cycle.clone());
-            if !seen.insert(canonical) {
+            if !seen.insert(canonicalize_route(&cycle, &edge_path)) {
                 return;
             }
 
@@ -3563,6 +3609,47 @@ mod tests {
             !is_better(&stale, &fresh),
             "and the stale one must never displace it"
         );
+    }
+
+    #[test]
+    /// The same token loop through different pools is two routes, not one.
+    ///
+    /// Deduplicating on the token sequence alone discarded the second, and
+    /// parallel venues on a pair are exactly the dislocation this bot exists to
+    /// find -- so the old key threw away the candidates most worth having.
+    #[test]
+    fn route_dedup_separates_parallel_venues_but_folds_rotations() {
+        let loop_nodes = vec![0usize, 1, 2, 0];
+        let via_a = vec![10usize, 11, 12];
+        let via_b = vec![20usize, 21, 22];
+
+        assert_ne!(
+            canonicalize_route(&loop_nodes, &via_a),
+            canonicalize_route(&loop_nodes, &via_b),
+            "same tokens, different pools must not collapse"
+        );
+
+        // The same route entered at a different token is still ONE route, so
+        // the edges rotate with the nodes.
+        let rotated_nodes = vec![1usize, 2, 0, 1];
+        let rotated_edges = vec![11usize, 12, 10];
+        assert_eq!(
+            canonicalize_route(&loop_nodes, &via_a),
+            canonicalize_route(&rotated_nodes, &rotated_edges),
+            "a rotation of one route is the same route"
+        );
+
+        // Same pools in a different ORDER is a different route.
+        assert_ne!(
+            canonicalize_route(&loop_nodes, &via_a),
+            canonicalize_route(&loop_nodes, &vec![12usize, 11, 10]),
+        );
+
+        // A mismatched edge count degrades to the node key rather than
+        // inventing an alignment between hops and edges.
+        let (nodes, edges) = canonicalize_route(&loop_nodes, &[10usize]);
+        assert!(edges.is_empty());
+        assert_eq!(nodes, canonicalize_cycle(loop_nodes));
     }
 
     #[test]
