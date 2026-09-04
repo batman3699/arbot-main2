@@ -493,6 +493,16 @@ where
     }
 }
 
+/// Opt-in for JIT parity work only. Never set this in production.
+fn jit_parity_opt_in() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("ARBOT_ENABLE_JIT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// `edge_indices` names the EXACT edge for each hop and is not advisory.
 ///
 /// This used to re-resolve every hop with `graph.edge_between(from, to)`, which
@@ -523,6 +533,31 @@ pub async fn build_plan_for_cycle(
     block_number: U64,
 ) -> Result<Plan> {
     let _ = (jit_quoter, block_number);
+    // JIT IS OFF, and the two ignored parameters above are why.
+    //
+    // The JIT legs are computed with `mul_div(amount, edge.rate_num,
+    // edge.rate_den)` -- a linear extrapolation of the probe-size rate -- while
+    // a `jit_quoter` and a `block_number` sit right there unused. Linear
+    // extrapolation is exactly what a concentrated-liquidity position cannot
+    // be priced by: the position is placed in a tick range, and what it earns
+    // and returns depends on the ticks the swap actually crosses at that block.
+    //
+    // Mispricing an ordinary hop loses the spread. Mispricing a JIT leg mints a
+    // position on the wrong range, swaps against it, and burns it, so the error
+    // compounds across three legs that all have to settle inside one
+    // transaction.
+    //
+    // Re-enable only when each leg carries an exact block-pinned quote for the
+    // real pool -- current tick, current liquidity, position amounts and
+    // removal result -- and the whole sequence simulates as one transaction.
+    // `ARBOT_ENABLE_JIT=1` exists for that parity work, and is not a production
+    // switch.
+    if jit.map(|cfg| cfg.enabled).unwrap_or(false) && !jit_parity_opt_in() {
+        return Err(anyhow!(
+            "JIT execution disabled: legs are priced by linear extrapolation, \
+             not by block-pinned quotes against the real pool"
+        ));
+    }
     if edge_indices.len() != cycle.len().saturating_sub(1) {
         return Err(anyhow!(
             "edge count {} does not match cycle of {} hops",
@@ -1955,7 +1990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adds_jit_steps_around_univ3_swap_when_enabled() {
+    async fn jit_is_refused_until_block_pinned_quote_parity() {
         let mut graph = Graph::default();
 
         let a = addr(1);
@@ -2031,7 +2066,7 @@ mod tests {
         }
         let quoter = StaticQuoter;
 
-        let plan = build_plan_for_cycle(
+                let refused = build_plan_for_cycle(
             &graph,
             &cycle,
             &graph.best_edge_indices_for_node_path(&cycle).expect("edges for test cycle"),
@@ -2041,52 +2076,21 @@ mod tests {
             Some(&quoter),
             U64::zero(),
         )
-        .await
-        .expect("jit plan should build");
+        .await;
 
-        let pre_swap = plan.steps.iter().find(|step| {
-            matches!(step, StepData::Uniswap { amount_in, .. } if *amount_in == U256::from(5u64))
-        });
-        assert!(pre_swap.is_some(), "expected preswap uniswap step");
-
-        let add_idx = plan
-            .steps
-            .iter()
-            .position(|step| matches!(step, StepData::JitLiquidityAdd { .. }))
-            .expect("expected jit add step");
-        if let StepData::JitLiquidityAdd {
-            pool: p,
-            amount0,
-            amount1,
-            ..
-        } = &plan.steps[add_idx]
-        {
-            assert_eq!(*p, pool);
-            assert_eq!(*amount0 + *amount1, U256::from(14u64));
-        }
-
-        let remove_idx = plan
-            .steps
-            .iter()
-            .position(|step| matches!(step, StepData::JitLiquidityRemove { .. }))
-            .expect("expected jit remove step");
-        assert!(add_idx < remove_idx);
-        if let StepData::JitLiquidityRemove { min_out, .. } = &plan.steps[remove_idx] {
-            let expected_remove_out = mul_div(U256::from(5u64), U256::from(2u64), U256::from(1u64));
-            let expected_min_out = apply_slippage(expected_remove_out, 100);
-            assert_eq!(*min_out, expected_min_out);
-        }
-
-        match plan.steps.last() {
-            Some(StepData::Balancer {
-                token_in,
-                token_out,
-                ..
-            }) => {
-                assert_eq!(*token_in, b);
-                assert_eq!(*token_out, a);
-            }
-            _ => panic!("expected trailing balancer step"),
+        // JIT is off by default. Its legs were priced by linear extrapolation
+        // of a probe-size rate while a quoter and a block number sat unused,
+        // and a concentrated-liquidity position cannot be priced that way --
+        // what it earns and returns depends on the ticks the swap crosses at
+        // that block. The setup above is kept so the parity work has a
+        // candidate to build against.
+        // `Plan` has no Debug, so match rather than expect_err.
+        match refused {
+            Err(err) => assert!(
+                err.to_string().contains("JIT execution disabled"),
+                "unexpected error: {err}"
+            ),
+            Ok(_) => panic!("JIT must be refused until block-pinned quote parity"),
         }
     }
 
