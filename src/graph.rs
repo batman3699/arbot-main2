@@ -3611,7 +3611,6 @@ mod tests {
         );
     }
 
-    #[test]
     /// The same token loop through different pools is two routes, not one.
     ///
     /// Deduplicating on the token sequence alone discarded the second, and
@@ -3642,7 +3641,7 @@ mod tests {
         // Same pools in a different ORDER is a different route.
         assert_ne!(
             canonicalize_route(&loop_nodes, &via_a),
-            canonicalize_route(&loop_nodes, &vec![12usize, 11, 10]),
+            canonicalize_route(&loop_nodes, &[12usize, 11, 10]),
         );
 
         // A mismatched edge count degrades to the node key rather than
