@@ -1671,9 +1671,14 @@ pub fn live_edge(hop: LiveHop<'_>, live: &LiveState) -> Option<crate::graph::Edg
 ///
 /// The fields a live edge derives from state are set so they cannot gate:
 ///
-///   * `max_input` enormous, so `cycle_input_capacity` never binds. The census
-///     brings its own size ladder and records refusals per size itself, so a
-///     capacity gate here would only hide sizes it was asked to measure.
+///   * `max_input` well above the census ladder's top rung but still FUNDABLE.
+///     It must not bind on the sizes being measured -- the census records
+///     refusals per size itself -- yet a truly enormous value is worse: the
+///     projected `trade_cap` then exceeds every flash provider and
+///     `prepare_candidate` refuses the candidate as `no_flashloan_capacity`
+///     before the sweep runs at all. Measured 2026-09-04 with `u128::MAX`: 11
+///     of 11 four-hop candidates rejected exactly there. 1e21 wei is 1,000
+///     native, thirty times the ladder's 30 and well inside Aave's ~9,900.
 ///   * `rate_num`/`rate_den` 1:1. They feed that same capacity projection and
 ///     a slippage DIAGNOSTIC, never the quoted output. The decimal-collapse
 ///     this would normally cause -- 202 of 363 rejections on 2026-09-03 --
@@ -1747,7 +1752,7 @@ pub fn census_edge(
         venue: venue_edge,
         estimated_gas,
         weight: 0,
-        max_input: U256::from(u128::MAX),
+        max_input: U256::exp10(21),
         tolerance_bps: 0,
         observed_slippage_bps: 0,
         quote_block: None,
@@ -5536,7 +5541,11 @@ mod tests {
         // Capacity must not gate: the census brings its own ladder and records
         // refusals per size, so a bound here would hide sizes it was asked to
         // measure.
-        assert_eq!(e.max_input, U256::from(u128::MAX));
+        // Above the ladder's 30-native top, below what a flash provider can
+        // fund: `u128::MAX` here rejected 11 of 11 four-hop candidates as
+        // `no_flashloan_capacity` before the sweep ever ran.
+        assert_eq!(e.max_input, U256::exp10(21));
+        assert!(e.max_input > U256::exp10(19), "must clear the ladder top");
         // And no haircut, or the min-out buffer shaves the measurement itself.
         assert_eq!(e.tolerance_bps, 0);
         assert_eq!(e.observed_slippage_bps, 0);
