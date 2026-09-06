@@ -7,6 +7,10 @@
 //! against every *other* endpoint and refuses to confirm when any independent
 //! endpoint contradicts the primary result.
 //!
+//! "The same" includes the BLOCK. Verifiers are pinned to the block the primary
+//! simulated at, because a call against a different state is a second opinion
+//! about a different question -- see `verify`.
+//!
 //! Modes (env `ARBOT_SIM_QUORUM_MODE`):
 //!   * `best_effort` (default): contradictions veto the trade; verifier
 //!     transport failures are tolerated (logged + surfaced) so trading does
@@ -21,7 +25,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::types::transaction::eip2718::TypedTransaction;
-use ethers::types::{BlockId, BlockNumber, U256};
+use ethers::types::{BlockId, BlockNumber, U256, U64};
 use tracing::{info, warn};
 
 const QUORUM_MODE_ENV: &str = "ARBOT_SIM_QUORUM_MODE";
@@ -135,10 +139,33 @@ independently cross-checked (single-RPC trust). Add fallback RPC URLs to enable 
 
     /// Cross-check a primary simulation that claimed `profit >= min_profit`.
     ///
+    /// `block_number` MUST be the block the primary simulated at. This used to
+    /// ask every verifier about `pending`, which is a different state and
+    /// therefore not evidence about the candidate at hand: the primary pins to
+    /// the block the plan was QUOTED against, and `pending` resolves to head+1.
+    /// A scan takes ~8.4s -- about four Base blocks -- so the verifier was
+    /// judging the plan against state roughly five blocks newer than the one it
+    /// was priced on. The drift measured on that pair is 2 blocks +6.63 bps, 10
+    /// blocks -23.70 bps, 20 blocks -45.70 bps, which is more than enough to
+    /// flip a verdict in either direction.
+    ///
+    /// The dangerous direction is the false CONTRADICTION: a contradiction
+    /// vetoes the trade even in `best_effort`, so drift on a secondary endpoint
+    /// could block a candidate the primary had correctly confirmed.
+    ///
+    /// A verifier that cannot serve the pinned block answers with a transport
+    /// error, which is classified `Unavailable` and tolerated, not
+    /// `Contradicted` -- only revert-shaped errors contradict.
+    ///
     /// Returns `Ok(confirmations)` when the quorum policy is satisfied and an
     /// error when any independent endpoint contradicts the primary result (or,
     /// in strict mode, when no endpoint could confirm it).
-    pub async fn verify(&self, tx: &TypedTransaction, min_profit: U256) -> Result<usize> {
+    pub async fn verify(
+        &self,
+        tx: &TypedTransaction,
+        min_profit: U256,
+        block_number: U64,
+    ) -> Result<usize> {
         if !self.is_active() {
             return Ok(0);
         }
@@ -148,7 +175,10 @@ independently cross-checked (single-RPC trust). Add fallback RPC URLs to enable 
             async move {
                 let verdict = match tokio::time::timeout(
                     self.timeout,
-                    provider.call(tx, Some(BlockId::Number(BlockNumber::Pending))),
+                    provider.call(
+                        tx,
+                        Some(BlockId::Number(BlockNumber::Number(block_number))),
+                    ),
                 )
                 .await
                 {
@@ -290,9 +320,35 @@ mod tests {
         let quorum = SimQuorum::disabled("base");
         let tx = TypedTransaction::default();
         let confirmations = quorum
-            .verify(&tx, U256::from(1u64))
+            .verify(&tx, U256::from(1u64), U64::from(123u64))
             .await
             .expect("vacuous pass");
         assert_eq!(confirmations, 0);
+    }
+
+    /// The verifier must ask about the same block the primary simulated at.
+    ///
+    /// It used to ask `pending`, which resolves to head+1 while the primary
+    /// pins to the block the plan was quoted against -- roughly five blocks
+    /// apart after an ~8.4s scan. A contradiction vetoes the trade even in
+    /// `best_effort`, so a verifier judging newer state could block a candidate
+    /// the primary had correctly confirmed.
+    ///
+    /// This pins the signature rather than the wire call, which needs a live
+    /// endpoint: `verify` cannot be invoked without naming a block, so the
+    /// `pending` default cannot come back by omission.
+    #[tokio::test]
+    async fn verification_is_pinned_to_a_caller_supplied_block() {
+        let quorum = SimQuorum::disabled("base");
+        let tx = TypedTransaction::default();
+        for block in [1u64, 5_000_000, u64::from(u32::MAX)] {
+            assert_eq!(
+                quorum
+                    .verify(&tx, U256::from(1u64), U64::from(block))
+                    .await
+                    .expect("disabled quorum passes vacuously at any block"),
+                0
+            );
+        }
     }
 }

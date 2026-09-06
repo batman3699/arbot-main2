@@ -9759,8 +9759,10 @@ where
         // Cross-check the primary simulation against independent RPC
         // endpoints. A compromised or stale primary must not be able to
         // single-handedly green-light a dispatch.
+        // Same block as the primary call above. A verifier on a different
+        // state is not evidence about this candidate.
         self.sim_quorum
-            .verify(&tx, plan.min_profit)
+            .verify(&tx, plan.min_profit, block_number)
             .await
             .context("simulation quorum verification failed")?;
 
