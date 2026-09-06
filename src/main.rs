@@ -5186,6 +5186,34 @@ where
                 wanted.push((FlashLoanProvider::AaveV3.as_id(), *token, pool));
             }
         }
+        // A flash swap / UniV3 flash borrows from ONE pool, so its capacity is
+        // that pool's balance of the token -- the same `balanceOf` read the
+        // vault and aToken use below, with the pool as the holder. Without
+        // these entries `flash_loan_quotes` had nothing to cap against, which
+        // is why those two providers advertised whatever the cycle asked for.
+        //
+        // Like the Balancer vault balance, this is a CEILING rather than a
+        // promise: a UniV2 swap cannot draw a full reserve and a UniV3 flash
+        // must leave the fee behind. It bounds the claim by something real,
+        // which is the property that was missing.
+        if let (Some(tokens), Some(pool)) = (self.univ2_flashloan_tokens.as_ref(), self.univ2_flash_pool) {
+            for token in tokens.iter() {
+                wanted.push((FlashLoanProvider::Univ2Flashswap.as_id(), *token, pool));
+            }
+        }
+        if let (Some(tokens), Some(pool)) = (self.univ3_flashloan_tokens.as_ref(), self.univ3_flash_pool) {
+            for token in tokens.iter() {
+                wanted.push((FlashLoanProvider::Univ3Flash.as_id(), *token, pool));
+            }
+        }
+        // ERC-3156 is deliberately absent. Its capacity is whatever the lender
+        // reports from `maxFlashLoan(token)` (selector 0x613255ab), NOT the
+        // lender's token balance -- a lender may hold tokens it will not lend,
+        // or lend tokens it does not hold. Reading `balanceOf` here would be a
+        // plausible-looking wrong number, which is worse than none: with no
+        // entry, `capacity_capped` fails closed and the provider is withheld.
+        // It is configured on no chain in ops/inputs.yaml, so nothing is lost.
+
         if wanted.is_empty() {
             return;
         }
@@ -5573,12 +5601,26 @@ where
             .unwrap_or(false);
         if erc3156_supported {
             if let Some(lender) = self.erc3156_lender {
-                quotes.push(FlashLoanQuote {
-                    provider: FlashLoanProvider::Erc3156,
-                    max_amount: capped_amount,
-                    fee_bps: self.erc3156_fee_bps,
-                    provider_addr: Some(lender),
-                });
+                // No capacity source exists for ERC-3156 (see
+                // `refresh_flash_capacity`), so this always fails closed. That
+                // is the point: it used to advertise `capped_amount`, a number
+                // derived from the CYCLE's appetite rather than the lender's,
+                // which is a promise nothing had checked. Implementing it means
+                // a `maxFlashLoan(token)` read, not a balance.
+                if let Some(max_amount) = self.capacity_capped(
+                    FlashLoanProvider::Erc3156,
+                    token,
+                    capped_amount,
+                    capital_min,
+                    true,
+                ) {
+                    quotes.push(FlashLoanQuote {
+                        provider: FlashLoanProvider::Erc3156,
+                        max_amount,
+                        fee_bps: self.erc3156_fee_bps,
+                        provider_addr: Some(lender),
+                    });
+                }
             }
         }
 
@@ -5593,12 +5635,20 @@ where
         // why every univ2-flashswap token was structurally unfundable.
         if univ2_supported {
             if let Some(pool) = self.univ2_flash_pool {
-                quotes.push(FlashLoanQuote {
-                    provider: FlashLoanProvider::Univ2Flashswap,
-                    max_amount: capped_amount,
-                    fee_bps: self.univ2_flash_fee_bps,
-                    provider_addr: Some(pool),
-                });
+                if let Some(max_amount) = self.capacity_capped(
+                    FlashLoanProvider::Univ2Flashswap,
+                    token,
+                    capped_amount,
+                    capital_min,
+                    true,
+                ) {
+                    quotes.push(FlashLoanQuote {
+                        provider: FlashLoanProvider::Univ2Flashswap,
+                        max_amount,
+                        fee_bps: self.univ2_flash_fee_bps,
+                        provider_addr: Some(pool),
+                    });
+                }
             } else {
                 warn!(
                     token = %format!("0x{}", hex::encode(token)),
@@ -5618,12 +5668,20 @@ where
         // `fee_bps == 0` literally and would price the loan as free.
         if univ3_supported {
             if let Some(pool) = self.univ3_flash_pool {
-                quotes.push(FlashLoanQuote {
-                    provider: FlashLoanProvider::Univ3Flash,
-                    max_amount: capped_amount,
-                    fee_bps: self.univ3_flash_fee_bps,
-                    provider_addr: Some(pool),
-                });
+                if let Some(max_amount) = self.capacity_capped(
+                    FlashLoanProvider::Univ3Flash,
+                    token,
+                    capped_amount,
+                    capital_min,
+                    true,
+                ) {
+                    quotes.push(FlashLoanQuote {
+                        provider: FlashLoanProvider::Univ3Flash,
+                        max_amount,
+                        fee_bps: self.univ3_flash_fee_bps,
+                        provider_addr: Some(pool),
+                    });
+                }
             } else {
                 warn!(
                     token = %format!("0x{}", hex::encode(token)),
@@ -15606,6 +15664,51 @@ chains:
         assert_eq!(
             capacity_capped_amount(None, U256::from(1000u64), min, false),
             Some(U256::from(1000u64))
+        );
+    }
+
+    /// Every provider must be bounded by something measured, not by the
+    /// cycle's appetite.
+    ///
+    /// ERC-3156, UniV2 flashswap and UniV3 flash used to push
+    /// `max_amount: capped_amount` -- a number derived from `max_cycle_input`
+    /// and the graph's edge limits, i.e. how much the TRADE wanted, never how
+    /// much the lender had. A provider that cannot fund the loan then reverts
+    /// at dispatch with real gas spent.
+    ///
+    /// The three call sites now go through `capacity_capped`, and
+    /// `refresh_flash_capacity` measures the two pool-backed ones. ERC-3156 has
+    /// no capacity source, so it fails closed until `maxFlashLoan` is read.
+    #[test]
+    fn an_unmeasured_provider_is_withheld_not_advertised_at_cycle_size() {
+        let min = U256::from(100u64);
+        let requested = U256::from(10_000u64);
+
+        // What the three branches did: no capacity entry, yet a quote at the
+        // full requested size. `capacity_capped` is what makes that impossible,
+        // and every branch now passes allowlist_configured = true -- correct,
+        // because each is only reached when its allowlist contains the token.
+        assert_eq!(
+            capacity_capped_amount(None, requested, min, true),
+            None,
+            "a provider with no measured capacity must be withheld"
+        );
+
+        // Measured and deep: bounded by the request, not inflated by capacity.
+        assert_eq!(
+            capacity_capped_amount(Some(U256::from(50_000u64)), requested, min, true),
+            Some(requested)
+        );
+        // Measured and shallow: bounded by the POOL, which is the whole point.
+        assert_eq!(
+            capacity_capped_amount(Some(U256::from(4_000u64)), requested, min, true),
+            Some(U256::from(4_000u64)),
+            "a shallow pool must cap the loan at what it actually holds"
+        );
+        // Measured and too shallow to be worth funding.
+        assert_eq!(
+            capacity_capped_amount(Some(U256::from(99u64)), requested, min, true),
+            None
         );
     }
 
