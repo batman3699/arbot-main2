@@ -18,6 +18,13 @@ pub struct PoolRecord {
     /// Hub-side USD liquidity from offline ranking (`rank_base_pools.py`).
     /// When present, cold-pool truncation prefers highest-liquidity pools.
     pub hub_usd_liquidity: Option<f64>,
+    /// Which hub token `hub_usd_liquidity` was measured against.
+    ///
+    /// Load-bearing, not decoration: a writer that never identified a hub
+    /// cannot have measured the hub side, so its absence means the number in
+    /// `hub_usd_liquidity` is some OTHER quantity. See
+    /// `trusted_hub_usd_liquidity`.
+    pub hub_symbol: Option<String>,
 }
 
 #[derive(Clone)]
@@ -38,6 +45,8 @@ pub(crate) struct PoolRecordJson {
     created_block: u64,
     #[serde(default)]
     hub_usd_liquidity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hub_symbol: Option<String>,
 }
 
 impl PoolRecord {
@@ -51,6 +60,7 @@ impl PoolRecord {
             fee: record.fee,
             created_block: record.created_block,
             hub_usd_liquidity: record.hub_usd_liquidity,
+            hub_symbol: record.hub_symbol,
         })
     }
 
@@ -63,6 +73,7 @@ impl PoolRecord {
             fee: self.fee,
             created_block: self.created_block,
             hub_usd_liquidity: self.hub_usd_liquidity,
+            hub_symbol: self.hub_symbol.clone(),
         }
     }
 }
@@ -156,6 +167,31 @@ pub(crate) fn sanitize_hub_usd_liquidity(value: Option<f64>) -> Option<f64> {
     value.filter(|usd| usd.is_finite() && *usd > 0.0 && *usd <= MAX_SANE_HUB_USD_LIQUIDITY)
 }
 
+/// The offline hub-side USD for a record, or `None` if it cannot be trusted.
+///
+/// A record must carry BOTH the number and the hub it was measured against.
+/// `hub_symbol` is not decoration: the writers that omit it
+/// (`Convert.py`, `scripts/aerodrome_*_99k.py`, `scripts/pancakeswap_v3_99k.py`)
+/// never identify a hub token at all. They write GeckoTerminal's
+/// `reserve_in_usd` -- WHOLE-POOL TVL -- into a field that means the USD value
+/// of the hub token's balance. Roughly double for a balanced pool, and
+/// unrelated for a concentrated-liquidity pool priced out of range.
+///
+/// Audited on-chain 2026-09-06 across the 32 records in
+/// `data/base/aerodrome_slipstream_gauge`: 23 sat at a plausible 1-4x (the
+/// whole-pool-vs-hub-side factor) and 9 were fabricated, including the six
+/// largest claims in the file. The pool claiming $2,364,678,243 holds $0.04 of
+/// WETH; the one claiming $481,706,729 holds $0.000011 of USDC. Being the
+/// largest numbers in their venue, they ranked FIRST.
+///
+/// Returning None here is not a loss: `univ3_hub_usd_liquidity_score` falls
+/// through to a live `balanceOf`, which is the correct value. It costs one RPC
+/// call per such record (186 across four Base inventories as of this writing).
+pub(crate) fn trusted_hub_usd_liquidity(record: &PoolRecord) -> Option<f64> {
+    record.hub_symbol.as_ref()?;
+    sanitize_hub_usd_liquidity(record.hub_usd_liquidity)
+}
+
 /// Keep the most liquid cold-pool candidates when inventory exceeds the cap.
 /// Prefers `hub_usd_liquidity` from offline ranking; falls back to newest
 /// `created_block` when liquidity metadata is absent.
@@ -165,9 +201,11 @@ pub fn prioritize_cold_pool_inventory(records: &mut Vec<PoolRecord>, max_cold: u
         return;
     }
     records.sort_by(|left, right| {
+        // Same trust rule as the ranker. Sorting on an untrusted number would
+        // keep exactly the pools that claim the most and hold the least.
         match (
-            sanitize_hub_usd_liquidity(left.hub_usd_liquidity),
-            sanitize_hub_usd_liquidity(right.hub_usd_liquidity),
+            trusted_hub_usd_liquidity(left),
+            trusted_hub_usd_liquidity(right),
         ) {
             (Some(l), Some(r)) => r
                 .partial_cmp(&l)
@@ -242,6 +280,7 @@ mod tests {
             fee: 30,
             created_block: 12,
             hub_usd_liquidity: Some(1_000_000.0),
+            hub_symbol: Some("WETH".to_string()),
         }];
         write_pool_records(&path, &records).expect("write");
         let loaded = load_pool_records(&path).expect("load");
@@ -260,6 +299,7 @@ mod tests {
             fee: 30,
             created_block: 50,
             hub_usd_liquidity: None,
+            hub_symbol: None,
         }];
         let incoming = vec![PoolRecord {
             pool,
@@ -268,6 +308,7 @@ mod tests {
             fee: 25,
             created_block: 20,
             hub_usd_liquidity: Some(2_000_000.0),
+            hub_symbol: Some("WETH".to_string()),
         }];
         let merged = merge_pool_records(existing, incoming);
         assert_eq!(merged.len(), 1);
@@ -285,6 +326,7 @@ mod tests {
                 fee: 500,
                 created_block: 99,
                 hub_usd_liquidity: Some(10_000.0),
+                hub_symbol: Some("WETH".to_string()),
             },
             PoolRecord {
                 pool: Address::from_low_u64_be(4),
@@ -293,6 +335,7 @@ mod tests {
                 fee: 500,
                 created_block: 1,
                 hub_usd_liquidity: Some(5_000_000.0),
+                hub_symbol: Some("WETH".to_string()),
             },
         ];
         prioritize_cold_pool_inventory(&mut pools, 1);
@@ -310,6 +353,7 @@ mod tests {
                 fee: 500,
                 created_block: 99,
                 hub_usd_liquidity: Some(1e33),
+                hub_symbol: Some("WETH".to_string()),
             },
             PoolRecord {
                 pool: Address::from_low_u64_be(4),
@@ -318,6 +362,7 @@ mod tests {
                 fee: 500,
                 created_block: 1,
                 hub_usd_liquidity: Some(5_000_000.0),
+                hub_symbol: Some("WETH".to_string()),
             },
         ];
         prioritize_cold_pool_inventory(&mut pools, 1);

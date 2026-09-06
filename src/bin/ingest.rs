@@ -180,6 +180,7 @@ async fn ingest_univ2(
                 fee: fee_bps,
                 created_block: block,
                 hub_usd_liquidity: None,
+                hub_symbol: None,
             });
         }
         sleep(Duration::from_millis(INTER_CHUNK_DELAY_MS)).await;
@@ -243,6 +244,7 @@ async fn ingest_univ3(
                 fee: event.fee,
                 created_block: block,
                 hub_usd_liquidity: None,
+                hub_symbol: None,
             });
         }
         sleep(Duration::from_millis(INTER_CHUNK_DELAY_MS)).await;

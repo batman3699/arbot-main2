@@ -688,7 +688,7 @@ fn finalize_hot_with_pins(
 /// ranking (~17-22s for 1.5k pools), and every one of its failure modes silently
 /// deleted a pool from the universe.
 fn offline_hub_usd_liquidity(record: &PoolRecord) -> Option<Decimal> {
-    let usd = crate::pool_store::sanitize_hub_usd_liquidity(record.hub_usd_liquidity)?;
+    let usd = crate::pool_store::trusted_hub_usd_liquidity(record)?;
     Decimal::from_f64(usd).filter(|value| !value.is_zero())
 }
 
@@ -1223,6 +1223,7 @@ mod tests {
                 fee: 500,
                 created_block: 0,
                 hub_usd_liquidity: None,
+                hub_symbol: None,
             },
             liquidity_score: Decimal::from(liq),
             volume_score: Decimal::from(vol),
@@ -1275,6 +1276,8 @@ mod tests {
     use ethers::types::Address;
 
     fn record_with_liquidity(id: u64, hub_usd_liquidity: Option<f64>) -> PoolRecord {
+        // Ranked output always names the hub it measured. The unnamed-hub case
+        // has its own helper below.
         PoolRecord {
             pool: Address::from_low_u64_be(id),
             token0: Address::from_low_u64_be(1),
@@ -1282,6 +1285,42 @@ mod tests {
             fee: 500,
             created_block: id,
             hub_usd_liquidity,
+            hub_symbol: hub_usd_liquidity.map(|_| "WETH".to_string()),
+        }
+    }
+
+    fn record_with_unnamed_hub(id: u64, hub_usd_liquidity: Option<f64>) -> PoolRecord {
+        PoolRecord {
+            hub_symbol: None,
+            ..record_with_liquidity(id, hub_usd_liquidity)
+        }
+    }
+
+    /// A number without the hub it was measured against is not a hub-side
+    /// measurement, however plausible it looks.
+    ///
+    /// The writers that omit `hub_symbol` never identify a hub token: they put
+    /// GeckoTerminal's `reserve_in_usd` -- whole-pool TVL -- into a field that
+    /// means the USD value of the hub token's balance. Audited on-chain
+    /// 2026-09-06 over the 32 aerodrome_slipstream_gauge records: 23 were
+    /// overstated by the expected 1-4x whole-pool-vs-hub-side factor, and 9
+    /// were fabricated. The pool claiming $2,364,678,243 holds $0.04 of WETH.
+    /// Being the largest numbers in their venue, they ranked FIRST.
+    ///
+    /// Refusing them is not a loss: `univ3_hub_usd_liquidity_score` falls
+    /// through to a live `balanceOf`, which is the correct value.
+    #[test]
+    fn a_liquidity_number_without_its_hub_is_not_trusted() {
+        for plausible in [1_008.39, 250_000.0, 5_695_613.95, 59_959_477.32] {
+            assert!(
+                offline_hub_usd_liquidity(&record_with_liquidity(1, Some(plausible))).is_some(),
+                "{plausible} names its hub and must be trusted"
+            );
+            assert_eq!(
+                offline_hub_usd_liquidity(&record_with_unnamed_hub(1, Some(plausible))),
+                None,
+                "{plausible} without a hub symbol must fall through to the live read"
+            );
         }
     }
 
@@ -1569,6 +1608,7 @@ mod tests {
             fee: 500,
             created_block: 1,
             hub_usd_liquidity: None,
+            hub_symbol: None,
         };
         let scored_pool = PoolRecord {
             pool: Address::from_low_u64_be(9),
@@ -1577,6 +1617,10 @@ mod tests {
             fee: 500,
             created_block: 2,
             hub_usd_liquidity: Some(1_000_000.0),
+            // Names its hub, so the score is actually trusted -- otherwise this
+            // would test that an UNSCORED pool loses to a pin, which is weaker
+            // than what it is named for.
+            hub_symbol: Some("WETH".to_string()),
         };
         let hot = finalize_hot_with_pins(vec![scored_pool], vec![pinned_pool.clone()], 1);
         assert_eq!(hot.len(), 1);
@@ -1592,6 +1636,7 @@ mod tests {
             fee: 500,
             created_block: 1,
             hub_usd_liquidity: None,
+            hub_symbol: None,
         };
         assert!(pool_matches_pair(
             &record,
