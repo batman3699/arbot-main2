@@ -1041,42 +1041,37 @@ impl RpcForkDb {
 
             for (idx, addr) in chunk.iter().enumerate() {
                 let base_id = idx * 3 + 1;
-                let nonce = entries
-                    .iter()
-                    .find(|item| item.get("id").and_then(|v| v.as_u64()) == Some(base_id as u64))
-                    .and_then(|item| item.get("result"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
-                    .unwrap_or(0);
-                let balance = entries
-                    .iter()
-                    .find(|item| {
-                        item.get("id").and_then(|v| v.as_u64()) == Some((base_id + 1) as u64)
-                    })
-                    .and_then(|item| item.get("result"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|raw| parse_u256_hex(raw).ok())
-                    .unwrap_or(U256::ZERO);
-                let code_hex = entries
-                    .iter()
-                    .find(|item| {
-                        item.get("id").and_then(|v| v.as_u64()) == Some((base_id + 2) as u64)
-                    })
-                    .and_then(|item| item.get("result"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("0x");
-                let code_bytes = hex::decode(code_hex.trim_start_matches("0x")).unwrap_or_default();
-                let code = Bytecode::new_raw(Bytes::from(code_bytes));
-                let code_hash = code.hash_slow();
-                self.account_cache.insert(
-                    *addr,
-                    AccountInfo {
-                        balance,
-                        nonce,
-                        code_hash,
-                        code: Some(code),
+                let by_id = |id: usize| {
+                    entries
+                        .iter()
+                        .find(|item| item.get("id").and_then(|v| v.as_u64()) == Some(id as u64))
+                };
+                // An account that cannot be decoded is left OUT of the cache
+                // rather than cached as zeros. `basic_ref` will fetch it again
+                // and fail loudly there if it is still unreadable, which ends
+                // in a fallback to eth_call -- a real simulation instead of one
+                // run against a fabricated empty account.
+                let decoded = rpc_result_str(by_id(base_id), "eth_getTransactionCount").and_then(
+                    |nonce_hex| {
+                        let balance_hex = rpc_result_str(by_id(base_id + 1), "eth_getBalance")?;
+                        let code_hex = rpc_result_str(by_id(base_id + 2), "eth_getCode")?;
+                        decode_account(nonce_hex, balance_hex, code_hex)
                     },
                 );
+                let info = match decoded {
+                    Ok(info) => info,
+                    Err(err) => {
+                        tracing::debug!(
+                            target: "sim_revm",
+                            address = %format!("{addr:#x}"),
+                            error = %err,
+                            "prefetch could not decode account; leaving it uncached \
+                             rather than assuming an empty one"
+                        );
+                        continue;
+                    }
+                };
+                self.account_cache.insert(*addr, info);
                 loaded += 1;
             }
         }
@@ -1124,32 +1119,15 @@ impl DatabaseRef for RpcForkDb {
         let balance_resp = self.call("eth_getBalance", json!([addr.clone(), self.block_param()]))?;
         let code_resp = self.call("eth_getCode", json!([addr, self.block_param()]))?;
 
-        let nonce_hex = nonce_resp
-            .get("result")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0x0");
-        let balance_hex = balance_resp
-            .get("result")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0x0");
-        let code_hex = code_resp
-            .get("result")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0x");
+        // Strict, and it has to be: this is the path the prefetch defers to.
+        // It defaulted a missing `result` to "0x0"/"0x" before the parsers ran,
+        // so the parsers never saw the failure -- an unreadable account became
+        // a real-looking empty one and the fork simulated against it.
+        let nonce_hex = rpc_result_str(Some(&nonce_resp), "eth_getTransactionCount")?;
+        let balance_hex = rpc_result_str(Some(&balance_resp), "eth_getBalance")?;
+        let code_hex = rpc_result_str(Some(&code_resp), "eth_getCode")?;
 
-        let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16)
-            .map_err(|err| RpcDbError(format!("parse nonce: {err}")))?;
-        let balance = parse_u256_hex(balance_hex)?;
-        let code_bytes = hex::decode(code_hex.trim_start_matches("0x")).unwrap_or_default();
-        let code = Bytecode::new_raw(Bytes::from(code_bytes));
-        let code_hash = code.hash_slow();
-
-        Ok(Some(AccountInfo {
-            balance,
-            nonce,
-            code_hash,
-            code: Some(code),
-        }))
+        Ok(Some(decode_account(nonce_hex, balance_hex, code_hex)?))
     }
 
     fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -1168,10 +1146,14 @@ impl DatabaseRef for RpcForkDb {
             "eth_getStorageAt",
             json!([addr, slot, self.block_param()]),
         )?;
-        let result = response
-            .get("result")
-            .and_then(|v| v.as_str())
-            .unwrap_or("0x0");
+        // The same rule as accounts, and this one is worse: the value is
+        // written into the block's storage cache below, so a single failed
+        // read poisons every later read of that slot at that block. Zero is
+        // also the most convincing wrong answer available -- an unset slot IS
+        // zero, so a fabricated one is indistinguishable from a real one, and
+        // a pool reserve or token balance reading zero changes which branch
+        // the fork takes.
+        let result = rpc_result_str(Some(&response), "eth_getStorageAt")?;
         let value = parse_u256_hex(result)?;
         store_storage(self.block_number, address, index, value);
         Ok(value)
@@ -1189,6 +1171,52 @@ impl DatabaseRef for RpcForkDb {
             .ok_or_else(|| RpcDbError("block hash missing".into()))?;
         parse_b256_hex(hash).map_err(|err| RpcDbError(err.to_string()))
     }
+}
+
+/// The `result` string of one JSON-RPC response, or an error saying why not.
+///
+/// A missing `result` is NOT a zero. JSON-RPC answers a query about a
+/// non-existent account or an unset storage slot with `result: "0x0"` --
+/// present and explicit -- so the field is absent only when the call errored or
+/// the reply was malformed. Defaulting it to "0x0" made those two
+/// indistinguishable, which is what let a broken response be cached as real
+/// chain state.
+fn rpc_result_str<'a>(entry: Option<&'a Value>, method: &str) -> Result<&'a str, RpcDbError> {
+    let entry = entry.ok_or_else(|| RpcDbError(format!("{method}: no response for this id")))?;
+    if let Some(err) = entry.get("error") {
+        return Err(RpcDbError(format!("{method}: rpc error {err}")));
+    }
+    entry
+        .get("result")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| RpcDbError(format!("{method}: response carried no result string")))
+}
+
+/// Build one account from its three RPC results, or fail.
+///
+/// Shared by the batched prefetch and the per-account `basic_ref`, because both
+/// decoded this independently and both defaulted every field. The code decode
+/// is the worst one to get wrong: `unwrap_or_default()` turns a malformed
+/// `eth_getCode` reply into a CODELESS account, so a contract call inside the
+/// fork returns empty instead of executing.
+fn decode_account(
+    nonce_hex: &str,
+    balance_hex: &str,
+    code_hex: &str,
+) -> Result<AccountInfo, RpcDbError> {
+    let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16)
+        .map_err(|err| RpcDbError(format!("parse nonce {nonce_hex:?}: {err}")))?;
+    let balance = parse_u256_hex(balance_hex)?;
+    let code_bytes = hex::decode(code_hex.trim_start_matches("0x"))
+        .map_err(|err| RpcDbError(format!("parse code: {err}")))?;
+    let code = Bytecode::new_raw(Bytes::from(code_bytes));
+    let code_hash = code.hash_slow();
+    Ok(AccountInfo {
+        balance,
+        nonce,
+        code_hash,
+        code: Some(code),
+    })
 }
 
 fn parse_u256_hex(raw: &str) -> Result<U256, RpcDbError> {
@@ -1468,6 +1496,58 @@ mod tests {
     fn refusing_is_preferred_to_simulating_the_wrong_contract() {
         assert!(executor_bytecode_at_block(&[], None).is_err());
         assert!(executor_bytecode_at_block(&[0x00], None).is_ok());
+    }
+
+    /// A missing RPC field is not an empty account.
+    ///
+    /// JSON-RPC answers a query about a non-existent account with an explicit
+    /// `result: "0x0"`, so the field is absent only when the call errored or
+    /// the reply was malformed. Defaulting it made a broken response
+    /// indistinguishable from real chain state, and the fork then simulated
+    /// against nonce 0 / balance 0 / no code as if that were true.
+    #[test]
+    fn a_missing_rpc_field_is_not_an_empty_account() {
+        // The legitimate case still decodes: a real account answering zeros.
+        let zero = json!({"id": 1, "result": "0x0"});
+        let ok = rpc_result_str(Some(&zero), "eth_getBalance");
+        assert_eq!(ok.expect("explicit zero is an answer"), "0x0");
+
+        // No response for this id at all -- a short or reordered batch.
+        assert!(rpc_result_str(None, "eth_getBalance").is_err());
+
+        // A response that carries an error instead of a result.
+        let errored = json!({"id": 1, "error": {"code": -32000, "message": "header not found"}});
+        let err = rpc_result_str(Some(&errored), "eth_getCode")
+            .expect_err("an rpc error is not an empty account");
+        assert!(
+            format!("{err}").contains("header not found"),
+            "the error must carry the node's reason, got: {err}"
+        );
+
+        // A malformed reply with no result member.
+        let bare = json!({"id": 1});
+        assert!(rpc_result_str(Some(&bare), "eth_getCode").is_err());
+    }
+
+    /// Malformed code must not become a CODELESS account: a contract call in
+    /// the fork would then return empty instead of executing.
+    #[test]
+    fn undecodable_account_fields_fail_rather_than_defaulting() {
+        let good = decode_account("0x2a", "0x1bc16d674ec80000", "0x6080")
+            .expect("a well-formed account decodes");
+        assert_eq!(good.nonce, 42);
+        assert_eq!(good.balance, U256::from(2_000_000_000_000_000_000u64));
+
+        // An account with no code is legitimate and still decodes.
+        assert!(decode_account("0x0", "0x0", "0x").is_ok());
+
+        assert!(decode_account("zzz", "0x0", "0x").is_err(), "bad nonce");
+        assert!(decode_account("0x0", "zzz", "0x").is_err(), "bad balance");
+        assert!(
+            decode_account("0x0", "0x0", "0xabc").is_err(),
+            "odd-length code hex used to become an empty contract"
+        );
+        assert!(decode_account("0x0", "0x0", "0xzz").is_err(), "bad code hex");
     }
 
     #[test]
