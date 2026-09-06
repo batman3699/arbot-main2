@@ -167,6 +167,38 @@ pub fn record_revm_metric(metrics: &crate::metrics::Metrics, success: bool) {
     }
 }
 
+/// Bytecode to inject for the executor when forking at a PINNED block.
+///
+/// `Ok(None)` means the fork's own state already has the code and nothing
+/// should be injected.
+///
+/// This used to fall back to `eth_getCode(executor, "latest")` when the address
+/// had no code at the requested block, which destroys the determinism the whole
+/// fork is for: the simulation runs at block N against bytecode that may not
+/// have existed at block N. A contract deployed or upgraded after N would then
+/// report a successful simulation for a trade that could not have executed.
+///
+/// The env override is kept because it is categorically different. It is an
+/// operator stating "use this code", which is a declared intent; reaching for
+/// latest chain state is the simulator inventing one.
+///
+/// Failing is cheap here: the caller records a Fallback metric and degrades to
+/// `eth_call`, which is a real simulation rather than a fabricated one.
+fn executor_bytecode_at_block(
+    onchain: &[u8],
+    env_override: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    if !onchain.is_empty() {
+        return Ok(None);
+    }
+    match env_override {
+        Some(bytecode) => Ok(Some(bytecode)),
+        None => Err(anyhow!(
+            "executor has no code at the pinned block and no bytecode override              is set; refusing to substitute latest chain state into a historical              fork (set ARBOT_SIM_REVM_EXECUTOR_BYTECODE to override deliberately)"
+        )),
+    }
+}
+
 /// Primary async entry: fork chain state at `block_number` and execute `tx` in REVM.
 pub async fn simulate_via_revm(request: SimForkRequest) -> Result<RevmSimResult> {
     if !sim_revm_enabled() {
@@ -186,21 +218,16 @@ pub async fn simulate_via_revm(request: SimForkRequest) -> Result<RevmSimResult>
             request.block_number,
         )
         .await?;
-        if onchain.is_empty() {
-            executor_bytecode = resolve_executor_bytecode_env();
-            if executor_bytecode.is_none() {
-                let latest = fetch_code_at_block(
-                    &request.rpc_url,
-                    request.executor_address,
-                    u64::MAX,
-                )
-                .await
-                .unwrap_or_default();
-                if !latest.is_empty() {
-                    executor_bytecode = Some(latest);
-                }
-            }
-        }
+        executor_bytecode = executor_bytecode_at_block(
+            &onchain,
+            resolve_executor_bytecode_env(),
+        )
+        .with_context(|| {
+            format!(
+                "executor {:#x} at block {}",
+                request.executor_address, request.block_number
+            )
+        })?;
     }
 
     let tx_env = typed_tx_to_tx_env(&request.tx, request.chain_id)?;
@@ -1398,6 +1425,49 @@ mod tests {
             .into();
         let rlp = encode_unsigned_tx_rlp(&tx, 8453).expect("rlp");
         assert!(!rlp.is_empty());
+    }
+
+    /// A fork pinned at block N must never be handed code from `latest`.
+    ///
+    /// The old fallback did exactly that when the executor had no code at N.
+    /// A contract deployed or upgraded after N would then simulate
+    /// successfully for a trade that could not have executed at N -- the fork
+    /// reports on a chain state that never existed.
+    #[test]
+    fn a_pinned_fork_never_borrows_latest_bytecode() {
+        // Code present at the pinned block: nothing to inject, the fork's own
+        // state is authoritative.
+        assert_eq!(
+            executor_bytecode_at_block(&[0x60, 0x80], None).expect("code at block"),
+            None,
+            "deployed executor must use the fork's own code, not an override"
+        );
+
+        // No code at the pinned block and no declared override. This is where
+        // `latest` used to be substituted; it must now fail instead.
+        let err = executor_bytecode_at_block(&[], None)
+            .expect_err("an undeployed executor must not borrow latest bytecode");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("refusing to substitute latest chain state"),
+            "the error must name what it refused to do, got: {message}"
+        );
+
+        // An operator override is a declared intent, not a substitution, so it
+        // is still honoured.
+        assert_eq!(
+            executor_bytecode_at_block(&[], Some(vec![0xfe])).expect("override honoured"),
+            Some(vec![0xfe])
+        );
+    }
+
+    /// Failing is cheap: `simulate_plan_execution` records a Fallback metric
+    /// and degrades to `eth_call`, which is a real simulation. Silently forking
+    /// against the wrong bytecode is not recoverable, because it succeeds.
+    #[test]
+    fn refusing_is_preferred_to_simulating_the_wrong_contract() {
+        assert!(executor_bytecode_at_block(&[], None).is_err());
+        assert!(executor_bytecode_at_block(&[0x00], None).is_ok());
     }
 
     #[test]
