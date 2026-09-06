@@ -244,9 +244,14 @@ where
                 continue;
             }
 
-            let tick_spacing = match results.get(base + 2) {
-                Some(Some(b)) if b.len() >= 32 => decode_int24(&b[..32]),
-                _ => 60,
+            // Omitting the pool is the documented contract of this function
+            // (see `ingestion.rs`: "silently omits any pool it cannot read"),
+            // and every other field here already fails closed the same way.
+            // Omitting the pool is the documented contract of this function
+            // (see `ingestion.rs`: "silently omits any pool it cannot read"),
+            // and every other field here already fails closed the same way.
+            let Some(tick_spacing) = decode_tick_spacing(results.get(base + 2)) else {
+                continue;
             };
             let fee_on_chain = match results.get(base + 3) {
                 Some(Some(b)) if b.len() >= 32 => {
@@ -286,6 +291,29 @@ where
     out
 }
 
+/// The pool's tick spacing, or `None` if it did not report a usable one.
+///
+/// A failed read is an ABSENT pool, not a UniV3-shaped one. This used to
+/// default to 60, which turns a broken `tickSpacing()` call into a
+/// healthy-looking pool whose ticks are then walked on the wrong grid -- and 60
+/// is positive and plausible, so the `tick_spacing <= 0` guard in
+/// `cl_ticks::build_tick_ladder` never fires on it.
+///
+/// Measured on Base 2026-09-06: Aerodrome Slipstream pools report spacings of
+/// 1, 100, 200 and 2000, and not one sampled pool used 60. Even UniV3 is not
+/// uniform -- its 1bps tier is spacing 1. This loader is venue-agnostic, so 60
+/// was wrong for most of what it sees.
+fn decode_tick_spacing(word: Option<&Option<Vec<u8>>>) -> Option<i32> {
+    let raw = word?.as_ref()?;
+    if raw.len() < 32 {
+        return None;
+    }
+    // `decode_int24` yields 0 for a short word, so this also covers a response
+    // that is present but truncated.
+    let spacing = decode_int24(&raw[..32]);
+    (spacing > 0).then_some(spacing)
+}
+
 /// Load slot0 + liquidity once per pool per block (tick spacing + fee from chain).
 pub async fn load_cl_pool_state<C>(
     provider: Arc<Provider<C>>,
@@ -323,12 +351,18 @@ where
         return Ok(None);
     }
 
+    // Same rule as the batched loader above, and this path matters more: it is
+    // the per-pool FALLBACK, reached precisely when the batched read already
+    // failed, so an RPC fault here is the likely case rather than the rare one.
     let tick_spacing = contract
         .tick_spacing()
         .block(block_id)
         .call()
         .await
-        .unwrap_or(60);
+        .context("CL pool tickSpacing()")?;
+    if tick_spacing <= 0 {
+        return Ok(None);
+    }
     let fee_on_chain = contract.fee().block(block_id).call().await.ok();
     let fee_ppm = fee_hint.or(fee_on_chain).unwrap_or(3_000);
 
@@ -489,6 +523,63 @@ pub fn cl_max_ticks_crossed() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn word(value: i32) -> Option<Vec<u8>> {
+        let mut w = vec![0u8; 32];
+        let raw = (value as u32) & 0x00ff_ffff;
+        // Sign-extend across the word the way an int24 return does.
+        if value < 0 {
+            for b in w.iter_mut().take(29) {
+                *b = 0xff;
+            }
+        }
+        w[29] = (raw >> 16) as u8;
+        w[30] = (raw >> 8) as u8;
+        w[31] = raw as u8;
+        Some(w)
+    }
+
+    /// A missing tick spacing means the pool is unavailable, never that it is a
+    /// 60-spacing UniV3 pool.
+    ///
+    /// The old `_ => 60` produced a pool that looks healthy and is then walked
+    /// on the wrong tick grid. Nothing downstream catches it: 60 is positive, so
+    /// `cl_ticks::build_tick_ladder`'s `tick_spacing <= 0` guard stays quiet.
+    #[test]
+    fn a_pool_that_reports_no_tick_spacing_is_omitted_not_defaulted() {
+        // The failure modes, all of which used to become 60.
+        assert_eq!(decode_tick_spacing(None), None, "call absent from results");
+        assert_eq!(decode_tick_spacing(Some(&None)), None, "sub-call reverted");
+        assert_eq!(
+            decode_tick_spacing(Some(&Some(vec![0u8; 8]))),
+            None,
+            "truncated response"
+        );
+        assert_eq!(
+            decode_tick_spacing(Some(&Some(vec![0u8; 32]))),
+            None,
+            "a zero spacing is not a grid"
+        );
+        assert_eq!(
+            decode_tick_spacing(Some(&word(-60))),
+            None,
+            "a negative spacing is not a grid"
+        );
+    }
+
+    /// Every spacing this loader actually meets on Base must survive, which is
+    /// the reason a single default was wrong: measured 2026-09-06, Slipstream
+    /// reports 1, 100, 200 and 2000, and UniV3's 1bps tier reports 1.
+    #[test]
+    fn real_venue_tick_spacings_are_all_accepted() {
+        for spacing in [1, 10, 50, 60, 100, 200, 2000] {
+            assert_eq!(
+                decode_tick_spacing(Some(&word(spacing))),
+                Some(spacing),
+                "spacing {spacing} is a real venue value and must load"
+            );
+        }
+    }
 
     #[test]
     fn single_tick_quote_non_zero() {
