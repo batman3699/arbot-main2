@@ -66,7 +66,7 @@ where
         gas_limit_hint: Option<U256>,
         priority_fee: Option<U256>,
     ) -> Result<FeeEstimate> {
-        match self.model {
+        let estimate = match self.model {
             GasModel::LineaEstimateGas => self.estimate_linea_fee(tx, priority_fee).await,
             GasModel::CustomRpcMethod => {
                 self.estimate_custom_fee(tx, gas_limit_hint, priority_fee)
@@ -80,8 +80,43 @@ where
                     .await
                     .ok()
                     .and_then(|block| block.and_then(|b| b.base_fee_per_gas));
-                let mut gas_price = self.provider.get_gas_price().await.unwrap_or_default();
-                if let Some(priority_fee) = priority_fee {
+                // This used to be `unwrap_or_default()`, so a failed
+                // eth_gasPrice produced a gas price of ZERO and the candidate
+                // was then priced as if execution were free. Fail closed: the
+                // caller can skip the block, it cannot un-know a fake number.
+                //
+                // The message says "rpc" deliberately -- `is_rpc_error` in
+                // main.rs matches on that word to trip the circuit breaker and
+                // mark the endpoint unhealthy, which is exactly what a gas-price
+                // failure is evidence of.
+                let mut gas_price = self
+                    .provider
+                    .get_gas_price()
+                    .await
+                    .context("eth_gasPrice rpc call failed")?;
+
+                // An endpoint that answers zero has not given us a price
+                // either. Substitute base+priority only when BOTH are known:
+                // a priority fee alone is the tip on top of a gas price, not a
+                // gas price, and using it as the whole cost understates gas by
+                // the entire base fee. `base_fee` being absent is tolerated
+                // above only because pre-EIP-1559 chains legitimately have
+                // none -- there, eth_gasPrice is the answer, so it must work.
+                if gas_price.is_zero() {
+                    gas_price = match (base_fee, priority_fee) {
+                        (Some(base), Some(priority)) => base.saturating_add(priority),
+                        _ => U256::zero(),
+                    };
+                }
+
+                // The tip only ever RAISES a price that already exists. With
+                // no base fee the floor is the tip alone, which is a legitimate
+                // floor over a real gas price (legacy chains) but is not itself
+                // a gas price -- so it must not be allowed to lift a ZERO into
+                // something that merely looks priced. That is why the repair
+                // above runs first and insists on a base fee, and why this is
+                // skipped entirely while gas_price is zero.
+                if let Some(priority_fee) = priority_fee.filter(|_| !gas_price.is_zero()) {
                     let forced = base_fee
                         .map(|base| base.saturating_add(priority_fee))
                         .unwrap_or(priority_fee);
@@ -113,7 +148,31 @@ where
                     total_fee_native,
                 })
             }
+        }?;
+
+        // One invariant, enforced once for every gas model: a fee estimate
+        // never carries a zero gas price.
+        //
+        // Zero is not a cheap estimate, it is an absent one, and it is the most
+        // dangerous value on the profitability path -- `total_fee_native`
+        // becomes zero, `dynamic_min_profit` charges nothing for gas, and every
+        // candidate clears the profit gate as if it executed for free. The
+        // ceiling checks downstream only catch gas that is too HIGH.
+        //
+        // `estimate_custom_fee` reached zero the same way (`.unwrap_or_default()`
+        // when the response carried neither a gas price nor base+priority), and
+        // `estimate_linea_fee` can be handed a zero base fee, so the check lives
+        // here rather than in one branch.
+        if estimate.gas_price.is_zero() {
+            return Err(anyhow!(
+                "{}: no usable gas price (the rpc endpoint returned zero and \
+                 base_fee/priority_fee cannot supply one); refusing to price a \
+                 candidate as if gas were free",
+                self.chain_name
+            ));
         }
+
+        Ok(estimate)
     }
 
     async fn estimate_op_stack_l1_fee(&self, tx: &TypedTransaction) -> Result<U256> {
@@ -351,8 +410,123 @@ struct CustomFeeResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::CustomFeeResponse;
-    use ethers::types::U256;
+    use super::{ArbitrumFeeConfig, CustomFeeResponse, FeeEstimator};
+    use crate::ops_inputs::GasModel;
+    use ethers::providers::{MockProvider, Provider};
+    use ethers::types::transaction::eip2718::TypedTransaction;
+    use ethers::types::{TransactionRequest, U256};
+
+    /// `MockProvider` answers requests LIFO, so responses are pushed in the
+    /// reverse of the order the code under test asks for them. The Eip1559 arm
+    /// of `estimate_for_tx` asks for the latest block first, then eth_gasPrice.
+    fn estimator_answering(
+        gas_price: Option<&str>,
+        base_fee: Option<&str>,
+    ) -> FeeEstimator<MockProvider> {
+        let (provider, mock) = Provider::mocked();
+        if let Some(price) = gas_price {
+            mock.push::<U256, _>(U256::from_str_radix(price, 16).expect("gas price"))
+                .expect("push gas price");
+        }
+        let block = match base_fee {
+            Some(fee) => serde_json::json!({
+                "number": "0x1",
+                "hash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "baseFeePerGas": format!("0x{fee}"),
+                "transactions": [],
+                "uncles": [],
+            }),
+            None => serde_json::Value::Null,
+        };
+        mock.push::<serde_json::Value, _>(block).expect("push block");
+        FeeEstimator::new(
+            "testchain".to_string(),
+            GasModel::Eip1559,
+            provider,
+            ArbitrumFeeConfig::default(),
+            None,
+        )
+    }
+
+    fn bare_tx() -> TypedTransaction {
+        TransactionRequest::new().into()
+    }
+
+    /// Zero is not a cheap gas price, it is an absent one. Pricing a candidate
+    /// at zero gas makes every route look profitable, and the ceiling checks
+    /// downstream only catch gas that is too high.
+    #[tokio::test]
+    async fn a_zero_gas_price_is_refused_rather_than_priced_as_free() {
+        // eth_gasPrice answers 0, and no priority fee is offered as a floor.
+        let estimator = estimator_answering(Some("0"), Some("64"));
+        let err = estimator
+            .estimate_for_tx(&bare_tx(), Some(U256::from(210_000u64)), None)
+            .await
+            .expect_err("a zero gas price must not produce a fee estimate");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no usable gas price"),
+            "unexpected error: {message}"
+        );
+    }
+
+    /// The failure has to reach `is_rpc_error` in main.rs, which matches on the
+    /// word "rpc" to trip the circuit breaker and mark the endpoint unhealthy.
+    /// A gas-price call that fails is exactly that evidence.
+    #[tokio::test]
+    async fn a_failed_gas_price_call_errors_and_reads_as_an_rpc_fault() {
+        // Nothing pushed for eth_gasPrice, so the mock errors on that request.
+        let estimator = estimator_answering(None, Some("64"));
+        let err = estimator
+            .estimate_for_tx(&bare_tx(), Some(U256::from(210_000u64)), None)
+            .await
+            .expect_err("a failed eth_gasPrice must not silently become zero");
+        let message = format!("{err:#}").to_ascii_lowercase();
+        assert!(
+            message.contains("rpc"),
+            "error must classify as an RPC fault, got: {message}"
+        );
+    }
+
+    /// A priority fee alone is the tip on top of a gas price, not a gas price.
+    /// Accepting it as the whole cost understates gas by the entire base fee,
+    /// which is the larger term on every chain worth trading.
+    #[tokio::test]
+    async fn a_priority_fee_alone_cannot_stand_in_for_a_missing_gas_price() {
+        // eth_gasPrice answers 0 and the block carries no base fee, so the only
+        // number available is the caller's 0.01 gwei tip.
+        let estimator = estimator_answering(Some("0"), None);
+        let err = estimator
+            .estimate_for_tx(
+                &bare_tx(),
+                Some(U256::from(210_000u64)),
+                Some(U256::from(10_000_000u64)),
+            )
+            .await
+            .expect_err("priority fee alone is not a gas price");
+        assert!(
+            format!("{err:#}").contains("no usable gas price"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// The ordinary path still works: a real gas price is returned untouched
+    /// and the priority fee only ever raises it.
+    #[tokio::test]
+    async fn a_real_gas_price_is_returned_and_the_tip_only_raises_it() {
+        let estimator = estimator_answering(Some("64"), Some("64"));
+        let estimate = estimator
+            .estimate_for_tx(&bare_tx(), Some(U256::from(210_000u64)), None)
+            .await
+            .expect("a valid gas price must produce an estimate");
+        assert_eq!(estimate.gas_price, U256::from(100u64));
+        assert_eq!(estimate.base_fee_per_gas, Some(U256::from(100u64)));
+        assert_eq!(
+            estimate.total_fee_native,
+            U256::from(100u64) * U256::from(210_000u64)
+        );
+    }
 
     #[test]
     fn parses_custom_fee_response() {

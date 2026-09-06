@@ -6574,28 +6574,28 @@ where
         let baseline_tx: TypedTransaction = TransactionRequest::new()
             .data(Bytes::from(baseline_calldata))
             .into();
-        let gas_parameters = match self
+        // A failed baseline estimate used to be swallowed here and replaced
+        // with a hand-built FeeEstimate carrying `gas_price: 0` and
+        // `total_fee_native: 0` -- which is the same fail-open that
+        // `estimate_for_tx` now refuses, just rebuilt one level up. Every
+        // candidate in the block would then be priced as if gas were free.
+        //
+        // Propagate instead. The scan loop's `Err` arm already does the right
+        // thing with this: `is_rpc_error` matches the "rpc" in the message, so
+        // it records an RPC error, trips the circuit breaker, and marks the
+        // endpoint unhealthy. Skipping one block costs a scan; scanning it with
+        // a zero gas price costs whatever the bot then sends.
+        let gas_parameters = self
             .fee_estimator
             .estimate_for_tx(&baseline_tx, Some(U256::from(210_000u64)), priority_fee)
             .await
-        {
-            Ok(estimate) => estimate,
-            Err(err) => {
-                warn!(error = %err, chain = %self.chain_name, "Failed to estimate baseline fee");
-                FeeEstimate {
-                    gas_limit: U256::from(210_000u64),
-                    gas_price: U256::zero(),
-                    base_fee_per_gas: base_fee,
-                    priority_fee_per_gas: priority_fee,
-                    max_fee_per_gas: base_fee.and_then(|base| {
-                        priority_fee.map(|priority| base.saturating_add(priority))
-                    }),
-                    max_priority_fee_per_gas: priority_fee,
-                    l1_data_fee: U256::zero(),
-                    total_fee_native: U256::zero(),
-                }
-            }
-        };
+            .with_context(|| {
+                format!(
+                    "baseline fee estimate failed for chain {} at block {block_number}; \
+                     skipping the block rather than scanning it with an unpriced gas cost",
+                    self.chain_name
+                )
+            })?;
 
         let gas_price_for_weights = self.gas_price_for_weights(&gas_parameters);
 
