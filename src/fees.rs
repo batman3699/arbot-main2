@@ -226,9 +226,20 @@ where
                 let dev_bps = if configured.is_zero() {
                     0u32
                 } else {
+                    // `as_u32()` PANICS above u32::MAX, in release as well as
+                    // debug, and this is reachable from ordinary config: a
+                    // small `per_byte_wei` against a large on-chain value
+                    // overflows u32 once multiplied by 10,000 (configured = 1
+                    // wei and 500k wei on-chain is already past it). Aborting
+                    // the process is a worse answer than a saturated one.
+                    //
+                    // Saturating is exact for the only use, a `> max_dev`
+                    // comparison against a u32: anything that would have
+                    // overflowed is already over any threshold.
                     diff.saturating_mul(U256::from(10_000u64))
                         .checked_div(configured)
                         .unwrap_or_default()
+                        .min(U256::from(u32::MAX))
                         .as_u32()
                 };
                 if dev_bps > max_dev {
@@ -300,11 +311,35 @@ where
         let gas_limit = resp
             .gas_limit
             .or(gas_limit_hint)
-            .ok_or_else(|| anyhow!("custom fee response missing gasLimit"))?;
+            .ok_or_else(|| {
+                // "rpc" so `is_rpc_error` (main.rs) classifies it, like the
+                // request and gas-price faults around it. This was the only
+                // fault in this function that could not trip the circuit
+                // breaker, so an endpoint answering without a gasLimit was
+                // never counted against its health.
+                anyhow!(
+                    "custom fee rpc response for {method} carried no gasLimit \
+                     and no gas limit hint was supplied"
+                )
+            })?;
         let base_fee = resp.base_fee_per_gas;
-        let priority_fee = priority_fee
-            .or(resp.priority_fee_per_gas)
-            .or(resp.gas_price);
+        // The tip is what is paid ON TOP of the base fee, so it may come from
+        // the caller or from the endpoint's own priorityFeePerGas -- never from
+        // `resp.gas_price`, which is the WHOLE price. That `.or(resp.gas_price)`
+        // fired only for a legacy-style response (a gasPrice with no
+        // base/priority split) and then set maxPriorityFeePerGas to the entire
+        // gas price: a transaction tipping 100% of its own cost.
+        //
+        // It never affected `gas_price` below -- the rebuild arm is reached
+        // only when `resp.gas_price` is None, which is exactly when this `.or`
+        // contributed nothing -- so dropping it changes the tip and nothing
+        // else.
+        //
+        // None is the right answer for a legacy response, and both consumers
+        // handle it: `apply_fee_to_tx` falls back to `set_gas_price` when
+        // neither 1559 field is set, and the max_fee_per_gas risk cap falls
+        // back to `fee.gas_price`.
+        let priority_fee = priority_fee.or(resp.priority_fee_per_gas);
         // A missing fee quote is not an economic zero. This used to end in
         // `.unwrap_or_default()`, so a response carrying neither a gasPrice nor
         // enough to rebuild one priced the transaction at zero gas -- the same
@@ -616,6 +651,120 @@ mod tests {
             .await
             .expect("an absurd base fee must saturate, not panic");
         assert_eq!(estimate.gas_price, U256::MAX);
+    }
+
+    /// A legacy-style response -- a gasPrice with no base/priority split -- must
+    /// produce NO tip. The endpoint's whole gas price used to be copied into
+    /// `priority_fee`, which is what lands on the transaction as
+    /// maxPriorityFeePerGas: a transaction tipping 100% of its own cost.
+    #[tokio::test]
+    async fn a_legacy_custom_response_does_not_tip_its_entire_gas_price() {
+        let estimator = custom_estimator(serde_json::json!({
+            "gasLimit": "0x5208",
+            "gasPrice": "0x64",
+        }));
+        let estimate = estimator
+            .estimate_for_tx(&bare_tx(), None, None)
+            .await
+            .expect("a legacy gasPrice is a usable price");
+        assert_eq!(estimate.gas_price, U256::from(100u64));
+        assert_eq!(
+            estimate.priority_fee_per_gas, None,
+            "a legacy response carries no tip"
+        );
+        assert_eq!(
+            estimate.max_priority_fee_per_gas, None,
+            "the gas price must never be copied into the tip"
+        );
+        // With neither 1559 field set, `apply_fee_to_tx` prices the transaction
+        // with `set_gas_price`, which is correct for a legacy response.
+        assert_eq!(estimate.max_fee_per_gas, None);
+    }
+
+    /// The caller's own tip still survives a legacy response.
+    #[tokio::test]
+    async fn a_caller_supplied_tip_is_kept_alongside_a_legacy_gas_price() {
+        let estimator = custom_estimator(serde_json::json!({
+            "gasLimit": "0x5208",
+            "gasPrice": "0x64",
+            "baseFeePerGas": "0x50",
+        }));
+        let estimate = estimator
+            .estimate_for_tx(&bare_tx(), None, Some(U256::from(2u64)))
+            .await
+            .expect("caller tip plus a quoted price");
+        assert_eq!(estimate.gas_price, U256::from(100u64));
+        assert_eq!(estimate.priority_fee_per_gas, Some(U256::from(2u64)));
+        assert_eq!(estimate.max_fee_per_gas, Some(U256::from(82u64)));
+    }
+
+    /// Every fault in `estimate_custom_fee` has to reach `is_rpc_error`. The
+    /// missing-gasLimit case was the one that did not, so an endpoint answering
+    /// without a gas limit was never counted against its health.
+    #[tokio::test]
+    async fn a_custom_response_without_a_gas_limit_reads_as_an_rpc_fault() {
+        let estimator = custom_estimator(serde_json::json!({ "gasPrice": "0x64" }));
+        let err = estimator
+            .estimate_for_tx(&bare_tx(), None, None)
+            .await
+            .expect_err("no gasLimit and no hint must not produce an estimate");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no gasLimit"),
+            "the error must name the missing field, got: {message}"
+        );
+        assert!(
+            message.to_ascii_lowercase().contains("rpc"),
+            "error must classify as an RPC fault, got: {message}"
+        );
+    }
+
+    /// The Arbitrum per-byte deviation check narrows a U256 to u32, and
+    /// `as_u32()` panics above u32::MAX in release as well as debug. A small
+    /// configured `per_byte_wei` against a large on-chain value overflows once
+    /// multiplied by 10,000, so this aborted the process from ordinary config.
+    #[tokio::test]
+    async fn an_absurd_arbitrum_deviation_saturates_rather_than_aborting() {
+        let (provider, mock) = Provider::mocked();
+        // getPricesInWei() returns six uint256; only the sixth (per-byte) is
+        // read. 500_000 wei against a configured 1 wei overflows u32 at x10_000.
+        let mut words = String::from("0x");
+        for _ in 0..5 {
+            words.push_str(&"0".repeat(64));
+        }
+        words.push_str(&format!("{:064x}", 500_000u64));
+        // Popped LIFO, and the arm asks in the order block -> gasPrice -> call,
+        // so they go in backwards.
+        mock.push::<String, _>(words).expect("push getPricesInWei");
+        mock.push::<U256, _>(U256::from(1u64)).expect("gas price");
+        mock.push::<serde_json::Value, _>(serde_json::json!({
+            "number": "0x1",
+            "hash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+            "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "baseFeePerGas": "0x64",
+            "transactions": [],
+            "uncles": [],
+        }))
+        .expect("block");
+
+        let estimator = FeeEstimator::new(
+            "arbitrum".to_string(),
+            GasModel::Arbitrum,
+            provider,
+            ArbitrumFeeConfig {
+                per_byte_wei: Some(U256::from(1u64)),
+                max_deviation_bps: Some(100),
+            },
+            None,
+        );
+        let estimate = estimator
+            .estimate_for_tx(&bare_tx(), Some(U256::from(210_000u64)), None)
+            .await
+            .expect("an out-of-range deviation must warn, not abort");
+        // The configured per-byte price still wins; an empty calldata makes the
+        // L1 component zero. What matters is that we got here at all.
+        assert_eq!(estimate.l1_data_fee, U256::zero());
+        assert_eq!(estimate.gas_price, U256::from(1u64));
     }
 
     /// The ordinary path still works: a real gas price is returned untouched
