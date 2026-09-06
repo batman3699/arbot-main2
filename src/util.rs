@@ -772,15 +772,21 @@ pub static GRID_HOPS_SINGLE_SAMPLE: std::sync::atomic::AtomicUsize = std::sync::
 pub static GRID_HOPS_INTACT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Fast-path hops priced WITH an impact term, i.e. the input token had a price.
 pub static FAST_HOPS_AT_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// Hops whose EXACT requested size was refused, so a different size's quote
-/// was substituted for it.
+/// Hops refused because the pool would not quote the EXACT size asked for.
 ///
-/// `quote_edge_with_curve` falls back to the first sample that quoted, which
-/// after sorting is the SMALLEST -- as little as a quarter of the amount asked
-/// for. Its `amount_out` is then used as the output for the full amount, which
-/// understates the hop by up to 4x and reads downstream as an unprofitable
-/// cycle rather than as an unfillable size.
-pub static HOP_QUOTE_SIZE_SUBSTITUTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// This used to count a SUBSTITUTION -- the hop was priced with another size's
+/// quote and continued. It now counts a refusal that kills the hop, which is
+/// the correct handling but makes the rate worth watching: a venue that
+/// frequently refuses the requested size is one the sizer cannot use at that
+/// size, and that is a different finding from an unprofitable route.
+///
+/// What was removed: `quote_edge_with_curve` fell back to the first sample that
+/// quoted, which after sorting is the SMALLEST -- as little as a quarter of the
+/// amount asked for. Its `amount_out` became the output for the full amount,
+/// understating the hop by up to 4x. Measured 0 firings in 3,130 exact quotes,
+/// because the requested size is always a grid point, so it is refused only
+/// when the pool genuinely cannot fill it.
+pub static HOP_QUOTE_SIZE_REFUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Hops answered by the quote for the size actually requested.
 pub static HOP_QUOTE_EXACT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Fast-path hops priced at the MARGIN because the input token had no price.

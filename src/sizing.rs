@@ -537,28 +537,27 @@ where
     let mut min_slippage = u32::MAX;
     let mut max_slippage = 0u32;
     let mut current_quote: Option<QuoteValue> = None;
-    let mut fallback: Option<QuoteValue> = None;
 
     let mut attempted = 0usize;
     let mut refused = 0usize;
     for sample in samples {
         attempted += 1;
-        // A sample that will not quote is SKIPPED, not fatal. The grid probes
-        // up to 4x the base amount deliberately, so the largest sizes are
-        // expected to exceed what some pools can fill -- that is what the
-        // search is for. Aborting the hop on the first refusal threw away every
-        // size that DID quote, and `current_quote`/`fallback` below exist
-        // precisely to tolerate a partial grid; the `?` here meant they were
-        // never reached. Measured 2026-09-03: a Slipstream pool refused a 124
-        // WETH probe and the hop was declared unquotable, which is then
-        // recorded as no_profitable_size.
+        // A CURVATURE sample that will not quote is SKIPPED, not fatal. The
+        // grid probes up to 4x the base amount deliberately, so the largest
+        // sizes are expected to exceed what some pools can fill -- that is what
+        // the search is for, and aborting the hop on the first refusal threw
+        // away every size that DID quote. Measured 2026-09-03: a Slipstream
+        // pool refused a 124 WETH probe and the whole hop was declared
+        // unquotable, recorded downstream as no_profitable_size.
+        //
+        // The REQUESTED size is not one of these. It is always in the grid, and
+        // when it refuses the hop dies -- see the selection below. Tolerating a
+        // partial grid means measuring curvature from fewer points, never
+        // pricing the trade at a size nobody asked about.
         let Some(quote) = quote_edge_amount(edge, sample, block, ctx).await else {
             refused += 1;
             continue;
         };
-        if fallback.is_none() {
-            fallback = Some(quote.clone());
-        }
         if sample == amount_in {
             current_quote = Some(quote.clone());
         }
@@ -575,37 +574,38 @@ where
         crate::util::GRID_HOPS_INTACT.fetch_add(1, Ordering::Relaxed);
     }
 
-    // Substituting another size's quote is NOT free: `amount_out` is then the
-    // output for a DIFFERENT input, and the caller uses it as the output for
-    // this one. `fallback` is the first sample that quoted and the grid is
-    // sorted ascending, so the substitute is the smallest surviving size --
-    // as little as amount_in/4. Counted before it is used, because it reads
-    // downstream as an unprofitable cycle rather than an unfillable size.
-    if current_quote.is_some() {
-        crate::util::HOP_QUOTE_EXACT.fetch_add(1, Ordering::Relaxed);
-    } else if fallback.is_some() {
-        crate::util::HOP_QUOTE_SIZE_SUBSTITUTED.fetch_add(1, Ordering::Relaxed);
+    // A quote is valid for the amount it was asked about, and for no other.
+    //
+    // This used to fall back to `fallback`, the first sample that quoted. The
+    // grid is sorted ascending, so that substitute was the SMALLEST surviving
+    // size -- as little as amount_in/4 -- and its `amount_out` was then used as
+    // the output for the full amount. Asking for 10 ETH and pricing 2.5 is not
+    // a conservative approximation, it is a different trade, and downstream it
+    // reads as an unprofitable cycle rather than as an unfillable size.
+    //
+    // Measured before removal: the substitution fired 0 times in 3,130 exact
+    // quotes, because `edge_sample_amounts` always pushes `amount_in` into the
+    // grid, so the exact sample is refused only when the pool genuinely cannot
+    // fill it. Deleting the path therefore costs no coverage and removes a
+    // silent mispricing that was one refused probe away from firing.
+    //
+    // The refusal is still counted: now that it kills the hop rather than
+    // quietly substituting, how often pools refuse the requested size is a
+    // number worth watching.
+    let Some(quote) = current_quote else {
+        crate::util::HOP_QUOTE_SIZE_REFUSED.fetch_add(1, Ordering::Relaxed);
         debug!(
+            target: "arb_exec::latency",
             requested = ?amount_in,
-            venue = venue_kind(edge),
             attempted,
             refused,
-            "exact size refused; substituting another size's quote for this hop"
+            venue = venue_kind(edge),
+            "exact requested size did not quote; refusing rather than \
+             substituting another size"
         );
-    }
-    // Only a grid where NOTHING quoted is unquotable.
-    let Some(quote) = current_quote.or(fallback) else {
-        if refused > 0 {
-            debug!(
-                target: "arb_exec::latency",
-                attempted,
-                refused,
-                venue = venue_kind(edge),
-                "every size in the grid was refused"
-            );
-        }
         return None;
     };
+    crate::util::HOP_QUOTE_EXACT.fetch_add(1, Ordering::Relaxed);
     let curvature_bps = max_slippage.saturating_sub(min_slippage);
     Some((quote, curvature_bps))
 }
@@ -1421,6 +1421,48 @@ mod tests {
             active: true,
             tick_ladder: None,
         }
+    }
+
+    /// The requested size is always in the probe grid, which is why refusing it
+    /// costs nothing that a substitution was recovering.
+    ///
+    /// `quote_edge_with_curve` no longer falls back to another sample's quote:
+    /// asking for 10 ETH and pricing 2.5 is a different trade, not a
+    /// conservative approximation. That fallback was safe to delete precisely
+    /// because the exact amount is a grid point, so it is refused only when the
+    /// pool genuinely cannot fill it -- measured 0 substitutions in 3,130 exact
+    /// quotes before removal.
+    #[test]
+    fn the_requested_size_is_always_a_grid_point() {
+        for amount in [1u64, 7, 1_000, 10u64.pow(18), 3 * 10u64.pow(18)] {
+            let a = U256::from(amount);
+            let grid = edge_sample_amounts(a, U256::zero());
+            assert!(
+                grid.contains(&a),
+                "requested {a} missing from its own grid {grid:?}"
+            );
+        }
+        // A cap below the request must not silently drop it either: the caller
+        // asked about this size, and the answer is either a quote for it or a
+        // refusal, never a quote for something else.
+        let a = U256::from(1_000u64);
+        let capped = edge_sample_amounts(a, U256::from(400u64));
+        assert!(
+            capped.contains(&a),
+            "a max_input below the request must still probe the request: {capped:?}"
+        );
+        // Grid points are unique and ascending, so "the first that quoted"
+        // would have been the smallest -- as little as a quarter of the ask.
+        let grid = edge_sample_amounts(U256::from(1_000u64), U256::zero());
+        let mut sorted = grid.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(grid, sorted, "grid must be ascending and unique");
+        assert!(
+            grid[0] < U256::from(1_000u64),
+            "the discarded fallback would have priced {} for a 1000 request",
+            grid[0]
+        );
     }
 
     #[tokio::test]
