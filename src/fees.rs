@@ -131,8 +131,12 @@ where
                     _ => U256::zero(),
                 };
 
-                let max_fee_per_gas =
-                    base_fee.and_then(|base| priority_fee.map(|priority| base + priority));
+                // Saturating, not `+`: primitive-types' U256 addition panics on
+                // overflow in RELEASE as well as debug, so a block header with
+                // an absurd baseFeePerGas would abort the process mid-scan
+                // rather than produce a bad number. This is the live path.
+                let max_fee_per_gas = base_fee
+                    .and_then(|base| priority_fee.map(|priority| base.saturating_add(priority)));
                 let total_fee_native = gas_price
                     .saturating_mul(gas_limit)
                     .saturating_add(l1_data_fee);
@@ -301,10 +305,35 @@ where
         let priority_fee = priority_fee
             .or(resp.priority_fee_per_gas)
             .or(resp.gas_price);
+        // A missing fee quote is not an economic zero. This used to end in
+        // `.unwrap_or_default()`, so a response carrying neither a gasPrice nor
+        // enough to rebuild one priced the transaction at zero gas -- the same
+        // fail-open as eth_gasPrice, reached by a different route.
+        //
+        // `estimate_for_tx` now refuses a zero estimate for every model, so the
+        // fail-open was already closed at the boundary; failing here as well
+        // says WHICH field the endpoint omitted instead of reporting a generic
+        // unusable price. Both messages say "rpc" so `is_rpc_error` (main.rs)
+        // classifies them, matching the request error above: an endpoint whose
+        // fee response cannot be used is an unhealthy endpoint.
         let gas_price = resp
             .gas_price
-            .or_else(|| base_fee.and_then(|base| priority_fee.map(|priority| base + priority)))
-            .unwrap_or_default();
+            .or_else(|| {
+                base_fee.and_then(|base| priority_fee.map(|priority| base.saturating_add(priority)))
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "custom fee rpc response for {} carried no gasPrice and no \
+                     baseFeePerGas+priorityFeePerGas to rebuild one",
+                    method
+                )
+            })?;
+
+        if gas_price.is_zero() {
+            return Err(anyhow!(
+                "custom fee rpc response for {method} returned a zero gas price"
+            ));
+        }
         let total_fee_native = gas_price
             .saturating_mul(gas_limit)
             .saturating_add(resp.l1_data_fee.unwrap_or_default());
@@ -314,7 +343,8 @@ where
             gas_price,
             base_fee_per_gas: base_fee,
             priority_fee_per_gas: priority_fee,
-            max_fee_per_gas: base_fee.and_then(|base| priority_fee.map(|priority| base + priority)),
+            max_fee_per_gas: base_fee
+                .and_then(|base| priority_fee.map(|priority| base.saturating_add(priority))),
             max_priority_fee_per_gas: priority_fee,
             l1_data_fee: resp.l1_data_fee.unwrap_or_default(),
             total_fee_native,
@@ -509,6 +539,83 @@ mod tests {
             format!("{err:#}").contains("no usable gas price"),
             "unexpected error: {err:#}"
         );
+    }
+
+    fn custom_estimator(response: serde_json::Value) -> FeeEstimator<MockProvider> {
+        let (provider, mock) = Provider::mocked();
+        mock.push::<serde_json::Value, _>(response)
+            .expect("push custom fee response");
+        FeeEstimator::new(
+            "testchain".to_string(),
+            GasModel::CustomRpcMethod,
+            provider,
+            ArbitrumFeeConfig::default(),
+            Some("test_estimateFee".to_string()),
+        )
+    }
+
+    /// A response that omits gasPrice and carries nothing to rebuild one is a
+    /// missing quote, not a free transaction.
+    #[tokio::test]
+    async fn a_custom_response_without_a_gas_price_is_refused() {
+        let estimator = custom_estimator(serde_json::json!({ "gasLimit": "0x5208" }));
+        let err = estimator
+            .estimate_for_tx(&bare_tx(), None, None)
+            .await
+            .expect_err("a response with no gas price must not produce an estimate");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no gasPrice"),
+            "the error must name the missing field, got: {message}"
+        );
+        assert!(
+            message.to_ascii_lowercase().contains("rpc"),
+            "error must classify as an RPC fault, got: {message}"
+        );
+    }
+
+    /// An endpoint that answers zero has quoted nothing either.
+    #[tokio::test]
+    async fn a_custom_response_quoting_zero_gas_is_refused() {
+        let estimator = custom_estimator(serde_json::json!({
+            "gasLimit": "0x5208",
+            "gasPrice": "0x0",
+        }));
+        let err = estimator
+            .estimate_for_tx(&bare_tx(), None, None)
+            .await
+            .expect_err("a zero gas price must not produce an estimate");
+        assert!(
+            format!("{err:#}").contains("zero gas price"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// base+priority rebuilds a missing gasPrice, and the arithmetic saturates
+    /// rather than panicking on whatever an endpoint chooses to return.
+    #[tokio::test]
+    async fn a_custom_response_rebuilds_the_price_from_base_and_priority() {
+        let estimator = custom_estimator(serde_json::json!({
+            "gasLimit": "0x5208",
+            "baseFeePerGas": "0x64",
+            "priorityFeePerGas": "0x2",
+        }));
+        let estimate = estimator
+            .estimate_for_tx(&bare_tx(), None, None)
+            .await
+            .expect("base+priority is enough to price the transaction");
+        assert_eq!(estimate.gas_price, U256::from(102u64));
+
+        let saturating = custom_estimator(serde_json::json!({
+            "gasLimit": "0x5208",
+            "baseFeePerGas": format!("0x{:x}", U256::MAX),
+            "priorityFeePerGas": "0x2",
+        }));
+        let estimate = saturating
+            .estimate_for_tx(&bare_tx(), None, None)
+            .await
+            .expect("an absurd base fee must saturate, not panic");
+        assert_eq!(estimate.gas_price, U256::MAX);
     }
 
     /// The ordinary path still works: a real gas price is returned untouched
