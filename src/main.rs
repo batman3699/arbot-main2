@@ -8272,6 +8272,28 @@ where
                 continue 'cascade;
             }
 
+            // THE SIMULATION IS AUTHORITATIVE FOR REVENUE, not just for costs.
+            //
+            // `simulated_profit` is what the exact plan returns when executed
+            // against real state; `est_gross_after_fee` is `sizing.gross -
+            // flash_fee` from the quote grid. Only the zero case was consulted,
+            // so a simulation that ran, succeeded, and disagreed with the
+            // estimate was discarded except as a liveness check -- and the
+            // dispatch decision below, `net_profit = est_gross_after_fee -
+            // gas_cost` gated on `min_profit`, then ran on the pre-simulation
+            // number.
+            //
+            // The inconsistency was visible in the two lines that follow: gas
+            // and the L1 fee were already adopted FROM the simulation. Costs
+            // were trusted from it and revenue was not, so the trade was judged
+            // on simulated costs against estimated income.
+            //
+            // Both are start-token raw units -- `optimize_trade_size` computes
+            // `gross = out - amount_in` there, and the executor's profit is
+            // compared against `plan.min_profit` in the same denomination -- so
+            // this is a substitution, not a conversion.
+            candidate.est_gross_after_fee = simulated_profit;
+
             if !simulated_l1_fee.is_zero() {
                 candidate.fee_estimate.l1_data_fee = simulated_l1_fee;
             }
