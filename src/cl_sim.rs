@@ -281,7 +281,7 @@ where
                     liquidity,
                     tick,
                     tick_spacing,
-                    fee_ppm: fee_hint.or(fee_on_chain).unwrap_or(3_000),
+                    fee_ppm: resolve_fee_ppm(fee_on_chain, *fee_hint),
                     balance0,
                     balance1,
                 },
@@ -289,6 +289,39 @@ where
         }
     }
     out
+}
+
+/// The swap fee in ppm. The CHAIN wins; the caller's hint is a fallback.
+///
+/// This used to be `fee_hint.or(fee_on_chain)`, which prefers the caller. That
+/// is backwards, and on Slipstream it was badly wrong: `PoolRecord.fee` is the
+/// venue's POOL KEY, not its fee -- a fee tier on univ3, where the two happen
+/// to be the same number, but a TICK SPACING on Slipstream, where they are not
+/// (see the note in `venues.rs` about resolving slipstream paths by spacing).
+/// Callers pass that key straight in as `fee_hint`.
+///
+/// Measured on Base 2026-09-06: Slipstream pools whose inventory `fee` reads
+/// 100 charge 2500 ppm on chain, 1 charges 400, another 100 charges 212. So
+/// those pools were priced at 1-100 ppm against real fees of 212-2500 --
+/// understating the fee by up to 24 bps PER HOP, in the direction that invents
+/// profit. UniV3 and Pancake hid it: their key IS their fee, and both agreed
+/// with the chain in every pool sampled.
+///
+/// A zero or out-of-range chain fee is treated as no answer: a decode that
+/// yields 0 would otherwise price the pool as free.
+fn resolve_fee_ppm(fee_on_chain: Option<u32>, fee_hint: Option<u32>) -> u32 {
+    /// Assume the worst common tier when nothing reports a fee.
+    ///
+    /// The old default was 3_000, the MEDIAN tier -- which understates a 1%
+    /// pool and so manufactures profit that is not there. If a fee must be
+    /// guessed, guess the one that makes a trade least likely: overstating the
+    /// fee costs an opportunity, understating it costs money.
+    const PESSIMISTIC_FEE_PPM: u32 = 10_000;
+
+    fee_on_chain
+        .filter(|ppm| *ppm > 0 && *ppm < 1_000_000)
+        .or(fee_hint)
+        .unwrap_or(PESSIMISTIC_FEE_PPM)
 }
 
 /// The pool's tick spacing, or `None` if it did not report a usable one.
@@ -364,7 +397,7 @@ where
         return Ok(None);
     }
     let fee_on_chain = contract.fee().block(block_id).call().await.ok();
-    let fee_ppm = fee_hint.or(fee_on_chain).unwrap_or(3_000);
+    let fee_ppm = resolve_fee_ppm(fee_on_chain, fee_hint);
 
     Ok(Some(ClPoolState {
         sqrt_price_x96,
@@ -537,6 +570,49 @@ mod tests {
         w[30] = (raw >> 8) as u8;
         w[31] = raw as u8;
         Some(w)
+    }
+
+    /// The chain's fee wins over the caller's hint, because on Slipstream the
+    /// hint is not a fee at all.
+    ///
+    /// `PoolRecord.fee` is the venue's POOL KEY. On univ3 that key IS the fee,
+    /// which is why `fee_hint.or(fee_on_chain)` looked correct for years. On
+    /// Slipstream the key is the TICK SPACING, so preferring it priced those
+    /// pools at 1-100 ppm against real fees of 212-2500 ppm -- understating the
+    /// cost by up to 24 bps per hop, in the direction that invents profit.
+    #[test]
+    fn the_chain_fee_beats_a_hint_that_is_really_a_pool_key() {
+        // Measured on Base 2026-09-06 (inventory `fee`, on-chain `fee()`).
+        for (key, chain) in [(100u32, 2500u32), (100, 212), (1, 400)] {
+            assert_eq!(
+                resolve_fee_ppm(Some(chain), Some(key)),
+                chain,
+                "a slipstream tick spacing of {key} must not be charged as a fee"
+            );
+        }
+        // univ3 and pancake: key and fee agree, so nothing changes for them.
+        for tier in [100u32, 500, 3_000, 10_000] {
+            assert_eq!(resolve_fee_ppm(Some(tier), Some(tier)), tier);
+        }
+        // The hint is still the fallback when the chain does not answer.
+        assert_eq!(resolve_fee_ppm(None, Some(500)), 500);
+    }
+
+    /// An unreported fee must not become a cheap one.
+    #[test]
+    fn an_unknown_fee_is_assumed_expensive_not_median() {
+        // Nothing reported: the old default was 3_000, the MEDIAN tier, which
+        // understates every pool above it and so manufactures profit.
+        assert_eq!(
+            resolve_fee_ppm(None, None),
+            10_000,
+            "an unknown fee must be assumed expensive, never median"
+        );
+        // A zero or absurd chain answer is not an answer. Charging 0 would
+        // price the pool as free, which is the most profitable lie available.
+        assert_eq!(resolve_fee_ppm(Some(0), Some(500)), 500);
+        assert_eq!(resolve_fee_ppm(Some(0), None), 10_000);
+        assert_eq!(resolve_fee_ppm(Some(1_000_000), None), 10_000);
     }
 
     /// A missing tick spacing means the pool is unavailable, never that it is a
