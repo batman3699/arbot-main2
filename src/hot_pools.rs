@@ -1311,6 +1311,40 @@ mod tests {
         }
     }
 
+    /// The cohort that was actually in the shipped inventory on 2026-09-06,
+    /// pinned so the cap cannot drift back up.
+    ///
+    /// These four records claimed fabricated hub liquidity and were written by
+    /// a path that also omitted `hub_symbol`. Under the old 1e12 cap the first
+    /// two were rejected and the last two PASSED, ranking #1 and #2 in the
+    /// hot-pool list -- garbage sorted to the top of the universe, which is
+    /// exactly what the cap exists to prevent. Re-measured on-chain the four
+    /// pools hold $262, $1.50, $0.02 and $0.02.
+    #[test]
+    fn the_cap_rejects_every_value_in_the_corrupted_cohort() {
+        for fabricated in [3.2441739079683994e18, 1.729821609691e12, 8.21312811065e11] {
+            assert_eq!(
+                offline_hub_usd_liquidity(&record_with_liquidity(1, Some(fabricated))),
+                None,
+                "{fabricated:e} is not a pool's USD liquidity and must not rank"
+            );
+        }
+    }
+
+    /// The other half of the cap: it must not start rejecting real pools.
+    /// $2.4e9 is the largest value in any inventory in this repo, and the
+    /// largest single pool that has ever existed on any chain is single-digit
+    /// billions -- all of which has to stay rankable.
+    #[test]
+    fn the_cap_still_admits_the_largest_pool_that_could_exist() {
+        for real in [1_008.39, 59_959_477.32, 2_364_678_244.0, 9.9e10] {
+            assert!(
+                offline_hub_usd_liquidity(&record_with_liquidity(1, Some(real))).is_some(),
+                "{real:e} is a plausible pool size and must still rank"
+            );
+        }
+    }
+
     #[test]
     fn every_priced_pool_survives_liquidity_ranking() {
         // The reported bug: a 584-pool inventory ranked far fewer. Each record is
@@ -1343,6 +1377,7 @@ mod tests {
             return; // inventory not present in this checkout
         }
         let total = records.len();
+        let records_for_report = records.clone();
         let outcomes: Vec<(PoolRecord, Option<Decimal>, bool)> = records
             .into_iter()
             .map(|record| {
@@ -1350,12 +1385,31 @@ mod tests {
                 (record, score, false)
             })
             .collect();
+        // Name the offenders. This reads a LIVE inventory that is regenerated
+        // outside git, so a failure here is usually bad data rather than a
+        // broken ranker -- and "1128 != 1130" alone sends you looking in the
+        // wrong place. Measured 2026-09-06: four records carried fabricated
+        // liquidity (3.2e18 USD among them) from a writer that also omitted
+        // `hub_symbol`; two were caught by MAX_SANE_HUB_USD_LIQUIDITY and two
+        // ranked #1 and #2 until the cap was tightened.
+        let unrankable: Vec<String> = records_for_report
+            .iter()
+            .filter(|record| offline_hub_usd_liquidity(record).is_none())
+            .map(|record| {
+                format!(
+                    "0x{} (hub_usd_liquidity: {:?})",
+                    hex::encode(record.pool),
+                    record.hub_usd_liquidity
+                )
+            })
+            .collect();
         // 1 == universe.min_pool_liquidity_tokens from ops/inputs.yaml.
         let (ranked, stats) = retain_ranked_liquidity(outcomes, 1.0);
         assert_eq!(
             ranked.len(),
             total,
-            "every pool in the shipped inventory must rank, dropped: {stats:?}"
+            "every pool in the shipped inventory must rank, dropped: {stats:?}; \
+             unrankable records: {unrankable:?}"
         );
     }
 

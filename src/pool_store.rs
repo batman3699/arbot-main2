@@ -136,7 +136,21 @@ pub fn write_pool_records(path: impl AsRef<Path>, records: &[PoolRecord]) -> Res
 }
 
 /// Values above this are almost certainly raw UniV3 `liquidity()` scores, not USD.
-const MAX_SANE_HUB_USD_LIQUIDITY: f64 = 1e12;
+///
+/// Was 1e12. That is roughly total DeFi TVL across every chain, so it only ever
+/// caught the most extreme corruption and let merely absurd values rank first.
+/// Measured 2026-09-06 in `data/base/uniswap_v3/pools.jsonl`: four records
+/// carried fabricated liquidity of 3.2e18, 1.7e12, 8.2e11 and 8.2e11 USD. The
+/// old cap rejected the first two and passed the other two, which then ranked
+/// #1 and #2 in the hot-pool list -- the exact outcome the cap exists to
+/// prevent. Re-measured on-chain, those four pools hold $262, $1.50, $0.02 and
+/// $0.02.
+///
+/// 1e11 is $100 billion in a single pool. The largest value in any inventory in
+/// this repo is $2.4e9, the largest pool that has ever existed on any chain is
+/// single-digit billions, and total DeFi TVL is around $1e11 -- so no real pool
+/// can approach this, while every value in the corrupted cohort is caught.
+const MAX_SANE_HUB_USD_LIQUIDITY: f64 = 1e11;
 
 pub(crate) fn sanitize_hub_usd_liquidity(value: Option<f64>) -> Option<f64> {
     value.filter(|usd| usd.is_finite() && *usd > 0.0 && *usd <= MAX_SANE_HUB_USD_LIQUIDITY)
