@@ -1123,11 +1123,13 @@ impl DatabaseRef for RpcForkDb {
         // It defaulted a missing `result` to "0x0"/"0x" before the parsers ran,
         // so the parsers never saw the failure -- an unreadable account became
         // a real-looking empty one and the fork simulated against it.
-        let nonce_hex = rpc_result_str(Some(&nonce_resp), "eth_getTransactionCount")?;
-        let balance_hex = rpc_result_str(Some(&balance_resp), "eth_getBalance")?;
-        let code_hex = rpc_result_str(Some(&code_resp), "eth_getCode")?;
+        let named = |err: RpcDbError| RpcDbError(format!("{err} for {address:#x}"));
+        let nonce_hex =
+            rpc_result_str(Some(&nonce_resp), "eth_getTransactionCount").map_err(named)?;
+        let balance_hex = rpc_result_str(Some(&balance_resp), "eth_getBalance").map_err(named)?;
+        let code_hex = rpc_result_str(Some(&code_resp), "eth_getCode").map_err(named)?;
 
-        Ok(Some(decode_account(nonce_hex, balance_hex, code_hex)?))
+        Ok(Some(decode_account(nonce_hex, balance_hex, code_hex).map_err(named)?))
     }
 
     fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
@@ -1153,7 +1155,13 @@ impl DatabaseRef for RpcForkDb {
         // zero, so a fabricated one is indistinguishable from a real one, and
         // a pool reserve or token balance reading zero changes which branch
         // the fork takes.
-        let result = rpc_result_str(Some(&response), "eth_getStorageAt")?;
+        //
+        // Name the slot: when this fires you need to know whether one contract
+        // is unreadable or the whole node is, and a bare method name says
+        // neither. `address`/`index` are Copy, so this costs nothing on the
+        // success path.
+        let result = rpc_result_str(Some(&response), "eth_getStorageAt")
+            .map_err(|err| RpcDbError(format!("{err} for {address:#x} slot {index:#x}")))?;
         let value = parse_u256_hex(result)?;
         store_storage(self.block_number, address, index, value);
         Ok(value)
