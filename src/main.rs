@@ -16003,6 +16003,7 @@ chains:
             created_block: 1,
             hub_usd_liquidity: None,
             hub_symbol: None,
+            fee_ppm_onchain: None,
         }];
         require_pool_inventory("arbitrum", "uniswap_v3", path, &records)
             .expect("inventory should be accepted");
@@ -16444,6 +16445,7 @@ chains:
             created_block: 1,
             hub_usd_liquidity: None,
             hub_symbol: None,
+            fee_ppm_onchain: None,
         }];
 
         let mandatory = HashSet::new();
@@ -16472,6 +16474,7 @@ chains:
             created_block: 1,
             hub_usd_liquidity: None,
             hub_symbol: None,
+            fee_ppm_onchain: None,
         }];
 
         let mandatory = HashSet::new();

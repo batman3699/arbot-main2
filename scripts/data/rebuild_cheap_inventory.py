@@ -79,15 +79,37 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import cycle
 from threading import Lock
 
-FACTORY = "data/base/uniswap_v3/pools.factory-full.jsonl"
-TARGET = "data/base/uniswap_v3/pools.jsonl"
-CACHE = "data/base/uniswap_v3/.cheap_depth_cache.json"
+# Per venue: where the factory enumeration lives, and which field carries the
+# REAL fee. On Uniswap the pool key IS the fee tier, so `fee` serves both roles.
+# On Slipstream the key is the TICK SPACING and the fee is dynamic -- spacing 100
+# pools were measured at 212 and 2500 ppm -- so the enumerator records the fee
+# separately and this reads it from there. Getting that wrong silently filters on
+# tick spacing, which is how the runtime came to price Slipstream at its spacing.
+VENUES = {
+    "uniswap_v3": {"fee_field": "fee"},
+    "aerodrome_slipstream": {"fee_field": "fee_ppm_onchain"},
+    "aerodrome_slipstream_v3": {"fee_field": "fee_ppm_onchain"},
+    "pancakeswap_v3": {"fee_field": "fee"},
+}
+if os.environ.get("CHEAP_VENUES"):
+    _want = {v.strip() for v in os.environ["CHEAP_VENUES"].split(",")}
+    VENUES = {k: v for k, v in VENUES.items() if k in _want}
+
+
+def paths(venue):
+    d = os.path.join("data", "base", venue)
+    return (os.path.join(d, "pools.factory-full.jsonl"),
+            os.path.join(d, "pools.jsonl"),
+            os.path.join(d, ".cheap_depth_cache.json"))
 
 DEFAULT_RPCS = "https://mainnet.base.org,https://base.gateway.tenderly.co"
 RPCS = [u.strip() for u in os.environ.get("CHEAP_RPC_URLS", DEFAULT_RPCS).split(",") if u.strip()]
 MIN_USD = float(os.environ.get("CHEAP_MIN_USD", "250000"))
 TOP_N = int(os.environ.get("CHEAP_TOP_N", "4000"))
-FEES = {int(f) for f in os.environ.get("CHEAP_FEES", "100,500").split(",")}
+# A ceiling, not a tier list: Slipstream fees are arbitrary ppm values
+# (65, 85, 90, 190, 346, 425 ...), so an enum of Uniswap tiers cannot
+# express "cheap" for it.
+MAX_FEE_PPM = int(os.environ.get("CHEAP_MAX_FEE_PPM", "500"))
 # Multicall3, not a JSON-RPC batch. Measured 2026-09-06: mainnet.base.org caps
 # JSON-RPC batches at 10 calls and rate-limits, which turns 46,603 reads into
 # 4,661 requests it will not serve. One aggregate3 carries 200 balanceOf calls
@@ -224,15 +246,18 @@ def balance_batch(jobs):
     return {}
 
 
-def main():
-    if not os.path.exists(FACTORY):
-        print(f"ABORT: {FACTORY} not found", file=sys.stderr)
-        return 1
+def rebuild_venue(venue, cfg):
+    factory, target, cache_path = paths(venue)
+    fee_field = cfg["fee_field"]
+    if not os.path.exists(factory):
+        print(f"  {venue}: no {factory}; skipped "
+              f"(enumerate it first)", file=sys.stderr)
+        return None
 
-    print(f"scanning {FACTORY} for fee in {sorted(FEES)} touching a hub token ...", flush=True)
-    cands, seen_pairs = [], defaultdict(list)
+    cands = []
+    pairs = defaultdict(list)
     total = 0
-    with open(FACTORY) as fh:
+    with open(factory) as fh:
         for line in fh:
             line = line.strip()
             if not line:
@@ -242,53 +267,51 @@ def main():
                 r = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if r.get("fee") not in FEES:
+            fee = r.get(fee_field)
+            if not isinstance(fee, int) or fee <= 0 or fee > MAX_FEE_PPM:
                 continue
             hub = pick_hub(r.get("token0", ""), r.get("token1", ""))
             if hub is None:
                 continue
             r["_hub"] = hub
+            r["_fee_ppm"] = fee
             cands.append(r)
-            seen_pairs[tuple(sorted((r["token0"].lower(), r["token1"].lower())))].append(r["pool"])
-    multi = sum(1 for v in seen_pairs.values() if len(v) > 1)
-    print(f"  {total:,} pools in factory -> {len(cands):,} cheap + hub-anchored")
-    print(f"  {len(seen_pairs):,} distinct pairs, {multi:,} with >=2 cheap pools (2-hop cycles)")
+            pairs[tuple(sorted((r["token0"].lower(), r["token1"].lower())))].append(r["pool"])
+    print(f"\n=== {venue} ===")
+    print(f"  {total:,} enumerated -> {len(cands):,} at <= {MAX_FEE_PPM} ppm and hub-anchored")
     if not cands:
-        print("ABORT: nothing qualified on fee; refusing to touch the inventory", file=sys.stderr)
-        return 1
+        return None
 
     depth = {}
-    if os.path.exists(CACHE):
+    if os.path.exists(cache_path):
         try:
-            depth = {k: int(v) for k, v in json.load(open(CACHE)).items()}
-            print(f"  resumed {len(depth):,} cached balances from {CACHE}")
+            depth = {k: int(v) for k, v in json.load(open(cache_path)).items()}
+            print(f"  resumed {len(depth):,} cached balances")
         except Exception:
             depth = {}
 
-    todo = [(r["pool"].lower(), r["_hub"], r["pool"]) for r in cands if r["pool"].lower() not in depth]
-    print(f"  reading balanceOf for {len(todo):,} pools "
-          f"({(len(todo) + BATCH - 1)//BATCH:,} multicalls of {BATCH}, {WORKERS} workers)", flush=True)
-
-    batches = [todo[i:i + BATCH] for i in range(0, len(todo), BATCH)]
-    done = 0
-    if batches:
+    todo = [(r["pool"].lower(), r["_hub"], r["pool"]) for r in cands
+            if r["pool"].lower() not in depth]
+    if todo:
+        batches = [todo[i:i + BATCH] for i in range(0, len(todo), BATCH)]
+        print(f"  reading balanceOf for {len(todo):,} pools "
+              f"({len(batches):,} multicalls of {BATCH})", flush=True)
+        done = 0
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
             for result in pool.map(balance_batch, batches):
                 depth.update(result)
                 done += 1
                 if done % 20 == 0:
-                    print(f"    {done:,}/{len(batches):,} multicalls, {len(depth):,} balances", flush=True)
+                    print(f"    {done:,}/{len(batches):,} multicalls, "
+                          f"{len(depth):,} balances", flush=True)
                     try:
-                        json.dump({k: str(v) for k, v in depth.items()}, open(CACHE, "w"))
+                        json.dump({k: str(v) for k, v in depth.items()}, open(cache_path, "w"))
                     except OSError:
                         pass
-    try:
-        json.dump({k: str(v) for k, v in depth.items()}, open(CACHE, "w"))
-    except OSError:
-        pass
-
-    unread = sum(1 for r in cands if r["pool"].lower() not in depth)
-    print(f"  balances read: {len(depth):,}   unread: {unread:,}")
+        try:
+            json.dump({k: str(v) for k, v in depth.items()}, open(cache_path, "w"))
+        except OSError:
+            pass
 
     scored = []
     for r in cands:
@@ -303,6 +326,8 @@ def main():
             "pool": r["pool"],
             "token0": r["token0"],
             "token1": r["token1"],
+            # POOL KEY, preserved verbatim from the enumeration. On Slipstream
+            # this is the tick spacing and the router needs it to resolve a path.
             "fee": r["fee"],
             "created_block": r.get("created_block") or 0,
             "hub_usd_liquidity": round(usd, 2),
@@ -310,31 +335,22 @@ def main():
             # liquidity number that does not name the hub it was measured
             # against, so omitting this silently discards the whole rebuild.
             "hub_symbol": sym,
+            "fee_ppm_onchain": r["_fee_ppm"],
         })
 
-    # Fee is already gated above; rank the survivors by depth.
+    # Fee was gated above; depth orders what survived.
     scored.sort(key=lambda r: -r["hub_usd_liquidity"])
     keep = scored[:TOP_N]
-    print(f"\n  qualified (>= ${MIN_USD:,.0f}): {len(scored):,}   keeping {len(keep):,}")
-    if keep:
-        from collections import Counter
-        print(f"  fee mix: {dict(Counter(r['fee'] for r in keep))}")
-        print("  deepest:")
-        for r in keep[:6]:
-            print(f"    {r['pool']}  fee={r['fee']:>4}  ${r['hub_usd_liquidity']:>14,.0f}  {r['hub_symbol']}")
-    kept_pairs = defaultdict(list)
-    for r in keep:
-        kept_pairs[tuple(sorted((r["token0"].lower(), r["token1"].lower())))].append(r)
-    print(f"  pairs with >=2 kept pools (direct 2-hop cycles): "
-          f"{sum(1 for v in kept_pairs.values() if len(v) > 1):,}")
-
-    if len(keep) < 50:
-        print(f"ABORT: only {len(keep)} pools qualified; leaving {TARGET} unchanged", file=sys.stderr)
-        return 1
+    print(f"  qualified (>= ${MIN_USD:,.0f}): {len(scored):,}   keeping {len(keep):,}")
+    for r in keep[:5]:
+        print(f"    {r['pool']}  {r['fee_ppm_onchain']:>4}ppm  "
+              f"${r['hub_usd_liquidity']:>13,.0f}  {r['hub_symbol']}")
+    if not keep:
+        return None
 
     existing = []
-    if os.path.exists(TARGET):
-        with open(TARGET) as fh:
+    if os.path.exists(target):
+        with open(target) as fh:
             for line in fh:
                 line = line.strip()
                 if line:
@@ -342,31 +358,55 @@ def main():
                         existing.append(json.loads(line))
                     except json.JSONDecodeError:
                         continue
-    by_pool = {}
-    for r in keep:
-        by_pool[r["pool"].lower()] = r
+    by_pool = {r["pool"].lower(): r for r in keep}
     # Existing records win: they may carry hand-verified or venue-specific
     # fields this script does not know about. UNION only -- never shrink.
     for r in existing:
-        p = r.get("pool")
-        if p:
-            by_pool[p.lower()] = r
+        pl = r.get("pool")
+        if pl:
+            by_pool[pl.lower()] = r
     merged = list(by_pool.values())
     added = len(merged) - len(existing)
-    print(f"\n  existing {len(existing):,} + new {added:,} -> {len(merged):,} total")
+    print(f"  existing {len(existing):,} + new {added:,} -> {len(merged):,}")
 
     if DRY_RUN:
-        print("\nDRY_RUN set; nothing written.")
-        return 0
+        return {"venue": venue, "added": added, "keep": keep, "written": False}
 
-    bak = f"{TARGET}.bak.cheap-{int(time.time())}"
-    if os.path.exists(TARGET):
-        shutil.copy2(TARGET, bak)
-        print(f"  backup: {bak}")
-    with open(TARGET, "w") as fh:
+    if os.path.exists(target):
+        shutil.copy2(target, f"{target}.bak.cheap-{int(time.time())}")
+    tmp = target + ".tmp"
+    with open(tmp, "w") as fh:
         for r in merged:
             fh.write(json.dumps(r) + "\n")
-    print(f"  wrote {len(merged):,} records to {TARGET}")
+    os.replace(tmp, target)
+    print(f"  wrote {len(merged):,} -> {target}")
+    return {"venue": venue, "added": added, "keep": keep, "written": True}
+
+
+def main():
+    print(f"fee ceiling {MAX_FEE_PPM} ppm, depth floor ${MIN_USD:,.0f}"
+          f"{'  [DRY_RUN]' if DRY_RUN else ''}")
+    results = [r for r in (rebuild_venue(v, c) for v, c in VENUES.items()) if r]
+    if not results:
+        print("\nnothing qualified anywhere; no inventory touched", file=sys.stderr)
+        return 1
+
+    # The number that matters: a 2-hop needs the same pair cheap on two pools,
+    # and across venues is where that actually happens.
+    allkeep = [(k, r["venue"]) for r in results for k in r["keep"]]
+    bypair = defaultdict(list)
+    for k, v in allkeep:
+        bypair[tuple(sorted((k["token0"].lower(), k["token1"].lower())))].append((v, k))
+    multi = {p: e for p, e in bypair.items() if len(e) > 1}
+    cross = {p: e for p, e in multi.items() if len({v.split("_")[0] for v, _ in e}) > 1}
+    print(f"\n=== {sum(r['added'] for r in results):,} pools added across "
+          f"{len(results)} venues ===")
+    print(f"  pairs with >=2 cheap+deep pools: {len(multi)}   of those cross-venue: {len(cross)}")
+    for pair, ent in sorted(cross.items(), key=lambda x: -max(k["hub_usd_liquidity"] for _v, k in x[1]))[:8]:
+        best = sorted(ent, key=lambda e: e[1]["fee_ppm_onchain"])[:2]
+        rt = sum(e[1]["fee_ppm_onchain"] for e in best) / 100.0
+        names = " + ".join(f"{v}@{k['fee_ppm_onchain']}ppm" for v, k in best)
+        print(f"    {rt:>6.2f} bps round-trip   {names}")
     return 0
 
 

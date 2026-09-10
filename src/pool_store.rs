@@ -18,6 +18,18 @@ pub struct PoolRecord {
     /// Hub-side USD liquidity from offline ranking (`rank_base_pools.py`).
     /// When present, cold-pool truncation prefers highest-liquidity pools.
     pub hub_usd_liquidity: Option<f64>,
+    /// The pool's REAL swap fee in ppm, when a builder could determine it.
+    ///
+    /// Deliberately separate from `fee`, which is the venue's POOL KEY: a fee
+    /// tier on univ3, where the two coincide, but a TICK SPACING on Slipstream,
+    /// where they do not. Slipstream fees are dynamic and not derivable from the
+    /// key -- measured pools at spacing 100 charge 212 and 2500 ppm, and spacing
+    /// 200 charges 8000. Any ranking that reads `fee` as a cost is therefore
+    /// wrong for Slipstream, which is how the runtime came to price those pools
+    /// at their tick spacing.
+    ///
+    /// `None` means unknown, never cheap.
+    pub fee_ppm_onchain: Option<u32>,
     /// Which hub token `hub_usd_liquidity` was measured against.
     ///
     /// Load-bearing, not decoration: a writer that never identified a hub
@@ -47,6 +59,8 @@ pub(crate) struct PoolRecordJson {
     hub_usd_liquidity: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hub_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fee_ppm_onchain: Option<u32>,
 }
 
 impl PoolRecord {
@@ -61,6 +75,7 @@ impl PoolRecord {
             created_block: record.created_block,
             hub_usd_liquidity: record.hub_usd_liquidity,
             hub_symbol: record.hub_symbol,
+            fee_ppm_onchain: record.fee_ppm_onchain,
         })
     }
 
@@ -74,6 +89,7 @@ impl PoolRecord {
             created_block: self.created_block,
             hub_usd_liquidity: self.hub_usd_liquidity,
             hub_symbol: self.hub_symbol.clone(),
+            fee_ppm_onchain: self.fee_ppm_onchain,
         }
     }
 }
@@ -281,6 +297,7 @@ mod tests {
             created_block: 12,
             hub_usd_liquidity: Some(1_000_000.0),
             hub_symbol: Some("WETH".to_string()),
+            fee_ppm_onchain: None,
         }];
         write_pool_records(&path, &records).expect("write");
         let loaded = load_pool_records(&path).expect("load");
@@ -300,6 +317,7 @@ mod tests {
             created_block: 50,
             hub_usd_liquidity: None,
             hub_symbol: None,
+            fee_ppm_onchain: None,
         }];
         let incoming = vec![PoolRecord {
             pool,
@@ -309,6 +327,7 @@ mod tests {
             created_block: 20,
             hub_usd_liquidity: Some(2_000_000.0),
             hub_symbol: Some("WETH".to_string()),
+            fee_ppm_onchain: None,
         }];
         let merged = merge_pool_records(existing, incoming);
         assert_eq!(merged.len(), 1);
@@ -327,6 +346,7 @@ mod tests {
                 created_block: 99,
                 hub_usd_liquidity: Some(10_000.0),
                 hub_symbol: Some("WETH".to_string()),
+                fee_ppm_onchain: None,
             },
             PoolRecord {
                 pool: Address::from_low_u64_be(4),
@@ -336,6 +356,7 @@ mod tests {
                 created_block: 1,
                 hub_usd_liquidity: Some(5_000_000.0),
                 hub_symbol: Some("WETH".to_string()),
+                fee_ppm_onchain: None,
             },
         ];
         prioritize_cold_pool_inventory(&mut pools, 1);
@@ -354,6 +375,7 @@ mod tests {
                 created_block: 99,
                 hub_usd_liquidity: Some(1e33),
                 hub_symbol: Some("WETH".to_string()),
+                fee_ppm_onchain: None,
             },
             PoolRecord {
                 pool: Address::from_low_u64_be(4),
@@ -363,6 +385,7 @@ mod tests {
                 created_block: 1,
                 hub_usd_liquidity: Some(5_000_000.0),
                 hub_symbol: Some("WETH".to_string()),
+                fee_ppm_onchain: None,
             },
         ];
         prioritize_cold_pool_inventory(&mut pools, 1);

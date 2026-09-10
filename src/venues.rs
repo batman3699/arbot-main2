@@ -1766,6 +1766,7 @@ where
                         created_block: 0,
                         hub_usd_liquidity: None,
                         hub_symbol: None,
+                        fee_ppm_onchain: None,
                     }),
                     Ok(None) => {}
                     Err(err) => {
@@ -1895,6 +1896,7 @@ where
                         created_block: 0,
                         hub_usd_liquidity: None,
                         hub_symbol: None,
+                        fee_ppm_onchain: None,
                     }),
                     Ok(None) => {}
                     Err(err) => {
@@ -5550,6 +5552,7 @@ impl Drop for RpcEnvGuard {
                 created_block: 0,
                 hub_usd_liquidity: None,
                 hub_symbol: None,
+                fee_ppm_onchain: None,
             },
             PoolRecord {
                 pool: Address::from_low_u64_be(101),
@@ -5559,6 +5562,7 @@ impl Drop for RpcEnvGuard {
                 created_block: 0,
                 hub_usd_liquidity: None,
                 hub_symbol: None,
+                fee_ppm_onchain: None,
             },
         ];
 

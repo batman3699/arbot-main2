@@ -744,8 +744,51 @@ fn retain_ranked_liquidity(
         }
         ranked.push((record, liquidity_score));
     }
-    ranked.sort_by_key(|(_, liquidity)| Reverse(*liquidity));
+    // Cheap pools first, then depth within each group.
+    //
+    // Ranking on depth alone is what buried the only pools arbitrage can use.
+    // Base's depth sits in the expensive tiers -- 1,778,343 of the factory's
+    // 1,881,808 univ3 pools are the 1% tier -- so sorting by liquidity selects
+    // a ~44.5 bps mean fee per hop, an ~89 bps hurdle on a 2-hop, while the
+    // cross-venue pairs that actually clear cost 1.1-8 bps round-trip. Measured
+    // 2026-09-06: restricting a census to cheap AND deep pools moved the 3-hop
+    // median gross from -173 bps to -7.4 bps.
+    //
+    // This only bites once a list is truncated (`.take(max_hot_pools)` below,
+    // 1500 today against 1,126 records), so it is a guard against a future
+    // ingest quietly re-burying them rather than a change to today's set.
+    //
+    // A fee is a hurdle paid on every hop of every attempt while depth only
+    // caps size, so it gates rather than weighting: cheap-and-shallow still
+    // loses to cheap-and-deep, but expensive-and-deep can no longer crowd the
+    // cheap cohort out. The depth floor above already removed dust, and the
+    // cheap cohort is small -- ~75 pools across Base at a $100k floor.
+    ranked.sort_by_key(|(record, liquidity)| {
+        (Reverse(is_cheap_enough_to_arb(record)), Reverse(*liquidity))
+    });
     (ranked, stats)
+}
+
+/// Fee ceiling, in ppm, under which a pool is worth preferring.
+///
+/// 500 ppm is 5 bps a hop: a 2-hop round trip at or under 10 bps, which is the
+/// band the measured cross-venue pairs occupy (1.09 to 8.00 bps).
+fn arb_fee_ceiling_ppm() -> u32 {
+    crate::util::env_parse_opt::<u32>("ARBOT_ARB_FEE_CEILING_PPM").unwrap_or(500)
+}
+
+/// Whether this pool's fee is known AND low enough to be worth preferring.
+///
+/// Reads `fee_ppm_onchain` and NEVER `record.fee`. That field is the venue's
+/// pool key -- a fee tier on univ3, a TICK SPACING on Slipstream -- so treating
+/// it as a cost would mark every spacing-1 or spacing-100 Slipstream pool
+/// "cheap" regardless of the 212-8000 ppm it actually charges. An unknown fee is
+/// not cheap: a builder that could not determine the fee has earned no
+/// preference for its pools.
+fn is_cheap_enough_to_arb(record: &PoolRecord) -> bool {
+    record
+        .fee_ppm_onchain
+        .is_some_and(|ppm| ppm > 0 && ppm <= arb_fee_ceiling_ppm())
 }
 
 /// Log the pools the liquidity stage removed. A drop here is invisible in the
@@ -1224,6 +1267,7 @@ mod tests {
                 created_block: 0,
                 hub_usd_liquidity: None,
                 hub_symbol: None,
+                fee_ppm_onchain: None,
             },
             liquidity_score: Decimal::from(liq),
             volume_score: Decimal::from(vol),
@@ -1286,12 +1330,14 @@ mod tests {
             created_block: id,
             hub_usd_liquidity,
             hub_symbol: hub_usd_liquidity.map(|_| "WETH".to_string()),
+            fee_ppm_onchain: None,
         }
     }
 
     fn record_with_unnamed_hub(id: u64, hub_usd_liquidity: Option<f64>) -> PoolRecord {
         PoolRecord {
             hub_symbol: None,
+            fee_ppm_onchain: None,
             ..record_with_liquidity(id, hub_usd_liquidity)
         }
     }
@@ -1348,6 +1394,83 @@ mod tests {
                 "corrupt value {corrupt:?} must not be trusted"
             );
         }
+    }
+
+    fn priced(id: u64, usd: f64, fee_ppm: Option<u32>) -> (PoolRecord, Option<Decimal>, bool) {
+        let mut r = record_with_liquidity(id, Some(usd));
+        r.fee_ppm_onchain = fee_ppm;
+        let score = offline_hub_usd_liquidity(&r);
+        (r, score, false)
+    }
+
+    /// A cheap pool outranks a deeper expensive one, because the fee is a hurdle
+    /// paid on every attempt while depth only caps size.
+    ///
+    /// Sorting on depth alone is what buried the arb-viable cohort: Base's depth
+    /// is in the 1% tier, so the top 50 by liquidity averaged 44.5 bps a hop --
+    /// an ~89 bps hurdle on a 2-hop -- while the cross-venue pairs that clear
+    /// cost 1.09 to 8.00 bps round-trip.
+    #[test]
+    fn a_cheap_pool_outranks_a_deeper_expensive_one() {
+        let (ranked, _) = retain_ranked_liquidity(
+            vec![
+                priced(1, 50_000_000.0, Some(3_000)),  // deep, 30 bps
+                priced(2, 250_000.0, Some(100)),       // shallow, 1 bp
+                priced(3, 900_000.0, Some(500)),       // mid, 5 bps
+            ],
+            1.0,
+        );
+        let order: Vec<u64> = ranked.iter().map(|(r, _)| r.pool.to_low_u64_be()).collect();
+        assert_eq!(
+            order,
+            vec![3, 2, 1],
+            "cheap pools lead, deepest first within the cheap group; the 30 bps \
+             pool ranks last however deep it is"
+        );
+    }
+
+    /// An unknown fee is not a cheap fee.
+    ///
+    /// `fee_ppm_onchain` is absent on every record a fee-blind builder wrote, and
+    /// those must not be promoted over pools whose cost was actually measured.
+    /// Within the unknown group the old depth ordering is untouched.
+    #[test]
+    fn an_unknown_fee_earns_no_preference() {
+        let (ranked, _) = retain_ranked_liquidity(
+            vec![
+                priced(1, 5_000_000.0, None),
+                priced(2, 100_000.0, Some(100)),
+                priced(3, 9_000_000.0, None),
+            ],
+            1.0,
+        );
+        let order: Vec<u64> = ranked.iter().map(|(r, _)| r.pool.to_low_u64_be()).collect();
+        assert_eq!(order, vec![2, 3, 1], "measured-cheap first, then depth");
+    }
+
+    /// The tick-spacing trap: `record.fee` must never be read as a cost.
+    ///
+    /// On Slipstream that field is the POOL KEY, so a spacing of 100 would look
+    /// like 1 bp while the pool charges 2500 ppm. Only the explicit
+    /// `fee_ppm_onchain` counts.
+    #[test]
+    fn a_slipstream_pool_key_is_not_mistaken_for_a_cheap_fee() {
+        // fee = 100 is the tick spacing; the pool really charges 2500 ppm.
+        let mut spacing_looks_cheap = record_with_liquidity(1, Some(100_000.0));
+        spacing_looks_cheap.fee = 100;
+        spacing_looks_cheap.fee_ppm_onchain = Some(2_500);
+        assert!(
+            !is_cheap_enough_to_arb(&spacing_looks_cheap),
+            "a spacing of 100 must not read as 1 bp when the pool charges 25 bps"
+        );
+
+        let mut genuinely_cheap = record_with_liquidity(2, Some(100_000.0));
+        genuinely_cheap.fee = 2_000; // a wide spacing ...
+        genuinely_cheap.fee_ppm_onchain = Some(90); // ... on a 0.9 bp pool
+        assert!(
+            is_cheap_enough_to_arb(&genuinely_cheap),
+            "a wide spacing says nothing about the fee; 90 ppm is cheap"
+        );
     }
 
     /// The cohort that was actually in the shipped inventory on 2026-09-06,
@@ -1609,6 +1732,7 @@ mod tests {
             created_block: 1,
             hub_usd_liquidity: None,
             hub_symbol: None,
+            fee_ppm_onchain: None,
         };
         let scored_pool = PoolRecord {
             pool: Address::from_low_u64_be(9),
@@ -1621,6 +1745,7 @@ mod tests {
             // would test that an UNSCORED pool loses to a pin, which is weaker
             // than what it is named for.
             hub_symbol: Some("WETH".to_string()),
+            fee_ppm_onchain: None,
         };
         let hot = finalize_hot_with_pins(vec![scored_pool], vec![pinned_pool.clone()], 1);
         assert_eq!(hot.len(), 1);
@@ -1637,6 +1762,7 @@ mod tests {
             created_block: 1,
             hub_usd_liquidity: None,
             hub_symbol: None,
+            fee_ppm_onchain: None,
         };
         assert!(pool_matches_pair(
             &record,

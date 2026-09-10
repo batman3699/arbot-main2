@@ -181,6 +181,7 @@ async fn ingest_univ2(
                 created_block: block,
                 hub_usd_liquidity: None,
                 hub_symbol: None,
+                fee_ppm_onchain: None,
             });
         }
         sleep(Duration::from_millis(INTER_CHUNK_DELAY_MS)).await;
@@ -245,6 +246,7 @@ async fn ingest_univ3(
                 created_block: block,
                 hub_usd_liquidity: None,
                 hub_symbol: None,
+                fee_ppm_onchain: None,
             });
         }
         sleep(Duration::from_millis(INTER_CHUNK_DELAY_MS)).await;
