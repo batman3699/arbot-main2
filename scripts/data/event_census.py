@@ -248,12 +248,17 @@ def cycles_for_pair(members):
     return out
 
 
+INSTANCE = [0]
+
+
 def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
     """Quote every cycle on this pair across the ladder; append rows."""
     hub = next((t for t in pair if t in HUBS), None)
     if hub is None:
         return 0, None
     sym, dec, px = HUBS[hub]
+    INSTANCE[0] += 1
+    inst_id = INSTANCE[0]
     combos = cycles_for_pair(members)
     jobs = []
     for (start, mid, a, b) in combos:
@@ -304,13 +309,22 @@ def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
         gas_tokens = int(GAS_USD / spx * (10 ** sdec))
         writer.write(json.dumps({
             "trigger": trigger,
+            "instance": inst_id,
             "swap_usd": swap_usd,
             "block": block_tag,
+            # depth_usd and fee_ppm ride along so a depth-floor sweep is a
+            # FILTER over one run rather than one run per floor. Sequential runs
+            # face different market conditions, and that confound is what made
+            # the earlier dollar-based sweep non-monotonic and unreadable.
             "route": [
                 {"venue": j["a"]["venue"], "pool": j["a"]["pool"],
-                 "from": j["start"], "to": j["mid"]},
+                 "from": j["start"], "to": j["mid"],
+                 "depth_usd": j["a"].get("hub_usd_liquidity"),
+                 "fee_ppm": j["a"].get("fee_ppm_onchain") or j["a"]["fee"]},
                 {"venue": j["b"]["venue"], "pool": j["b"]["pool"],
-                 "from": j["mid"], "to": j["start"]},
+                 "from": j["mid"], "to": j["start"],
+                 "depth_usd": j["b"].get("hub_usd_liquidity"),
+                 "fee_ppm": j["b"].get("fee_ppm_onchain") or j["b"]["fee"]},
             ],
             "hops": 2,
             "start": j["start"],
