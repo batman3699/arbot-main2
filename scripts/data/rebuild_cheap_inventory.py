@@ -358,15 +358,33 @@ def rebuild_venue(venue, cfg):
                         existing.append(json.loads(line))
                     except json.JSONDecodeError:
                         continue
-    by_pool = {r["pool"].lower(): r for r in keep}
-    # Existing records win: they may carry hand-verified or venue-specific
-    # fields this script does not know about. UNION only -- never shrink.
+    # UNION, never shrink. An existing record keeps every field this script does
+    # not measure -- it may be hand-verified or carry venue-specific keys -- but
+    # the three facts this run DID measure are overlaid onto it.
+    #
+    # Plain "existing wins" was wrong and silently defeated the rebuild: the
+    # scraped Slipstream records predate `fee_ppm_onchain`/`hub_symbol`, so
+    # skipping them left the pools unusable to anything that filters on a
+    # measured fee, and the cheap universe collapsed to the two venues whose
+    # pool key happens to double as their fee.
+    measured = {"hub_usd_liquidity", "hub_symbol", "fee_ppm_onchain"}
+    fresh = {r["pool"].lower(): r for r in keep}
+    by_pool = {}
     for r in existing:
         pl = r.get("pool")
-        if pl:
-            by_pool[pl.lower()] = r
+        if not pl:
+            continue
+        new_rec = fresh.get(pl.lower())
+        if new_rec:
+            r = {**r, **{k: v for k, v in new_rec.items() if k in measured}}
+        by_pool[pl.lower()] = r
+    enriched = sum(1 for pl in fresh if pl in by_pool)
+    for pl, r in fresh.items():
+        by_pool.setdefault(pl, r)
     merged = list(by_pool.values())
     added = len(merged) - len(existing)
+    if enriched:
+        print(f"  enriched {enriched:,} existing records with measured fee/depth/hub")
     print(f"  existing {len(existing):,} + new {added:,} -> {len(merged):,}")
 
     if DRY_RUN:
