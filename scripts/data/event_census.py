@@ -54,7 +54,11 @@ RPCS = [u.strip() for u in os.environ.get(
     "https://base-mainnet.public.blastapi.io"
 ).split(",") if u.strip()]
 OUT = os.environ.get("EV_OUT", "/tmp/event_census.jsonl")
-MIN_SWAP_USD = float(os.environ.get("EV_MIN_SWAP_USD", "5000"))
+# $7,500, measured across 700 instances spanning $500-$50k: the hit rate is
+# 12.1% below $5k and 38.9% at or above, peaking at 51.8% in the $7.5k-$10k band
+# where the median best cycle is actually positive. It falls to ~32% above $20k,
+# where faster participants have presumably already taken it.
+MIN_SWAP_USD = float(os.environ.get("EV_MIN_SWAP_USD", "7500"))
 MINUTES = float(os.environ.get("EV_MINUTES", "60"))
 PACE_S = float(os.environ.get("EV_PACE_S", "0.35"))
 CONTROL_EVERY = int(os.environ.get("EV_CONTROL_EVERY", "3"))
@@ -248,7 +252,7 @@ def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
     """Quote every cycle on this pair across the ladder; append rows."""
     hub = next((t for t in pair if t in HUBS), None)
     if hub is None:
-        return 0
+        return 0, None
     sym, dec, px = HUBS[hub]
     combos = cycles_for_pair(members)
     jobs = []
@@ -264,12 +268,12 @@ def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
             jobs.append({"start": start, "mid": mid, "a": a, "b": b,
                          "usd": usd, "amt": amt})
     if not jobs:
-        return 0
+        return 0, None
 
     leg1 = multicall_chunked([quote_call(j["a"]["venue"], j["start"], j["mid"],
                                          j["amt"], j["a"]["fee"]) for j in jobs], block_tag)
     if len(leg1) != len(jobs):
-        return 0
+        return 0, None
     live = []
     for j, (ok, ret) in zip(jobs, leg1):
         if ok and len(ret) >= 32:
@@ -278,13 +282,14 @@ def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
                 j["mid_amt"] = mid_amt
                 live.append(j)
     if not live:
-        return 0
+        return 0, None
     leg2 = multicall_chunked([quote_call(j["b"]["venue"], j["mid"], j["start"],
                                          j["mid_amt"], j["b"]["fee"]) for j in live], block_tag)
     if len(leg2) != len(live):
-        return 0
+        return 0, None
 
     n = 0
+    best_bps = None
     for j, (ok, ret) in zip(live, leg2):
         if not (ok and len(ret) >= 32):
             continue
@@ -294,6 +299,8 @@ def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
         s = j["start"].lower()
         _sy, sdec, spx = HUBS[s]
         gross = out_amt - j["amt"]
+        bps = gross / j["amt"] * 1e4
+        best_bps = bps if best_bps is None else max(best_bps, bps)
         gas_tokens = int(GAS_USD / spx * (10 ** sdec))
         writer.write(json.dumps({
             "trigger": trigger,
@@ -318,7 +325,7 @@ def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
         }) + "\n")
         n += 1
     writer.flush()
-    return n
+    return n, best_bps
 
 
 def swap_usd_of(log, pool_by_addr):
@@ -364,7 +371,7 @@ def main():
           f"for {MINUTES:.0f} min -> {OUT}", flush=True)
 
     deadline = time.time() + MINUTES * 60
-    events = controls = rows = 0
+    events = controls = rows = hits = control_hits = 0
     quiet_blocks = 0
     seen = head
     with open(OUT, "w") as writer:
@@ -390,23 +397,39 @@ def main():
                         pair = tuple(sorted((rec["token0"].lower(), rec["token1"].lower())))
                         # "latest", not the swap's block: the question is whether
                         # the dislocation is still there when we could act.
-                        n = price_cycles(pair, universe[pair], "swap", round(usd, 2),
-                                         "latest", writer)
+                        n, best = price_cycles(pair, universe[pair], "swap",
+                                               round(usd, 2), "latest", writer)
                         rows += n
-                        events += 1
-                        print(f"  [{blk}] swap ${usd:>12,.0f} on {addr[:12]} "
-                              f"-> {n} quotes", flush=True)
+                        if n:
+                            events += 1
+                            if best is not None and best > 0:
+                                hits += 1
+                        rate = (100.0 * hits / events) if events else 0.0
+                        print(f"  [{blk}] swap ${usd:>11,.0f} -> {n:>4} quotes  "
+                              f"best {('%+.2f' % best) if best is not None else '   n/a':>8} bps  "
+                              f"HIT-RATE {hits}/{events} = {rate:.1f}%", flush=True)
                 else:
                     quiet_blocks += 1
                     if quiet_blocks >= CONTROL_EVERY:
                         quiet_blocks = 0
                         pair = random.choice(list(universe))
-                        n = price_cycles(pair, universe[pair], "control", 0.0,
-                                         "latest", writer)
+                        n, best = price_cycles(pair, universe[pair], "control", 0.0,
+                                               "latest", writer)
                         rows += n
-                        controls += 1
+                        if n:
+                            controls += 1
+                            if best is not None and best > 0:
+                                control_hits += 1
             seen = min(nxt, seen + 6)
-    print(f"\nevents {events}  controls {controls}  rows {rows} -> {OUT}")
+    # The RATE is the measurement that converges. Realised dollars are
+    # fat-tailed -- one window's total was 87% two events -- so a 45-minute run
+    # cannot separate two configurations on money. A hit rate over ~100
+    # instances can.
+    er = (100.0 * hits / events) if events else 0.0
+    cr = (100.0 * control_hits / controls) if controls else 0.0
+    print(f"\nswap    instances {events:>4}  hits {hits:>4}  HIT RATE {er:5.1f}%")
+    print(f"control instances {controls:>4}  hits {control_hits:>4}  HIT RATE {cr:5.1f}%")
+    print(f"rows {rows} -> {OUT}")
     return 0
 
 
