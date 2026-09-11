@@ -62,9 +62,12 @@ USAGE
     python3 scripts/data/rebuild_cheap_inventory.py            # write
     DRY_RUN=1 python3 scripts/data/rebuild_cheap_inventory.py  # report only
 
-Env: CHEAP_RPC_URLS, CHEAP_MIN_USD (250000), CHEAP_TOP_N (4000),
-     CHEAP_FEES (100,500), CHEAP_BATCH (200), CHEAP_WORKERS (1),
-     CHEAP_PACE_S (1.2), DRY_RUN.
+Env: CHEAP_RPC_URLS, CHEAP_MIN_USD (100000), CHEAP_MAX_FEE_PPM (500),
+     CHEAP_TOP_N (4000), CHEAP_VENUES, CHEAP_BATCH (200),
+     CHEAP_WORKERS (1), CHEAP_PACE_S (1.2), DRY_RUN.
+
+Both thresholds are measured, not chosen: see sweep_depth_floor.py for the
+depth floor and event_census.py for the fee ceiling.
 """
 
 import json
@@ -104,11 +107,20 @@ def paths(venue):
 
 DEFAULT_RPCS = "https://mainnet.base.org,https://base.gateway.tenderly.co"
 RPCS = [u.strip() for u in os.environ.get("CHEAP_RPC_URLS", DEFAULT_RPCS).split(",") if u.strip()]
-MIN_USD = float(os.environ.get("CHEAP_MIN_USD", "250000"))
+# $100k, measured: swept as a filter over one event-census window
+# (scripts/data/sweep_depth_floor.py), the hit rate is 17.4% at every floor from
+# $0 to $50k and 20.0% at $100k, because a lower floor adds CYCLES but not
+# INSTANCES -- the best cycle in an instance was already a deep one. $100k is
+# therefore the same opportunity against a third of the pools to scan. $250k
+# leaves only 4 instances and finds nothing.
+MIN_USD = float(os.environ.get("CHEAP_MIN_USD", "100000"))
 TOP_N = int(os.environ.get("CHEAP_TOP_N", "4000"))
 # A ceiling, not a tier list: Slipstream fees are arbitrary ppm values
 # (65, 85, 90, 190, 346, 425 ...), so an enum of Uniswap tiers cannot
 # express "cheap" for it.
+# 500 ppm = 5 bps a hop, so a 2-hop round trip at or under 10 bps. That is the
+# band the tradeable cross-venue pairs occupy (1.09 to 8.00 bps round-trip),
+# against the ~89 bps hurdle a depth-ranked selection produces.
 MAX_FEE_PPM = int(os.environ.get("CHEAP_MAX_FEE_PPM", "500"))
 # Multicall3, not a JSON-RPC batch. Measured 2026-09-06: mainnet.base.org caps
 # JSON-RPC batches at 10 calls and rate-limits, which turns 46,603 reads into

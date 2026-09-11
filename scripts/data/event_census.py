@@ -31,8 +31,16 @@ numbers are directly comparable to `census_*.jsonl`, and it writes the same
 JSONL schema.
 
 Usage:  python3 scripts/data/event_census.py
-Env:    EV_RPC_URLS, EV_OUT, EV_MIN_SWAP_USD (5000), EV_MINUTES (60),
-        EV_PACE_S (0.35), EV_CONTROL_EVERY (3)
+Env:    EV_RPC_URLS, EV_OUT, EV_MINUTES (60), EV_PACE_S (0.35),
+        EV_CONTROL_EVERY (3), EV_MAX_POOLS_PER_PAIR (4),
+        EV_MIN_SWAP_USD (7500), EV_MIN_DEPTH_USD (100000),
+        EV_MAX_FEE_PPM (500)
+
+Every threshold above is measured rather than chosen. Swap size: hit rate is
+12.1% below $5k and 38.9% at or above, peaking at 51.8% in $7.5k-$10k. Depth:
+17.4% at every floor from $0 to $50k and 20.0% at $100k, so $100k buys the same
+opportunity for a third of the pools (sweep_depth_floor.py). Fee: 500 ppm is
+5 bps a hop, the band the tradeable cross-venue pairs occupy.
 """
 
 import json
@@ -62,7 +70,12 @@ MIN_SWAP_USD = float(os.environ.get("EV_MIN_SWAP_USD", "7500"))
 MINUTES = float(os.environ.get("EV_MINUTES", "60"))
 PACE_S = float(os.environ.get("EV_PACE_S", "0.35"))
 CONTROL_EVERY = int(os.environ.get("EV_CONTROL_EVERY", "3"))
-MIN_FEE_PPM = int(os.environ.get("EV_MAX_FEE_PPM", "500"))
+# A fee CEILING (the old name said MIN and meant the opposite). 500 ppm is
+# 5 bps a hop: a 2-hop round trip at or under 10 bps, the band the tradeable
+# cross-venue pairs occupy.
+MAX_FEE_PPM = int(os.environ.get("EV_MAX_FEE_PPM", "500"))
+# $100k, measured by sweep_depth_floor.py: identical hit rate to every lower
+# floor, against a third of the pools. See that script for the table.
 MIN_USD_DEPTH = float(os.environ.get("EV_MIN_DEPTH_USD", "100000"))
 
 MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
@@ -212,7 +225,7 @@ def load_universe():
                     fee = r.get("fee")
                 else:
                     continue
-            if not isinstance(fee, int) or fee <= 0 or fee > MIN_FEE_PPM:
+            if not isinstance(fee, int) or fee <= 0 or fee > MAX_FEE_PPM:
                 continue
             if (r.get("hub_usd_liquidity") or 0) < MIN_USD_DEPTH:
                 continue
@@ -370,7 +383,7 @@ def main():
         for r in members:
             pool_by_addr[r["pool"].lower()] = r
     print(f"universe: {len(universe)} pairs, {len(pool_by_addr)} pools "
-          f"(<= {MIN_FEE_PPM} ppm, >= ${MIN_USD_DEPTH:,.0f})")
+          f"(<= {MAX_FEE_PPM} ppm, >= ${MIN_USD_DEPTH:,.0f})")
     if not universe:
         print("ABORT: no pair carries two cheap+deep pools", file=sys.stderr)
         return 1
