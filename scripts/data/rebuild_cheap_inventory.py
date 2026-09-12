@@ -57,10 +57,20 @@ disk (existing records win on conflict, so hand-verified entries survive), the
 previous file is copied aside first, and the run aborts without writing if too
 few pools qualify -- a broken RPC must not be able to empty the universe.
 
+PIPELINE ORDER
+--------------
+Run `verify_pool_venues.py` AFTER this, always. `pools.factory-full.jsonl` is
+named for one factory but is not confined to it: every pool this script added
+from the uniswap_v3 enumeration was present in that file, yet ten of them
+belonged to other factories. A pool filed under the wrong venue is priced by the
+wrong quoter, which resolves a DIFFERENT pool and returns a real number for it --
+invisible in the inventory, silent at runtime.
+
 USAGE
 -----
     python3 scripts/data/rebuild_cheap_inventory.py            # write
     DRY_RUN=1 python3 scripts/data/rebuild_cheap_inventory.py  # report only
+    python3 scripts/data/verify_pool_venues.py                 # then always
 
 Env: CHEAP_RPC_URLS, CHEAP_MIN_USD (100000), CHEAP_MAX_FEE_PPM (500),
      CHEAP_TOP_N (4000), CHEAP_VENUES, CHEAP_BATCH (200),
