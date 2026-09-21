@@ -1,12 +1,16 @@
 [
+  // Balancer V3 (Base) — pools with publicly reported liquidity ≥ $99k
+  // Token addresses resolved Aug 2026
+
+  // ── waBasWETH / rETH  (~$348k) ─────────────────────────────────────────
   {
-    poolId: '0x4c42b5057a8663e2b1ac21685d1502c937a0381700020000000000000000019c',
-    tokenIn: '0x4200000000000000000000000000000000000006',
-    tokenOut: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+    poolId: "0xb7b8b3afc010169779c5c2385ec0eb0477fe3347",
+    tokenIn: "0x4200000000000000000000000000000000000006", // WETH
+    tokenOut: "0xB6fe221Fe9EeF5aBa221c348bA20A1Bf5e73624c"  // rETH
   },
   {
-    poolId: '0x4c42b5057a8663e2b1ac21685d1502c937a0381700020000000000000000019c',
-    tokenIn: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
-    tokenOut: '0x4200000000000000000000000000000000000006',
-  },
+    poolId: "0xb7b8b3afc010169779c5c2385ec0eb0477fe3347",
+    tokenIn: "0xB6fe221Fe9EeF5aBa221c348bA20A1Bf5e73624c",
+    tokenOut: "0x4200000000000000000000000000000000000006"
+  }
 ]

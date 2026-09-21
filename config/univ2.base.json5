@@ -1,41 +1,271 @@
 [
-  // BaseSwap BSWAP/WETH
+  // Uniswap V2 (Base) — all pools with publicly reported liquidity ≥ $99k
+  // Source: GeckoTerminal / DEX Screener / WhatToFarm (Aug 2026)
+  // feeBps: 30 = standard Uniswap V2 0.3%
+
+  // ── TIBBIR / VIRTUAL  (~$3.5–3.6M) ─────────────────────────────────────
   {
-    pair: "0xE80B4F755417FB4baF4dbd23C029db3F62786523",
-    tokenIn: "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
-    tokenOut: "0x4200000000000000000000000000000000000006",
-    feeBps: 30,
+    pair: "0x0c3b466104545efa096b8f944c1e524e1d0d4888",
+    tokenIn: "0xA4A2E2ca3fBfE21aed83471D28b6f65A233C6e00", // TIBBIR
+    tokenOut: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", // VIRTUAL
+    feeBps: 30
   },
   {
-    pair: "0xE80B4F755417FB4baF4dbd23C029db3F62786523",
+    pair: "0x0c3b466104545efa096b8f944c1e524e1d0d4888",
+    tokenIn: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b",
+    tokenOut: "0xA4A2E2ca3fBfE21aed83471D28b6f65A233C6e00",
+    feeBps: 30
+  },
+
+  // ── GAME / VIRTUAL  (~$2.9–3.0M) ───────────────────────────────────────
+  {
+    pair: "0xd418dfe7670c21f682e041f34250c114db5d7789",
+    tokenIn: "0x1C4CcA7C5DB003824208aDDA61Bd749e55F463a3", // GAME
+    tokenOut: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", // VIRTUAL
+    feeBps: 30
+  },
+  {
+    pair: "0xd418dfe7670c21f682e041f34250c114db5d7789",
+    tokenIn: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b",
+    tokenOut: "0x1C4CcA7C5DB003824208aDDA61Bd749e55F463a3",
+    feeBps: 30
+  },
+
+  // ── VIRTUAL / WETH  (~$1.4M) ───────────────────────────────────────────
+  {
+    pair: "0xe31c372a7af875b3b5e0f3713b17ef51556da667",
+    tokenIn: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", // VIRTUAL
+    tokenOut: "0x4200000000000000000000000000000000000006", // WETH
+    feeBps: 30
+  },
+  {
+    pair: "0xe31c372a7af875b3b5e0f3713b17ef51556da667",
     tokenIn: "0x4200000000000000000000000000000000000006",
-    tokenOut: "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
-    feeBps: 30,
+    tokenOut: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b",
+    feeBps: 30
   },
-  // BaseSwap BSWAP/USDC
+
+  // ── WETH / USDC  (~$1.4M) ──────────────────────────────────────────────
   {
-    pair: "0x901C8995097710F9809bc7F52b5fd7990D1ce873",
-    tokenIn: "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
-    tokenOut: "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913",
-    feeBps: 30,
-  },
-  {
-    pair: "0x901C8995097710F9809bc7F52b5fd7990D1ce873",
-    tokenIn: "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913",
-    tokenOut: "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
-    feeBps: 30,
-  },
-  // BaseSwap BSWAP/USDbC
-  {
-    pair: "0xD8052652da8cFE907f7E29704D569506DdAaeEB4",
-    tokenIn: "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
-    tokenOut: "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913",
-    feeBps: 30,
+    pair: "0x88a43bbdf9d098eec7bceda4e2494615dfd9bb9c",
+    tokenIn: "0x4200000000000000000000000000000000000006", // WETH
+    tokenOut: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // USDC
+    feeBps: 30
   },
   {
-    pair: "0xD8052652da8cFE907f7E29704D569506DdAaeEB4",
-    tokenIn: "0x833589fCD6eDb6E08f4c7C32D4f71b54bDa02913",
-    tokenOut: "0x78a087d713Be963Bf307b18F2Ff8122EF9A63ae9",
-    feeBps: 30,
+    pair: "0x88a43bbdf9d098eec7bceda4e2494615dfd9bb9c",
+    tokenIn: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+
+  // ── Zuzalu / WETH  (~$905k) ────────────────────────────────────────────
+  {
+    pair: "0xe1bed6aadba5471700f16a47eee2504346b724ad",
+    tokenIn: "0x3054E8F8fBA3055a42e5F5228A2A4e2AB1326933", // Zuzalu
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+  {
+    pair: "0xe1bed6aadba5471700f16a47eee2504346b724ad",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0x3054E8F8fBA3055a42e5F5228A2A4e2AB1326933",
+    feeBps: 30
+  },
+
+  // ── KEYCAT / WETH  (~$890–930k) ────────────────────────────────────────
+  {
+    pair: "0x377feeed4820b3b28d1ab429509e7a0789824fca",
+    tokenIn: "0x9a26F5433671751C3276a065f57e5a02D2817973", // KEYCAT
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+  {
+    pair: "0x377feeed4820b3b28d1ab429509e7a0789824fca",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0x9a26F5433671751C3276a065f57e5a02D2817973",
+    feeBps: 30
+  },
+
+  // ── SKI / WETH  (~$740–775k) ───────────────────────────────────────────
+  {
+    pair: "0x6d6391b9bd02eefa00fa711fb1cb828a6471d283",
+    tokenIn: "0x768BE13e1680b5ebE0024C42c896E3dB59ec0149", // SKI
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+  {
+    pair: "0x6d6391b9bd02eefa00fa711fb1cb828a6471d283",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0x768BE13e1680b5ebE0024C42c896E3dB59ec0149",
+    feeBps: 30
+  },
+
+  // ── WETH / NPC  (~$580–720k) ───────────────────────────────────────────
+  {
+    pair: "0x3f413fccaea59b8053d605aea7ae847c02ed5d95",
+    tokenIn: "0x4200000000000000000000000000000000000006", // WETH
+    tokenOut: "0xB166E8B140D35D9D8226E40C09f757BAC5A4d87d", // NPC
+    feeBps: 30
+  },
+  {
+    pair: "0x3f413fccaea59b8053d605aea7ae847c02ed5d95",
+    tokenIn: "0xB166E8B140D35D9D8226E40C09f757BAC5A4d87d",
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+
+  // ── Fren Pet / WETH  (~$620k) ──────────────────────────────────────────
+  {
+    pair: "0xde66c35e01ed8e619bf092352338ef94f2327337",
+    tokenIn: "0xFF0C532FDB8Cd566Ae169C1CB157ff2Bdc83E105", // Fren Pet
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+  {
+    pair: "0xde66c35e01ed8e619bf092352338ef94f2327337",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0xFF0C532FDB8Cd566Ae169C1CB157ff2Bdc83E105",
+    feeBps: 30
+  },
+
+  // ── MIGGLES / WETH  (~$549–554k) ───────────────────────────────────────
+  {
+    pair: "0x17a3ad8c74c4947005afeda9965305ae2eb2518a",
+    tokenIn: "0xb1a03eda10342529bbf8eb700a06c60441fef25d", // MIGGLES
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+  {
+    pair: "0x17a3ad8c74c4947005afeda9965305ae2eb2518a",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0xb1a03eda10342529bbf8eb700a06c60441fef25d",
+    feeBps: 30
+  },
+
+  // ── RUSSELL / WETH  (~$390–415k) ───────────────────────────────────────
+  {
+    pair: "0xea8b7ed6170e0ea3703dde6b496b065a8ececd7b",
+    tokenIn: "0x0C5142BC58f9A61AB8C3D2085DD2F4e550c5cE0B", // RUSSELL
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+  {
+    pair: "0xea8b7ed6170e0ea3703dde6b496b065a8ececd7b",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0x0C5142BC58f9A61AB8C3D2085DD2F4e550c5cE0B",
+    feeBps: 30
+  },
+
+  // ── FROK / WETH  (~$345–354k) ──────────────────────────────────────────
+  {
+    pair: "0x45f4db10bb0102c133f1c70500124e4569f3edcd",
+    tokenIn: "0x42069BAbe14fB1802C5CB0F50BB9D2Ad6FEf55e2", // FROK
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+  {
+    pair: "0x45f4db10bb0102c133f1c70500124e4569f3edcd",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0x42069BAbe14fB1802C5CB0F50BB9D2Ad6FEf55e2",
+    feeBps: 30
+  },
+
+  // ── ETHY / VIRTUAL  (~$255–317k) ───────────────────────────────────────
+  {
+    pair: "0x47006dcfc5aa14b577d3d2a0e39f72046bf4c054",
+    tokenIn: "0xC44141a684f6AA4E36cD9264ab55550B03C88643", // ETHY
+    tokenOut: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", // VIRTUAL
+    feeBps: 30
+  },
+  {
+    pair: "0x47006dcfc5aa14b577d3d2a0e39f72046bf4c054",
+    tokenIn: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b",
+    tokenOut: "0xC44141a684f6AA4E36cD9264ab55550B03C88643",
+    feeBps: 30
+  },
+
+  // ── WIRE / VIRTUAL  (~$206–268k) ───────────────────────────────────────
+  {
+    pair: "0x8ffd336d457ada04a2d5112f8f0c1f1a84577f2f",
+    tokenIn: "0x0b3ae50babe7ffa4e1a50569cee6bdefd4ccaee0", // WIRE
+    tokenOut: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", // VIRTUAL
+    feeBps: 30
+  },
+  {
+    pair: "0x8ffd336d457ada04a2d5112f8f0c1f1a84577f2f",
+    tokenIn: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b",
+    tokenOut: "0x0b3ae50babe7ffa4e1a50569cee6bdefd4ccaee0",
+    feeBps: 30
+  },
+
+  // ── PRXVT / VIRTUAL  (~$243–248k) ──────────────────────────────────────
+  {
+    pair: "0xf19135499ccc96622bc08dbd080aea66e9a08a44",
+    tokenIn: "0x4b5D32A07b8d3eC5D6928cAa30196f8dd6a7C5A9", // PRXVT
+    tokenOut: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", // VIRTUAL
+    feeBps: 30
+  },
+  {
+    pair: "0xf19135499ccc96622bc08dbd080aea66e9a08a44",
+    tokenIn: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b",
+    tokenOut: "0x4b5D32A07b8d3eC5D6928cAa30196f8dd6a7C5A9",
+    feeBps: 30
+  },
+
+  // ── A1C / WETH  (~$180–236k) ───────────────────────────────────────────
+  {
+    pair: "0x7dc3662f4c2c41c5752652e8b417a9024c2b1f63",
+    tokenIn: "0x1f1c695f6b4a3f8b05f2492cef9474afb6d6ad69", // A1C
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+  {
+    pair: "0x7dc3662f4c2c41c5752652e8b417a9024c2b1f63",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0x1f1c695f6b4a3f8b05f2492cef9474afb6d6ad69",
+    feeBps: 30
+  },
+
+  // ── FACY / VIRTUAL  (~$223–227k) ───────────────────────────────────────
+  {
+    pair: "0xd87ea5f46615e1175c909610766e853faa5f94be",
+    tokenIn: "0xFAC77f01957ed1B3DD1cbEa992199B8f85B6E886", // FACY
+    tokenOut: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", // VIRTUAL
+    feeBps: 30
+  },
+  {
+    pair: "0xd87ea5f46615e1175c909610766e853faa5f94be",
+    tokenIn: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b",
+    tokenOut: "0xFAC77f01957ed1B3DD1cbEa992199B8f85B6E886",
+    feeBps: 30
+  },
+
+  // ── PATIENCE / WETH  (~$151–165k) ──────────────────────────────────────
+  {
+    pair: "0xef4afdef77cb521760d82ac0ed1b6d3007bdbd37",
+    tokenIn: "0x6d96f18f00b815b2109a3766e79f6a7ad7785624", // PATIENCE
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    feeBps: 30
+  },
+  {
+    pair: "0xef4afdef77cb521760d82ac0ed1b6d3007bdbd37",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0x6d96f18f00b815b2109a3766e79f6a7ad7785624",
+    feeBps: 30
+  },
+
+  // ── SIBYL / VIRTUAL  (~$145–155k) ──────────────────────────────────────
+  {
+    pair: "0x43447f02ada550929f1f0619471a8f8dba173243",
+    tokenIn: "0x797f214a2CD64a4963A91Fa21c8C55Ec3EBa4714", // SIBYL
+    tokenOut: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b", // VIRTUAL
+    feeBps: 30
+  },
+  {
+    pair: "0x43447f02ada550929f1f0619471a8f8dba173243",
+    tokenIn: "0x0b3e328455c4059EEb9e3f84b5543F74E24e7E1b",
+    tokenOut: "0x797f214a2CD64a4963A91Fa21c8C55Ec3EBa4714",
+    feeBps: 30
   }
 ]

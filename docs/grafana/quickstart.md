@@ -16,15 +16,20 @@ This walkthrough assumes you have never managed servers before. Follow every ste
 ## Step 1 – Start Arbot With Metrics Enabled
 
 1. In the terminal, change into the Arbot folder:
+   
    ```bash
    cd /path/to/arbot
    ```
+   
    Replace `/path/to/arbot` with the actual folder location if it is different.
+
 2. Tell Arbot which port to use for metrics and then launch it:
+   
    ```bash
    export PROMETHEUS_PORT=9000
    RUST_LOG=info cargo run --release
    ```
+   
    - After you press <kbd>Enter</kbd>, Arbot starts and prints scrolling text. Leave this terminal running. It keeps exposing live profit metrics at `http://localhost:9000/metrics`.
    - If you ever close this window, Arbot stops. Do **not** close it while following this guide.
 
@@ -35,10 +40,13 @@ Leave the Arbot terminal running and open a **second** terminal window for the r
 ## Step 2 – Create the Prometheus Settings File
 
 1. In the second terminal, make sure you are in the same Arbot folder:
+   
    ```bash
    cd /path/to/arbot
    ```
+
 2. Copy and paste the block below exactly. Press <kbd>Enter</kbd> after the last `EOF` line. This creates a file named `prometheus.yml`. Do **not** edit the text.
+   
    ```bash
    cat <<'EOF' > prometheus.yml
    global:
@@ -49,10 +57,13 @@ Leave the Arbot terminal running and open a **second** terminal window for the r
          - targets: ["localhost:9000"]
    EOF
    ```
+
 3. Confirm the file exists:
+   
    ```bash
    ls prometheus.yml
    ```
+   
    The terminal must print `prometheus.yml`. If it prints “No such file or directory,” repeat Step 2.
 
 ---
@@ -60,30 +71,43 @@ Leave the Arbot terminal running and open a **second** terminal window for the r
 ## Step 3 – Install Prometheus (Data Collector)
 
 1. Still in the second terminal, download Prometheus:
+   
    ```bash
    curl -LO https://github.com/prometheus/prometheus/releases/download/v2.52.0/prometheus-2.52.0.linux-amd64.tar.gz
    ```
+   
    Wait until the command finishes; you will return to a prompt that ends with `$`.
+
 2. Unpack the download:
+   
    ```bash
    tar -xf prometheus-2.52.0.linux-amd64.tar.gz
    ```
+
 3. Move into the new folder:
+   
    ```bash
    cd prometheus-2.52.0.linux-amd64
    ```
+
 4. Copy the settings file into the Prometheus folder:
+   
    ```bash
    cp ../prometheus.yml .
    ```
+
 5. Create a place to store Prometheus data:
+   
    ```bash
    mkdir -p data
    ```
+
 6. Start Prometheus now:
+   
    ```bash
    ./prometheus --config.file="$(pwd)/prometheus.yml" --storage.tsdb.path="$(pwd)/data"
    ```
+   
    - Prometheus prints lines that include `Server is ready to receive web requests.` Leave this terminal open; Prometheus must keep running.
    - Prometheus listens on `http://localhost:9090`. Do **not** stop it.
 
@@ -94,25 +118,35 @@ You now have two terminals running: one for Arbot, one for Prometheus. Open a **
 ## Step 4 – Install Grafana (Dashboard)
 
 1. In the third terminal, go back to the Arbot folder:
+   
    ```bash
    cd /path/to/arbot
    ```
+
 2. Download Grafana:
+   
    ```bash
    curl -LO https://dl.grafana.com/oss/release/grafana-10.4.2.linux-amd64.tar.gz
    ```
+
 3. Unpack the file:
+   
    ```bash
    tar -xf grafana-10.4.2.linux-amd64.tar.gz
    ```
+
 4. Enter the Grafana folder:
+   
    ```bash
-   cd grafana-10.4.2
+   cd grafana-v10.4.2
    ```
+
 5. Start Grafana:
+   
    ```bash
    ./bin/grafana-server web
    ```
+   
    - The terminal shows log lines. Wait for `HTTP Server Listen` to appear. Leave this terminal window open; Grafana must keep running.
    - Grafana uses `http://localhost:3000` and default login `admin` / `admin`. You will change the password soon.
 
@@ -163,7 +197,8 @@ New metric backing the funnel: `tx_relay_rejected_total{chain,strategy}` counts
 private-relay rejections (a distinct loss stage). Not yet instrumented:
 realised-vs-simulated net, which needs on-chain profit extraction from the executor
 receipt — until then the funnel measures inclusion, not slippage/L1-fee truth.
-   - **Circuit Control Mode:** reminder that breaker controls are manual-only (`tripCircuit` / `resetCircuit`).
+
+- **Circuit Control Mode:** reminder that breaker controls are manual-only (`tripCircuit` / `resetCircuit`).
 
 If the panels stay empty, re-check Steps 1–5. Most issues come from Prometheus or Arbot not running.
 
