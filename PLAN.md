@@ -2948,12 +2948,63 @@ fn contradicting_feeds_are_never_resolved_by_vote() {
 
 **Dependencies:** Phases 0, 1.
 
-**Files:**
-- CREATE `crates/apex-math/{Cargo.toml,src/lib.rs,src/engine.rs}`; MOVE `cl_math.rs`, `cl_swap.rs`, `cl_ticks.rs`, `cl_parity_gate.rs`, `math.rs`, `quote_univ2.rs`, `quote_solidly.rs` into `crates/apex-math/src/`
-- MOVE `cl_sim.rs`, `quote_curve.rs`, `quote_balancer.rs`, `quote_common.rs` into `crates/apex-math/src/` and extend to the §11 six-method contract
-- CREATE `crates/apex-venues/{Cargo.toml,src/lib.rs,src/adapter.rs,src/univ3.rs,src/slipstream.rs,src/pancake.rs,src/aerodrome.rs,src/balancer.rs,src/curve.rs,src/discovery.rs,src/registry.rs,src/breaker.rs}`
-- MOVE `quote_univ3.rs`, `quote_slipstream.rs`, `quote_cl.rs`, `discovery.rs` into `crates/apex-venues/src/`
+### Scope correction, recorded 2026-09-22 — the file allocation below made a crate cycle
+
+**The allocation this phase originally specified cannot be built.** Measured
+import edges in `crates/arb-exec-legacy/src`:
+
+```
+math            -> (nothing)          cl_swap    -> cl_math cl_sim
+cl_math         -> math               cl_ticks   -> cl_math cl_sim cl_swap quote_cl
+quote_common    -> math               cl_sim     -> cl_ticks quote_cl quote_univ3 util
+quote_solidly   -> math quote_common  quote_cl   -> quote_common quote_slipstream quote_univ3 util
+quote_curve     -> quote_common       quote_univ3-> quote_cl quote_common util
+quote_balancer  -> quote_common       quote_slip.-> quote_cl quote_univ3 util
+cl_parity_gate  -> cl_sim cl_swap util  quote_univ2 -> quote_cl quote_common
+                                      discovery  -> quote_univ2 util
+```
+
+`cl_sim`, `cl_ticks` and `quote_univ2` were assigned to `apex-math`; they all
+import `quote_cl`, which was assigned to `apex-venues`; and `quote_cl` imports
+`quote_common`, which was assigned to `apex-math`. §6.1 has `apex-math` below
+`apex-venues`. That is a cycle, and cargo rejects it. This is the same failure
+that Task 0.4 caught for `apex-config`, found the same way — measure the edges
+before moving the file.
+
+**The seam is purity, not venue family.** Classified by I/O evidence
+(`abigen!` / `Provider` / `.await` / `async fn` counts per file):
+
+| Pure — no provider, no async | Has network I/O |
+|---|---|
+| `math`, `cl_math`, `quote_common`, `cl_swap`, `quote_solidly`, `cl_parity_gate` | `cl_sim`, `cl_ticks`, `quote_cl`, `quote_univ2`, `quote_univ3`, `quote_slipstream`, `quote_curve`, `quote_balancer`, `discovery` |
+
+Two artefacts, not real dependencies, are what tie the pure files to the I/O
+files. Both are fixed by moving a symbol, not by redrawing the crate boundary:
+
+1. **`ClPoolState`** is declared in `cl_sim` (which fetches it) but is the state
+   the pure swap loop operates on. It is the entire `cl_swap -> cl_sim` edge and
+   half the `cl_ticks -> cl_sim` edge. It belongs in `apex-math`.
+2. **`multicall3_aggregate3`** is declared in `quote_cl` but is generic JSON-RPC
+   batching with nothing CL about it. It is the entire `quote_univ2 -> quote_cl`
+   edge and both `cl_ticks`/`cl_sim` -> `quote_cl` edges. Six modules call it,
+   including `util` and `hot_pools`, which stay in the legacy crate. It belongs
+   in `apex-venues::transport`.
+
+**Also recorded:** `quote_curve` and `quote_balancer` are `abigen!` RPC clients,
+not local pricing engines. There is no local Curve or Balancer math in this
+repository to differential against the chain. §4.7's two `UNKNOWN` entries for
+them are therefore mis-stated — see Task 2.7.
+
+**Corrected files:**
+- CREATE `crates/apex-math/{Cargo.toml,src/lib.rs,src/engine.rs,src/cl_state.rs}`; MOVE `math.rs`, `cl_math.rs`, `quote_common.rs`, `cl_swap.rs`, `quote_solidly.rs` into `crates/apex-math/src/` unchanged
+- EXTRACT the pure half of `cl_sim.rs` (`ClPoolState`, `quote_exact_input_single_tick`, `validate_pool`, the decode helpers) into `crates/apex-math/src/cl_state.rs`; the loader half stays behind and moves to `apex-venues`
+- MOVE `cl_parity_gate.rs` into `crates/apex-math/src/` **after** its three `util::env_parse_opt` reads and `cl_sim::cl_max_ticks_crossed()` read become injected config — it is pure of I/O but not of env, and `apex-math` must not read the environment (§5.2). Lands with Task 2.6, which is where that env plane is dismantled anyway.
+- CREATE `crates/apex-venues/{Cargo.toml,src/lib.rs,src/adapter.rs,src/transport.rs,src/univ3.rs,src/slipstream.rs,src/pancake.rs,src/aerodrome.rs,src/balancer.rs,src/curve.rs,src/discovery.rs,src/registry.rs,src/breaker.rs}`
+- MOVE `cl_sim.rs` (loader half), `cl_ticks.rs`, `quote_cl.rs`, `quote_univ2.rs`, `quote_univ3.rs`, `quote_slipstream.rs`, `quote_curve.rs`, `quote_balancer.rs`, `discovery.rs` into `crates/apex-venues/src/`
 - REMOVE `src/venue_adapter.rs` (wrong trait, zero implementors)
+
+**Files:**
+- (superseded by the corrected list above)
 - CREATE `crates/apex-math/tests/differential.rs`, `crates/apex-math/fuzz/`
 - CREATE `scripts/data/verify_registry_bytecode.py`
 - REMOVE `base_venues_complete.yaml`, `generate_base_venues.py` (B-7)
