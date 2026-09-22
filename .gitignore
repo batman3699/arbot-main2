@@ -10,6 +10,20 @@ env.example
 *secret*
 *.secrets
 
+# ...but `*secret*` is a filename pattern, and three files that are SOURCE were
+# silently swallowed by it: the `Secret<T>` redaction wrapper, its tests, and
+# the secret-scanning CI gate. They were written, tested against the working
+# tree, and never committed -- `apex-config` did not compile from a clean
+# checkout of any commit in Phase 0 or 1, which nothing noticed because CI has
+# not run on this branch yet.
+#
+# Negations are per-path and deliberate. The broad deny still stands for
+# everything else.
+!crates/apex-config/src/secret.rs
+!crates/apex-config/tests/secret.rs
+!scripts/ci/secret_scan.sh
+!scripts/secret_scan.sh
+
 # Rust build artifacts
 /target/
 
