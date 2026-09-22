@@ -31,15 +31,53 @@ TOTAL: 1374 passed, 0 failed, 2 ignored, across 9 targets.
 
 ## forge test
 
-**NOT GREEN.** Two pre-existing failures, recorded as finding B-13 in PLAN.md §3.4.
-Task 0.2a fixes them and re-freezes this file; Phase 0 exits on green, not on "matches baseline".
+**NOT GREEN, AND NOT DETERMINISTIC.** This is the corrected finding; see B-13 in
+PLAN.md §3.4. The first freeze recorded "64 passed, 2 failed" as though it were a
+fixed pair. It is not — the suite is **flaky**, which is worse than red, because a
+flaky gate cannot certify anything.
+
+Measured over 8 consecutive unmodified `forge test` runs:
 
 ```text
-[FAIL: assertion failed: 0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45 != 0x0000000000000000000000000000000000003001] testEnvAddressLookupAcceptsEthereumLongPrefixAlias() (gas: 18554)
-[FAIL: MissingRequiredIntegration("BAL_VAULT|BALANCER_VAULT", 31337 [3.133e4], "OPT")] testDeployInitialisesExecutorOwnerToRouter() (gas: 7940404)
-[FAIL: MissingRequiredIntegration("BAL_VAULT|BALANCER_VAULT", 31337 [3.133e4], "OPT")] testDeployTransfersRouterOwnershipToConfiguredExecutorOwner() (gas: 7943530)
-Ran 12 test suites in 21.28ms (77.07ms CPU time): 63 tests passed, 3 failed, 0 skipped (66 total tests)
+run 1   67/0      run 5   67/0
+run 2   65/2      run 6   67/0
+run 3   67/0      run 7   67/0
+run 4   66/1      run 8   66/1
 ```
+
+The failing set varies run to run and has included at least:
+`testEnvAddressLookupAcceptsEthereumLongPrefixAlias`,
+`testDeployTransfersRouterOwnershipToConfiguredExecutorOwner`,
+`testEnvAddressLookupUsesMappedOptimismPrefix`,
+`testDefaultDoesNotRequireBalancerOrAave`.
+
+**Root cause.** The deploy tests configure themselves with `vm.setEnv`, which
+writes the *forge process* environment — global, shared, and persisting for the
+whole run. forge additionally auto-loads `.env`, which supplies `CHAIN=base`,
+`ETH_UNIV3_ROUTER` and `BASE_EXECUTOR_OWNER`; the prefixed keys correctly outrank
+the unprefixed ones the tests set. So each test's result depends on the ambient
+`.env` AND on what every other test wrote before it. `script/Deploy.s.sol`'s
+precedence logic is correct — this is a test-architecture defect.
+
+**Scope.** Entirely confined to the 15 `test/Deploy*.t.sol` tests. The other 52
+are clean: `forge test --no-match-path 'test/Deploy*'` gives 52/0.
+
+**What was tried and did NOT work** (recorded so it is not retried):
+
+| Attempt | Result |
+|---|---|
+| Synthetic probe keys `.env` cannot define | Each test passes ALONE; no improvement in-file |
+| Pinning `CHAIN` + setting both key forms | Ownership test passes ALONE; no improvement in-file |
+| `threads = 1` in foundry.toml (confirmed read by `forge config`) | Still 6/12 runs failing — the tests share one process either way |
+| One forge process per `Deploy*` file | Reduces but does not remove it; intra-file pollution remains |
+| Combined, measured per-file | 11 passed/4 failed vs 11/3 for the originals — **no measurable gain, so reverted** |
+
+There is no `unsetEnv` cheatcode in forge 1.7, so a test cannot isolate itself
+from `.env` or from its siblings. The real fix is to stop configuring the deploy
+script through the process environment — which is the same global-mutable-state
+pathology INV-11 forbids in the engine, appearing here in the test harness.
+
+**Decision required before Phase 0 can exit** — see the Phase 0 exit gate.
 
 ## Size
 
