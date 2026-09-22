@@ -2612,7 +2612,11 @@ features:
 
     #[test]
     fn validate_liquidation_safety_allows_placeholders_when_feature_disabled() {
-        let cfg = load_ops_inputs("ops/inputs.yaml").expect("parse ops inputs");
+        // workspace_path, not a bare relative path: cargo runs a test with the
+        // PACKAGE directory as cwd, which stopped being the repo root at the
+        // workspace split.
+        let cfg = load_ops_inputs(crate::util::workspace_path("ops/inputs.yaml"))
+            .expect("parse ops inputs");
         cfg.validate_liquidation_safety(false)
             .expect("disabled liquidations should not block startup");
     }

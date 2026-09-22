@@ -1532,8 +1532,11 @@ mod tests {
     /// bug was that a 584-pool file ranked a fraction of itself.
     #[test]
     fn shipped_base_univ3_inventory_ranks_in_full() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("data/base/uniswap_v3/pools.jsonl");
+        // WORKSPACE_ROOT, not CARGO_MANIFEST_DIR: `data/` sits at the repo root
+        // and is gitignored, so pointing at the crate dir would make this test
+        // silently take its `records.is_empty()` early return on every run and
+        // stop checking anything.
+        let path = crate::util::workspace_path("data/base/uniswap_v3/pools.jsonl");
         let records = crate::pool_store::load_pool_records(&path).expect("load inventory");
         if records.is_empty() {
             return; // inventory not present in this checkout

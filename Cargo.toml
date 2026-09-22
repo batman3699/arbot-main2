@@ -1,60 +1,12 @@
-[package]
-name = "arb-exec"
-version = "0.2.0"
-edition = "2021"
-default-run = "arb-exec"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
 
-[[bin]]
-name = "arb-exec"
-path = "src/main.rs"
-
-[[bin]]
-name = "cl_parity"
-path = "src/bin/cl_parity.rs"
-
-[dependencies]
-anyhow = "1"
-ethers = { version = "2.0.14", features = ["abigen", "ws", "rustls"] }
-tokio = { version = "1", features = ["full", "test-util"] }
-serde = { version = "1", features = ["derive"] }
-json5 = "0.4"
-dotenvy = "0.15"
-once_cell = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-hex = "0.4"
-hex-literal = "0.4"
-rayon = "1"
-rand = "0.8"
-arc-swap = "1"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "blocking"] }
-serde_json = "1.0"
-futures-util = { version = "0.3", default-features = false, features = ["std"] }
-prometheus = "0.13"
-sha2 = "0.10"
-semver = { version = "1.0", default-features = false, features = ["std"] }
-csv = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
-rust_decimal = { version = "1", default-features = false, features = ["maths", "std"] }
-lru = "0.12"
-serde_yaml = "0.9"
-async-trait = "0.1"
-dashmap = "6"
-# revm 20.x stack: in-process EVM fork simulation (sim_revm.rs)
-revm = { version = "20", features = ["std"] }
-rlp = "0.5"
-# Exhaustive interleaving model for the dirty-set protocol (spec 8 I1).
-# Gated behind a FEATURE, not RUSTFLAGS="--cfg loom": a global cfg activates
-# cfg(loom) paths inside concurrent-queue, which cannot build without loom as
-# its own dependency.
-loom = { version = "0.7", optional = true }
-
-[features]
-loom-model = ["dep:loom"]
-
-[dev-dependencies]
-tempfile = "3"
-httpmock = "0.7"
+# Dependency versions stay in the individual crate manifests for now rather than
+# being hoisted into [workspace.dependencies]. Hoisting earns its keep once two
+# crates share a dependency; today it would only add a second place to look while
+# changing resolution during a move whose whole requirement is zero behaviour
+# change. Hoist when the second real consumer lands.
 
 # Latency-critical: this binary races other searchers for block inclusion.
 # The deployed artifact is built with `cargo build --release`, so the release

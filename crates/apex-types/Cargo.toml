@@ -1,0 +1,5 @@
+[package]
+name = "apex-types"
+version = "0.1.0"
+edition = "2021"
+description = "APEX-MEV v4 shared vocabulary: no I/O, no async, no provider types."

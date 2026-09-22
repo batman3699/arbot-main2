@@ -5123,10 +5123,18 @@ impl Drop for RpcEnvGuard {
     /// This pins the file against the real resolver so neither shape can return.
     #[test]
     fn shipped_univ4_inventory_parses_as_poolkeys() {
-        let raw = match std::fs::read_to_string("data/base/uniswap_v4/pools.json") {
+        // workspace_path, not a bare relative path: cargo runs a test with the
+        // PACKAGE directory as cwd, which stopped being the repo root at the
+        // workspace split. That matters more here than in a test that panics --
+        // the Err arm below returns SUCCESS, so a wrong base turns this into a
+        // permanent no-op that reports green while checking nothing.
+        let path = crate::util::workspace_path("data/base/uniswap_v4/pools.json");
+        let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => raw,
             // Not every checkout carries chain data; absence is not a failure.
-            Err(_) => return,
+            // But if data/ IS present, an unreadable file is a real failure.
+            Err(_) if !crate::util::workspace_path("data").exists() => return,
+            Err(e) => panic!("data/ exists but {} is unreadable: {e}", path.display()),
         };
         if raw.trim().is_empty() {
             return;

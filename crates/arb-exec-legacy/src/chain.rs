@@ -2227,7 +2227,7 @@ mod tests {
 
     #[test]
     fn fork_dry_run_chain_id_mapping_stays_in_sync_with_chain_metadata() {
-        let script = include_str!("../scripts/fork/run_integration_dry_run.sh");
+        let script = include_str!(concat!(env!("WORKSPACE_ROOT"), "/scripts/fork/run_integration_dry_run.sh"));
         let mut script_mapping = HashMap::<String, u64>::new();
 
         for line in script.lines() {

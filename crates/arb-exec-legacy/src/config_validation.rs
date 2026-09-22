@@ -12,11 +12,14 @@ fn load(path: &Path) -> String {
     })
 }
 
-/// Resolve a repo-relative path against the crate manifest dir so these tests are
+/// Resolve a repo-relative path against the WORKSPACE ROOT so these tests are
 /// immune to the process working directory being changed by a parallel test
 /// (e.g. registry.rs's DirGuard calls set_current_dir).
+///
+/// Was `CARGO_MANIFEST_DIR`, which stopped being the repo root at the workspace
+/// split. `config/` and `ops/` live at the root, not beside this crate.
 fn manifest_path(rel: &str) -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+    crate::util::workspace_path(rel)
 }
 
 #[test]

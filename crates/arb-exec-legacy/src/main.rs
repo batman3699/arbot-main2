@@ -14809,7 +14809,7 @@ fn load_dotenv() {
     if dotenvy::dotenv().is_ok() {
         return;
     }
-    let fallback = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+    let fallback = crate::util::dotenv_fallback_path();
     if fallback.exists() {
         let _ = dotenvy::from_path(&fallback);
     }

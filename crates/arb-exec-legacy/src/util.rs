@@ -147,6 +147,39 @@ pub fn env_u256_opt(name: &str) -> Option<U256> {
 /// Boolean flag: `true` for `1`/`true`/`yes` (case-insensitive), `false` for any
 /// other set value, and `default` when unset. Same semantics as the
 /// `matches!(raw.to_ascii_lowercase().as_str(), "1"|"true"|"yes")` idiom.
+/// Absolute path of the workspace root, fixed at compile time by `build.rs`.
+///
+/// Before the workspace split this crate WAS the workspace, so
+/// `CARGO_MANIFEST_DIR` and the repo root were the same directory. They now
+/// differ by two levels. `WORKSPACE_ROOT` is resolved by walking up for the
+/// manifest declaring `[workspace]`, not by counting `../`, so moving this crate
+/// again does not silently break the callers below.
+pub fn workspace_root() -> &'static std::path::Path {
+    std::path::Path::new(env!("WORKSPACE_ROOT"))
+}
+
+/// Resolve a repo-relative path against the workspace root.
+///
+/// Immune to the process working directory, which matters here: `registry.rs`'s
+/// `DirGuard` calls `set_current_dir`, so a parallel test can move the cwd out
+/// from under an unrelated one.
+pub fn workspace_path(rel: &str) -> std::path::PathBuf {
+    workspace_root().join(rel)
+}
+
+/// Where `load_dotenv` looks when `dotenvy` finds nothing by walking up from the
+/// working directory.
+///
+/// Separated out so it is testable. This was the one path site the split broke
+/// SILENTLY: pointed at `CARGO_MANIFEST_DIR` it resolves to
+/// `crates/arb-exec-legacy/.env`, which does not exist. Launching from the repo
+/// root masks it entirely, because dotenvy searches the cwd first — so the bot
+/// would start with no configuration only when launched from somewhere else, and
+/// say nothing about it.
+pub fn dotenv_fallback_path() -> std::path::PathBuf {
+    workspace_path(".env")
+}
+
 pub fn env_flag(name: &str, default: bool) -> bool {
     std::env::var(name)
         .ok()
