@@ -5735,4 +5735,128 @@ mod tests {
         *f.pricing.lock().unwrap() = Some((None, 0.0));
         assert!(f.reprice_now(&[t0, t1], &[a, b]).is_some(), "priced once published");
     }
+
+    /// G-PRICE-2 (§1.1.1, PLAN.md Task 2.6). Not one fast-path CL edge is
+    /// exactly priced, and now it says so.
+    ///
+    /// `live_edge` builds every concentrated-liquidity edge with
+    /// `tick_ladder: None` and `state: None`, deliberately — the comment on
+    /// that construction reads *"No cached tick ladder: sizing requotes on
+    /// chain, and a stale ladder would be worse than none."* That is a
+    /// defensible design. What was not defensible is that nothing recorded it:
+    /// `cl_hop_out` logged *"multi-tick ON but this edge carries NO ladder;
+    /// forced to single-tick"* at debug level and the ranking then compared
+    /// that number against exactly-priced ones as if they were commensurable.
+    ///
+    /// This test pins both halves. It fails if a ladder ever starts arriving
+    /// without `exactness()` following it, and it fails if an edge starts
+    /// claiming exactness it cannot support.
+    #[test]
+    fn no_fast_path_cl_edge_is_silently_single_tick() {
+        use apex_types::route::Exactness;
+
+        let live = LiveState::new();
+        let (pool, t0, t1) = (addr(1), addr(80), addr(81));
+        assert!(live.anchor_cl(pool, 100, U256::from(1u64) << 96, 1_000_000_000_000, 0));
+        let meta = PoolMeta {
+            token0: t0,
+            token1: t1,
+            fee_ppm: 500,
+            kind: PoolKind::ConcentratedLiquidity,
+            verified: true,
+            confirmed_at: Some(Instant::now()),
+            // Real balances: `live_edge` takes capacity for a CL hop from the
+            // pool's actual holdings, and refuses the edge without them.
+            balances: Some((1e21, 1e21)),
+        };
+
+        let mut checked = 0;
+        for venue in [
+            FastVenue::UniV3 { fee: 500 },
+            FastVenue::RoutedCl { path_param: 100, router: addr(7) },
+        ] {
+            let edge = live_edge(
+                LiveHop { venue, pool, meta: &meta, from: t0, to: t1 },
+                &live,
+            )
+            .expect("the fixture must produce an edge");
+            assert!(edge.is_concentrated_liquidity());
+
+            // The plan's assertion: a ladder, or an honest label.
+            assert!(
+                edge.tick_ladder.is_some() || edge.exactness() == Exactness::Approximate,
+                "CL edge prices single-tick but claims to be exact: {:?}",
+                edge.venue.pool_address()
+            );
+
+            // And what is true TODAY, pinned so a change has to be deliberate.
+            assert!(edge.tick_ladder.is_none(), "the fast path attaches no ladder");
+            assert_eq!(edge.exactness(), Exactness::Approximate);
+            assert!(
+                !edge.may_authorize_live_dispatch(),
+                "an edge priced with liquidity held constant must not authorize a \
+                 live dispatch without a requote (INV-17)"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "both CL fast-path venues must be exercised");
+    }
+
+    /// The constant-product half of the same path IS exact, and must not be
+    /// swept into the same bucket.
+    ///
+    /// A blanket "the fast path is approximate" would be the easy answer and
+    /// the wrong one: the reserves ARE the whole state of a Solidly volatile
+    /// pair, and `apex-math`'s engines price them to the wei. Note the fast
+    /// path has no plain `UniV2` venue — constant product arrives as
+    /// `Solidly { stable: false }`, which is Aerodrome's volatile curve.
+    #[test]
+    fn a_fast_path_constant_product_edge_is_exactly_priced() {
+        use apex_types::route::Exactness;
+
+        let live = LiveState::new();
+        let (pool, t0, t1) = (addr(2), addr(90), addr(91));
+        // Not `seeded_v2`: it anchors reserves of 1 wei, and
+        // `edge_capacity_from_reserve` floors a third of that to zero, so
+        // `live_edge` refuses the edge for want of capacity.
+        assert!(live.anchor_v2(
+            pool,
+            99,
+            crate::quote_univ2::UniV2PairState {
+                token0: t0,
+                token1: t1,
+                reserve0: U256::from(1_000_000_000_000_000_000_000u128),
+                reserve1: U256::from(2_000_000_000_000_000_000_000u128),
+            }
+        ));
+        let meta = PoolMeta {
+            token0: t0,
+            token1: t1,
+            fee_ppm: 3_000,
+            kind: PoolKind::ConstantProduct,
+            verified: true,
+            confirmed_at: Some(Instant::now()),
+            balances: None,
+        };
+        let edge = live_edge(
+            LiveHop {
+                venue: FastVenue::Solidly {
+                    stable: false,
+                    fee_bps: 30,
+                    decimals0: 18,
+                    decimals1: 18,
+                },
+                pool,
+                meta: &meta,
+                from: t0,
+                to: t1,
+            },
+            &live,
+        )
+        .expect("the fixture must produce an edge");
+        assert!(!edge.is_concentrated_liquidity());
+        assert_eq!(edge.exactness(), Exactness::Proven);
+        assert!(edge.may_authorize_live_dispatch());
+    }
+
 }

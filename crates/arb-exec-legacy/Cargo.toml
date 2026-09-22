@@ -36,6 +36,7 @@ path = "src/bin/encode_plan_v2.rs"
 
 [dependencies]
 apex-math = { path = "../apex-math" }
+apex-types = { path = "../apex-types" }
 apex-venues = { path = "../apex-venues" }
 anyhow = "1"
 ethers = { version = "2.0.14", features = ["abigen", "ws", "rustls"] }

@@ -3323,10 +3323,75 @@ fn exactly_priced_edges_carry_no_haircut() {
 }
 ```
 
-- [ ] **Step 2: Run and observe the failures** — today every fast-path CL edge has `tick_ladder: None` and a 50 bps haircut.
-- [ ] **Step 3: Implement** ladder attachment on the fast path, respecting `base_fast.rs:1570`'s reason for its absence: a ladder must be **fresh or absent, never stale**, so it is bound to the edge's `StateVersion` and invalidated with it.
-- [ ] **Step 4: Run and observe the passes**, then re-run the event-triggered census under exact pricing and diff it against the recorded run.
-- [ ] **Step 5: Record** the result in `docs/apex/reports/frontier-exact-<date>.md` and **revise or confirm §36.2**. Commit (named paths only).
+- [x] **Step 2: Run and observe the failures** — today every fast-path CL edge has `tick_ladder: None` and a 50 bps haircut.
+- [x] **Step 3 (partial): make the approximation visible.** See the correction below — ladder attachment is NOT the right fix, and criterion (b) was mis-stated.
+- [ ] **Step 4: Re-run the event-triggered census under exact pricing** and diff it against the recorded run. **Blocked: no egress to Base from the development environment** (HTTP 403 on both the public and keyed endpoints).
+- [ ] **Step 5: Record** the result in `docs/apex/reports/frontier-exact-<date>.md` and **revise or confirm §36.2**.
+
+### Correction, recorded 2026-09-23 — (b) was wrong, and (a)'s fix is the second branch
+
+**Criterion (b) as written — *"`cl_tick_buffer_bps` is 0 on exactly-priced
+edges"* — conflates two different things, and the first is already true.**
+`plan::hop_expected_out` already branches on whether the quote actually crossed
+ticks: `used_multi_tick == true` takes `cl_exec_buffer_bps` (75) and
+`false` takes `cl_tick_buffer_bps` (50). A test already guards against those
+arms being inverted. So the tick buffer is *not* applied to a modelled
+crossing, and has not been.
+
+What an exactly-priced edge *does* still carry is the 75 bps **execution**
+buffer, and that is not a modelling fudge: it is a measured model-versus-router
+gap. Slipstream pool `0xdbc6998296caa1652a810dc8d3baf4a8294330f1`, 4340.955932
+USDC → WETH through the deployed router with the planner's own path bytes — the
+model said 1.891636 WETH, the router paid 1.885833, a ~31 bps overstatement,
+observed on 100% of candidates across 57k+ records and invariant to trade size,
+tick buffer and pricing model. Driving that to zero means closing the gap to
+the router, not deleting the buffer. Criterion (b) is therefore restated:
+**the tick buffer must not be applied to a modelled crossing** (already true,
+now cross-checked), and the execution buffer stays until the router gap is
+measured to zero.
+
+**Criterion (a)'s fix is the second branch, not the first.** The plan offered
+"every fast-path CL edge carries a tick ladder, **or** the edge is explicitly
+marked `Exactness::Approximate`". Attaching ladders on the fast path is the
+wrong move, and `base_fast.rs:1570` says why: *"No cached tick ladder: sizing
+requotes on chain, and a stale ladder would be worse than none."* That design —
+rank cheaply, requote exactly — is sound. What was unsound is that nothing
+recorded which number was which: `cl_hop_out` logged *"multi-tick ON but this
+edge carries NO ladder; forced to single-tick"* at **debug** level, and the
+ranking then compared that number against exactly-priced ones as if they were
+commensurable.
+
+Delivered instead:
+
+* `Edge::exactness()` — derived from what was actually modelled, not from the
+  venue name. A CL edge is `Proven` only with **both** a ladder to cross
+  against and the pool state to cross from; three of those four combinations
+  are `Approximate`. Constant product and Solidly are `Proven` (the reserves
+  are the whole state). Curve, Balancer and V4 are `Approximate` and cannot
+  become otherwise — there is no local implementation of either curve, and
+  INV-16 says a router quote is not authoritative.
+* `Edge::may_authorize_live_dispatch()` — INV-17's predicate, per hop.
+* A **cross-check in the pricing path**, so the method is load-bearing rather
+  than a fact nobody reads. `used_multi_tick` ("the quote crossed ticks") and
+  `edge.exactness()` ("the edge carries what crossing needs") are derived
+  independently and must agree. When a multi-tick quote appears on an edge that
+  is not exactly priced, the conservative arm wins and the larger single-tick
+  buffer is charged; the reverse disagreement warns, because an edge claiming
+  exactness that fell through to single-tick has a claim that does not hold at
+  that size.
+* Tests pinning **both** halves: that not one fast-path CL edge is exactly
+  priced today, and that the constant-product half of the same path *is* — a
+  blanket "the fast path is approximate" would have been the easy answer and
+  the wrong one.
+
+**Still open for G-PRICE-2:** step 4's census re-run needs egress to Base. And
+the candidate log does not yet carry exactness, so the *proportion* of
+candidates priced approximately is not measurable from the logs. That belongs
+with Phase 8's observability work rather than here: `log_candidate_stage`
+already takes sixteen positional arguments with two adjacent booleans
+(`bridge`, `liquidation`) and is called from 35 sites, so adding a
+seventeenth is the wrong move — it wants a parameters struct, and §26/§27
+restructure that record anyway.
 
 ### Task 2.7 — Resolve the `UNKNOWN` register entries owned by this phase
 

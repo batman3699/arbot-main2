@@ -246,6 +246,24 @@ fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> Option<
                     // modelled — measured at ~31 bps — so apply the smaller
                     // execution buffer. Without it `min_out` lands above what
                     // the router pays and every hop reverts.
+                    //
+                    // Cross-check (G-PRICE-2). `used_multi_tick` says the
+                    // quote actually crossed ticks; `edge.exactness()` says the
+                    // edge carries what crossing needs. The two are derived
+                    // independently and must agree. If they ever do not, the
+                    // conservative reading wins -- charge the larger,
+                    // single-tick buffer -- because the failure mode of
+                    // believing a quote is exact when it is not is a phantom
+                    // candidate, and this repository has shipped that one.
+                    if !edge.may_authorize_live_dispatch() {
+                        tracing::warn!(
+                            target: "minout",
+                            pool = ?edge.venue.pool_address(),
+                            "multi-tick quote on an edge that is not exactly priced; \
+                             charging the single-tick buffer"
+                        );
+                        return Some(crate::util::apply_slippage(out, cl_tick_buffer_bps()));
+                    }
                     let discounted = crate::util::apply_slippage(out, cl_exec_buffer_bps());
                     tracing::debug!(
                         target: "minout",
@@ -261,6 +279,20 @@ fn hop_expected_out(edge: &Edge, from: Address, current_amount: U256) -> Option<
                 // estimate is systematically optimistic and the buffer still
                 // covers the unmodelled crossing.
                 Some((out, false)) => {
+                    // The other direction of the same cross-check: an edge that
+                    // claims exactness must not be priced single-tick. That
+                    // would mean a ladder and state were present and the swap
+                    // still fell through -- ladder exhaustion inside real
+                    // depth, per `cl_hop_out` -- so the quote is NOT exact and
+                    // the edge's claim is stale for this size.
+                    if edge.may_authorize_live_dispatch() {
+                        tracing::warn!(
+                            target: "minout",
+                            pool = ?edge.venue.pool_address(),
+                            "edge claims exact pricing but this size fell through to \
+                             single-tick; the claim does not hold at this size"
+                        );
+                    }
                     let discounted = crate::util::apply_slippage(out, cl_tick_buffer_bps());
                     tracing::debug!(
                         target: "minout",

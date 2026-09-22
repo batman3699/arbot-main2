@@ -136,6 +136,73 @@ pub struct Edge {
     pub tick_ladder: Option<std::sync::Arc<crate::cl_swap::TickLadder>>,
 }
 
+impl Edge {
+    /// True for the venues priced by the concentrated-liquidity swap loop.
+    // `main.rs` compiles its own copy of this module, and this predicate is
+    // read by tests and by the coming exactness surface rather than by the
+    // binary's own paths, so it reads as dead there. Same note as
+    // `cl_swap::TickLadder`.
+    #[allow(dead_code)]
+    pub fn is_concentrated_liquidity(&self) -> bool {
+        matches!(
+            self.venue,
+            VenueEdge::UniV3 { .. } | VenueEdge::Slipstream { .. }
+        )
+    }
+
+    /// Whether this edge's quote came from a model proven exact against the
+    /// chain, or from one that approximates (§11, INV-17).
+    ///
+    /// # Why a CL edge with no ladder is NOT exact
+    ///
+    /// `quote_exact_input_single_tick` holds liquidity constant and does not
+    /// cross ticks — it prices the pool as if the curve it is tangent to at the
+    /// current price ran to infinity. For any swap large enough to touch a tick
+    /// boundary that is systematically OPTIMISTIC, and `plan::cl_hop_out` calls
+    /// falling through to it "the bug that made every candidate a phantom".
+    ///
+    /// The fast path builds **every** CL edge with `tick_ladder: None` and
+    /// `state: None`, deliberately: `base_fast.rs` records *"No cached tick
+    /// ladder: sizing requotes on chain, and a stale ladder would be worse than
+    /// none."* That is a defensible design — rank cheaply, requote exactly —
+    /// but it means the ranking number is not commensurable with an exactly
+    /// priced one, and nothing said so. §1.1.1 / G-PRICE-2.
+    ///
+    /// `Approximate` may rank and propose. It may not authorize a live
+    /// dispatch without a requote.
+    pub fn exactness(&self) -> apex_types::route::Exactness {
+        use apex_types::route::Exactness::{Approximate, Proven};
+        match &self.venue {
+            // Exact only when the crossing is actually modelled: a ladder to
+            // cross against, and the pool state to cross from.
+            VenueEdge::UniV3 { state, .. } | VenueEdge::Slipstream { state, .. } => {
+                if self.tick_ladder.is_some() && state.is_some() {
+                    Proven
+                } else {
+                    Approximate
+                }
+            }
+            // Constant product and the Solidly curves are exact in
+            // `apex-math`, and the reserves carried on the edge ARE the state
+            // those engines need.
+            VenueEdge::UniV2 { .. } | VenueEdge::SolidlyV2 { .. } => Proven,
+            // No local implementation exists for either curve: `quote_curve`
+            // and `quote_balancer` are abigen! clients (Phase 2 scope
+            // correction). A router quote is not authoritative (INV-16).
+            VenueEdge::Curve { .. } | VenueEdge::Balancer { .. } => Approximate,
+            // A 73-LOC fixed-price stub. Phase 11 replaces it.
+            VenueEdge::Univ4 { .. } => Approximate,
+            // Not priced by an exact engine at all.
+            VenueEdge::Bridge { .. } | VenueEdge::Liquidation { .. } => Approximate,
+        }
+    }
+
+    /// INV-17's predicate, per hop.
+    pub fn may_authorize_live_dispatch(&self) -> bool {
+        self.exactness().may_authorize_live_dispatch()
+    }
+}
+
 /// `a * b / d`, evaluated in 512 bits so the intermediate product cannot wrap.
 /// Saturates instead of panicking; a zero divisor yields zero.
 /// Per-hop capacity projected to start-token units with no intermediate flooring.
@@ -4560,4 +4627,149 @@ mod tests {
             .expect("edge index must resolve");
         assert_eq!(edge.weight, -5);
     }
+
+    /// The exactness mapping, venue by venue (§11, INV-17, G-PRICE-2).
+    ///
+    /// Written as one table rather than seven tests because the thing that
+    /// matters is the SHAPE: every venue has to appear, and a new variant added
+    /// to `VenueEdge` without a decision here is a venue whose quotes nobody
+    /// classified.
+    #[test]
+    fn every_venue_declares_whether_its_pricing_is_exact() {
+        use apex_types::route::Exactness::{Approximate, Proven};
+
+        let ladder = std::sync::Arc::new(crate::cl_swap::TickLadder::new(
+            vec![(-60, 100), (60, -100)],
+            -60,
+            60,
+        ));
+        let cl_state = crate::cl_sim::ClPoolState {
+            sqrt_price_x96: U256::from(1u128) << 96,
+            liquidity: 1_000_000,
+            tick: 0,
+            tick_spacing: 60,
+            fee_ppm: 500,
+            balance0: None,
+            balance1: None,
+        };
+
+        let base = two_hop_edge(1, 2, 1000, 1000, 1);
+        let cl = |state: Option<crate::cl_sim::ClPoolState>,
+                  lad: Option<std::sync::Arc<crate::cl_swap::TickLadder>>| {
+            let mut e = base.clone();
+            e.venue = VenueEdge::UniV3 {
+                path: Vec::new(),
+                pool: addr(1),
+                fee: 500,
+                state,
+            };
+            e.tick_ladder = lad;
+            e
+        };
+
+        // Concentrated liquidity: exact ONLY when the crossing is modelled,
+        // which needs both the ladder to cross against and the state to cross
+        // from. Three of the four combinations are approximate.
+        assert_eq!(cl(Some(cl_state.clone()), Some(ladder.clone())).exactness(), Proven);
+        assert_eq!(cl(Some(cl_state.clone()), None).exactness(), Approximate);
+        assert_eq!(cl(None, Some(ladder.clone())).exactness(), Approximate);
+        assert_eq!(cl(None, None).exactness(), Approximate);
+
+        let with = |venue: VenueEdge| {
+            let mut e = base.clone();
+            e.venue = venue;
+            e
+        };
+
+        // Constant product and Solidly: the reserves ARE the state, and
+        // apex-math prices both to the wei.
+        assert_eq!(
+            with(VenueEdge::UniV2 {
+                pair: addr(2),
+                token_out: addr(3),
+                token0: addr(2),
+                token1: addr(3),
+                reserve_in: U256::from(1_000u64),
+                reserve_out: U256::from(1_000u64),
+                fee_bps: 30,
+            })
+            .exactness(),
+            Proven
+        );
+        assert_eq!(
+            with(VenueEdge::SolidlyV2 {
+                pair: addr(4),
+                token_out: addr(5),
+                token0: addr(4),
+                token1: addr(5),
+                stable: false,
+                reserve_in: U256::from(1_000u64),
+                reserve_out: U256::from(1_000u64),
+                fee_bps: 5,
+                decimals0: 18,
+                decimals1: 18,
+            })
+            .exactness(),
+            Proven
+        );
+
+        // No local implementation of either curve exists: `quote_curve` and
+        // `quote_balancer` are abigen! clients. A router quote is not
+        // authoritative (INV-16), so neither can ever read as exact.
+        assert_eq!(
+            with(VenueEdge::Curve {
+                pool: addr(6),
+                selector: [0; 4],
+                i: 0,
+                j: 1
+            })
+            .exactness(),
+            Approximate
+        );
+        assert_eq!(
+            with(VenueEdge::Balancer {
+                pool_id: [0u8; 32],
+                token_in: addr(7),
+                token_out: addr(8),
+            })
+            .exactness(),
+            Approximate
+        );
+
+        // A fixed-price stub. Phase 11.
+        assert_eq!(
+            with(VenueEdge::Univ4 {
+                pool_manager: addr(9),
+                token0: addr(9),
+                token1: addr(10),
+                fee: 500,
+                tick_spacing: 60,
+                hooks: Address::zero(),
+                sqrt_price_x96: U256::from(1u128) << 96,
+            })
+            .exactness(),
+            Approximate
+        );
+    }
+
+    /// `may_authorize_live_dispatch` is the predicate, and it must track
+    /// `exactness` rather than being a second opinion about it.
+    #[test]
+    fn only_exactly_priced_edges_may_authorize_a_live_dispatch() {
+        use apex_types::route::Exactness::Proven;
+        let mut e = two_hop_edge(1, 2, 1000, 1000, 1);
+        e.venue = VenueEdge::Curve {
+            pool: addr(1),
+            selector: [0; 4],
+            i: 0,
+            j: 1,
+        };
+        assert!(!e.may_authorize_live_dispatch());
+
+        let v2 = two_hop_edge(1, 2, 1000, 1000, 1);
+        // `two_hop_edge` builds a UniV3 edge with no state and no ladder.
+        assert!(!v2.may_authorize_live_dispatch());
+        assert_ne!(v2.exactness(), Proven);
+    }
+
 }
