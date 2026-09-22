@@ -18,6 +18,7 @@
 //! the five CL switches still in `arb_exec::cl_sim`.
 
 pub mod adapter;
+pub mod admission;
 pub mod breaker;
 pub mod cl_load;
 pub mod cl_ticks;

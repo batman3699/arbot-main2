@@ -10,6 +10,10 @@ description = "Venue adapters: the RPC clients, loaders and quoters that fetch w
 # and it is the reason ClPoolState and the CL swap loop live over there.
 apex-math = { path = "../apex-math" }
 apex-types = { path = "../apex-types" }
+# Admission speaks apex-types identity (PoolId/TokenId/VenueId), which is
+# alloy. The pricing path still speaks ethers. C-10 closes that in Phase 17.
+alloy-primitives = { version = "0.8", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
 # Full ethers here, unlike apex-math: this crate's whole job is talking to a
 # node.
 ethers = { version = "2.0.14", features = ["abigen", "ws", "rustls"] }
@@ -34,4 +38,4 @@ tracing = "0.1"
 # and ids with alloy (what apex-types speaks). The conversion boundary is the
 # subject of C-10 and lands in Phase 17.
 ethers-core = "2.0.14"
-alloy-primitives = "0.8"
+serde_json = "1"

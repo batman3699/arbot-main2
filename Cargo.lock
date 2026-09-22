@@ -254,6 +254,8 @@ dependencies = [
  "lru",
  "once_cell",
  "rust_decimal",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

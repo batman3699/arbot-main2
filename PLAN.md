@@ -3240,8 +3240,55 @@ fn an_address_with_no_bytecode_is_never_admitted() {
 
 - [ ] **Step 2: Run and observe the failures.**
 - [ ] **Step 3: Implement** `PoolAdmission`, `VenueRegistry::admit`, and `scripts/data/verify_registry_bytecode.py` which checks `extcodehash` for every address in `config/registry.json` and every pool in `data/**/pools.jsonl`. Delete `base_venues_complete.yaml` and `generate_base_venues.py`.
-- [ ] **Step 4: Run and observe the passes**, and run the verification script over the whole registry — recording any fabricated address it finds in `docs/apex/reports/registry-verification-<date>.md`.
-- [ ] **Step 5: Commit.**
+- [x] **Step 4: Run and observe the passes**, and run the verification script over the whole registry — recording any fabricated address it finds in `docs/apex/reports/registry-verification-<date>.md`.
+- [x] **Step 5: Commit.**
+
+**Delivered 2026-09-23.** `apex-venues::admission` with 10 tests, and
+`scripts/data/verify_registry_bytecode.py` with an offline self-test that
+exercises the real RPC path against a localhost stub.
+
+**The admissible universe is 232 pools, not 558,095.** The inventory holds
+558,095 pool records; **232** carry `hub_usd_liquidity ≥ $100k`, the measured
+floor. Every one of the other 557,863 would be refused by `VenueRegistry::admit`
+on depth alone. This sharpens §36.2 and [[inventory-is-the-constraint]]: the
+thing being searched is three orders of magnitude smaller than the thing being
+stored, and the verification script scopes to the admissible band for exactly
+that reason — verifying a pool that cannot be admitted proves nothing about
+what the engine would trade.
+
+**G-VENUE-1 is NOT closed. Base and Ethereum could not be reached.** Both the
+public and the keyed Base endpoints return HTTP 403 from this environment, and
+the Ethereum endpoint refuses the connection. Optimism answered and **11 of 11
+addresses hold code**. The report records 402 addresses as *unread*, and unread
+exits non-zero — "we could not check" is not "it is fine". The gate needs one
+run from a host with egress to Base.
+
+Two false-reassurance bugs in the report generator, both caught by reading the
+output rather than the code:
+
+* It printed *"every address on this chain holds code"* beside the unread
+  count, for a chain where nothing had been read.
+* A chain with **no RPC configured at all** returned `(no missing, 0 unread)`
+  and so rendered as clean. "No endpoint configured" is a reason the check did
+  not happen, not a result.
+
+Both are the same shape as the defect the script exists to find, which is worth
+noting: a verification report that reassures about work it did not do is more
+dangerous than no report.
+
+**Also measured:** `mainnet.optimism.io` answers a single `eth_blockNumber` and
+then refuses an eleven-request JSON-RPC batch with HTTP 413. Batching is an
+optimisation; the script now falls back to single calls, because being unable
+to batch must not be indistinguishable from being unable to verify.
+
+**On deleting the fabricated files.** `base_venues_complete.yaml` and
+`generate_base_venues.py` are **untracked**, so they cannot arrive through a
+clone and deleting them is unrecoverable. Nothing in the tracked tree reads
+either one — verified — and `scripts/ci/no_fabricated_venue_sources.sh` now
+fails the build if anything ever does, scanning tracked files with docstring
+and doc-comment awareness so the modules that exist *because* of this hazard
+can still name it. The files remain on disk for their owner to remove; they are
+inert.
 
 ### Task 2.5 — Finite-size candidate generation (Engine C, §12.3)
 
