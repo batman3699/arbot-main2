@@ -2796,8 +2796,12 @@ A gate that is red on arrival gets ignored, so each is listed here rather than w
 
 **Dependencies:** Phase 0.
 
+> **Scope refinement, recorded 2026-09-22.** §6.1's dependency graph puts `apex-math` *before* `apex-state`, but this phase order puts state first. The conflict is real: `live_state` imports `quote_univ2`, and `reconcile`/`ingestion` follow it. Measured dependencies for the whole cluster — `continuity`, `state_gate`, `log_decode` and `pool_store` import nothing; `live_state`, `reconcile`, `validation_select` and `ingestion` import only each other plus `quote_univ*`.
+>
+> So Phase 1 delivers the **new state primitives**, which are pure and need no pricing: `Versioned<T>`, the extended `Ordinal`, `FeedIntegrity`/`FeedArbiter`, and the speculative branch tree. The **module moves** (`live_state`, `ingestion`, `reconcile`, `validation_select`) and the red/blue differential that depends on them move to Phase 2, landing with `apex-math`. Tasks 1.5 (token classifier, needs on-chain probing) and 1.6 (differential) go with them. This respects the dependency graph rather than forcing a premature `apex-math` stub.
+
 **Files:**
-- CREATE `crates/apex-state/{Cargo.toml,src/lib.rs,src/version.rs,src/branch.rs,src/fingerprint.rs,src/patch.rs,src/dep_index.rs,src/feed/{mod.rs,integrity.rs,arbiter.rs},src/versioned.rs,src/differential.rs}`
+- CREATE `crates/apex-state/{Cargo.toml,src/lib.rs,src/versioned.rs,src/branch.rs,src/ordinal.rs,src/feed/{mod.rs,integrity.rs,arbiter.rs}}`
 - MOVE `src/live_state.rs` → `crates/apex-state/src/live.rs`; `src/continuity.rs` → `src/continuity.rs`; `src/state_gate.rs`, `src/state_validation.rs`, `src/reconcile.rs`, `src/validation_select.rs`, `src/log_decode.rs` → `crates/apex-state/src/`
 - MOVE `src/ingestion.rs` → `crates/apex-state/src/feed/ingestion.rs`; `src/pool_store.rs` → `src/pools.rs`; `src/liquidity_cache.rs` → `src/depth.rs`
 - CREATE `crates/apex-state/src/tokens/{mod.rs,classifier.rs,fingerprint.rs}` (REBUILD of `token_refresh.rs`)

@@ -1,0 +1,15 @@
+[package]
+name = "apex-state"
+version = "0.1.0"
+edition = "2021"
+description = "Canonical and speculative state: versions, branches, feed integrity."
+
+[dependencies]
+apex-types = { path = "../apex-types" }
+# Already a workspace dependency (arb-exec uses it). The point of Versioned<T>
+# is a lock-free read on the fast path; a Mutex there is the thing being removed.
+arc-swap = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

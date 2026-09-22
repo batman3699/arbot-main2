@@ -48,7 +48,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p apex-types -p apex-config --all-targets -- -D warnings
+      - run: cargo clippy -p apex-types -p apex-config -p apex-state --all-targets -- -D warnings
 
   solidity:
     name: forge
@@ -73,6 +73,8 @@ jobs:
       # still exists (B-1), so the gate would be red on arrival and get switched
       # off. It lands with its fix in Phase 5 Task 5.1, which writes the test
       # that proves the hole before closing it.
+      - name: no shared mutable published state (INV-11)
+        run: ./scripts/ci/no_shared_mutable_state.sh
       - name: no GasLimit/GasUsed conversion (INV-19)
         run: ./scripts/ci/no_gas_conversion.sh
       - name: DiscreteSize only from the refinement path (INV-18)
