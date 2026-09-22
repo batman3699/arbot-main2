@@ -210,6 +210,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "apex-math"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ethers-core",
+ "proptest",
+]
+
+[[package]]
 name = "apex-state"
 version = "0.1.0"
 dependencies = [
@@ -233,6 +242,7 @@ name = "arb-exec"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "apex-math",
  "arc-swap",
  "async-trait",
  "chrono",

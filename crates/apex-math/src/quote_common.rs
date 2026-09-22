@@ -1,7 +1,7 @@
 //! Helpers shared across the per-venue quote modules.
 
 use crate::math::mul_div;
-use ethers::types::U256;
+use ethers_core::types::U256;
 
 /// Apply a bps swap fee to an input amount: `amount_in * (10_000 - fee_bps) / 10_000`.
 ///
@@ -9,7 +9,7 @@ use ethers::types::U256;
 /// post-fee amount may be zero (dust input); callers treat that as "no quote".
 /// Shared by the constant-product venues (UniV2 and the volatile Solidly curve)
 /// so the fee arithmetic cannot drift between them.
-pub(crate) fn apply_swap_fee(amount_in: U256, fee_bps: u32) -> anyhow::Result<U256> {
+pub fn apply_swap_fee(amount_in: U256, fee_bps: u32) -> anyhow::Result<U256> {
     let fee_den = U256::from(10_000u64);
     let fee_num = U256::from(10_000u64.saturating_sub(fee_bps as u64));
     if fee_num.is_zero() {
@@ -22,7 +22,7 @@ pub(crate) fn apply_swap_fee(amount_in: U256, fee_bps: u32) -> anyhow::Result<U2
 /// `(amount_in_with_fee * reserve_out) / (reserve_in + amount_in_with_fee)`.
 /// Returns `None` when the result degenerates to zero (dust input, empty
 /// denominator, or zero output).
-pub(crate) fn constant_product_out(
+pub fn constant_product_out(
     amount_in_with_fee: U256,
     reserve_in: U256,
     reserve_out: U256,
@@ -46,7 +46,7 @@ pub(crate) fn constant_product_out(
 /// Constant-product price-impact proxy in bps:
 /// `amount_in / (reserve_in + amount_in) * 10_000`, saturating to `u32::MAX`.
 /// Uses the pre-fee `amount_in`, matching the on-chain-agnostic slippage proxy.
-pub(crate) fn constant_product_price_impact_bps(amount_in: U256, reserve_in: U256) -> u32 {
+pub fn constant_product_price_impact_bps(amount_in: U256, reserve_in: U256) -> u32 {
     let denom = reserve_in.saturating_add(amount_in);
     let bps = if denom.is_zero() {
         U256::zero()

@@ -38,6 +38,12 @@ jobs:
         # (lib.rs declares 42 modules, main.rs 58) and declares five binaries.
         # `--lib` alone misses the sizing and hot_pools tests entirely.
         run: cargo test --workspace --all-targets --locked
+      - name: exhaustive maths (release)
+        # apex-math's tick tables are checked at EVERY tick, not at a sample:
+        # 1.8M iterations, 2.5 s in release and 73 s in debug. Ignored by
+        # default so the everyday `cargo test` stays fast, run here so it is
+        # still enforced on every push.
+        run: cargo test --release -p apex-math --locked -- --ignored
 
   rust-lint:
     name: clippy (migrated crates)
@@ -48,7 +54,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p apex-types -p apex-config -p apex-state --all-targets -- -D warnings
+      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math --all-targets -- -D warnings
 
   solidity:
     name: forge

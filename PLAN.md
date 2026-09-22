@@ -3042,6 +3042,58 @@ fn next_state_exact_round_trips_through_quote_exact() {
 }
 ```
 
+**Correction, recorded 2026-09-22 — the equality above is wrong for V2, and the
+implemented test asserts `<=` with the gap measured.** Splitting a swap can
+never produce *more* than doing it at once; whether it produces *less* depends
+on where the venue keeps its fee, and the two families differ:
+
+| amount in | CL ticks crossed | CL split gap | CPMM split gap |
+|---|---|---|---|
+| 1e12 | 0 | 0 wei | 2 wei |
+| 1e15 | 0 | 1 wei | 1,495,497 wei |
+| 1e18 | 0 | 0 wei | 1,491,776,539,545 wei |
+| 1e19 | 1 | 1 wei | 145,882,581,575,060 wei |
+| 2e19 | 1 | 0 wei | 569,345,526,271,364 wei |
+
+Uniswap V3 holds fees **outside** the swappable curve — `computeSwapStep`
+returns `feeAmount` separately, the price moves only by the post-fee input, and
+the fee accrues to `feeGrowthGlobal`. So V3 composition telescopes exactly and
+the only gap is per-step rounding: 0–1 wei, including across a tick crossing.
+Uniswap V2 adds the fee straight to reserves, so the second half of a split
+trades against a pool the fee has already moved and pays fee-on-fee — a real,
+quadratic, second-order loss (0.14 bps at 2e19 against 1000/2000 reserves).
+
+The assertion that carries the weight is the **direction**, not the magnitude.
+`q1 + q2 > qc` would mean the model believes chopping an order against a single
+pool creates value out of nothing, and since ranking maximises gross the
+searcher would chase it on every block — the same shape as the `liquidity()`
+overstatement that made one Base pool the most profitable edge on the chain.
+
+**Two gaps this task surfaced, both recorded rather than papered over:**
+
+1. **`cl_math` had no `get_tick_at_sqrt_ratio`.** `next_state_exact` needs it:
+   a swap that stops mid-range leaves the price between ticks, and the state it
+   produces must carry the tick that price sits in or the next swap navigates
+   the ladder from the wrong side of a boundary. Implemented as a binary search
+   over `get_sqrt_ratio_at_tick` rather than a port of v3-core's `log2`
+   assembly — searching the function being inverted cannot disagree with it,
+   whereas the assembly agrees only because its magic constants were chosen to,
+   and a transcription slip there is wrong on a narrow band of prices and right
+   everywhere else. The exhaustive monotonicity test that makes the round trip
+   a proof runs at every one of the 1,774,545 ticks, in release, in CI.
+2. **The multi-tick loop leaves the post-swap state undetermined at a tick
+   boundary.** When a swap comes to rest exactly on an initialized tick,
+   v3-core crosses eagerly and this port deliberately does not (crossing there
+   can mislabel a complete quote as exhausted). The quote is unaffected; the
+   *liquidity* on the far side is not determined. `next_state_exact` returns
+   `NotRepresentable` rather than publishing pre-crossing liquidity.
+
+**Also corrected:** ladder exhaustion is `NotRepresentable`, **not** a
+`RevertCondition`. The pool would very likely fill the trade; we cannot see far
+enough to say by how much. Recording it as a revert would tell the simulator
+the chain refused a trade the chain never saw, and every revert statistic built
+on that is then wrong.
+
 - [ ] **Step 2: Run and observe the failures** — the trait does not exist; the round-trip will additionally expose any rounding drift in `next_state_exact`.
 - [ ] **Step 3: Implement** the trait and wire each existing quoter to it. `cl_math`/`cl_swap`/`cl_ticks` are moved unchanged; only the trait impl is new.
 - [ ] **Step 4: Run and observe the passes.**

@@ -1,4 +1,4 @@
-use ethers::types::{U256, U512};
+use ethers_core::types::{U256, U512};
 use std::convert::TryFrom;
 
 #[inline]

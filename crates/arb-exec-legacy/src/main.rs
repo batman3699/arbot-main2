@@ -5,10 +5,8 @@ mod capital;
 mod chain;
 mod continuity;
 mod convex;
-mod cl_math;
 mod cl_sim;
 mod cl_parity_gate;
-mod cl_swap;
 mod cl_ticks;
 #[cfg(test)]
 mod config_validation;
@@ -27,16 +25,22 @@ mod liquidations;
 mod liquidity_cache;
 mod live_state;
 mod log_decode;
-mod math;
 mod metrics;
 mod ops_inputs;
 mod plan;
 mod pool_store;
 mod quote_balancer;
 mod quote_cl;
-mod quote_common;
 mod quote_curve;
-mod quote_solidly;
+// Moved to `apex-math` in Phase 2 (PLAN.md §33 Phase 2, scope correction).
+// Re-exported at the crate root so every `crate::math::...` / `crate::cl_swap::...`
+// path in this crate keeps resolving: the move is a relocation, not a rename,
+// and rewriting ~200 call sites would bury it in noise.
+pub use apex_math::cl_math;
+pub use apex_math::cl_swap;
+pub use apex_math::math;
+pub use apex_math::quote_common;
+pub use apex_math::quote_solidly;
 mod quote_univ2;
 mod quote_univ3;
 mod quote_slipstream;

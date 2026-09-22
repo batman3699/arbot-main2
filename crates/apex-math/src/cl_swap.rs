@@ -6,8 +6,8 @@
 use crate::cl_math::{
     compute_swap_step, get_sqrt_ratio_at_tick, max_sqrt_ratio, min_sqrt_ratio, MAX_TICK, MIN_TICK,
 };
-use crate::cl_sim::ClPoolState;
-use ethers::types::U256;
+use crate::cl_state::ClPoolState;
+use ethers_core::types::U256;
 
 /// Outcome of asking a ladder for the next initialized tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +46,15 @@ impl TickLadder {
             lower_bound: lower_bound.max(MIN_TICK),
             upper_bound: upper_bound.min(MAX_TICK),
         }
+    }
+
+    /// The initialized ticks this ladder proves, ascending.
+    ///
+    /// Exposed for `ExactPricingEngine::state_dependencies`: a quote that
+    /// crossed these ticks is invalidated by a mint or burn on any of them,
+    /// and a caller cannot know that without being told which ones they were.
+    pub fn ticks(&self) -> &[(i32, i128)] {
+        &self.ticks
     }
 
     pub fn is_empty(&self) -> bool {
@@ -113,6 +122,22 @@ pub struct MultiTickQuote {
     /// complete answer — callers must fall back rather than use it as a real
     /// output.
     pub exhausted: bool,
+    /// Pool liquidity when the loop stopped, after every tick it crossed.
+    ///
+    /// Added in Phase 2 for `ExactPricingEngine::next_state_exact`. The loop
+    /// has always tracked this; it simply never reported it, because a quote
+    /// only needs the output. Composing two swaps through one pool needs the
+    /// state between them.
+    pub liquidity_after: u128,
+    /// The swap came to rest exactly ON an initialized tick without crossing
+    /// it.
+    ///
+    /// The quote is complete and correct. The post-swap STATE is not
+    /// determined: v3-core crosses eagerly in this situation and this loop
+    /// deliberately does not (see the `remaining.is_zero()` break below), so
+    /// `liquidity_after` is the pre-crossing value while v3 would report the
+    /// post-crossing one. `next_state_exact` refuses rather than guess.
+    pub ended_on_tick_boundary: bool,
 }
 
 /// Published UniV3 price bounds. A swap that ends here has consumed every
@@ -191,6 +216,7 @@ pub fn quote_exact_input_multi_tick(
     let mut tick = state.tick;
     let mut ticks_crossed: u32 = 0;
     let mut exhausted = false;
+    let mut ended_on_tick_boundary = false;
 
     while !remaining.is_zero() {
         if zero_for_one && sqrt_price <= price_limit {
@@ -236,6 +262,13 @@ pub fn quote_exact_input_multi_tick(
             // crossing now would only matter if there were more to swap, and
             // running the crossing guards here can mislabel a complete quote
             // as exhausted.
+            //
+            // It does, however, leave the post-swap state undetermined: the
+            // price is at an initialized tick whose liquidity delta has not
+            // been applied. Flag it so `next_state_exact` refuses instead of
+            // publishing pre-crossing liquidity as if the tick were still
+            // ahead of us.
+            ended_on_tick_boundary = true;
             break;
         }
 
@@ -270,14 +303,16 @@ pub fn quote_exact_input_multi_tick(
         sqrt_price_after: sqrt_price,
         ticks_crossed,
         exhausted,
+        liquidity_after: liquidity,
+        ended_on_tick_boundary,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cl_sim::ClPoolState;
-    use ethers::types::U256;
+    use crate::cl_state::ClPoolState;
+    use ethers_core::types::U256;
 
     fn ladder() -> TickLadder {
         // Symmetric band around 0, 60-spaced, with liquidity added at the
@@ -374,7 +409,7 @@ mod tests {
 
         let multi = quote_exact_input_multi_tick(&state, &l, amount_in, true, 128)
             .expect("multi-tick quote");
-        let single = crate::cl_sim::quote_exact_input_single_tick(&state, amount_in, true, 3_000)
+        let single = crate::cl_state::quote_exact_input_single_tick(&state, amount_in, true, 3_000)
             .expect("single-tick call")
             .expect("single-tick quote");
 
@@ -419,7 +454,7 @@ mod tests {
 
         let multi = quote_exact_input_multi_tick(&state, &l, amount_in, true, 128)
             .expect("multi-tick quote");
-        let single = crate::cl_sim::quote_exact_input_single_tick(&state, amount_in, true, 3_000)
+        let single = crate::cl_state::quote_exact_input_single_tick(&state, amount_in, true, 3_000)
             .expect("single-tick call")
             .expect("single-tick quote");
 

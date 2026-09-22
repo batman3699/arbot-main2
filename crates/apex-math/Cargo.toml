@@ -1,0 +1,21 @@
+[package]
+name = "apex-math"
+version = "0.1.0"
+edition = "2021"
+description = "Exact pricing mathematics: pure, total, no provider, no environment."
+
+[dependencies]
+# ethers-CORE, not ethers. The exact pricing layer must not be able to name a
+# provider type, and depending on the types crate alone makes that a build
+# fact rather than a review convention (PLAN.md §5.2, §33 Phase 2 scope
+# correction). `ethers_core::types::U256` IS `ethers::types::U256` -- the same
+# type, re-exported -- so nothing converts at the boundary with the legacy
+# crate. The alloy migration (C-10) converts this layer in Phase 17; doing it
+# in the same commit that moves 1,700 lines of audited fixed-point arithmetic
+# would hide a rounding change inside a file move.
+ethers-core = "2.0.14"
+anyhow = "1"
+
+[dev-dependencies]
+# Already in Cargo.lock via the alloy/revm tree, so this adds nothing new.
+proptest = "1"

@@ -1082,6 +1082,39 @@ mod tests {
         assert!(as_f64 > 0.0);
     }
 
+    /// Wait for the logger's background writer to produce `lines` complete
+    /// lines, or fail with what it actually wrote.
+    ///
+    /// These three tests used `sleep(20ms)` and then read the file. That is a
+    /// timing ASSUMPTION, not synchronisation: `CandidateDecisionLogger::write`
+    /// hands the record to a channel and a spawned thread does the I/O, so on
+    /// a loaded machine 20 ms is not enough and the read fails with `NotFound`.
+    /// Measured 2026-09-22 — reproducible in roughly 1 run in 9 with three
+    /// concurrent test binaries competing for 8 cores, and invisible on an idle
+    /// one. CI runners are the loaded case.
+    ///
+    /// Polling to a deadline is the same test with a real wait: still a few
+    /// milliseconds when the machine is quiet, and it does not lie when it is
+    /// not.
+    fn await_log_lines(path: &Path, lines: usize) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut last = String::new();
+        loop {
+            last = fs::read_to_string(path).unwrap_or(last);
+            if last.lines().count() >= lines && last.ends_with('\n') {
+                return last;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "logger never wrote {lines} line(s) to {}; it wrote {:?}",
+                    path.display(),
+                    last
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     fn temp_candidate_log_path(name: &str) -> PathBuf {
         // A millisecond timestamp is not unique enough: the lib and bin test
         // binaries each contain a copy of these tests and run concurrently, so
@@ -1134,8 +1167,7 @@ mod tests {
             error: Some("forced".into()),
         };
         logger.write(record).expect("write candidate record");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let contents = fs::read_to_string(path).expect("read jsonl");
+        let contents = await_log_lines(&path, 1);
         assert!(contents.contains("candidate_rejected_pre_sim"));
         assert!(contents.contains("unreliable_native_price_for_start_token"));
     }
@@ -1173,8 +1205,7 @@ mod tests {
             error: None,
         };
         logger.write(selected).expect("write selected");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let contents = fs::read_to_string(path).expect("read jsonl");
+        let contents = await_log_lines(&path, 1);
         assert_eq!(contents.lines().count(), 1);
         assert!(contents.contains("candidate_selected"));
     }
@@ -1212,8 +1243,7 @@ mod tests {
             error: None,
         };
         logger.write(record).expect("write schema record");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let raw = fs::read_to_string(path).expect("read schema");
+        let raw = await_log_lines(&path, 1);
         let line = raw.lines().next().expect("one line");
         let parsed: Value = serde_json::from_str(line).expect("valid json");
         for key in [

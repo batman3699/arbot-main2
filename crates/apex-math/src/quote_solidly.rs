@@ -1,5 +1,5 @@
 use anyhow::Result;
-use ethers::types::{Address, U256};
+use ethers_core::types::{Address, U256};
 
 use crate::math::mul_div;
 use crate::quote_common::{apply_swap_fee, constant_product_out, constant_product_price_impact_bps};

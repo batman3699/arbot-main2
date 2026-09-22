@@ -5,7 +5,7 @@
 //! replaced with explicit `Option` propagation: this runs pre-broadcast, and a
 //! silently saturated intermediate is a wrong price, not a slow one.
 
-use ethers::types::{U256, U512};
+use ethers_core::types::{U256, U512};
 use std::convert::TryFrom;
 
 pub const MIN_TICK: i32 = -887_272;
@@ -313,17 +313,149 @@ pub fn compute_swap_step(
     })
 }
 
+/// Inverse of [`get_sqrt_ratio_at_tick`]: the greatest tick whose sqrt price is
+/// at most `sqrt_price_x96`. `None` outside the published price bounds.
+///
+/// # Why this is a binary search and not the v3-core assembly
+///
+/// `TickMath.getTickAtSqrtRatio` computes a base-1.0001 logarithm through a
+/// 14-round fixed-point `log2` and two magic 128.128 correction constants. It
+/// is fast and it is *independently* derived — it agrees with
+/// `getSqrtRatioAtTick` because the constants were chosen to make it agree, not
+/// because it inverts the same table. A transcription slip in any of those
+/// constants produces an answer that is wrong by one tick on a narrow band of
+/// prices and correct everywhere else, which is precisely the defect this
+/// repository keeps shipping: right in every test anyone thought to write.
+///
+/// Searching the function being inverted cannot disagree with it. The
+/// definition — "greatest tick with `ratio(tick) <= p`" — is evaluated
+/// directly, so `get_tick_at_sqrt_ratio(get_sqrt_ratio_at_tick(t)) == t` holds
+/// by construction for every tick in range, and the test below proves it over
+/// all 1,774,545 of them rather than over a sample.
+///
+/// The cost is ~21 calls to `get_sqrt_ratio_at_tick` instead of ~14 rounds of
+/// shifts. This is not on the per-tick path of the swap loop — it runs once
+/// when a swap ends mid-range and the resulting state needs its tick — so the
+/// exactness is worth more than the nanoseconds. If profiling ever says
+/// otherwise, port the assembly and differential it against this.
+pub fn get_tick_at_sqrt_ratio(sqrt_price_x96: U256) -> Option<i32> {
+    if sqrt_price_x96 < min_sqrt_ratio() || sqrt_price_x96 > max_sqrt_ratio() {
+        return None;
+    }
+
+    // Invariant: ratio(lo) <= p, and either hi > MAX_TICK or ratio(hi) > p.
+    let mut lo = MIN_TICK;
+    let mut hi = MAX_TICK + 1;
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        match get_sqrt_ratio_at_tick(mid) {
+            Some(ratio) if ratio <= sqrt_price_x96 => lo = mid,
+            // A `None` here means the table refused a tick inside its own
+            // range, which is a bug in the table, not a price out of bounds.
+            // Treat it as "too high" so the search terminates rather than
+            // looping, and let the round-trip test catch the table.
+            _ => hi = mid,
+        }
+    }
+    Some(lo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethers::types::U256;
+    use ethers_core::types::U256;
+
+    /// `get_sqrt_ratio_at_tick` is strictly increasing at EVERY tick, not at a
+    /// sample of nineteen probes.
+    ///
+    /// The sampled version below cannot see a wrong low-order constant: if the
+    /// `0x2` factor were mistyped, ticks two apart would be mis-ordered while
+    /// every probe pair — spaced thousands of ticks apart — stayed correctly
+    /// ordered. The nineteen constants are the whole function, so all of them
+    /// have to be exercised.
+    ///
+    /// This also does the real work for [`get_tick_at_sqrt_ratio`]: a binary
+    /// search over a strictly increasing function returns the unique greatest
+    /// tick whose ratio is at most `p`, so `inverse(ratio(t)) == t` follows for
+    /// every tick from this test plus the definition — it does not need its own
+    /// 1.8-million-iteration round trip.
+    ///
+    /// # Why `#[ignore]`
+    ///
+    /// 1,774,545 ticks x ~19 `mul_div`s is 2.5 s in release and **73 s in
+    /// debug**, which is what `cargo test` runs. A 73-second tax on every
+    /// local run gets a test skipped or deleted, not run. CI runs it in
+    /// release via `cargo test --release -p apex-math -- --ignored`, where it
+    /// costs less than the compile it rides on. The cheap sampled version
+    /// below stays for the everyday loop.
+    #[test]
+    #[ignore = "exhaustive: 1.8M ticks; CI runs it in release via --ignored"]
+    fn sqrt_ratio_is_strictly_monotonic_at_every_tick() {
+        let mut prev = get_sqrt_ratio_at_tick(MIN_TICK).expect("MIN_TICK in range");
+        for tick in (MIN_TICK + 1)..=MAX_TICK {
+            let cur = get_sqrt_ratio_at_tick(tick).expect("tick in range");
+            assert!(
+                cur > prev,
+                "ratio({tick}) = {cur} is not above ratio({}) = {prev}",
+                tick - 1
+            );
+            prev = cur;
+        }
+    }
+
+    /// The inverse inverts. Dense at the bounds and at the sign change, spread
+    /// across the rest; the exhaustive claim is carried by monotonicity above.
+    #[test]
+    fn the_tick_inverse_inverts() {
+        let ticks = (MIN_TICK..MIN_TICK + 64)
+            .chain(-64..64)
+            .chain(MAX_TICK - 63..=MAX_TICK)
+            .chain((MIN_TICK..=MAX_TICK).step_by(9_973));
+        for tick in ticks {
+            let ratio = get_sqrt_ratio_at_tick(tick).expect("tick in range");
+            assert_eq!(
+                get_tick_at_sqrt_ratio(ratio),
+                Some(tick),
+                "ratio({tick}) did not invert to {tick}"
+            );
+        }
+    }
+
+    /// Between two ticks the answer rounds DOWN, never up.
+    ///
+    /// Rounding up would place the price in a range whose upper boundary it has
+    /// not actually reached, so the ladder would report the next initialized
+    /// tick as already crossed.
+    #[test]
+    fn a_price_between_ticks_resolves_to_the_lower_tick() {
+        for tick in [-887_000, -60_000, -60, -1, 0, 1, 60, 60_000, 887_000] {
+            let lo = get_sqrt_ratio_at_tick(tick).expect("tick in range");
+            let hi = get_sqrt_ratio_at_tick(tick + 1).expect("tick in range");
+            assert!(hi > lo, "ratio must be strictly increasing at {tick}");
+            // Every representable price strictly inside (lo, hi) belongs to
+            // `tick`; check the two ends of that open interval.
+            assert_eq!(get_tick_at_sqrt_ratio(lo + U256::one()), Some(tick));
+            assert_eq!(get_tick_at_sqrt_ratio(hi - U256::one()), Some(tick));
+        }
+    }
+
+    /// Out of bounds is `None`, not a clamped tick.
+    #[test]
+    fn prices_outside_the_published_bounds_have_no_tick() {
+        assert_eq!(get_tick_at_sqrt_ratio(min_sqrt_ratio() - U256::one()), None);
+        assert_eq!(get_tick_at_sqrt_ratio(max_sqrt_ratio() + U256::one()), None);
+        assert_eq!(get_tick_at_sqrt_ratio(U256::zero()), None);
+        // The bounds themselves ARE in range.
+        assert_eq!(get_tick_at_sqrt_ratio(min_sqrt_ratio()), Some(MIN_TICK));
+        assert_eq!(get_tick_at_sqrt_ratio(max_sqrt_ratio()), Some(MAX_TICK));
+    }
 
     /// Three values that pin the whole constant table. `tick = 0` must be
     /// exactly 2^96; the bounds are the published MIN/MAX_SQRT_RATIO. If the
     /// table has a typo, at least one of these fails.
     ///
     /// NOTE: these literals must be parsed with `U256::from_dec_str`, not
-    /// `U256::from_str`/`FromStr` — `ethers::types::U256`'s `FromStr` impl
+    /// `U256::from_str`/`FromStr` — `ethers_core::types::U256`'s `FromStr` impl
     /// (from the `uint` crate) parses its input as HEXADECIMAL, so feeding it
     /// a decimal literal silently produces the wrong "expected" value. This
     /// is a test-scaffolding bug, not a constant-table transcription error:

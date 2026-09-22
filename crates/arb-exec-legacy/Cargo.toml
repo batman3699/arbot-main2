@@ -35,6 +35,7 @@ name = "encode_plan_v2"
 path = "src/bin/encode_plan_v2.rs"
 
 [dependencies]
+apex-math = { path = "../apex-math" }
 anyhow = "1"
 ethers = { version = "2.0.14", features = ["abigen", "ws", "rustls"] }
 tokio = { version = "1", features = ["full", "test-util"] }
