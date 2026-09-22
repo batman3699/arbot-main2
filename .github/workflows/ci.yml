@@ -1,0 +1,95 @@
+# The repository had no CI. `make lint` and `make fmt` both fail on the existing
+# tree, so neither was enforced anywhere and nothing stopped a regression in
+# cl_math.rs from merging.
+#
+# Two deliberate narrowings, both recorded in PLAN.md rather than hidden here:
+#
+#   clippy runs on the NEW crates only. `cargo clippy -D warnings` fails
+#   pre-existing across arb-exec-legacy, and a gate that is red on arrival gets
+#   switched off. Each crate joins as it is migrated.
+#
+#   forge excludes test/Deploy*. Those 15 tests are flaky, not red (B-13): they
+#   configure themselves with vm.setEnv, which writes the shared forge process
+#   environment, so they race each other and the auto-loaded .env. Measured 3 of
+#   8 runs failing with a varying subset. Quarantined until Phase 5 Task 5.7.
+#   The other 52 are green deterministically.
+
+name: CI
+on:
+  push:
+    branches: [main, "phase*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: check
+        run: cargo check --workspace --all-targets --locked
+      - name: test
+        # --all-targets, not --lib: the legacy crate compiles a dual module tree
+        # (lib.rs declares 42 modules, main.rs 58) and declares five binaries.
+        # `--lib` alone misses the sizing and hot_pools tests entirely.
+        run: cargo test --workspace --all-targets --locked
+
+  rust-lint:
+    name: clippy (migrated crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p apex-types -p apex-config --all-targets -- -D warnings
+
+  solidity:
+    name: forge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: foundry-rs/foundry-toolchain@v1
+      - run: forge build --sizes
+      - name: test (Deploy* quarantined -- B-13)
+        run: forge test --no-match-path 'test/Deploy*'
+      - name: executor runtime size
+        run: ./scripts/ci/check_executor_size.sh
+
+  gates:
+    name: invariant gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # INV-33's check_no_generic_call.sh is NOT wired here yet: _execGeneric
+      # still exists (B-1), so the gate would be red on arrival and get switched
+      # off. It lands with its fix in Phase 5 Task 5.1, which writes the test
+      # that proves the hole before closing it.
+      - name: no GasLimit/GasUsed conversion (INV-19)
+        run: ./scripts/ci/no_gas_conversion.sh
+      - name: DiscreteSize only from the refinement path (INV-18)
+        run: ./scripts/ci/no_unearned_discrete_size.sh
+      - name: invariant coverage ratchet
+        run: ./scripts/ci/invariant_coverage.sh
+      # secret_scan.sh is NOT wired yet. It is red on arrival, but only on test
+      # fixtures -- `/v2/test-key`, `/v2/test`, `/v2/abc123` and a doc-comment
+      # example in a shadow script. No real credential is exposed. It needs a
+      # placeholder filter before it can gate, and weakening a secret scanner to
+      # make CI green is the wrong instinct to act on under time pressure.
+      # Tracked as a Phase 0 follow-up.
+      # check_placeholder_endpoints.sh is NOT wired yet. It is red on arrival
+      # for a real reason: config/registry.json:363 carries ${ALCHEMY_KEY} for
+      # `abstract`, one of the six non-live chains. Same root cause as
+      # apex-config refusing to load fail-closed -- dead chains carrying
+      # placeholders. Both clear together when the default chain set is trimmed;
+      # wiring a red gate now just teaches people to ignore it.
+      - name: no runtime panics on the hot path
+        run: ./scripts/ci/no_runtime_panics.sh

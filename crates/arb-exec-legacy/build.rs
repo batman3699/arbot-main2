@@ -12,6 +12,14 @@
 //! Resolved by walking up for the manifest that declares `[workspace]` rather than
 //! by counting `../` levels, so moving a crate deeper does not reintroduce this.
 
+// scripts/ci/no_runtime_panics.sh forbids unwrap/expect, and correctly: a panic
+// in a running trading bot is an outage. A BUILD script is the opposite case --
+// it runs at compile time, and aborting the build is the loudest, safest way to
+// report that the workspace root cannot be resolved. The alternative is emitting
+// a wrong WORKSPACE_ROOT, which is precisely the silent failure this file exists
+// to prevent (main.rs's .env fallback resolving to the crate directory).
+#![allow(clippy::expect_used)]
+
 use std::path::{Path, PathBuf};
 
 fn main() {

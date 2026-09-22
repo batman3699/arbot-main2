@@ -51,3 +51,66 @@ eth-docker/
 *.bak-preexpand
 # large binary docs
 *.pdf
+
+# ───────────────────────────────────────────────────────────────
+# Phase 0 hygiene (PLAN.md §32).
+#
+# Most of what B-12 called "200+ MB in-tree" was already ignored -- the
+# grafana/prometheus tarballs and unpacked directories, node/, eth-docker/ and
+# target/ (49 GB of cargo output). The audit conflated "present in the working
+# directory" with "tracked in git"; only contracts/artifacts/ and two .bak
+# scripts were actually committed. What is left is run debris that keeps
+# `git status` noisy enough to hide a real change.
+# ───────────────────────────────────────────────────────────────
+
+# Validation run logs (~40 files). Findings belong in docs/apex/reports/.
+validation-*.log
+*-validation.log
+
+# Timestamped config/ops backups from in-place edits. The canonical file is the
+# one without a suffix; git is the backup.
+*.bak.[0-9]*
+*.bak.audit
+*.bak.topk
+*.bak.widen
+*.bak.fundable-*
+*.bak.perpool-*
+*.bak.slipstream-*
+*.bak.cheap-*
+*.bak.venue-*
+*.bak.prune-*
+*.rpcbak.*
+*.curvebak.*
+*.bak-[0-9]*
+
+# Forge artifacts committed by hand. `out/` is the single source of truth;
+# these drift silently against it.
+/contracts/artifacts/
+
+# One-off census and pool-enumeration outputs.
+/cl_pools.txt
+/cl_candidates.txt
+/parity_*.csv
+/base_all_pools_*.json
+/base_multi_dex_pools.json
+
+# Paste debris.
+python3 Convert.py
+
+# Live run log.
+/arbot-live.log
+
+# Root-level pool-enumeration one-offs. PLAN.md §34.1 removes these at Phase 2,
+# when the verified inventory pipeline replaces them; ignored until then so they
+# cannot be committed by accident.
+/base_all_pools_100k.py
+/base_multi_dex_pools.py
+/uniswap_v4_pools_99k.py
+
+# C-11 / B-7: generate_base_venues.py INVENTS router and quoter addresses, and
+# base_venues_complete.yaml is its output. Must never be committed -- an
+# address that looks real and is not is indistinguishable from config at the
+# point of use. Deleted in Phase 2 Task 2.4, after the bytecode-verification
+# pipeline lands.
+/base_venues_complete.yaml
+/generate_base_venues.py

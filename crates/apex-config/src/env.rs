@@ -30,8 +30,18 @@ impl Env {
         Self { secrets_only: false, consulted: Mutex::new(BTreeSet::new()) }
     }
 
+    /// Recover from a poisoned lock rather than propagating the panic.
+    ///
+    /// Poisoning means some other thread panicked while holding this mutex. The
+    /// guarded value is a record of which keys were read -- losing exactness in
+    /// that record is not worth turning one thread's panic into a second one.
+    /// `main.rs` already carries a `lock_unpoison` helper for the same reason.
+    fn consulted_guard(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        self.consulted.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn get(&self, key: &str) -> Option<String> {
-        self.consulted.lock().expect("env mutex").insert(key.to_string());
+        self.consulted_guard().insert(key.to_string());
         if self.secrets_only && !key.starts_with(SECRET_PREFIX) {
             return None;
         }
@@ -39,6 +49,6 @@ impl Env {
     }
 
     pub fn consulted(&self) -> Vec<String> {
-        self.consulted.lock().expect("env mutex").iter().cloned().collect()
+        self.consulted_guard().iter().cloned().collect()
     }
 }

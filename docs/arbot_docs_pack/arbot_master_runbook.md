@@ -34,7 +34,9 @@ Simple meanings:
 Arbot normally uses 3 configuration layers.
 
 ## A. `ops/inputs.yaml`
+
 Use this for:
+
 - chain definitions
 - venues
 - flashloan providers
@@ -42,13 +44,17 @@ Use this for:
 - scan and risk controls
 
 ## B. `config/registry.json`
+
 Use this for:
+
 - shared chain metadata
 - static route metadata
 - non-secret registry information
 
 ## C. `.env`
+
 Use this for:
+
 - secrets
 - private keys
 - private relay URLs
@@ -139,11 +145,13 @@ bash ./scripts/ci/check_placeholder_endpoints.sh
 ```
 
 This catches bad committed endpoints like:
+
 - `127.0.0.1`
 - `localhost`
 - `${ALCHEMY_KEY}`
 
 Important:
+
 - local fork URLs are okay in your local env
 - they are not okay in committed shared config files
 
@@ -244,6 +252,7 @@ Or pass them on the same command line as the command you are running.
 **Wallet signs -> wallet owns -> clone executes**
 
 Do not confuse:
+
 - clone address
 - batch router address
 - signer wallet
@@ -296,12 +305,14 @@ forge script script/Deploy.s.sol:Deploy \
 ## Step 5: save the returned addresses
 
 Record:
+
 - implementation
 - factory
 - clone
 - router
 
 The important runtime ones are:
+
 - executor address = clone
 - executor owner = admin wallet
 - signer = wallet from private key
@@ -315,6 +326,7 @@ A fork is a safe local copy of a live chain.
 Use forks before trusting live changes.
 
 Fork testing helps prove:
+
 - RPC wiring is correct
 - quote calls work
 - inventory is usable
@@ -326,6 +338,7 @@ Fork testing helps prove:
 # 10. Local fork rules
 
 ## Rule 1
+
 Anvil may **listen** on `0.0.0.0`, but your client should usually **connect** to `127.0.0.1`.
 
 Good:
@@ -343,14 +356,18 @@ ARBOT_FORK_RPC_URL=http://127.0.0.1:8546
 Do not treat `0.0.0.0` like a normal client endpoint.
 
 ## Rule 2
+
 Do not mix:
+
 - upstream block numbers
 - local fork `eth_call` or simulation
 
 That is a common cause of:
+
 - `block out of range`
 
 ## Rule 3
+
 If you restart the fork, restart the bot too.
 
 ---
@@ -413,6 +430,7 @@ test integration_smoke_per_chain ... ok
 ## What failure looks like
 
 Examples:
+
 - `no univ3 quote found`
 - `missing fee for hop 1`
 - `block out of range`
@@ -492,6 +510,7 @@ env | grep -E '^(CHAIN|ENV_PREFIX|BASE_UNIV3_ROUTER|BASE_AAVE_POOL|BASE_BAL_VAUL
 Ingesting means building the pool inventory files Arbot uses for UniV2/UniV3 style venues.
 
 Without ingesting, you can get:
+
 - poor edge population
 - missing pool coverage
 - weak route surface
@@ -540,16 +559,19 @@ If the file is missing or empty, venue coverage will usually be poor.
 # 14. Why “no edges scanned” can happen
 
 You can have:
+
 - pool inventory present
 - quote successes present
 - built edges present
 
 and still end with:
+
 - `edges scanned: 0`
 
 That usually means the failure is **downstream of quoting**, not necessarily in the venue layer.
 
 Common causes:
+
 1. search budget exceeded
 2. pruning removed everything
 3. stale/block-lag checks rejected edges
@@ -557,6 +579,7 @@ Common causes:
 5. fork block mismatch poisoned downstream checks
 
 If you see:
+
 - `quote_success` large
 - `built_edges` non-zero
 - `edges scanned: 0`
@@ -570,6 +593,7 @@ then the likely issue is search/pruning, not basic quote connectivity.
 Shadow mode runs the full trading logic without sending live trades.
 
 Use it when:
+
 - tuning a chain
 - testing a venue
 - changing risk controls
@@ -593,6 +617,7 @@ tail -f logs/shadow.base.jsonl
 ```
 
 If shadow mode seems to hang, inspect logs around:
+
 - hot pool refresh
 - quote queue starvation
 - search budget exceeded
@@ -619,26 +644,36 @@ Work in this order:
 # 17. Troubleshooting by symptom
 
 ## `missing fee for hop 1`
+
 Usually means:
+
 - path encoding bug
 - wrong helper used for a single-hop quote
 - generic multi-hop helper used where a direct single-hop quote helper should be used
 
 ## `block out of range`
+
 Usually means:
+
 - provider was asked for a block it cannot serve
 - most often because upstream block numbers got mixed with local fork calls
 
 ## `connection refused`
+
 Means:
+
 - nothing is listening on the target RPC port
 
 ## `no univ3 quote found`
+
 Means:
+
 - the probe exhausted candidates and found no successful quote
 
 ## `built_edges > 0` but `edges scanned = 0`
+
 Means:
+
 - venue quoting probably worked
 - search/pruning is likely the real issue
 

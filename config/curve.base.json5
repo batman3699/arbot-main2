@@ -1,0 +1,149 @@
+[
+  // Curve (Base) — all pools with publicly reported liquidity ≥ $99k
+  // Token addresses resolved Aug 2026 from GeckoTerminal / BaseScan / registries
+  // selector 0x5e0d443f = get_dy(int128,int128,uint256) — confirm coins()/views on-chain before production
+
+  // ── OETHb / WETH  (~$15M) ──────────────────────────────────────────────
+  {
+    pool: "0x302a94e3c28c290eaf2a4605fc52e11eb915f378",
+    tokenIn: "0x4200000000000000000000000000000000000006", // WETH
+    tokenOut: "0xdbfefd2e8460a6ee4955a68582f85708baea60a3", // OETHb / superOETHb
+    selector: "0x5e0d443f",
+    i: 0,
+    j: 1
+  },
+  {
+    pool: "0x302a94e3c28c290eaf2a4605fc52e11eb915f378",
+    tokenIn: "0xdbfefd2e8460a6ee4955a68582f85708baea60a3",
+    tokenOut: "0x4200000000000000000000000000000000000006",
+    selector: "0x5e0d443f",
+    i: 1,
+    j: 0
+  },
+
+  // ── cbETH / WETH  (~$1.7–1.8M) ─────────────────────────────────────────
+  {
+    pool: "0x11c1fbd4b3de66bc0565779b35171a6cf3e71f59",
+    tokenIn: "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22", // cbETH
+    tokenOut: "0x4200000000000000000000000000000000000006", // WETH
+    selector: "0x5e0d443f",
+    i: 0,
+    j: 1
+  },
+  {
+    pool: "0x11c1fbd4b3de66bc0565779b35171a6cf3e71f59",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",
+    selector: "0x5e0d443f",
+    i: 1,
+    j: 0
+  },
+
+  // ── USDSM / USDC  (~$1.0M) ─────────────────────────────────────────────
+  {
+    pool: "0x33885a2851f68b02863cda6a7622d26fb1172884",
+    tokenIn: "0x26c358f7c5fedb20a6ddef108cd91efb6b8da0cb", // USDSM
+    tokenOut: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // USDC
+    selector: "0x5e0d443f",
+    i: 0,
+    j: 1
+  },
+  {
+    pool: "0x33885a2851f68b02863cda6a7622d26fb1172884",
+    tokenIn: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    tokenOut: "0x26c358f7c5fedb20a6ddef108cd91efb6b8da0cb",
+    selector: "0x5e0d443f",
+    i: 1,
+    j: 0
+  },
+
+  // ── TriBitcoin  tBTC / cbBTC / WBTC  (~$490–700k) ──────────────────────
+  {
+    pool: "0xfac15a759d0f887bc7f5ab874491258cf6ec8ace",
+    tokenIn: "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf", // cbBTC
+    tokenOut: "0x236aa50979d5f3de3bd1eeb40e81137f22ab794b", // tBTC
+    selector: "0x5e0d443f",
+    i: 0,
+    j: 1
+  },
+  {
+    pool: "0xfac15a759d0f887bc7f5ab874491258cf6ec8ace",
+    tokenIn: "0x236aa50979d5f3de3bd1eeb40e81137f22ab794b",
+    tokenOut: "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    selector: "0x5e0d443f",
+    i: 1,
+    j: 0
+  },
+
+  // ── tricrypto  crvUSD / tBTC / WETH  (~$330–535k) ──────────────────────
+  {
+    pool: "0x6e53131f68a034873b6bfa15502af094ef0c5854",
+    tokenIn: "0x417Ac0e078398C154EdFadD9Ef675d30Be60Af93", // crvUSD
+    tokenOut: "0x4200000000000000000000000000000000000006", // WETH
+    selector: "0x5e0d443f",
+    i: 0,
+    j: 2
+  },
+  {
+    pool: "0x6e53131f68a034873b6bfa15502af094ef0c5854",
+    tokenIn: "0x4200000000000000000000000000000000000006",
+    tokenOut: "0x417Ac0e078398C154EdFadD9Ef675d30Be60Af93",
+    selector: "0x5e0d443f",
+    i: 2,
+    j: 0
+  },
+
+  // ── LCAP / eUSD  (~$261–325k) ──────────────────────────────────────────
+  {
+    pool: "0xba0c274085a078d19c46f2d902698a841cbfb289",
+    tokenIn: "0x4da9a0f397db1397902070f93a4d6ddbc0e0e6e8", // LCAP
+    tokenOut: "0xcfa3ef56d303ae4faaba0592388f19d7c3399fb4", // eUSD
+    selector: "0x5e0d443f",
+    i: 0,
+    j: 1
+  },
+  {
+    pool: "0xba0c274085a078d19c46f2d902698a841cbfb289",
+    tokenIn: "0xcfa3ef56d303ae4faaba0592388f19d7c3399fb4",
+    tokenOut: "0x4da9a0f397db1397902070f93a4d6ddbc0e0e6e8",
+    selector: "0x5e0d443f",
+    i: 1,
+    j: 0
+  },
+
+  // ── 4pool  USDC / USDbC / axlUSDC / crvUSD  (~$160–236k) ───────────────
+  {
+    pool: "0xf6c5f01c7f3148891ad0e19df78743d31e390d1f",
+    tokenIn: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", // USDC
+    tokenOut: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA", // USDbC
+    selector: "0x5e0d443f",
+    i: 0,
+    j: 1
+  },
+  {
+    pool: "0xf6c5f01c7f3148891ad0e19df78743d31e390d1f",
+    tokenIn: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA",
+    tokenOut: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    selector: "0x5e0d443f",
+    i: 1,
+    j: 0
+  },
+
+  // ── CRV / crvUSD  (~$103–137k) ─────────────────────────────────────────
+  {
+    pool: "0xde37e221442fa15c35dc19fbae11ed106ba52fb2",
+    tokenIn: "0x8Ee73c484A26e0A5df2Ee2a4960B789967dd0415", // CRV
+    tokenOut: "0x417Ac0e078398C154EdFadD9Ef675d30Be60Af93", // crvUSD
+    selector: "0x5e0d443f",
+    i: 0,
+    j: 1
+  },
+  {
+    pool: "0xde37e221442fa15c35dc19fbae11ed106ba52fb2",
+    tokenIn: "0x417Ac0e078398C154EdFadD9Ef675d30Be60Af93",
+    tokenOut: "0x8Ee73c484A26e0A5df2Ee2a4960B789967dd0415",
+    selector: "0x5e0d443f",
+    i: 1,
+    j: 0
+  }
+]

@@ -27,11 +27,14 @@
 Gives an RPC read a position in the same order the log stream uses. Everything else in this plan depends on it.
 
 **Files:**
+
 - Modify: `src/continuity.rs` (add an `impl Ordinal` block after the struct definition at :15-20)
 - Test: `src/continuity.rs` (`mod tests`, ~:79)
 
 **Interfaces:**
+
 - Consumes: `Ordinal { block, tx_index, log_index }`, which already `derive(Ord)` comparing block, then tx_index, then log_index.
+
 - Produces: `Ordinal::end_of_block(block: u64) -> Ordinal`
 
 - [ ] **Step 1: Write the failing test**
@@ -105,12 +108,15 @@ git commit -m "feat(continuity): give end-of-block RPC state an ordinal"
 The correctness core. Without this, an anchor and a log for the same block both apply and double-count.
 
 **Files:**
+
 - Modify: `src/live_state.rs` — `ApplyOutcome` (:129-143), `apply_log` (guard goes after the cursor observation at :319-323)
 - Modify: `src/ingestion.rs` — the `ApplyOutcome` match (~:562)
 - Test: `src/live_state.rs` (`mod tests`)
 
 **Interfaces:**
+
 - Consumes: `Ordinal::end_of_block` (Task 1); existing `Provenance.ordinal: Option<Ordinal>`.
+
 - Produces: `ApplyOutcome::Superseded`; `LiveState::current_ordinal(&self, pool: Address) -> Option<Ordinal>`; free fn `supersedes(existing: Option<Ordinal>, incoming: Ordinal) -> bool`.
 
 - [ ] **Step 1: Write the failing test**
@@ -320,10 +326,13 @@ git commit -m "feat(live-state): order anchors against the log stream"
 Task 2 made anchors carry an ordinal to satisfy its own tests. This task proves the property directly rather than as a side effect, and covers V2.
 
 **Files:**
+
 - Test only: `src/live_state.rs` (`mod tests`)
 
 **Interfaces:**
+
 - Consumes: `anchor_cl(pool, block, sqrt_price_x96, liquidity, tick)`, `anchor_v2(pool, block, state)`, `Ordinal::end_of_block`.
+
 - Produces: nothing new.
 
 - [ ] **Step 1: Write the test**
@@ -409,12 +418,14 @@ git commit -m "test(live-state): pin the anchor ordinal and post-gap trust recov
 The highest-risk item in the plan. Get it wrong and the divergence rate goes to zero for a reason that has nothing to do with correctness.
 
 **Files:**
+
 - Modify: `src/validation_select.rs` — `SelectOutcome` (:16-26), `select` (:41-58)
 - Modify: `src/state_validation.rs` — `validatable` (:44-57), both `select` call sites (~:139 and ~:183)
 - Modify: `src/metrics.rs` — the `live_state_checks` doc comment
 - Test: `src/validation_select.rs`, `src/state_validation.rs`
 
 **Interfaces:**
+
 - Consumes: `SnapshotSource` from `crate::live_state`.
 - Produces:
   - `pub struct SnapshotPosition { pub ordinal: Option<Ordinal>, pub source: SnapshotSource }`
@@ -650,11 +661,13 @@ git commit -m "fix(validation): never measure a snapshot against its own source"
 ### Task 5: Anchor the pools that need it, from the poller
 
 **Files:**
+
 - Modify: `src/ingestion.rs` — new method on `PoolMonitor`, called from `poll_all_pools` inside the existing `Ok(block)` arm (~:778)
 - Modify: `src/metrics.rs` — anchor counter
 - Test: `src/ingestion.rs`
 
 **Interfaces:**
+
 - Consumes: `LiveState::anchor_cl(pool, block, sqrt_price_x96, liquidity, tick)`, `LiveState::cl_snapshot`, `crate::cl_sim::load_cl_pool_states_batched(provider, &[(Address, Option<u32>, Address, Address)], block) -> HashMap<Address, ClPoolState>`, `may_price_locally`.
 - Produces: `PoolMonitor::anchor_candidates(&self, pools: &[MonitoredPool], live: &LiveState, cap: usize) -> Vec<MonitoredPool>`, and `PoolMonitor::anchor_untrusted(&self, block: U64)`.
 
@@ -866,11 +879,14 @@ git commit -m "feat(ingestion): anchor pools that cannot recover from the log st
 Unit tests cannot show whether anchoring actually restores coverage, or whether it masks decoder error. Only a run can.
 
 **Files:**
+
 - Modify: `docs/superpowers/specs/2026-08-29-live-state-dirty-scan-design.md` (§10 result)
 - No source changes unless the run finds a fault.
 
 **Interfaces:**
+
 - Consumes: `CHAOS_WS_GAP_SECS` (`9480030`), the counters from Tasks 2 and 5.
+
 - Produces: a recorded result.
 
 - [ ] **Step 1: Build and start a forced-gap run**
@@ -897,13 +913,13 @@ curl -s http://localhost:9100/metrics | grep "^live_state_checks"
 
 - [ ] **Step 3: Judge against the predictions**
 
-| metric | prediction | what a miss means |
-|---|---|---|
-| `live_state_anchors_total` | > 0 | the anchor pass never ran; check `live_state` is wired and pools are CL |
-| `live_state_untrusted_base_total` | well below 5194 per 12 gaps | anchoring is not restoring bases; check trust actually flips to `Anchored` |
-| `live_state_superseded_total` | small but non-zero | zero means anchors never race logs, so the ordinal work is untested by this run |
-| `live_state_checks{outcome="not_independent"}` | > 0 | zero means anchored snapshots are still being measured — the circular-validation trap is open |
-| divergence rate, log-derived only | unchanged from the 0/518 baseline | a **fall** is the warning sign, not the win: anchoring may be erasing decoder error before validation sees it |
+| metric                                         | prediction                        | what a miss means                                                                                             |
+| ---------------------------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `live_state_anchors_total`                     | > 0                               | the anchor pass never ran; check `live_state` is wired and pools are CL                                       |
+| `live_state_untrusted_base_total`              | well below 5194 per 12 gaps       | anchoring is not restoring bases; check trust actually flips to `Anchored`                                    |
+| `live_state_superseded_total`                  | small but non-zero                | zero means anchors never race logs, so the ordinal work is untested by this run                               |
+| `live_state_checks{outcome="not_independent"}` | > 0                               | zero means anchored snapshots are still being measured — the circular-validation trap is open                 |
+| divergence rate, log-derived only              | unchanged from the 0/518 baseline | a **fall** is the warning sign, not the win: anchoring may be erasing decoder error before validation sees it |
 
 The last row is the one to read carefully. Anchoring buys availability with diagnostic power, and a divergence rate that improves alongside coverage is more likely masking than correctness.
 
@@ -923,6 +939,7 @@ git commit -m "docs(spec): record the anchor path field result"
 **Spec coverage.** Design §3.1 → Task 1 and Task 2 Step 3. §3.2 → Task 2. §3.3 → Task 4. §3.4 → Task 5. §4 (masking tension) → Task 6 Step 3. §5 out-of-scope items stay out. §6 open questions: "anchor at head vs settled" is resolved to head, because Task 5 reuses the block the poller already pinned; TTL is left alone since `anchored_at` and the gate's expiry already exist; V2 symmetry is covered for the ordinal in Tasks 2–3 but **`anchor_v2` is never called from the poller** — the poller's V2 path caches into `CachedState`, not `LiveState`, so wiring it is a separate change; `anchor_id` still has no consumer and is untouched.
 
 **Known gaps, stated rather than hidden:**
+
 - V2 pools get the anchor *ordinal* but no anchor *caller*. CL is where the untrusted-base cost was measured (5194 dropped deltas are all Mint/Burn), so CL is where the value is. V2 wiring should follow once this is proven.
 - `ANCHOR_BUDGET_PER_CYCLE = 16` is a guess, not a measurement. With a 1.2s poll interval it drains 683 pools in ~43 cycles (~52s). Task 6 will show whether that is too slow.
 - Task 5's tests cover candidate selection, not the batched read itself, which needs a live provider.
