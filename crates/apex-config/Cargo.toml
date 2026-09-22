@@ -1,0 +1,15 @@
+[package]
+name = "apex-config"
+version = "0.1.0"
+edition = "2021"
+description = "Immutable, validated, versioned APEX-MEV v4 configuration."
+
+[dependencies]
+apex-types = { path = "../apex-types" }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "1"
+
+[dev-dependencies]
+serde_json = "1"
