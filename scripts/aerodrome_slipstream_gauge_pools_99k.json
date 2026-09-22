@@ -1,0 +1,1772 @@
+[
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x95510770d728892e1bf376b247e3cf3a5cf38709",
+    "name": "EVBTC / WETH 0.3%",
+    "liquidity_usd": 2364678243.8119,
+    "token0": "0x683090c02dd9d7738ed44e994dab6895bf37ec40",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 0.0,
+    "created_at": "2026-02-12T18:51:56Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x6598649edc71fb61b7ceee8ec5ed5f68e3b668c1",
+    "name": "SOL / ZEC 0.3%",
+    "liquidity_usd": 622713541.3795,
+    "token0": "0x311935cd80b76769bf2ecc9d8ab7635b2139cf82",
+    "token1": "0x715324e1567bf6c59d917edca0dea2f235a6320f",
+    "volume_24h": 0.0,
+    "created_at": "2026-08-17T23:36:09Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x32bed15a3d328acdc92bac0354f77ad0febd58ba",
+    "name": "ZEC / USDC 0.3%",
+    "liquidity_usd": 481706729.7946,
+    "token0": "0x715324e1567bf6c59d917edca0dea2f235a6320f",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 0.0,
+    "created_at": "2026-08-05T23:53:55Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0xce7f9eb890f7aece41b96cfa26ea3180d110355e",
+    "name": "EVBTC / USDC 0.3%",
+    "liquidity_usd": 438505094.4461,
+    "token0": "0x683090c02dd9d7738ed44e994dab6895bf37ec40",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 0.0,
+    "created_at": "2026-02-07T20:58:47Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x9ad9b0aa354f98099c1c387368f504dc24f47ec8",
+    "name": "EVB / cbBTC 0.3%",
+    "liquidity_usd": 112403642.6992,
+    "token0": "0x9eeb493a347b160abcdf4a820f1fdcc88b511cc0",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 0.1042574357,
+    "created_at": "2026-02-13T16:34:19Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x23a91fe02c66ce7682dfef0c4fb48c703e5e9304",
+    "name": "xETH / USDC 0.3%",
+    "liquidity_usd": 23626045.7489,
+    "token0": "0x85ebde89b81a7938b57915f540d9dbc853ad5a62",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 0.009683836158,
+    "created_at": "2026-08-20T08:49:15Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x70acdf2ad0bf2402c957154f944c19ef4e1cbae1",
+    "name": "cbBTC / WETH 0.05%",
+    "liquidity_usd": 16984280.2659,
+    "token0": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 11590330.7598135,
+    "created_at": "2024-09-12T13:53:26Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x42d4a22cad0f5a49681a5715ce994af73a43b76b",
+    "name": "cbBTC / WETH 0.05%",
+    "liquidity_usd": 9694386.0837,
+    "token0": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 125792391.809099,
+    "created_at": "2026-04-22T21:55:43Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59",
+    "name": "WETH / USDC 0.05%",
+    "liquidity_usd": 8801599.7639,
+    "token0": "0x4200000000000000000000000000000000000006",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 53120248.092764,
+    "created_at": "2024-05-06T05:03:45Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x3fe04a59ebd38cf06080a6f60a98d124eb59392a",
+    "name": "WETH / USDC 0.05%",
+    "liquidity_usd": 6270637.223,
+    "token0": "0x4200000000000000000000000000000000000006",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 81771875.2631905,
+    "created_at": "2026-04-22T21:59:50Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0xf041d05cc89a12c64d00ca16e3bb6744e8437cb5",
+    "name": "TRX / USDC 0.05%",
+    "liquidity_usd": 5651197.7775,
+    "token0": "0x989cfdc3508500d0c91f22896a0d2ee1ef675870",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 593.8644478682,
+    "created_at": "2026-01-21T12:21:54Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x4e962bb3889bf030368f56810a9c96b83cb3e778",
+    "name": "cbBTC / USDC 0.05%",
+    "liquidity_usd": 5617242.6508,
+    "token0": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 47319379.0254826,
+    "created_at": "2024-09-12T13:56:07Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x01271a205e3f37cbfc9b353170d726060e193c0d",
+    "name": "VVV / DIEM 0.076%",
+    "liquidity_usd": 5309113.0016,
+    "token0": "0xacfe6019ed1a7dc6f7b508c02d1b04ec88cc21bf",
+    "token1": "0xf4d97f2da56e8c3098f3a8d538db630a2606a024",
+    "volume_24h": 781761.054205799,
+    "created_at": "2026-05-12T15:06:10Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xf71f67d5df3c13433422b6ed12dd779151f9d987",
+    "name": "OpenAI / USDC",
+    "liquidity_usd": 5128163.9267,
+    "token0": "0xc87e0c87aff07aa4fffeaa603a856c4f9726db07",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 34586866.6517226,
+    "created_at": "2026-08-22T12:19:39Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x6446021f4e396da3df4235c62537431372195d38",
+    "name": "OETHb / WETH 0.01%",
+    "liquidity_usd": 5047734.3711,
+    "token0": "0xdbfefd2e8460a6ee4955a68582f85708baea60a3",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 4862.7629701588,
+    "created_at": "2024-08-13T00:22:05Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0xf388192c5ad732ed41c75ed8c90d4ab44578de15",
+    "name": "UTY / USDC 0.01%",
+    "liquidity_usd": 4896404.0095,
+    "token0": "0xba515304d8153c4b162dc79f867e152df9c127eb",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 0.0,
+    "created_at": "2026-04-09T10:24:20Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x3e66e55e97ce60096f74b7c475e8249f2d31a9fb",
+    "name": "USDC / cbBTC 1%",
+    "liquidity_usd": 4813040.528,
+    "token0": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 10020732.7617683,
+    "created_at": "2025-03-12T06:42:10Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x6b0f53cbd9272d8117e9535fe25371dedf39a1be",
+    "name": "VELVET / USDC 0.01%",
+    "liquidity_usd": 4434564.3414,
+    "token0": "0xbf927b841994731c573bdf09ceb0c6b0aa887cdd",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 3712786.30899627,
+    "created_at": "2025-08-23T23:44:37Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xa44d3bb767d953711ea4bce8c0f01f4d7d299af6",
+    "name": "LBTC / cbBTC 0.01%",
+    "liquidity_usd": 4173433.5757,
+    "token0": "0xecac9c5f704e954931349da37f60e39f515c11c1",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 291680.922875884,
+    "created_at": "2024-11-26T15:41:13Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x160d7e9d948b16c163332a277b393c288408eb12",
+    "name": "cbBTC / USDC 0.05%",
+    "liquidity_usd": 4129214.8133,
+    "token0": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 58403674.4012596,
+    "created_at": "2026-04-22T21:52:40Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x861a2922be165a5bd41b1e482b49216b465e1b5f",
+    "name": "wstETH / WETH 0.3%",
+    "liquidity_usd": 3446010.6527,
+    "token0": "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 3863939.24925253,
+    "created_at": "2024-05-06T05:26:49Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x47ca96ea59c13f72745928887f84c9f52c3d7348",
+    "name": "cbETH / WETH 0.05%",
+    "liquidity_usd": 3170339.5151,
+    "token0": "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 3862878.54201411,
+    "created_at": "2024-05-06T05:11:31Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x4e506648d493c8870f55e870480f92f2f33ece51",
+    "name": "AERO / WETH 0.3%",
+    "liquidity_usd": 3069421.4168,
+    "token0": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 4080168.76980504,
+    "created_at": "2026-04-29T19:14:02Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x7ec6c9d993d9832aa654593f2dbc21303650bc6c",
+    "name": "VVV / WETH 0.05%",
+    "liquidity_usd": 2975582.7309,
+    "token0": "0xacfe6019ed1a7dc6f7b508c02d1b04ec88cc21bf",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 5888840.39382649,
+    "created_at": "2025-01-29T23:33:20Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xbe00ff35af70e8415d0eb605a286d8a45466a4c1",
+    "name": "AERO / USDC 1%",
+    "liquidity_usd": 2904561.4839,
+    "token0": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 890028.027069565,
+    "created_at": "2024-05-29T14:38:57Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xe846373c1a92b167b4e9cd5d8e4d6b1db9e90ec7",
+    "name": "EURC / USDC 0.05%",
+    "liquidity_usd": 2675432.4147,
+    "token0": "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 5259977.84467565,
+    "created_at": "2024-08-01T14:10:35Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x0392b12a1ceb0cd13af5ea448cf5586ea609852d",
+    "name": "ZEN / WETH 0.15%",
+    "liquidity_usd": 2325839.5756,
+    "token0": "0xf43eb8de897fbc7f2502483b2bef7bb9ea179229",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 5215174.97596461,
+    "created_at": "2025-07-23T13:35:47Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x34e3334e845d101205394e0bd8821fddc7cd5559",
+    "name": "REI / WETH 0.05%",
+    "liquidity_usd": 2106256.0435,
+    "token0": "0x6b2504a03ca4d43d0d73776f6ad46dab2f2a4cfd",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 109564.283235592,
+    "created_at": "2025-11-21T17:38:06Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x00145e8fc9f06a0b71bd57fefbf451ec1db9d69f",
+    "name": "msUSD / msETH 0.011%",
+    "liquidity_usd": 1888945.7802,
+    "token0": "0x526728dbc96689597f85ae4cd716d4f7fccbae9d",
+    "token1": "0x7ba6f01772924a82d9626c126347a28299e98c98",
+    "volume_24h": 600055.504026111,
+    "created_at": "2026-05-19T04:33:47Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xc1cbf7a0b2f63fb864004c586d2deae924c95990",
+    "name": "uniBTC / cbBTC",
+    "liquidity_usd": 1870120.4686,
+    "token0": "0x93919784c523f39cacaa98ee0a9d96c3f32b593e",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 162814.644291909,
+    "created_at": "2026-04-22T08:01:15Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x8d479a4c680a76d4ae03f10203569558405ddfff",
+    "name": "O / USDC 0.034%",
+    "liquidity_usd": 1783716.8192,
+    "token0": "0x182fa643e5f29d5eca75e7b9cf9336a3fe4620b2",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 2037050.89071122,
+    "created_at": "2026-06-17T15:00:33Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x47f9e291bb766fc307ad7bba4f29f3eab6a97101",
+    "name": "ZEN / cbBTC 0.25%",
+    "liquidity_usd": 1362137.3085,
+    "token0": "0xf43eb8de897fbc7f2502483b2bef7bb9ea179229",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 2078705.07487934,
+    "created_at": "2025-07-23T13:35:47Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xa41bc0affba7fd420d186b84899d7ab2ac57fcd1",
+    "name": "USDT / USDC 0.01%",
+    "liquidity_usd": 1326215.2298,
+    "token0": "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 6938372.01885991,
+    "created_at": "2024-07-24T23:03:23Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x93ecc1773d617eb9e921a9a7e9a13a1c83ca2a2e",
+    "name": "MTR / USDC",
+    "liquidity_usd": 1299505.6333,
+    "token0": "0x7a65e14206ec44b5381d546fb53b39f7c91b3914",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 966.2804262252,
+    "created_at": "2026-07-06T16:14:37Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x2ae9df02539887d4ebce0230168a302d34784c82",
+    "name": "bsdETH / WETH 0.01%",
+    "liquidity_usd": 1253849.0927,
+    "token0": "0xcb327b99ff831bf8223cced12b1338ff3aa322ff",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 60725.8403426059,
+    "created_at": "2024-05-15T13:54:17Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x82321f3beb69f503380d6b233857d5c43562e2d0",
+    "name": "AERO / WETH 1%",
+    "liquidity_usd": 1215243.6467,
+    "token0": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 1110431.69388993,
+    "created_at": "2024-05-08T21:46:47Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x8bb9eaf3c5a906d20c4cc10ea2f73a3ac2d5d41a",
+    "name": "cbETH / cbBTC 0.05%",
+    "liquidity_usd": 1189690.8668,
+    "token0": "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 8553488.5734332,
+    "created_at": "2026-01-12T21:00:22Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xdfe5f275020def30993f042174fc2d335678b626",
+    "name": "AERO / cbBTC 0.6%",
+    "liquidity_usd": 1183479.6654,
+    "token0": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 6491255.72369537,
+    "created_at": "2024-11-27T22:05:52Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x74f72788f4814d7ff3c49b44684aa98eee140c0e",
+    "name": "msETH / WETH 0.05%",
+    "liquidity_usd": 1180934.1783,
+    "token0": "0x7ba6f01772924a82d9626c126347a28299e98c98",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 1098217.86763009,
+    "created_at": "2025-05-08T02:28:42Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x0225ba893d5f8ecd6d2022f9dec59b34f61098a1",
+    "name": "uSOL / WETH 0.3%",
+    "liquidity_usd": 1171558.822,
+    "token0": "0x9b8df6e244526ab5f6e6400d331db28c8fdddb55",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 2109526.96959165,
+    "created_at": "2024-08-20T20:07:14Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xff56d037d948fad1027a1ac82ae610e4b694c641",
+    "name": "MUSD / USDC 0.004%",
+    "liquidity_usd": 1067598.9631,
+    "token0": "0xdd468a1ddc392dcdbef6db6e34e89aa338f9f186",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 47202.7149671515,
+    "created_at": "2026-04-16T05:13:54Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x4a79b0168296c0ef7b8f314973b82ad406a29f1b",
+    "name": "AAVE / WETH 0.3%",
+    "liquidity_usd": 1054773.735,
+    "token0": "0x63706e401c06ac8513145b7687a14804d17f814b",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 1972822.98234217,
+    "created_at": "2025-02-05T22:33:44Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x7501bc8bb51616f79bfa524e464fb7b41f0b10fb",
+    "name": "msUSD / USDC 0.05%",
+    "liquidity_usd": 1047756.4179,
+    "token0": "0x526728dbc96689597f85ae4cd716d4f7fccbae9d",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 3195655.20411634,
+    "created_at": "2024-12-04T17:59:18Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x3f5e98c7ebff35056ab4346bccd722a537c1aefa",
+    "name": "TIG / USDC 0.27%",
+    "liquidity_usd": 1019707.7584,
+    "token0": "0x0c03ce270b4826ec62e7dd007f0b716068639f7b",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 244342.66218943,
+    "created_at": "2025-06-29T18:37:45Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0xfcda5ab6bbc1fe5b8e1a185e86bb5f24b12e2278",
+    "name": "USDC / cbBTC 2%",
+    "liquidity_usd": 988468.7874,
+    "token0": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 1048704.81259407,
+    "created_at": "2025-12-15T14:47:53Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xa135b59fe221c0c8d441294f97f96fbc37bc9fbe",
+    "name": "VVV / WETH 0.3%",
+    "liquidity_usd": 974290.5903,
+    "token0": "0xacfe6019ed1a7dc6f7b508c02d1b04ec88cc21bf",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 5177501.96120514,
+    "created_at": "2026-04-16T04:45:13Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xb5f0b4ae66c14f7efaa9aa1468e8fc536a3e288c",
+    "name": "MORPHO / WETH 0.3%",
+    "liquidity_usd": 936176.8195,
+    "token0": "0xbaa5cc21fd487b8fcc2f632f3f4e8d37262a0842",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 2225772.17175993,
+    "created_at": "2024-11-26T20:22:44Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x3416f5fa0ade2d3de6935d4b204d9fe0b68c0ea6",
+    "name": "SERV / WETH",
+    "liquidity_usd": 922036.2015,
+    "token0": "0x5576d6ed9181f2225aff5282ac0ed29f755437ea",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 43176.9389955734,
+    "created_at": "2026-06-09T22:44:09Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xbd3cd0d9d429b41f0a2e1c026552bd598294d5e0",
+    "name": "weETH.base / WETH 0.3%",
+    "liquidity_usd": 871642.4908,
+    "token0": "0x04c0599ae5a44757c0af6f9ec3b93da8976c150a",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 516634.160153228,
+    "created_at": "2024-05-06T08:44:03Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x4e829f8a5213c42535ab84aa40bd4adcce9cba02",
+    "name": "BRETT / WETH 1%",
+    "liquidity_usd": 805580.411,
+    "token0": "0x532f27101965dd16442e59d40670faf5ebb142e4",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 950991.221114349,
+    "created_at": "2024-05-06T05:23:31Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xef7e596aef9e4c6301b4d1f1e88f8ffe8c306222",
+    "name": "DRV / WETH 0.8%",
+    "liquidity_usd": 732742.7464,
+    "token0": "0x9d0e8f5b25384c7310cb8c6ae32c8fbeb645d083",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 277190.929794319,
+    "created_at": "2026-04-16T04:45:42Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x80cc08712aa61ce9dc7604f9ce7560a25094b862",
+    "name": "SAPIEN / USDC 0.05%",
+    "liquidity_usd": 729745.807,
+    "token0": "0xc729777d0470f30612b1564fd96e8dd26f5814e3",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 155281.29291998,
+    "created_at": "2025-08-20T16:55:19Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x7c7420dd105e2779316423ba3e973f434315efa9",
+    "name": "cbBTC / WETH 0.009%",
+    "liquidity_usd": 694080.0764,
+    "token0": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 39054971.3303425,
+    "created_at": "2026-04-16T04:45:09Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x0abe41c8aaa9282429e06ebed48be36298981d94",
+    "name": "RECALL / USDC 0.3%",
+    "liquidity_usd": 688492.1245,
+    "token0": "0x1f16e03c1a5908818f47f6ee7bb16690b40d0671",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 750685.674387704,
+    "created_at": "2026-05-12T16:08:12Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x8a8e4170c09074b109352190d47e54d7c1f61e4e",
+    "name": "PROS / USDC 0.01%",
+    "liquidity_usd": 684165.0512,
+    "token0": "0x8b7dde054be9d180c1be7fae0874697374a49832",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 1338609.80584363,
+    "created_at": "2026-05-13T13:17:19Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x9785ef59e2b499fb741674ecf6faf912df7b3c1b",
+    "name": "USDT / WETH 0.05%",
+    "liquidity_usd": 634734.5983,
+    "token0": "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 6642853.06954604,
+    "created_at": "2024-07-24T23:06:55Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xeaf57753bc382e0324a1d43f72e7027705a2273e",
+    "name": "METAc / USDC 0.006%",
+    "liquidity_usd": 630164.7611,
+    "token0": "0xb2000000000000000000008bc8786b856e61707c",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 955635.480100774,
+    "created_at": "2026-08-13T13:02:11Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xe30d5bf485f7476ac15884a28ffb3c9cea635dcb",
+    "name": "AVNT / USDC 0.01%",
+    "liquidity_usd": 629496.3432,
+    "token0": "0x696f9436b67233384889472cd7cd58a6fb5df4f1",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 488439.094494507,
+    "created_at": "2025-09-09T12:55:33Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xa3b1e3f9747065e2073722ff4c9027d3ea4994f0",
+    "name": "AAPL / USDC 0.032%",
+    "liquidity_usd": 627239.5739,
+    "token0": "0xb200000000000000000000c2e324d24d7eecd1fb",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 910027.418036042,
+    "created_at": "2026-08-13T09:31:03Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x41d4934322f2bd6fe1dbe4124070fe61651a2067",
+    "name": "GHST / USDC 1%",
+    "liquidity_usd": 584471.2391,
+    "token0": "0xcd2f22236dd9dfe2356d7c543161d4d260fd9bcb",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 4944.0918004893,
+    "created_at": "2026-04-16T04:45:02Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xa5e0da329ee5aa03f09228e534953496334080f5",
+    "name": "LMTS / USDC 1%",
+    "liquidity_usd": 567309.8191,
+    "token0": "0x9eadbe35f3ee3bf3e28180070c429298a1b02f93",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 24808.9890919263,
+    "created_at": "2025-10-22T12:31:16Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x853f5f1b92b16714fe6cda67caad0856b83c7ab9",
+    "name": "NVDAc / USDC 0.021%",
+    "liquidity_usd": 561007.366,
+    "token0": "0xb20000000000000000000078ee7ce2fe4908108c",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 3692320.35749665,
+    "created_at": "2026-08-12T19:31:01Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x99f0364e162a36a77e5d77b5eeb56539563735a3",
+    "name": "TAO / USDC",
+    "liquidity_usd": 558683.4183,
+    "token0": "0xf3081494b87e8d5fb7960f066e931d1d0e6e3d67",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 856806.095147305,
+    "created_at": "2026-08-19T14:20:19Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xaa5fe7dcc07dcb8b7afcd1b93874e7cb1e0ab50b",
+    "name": "EURC / WETH 0.05%",
+    "liquidity_usd": 551279.5591,
+    "token0": "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 7433070.37808789,
+    "created_at": "2026-04-29T21:49:46Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xb099c658e784b41ee435d48a8eb67e8f27285c93",
+    "name": "B3 / WETH 0.05%",
+    "liquidity_usd": 531256.3634,
+    "token0": "0xb3b32f9f8827d4634fe7d973fa1034ec9fddb3b3",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 2424725.1856373,
+    "created_at": "2025-02-10T14:28:13Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x988702fe529a3461ec7fd09eea3f962856709fd9",
+    "name": "eUSD / USDC 0.01%",
+    "liquidity_usd": 527006.5155,
+    "token0": "0xcfa3ef56d303ae4faaba0592388f19d7c3399fb4",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 29401.4174456243,
+    "created_at": "2024-06-05T00:02:35Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x3a88ef38879efb900c2d7b6199d21c139cef5fa7",
+    "name": "LCAP / WETH 0.3%",
+    "liquidity_usd": 526233.3736,
+    "token0": "0x4da9a0f397db1397902070f93a4d6ddbc0e0e6e8",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 181450.611835213,
+    "created_at": "2025-08-21T16:03:37Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xa4fdd479eda160671636e2ecf8f993cbf86258a8",
+    "name": "AERO / USDC 0.05%",
+    "liquidity_usd": 523007.48,
+    "token0": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 1367459.41736043,
+    "created_at": "2025-08-12T23:55:05Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x96b9e829c934324a33f4130c7acc8a18e2351199",
+    "name": "FXUSD / USDC",
+    "liquidity_usd": 512357.9077,
+    "token0": "0x55380fe7a1910dff29a47b622057ab4139da42c5",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 6069.4284598092,
+    "created_at": "2026-05-25T07:33:41Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xf39b7c34be147f5dc1bc374f27af2e9f03ad3113",
+    "name": "EURC / USDC 0.007%",
+    "liquidity_usd": 500120.9221,
+    "token0": "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 6506039.96295882,
+    "created_at": "2026-04-16T04:45:03Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x37e1490f7f6f98d263f826e1244c7e7f128632f2",
+    "name": "UP / cbBTC 1%",
+    "liquidity_usd": 481809.7125,
+    "token0": "0x5b2193fdc451c1f847be09ca9d13a4bf60f8c86b",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 89805.8745140605,
+    "created_at": "2026-04-16T04:45:23Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0xbe762d548f8ca86a78e9da6e3ddc87f91457e398",
+    "name": "ICP / WETH 0.05%",
+    "liquidity_usd": 461086.3724,
+    "token0": "0x00f3c42833c3170159af4e92dbb451fb3f708917",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 518413.17391851,
+    "created_at": "2025-11-05T03:16:22Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x0ab02e160f0df68dc049b012c514857306960eae",
+    "name": "CTR / USDC 0.005%",
+    "liquidity_usd": 455171.1011,
+    "token0": "0x11030f79109269d796fd0fb956d6244e502757f7",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 730966.157177783,
+    "created_at": "2026-05-26T12:53:05Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x4a021ba3ab1f0121e7df76f345c547db86cb3468",
+    "name": "MAMO / VIRTUAL 0.3%",
+    "liquidity_usd": 443688.108,
+    "token0": "0x7300b37dfdfab110d83290a29dfb31b1740219fe",
+    "token1": "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",
+    "volume_24h": 53412.1384687546,
+    "created_at": "2025-07-02T16:06:08Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x892a6ab3fa0f1f839fcb0ae264a8c4bbfb030725",
+    "name": "XSGD / USDC 0.01%",
+    "liquidity_usd": 438467.2055,
+    "token0": "0x0a4c9cb2778ab3302996a34befcf9a8bc288c33b",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 381339.310680079,
+    "created_at": "2025-09-27T03:21:41Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x4267f2da3a054c34dd6463d951eb3a9474901fbd",
+    "name": "PEPTAI / BIO",
+    "liquidity_usd": 433945.618,
+    "token0": "0x54f16bd3996169914c84dbb2a16635100cf48a0a",
+    "token1": "0x226a2fa2556c48245e57cd1cba4c6c9e67077dd2",
+    "volume_24h": 7817.7628950648,
+    "created_at": "2026-07-04T10:40:09Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xb90fe999be6869af0afc557dccfbe169ea3403d6",
+    "name": "cbXRP / WETH 0.003%",
+    "liquidity_usd": 413980.1816,
+    "token0": "0xcb585250f852c6c6bf90434ab21a00f02833a4af",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 13213853.1119495,
+    "created_at": "2026-04-16T04:51:04Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xe2b3aa806e56603a244bfc111c9474f7dedd03db",
+    "name": "MAMO / cbBTC 0.3%",
+    "liquidity_usd": 407437.4587,
+    "token0": "0x7300b37dfdfab110d83290a29dfb31b1740219fe",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 73529.0002657295,
+    "created_at": "2025-05-21T14:58:31Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x3f0296bf652e19bca772ec3df08b32732f93014a",
+    "name": "VIRTUAL / WETH 0.05%",
+    "liquidity_usd": 397957.4719,
+    "token0": "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 5237542.8000284,
+    "created_at": "2025-01-06T20:15:25Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0xf0d64b4fe5d2619a3adbe2734ad0584fc54bed88",
+    "name": "USDL / USDC 0.05%",
+    "liquidity_usd": 386482.4385,
+    "token0": "0x78e8cf657742e10eac8f64007615aa741fc76414",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 49722.2499507644,
+    "created_at": "2026-01-28T04:03:44Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xc200f21efe67c7f41b81a854c26f9cda80593065",
+    "name": "VIRTUAL / WETH 0.7%",
+    "liquidity_usd": 385487.7515,
+    "token0": "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 4459388.40710917,
+    "created_at": "2024-10-23T23:13:35Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x9e48d016ee76cf53e2de8dc8058c7549c8c202df",
+    "name": "HYPE / WETH 0.05%",
+    "liquidity_usd": 381151.7069,
+    "token0": "0x15d0e0c55a3e7ee67152ad7e89acf164253ff68d",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 3988011.99846119,
+    "created_at": "2025-11-05T02:58:46Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x0e4409f7a8eba3213f336daf608985302e79328c",
+    "name": "TIBBIR / WETH 0.25%",
+    "liquidity_usd": 380549.5548,
+    "token0": "0xa4a2e2ca3fbfe21aed83471d28b6f65a233c6e00",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 990167.807179138,
+    "created_at": "2026-04-16T04:45:17Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x1131db5977242a03ebead1acd18f80a9a29e5922",
+    "name": "SOL / USDC 0.035%",
+    "liquidity_usd": 364994.8634,
+    "token0": "0x311935cd80b76769bf2ecc9d8ab7635b2139cf82",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 12026389.6733951,
+    "created_at": "2026-04-16T04:45:10Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0xc758d81b9b81a6fcdad075bd471874a2c46b54e0",
+    "name": "WETH / USDC 0.05%",
+    "liquidity_usd": 364108.1269,
+    "token0": "0x4200000000000000000000000000000000000006",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 98067.752568778,
+    "created_at": "2025-11-12T14:52:01Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xd40bffa9c9e35493b88a2b6744c49d8716b00898",
+    "name": "BIO / USDC 0.3%",
+    "liquidity_usd": 360809.1057,
+    "token0": "0x226a2fa2556c48245e57cd1cba4c6c9e67077dd2",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 231928.897272717,
+    "created_at": "2025-10-23T12:04:34Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x659be70647b0f63217d60e077f4417b1ecc65064",
+    "name": "FUN / USDC 1%",
+    "liquidity_usd": 357715.034,
+    "token0": "0x16ee7ecac70d1028e7712751e2ee6ba808a7dd92",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 192350.157795731,
+    "created_at": "2026-01-15T13:53:08Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x1024c20c048ea6087293f46d4a1c042cb6705924",
+    "name": "BID / WETH 0.3%",
+    "liquidity_usd": 356103.5845,
+    "token0": "0xa1832f7f4e534ae557f9b5ab76de54b1873e498b",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 12653.873976431,
+    "created_at": "2025-09-09T17:46:29Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xb1987cad1682841b4b641d50e520777ec5ab5542",
+    "name": "GOOGLc / USDC 0.05%",
+    "liquidity_usd": 347596.5759,
+    "token0": "0xb2000000000000000000002d0ba3164cc74f58b7",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 1204211.80929509,
+    "created_at": "2026-08-13T13:03:59Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xf81e1a62cbfa487e807044618661bfd4802b4982",
+    "name": "tBTC / USDC 0.3%",
+    "liquidity_usd": 346261.5186,
+    "token0": "0x236aa50979d5f3de3bd1eeb40e81137f22ab794b",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 27047.3884871238,
+    "created_at": "2024-05-14T11:00:35Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x95180496adabc8380fca36ec81bae131ca97cd3b",
+    "name": "AEROSTRAT / AERO 0.05%",
+    "liquidity_usd": 346020.986,
+    "token0": "0x1a85b97f8b0e1cee4d5500e093f5970a2aeb3fb8",
+    "token1": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+    "volume_24h": 554.5798938066,
+    "created_at": "2025-11-05T04:12:20Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x678f431da2abb9b5726bbf5ccdbaeebb60da9813",
+    "name": "MAMO / USDC 0.3%",
+    "liquidity_usd": 336153.3646,
+    "token0": "0x7300b37dfdfab110d83290a29dfb31b1740219fe",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 68304.4535343286,
+    "created_at": "2025-07-14T18:02:05Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x02b6b7ab1ede16f48c57893d2fdf6251c2cb3821",
+    "name": "jEUR / USDC",
+    "liquidity_usd": 335100.7326,
+    "token0": "0x4154550f4db74dc38d1fe98e1f3f28ed6dad627d",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 43065.9952472948,
+    "created_at": "2026-08-05T20:19:43Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x46d398a5b33709877f50c8918a7ee96f1be1d7dd",
+    "name": "VVV / WETH 0.3%",
+    "liquidity_usd": 321505.6179,
+    "token0": "0xacfe6019ed1a7dc6f7b508c02d1b04ec88cc21bf",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 552866.402745177,
+    "created_at": "2025-01-27T17:50:32Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xe9437a75128190b5c44b399e9fb454681d04479e",
+    "name": "hbtc / cbBTC",
+    "liquidity_usd": 307998.7945,
+    "token0": "0x9c2dcdbdb3f0a0f628d1112bbcabd9ae75353df3",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 0.0,
+    "created_at": "2026-08-14T11:35:19Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x94a734bf60cde88ab10a9951b17278a3ce129860",
+    "name": "FOLKS / USDC 0.018%",
+    "liquidity_usd": 305897.9056,
+    "token0": "0xff7f8f301f7a706e3cfd3d2275f5dc0b9ee8009b",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 196123.867456847,
+    "created_at": "2026-06-29T10:27:55Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x51663b8a28e7ea197c5ccf983afc084da0a8023d",
+    "name": "RAVE / USDC 0.3%",
+    "liquidity_usd": 305585.0995,
+    "token0": "0x1aa8fd5bcce2231c6100d55bf8b377cff33acfc3",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 391420.113939107,
+    "created_at": "2025-12-12T12:01:49Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x72be417afb0abea66913141c605d313bb389b59c",
+    "name": "LINK / WETH 0.25%",
+    "liquidity_usd": 303530.4831,
+    "token0": "0x88fb150bdc53a65fe94dea0c9ba0a6daf8c6e196",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 609403.732098106,
+    "created_at": "2025-03-20T00:12:50Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0xefcc15b5976af35aadd4755a730022ff9fea440b",
+    "name": "A0T / USDC 2%",
+    "liquidity_usd": 301139.4753,
+    "token0": "0xcc4adb618253ed0d4d8a188fb901d70c54735e03",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 20345.1188081844,
+    "created_at": "2025-11-11T08:47:37Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x222ccbe78890a4d9ef8d22d7fc1b968be0f2c653",
+    "name": "BIO / WETH 0.05%",
+    "liquidity_usd": 297864.4111,
+    "token0": "0x226a2fa2556c48245e57cd1cba4c6c9e67077dd2",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 816242.737490952,
+    "created_at": "2025-03-20T18:34:52Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x99fb961b5f8d5bf137976ba50cf6999546b0503f",
+    "name": "tGBP / USDC 0.05%",
+    "liquidity_usd": 294065.12,
+    "token0": "0x27f6c8289550fce67f6b50bed1f519966afe5287",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 4905.6025135805,
+    "created_at": "2025-12-02T11:44:37Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xccfa472815563ff9eb2de95c7b2be1ccf91f7f31",
+    "name": "SOL / cbBTC 0.018%",
+    "liquidity_usd": 293927.5358,
+    "token0": "0x311935cd80b76769bf2ecc9d8ab7635b2139cf82",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 14487952.6442732,
+    "created_at": "2026-04-16T04:45:00Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xaa067f08fef60420d050a92e7800e588748b7d67",
+    "name": "MAMO / WETH 0.3%",
+    "liquidity_usd": 291024.6706,
+    "token0": "0x7300b37dfdfab110d83290a29dfb31b1740219fe",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 72446.445899679,
+    "created_at": "2025-08-04T23:49:34Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x48c5d4a6677ed59646a9c6465db2562be4a20aec",
+    "name": "POD / USDC 0.3%",
+    "liquidity_usd": 290147.1886,
+    "token0": "0xed664536023d8e4b1640c394777d34abaff1df8f",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 112919.197279433,
+    "created_at": "2026-07-14T17:29:24Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xb07d7eece8866e549601af5c7622d8cdbedc914e",
+    "name": "EURC / cbBTC 0.05%",
+    "liquidity_usd": 280258.6346,
+    "token0": "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 2264968.511884,
+    "created_at": "2024-09-18T23:58:43Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x0f56aeba06f65e2790c5b6687f5c3128b7456f76",
+    "name": "align / USDC 0.017%",
+    "liquidity_usd": 278000.5302,
+    "token0": "0x53f39e5c53ee40bbc3da97c3b47bd2968d110a8d",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 773289.917356917,
+    "created_at": "2026-08-20T14:31:05Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xad06a870fc2198398c18a6f2ca035bf795edeefe",
+    "name": "WOO / WETH 0.3%",
+    "liquidity_usd": 272977.6726,
+    "token0": "0xf3df0a31ec5ea438150987805e841f960b9471b6",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 24874.7447200844,
+    "created_at": "2025-06-19T16:29:22Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x17f707cf3edbbd5d9251d4bcdf9ad70a247d7b84",
+    "name": "TRUST / USDC 0.01%",
+    "liquidity_usd": 263370.0764,
+    "token0": "0x6cd905df2ed214b22e0d48ff17cd4200c1c6d8a3",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 168025.936833754,
+    "created_at": "2025-11-05T08:54:27Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x611865e603862a3d1cd29146458564a684e1cbbb",
+    "name": "TITN / USDC 0.01%",
+    "liquidity_usd": 261191.0626,
+    "token0": "0xe62bfbe57763ec24c0f130426f34dbce11fc5b06",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 23381.6951194227,
+    "created_at": "2025-11-03T07:42:28Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xa33f162da19c7273ba1205bfd9d4340da2446e3a",
+    "name": "tBTC / WETH 0.3%",
+    "liquidity_usd": 251786.7383,
+    "token0": "0x236aa50979d5f3de3bd1eeb40e81137f22ab794b",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 71788.7481179927,
+    "created_at": "2024-05-14T06:15:19Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0xbe4c36b9542610df83ca690c8b5bc53bbbc5d542",
+    "name": "LMTS / USDC 0.05%",
+    "liquidity_usd": 242119.2267,
+    "token0": "0x9eadbe35f3ee3bf3e28180070c429298a1b02f93",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 879685.232852617,
+    "created_at": "2026-03-09T15:01:35Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xff862675c47b6a2c9072dcbe2f37a78a445c4f37",
+    "name": "CARV / USDC 0.05%",
+    "liquidity_usd": 241842.159,
+    "token0": "0xc08cd26474722ce93f4d0c34d16201461c10aa8c",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 23437.2683250247,
+    "created_at": "2025-09-06T09:13:25Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x138acee5573fa09e7f215965ff60898cc33c6330",
+    "name": "tBTC / cbBTC 0.01%",
+    "liquidity_usd": 241534.8734,
+    "token0": "0x236aa50979d5f3de3bd1eeb40e81137f22ab794b",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 178018.362180703,
+    "created_at": "2024-09-13T20:00:35Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0xd4dc229a997a73e86c13e3ce8019be02cd4827a6",
+    "name": "TOWER / USDC 0.05%",
+    "liquidity_usd": 240412.1609,
+    "token0": "0xf7c1cefcf7e1dd8161e00099facd3e1db9e528ee",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 13316.962021904,
+    "created_at": "2025-11-11T03:08:44Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xa11fbd0f7112f2fad10f92f09b4a8d85e8ddd401",
+    "name": "chz / USDC 0.018%",
+    "liquidity_usd": 239704.7677,
+    "token0": "0x70c8392de9b39a1e48d12a70af6ff4be25d6d0a2",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 117740.598466058,
+    "created_at": "2026-04-28T13:34:05Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x48be08d21fccf3f793783c23c33555f5e0c2b7cd",
+    "name": "TOWNS / WETH 0.124%",
+    "liquidity_usd": 238413.8782,
+    "token0": "0x00000000a22c618fd6b4d7e9a335c4b96b189a38",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 279752.468800468,
+    "created_at": "2026-05-11T19:26:23Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xfebeebaa6c9585fd97aa9157e3b7aace804b688c",
+    "name": "XSGD / WETH 0.05%",
+    "liquidity_usd": 211024.8256,
+    "token0": "0x0a4c9cb2778ab3302996a34befcf9a8bc288c33b",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 283844.161908976,
+    "created_at": "2025-10-08T23:29:27Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xd5b83c33a8711e727c0abb6f72ee508755d37e10",
+    "name": "wtSGOV / USDC 0.01%",
+    "liquidity_usd": 205824.4689,
+    "token0": "0x78c31580c97101694c70022c83d570150c11e935",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 53048.5307377956,
+    "created_at": "2026-07-16T00:53:35Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x565aecf84b5d30a6e79a5cef3f0da0fc4280debc",
+    "name": "AERO / wstETH 1%",
+    "liquidity_usd": 205766.5129,
+    "token0": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+    "token1": "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452",
+    "volume_24h": 75581.9459810868,
+    "created_at": "2024-05-06T05:14:53Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x681d6e4b0b020656ca04956ddaf76add7ef022f6",
+    "name": "SEDA / WETH 0.3%",
+    "liquidity_usd": 205718.7794,
+    "token0": "0x306acd0c07c430abbbb2e74ef7bde94f32a898c0",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 17632.0318873563,
+    "created_at": "2025-06-23T19:57:31Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x87d3c5e2b9985c5356abc26e3908b045e7cf2d7b",
+    "name": "HOLI / USDC 1%",
+    "liquidity_usd": 200993.346,
+    "token0": "0x896a0b1f23479e4438ad086c0bda159361294250",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 1613.6700605035,
+    "created_at": "2025-12-19T15:33:21Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x56aeaf4af2df4bdfd9d865830fefdd278b25e7ef",
+    "name": "WETH / USDC 2%",
+    "liquidity_usd": 198226.7622,
+    "token0": "0x4200000000000000000000000000000000000006",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 141018.243187038,
+    "created_at": "2025-12-29T17:05:17Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x700d91f1c3c5e430ea776245e741b84402e8de2e",
+    "name": "VFY / ZEN 0.3%",
+    "liquidity_usd": 197612.6441,
+    "token0": "0xa749de6c28262b7ffbc5de27dc845dd7ecd2b358",
+    "token1": "0xf43eb8de897fbc7f2502483b2bef7bb9ea179229",
+    "volume_24h": 61821.0633347734,
+    "created_at": "2025-09-30T11:23:30Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x44b5d0d8ce8c643c7e217e92492621c4c0ae3121",
+    "name": "OFC / USDC 0.038%",
+    "liquidity_usd": 191933.5525,
+    "token0": "0x752c5a95d202972e124390f30a50154409d3c858",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 35145.9346894755,
+    "created_at": "2026-04-16T04:47:26Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x9520e1a3bfd86da6c1e9e5ee4b9c2f11c413358f",
+    "name": "VIRTUAL / WETH 0.015%",
+    "liquidity_usd": 191416.3747,
+    "token0": "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 3005612.28290569,
+    "created_at": "2026-05-13T04:47:25Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x592e01edeb601016a20a3e6cd5bf533ebbadbc8b",
+    "name": "CHIP / USDC 0.025%",
+    "liquidity_usd": 190703.8905,
+    "token0": "0x0c1c1c109fe34733fca54b82d7b46b75cfb71f6e",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 67135.2147574816,
+    "created_at": "2026-04-21T12:15:23Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xbc3231036ee1eca03e5f67fecedc640d21610823",
+    "name": "DIEM / USDC 0.05%",
+    "liquidity_usd": 190699.0311,
+    "token0": "0xf4d97f2da56e8c3098f3a8d538db630a2606a024",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 795468.977697785,
+    "created_at": "2025-08-20T21:11:34Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x9d14ff91ae2c6e3d1a760542248b6c7f206894b0",
+    "name": "cbBTC / USDC 0.021%",
+    "liquidity_usd": 189748.1056,
+    "token0": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 1845936.15139368,
+    "created_at": "2026-04-16T04:45:02Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xa6da283cf7d06b2279626e787c329d6acf7e2994",
+    "name": "cbXRP / WETH 1%",
+    "liquidity_usd": 189572.1833,
+    "token0": "0xcb585250f852c6c6bf90434ab21a00f02833a4af",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 803527.066681313,
+    "created_at": "2025-06-04T22:42:53Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xe4e46e9cbc064953ff3e977158a6df17f5ed7f03",
+    "name": "CLAIM / USDC",
+    "liquidity_usd": 187765.4728,
+    "token0": "0x312e8d3caddc69f131aa077cea0f98ed03be66ac",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 0.0,
+    "created_at": "2026-07-29T19:30:09Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x6044c817e55a03dadc5f6b8b7045af1985ae90fa",
+    "name": "cbLTC / cbBTC 0.25%",
+    "liquidity_usd": 175521.7223,
+    "token0": "0xcb17c9db87b595717c857a08468793f5bab6445f",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 226749.528526347,
+    "created_at": "2025-06-25T19:52:11Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x275be3a43b66516e532bcaa36ee453edd47614ea",
+    "name": "LSK / WETH 0.27%",
+    "liquidity_usd": 175254.6871,
+    "token0": "0xac485391eb2d7d88253a7f1ef18c37f4242d1a24",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 7267.9880028968,
+    "created_at": "2025-11-11T08:05:10Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xdc55a0291029665fecff5ca5add0e51dd2964877",
+    "name": "MOCA / USDC 0.06%",
+    "liquidity_usd": 174870.1541,
+    "token0": "0x2b11834ed1feaed4b4b3a86a6f571315e25a884d",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 50274.8609356126,
+    "created_at": "2026-05-21T09:39:16Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xcdbe19a6ef1b633be744920c93ee40521d5cf2a6",
+    "name": "AERO / cbBTC 0.079%",
+    "liquidity_usd": 173864.086,
+    "token0": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 638938.360539431,
+    "created_at": "2026-05-13T19:31:51Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x22aee3699b6a0fed71490c103bd4e5f3309891d5",
+    "name": "WETH / cbBTC 0.01%",
+    "liquidity_usd": 173387.9954,
+    "token0": "0x4200000000000000000000000000000000000006",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 1558993.56088387,
+    "created_at": "2025-09-02T00:25:55Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xc8c15670050541255f9b797c008047682524861f",
+    "name": "LCAP / USDC 0.3%",
+    "liquidity_usd": 173003.4213,
+    "token0": "0x4da9a0f397db1397902070f93a4d6ddbc0e0e6e8",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 81893.1061082052,
+    "created_at": "2025-09-18T15:43:43Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x82312ae1bbf1864ce00dfceb974a10e0d6245b48",
+    "name": "MXNB / USDC",
+    "liquidity_usd": 170246.5586,
+    "token0": "0xf197ffc28c23e0309b5559e7a166f2c6164c80aa",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 157.3467443871,
+    "created_at": "2026-05-20T00:42:31Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x016df91005f30039c9f1a89b44db5e8c60613603",
+    "name": "PENDLE / WETH 0.05%",
+    "liquidity_usd": 166464.8435,
+    "token0": "0xa99f6e6785da0f5d6fb42495fe424bce029eeb3e",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 234718.793740194,
+    "created_at": "2024-12-14T06:44:25Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x99d9b916f55883a88713287677b05a31e436e086",
+    "name": "MRDN / USDC 1%",
+    "liquidity_usd": 165494.7961,
+    "token0": "0xe57e601c06689d3e2bf7db7bebb14b4ff28400c6",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 46193.0508313424,
+    "created_at": "2025-09-16T19:33:31Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x3693022bd390e147d8dd89a05403c80ff21dd64b",
+    "name": "ZEST / USDC 0.012%",
+    "liquidity_usd": 163405.6433,
+    "token0": "0x7297968ffb753dd12e4f6b1f18d9865c76707fc2",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 255893.724963222,
+    "created_at": "2026-06-03T15:27:11Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x6744257f30d991ff0de9f5aa2acd03f8093e7067",
+    "name": "BIO / AUBRAI 1%",
+    "liquidity_usd": 163092.9188,
+    "token0": "0x226a2fa2556c48245e57cd1cba4c6c9e67077dd2",
+    "token1": "0x9d56c29e820dd13b0580b185d0e0dc301d27581d",
+    "volume_24h": 2378.6080687792,
+    "created_at": "2025-09-01T00:24:25Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x8782d97c8b25b4d17dbfbaa03f25dc18e51e909d",
+    "name": "cbADA / cbBTC 0.25%",
+    "liquidity_usd": 160789.9421,
+    "token0": "0xcbada732173e39521cdbe8bf59a6dc85a9fc7b8c",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 1701300.63311419,
+    "created_at": "2025-06-25T19:26:22Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x98637c29abc801001c63fb0e3b94f27a65b610ac",
+    "name": "USDL / WETH 0.05%",
+    "liquidity_usd": 159630.6796,
+    "token0": "0x78e8cf657742e10eac8f64007615aa741fc76414",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 189241.780245397,
+    "created_at": "2026-01-27T17:17:22Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xb4cfcd4a4bc44bbc33fc0928d932e9062be2d056",
+    "name": "TIG / WETH 0.3%",
+    "liquidity_usd": 158367.8828,
+    "token0": "0x0c03ce270b4826ec62e7dd007f0b716068639f7b",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 29947.5246836822,
+    "created_at": "2025-09-17T17:13:01Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x0040559f59e2391ec57162826df354b1bbb05c12",
+    "name": "RED / WETH 0.3%",
+    "liquidity_usd": 156724.7781,
+    "token0": "0x4eb92702ba4cfbf80561bad64d89c706ac824960",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 91028.1710305901,
+    "created_at": "2026-04-22T22:03:11Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x1a03d2759d43c262c0fe6f2f1f6e9b6fded62de9",
+    "name": "cadd / USDC",
+    "liquidity_usd": 155321.6333,
+    "token0": "0x16f93ebc5320c89efc8701577efe49d14a276a06",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 649.9535600247,
+    "created_at": "2026-06-11T13:24:43Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x98c7a2338336d2d354663246f64676009c7bda97",
+    "name": "USDC / USDbC 0.01%",
+    "liquidity_usd": 153092.2166,
+    "token0": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "token1": "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",
+    "volume_24h": 200572.195738976,
+    "created_at": "2024-05-06T05:07:53Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xd7338b6f338da54b922bbbc6fbe3efedd5ce35fa",
+    "name": "FLOCK / USDC 0.05%",
+    "liquidity_usd": 146807.8264,
+    "token0": "0x5ab3d4c385b400f3abb49e80de2faf6a88a7b691",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 202259.090104311,
+    "created_at": "2025-08-27T22:26:53Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xb0b3303ed186c01cdc4456e45d17a622e3860c64",
+    "name": "KRWQ / USDC 0.05%",
+    "liquidity_usd": 146238.2409,
+    "token0": "0x370923d39f139c64813f173a1bf0b4f9ba36a24f",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 26580.7207660243,
+    "created_at": "2025-10-07T06:00:03Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xdbc6998296caa1652a810dc8d3baf4a8294330f1",
+    "name": "WETH / USDC 0.01%",
+    "liquidity_usd": 144718.1923,
+    "token0": "0x4200000000000000000000000000000000000006",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 713322.091225893,
+    "created_at": "2025-08-27T17:30:22Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x8343c68279587498526114e6385f0a87f248e0d9",
+    "name": "LFI / USDC",
+    "liquidity_usd": 143666.6837,
+    "token0": "0x3722264ab15a1dfce5a5af89e6547f7949a8aba3",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 386823.232392703,
+    "created_at": "2026-05-05T05:23:53Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x183cefd0928ea4d54c9d726dd975fab561705c86",
+    "name": "EURAU / USDC 0.05%",
+    "liquidity_usd": 142588.7432,
+    "token0": "0x4933a85b5b5466fbaf179f72d3de273c287ec2c2",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 8863.5165382549,
+    "created_at": "2026-02-16T17:18:04Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x0f664affb82f074937d5cfcd61b97f3f32d5dc50",
+    "name": "TIBBIR / WETH 0.3%",
+    "liquidity_usd": 138776.9014,
+    "token0": "0xa4a2e2ca3fbfe21aed83471d28b6f65a233c6e00",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 320229.754975228,
+    "created_at": "2025-02-04T18:03:58Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x62916b911f2b64d0e3a3b72472d6f8c08c75dcaa",
+    "name": "cbXRP / cbBTC 0.25%",
+    "liquidity_usd": 137118.3718,
+    "token0": "0xcb585250f852c6c6bf90434ab21a00f02833a4af",
+    "token1": "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",
+    "volume_24h": 1082391.93198183,
+    "created_at": "2026-04-16T04:48:34Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x3083b87e8b9909cf659d96473bc61377a7603f77",
+    "name": "PEPTAI / USDC 1%",
+    "liquidity_usd": 136439.6296,
+    "token0": "0x54f16bd3996169914c84dbb2a16635100cf48a0a",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 20987.0510181853,
+    "created_at": "2026-05-14T13:21:27Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xf2c832b6999f0246ed504c69ac1bfb97de0b8d50",
+    "name": "PLAY / USDC 0.3%",
+    "liquidity_usd": 133140.9631,
+    "token0": "0x853a7c99227499dba9db8c3a02aa691afdebf841",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 14173.2367722248,
+    "created_at": "2025-10-06T10:11:19Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x09da4832d34bebbb55783340d5bede7a70f5c48e",
+    "name": "CADC / USDC 0.05%",
+    "liquidity_usd": 131701.5299,
+    "token0": "0x043eb4b75d0805c43d7c834902e335621983cf03",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 19210.8619426724,
+    "created_at": "2025-03-13T00:07:51Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xccd9cc53b63662088c738b8bc06e9078fb8d9ad4",
+    "name": "AERO / USDC 0.3%",
+    "liquidity_usd": 129162.2293,
+    "token0": "0x940181a94a35a4569e4529a3cdfb74e38fd98631",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 302951.459692736,
+    "created_at": "2025-09-15T14:47:21Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x4e392fbfe4d0557c82d2f97f02ec39daa31516dd",
+    "name": "WETH / USDC 0.008%",
+    "liquidity_usd": 129154.6271,
+    "token0": "0x4200000000000000000000000000000000000006",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 4885093.11062139,
+    "created_at": "2026-04-16T04:45:08Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xabe1f289107c20081f591bb3972b8289add64f6c",
+    "name": "hTEA / USDC 0.3%",
+    "liquidity_usd": 128650.2298,
+    "token0": "0xa1a0b2e02b0e6830ad5a4a7211691200945d8919",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 5785.2294530006,
+    "created_at": "2026-05-29T23:50:03Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x2a5eeea4d91042f779ee6014f4f6fd41f375262d",
+    "name": "MOCA / MENTE 0.001%",
+    "liquidity_usd": 128058.3824,
+    "token0": "0x2b11834ed1feaed4b4b3a86a6f571315e25a884d",
+    "token1": "0x4cd9a847f39106e19a4e41aea8a232e915c82af5",
+    "volume_24h": 15432.7918111445,
+    "created_at": "2026-05-18T22:08:41Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x4ae0272a740950d3d9b12a6ee9d5ca6b6aaf0efd",
+    "name": "TIBBIR / USDC 1%",
+    "liquidity_usd": 125207.7119,
+    "token0": "0xa4a2e2ca3fbfe21aed83471d28b6f65a233c6e00",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 1037.4281217988,
+    "created_at": "2025-08-25T21:09:51Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xcdd442e2de893c07146b2f1072f8e077559f9aa4",
+    "name": "BNKR / WETH 0.3%",
+    "liquidity_usd": 123195.9499,
+    "token0": "0x22af33fe49fd1fa80c7149773dde5890d3c76f3b",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 556179.422483741,
+    "created_at": "2025-01-17T15:13:12Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x66486992257a95e24008b9a63bacee578509c1fb",
+    "name": "PEAK / VIRTUAL",
+    "liquidity_usd": 120962.5403,
+    "token0": "0x296eb9c4d8fcbd00fbc6d5027e4202bf955fa76f",
+    "token1": "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",
+    "volume_24h": 13766.5542961396,
+    "created_at": "2026-06-06T14:11:11Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xc5e51044eb7318950b1afb044fccfb25782c48c1",
+    "name": "EURC / USDC 0.01%",
+    "liquidity_usd": 120860.7186,
+    "token0": "0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 2076888.28496604,
+    "created_at": "2024-11-03T01:26:52Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x4858ba5a92a23de1b2dbb3509b01d0a9f0e0756a",
+    "name": "oUSDT / USDC 0.01%",
+    "liquidity_usd": 120645.8008,
+    "token0": "0x1217bfe6c773eec6cc4a38b5dc45b92292b6e189",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 246074.306262943,
+    "created_at": "2025-04-06T00:50:32Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xa00b220f4173742b245f1f64feba9cc89c0b333e",
+    "name": "CAS / VIRTUAL",
+    "liquidity_usd": 119675.9817,
+    "token0": "0xf1070fd43cd11af8da18ff4edfb1a18279cd6f67",
+    "token1": "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",
+    "volume_24h": 657.2919686946,
+    "created_at": "2026-06-02T18:00:05Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x885c451925cf72a1e8c9a1c76c0215fe275f11ba",
+    "name": "RLV / USDC 1%",
+    "liquidity_usd": 118198.884,
+    "token0": "0x03699469849a6cf876a65b4fd01fbd663c401127",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 1.38099906,
+    "created_at": "2025-11-25T11:10:38Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xd23fe2db317e1a96454a2d1c7e8fc0dbf19bb000",
+    "name": "CLANKER / WETH 0.3%",
+    "liquidity_usd": 118195.2288,
+    "token0": "0x1bc0c42215582d5a085795f4badbac3ff36d1bcb",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 264926.712310477,
+    "created_at": "2024-11-25T16:37:41Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x200681425b0c8d78c6a467512c5d49fa56bac88a",
+    "name": "cbLTC / WETH 0.25%",
+    "liquidity_usd": 117942.5563,
+    "token0": "0xcb17c9db87b595717c857a08468793f5bab6445f",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 265421.345516211,
+    "created_at": "2025-06-25T20:15:29Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-2",
+    "pool": "0x08d019e43ce77cfc8392a77dbb2813c4ffb59598",
+    "name": "GALE / USDC 1%",
+    "liquidity_usd": 116514.4126,
+    "token0": "0xd9bf9127e37d33514aa485ff7d3b26f1f5298411",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 1.4364297866,
+    "created_at": "2025-11-21T11:30:30Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x653489511b193db2ba980d29dbfc36e924e50381",
+    "name": "VANA / USDC 0.024%",
+    "liquidity_usd": 116243.0331,
+    "token0": "0x7ff7fa94b8b66ef313f7970d4eebd2cb3103a2c0",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 27994.6984166922,
+    "created_at": "2026-07-06T23:23:21Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0xba585d3fff2626bf77bdf0d8407bd4e0befb97c9",
+    "name": "SLINKY / USDC",
+    "liquidity_usd": 113541.5369,
+    "token0": "0xbb3d6c47379abb4713acffffa27483b726ee67db",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 136.5467176968,
+    "created_at": "2026-08-18T10:34:53Z"
+  },
+  {
+    "dex": "aerodrome-slipstream-3",
+    "pool": "0x9cb312de396e90fa51850452718bd7138da2bdcf",
+    "name": "AAA / USDC",
+    "liquidity_usd": 113342.1413,
+    "token0": "0xaaa843fb2916c0b57454270418e121c626402aaa",
+    "token1": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    "volume_24h": 15927.2915472596,
+    "created_at": "2026-05-27T17:42:53Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xfd612e33f07f1070f8f325bc25fff94fbefbd372",
+    "name": "ALTT / VIRTUAL 1%",
+    "liquidity_usd": 108178.6167,
+    "token0": "0x1b5ce2a593a840e3ad3549a34d7b3dec697c114d",
+    "token1": "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",
+    "volume_24h": 11820.7168851606,
+    "created_at": "2025-08-15T06:51:40Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0xb862f23ba38c8c65e256782b31e8c08c9aefd612",
+    "name": "cbADA / WETH 0.25%",
+    "liquidity_usd": 107127.6708,
+    "token0": "0xcbada732173e39521cdbe8bf59a6dc85a9fc7b8c",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 790678.620873641,
+    "created_at": "2025-06-25T20:21:08Z"
+  },
+  {
+    "dex": "aerodrome-slipstream",
+    "pool": "0x4ba1e3e9280facbacafa7baf4ae0b78bea60beca",
+    "name": "SPX / WETH 0.3%",
+    "liquidity_usd": 102927.5782,
+    "token0": "0x50da645f148798f68ef2d7db7c1cb22a6819bb2c",
+    "token1": "0x4200000000000000000000000000000000000006",
+    "volume_24h": 96363.1280578415,
+    "created_at": "2024-10-02T16:54:16Z"
+  }
+]
