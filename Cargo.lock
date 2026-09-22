@@ -241,11 +241,14 @@ dependencies = [
 name = "apex-venues"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "apex-math",
+ "apex-types",
  "async-trait",
  "dashmap 5.5.3",
  "ethers",
+ "ethers-core",
  "hex",
  "hex-literal",
  "lru",

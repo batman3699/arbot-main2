@@ -17,6 +17,8 @@
 //! replaces that env plane with injected configuration. The same is true of
 //! the five CL switches still in `arb_exec::cl_sim`.
 
+pub mod adapter;
+pub mod breaker;
 pub mod cl_load;
 pub mod cl_ticks;
 pub mod discovery;
@@ -27,6 +29,7 @@ pub mod quote_curve;
 pub mod quote_slipstream;
 pub mod quote_univ2;
 pub mod quote_univ3;
+pub mod revert;
 
 /// Crate version, exposed so workspace wiring is testable before any adapter
 /// is consumed.

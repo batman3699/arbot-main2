@@ -85,6 +85,8 @@ jobs:
         # `*secret*` swallowed three of them through Phases 0 and 1 and nothing
         # noticed, because everything ran against the working tree.
         run: ./scripts/ci/no_ignored_sources.sh
+      - name: no VenueAdapter method has a default body (§10.4)
+        run: ./scripts/ci/no_adapter_defaults.sh
       - name: no shared mutable published state (INV-11)
         run: ./scripts/ci/no_shared_mutable_state.sh
       - name: no GasLimit/GasUsed conversion (INV-19)

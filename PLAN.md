@@ -3157,11 +3157,66 @@ on that is then wrong.
 
 ### Task 2.3 — `VenueAdapter` and per-venue circuit breakers
 
-- [ ] **Step 1: Write the failing tests** — every admitted venue has an adapter implementing all six methods; `gas_model` and `classify_revert` have no default impls; each adapter has an independent breaker that can trip without affecting others.
-- [ ] **Step 2: Run and observe the failures.**
-- [ ] **Step 3: Implement.** Delete `src/venue_adapter.rs`.
-- [ ] **Step 4: Run and observe the passes.**
-- [ ] **Step 5: Commit.**
+- [x] **Step 1: Write the failing tests** — every admitted venue has an adapter implementing all six methods; `gas_model` and `classify_revert` have no default impls; each adapter has an independent breaker that can trip without affecting others.
+- [x] **Step 2: Run and observe the failures.**
+- [x] **Step 3: Implement.** (`src/venue_adapter.rs` is deleted in Task 2.7 with the rest of the legacy pricing surface — it has zero implementors, so nothing depends on the order.)
+- [x] **Step 4: Run and observe the passes.**
+- [x] **Step 5: Commit.**
+
+**Delivered 2026-09-23**, with four decisions worth recording.
+
+**Five methods now, two later, none by default.** §10.4 sketches seven.
+`simulate_call_graph` and `encode_exact` are typed over `CallGraph` and
+`EncodedAction`, which belong to Phases 4 and 5; inventing those shapes now
+would mean guessing at two phases of design and then contradicting the guess.
+They are not declared. The risk in leaving them out is the obvious one — when
+Phase 4 adds `simulate_call_graph`, the path of least resistance is a default
+body so existing adapters keep compiling, which is exactly the failure the
+no-defaults rule guards against. `scripts/ci/no_adapter_defaults.sh` reads the
+trait block and fails if any method signature ends in `{` instead of `;`, so
+the rule holds for methods that do not exist yet. Mutation-tested.
+
+**Not one venue gas figure has ever been measured.** The six constants in
+`venues.rs` (`ESTIMATED_GAS_UNIV3 = 140_000` and friends) are round numbers
+with no recorded source, and gas is a first-order term in the profit decision —
+an unmeasured gas number is precisely the "hidden economic assumption" §8.3
+forbids. `GasModel` now carries `GasProvenance`, and every adapter returns
+`UnmeasuredLegacyConstant`. A test asserts that, and is expected to fail in
+Phase 3 when the measurements land: the way to satisfy it is to measure, not to
+edit a comment.
+
+**Curve and Balancer have adapters that refuse.** Both are `abigen!` clients
+with no local curve implementation, so `quote_exact` returns
+`NotRepresentable`. They get adapters anyway so the venues are visible to the
+registry, the breaker and the metrics, and so the absence of local maths is a
+value the caller receives rather than a venue that silently is not there. A
+quote that forwarded the on-chain quoter's number and called itself exact would
+make INV-16 — *"no router quote is authoritative"* — a dead letter.
+
+**Losing a race is not a venue fault.** The breaker's real judgement is what
+counts as a failure, and `counts_against_venue` is exhaustive over
+`RevertClass` with no catch-all so a new class forces the decision.
+`MinOutNotMet` does not count: it means someone moved the pool between quote
+and execution, it happens most on the venues with the most flow, and counting
+it would trip exactly the venues worth trading on. `OutOfGas` does not count
+either — a gas ceiling is ours to set, and tripping the venue hides the fix.
+`Unknown` does count: an unexplained failure on one venue is when to back off.
+
+Two things the implementation caught that the specification did not:
+
+* **A dropped probe permit would have wedged a venue permanently.** The
+  half-open state admits exactly one caller, claimed by compare-and-swap. If
+  that caller panicked or returned early on `?` before reporting, the claim was
+  never released and `try_admit` refused every caller for the life of the
+  process — a permanent outage caused by an error path, on the one venue that
+  had just started recovering. `Permit` is now RAII: `Drop` resolves an
+  unreported probe as a failure, which is the conservative reading of "we
+  admitted a call and never heard back".
+* **Empty revert data is not evidence of out-of-gas.** It is what an
+  out-of-gas frame returns, and also a bare `revert()`, a call to an address
+  with no code, and several assembly paths. `RevertClass::OutOfGas` has to come
+  from gas accounting, which the classifier does not see. Guessing would tell
+  the risk engine to raise gas limits in response to a venue rejecting us.
 
 ### Task 2.4 — Pool admissibility and registry verification (§6.3, C-11/B-7)
 

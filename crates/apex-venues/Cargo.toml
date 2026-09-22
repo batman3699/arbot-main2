@@ -9,6 +9,7 @@ description = "Venue adapters: the RPC clients, loaders and quoters that fetch w
 # way round -- that direction is what the Phase 2 scope correction established,
 # and it is the reason ClPoolState and the CL swap loop live over there.
 apex-math = { path = "../apex-math" }
+apex-types = { path = "../apex-types" }
 # Full ethers here, unlike apex-math: this crate's whole job is talking to a
 # node.
 ethers = { version = "2.0.14", features = ["abigen", "ws", "rustls"] }
@@ -27,3 +28,10 @@ rust_decimal = { version = "1", default-features = false, features = ["maths", "
 # caught.
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing = "0.1"
+
+[dev-dependencies]
+# The adapter tests build states with ethers-core types (what apex-math speaks)
+# and ids with alloy (what apex-types speaks). The conversion boundary is the
+# subject of C-10 and lands in Phase 17.
+ethers-core = "2.0.14"
+alloy-primitives = "0.8"
