@@ -11,6 +11,7 @@
 //! an address field and gets treated as real.
 
 mod env;
+pub mod env_migration;
 mod schema;
 mod secret;
 

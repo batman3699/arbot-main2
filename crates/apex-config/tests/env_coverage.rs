@@ -1,0 +1,156 @@
+//! Task 0.5: every legacy `ARBOT_*` variable is accounted for exactly once.
+//!
+//! Enforced in BOTH directions. A variable present in the source but missing
+//! from the manifest fails, and a manifest entry no longer present in the source
+//! fails too -- otherwise the table silently rots into fiction as modules
+//! migrate, which is this repository's most-repeated failure mode (four
+//! instances of something written in one phase and never wired in the next).
+
+use apex_config::env_migration::{count_for, lookup, Destination, LEGACY_ENV_VARS};
+use std::collections::BTreeSet;
+
+/// Scan the legacy crate for `ARBOT_*` identifiers.
+fn vars_in_source() -> BTreeSet<String> {
+    let root = format!("{}/../arb-exec-legacy/src", env!("CARGO_MANIFEST_DIR"));
+    let mut found = BTreeSet::new();
+    walk(std::path::Path::new(&root), &mut |text| {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while let Some(rel) = text[i..].find("ARBOT_") {
+            let start = i + rel;
+            let mut end = start + "ARBOT_".len();
+            while end < bytes.len()
+                && (bytes[end].is_ascii_uppercase() || bytes[end].is_ascii_digit() || bytes[end] == b'_')
+            {
+                end += 1;
+            }
+            found.insert(text[start..end].to_string());
+            i = end;
+        }
+    });
+    found
+}
+
+fn walk(dir: &std::path::Path, f: &mut impl FnMut(&str)) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk(&p, f);
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                f(&text);
+            }
+        }
+    }
+}
+
+#[test]
+fn every_legacy_env_var_is_accounted_for() {
+    let found = vars_in_source();
+    assert!(!found.is_empty(), "scanner found nothing -- it is broken, not the source");
+
+    let unaccounted: Vec<&String> = found.iter().filter(|v| lookup(v).is_none()).collect();
+    assert!(
+        unaccounted.is_empty(),
+        "these ARBOT_* variables have no migration destination: {unaccounted:#?}\n\
+         Add them to apex_config::env_migration::LEGACY_ENV_VARS with a destination \
+         and a reason. Blueprint §2.4 forbids late configuration lookup; a variable \
+         with no owning crate is one that never gets retired."
+    );
+}
+
+#[test]
+fn the_manifest_has_not_rotted() {
+    // The other direction. An entry for a variable that no longer exists means
+    // the table is describing a codebase that has moved on.
+    let found = vars_in_source();
+    let stale: Vec<&str> = LEGACY_ENV_VARS
+        .iter()
+        .map(|e| e.name)
+        .filter(|n| !found.contains(*n))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "manifest entries with no remaining call site: {stale:#?}\n\
+         The variable is gone -- delete the entry, or move it to the phase notes \
+         if it was genuinely retired."
+    );
+}
+
+#[test]
+fn no_variable_is_listed_twice() {
+    let mut seen = BTreeSet::new();
+    for e in LEGACY_ENV_VARS {
+        assert!(seen.insert(e.name), "{} appears twice in the manifest", e.name);
+    }
+    assert_eq!(seen.len(), LEGACY_ENV_VARS.len());
+}
+
+#[test]
+fn every_entry_carries_a_reason() {
+    for e in LEGACY_ENV_VARS {
+        assert!(!e.note.trim().is_empty(), "{} has no note", e.name);
+        assert!(
+            e.note.len() > 12,
+            "{}'s note is too short to be a reason: {:?}",
+            e.name,
+            e.note
+        );
+    }
+}
+
+#[test]
+fn the_dispatch_path_destinations_are_populated() {
+    // A sanity check on the classification itself: if everything landed in one
+    // bucket the manifest would be shaped like a to-do list rather than a plan.
+    for d in [
+        Destination::State,
+        Destination::Math,
+        Destination::Search,
+        Destination::Econ,
+        Destination::Sim,
+        Destination::Capture,
+        Destination::Chain,
+    ] {
+        assert!(count_for(d) > 0, "no variable is destined for {d:?}");
+    }
+}
+
+#[test]
+fn test_only_variables_are_not_read_on_the_trading_path() {
+    // A TestOnly classification is a claim, so check it rather than trust it.
+    //
+    // main.rs carries its own `#[cfg(test)] mod tests` -- 16,659 lines with the
+    // tests at the bottom -- so a naive `contains` over the whole file reports
+    // every fixture variable as production. Truncate at the test module first.
+    // (That crude version did fire on ARBOT_FORK_RPC_URL, which turned out to
+    // sit in a #[tokio::test]; the classification was right and the detector
+    // was wrong.)
+    let main = std::fs::read_to_string(format!(
+        "{}/../arb-exec-legacy/src/main.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("read main.rs");
+
+    let production = match main.find("#[cfg(test)]") {
+        Some(i) => &main[..i],
+        None => &main[..],
+    };
+    assert!(
+        production.len() < main.len(),
+        "main.rs has no #[cfg(test)] module; this test's assumption no longer holds"
+    );
+
+    let leaked: Vec<&str> = LEGACY_ENV_VARS
+        .iter()
+        .filter(|e| e.destination == Destination::TestOnly)
+        .map(|e| e.name)
+        .filter(|n| production.contains(*n))
+        .collect();
+
+    assert!(
+        leaked.is_empty(),
+        "classified TestOnly but read by production code in main.rs: {leaked:#?}"
+    );
+}
