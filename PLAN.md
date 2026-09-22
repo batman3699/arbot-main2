@@ -225,7 +225,7 @@ These are recorded rather than silently compromised, per the task mandate. Each 
 | **B-10** | **Acknowledgement conflated with submission.** No `transport_accepted` / `node_known` / `sequencer_received` / `preconfirmed` / `included` / `finalized` ladder. | Medium | `dispatch_call`, `classify_receipt` |
 | **B-11** | **Binary targets undeclared.** `src/bin/ingest.rs`, `cycle_index_stats.rs`, `ws_probe.rs` are implicit targets; only `arb-exec` and `cl_parity` are declared. `cargo test --lib` therefore misses binary-crate tests (`sizing`, `hot_pools`). | Medium | `Cargo.toml` vs `src/bin/` |
 | **B-14** | **Lane protection is undocumented, not absent.** Base's submission lanes use **provider-level MEV protection** rather than builder relays: the configured `https://base.blockpi.network/v1/rpc/{key}` is BlockPI's keyed endpoint, whose MEV protection is a per-endpoint toggle **enabled by default** (their public endpoint is the different `base.public.blockpi.network/...` host), and BlockPI additionally offers a **bundle service on Base**. The Flashbots/Titan/Beaver entries at `ops/inputs.yaml:79-81` belong to ethereum because Base has no builder market — a centralized sequencer instead — so a different protection architecture is correct here, not a misconfiguration. **What is genuinely missing is evidence, not protection:** nothing in the repo records what each lane guarantees, and §14.1's EV model prices lanes by policy. `ARCHITECTURE_PIVOT_HANDOFF.md §6.6` asserted these were unprotected; that assertion is **superseded**. | Low (documentation) | `.env:74`; [BlockPI MEV protection](https://blockpi.io/blog/new-features-mev-protection-is-live-263d6d8410a3/), [supported networks](https://docs.blockpi.io/build/supported-networks-and-advanced-features) |
-| **B-13** | **`forge test` was not green, and the Phase 0 gate would have baked that in — two non-hermetic deploy tests.** *Diagnosed and FIXED in Phase 0 Task 0.2a; the original characterization below it was wrong and is corrected here.* Both failures had one root cause: **forge auto-loads `.env`, and the tests set unprefixed env keys while `.env` supplies prefixed ones that correctly outrank them.** `.env:32` sets `ETH_UNIV3_ROUTER` (one of 22 `ETH_*` keys; there are no `ETHEREUM_*` keys), so with `CHAIN=eth` the canonical key won and the alias-fallback branch was never reached — proved by commenting the line, which turned the test green. `.env:47` sets `BASE_EXECUTOR_OWNER` to exactly the address in the second failure message, and `.env:14` sets `CHAIN=base`. A compounding hazard: `DeployEnvPrefix.t.sol` writes `CHAIN` via `vm.setEnv`, and env writes persist for the whole run, so the resolved prefix depended on test order. **`Deploy.s.sol`'s precedence logic is correct** — prefixed beats unprefixed is the intended rule. **The suite is flaky, not red** — 8 unmodified runs gave a varying failing set (67/0, 65/2, 67/0, 66/1, 67/0, 67/0, 67/0, 66/1), so the "2 failures" at first freeze were a sample, not a fixed pair. Every affected test passes in isolation; they poison each other. Confined to the 15 `test/Deploy*.t.sol` tests — the other 52 are clean. Test-level fixes and `threads = 1` were tried and gave no measurable gain (11/4 vs 11/3 per-file), and were reverted. No `unsetEnv` cheatcode exists in forge 1.7. | ~~High~~ **Medium (test architecture), OPEN — blocks the Phase 0 exit gate** | `.env:14,32,47`; `docs/apex/BASELINE.md` |
+| **B-13** | **`forge test` was not green, and the Phase 0 gate would have baked that in — two non-hermetic deploy tests.** *Diagnosed and FIXED in Phase 0 Task 0.2a; the original characterization below it was wrong and is corrected here.* Both failures had one root cause: **forge auto-loads `.env`, and the tests set unprefixed env keys while `.env` supplies prefixed ones that correctly outrank them.** `.env:32` sets `ETH_UNIV3_ROUTER` (one of 22 `ETH_*` keys; there are no `ETHEREUM_*` keys), so with `CHAIN=eth` the canonical key won and the alias-fallback branch was never reached — proved by commenting the line, which turned the test green. `.env:47` sets `BASE_EXECUTOR_OWNER` to exactly the address in the second failure message, and `.env:14` sets `CHAIN=base`. A compounding hazard: `DeployEnvPrefix.t.sol` writes `CHAIN` via `vm.setEnv`, and env writes persist for the whole run, so the resolved prefix depended on test order. **`Deploy.s.sol`'s precedence logic is correct** — prefixed beats unprefixed is the intended rule. **The suite is flaky, not red** — 8 unmodified runs gave a varying failing set (67/0, 65/2, 67/0, 66/1, 67/0, 67/0, 67/0, 66/1), so the "2 failures" at first freeze were a sample, not a fixed pair. Every affected test passes in isolation; they poison each other. Confined to the 15 `test/Deploy*.t.sol` tests — the other 52 are clean. Test-level fixes and `threads = 1` were tried and gave no measurable gain (11/4 vs 11/3 per-file), and were reverted. No `unsetEnv` cheatcode exists in forge 1.7. | ~~High~~ **Medium (test architecture), QUARANTINED** — operator decision 2026-09-22: excluded from the Phase 0 gate, fixed in Phase 5 Task 5.7 when `Deploy.s.sol` is rewritten for the new contract set anyway. Writing this test architecture twice is poor next-dollar allocation (§52). | `.env:14,32,47`; `docs/apex/BASELINE.md` |
 | **B-12** | **200+ MB of build artifacts and logs in-tree.** `grafana-10.4.2.linux-amd64.tar.gz` (119 MB), `prometheus-2.52.0.linux-amd64.tar.gz` (105 MB), `arbot-live.log` (5.3 MB), `out/` (50 dirs), 30+ `.bak.<epoch>` files. | Medium | `ls -la` |
 
 ## 3.5 What is architecturally obsolete
@@ -2771,7 +2771,7 @@ fn dotenv_fallback_resolves_to_the_workspace_root_not_the_crate() {
 **Acceptance criteria:**
 1. `cargo check --workspace --all-targets` matches the Task 0.1 baseline exactly (no new warnings or errors).
 2. `cargo test --workspace --all-targets` passes, including every pre-existing test.
-3. `forge test` is **deterministic**, and green on whatever scope the B-13 decision defines. Note the amendment: "fully green" was the original wording, written before the suite was known to be *flaky* rather than merely red. Determinism is the real requirement — a gate that passes 5 runs in 8 certifies nothing. The 52 non-Deploy tests must be green unconditionally (`forge test --no-match-path 'test/Deploy*'` → 52/0 today).
+3. `forge test --no-match-path 'test/Deploy*'` is **52/0, deterministically**, verified over 5 consecutive runs. The 15 `test/Deploy*.t.sol` tests are **quarantined** under B-13 and excluded from this gate until Phase 5 Task 5.7. Note the amendment: the original wording was "fully green", written before the suite was known to be *flaky* rather than merely red — determinism is the real requirement, since a gate that passes 5 runs in 8 certifies nothing.
 4. CI runs on push and enforces the gates listed in §32.
 5. `git log --follow` works on `crates/apex-config/src/ops.rs` (history preserved).
 6. Repository working-tree size reduced by ≥ 200 MB with no tracked source lost.
@@ -3333,6 +3333,36 @@ function testGenericStepCanCallAnyTarget() external {
 - [ ] **Step 2:** Run `forge test` and `make check-contract-size`; confirm the runtime size gate passes with margin.
 - [ ] **Step 3:** Resolve `BatchRouter.sol` from `UNKNOWN`: trace callers; if none, remove.
 - [ ] **Step 4:** Commit.
+
+### Task 5.7 — Retire the deploy tests' process-global env dependence (B-13)
+
+Quarantined at Phase 0; due here because this phase rewrites `script/Deploy.s.sol` for the new contract set, so the tests are being touched anyway.
+
+- [ ] **Step 1: Write the failing test** — `test/DeployHermetic.t.sol` asserting that a deploy's resolved configuration is a pure function of explicit inputs, with no read of `vm.envOr`/`vm.envAddress` on the path:
+
+```solidity
+function testResolvedConfigIsIndependentOfAmbientEnv() external {
+    // Same explicit config must produce the same resolution regardless of what
+    // the process environment says. Today this fails: .env supplies CHAIN=base,
+    // ETH_UNIV3_ROUTER and BASE_EXECUTOR_OWNER, and prefixed keys outrank the
+    // unprefixed ones a test can set.
+    vm.setEnv("CHAIN", "optimism");
+    DeployConfig memory a = deployScript.resolveConfig(explicitConfig());
+    vm.setEnv("CHAIN", "eth");
+    DeployConfig memory b = deployScript.resolveConfig(explicitConfig());
+    assertEq(keccak256(abi.encode(a)), keccak256(abi.encode(b)));
+}
+
+function testDeployTestsDoNotWriteProcessEnv() external {
+    // vm.setEnv is global and persists for the whole run; no test may rely on it.
+    assertEq(vm.ffi(grepForSetEnvUnder("test/Deploy")).length, 0);
+}
+```
+
+- [ ] **Step 2: Run and observe the failures** — both fail today; §3.4 B-13 and `docs/apex/BASELINE.md` carry the measured evidence and the list of approaches already tried and reverted, which must not be retried.
+- [ ] **Step 3: Implement** a `resolveConfig(DeployConfig explicit)` seam on `Deploy` so the environment is read in exactly one place at the top and everything below is pure. Tests pass a struct; production passes the env-derived one.
+- [ ] **Step 4: Run and observe** the full `forge test` deterministic and green over 10 consecutive runs — the acceptance bar Phase 0 could not meet.
+- [ ] **Step 5: Commit**, and lift the B-13 quarantine from the Phase 0 gate wording.
 
 ### Task 5.6 — Invariant fuzzing and external review
 
