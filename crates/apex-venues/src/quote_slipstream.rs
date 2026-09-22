@@ -1,6 +1,6 @@
 use crate::quote_cl::{cl_quote_path, cl_quote_path_grid, ClQuoteCache};
 use crate::quote_univ3::UniV3ValidationConfig;
-use crate::util::encode_univ3_path;
+use crate::path::encode_univ3_path;
 use anyhow::{ensure, Result};
 use ethers::prelude::*;
 use ethers::providers::JsonRpcClient;
@@ -263,7 +263,7 @@ pub fn default_slipstream_validation_base() -> UniV3ValidationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::encode_univ3_path;
+    use crate::path::encode_univ3_path;
 
     #[test]
     fn tick_spacing_path_encoding_matches_univ3_layout() {

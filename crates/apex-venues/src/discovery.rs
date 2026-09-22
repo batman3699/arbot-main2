@@ -194,7 +194,10 @@ fn scale_reserve(reserve: U256, decimals: Option<u8>) -> Decimal {
     if reserve.is_zero() {
         return Decimal::ZERO;
     }
-    let mut value = crate::util::u256_to_decimal(reserve);
+    // `util::u256_to_decimal` stayed in the legacy crate -- it has other
+    // callers there and is not a venue concern. It is one expression, and
+    // duplicating one expression beats a dependency edge pointing backwards.
+    let mut value = Decimal::from_str_exact(&reserve.to_string()).unwrap_or(Decimal::MAX);
     if let Some(decimals) = decimals {
         let divisor = Decimal::from(10u64)
             .checked_powu(decimals as u64)

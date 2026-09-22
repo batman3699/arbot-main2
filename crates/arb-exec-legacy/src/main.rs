@@ -7,12 +7,10 @@ mod continuity;
 mod convex;
 mod cl_sim;
 mod cl_parity_gate;
-mod cl_ticks;
 #[cfg(test)]
 mod config_validation;
 mod base_fast;
 mod cycle_index;
-mod discovery;
 mod fees;
 mod flash_loan;
 mod graph;
@@ -29,9 +27,6 @@ mod metrics;
 mod ops_inputs;
 mod plan;
 mod pool_store;
-mod quote_balancer;
-mod quote_cl;
-mod quote_curve;
 // Moved to `apex-math` in Phase 2 (PLAN.md §33 Phase 2, scope correction).
 // Re-exported at the crate root so every `crate::math::...` / `crate::cl_swap::...`
 // path in this crate keeps resolving: the move is a relocation, not a rename,
@@ -41,9 +36,18 @@ pub use apex_math::cl_swap;
 pub use apex_math::math;
 pub use apex_math::quote_common;
 pub use apex_math::quote_solidly;
-mod quote_univ2;
-mod quote_univ3;
-mod quote_slipstream;
+// Moved to `apex-venues` in Phase 2 (PLAN.md §33 Phase 2, scope correction):
+// every one of these carries an `abigen!` block, a `Provider` or an `async fn`.
+// Re-exported at the crate root so `crate::quote_cl::...` and friends keep
+// resolving from the ~40 call sites that have not moved yet.
+pub use apex_venues::cl_ticks;
+pub use apex_venues::discovery;
+pub use apex_venues::quote_balancer;
+pub use apex_venues::quote_cl;
+pub use apex_venues::quote_curve;
+pub use apex_venues::quote_slipstream;
+pub use apex_venues::quote_univ2;
+pub use apex_venues::quote_univ3;
 mod quote_univ4;
 mod reconcile;
 mod registry;

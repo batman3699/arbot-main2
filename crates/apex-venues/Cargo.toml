@@ -1,0 +1,29 @@
+[package]
+name = "apex-venues"
+version = "0.1.0"
+edition = "2021"
+description = "Venue adapters: the RPC clients, loaders and quoters that fetch what apex-math prices."
+
+[dependencies]
+# The pure pricing layer. apex-venues depends on apex-math and never the other
+# way round -- that direction is what the Phase 2 scope correction established,
+# and it is the reason ClPoolState and the CL swap loop live over there.
+apex-math = { path = "../apex-math" }
+# Full ethers here, unlike apex-math: this crate's whole job is talking to a
+# node.
+ethers = { version = "2.0.14", features = ["abigen", "ws", "rustls"] }
+anyhow = "1"
+async-trait = "0.1"
+dashmap = "5"
+hex = "0.4"
+hex-literal = "0.4"
+lru = "0.12"
+once_cell = "1"
+rust_decimal = { version = "1", default-features = false, features = ["maths", "std"] }
+# `test-util` is not optional here: `quote_cl`/`quote_univ3` tests drive the
+# TTL cache with `tokio::time::pause`/`advance`. Without it this crate builds
+# inside the workspace (feature unification borrows it from arb-exec) and
+# fails to build alone -- which is exactly what `cargo clippy -p apex-venues`
+# caught.
+tokio = { version = "1", features = ["full", "test-util"] }
+tracing = "0.1"

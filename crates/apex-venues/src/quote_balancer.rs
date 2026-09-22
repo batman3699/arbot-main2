@@ -55,7 +55,7 @@ abigen!(
 
 pub use i_balancer_vault::{BatchSwapStep, FundManagement};
 
-use crate::quote_common::is_block_out_of_range_error;
+use apex_math::quote_common::is_block_out_of_range_error;
 
 pub struct BalQuote<C>
 where

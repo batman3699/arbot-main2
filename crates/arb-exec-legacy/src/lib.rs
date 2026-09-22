@@ -2,7 +2,6 @@ pub mod base_fast;
 pub mod backrun_state;
 pub mod cl_sim;
 pub mod cl_parity_gate;
-pub mod cl_ticks;
 pub mod sim_revm;
 pub mod abi;
 pub mod abi_fixture;
@@ -11,7 +10,6 @@ pub mod chain;
 pub mod continuity;
 pub mod convex;
 pub mod cycle_index;
-pub mod discovery;
 pub mod graph;
 pub mod hot_path;
 pub mod ingestion;
@@ -21,12 +19,6 @@ pub mod metrics;
 pub mod ops_inputs;
 pub mod plan;
 pub mod pool_store;
-pub mod quote_balancer;
-pub mod quote_cl;
-pub mod quote_curve;
-pub mod quote_univ2;
-pub mod quote_slipstream;
-pub mod quote_univ3;
 pub mod quote_univ4;
 pub mod reconcile;
 pub mod registry;
@@ -45,3 +37,16 @@ pub use apex_math::cl_swap;
 pub use apex_math::math;
 pub use apex_math::quote_common;
 pub use apex_math::quote_solidly;
+
+// Moved to `apex-venues` in Phase 2 (PLAN.md §33 Phase 2, scope correction):
+// every one of these carries an `abigen!` block, a `Provider` or an `async fn`.
+// Re-exported at the crate root so `crate::quote_cl::...` and friends keep
+// resolving from the ~40 call sites that have not moved yet.
+pub use apex_venues::cl_ticks;
+pub use apex_venues::discovery;
+pub use apex_venues::quote_balancer;
+pub use apex_venues::quote_cl;
+pub use apex_venues::quote_curve;
+pub use apex_venues::quote_slipstream;
+pub use apex_venues::quote_univ2;
+pub use apex_venues::quote_univ3;

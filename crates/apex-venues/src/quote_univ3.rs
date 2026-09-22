@@ -1,5 +1,5 @@
 use crate::quote_cl::{cl_quote_path, cl_quote_path_grid, ClQuoteCache};
-use crate::util::encode_univ3_path;
+use crate::path::encode_univ3_path;
 use anyhow::{ensure, Result};
 use ethers::{prelude::*, providers::JsonRpcClient};
 use std::{
@@ -261,7 +261,7 @@ pub fn default_pancakeswap_validation_base() -> UniV3ValidationConfig {
 
 #[cfg(test)]
 mod block_range_tests {
-    use crate::quote_common::is_block_out_of_range_error;
+    use apex_math::quote_common::is_block_out_of_range_error;
 
     #[test]
     fn detects_block_out_of_range_messages() {
@@ -281,7 +281,7 @@ mod block_range_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::encode_univ3_path;
+    use crate::path::encode_univ3_path;
     use tokio::time::{advance, pause};
 
     fn amount_bytes(amount: U256) -> Bytes {

@@ -316,12 +316,11 @@ impl HubSearchLimits {
 /// Natural-log of an edge's post-haircut exchange rate, or `None` if the edge
 /// is unusable. This is the quantity cycles accumulate: a cycle is profitable
 /// exactly when the sum over its hops is positive.
-fn edge_log_rate(edge: &Edge) -> Option<f64> {
+fn edge_log_rate(edge: &Edge, detection_haircut_bps: u32) -> Option<f64> {
     if !edge.active || edge.rate_den.is_zero() {
         return None;
     }
-    let protected_num =
-        crate::util::apply_slippage(edge.rate_num, crate::util::detection_haircut_bps());
+    let protected_num = crate::util::apply_slippage(edge.rate_num, detection_haircut_bps);
     if protected_num.is_zero() {
         return None;
     }
@@ -431,7 +430,7 @@ impl Graph {
     ) -> HashMap<Address, Vec<(usize, Address, f64)>> {
         let mut by_pair: HashMap<(Address, Address), Vec<(usize, f64)>> = HashMap::new();
         for (idx, edge) in self.edges.iter().enumerate() {
-            if let Some(log_rate) = edge_log_rate(edge) {
+            if let Some(log_rate) = edge_log_rate(edge, self.detection_haircut_bps) {
                 by_pair
                     .entry((edge.from, edge.to))
                     .or_default()
@@ -704,6 +703,21 @@ pub struct Graph {
     edges_from: HashMap<Address, Vec<usize>>,
     edge_lookup: HashMap<(Address, Address), Vec<usize>>,
     adjacency: Arc<AdjacencyMap>,
+    /// Detection haircut in bps, resolved ONCE when the graph is built.
+    ///
+    /// This used to be `util::detection_haircut_bps()` called per edge inside
+    /// the relaxation loop. Two things were wrong with that. It is a late
+    /// configuration lookup on the hottest path in the scanner, which the
+    /// blueprint forbids (§2.4); and because the underlying reader latches a
+    /// `OnceLock` from a process-global env var, a single test that set
+    /// `DETECTION_HAIRCUT_BPS` fixed the value for the whole test binary and
+    /// made nineteen sibling tests fail depending on which one ran first. The
+    /// test that set it already carried a comment admitting as much and made
+    /// its own assertion conditional; the other eighteen had no such guard.
+    ///
+    /// Held on the graph, it is injectable, it is read once, and a test states
+    /// the haircut it wants instead of shouting it at the process.
+    pub detection_haircut_bps: u32,
 }
 
 impl Default for Graph {
@@ -715,6 +729,7 @@ impl Default for Graph {
             edges_from: HashMap::new(),
             edge_lookup: HashMap::new(),
             adjacency: Arc::new(DashMap::new()),
+            detection_haircut_bps: crate::util::detection_haircut_bps(),
         }
     }
 }
@@ -1985,7 +2000,7 @@ impl Graph {
                 return None;
             }
             let protected_num =
-                crate::util::apply_slippage(edge.rate_num, crate::util::detection_haircut_bps());
+                crate::util::apply_slippage(edge.rate_num, self.detection_haircut_bps);
             if protected_num.is_zero() || edge.rate_den.is_zero() {
                 return None;
             }
@@ -2082,7 +2097,7 @@ impl Graph {
                 continue;
             };
             let protected =
-                crate::util::apply_slippage(edge.rate_num, crate::util::detection_haircut_bps());
+                crate::util::apply_slippage(edge.rate_num, self.detection_haircut_bps);
             if protected.is_zero() || edge.rate_den.is_zero() {
                 continue;
             }
@@ -4196,14 +4211,14 @@ mod tests {
         // silently raised the bar detection had to clear — 30bps per leg became
         // a ~60bps bar on a 2-hop round trip, measured as -61.3bps of apparent
         // loss on a market that was really about -11bps.
-        std::env::remove_var("DETECTION_HAIRCUT_BPS"); // default 0
-
         let mut a = Graph::default();
+        a.detection_haircut_bps = 0;
         a.add_edge(two_hop_edge(1, 2, 1000, 1000, 1));
         a.add_edge(two_hop_edge(2, 1, 1000, 1000, 2));
 
         // Same rates, but a large EXECUTION tolerance on every edge.
         let mut b = Graph::default();
+        b.detection_haircut_bps = 0;
         for (f, t, pool) in [(1u64, 2u64, 1u8), (2, 1, 2)] {
             let mut e = two_hop_edge(f, t, 1000, 1000, pool);
             e.tolerance_bps = 300; // 3% execution margin
@@ -4229,22 +4244,33 @@ mod tests {
     fn detection_haircut_still_applies_when_configured() {
         // Opting in must still work — it is a recall/cost dial, just no longer
         // welded to the execution margin.
-        std::env::set_var("DETECTION_HAIRCUT_BPS", "25");
-        // OnceLock means the value may already be fixed by another test in this
-        // binary; only assert when this process actually observes 25.
-        if crate::util::detection_haircut_bps() == 25 {
-            let mut g = Graph::default();
-            g.add_edge(two_hop_edge(1, 2, 1000, 1000, 1));
-            g.add_edge(two_hop_edge(2, 1, 1000, 1000, 2));
-            let p = g.best_two_hop_roundtrip().expect("route exists");
-            // Two legs haircut 25bps each => ~-50bps.
-            assert!(
-                (p.best_bps - (-49.94)).abs() < 1.0,
-                "expected ~-50bps from 2x25bps haircut, got {}",
-                p.best_bps
-            );
-        }
-        std::env::remove_var("DETECTION_HAIRCUT_BPS");
+        // Set on the graph, not on the process. The previous version set the
+        // env var and then asserted only `if detection_haircut_bps() == 25`,
+        // because a sibling test might already have latched the OnceLock --
+        // which meant this test silently checked nothing whenever it lost that
+        // race, AND poisoned the eighteen tests that came after it.
+        let mut g = Graph::default();
+        g.detection_haircut_bps = 25;
+        // Rate scale 1e6, not 1e3. `apply_slippage` truncates: on a numerator
+        // of 1000 a 25 bps haircut is 997.5, which floors to 997 -- a 30 bps
+        // haircut, and the round trip reads -59.91 rather than -49.94. The
+        // truncation is correct (rounding down means the haircut is never
+        // less than asked for) but it is an artefact of a fixture too small to
+        // represent the number under test. At 1e6, 25 bps is exact.
+        //
+        // The old version of this assertion never ran: it was wrapped in
+        // `if detection_haircut_bps() == 25`, which was false whenever a
+        // sibling test had already latched the OnceLock, so it passed by
+        // checking nothing. It has been failing silently since it was written.
+        g.add_edge(two_hop_edge(1, 2, 1_000_000, 1_000_000, 1));
+        g.add_edge(two_hop_edge(2, 1, 1_000_000, 1_000_000, 2));
+        let p = g.best_two_hop_roundtrip().expect("route exists");
+        // Two legs haircut 25bps each, compounded: 0.9975^2 - 1 = -49.94 bps.
+        assert!(
+            (p.best_bps - (-49.94)).abs() < 0.01,
+            "expected -49.94bps from 2x25bps haircut, got {}",
+            p.best_bps
+        );
     }
 
     #[test]

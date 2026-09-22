@@ -54,7 +54,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math --all-targets -- -D warnings
+      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues --all-targets -- -D warnings
 
   solidity:
     name: forge
@@ -79,6 +79,12 @@ jobs:
       # still exists (B-1), so the gate would be red on arrival and get switched
       # off. It lands with its fix in Phase 5 Task 5.1, which writes the test
       # that proves the hole before closing it.
+      - name: no source hidden from a clean checkout
+        # First. It is the cheapest gate and it answers the question every
+        # other check assumes: does a fresh clone have the files? `.gitignore`'s
+        # `*secret*` swallowed three of them through Phases 0 and 1 and nothing
+        # noticed, because everything ran against the working tree.
+        run: ./scripts/ci/no_ignored_sources.sh
       - name: no shared mutable published state (INV-11)
         run: ./scripts/ci/no_shared_mutable_state.sh
       - name: no GasLimit/GasUsed conversion (INV-19)

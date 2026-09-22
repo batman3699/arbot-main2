@@ -21,6 +21,12 @@ use std::{
 use tokio::time::{sleep, Duration};
 use tracing::{error, info, warn};
 
+// Moved to `apex_venues::path` in Phase 2: encoding a QuoterV2 path is a venue
+// wire format, not a general utility, and it was the last thing the
+// UniV3-family quoters still reached back into this crate for. Re-exported so
+// `crate::util::encode_univ3_path` keeps resolving from `plan`.
+pub use apex_venues::path::encode_univ3_path;
+
 abigen!(
     IERC20,
     r#"[
@@ -385,30 +391,6 @@ pub fn decimal_ratio(num: U256, den: U256) -> Option<Decimal> {
     numerator.checked_div(denominator)
 }
 
-pub fn encode_univ3_path(path: &[(Address, Option<u32>)]) -> Result<Vec<u8>> {
-    let hops = path.len();
-    if hops == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut capacity = hops.saturating_mul(20);
-    if hops > 1 {
-        capacity += (hops - 1) * 3;
-    }
-
-    let mut bytes = Vec::with_capacity(capacity);
-    for (i, (token, fee)) in path.iter().enumerate() {
-        if i > 0 {
-            let Some(fee) = fee else {
-                warn!("Skipping UniV3 path encoding due to missing fee");
-                return Err(anyhow!("missing fee for hop {i}"));
-            };
-            bytes.extend_from_slice(&fee.to_be_bytes()[1..4]);
-        }
-        bytes.extend_from_slice(token.as_bytes());
-    }
-    Ok(bytes)
-}
 
 /// Haircut applied to a quoted rate when DISCOVERING cycles (Stage 1), in bps.
 ///
@@ -834,10 +816,6 @@ mod tests {
     use serde_json::Value;
     use std::fs;
 
-    fn addr(n: u64) -> Address {
-        Address::from_low_u64_be(n)
-    }
-
     /// Credential-shaped secrets used only to prove they never survive
     /// redaction. Not real keys.
     const FAKE_KEY: &str = "aaaaaaaabbbbbbbbccccccccdddddddd";
@@ -959,23 +937,6 @@ mod tests {
         assert!(price.native_for_tokens_strict(U256::from(4_000u64)).is_none());
     }
 
-    #[test]
-    fn encodes_univ3_path_with_expected_layout() {
-        let path = vec![(addr(1), None), (addr(2), Some(500))];
-        let encoded = encode_univ3_path(&path).expect("path should encode");
-
-        assert_eq!(encoded.len(), 43);
-        assert_eq!(&encoded[..20], addr(1).as_bytes());
-        assert_eq!(&encoded[20..23], &500u32.to_be_bytes()[1..4]);
-        assert_eq!(&encoded[23..], addr(2).as_bytes());
-    }
-
-    #[test]
-    fn rejects_univ3_path_without_fee_on_second_hop() {
-        let path = vec![(addr(1), Some(500)), (addr(2), None)];
-        let err = encode_univ3_path(&path).expect_err("path should be rejected");
-        assert!(err.to_string().contains("missing fee for hop 1"));
-    }
 
     #[test]
     fn coerce_http_url_converts_known_schemes() {

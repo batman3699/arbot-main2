@@ -2,7 +2,7 @@ use anyhow::Result;
 use ethers::{prelude::*, providers::JsonRpcClient};
 use std::sync::Arc;
 
-use crate::quote_common::{apply_swap_fee, constant_product_out, constant_product_price_impact_bps};
+use apex_math::quote_common::{apply_swap_fee, constant_product_out, constant_product_price_impact_bps};
 
 abigen!(
     IUniswapV2Pair,

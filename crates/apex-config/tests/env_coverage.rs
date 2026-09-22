@@ -9,9 +9,20 @@
 use apex_config::env_migration::{count_for, lookup, Destination, LEGACY_ENV_VARS};
 use std::collections::BTreeSet;
 
-/// Scan the legacy crate for `ARBOT_*` identifiers.
+/// Scan **every crate** for `ARBOT_*` identifiers.
+///
+/// Originally this walked `arb-exec-legacy/src` alone, which was right while
+/// that was the only crate with any code in it. Phase 2 moved the venue
+/// quoters to `apex-venues` and the scan promptly declared
+/// `ARBOT_SLIPSTREAM_LIVE_QUOTE` retired — the variable had not moved, the
+/// scanner had stopped looking. A manifest that covers the repository has to
+/// be checked against the repository.
+///
+/// Two files are excluded, and the exclusion is load-bearing: the manifest
+/// itself names all 84 variables, so scanning it would make
+/// `the_manifest_has_not_rotted` find every entry and never fire again.
 fn vars_in_source() -> BTreeSet<String> {
-    let root = format!("{}/../arb-exec-legacy/src", env!("CARGO_MANIFEST_DIR"));
+    let root = format!("{}/..", env!("CARGO_MANIFEST_DIR"));
     let mut found = BTreeSet::new();
     walk(std::path::Path::new(&root), &mut |text| {
         let bytes = text.as_bytes();
@@ -24,20 +35,38 @@ fn vars_in_source() -> BTreeSet<String> {
             {
                 end += 1;
             }
-            found.insert(text[start..end].to_string());
-            i = end;
+            // A bare `ARBOT_` with nothing after it is a PREFIX, not a
+            // variable -- `apex-config` tests one. Requiring a suffix keeps
+            // the scan from inventing a name nobody can migrate.
+            if end > start + "ARBOT_".len() {
+                found.insert(text[start..end].to_string());
+            }
+            i = end.max(start + 1);
         }
     });
     found
 }
+
+/// Files whose contents would make the scan answer its own question.
+const SELF_REFERENTIAL: [&str; 2] = ["env_migration.rs", "env_coverage.rs"];
 
 fn walk(dir: &std::path::Path, f: &mut impl FnMut(&str)) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
+            // `target/` holds build output including vendored sources; walking
+            // it is slow and finds variables no one wrote.
+            if p.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
             walk(&p, f);
-        } else if p.extension().is_some_and(|x| x == "rs") {
+        } else if p.extension().is_some_and(|x| x == "rs")
+            && !p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| SELF_REFERENTIAL.contains(&n))
+        {
             if let Ok(text) = std::fs::read_to_string(&p) {
                 f(&text);
             }

@@ -3,7 +3,7 @@ use ethers::{prelude::*, providers::JsonRpcClient};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
-use crate::quote_common::is_block_out_of_range_error;
+use apex_math::quote_common::is_block_out_of_range_error;
 
 fn should_cache_quote(block: U64, used_latest_fallback: bool) -> bool {
     block.is_zero() || !used_latest_fallback

@@ -106,7 +106,7 @@ pub(crate) async fn cl_quote_path<C>(
 where
     C: JsonRpcClient + Clone + Send + Sync + 'static,
 {
-    let path_bytes = Bytes::from(crate::util::encode_univ3_path(&path)?);
+    let path_bytes = Bytes::from(crate::path::encode_univ3_path(&path)?);
     let cache_key = QuoteCacheKey {
         path: path_bytes.clone(),
         amount_in,
@@ -144,7 +144,7 @@ where
     // and drop the candidate if none can serve it.
     let raw = match provider.call(&tx, Some(block_id_for(block))).await {
         Ok(value) => value,
-        Err(err) if !block.is_zero() && crate::quote_common::is_block_out_of_range_error(&err) => {
+        Err(err) if !block.is_zero() && apex_math::quote_common::is_block_out_of_range_error(&err) => {
             return Err(anyhow!(
                 "quote provider cannot serve pinned block {block}: {err}"
             ));
@@ -204,7 +204,7 @@ where
     if amounts.is_empty() {
         return Ok(Vec::new());
     }
-    let path_bytes = Bytes::from(crate::util::encode_univ3_path(&path)?);
+    let path_bytes = Bytes::from(crate::path::encode_univ3_path(&path)?);
     let calls: Vec<(Address, Vec<u8>)> = amounts
         .iter()
         .map(|&amount| {
@@ -258,7 +258,11 @@ where
 /// The batch is pinned to `block` and retried once at `Latest` on a
 /// block-out-of-range error, matching [`cl_quote_path`]; without that a
 /// websocket head leading the quoting node would fail the whole batch.
-pub(crate) async fn multicall3_aggregate3<C>(
+// `pub`, not `pub(crate)`: `arb_exec`'s `util` and `hot_pools` batch their
+// own reads through this. Every other item in this module stayed
+// `pub(crate)`, which is a TIGHTENING -- they used to be visible to all 75
+// legacy modules and are now visible to the ten in this crate.
+pub async fn multicall3_aggregate3<C>(
     provider: &Arc<Provider<C>>,
     calls: &[(Address, Vec<u8>)],
     block: U64,
@@ -306,7 +310,7 @@ where
     // and drop the candidate if none can serve it.
     let raw = match provider.call(&tx, Some(block_id_for(block))).await {
         Ok(value) => value,
-        Err(err) if !block.is_zero() && crate::quote_common::is_block_out_of_range_error(&err) => {
+        Err(err) if !block.is_zero() && apex_math::quote_common::is_block_out_of_range_error(&err) => {
             return Err(anyhow!(
                 "quote provider cannot serve pinned block {block}: {err}"
             ));
@@ -379,13 +383,13 @@ mod tests {
             "block out of range",
         ] {
             assert!(
-                crate::quote_common::is_block_out_of_range_error(&msg.to_string()),
+                apex_math::quote_common::is_block_out_of_range_error(&msg.to_string()),
                 "{msg:?} must still be recognised as unservable-block"
             );
         }
         // An ordinary revert is NOT a block problem and must not be confused
         // for one.
-        assert!(!crate::quote_common::is_block_out_of_range_error(
+        assert!(!apex_math::quote_common::is_block_out_of_range_error(
             &"execution reverted".to_string()
         ));
     }

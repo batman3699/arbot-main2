@@ -126,9 +126,9 @@ impl TickDataSource for StaticTickSource {
     }
 }
 
-use crate::cl_math::{MAX_TICK, MIN_TICK};
-use crate::cl_sim::ClPoolState;
-use crate::cl_swap::TickLadder;
+use apex_math::cl_math::{MAX_TICK, MIN_TICK};
+use apex_math::cl_state::ClPoolState;
+use apex_math::cl_swap::TickLadder;
 
 /// Materialise a `TickLadder` around the pool's current price.
 ///
@@ -624,11 +624,11 @@ mod tests {
         assert!(!(word & (U256::one() << 1)).is_zero(), "tick 60 -> bit 1 must be set");
     }
 
-    use crate::cl_sim::ClPoolState;
+    use apex_math::cl_state::ClPoolState;
 
     fn state_at_tick_zero() -> ClPoolState {
         ClPoolState {
-            sqrt_price_x96: crate::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
+            sqrt_price_x96: apex_math::cl_math::get_sqrt_ratio_at_tick(0).expect("tick 0"),
             liquidity: 1_000_000_000_000,
             tick: 0,
             tick_spacing: 60,
@@ -653,11 +653,11 @@ mod tests {
         assert_eq!(ladder.len(), 4);
         assert_eq!(
             ladder.next_initialized(0, true),
-            crate::cl_swap::LadderStep::Initialized { tick: -60, liquidity_net: 300 }
+            apex_math::cl_swap::LadderStep::Initialized { tick: -60, liquidity_net: 300 }
         );
         assert_eq!(
             ladder.next_initialized(0, false),
-            crate::cl_swap::LadderStep::Initialized { tick: 60, liquidity_net: -300 }
+            apex_math::cl_swap::LadderStep::Initialized { tick: 60, liquidity_net: -300 }
         );
     }
 
@@ -720,12 +720,12 @@ mod tests {
             .expect("an absurd spacing must clamp, not panic or error");
 
         assert!(
-            ladder.lower_bound() >= crate::cl_math::MIN_TICK,
+            ladder.lower_bound() >= apex_math::cl_math::MIN_TICK,
             "lower bound {} escaped the protocol range",
             ladder.lower_bound()
         );
         assert!(
-            ladder.upper_bound() <= crate::cl_math::MAX_TICK,
+            ladder.upper_bound() <= apex_math::cl_math::MAX_TICK,
             "upper bound {} escaped the protocol range",
             ladder.upper_bound()
         );
@@ -745,7 +745,7 @@ mod tests {
             .expect("ladder builds");
 
         assert!(ladder.is_empty());
-        assert_eq!(ladder.next_initialized(0, true), crate::cl_swap::LadderStep::Exhausted);
+        assert_eq!(ladder.next_initialized(0, true), apex_math::cl_swap::LadderStep::Exhausted);
     }
 
     /// Pin the selector bytes as LITERALS, independently confirmed with

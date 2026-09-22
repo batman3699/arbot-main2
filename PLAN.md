@@ -3009,6 +3009,54 @@ them are therefore mis-stated — see Task 2.7.
 - CREATE `scripts/data/verify_registry_bytecode.py`
 - REMOVE `base_venues_complete.yaml`, `generate_base_venues.py` (B-7)
 
+### Three defects the Phase 2 migration surfaced, recorded 2026-09-23
+
+None of these were caused by the migration. All three were found because moving
+a file forces you to look at what it depends on, and because accounting for a
+test count forced the first build of a *commit* rather than of the working
+directory.
+
+**1. `.gitignore`'s `*secret*` pattern swallowed three source files.**
+`crates/apex-config/src/secret.rs` is declared by `mod secret;` and matches the
+deny rule that keeps credentials out of a public repository, so it was never
+added. Its test file and `scripts/secret_scan.sh` went the same way.
+**`apex-config` did not compile from a clean checkout of any commit in Phase 0
+or Phase 1.** Nothing caught it because every check — `cargo check`, `cargo
+test`, clippy, the gates — ran against the working tree, where the files exist.
+CI would have caught it on the first push, but this branch has not been pushed
+since the plan commit. Fixed with per-path negations; the deny rule stands.
+`scripts/ci/no_ignored_sources.sh` now fails any build where a source file is
+gitignored and untracked, and it runs first in the gates job because it answers
+the question every other check assumes.
+
+**2. The detection haircut was read from a process-global inside the
+relaxation loop.** `util::detection_haircut_bps()` latches a `OnceLock` from
+`DETECTION_HAIRCUT_BPS` and was called once per edge at three sites in
+`graph.rs` — a late configuration lookup on the scanner's hottest path (§2.4
+forbids it). Because the value latches for the whole process, one test that set
+the variable fixed it for the entire test binary: nineteen sibling tests failed
+or passed depending on which ran first. The test that set it already carried a
+comment admitting this and wrapped its own assertion in `if
+detection_haircut_bps() == 25`, so **that assertion had never actually run** —
+and when finally made to run it failed, because `apply_slippage` truncates and
+a 25 bps haircut on a numerator of 1000 is 30 bps. The haircut is now a field
+on `Graph`, resolved once at construction; tests set it on the graph instead of
+shouting it at the process.
+
+**3. `apex-venues` did not build standalone.** Its `quote_cl`/`quote_univ3`
+tests drive the TTL cache with `tokio::time::pause`, which needs tokio's
+`test-util` feature. Inside the workspace, feature unification borrowed it from
+`arb-exec`; `cargo clippy -p apex-venues` alone did not. Per-crate clippy in CI
+is what caught it, which is an argument for keeping the gate per-crate rather
+than running it once over the workspace.
+
+**Also recorded:** `cl_load::log_cl_quote_parity` has no callers and never did,
+and neither did the `ARBOT_CL_QUOTE_PARITY` flag that gated it. It is carried
+forward rather than deleted because it is exactly the local-vs-quoter
+comparison Task 2.2's three-way differential needs. Its internal env check is
+gone — `apex-venues` does not read the environment, and gating is the caller's
+job.
+
 ### Task 2.1 — `ExactPricingEngine` trait and the CL implementors
 
 - [ ] **Step 1: Write the failing test:**
