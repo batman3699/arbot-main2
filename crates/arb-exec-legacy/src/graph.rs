@@ -124,7 +124,19 @@ pub struct Edge {
     pub rate_den: U256,
     pub venue: VenueEdge,
     pub estimated_gas: u64,
-    /// Fixed-point scaled weight (negative log exchange rate plus gas ratio) scaled by `WEIGHT_SCALE`.
+    /// Fixed-point `-ln(rate)`, scaled by `WEIGHT_SCALE`.
+    ///
+    /// **Rate-only. There is no gas term**, whatever this comment used to say:
+    /// `util::compute_edge_weight` takes a numerator and a denominator and adds
+    /// nothing else, and `venues.rs` relies on exactly that when it reuses a
+    /// cached edge set across a gas-price move. Gas is charged later, in
+    /// `dynamic_min_profit` and in sizing.
+    ///
+    /// The consequence is Engine C's whole reason for existing: a cycle whose
+    /// marginal gross clears parity is a negative cycle here regardless of
+    /// whether any SIZE pays for the transaction, and a size-independent cost
+    /// is not something a rate-only weight can express. See
+    /// `apex_math::finite_size`.
     pub weight: i64,
     pub max_input: U256,
     pub tolerance_bps: u32,

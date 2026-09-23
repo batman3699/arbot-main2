@@ -33,6 +33,7 @@ pub mod cl_math;
 pub mod cl_state;
 pub mod cl_swap;
 pub mod engine;
+pub mod finite_size;
 pub mod math;
 pub mod quote_common;
 pub mod quote_solidly;

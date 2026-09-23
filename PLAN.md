@@ -3339,11 +3339,69 @@ inert.
 
 ### Task 2.5 — Finite-size candidate generation (Engine C, §12.3)
 
-- [ ] **Step 1: Write the failing test** — a fixture where infinitesimal rates show no negative cycle but a finite size of 0.4 WETH is profitable across two venues; assert Engine C finds it and Engine A does not.
-- [ ] **Step 2: Run and observe the failure.**
-- [ ] **Step 3: Implement** pairwise cross-venue mismatch search over the cheap frontier.
-- [ ] **Step 4: Run and observe the pass.**
-- [ ] **Step 5: Commit.**
+- [x] **Step 1: Write the failing test** — a fixture where infinitesimal rates show no negative cycle but a finite size of 0.4 WETH is profitable across two venues; assert Engine C finds it and Engine A does not.
+- [x] **Step 2: Run and observe the failure.** **The fixture does not exist.** See below.
+- [x] **Step 3: Implement** pairwise cross-venue mismatch search over the cheap frontier.
+- [x] **Step 4: Run and observe the pass.**
+- [x] **Step 5: Commit.**
+
+### Correction, recorded 2026-09-23 — the specified fixture is impossible, and Engine C's value runs the other way
+
+**No fixture exists where infinitesimal rates show no negative cycle and a
+finite size is profitable.** Every venue this repository prices — constant
+product, the Solidly curves, concentrated liquidity — has an output that is
+concave in its input and zero at zero. For any such function the average rate
+over `[0, x]` is at most the marginal rate at 0, and a cycle's finite-size
+gross is the product of its hops' average rates. So the finite-size gross can
+never exceed the marginal gross. "Infinitesimal rates say no, finite size says
+yes" describes a **convex** market. Asserted as a property test over random
+spreads, fees and sizes, not just the six hand-picked fixtures.
+
+**Engine C earns its place by refusing, not by finding.** `graph.rs`'s edge
+weights are rate-only — `compute_edge_weight` is `-ln(rate)` and nothing adds a
+gas term, whatever the stale comment on `Edge::weight` said (now corrected);
+`venues.rs` depends on exactly that when it reuses a cached edge set across a
+gas-price move. So Engine A calls any cycle with a marginal gross above parity
+a negative cycle, **regardless of whether any size pays for the transaction**.
+Measured on a two-pool fixture with gas at 0.00002 WETH (~1 cent, this
+repository's own figure):
+
+| spread | marginal gross | best gross over all sizes | clears gas |
+|---|---|---|---|
+| 60.5 bps | +0.000228% | +0.00000006 WETH | **no — 300× short** |
+| 61 bps | +0.000725% | +0.00000066 WETH | **no** |
+| 63 bps | +0.002713% | +0.00000921 WETH | **no** |
+| 65 bps | +0.004701% | +0.00002765 WETH | yes |
+| 80 bps | +0.019611% | +0.00048050 WETH | yes |
+| 200 bps | +0.138890% | +0.02381796 WETH | yes |
+
+Engine A accepts all six. Three cannot be traded at any size. That band is not
+a corner case — it is exactly where the cheap frontier sits, and it is
+consistent with the census finding **0 of 750** candidates net-positive and
+with 15.2% of prep-sent candidates already carrying `local_gross_bps < 0`.
+
+**And it answers a question Engine A cannot ask.** The optimum on that fixture
+is 0.120 WETH at 65 bps and 0.490 WETH at 80 bps — so the plan's *"0.4 WETH"*
+was the right order of magnitude for the wrong reason. A rate-only search
+cannot express a quantity at all.
+
+**Two things measured on the way:**
+
+* **A dust probe measures rounding, not a rate.** At 1e-6 WETH the round trip
+  reads −21 bps on a fixture whose rate is −5, because the middle leg is
+  6-decimal USDC and integer division throws away a meaningful fraction of
+  2,000 raw units. It errs pessimistic — the safe direction — but the marginal
+  rate is not measurable that way. 1e-3 WETH puts truncation below 0.01 bps.
+* **A basis point is too coarse to express the disagreement.** At a 61 bps
+  spread the gross is +0.7 *thousandths* of a basis point. `marginal_gross_bps`
+  rounds that to zero, so the test asks Engine A's actual question
+  (`output > input`) rather than a rounded report of it.
+
+**Not delivered:** the other Engine C modes §12.2 lists — k-shortest simple
+routes, k-shortest cycles, same-pair split, event-targeted, backrun and
+liquidation templates. Pairwise cross-venue mismatch is the one the cheap
+frontier needs, and the rest are search *topologies* over the same finite-size
+evaluator.
 
 ### Task 2.6 — Close the pricing provenance (§1.1.1)
 
