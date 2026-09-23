@@ -21,45 +21,128 @@ contract Deploy is Script {
         return _run(bytes32(0));
     }
 
+    /// Everything a deploy needs, as data.
+    ///
+    /// # Why this struct exists (B-13)
+    ///
+    /// The deploy tests were flaky, not red — 3 of 8 unmodified runs failed
+    /// with a *varying* subset. They configured themselves with `vm.setEnv`,
+    /// which writes the **forge process** environment: global, shared, and
+    /// persisting for the whole run. forge additionally auto-loads `.env`. So
+    /// each test's result depended on the ambient environment and on whatever
+    /// every earlier test had written, and there is no `unsetEnv` cheatcode to
+    /// isolate with.
+    ///
+    /// Five approaches were tried and reverted (recorded in
+    /// `docs/apex/BASELINE.md`, including `threads = 1`, which `forge config`
+    /// confirmed was read and which changed nothing — the tests share one
+    /// process either way). The real fix is not to isolate the tests from the
+    /// environment but to stop configuring the script through it: the
+    /// environment is read **once**, in [`configFromEnv`], and everything
+    /// below operates on this struct.
+    ///
+    /// That is the same global-mutable-state pathology INV-11 forbids in the
+    /// engine, appearing in the test harness.
+    struct DeployConfig {
+        string prefix;
+        address vault;
+        address uniRouter;
+        address aavePool;
+        address permit2;
+        address configuredOwner;
+        uint256 privateKey;
+        bytes32 salt;
+        bool requireBalancer;
+        bool requireAave;
+    }
+
+    /// The **only** function in this script that reads the environment.
+    ///
+    /// Production calls it; tests do not. A test that wants a configuration
+    /// builds the struct, which is why `resolveConfig` gives the same answer
+    /// whatever `.env` or a sibling test has done to the process.
+    function configFromEnv(bytes32 salt) public view returns (DeployConfig memory cfg) {
+        cfg.prefix = _resolveEnvPrefix();
+        cfg.vault = _envAddressWithPrefixFallback(cfg.prefix, "BAL_VAULT", "BALANCER_VAULT", address(0));
+        cfg.uniRouter = _envAddressWithPrefix(cfg.prefix, "UNIV3_ROUTER", address(0));
+        if (cfg.uniRouter == address(0)) {
+            cfg.uniRouter = _envAddressWithPrefix(cfg.prefix, "SWAPROUTER02", address(0));
+        }
+        cfg.aavePool = _envAddressWithPrefix(cfg.prefix, "AAVE_POOL", address(0));
+        cfg.permit2 = _envAddressWithPrefixFallback(cfg.prefix, "PERMIT2_ADDRESS", "PERMIT2", address(0));
+        cfg.configuredOwner = _envAddressWithPrefix(cfg.prefix, "EXECUTOR_OWNER", address(0));
+        cfg.privateKey = _envUintOr("PRIVATE_KEY", uint256(0));
+        cfg.requireBalancer = _envBoolWithPrefix(cfg.prefix, "REQUIRE_BALANCER", false);
+        cfg.requireAave = _envBoolWithPrefix(cfg.prefix, "REQUIRE_AAVE", false);
+
+        cfg.salt = salt;
+        if (cfg.salt == bytes32(0)) {
+            cfg.salt = _envBytes32Or("EXECUTOR_SALT", bytes32(0));
+        }
+        if (cfg.salt == bytes32(0)) {
+            cfg.salt = _envBytes32Or("CREATE2_SALT", bytes32(0));
+        }
+    }
+
+    /// Fill the gaps and check the result. **Reads no environment.**
+    ///
+    /// Depends on `block.chainid`, which is chain state rather than process
+    /// state — a test controls it with `vm.chainId` and two tests cannot
+    /// pollute each other through it.
+    function resolveConfig(DeployConfig memory explicitCfg)
+        public
+        view
+        returns (DeployConfig memory cfg)
+    {
+        cfg = explicitCfg;
+        if (cfg.vault == address(0)) {
+            cfg.vault = _defaultBalancerVault(block.chainid);
+        }
+        if (cfg.uniRouter == address(0)) {
+            cfg.uniRouter = _defaultUniV3Router(block.chainid);
+        }
+        if (cfg.aavePool == address(0)) {
+            cfg.aavePool = _defaultAavePool(block.chainid);
+        }
+        if (cfg.permit2 == address(0)) {
+            cfg.permit2 = _defaultPermit2(block.chainid);
+        }
+        if (cfg.salt == bytes32(0)) {
+            cfg.salt = keccak256(abi.encodePacked("arb-exec", block.chainid));
+        }
+        _validateResolvedIntegrations(cfg);
+    }
+
     function _run(bytes32 salt)
         internal
         returns (MultiVenueArbImplementation impl, ArbitrageCloneFactory factory, address clone, BatchRouter router)
     {
-        string memory prefix = _resolveEnvPrefix();
+        return runWith(configFromEnv(salt));
+    }
 
-        address vault = _envAddressWithPrefixFallback(prefix, "BAL_VAULT", "BALANCER_VAULT", address(0));
-        if (vault == address(0)) {
-            vault = _defaultBalancerVault(block.chainid);
-        }
-        address uniRouter = _envAddressWithPrefix(prefix, "UNIV3_ROUTER", address(0));
-        if (uniRouter == address(0)) {
-            uniRouter = _envAddressWithPrefix(prefix, "SWAPROUTER02", address(0));
-        }
-        if (uniRouter == address(0)) {
-            uniRouter = _defaultUniV3Router(block.chainid);
-        }
-        address aavePool = _envAddressWithPrefix(prefix, "AAVE_POOL", address(0));
-        if (aavePool == address(0)) {
-            aavePool = _defaultAavePool(block.chainid);
-        }
-        address permit2 = _envAddressWithPrefixFallback(prefix, "PERMIT2_ADDRESS", "PERMIT2", address(0));
-        if (permit2 == address(0)) {
-            permit2 = _defaultPermit2(block.chainid);
-        }
+    /// Deploy from an explicit configuration.
+    ///
+    /// `run()` is this with `configFromEnv`. Separating them is what lets a
+    /// test deploy without the process environment reaching in: the ownership
+    /// test used to set `EXECUTOR_OWNER` and get `.env`'s `BASE_EXECUTOR_OWNER`
+    /// instead, because the prefixed key correctly outranks the bare one, and
+    /// no amount of care in the test could change that.
+    function runWith(DeployConfig memory explicitCfg)
+        public
+        returns (MultiVenueArbImplementation impl, ArbitrageCloneFactory factory, address clone, BatchRouter router)
+    {
+        DeployConfig memory cfg = resolveConfig(explicitCfg);
         address owner;
 
-        uint256 privateKey = _envUintOr("PRIVATE_KEY", uint256(0));
-        address configuredOwner = _envAddressWithPrefix(prefix, "EXECUTOR_OWNER", address(0));
-
-        if (privateKey != 0) {
-            vm.startBroadcast(privateKey);
-            owner = vm.addr(privateKey);
+        if (cfg.privateKey != 0) {
+            vm.startBroadcast(cfg.privateKey);
+            owner = vm.addr(cfg.privateKey);
         } else {
             vm.startBroadcast();
         }
 
-        if (configuredOwner != address(0)) {
-            owner = configuredOwner;
+        if (cfg.configuredOwner != address(0)) {
+            owner = cfg.configuredOwner;
         } else if (owner == address(0)) {
             owner = tx.origin;
         }
@@ -70,31 +153,18 @@ contract Deploy is Script {
             revert OwnerNotConfigured();
         }
 
-        _validateResolvedIntegrations(prefix, vault, uniRouter, aavePool, permit2);
-
-        bytes32 chosenSalt = salt;
-        if (chosenSalt == bytes32(0)) {
-            chosenSalt = _envBytes32Or("EXECUTOR_SALT", bytes32(0));
-        }
-        if (chosenSalt == bytes32(0)) {
-            chosenSalt = _envBytes32Or("CREATE2_SALT", bytes32(0));
-        }
-        if (chosenSalt == bytes32(0)) {
-            chosenSalt = keccak256(abi.encodePacked("arb-exec", block.chainid));
-        }
-
         impl = new MultiVenueArbImplementation();
         factory = new ArbitrageCloneFactory(address(impl));
-        clone = factory.deployClone(chosenSalt);
+        clone = factory.deployClone(cfg.salt);
 
         router = new BatchRouter(clone);
 
         MultiVenueArbImplementation(clone).initialise({
             _owner: address(router),
-            _vault: vault,
-            _uni: uniRouter,
-            _aavePool: aavePool,
-            _permit2: permit2,
+            _vault: cfg.vault,
+            _uni: cfg.uniRouter,
+            _aavePool: cfg.aavePool,
+            _permit2: cfg.permit2,
             feeBps: 300,
             maxSlippageBps: 150,
             deadlineBuffer: 60
@@ -106,11 +176,11 @@ contract Deploy is Script {
 
         console2.log("MultiVenue executor clone deployed", clone);
         console2.log("Batch router deployed", address(router));
-        console2.log("Env prefix", prefix);
-        console2.log("Vault", vault);
-        console2.log("Univ3 router", uniRouter);
-        console2.log("Aave pool", aavePool);
-        console2.log("Permit2", permit2);
+        console2.log("Env prefix", cfg.prefix);
+        console2.log("Vault", cfg.vault);
+        console2.log("Univ3 router", cfg.uniRouter);
+        console2.log("Aave pool", cfg.aavePool);
+        console2.log("Permit2", cfg.permit2);
 
         vm.stopBroadcast();
     }
@@ -282,24 +352,18 @@ contract Deploy is Script {
         return "";
     }
 
-    function _validateResolvedIntegrations(
-        string memory prefix,
-        address vault,
-        address uniRouter,
-        address aavePool,
-        address permit2
-    ) internal view {
-        if (_isUniV3Required(block.chainid) && uniRouter == address(0)) {
-            revert MissingRequiredIntegration("UNIV3_ROUTER|SWAPROUTER02", block.chainid, prefix);
+    function _validateResolvedIntegrations(DeployConfig memory cfg) internal view {
+        if (_isUniV3Required(block.chainid) && cfg.uniRouter == address(0)) {
+            revert MissingRequiredIntegration("UNIV3_ROUTER|SWAPROUTER02", block.chainid, cfg.prefix);
         }
-        if (_isPermit2Required(block.chainid) && permit2 == address(0)) {
-            revert MissingRequiredIntegration("PERMIT2_ADDRESS|PERMIT2", block.chainid, prefix);
+        if (_isPermit2Required(block.chainid) && cfg.permit2 == address(0)) {
+            revert MissingRequiredIntegration("PERMIT2_ADDRESS|PERMIT2", block.chainid, cfg.prefix);
         }
-        if (_isBalancerRequired(prefix) && vault == address(0)) {
-            revert MissingRequiredIntegration("BAL_VAULT|BALANCER_VAULT", block.chainid, prefix);
+        if (cfg.requireBalancer && cfg.vault == address(0)) {
+            revert MissingRequiredIntegration("BAL_VAULT|BALANCER_VAULT", block.chainid, cfg.prefix);
         }
-        if (_isAaveRequired(prefix) && aavePool == address(0)) {
-            revert MissingRequiredIntegration("AAVE_POOL", block.chainid, prefix);
+        if (cfg.requireAave && cfg.aavePool == address(0)) {
+            revert MissingRequiredIntegration("AAVE_POOL", block.chainid, cfg.prefix);
         }
     }
 
@@ -311,13 +375,7 @@ contract Deploy is Script {
         return chainId != 31337;
     }
 
-    function _isBalancerRequired(string memory prefix) internal view returns (bool) {
-        return _envBoolWithPrefix(prefix, "REQUIRE_BALANCER", false);
-    }
 
-    function _isAaveRequired(string memory prefix) internal view returns (bool) {
-        return _envBoolWithPrefix(prefix, "REQUIRE_AAVE", false);
-    }
 
     function _envBoolWithPrefix(string memory prefix, string memory key, bool defaultValue) internal view returns (bool) {
         if (bytes(prefix).length != 0) {

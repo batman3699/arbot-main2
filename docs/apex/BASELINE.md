@@ -31,6 +31,31 @@ TOTAL: 1374 passed, 0 failed, 2 ignored, across 9 targets.
 
 ## forge test
 
+> **RESOLVED 2026-09-24 by Phase 5 Task 5.7.** Everything below was true at the
+> Phase 0 freeze and is kept as recorded — a baseline that gets edited when the
+> world changes is not a baseline. What changed: `script/Deploy.s.sol` grew a
+> `DeployConfig` seam, so `configFromEnv` is the only function in the Solidity
+> tree that reads the environment and `resolveConfig`/`runWith` are functions of
+> their argument. The three deploy test files now pass explicit structs or
+> per-test synthetic keys, and no key is written by two files —
+> `scripts/ci/no_shared_env_keys.sh` gates both halves of that.
+>
+> **Re-measured, whole suite, no `--no-match-path`:**
+>
+> ```text
+> run 1   107/0     run 6   107/0
+> run 2   107/0     run 7   107/0
+> run 3   107/0     run 8   107/0
+> run 4   107/0     run 9   107/0
+> run 5   107/0     run 10  107/0
+> ```
+>
+> 107 rather than 67 because Phases 1–5 added 40 tests. The CI exclusion is
+> removed; `forge test` gates unqualified. See PLAN.md Task 5.7 for the two
+> deliberate deviations from its own Step 1 sketch — in particular, the sketch's
+> hermetic test perturbed `CHAIN`, which would have re-created this defect
+> across files while claiming to close it.
+
 **NOT GREEN, AND NOT DETERMINISTIC.** This is the corrected finding; see B-13 in
 PLAN.md §3.4. The first freeze recorded "64 passed, 2 failed" as though it were a
 fixed pair. It is not — the suite is **flaky**, which is worse than red, because a

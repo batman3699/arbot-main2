@@ -76,8 +76,14 @@ jobs:
       # margin -- so it is structurally over by construction. The size question
       # that matters is asked below, over deployable contracts only.
       - run: forge build
-      - name: test (Deploy* quarantined -- B-13)
-        run: forge test --no-match-path 'test/Deploy*'
+      # The `--no-match-path 'test/Deploy*'` quarantine that stood here from
+      # Phase 0 is gone. Task 5.7 gave `script/Deploy.s.sol` a `DeployConfig`
+      # seam -- `configFromEnv` is the one env reader, `resolveConfig` and
+      # `runWith` are functions of their argument -- so the deploy tests no
+      # longer race over the forge process environment. Measured at 10/10 green
+      # over consecutive full runs; `no_shared_env_keys.sh` keeps it that way.
+      - name: test
+        run: forge test
       - name: invariant suites
         # Bounded runs. Task 5.6 Step 2's 100k bar is `--profile deep`, which
         # takes minutes rather than seconds and belongs in a scheduled run
@@ -122,6 +128,8 @@ jobs:
         run: ./scripts/ci/no_unearned_discrete_size.sh
       - name: invariant coverage ratchet
         run: ./scripts/ci/invariant_coverage.sh
+      - name: no test file contends for a process-global env key (B-13)
+        run: ./scripts/ci/no_shared_env_keys.sh
       # secret_scan.sh is NOT wired yet. It is red on arrival, but only on test
       # fixtures -- `/v2/test-key`, `/v2/test`, `/v2/abc123` and a doc-comment
       # example in a shadow script. No real credential is exposed. It needs a
