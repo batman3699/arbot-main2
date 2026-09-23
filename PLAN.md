@@ -3940,13 +3940,75 @@ succeed if it ran" when the question is "would this run".
 
 ### Task 4.3 — Tier 2 result completeness
 
-- [ ] **Step 1: Write the failing test** — `SimulationResult` from every backend carries success, revert class + data, gas used, per-token balance deltas, loan-repaid flag, profit-invariant flag, token residues, state-after fingerprint, the state it simulated at, and a stable `result_hash`.
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 1: Write the failing test** — `SimulationResult` from every backend carries success, revert class + data, gas used, per-token balance deltas, loan-repaid flag, profit-invariant flag, token residues, state-after fingerprint, the state it simulated at, and a stable `result_hash`.
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-23.**
+
+**Completeness is checked by exhaustive destructuring, not a field list.** A
+list of names has to be maintained in step with the struct and silently
+under-tests when it is not. A `let SimulationResult { .. } = r;` that binds
+every field **fails to compile** the moment one is added, which makes the check
+impossible to forget rather than merely likely to be noticed. (`apex-venues`'s
+`REQUIRED_FIELDS` uses the list approach because a serde round-trip is the
+thing under test there; here it is not.)
+
+**What `result_hash` covers is the whole design.** It exists so two *backends*
+can be compared by one equality rather than by ten, and that only works if it
+covers the semantic outcome and nothing about how the outcome was produced:
+
+| Excluded | Why |
+|---|---|
+| `tier` | Tier 1 agreeing with Tier 2 is the **point**. A hash including the tier can never show agreement between them, which is the one thing §35's red/blue comparison needs it for. |
+| `elapsed` | Two correct runs take different amounts of time. A hash including duration disagrees with itself. |
+
+| Included | Why |
+|---|---|
+| `simulated_at_state` | Two results about **different states are not the same result**, however identical their numbers. Excluding it would make the quorum agree across a reorg. |
+| revert *data*, not just class | Two reverts of the same class with different return data are different outcomes. |
+| `None` vs empty, tagged | `preconf_sequence: None` and `Some(0)` are different facts; a flattened encoding makes them the same bytes. |
+
+A test mutates each semantic field in turn and asserts the hash moves — a field
+that does not reach the hash is a field two backends can disagree about while
+comparing equal.
+
+**Found: `SimulationResult` does not serialise to JSON.** `balance_deltas` and
+`token_residues` are `BTreeMap<TokenId, _>`, and JSON object keys must be
+strings — serde fails with *"key must be a string"*. So §35's
+`sim-diff-<date>.csv` cannot be written from these records, and neither can a
+replay corpus. Recorded rather than fixed: the fix is a wire-format decision
+and belongs with Task 4.5, which is blocked on a live node regardless. A test
+exists that **fails when somebody fixes it**, so the format is chosen
+deliberately rather than discovered.
 
 ### Task 4.4 — Simulation fidelity scorer (§34, INV-44)
 
-- [ ] **Step 1: Write the failing test** — feeding a stream of (predicted, realized) pairs whose gas error exceeds the band produces, in order, `ReduceSize`, then `RaiseTier`, then `Disable` for that strategy×venue.
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 1: Write the failing test** — feeding a stream of (predicted, realized) pairs whose gas error exceeds the band produces, in order, `ReduceSize`, then `RaiseTier`, then `Disable` for that strategy×venue.
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-23, with an asymmetry the specification does not mention.**
+
+**Under-prediction and over-prediction are not the same error, so the band is
+not symmetric.** Over-predicting gas costs *opportunity*: the candidate was
+priced as more expensive than it was, so trades were declined that would have
+paid, and the loss is bounded by the trades not taken. Under-predicting costs
+*money already committed*: the candidate was admitted on arithmetic wrong in
+the profitable direction, the gas limit may be short, and the transaction can
+burn the whole limit and revert. The loss is unbounded by anything the model
+knew. The default tolerances are **5% under, 20% over**, and a test pins that
+10% over budget breaches while 10% under does not.
+
+**One bad sample is not a breach.** A single outlier — an unusual pool state, a
+competitor landing between simulation and inclusion — is noise, and escalating
+on it would disable a working strategy on the first unlucky block. The scorer
+needs a minimum sample count and a breach *rate* over a window, the same shape
+as `apex_venues::breaker`.
+
+**The ladder descends no faster than it climbs.** Recovery needs a *clean*
+window rather than a merely below-threshold one, and each rung is held for a
+full sample count before it can move again. A ladder that falls back faster
+than it rises oscillates, and an oscillating gate is one nobody trusts — the
+operator learns to ignore it, which is worse than not having it.
 
 ### Task 4.5 — Red/blue for simulation
 

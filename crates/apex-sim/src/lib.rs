@@ -24,6 +24,7 @@
 //! actually asked.
 
 pub mod backends;
+pub mod fidelity;
 pub mod tier0;
 
 /// Crate version, exposed so workspace wiring is testable before a backend

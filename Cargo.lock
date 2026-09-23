@@ -234,6 +234,7 @@ dependencies = [
 name = "apex-sim"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "apex-types",
  "proptest",
  "serde",
