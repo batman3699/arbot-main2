@@ -4632,11 +4632,29 @@ mod tests {
             .or_else(|| cycles.first())
             .expect("cycle with edges");
         assert_eq!(candidate.edge_indices.len(), 2);
-        // First hop must be the better parallel A→B edge (index 1), not edge_between pick.
-        assert_eq!(candidate.edge_indices[0], 1);
-        let edge = graph
-            .edge_by_index(candidate.edge_indices[0])
-            .expect("edge index must resolve");
+
+        // The property is WHICH parallel edge was chosen, not where the cycle
+        // starts. Asserting `edge_indices[0] == 1` also asserted a rotation,
+        // and the rotation is not determined: `bellman_ford_inner` searches
+        // every start vertex under `rayon::par_iter` with a shared `abort`
+        // flag, so whichever worker finishes first decides which rotation is
+        // reported. Green on an 8-core machine across 65 runs, red on a
+        // GitHub runner, which reported `[2, 1]` -- the same cycle entered
+        // from B. The better edge had still been chosen.
+        //
+        // Anything downstream that needs a canonical rotation has to
+        // canonicalise it; the search does not.
+        assert!(
+            candidate.edge_indices.contains(&1),
+            "the better parallel A→B edge (weight -5) must be in the cycle: {:?}",
+            candidate.edge_indices
+        );
+        assert!(
+            !candidate.edge_indices.contains(&0),
+            "the worse parallel A→B edge (weight 0) must not be: {:?}",
+            candidate.edge_indices
+        );
+        let edge = graph.edge_by_index(1).expect("edge index must resolve");
         assert_eq!(edge.weight, -5);
     }
 

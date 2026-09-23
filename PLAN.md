@@ -3730,6 +3730,27 @@ expensive", and reported as such rather than by a sentinel.
 - [ ] **Step 1: Write the failing tests** — `FlashSourceQuote` carries all nine §19.1 fields; selection is `argmin(premium + gas_overhead·gasPrice + failure_risk_cost + availability_penalty)`; a provider whose measured capacity is below the required amount is excluded (preserving the existing capacity-bounding behaviour); a single provider outage does not block selection (§19.4).
 - [ ] **Step 2: Run and observe the failures.** **Step 3: Implement.** **Step 4: Observe the passes.** **Step 5: Commit.**
 
+### Cycle rotation is not determined, recorded 2026-09-23
+
+`bellman_ford_inner` searches every candidate start vertex under
+`rayon::par_iter` with a **shared `abort` flag**, so whichever worker finishes
+first decides which rotation of a cycle is reported. The same arbitrage entered
+at A and entered at B are the same cycle and different `edge_indices`.
+
+Found when `graph::tests::bellman_ford_preserves_parallel_edge_path` went red
+on a GitHub runner after 65 consecutive green local runs — including 25 under
+deliberate CPU contention and across `RAYON_NUM_THREADS` of 1, 2, 4 and 8. It
+reported `[2, 1]`: the same cycle, entered from B. The property the test
+existed for — that the *better* of two parallel edges is chosen — held.
+
+The test now asserts that property and not the rotation. The finding is
+larger than the test, though: **anything downstream that needs a canonical
+rotation has to canonicalise it**, because the search does not. `cycle_start`
+decides a candidate's start token, and therefore its flash-loan asset and its
+profit denomination. This is recorded rather than fixed: making the search
+deterministic means giving up the abort optimisation, and choosing between
+those is a Phase 12 question (§13 joint allocation) rather than a Phase 3 one.
+
 ### Task 3.5 — Scenario-conditioned EV and the eligibility gate (§2, INV-20, INV-23)
 
 - [ ] **Step 1: Write the failing tests:**
