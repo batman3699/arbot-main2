@@ -14,10 +14,18 @@ allowed='^crates/apex-econ/src/sizing/'
 violations=""
 while IFS= read -r line; do
   file="${line%%:*}"
-  # The definition and its own tests are not call sites.
+  # The definition is not a call site.
+  #
+  # Integration tests are exempt, and the reason is structural rather than
+  # convenience: `crates/*/tests/**` compiles to separate binaries that link the
+  # library, so nothing in `src/` can call into them. A witness minted there can
+  # never reach production code, which is what INV-18 is about. Inline
+  # `#[cfg(test)]` modules under `src/` are NOT exempt -- they share the
+  # compilation unit, and a helper there is one `cfg` edit away from being
+  # reachable.
   case "$file" in
     crates/apex-types/src/candidate.rs) continue ;;
-    crates/apex-types/tests/*)          continue ;;
+    crates/*/tests/*)                   continue ;;
   esac
   if ! echo "$file" | grep -qE "$allowed"; then
     violations="${violations}${line}\n"

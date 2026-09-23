@@ -4900,6 +4900,21 @@ acceptance criteria are met and two need Base traffic.**
 
 **Four plan corrections came out of this phase**, all recorded in place rather than reconciled quietly: the trait has eleven methods and not ten; `optimize_submission_cost` needs a time it was not given; `observe_outcome` cannot return the miss ledger's `ObservedOutcome`; and §23's clamp is operative for small transactions rather than always. The last is the only one supported by measurement — twelve real Base receipts, already in this repository.
 
+**CI went red once in this phase, on my own gate.** `no_unearned_discrete_size.sh`
+(INV-18) caught `DiscreteRefined::new()` in `apex-chain`'s test fixture. I had
+run the new gate and clippy locally but not the full `scripts/ci/` sweep, which
+is the check that would have found it — the same class of miss as Phase 2's
+`the_executor_really_declares_these_errors`, where `cargo test` and `forge test`
+being separate commands hid a cross-language break.
+
+**The fix narrows the exemption on a structural argument rather than a
+convenience one.** `crates/*/tests/**` compiles to separate binaries that link
+the library, so nothing in `src/` can call into them: a witness minted there can
+never reach production code, which is what INV-18 is about. Inline
+`#[cfg(test)]` modules under `src/` are deliberately **not** exempt — they share
+the compilation unit, and a helper there is one `cfg` edit away from being
+reachable. Both cases mutation-tested.
+
 **What Phase 7 deliberately did not do:** move `rpc_failover.rs`, `base_fast.rs`'s feed or `util.rs`. §3.4 classifies `chain.rs` as **REBUILD** — a config struct is not an adapter — and that is what happened. The three moves are mechanical relocations of working code with upward dependencies into `main.rs`, and the migration rule is to measure before moving; they belong with the phase that ports their consumers, not with the phase that builds their replacement's interface.
 
 ---
