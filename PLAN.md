@@ -4558,7 +4558,21 @@ fn each_revalidation_check_can_reject() {
 }
 ```
 
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-24.** `src/revalidate.rs`; 10 tests and 4 doctests. Workspace 1,596 passing.
+
+**`compile_fail` doctests rather than `trybuild`**, per the convention established in `apex_types::candidate`: `trybuild` compares full stderr against a recorded file, which pins the test to a rustc version and turns a diagnostic reword into a red build. Three of them — forging `Revalidated`, `Revalidated::default()`, and calling `SigningAuthorization::new` without a token — each paired with a compiling twin that differs only in going through `last_mile`.
+
+**`SigningAuthorization` is the thing a signer accepts, and `Revalidated` is the only way to build one.** §16.2 step 5 requires a token produced only by step 4; that is now a type rather than a comment on a function. It exists ahead of the signer deliberately — the gate has to be in place before there is something to gate, or the first signing code path will be written without it.
+
+**The table test is `passing_but_failing(check)`**, exactly as the plan sketched: a context that satisfies all eleven, with precisely one input broken. Entangled checks — one comparison covering for another, or an early guard subsuming several — show up as a check that cannot be made to fire on its own. Two counterweights keep the table honest: `a_context_that_satisfies_everything_passes`, without which a `last_mile` that rejected everything would make the table green while gating nothing; and `the_check_list_is_complete`, which fails to compile if a twelfth variant is added to the enum and forgotten in the hand-written `ALL`.
+
+**First failure, not all failures.** `T_sign` p99 must stay under 3 ms *including* revalidation (§21), so the checks are ordered cheapest-first and stop at the first rejection — running ten more comparisons after the answer is known spends the budget the ordering exists to protect. The histogram therefore counts first-failures, which is the right denominator for "why did we not sign".
+
+**Only the venues the route touches** (§16.2 step 4's "only critical mutable state"), and a venue *missing* from the live map is a rejection rather than a pass — §5.6 forbids converting a gap into "probably unchanged", and immediately before signing is where that conversion is most expensive.
+
+**Six mutations, each caught:** dropping the fee-ceiling check; the deadline becoming inclusive; the profit floor becoming exclusive; a missing venue counting as unchanged; iterating the live map instead of the committed one; and the seal coming off `Revalidated` (which turns the compile_fail green).
 
 ### Task 6.5 — Priority scheduling and preemption (INV-09)
 

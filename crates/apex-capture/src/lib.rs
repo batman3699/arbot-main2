@@ -8,6 +8,7 @@ pub mod clock;
 pub mod journal;
 pub mod recover;
 pub mod registry;
+pub mod revalidate;
 pub mod signer;
 pub(crate) mod sync;
 
@@ -16,6 +17,9 @@ pub use journal::{FileJournal, InMemoryJournal, Journal, JournalEntry};
 pub use recover::{
     scan, ChainOutcomeSource, Disposition, DispatchGate, DispatchPermit, JournalScan,
     ReconciliationComplete, RecoveryError,
+};
+pub use revalidate::{
+    last_mile, LastMileCheck, LastMileContext, Revalidated, RevalidationFailure, SigningAuthorization,
 };
 pub use registry::{RegistryError, RegistryMetrics, TicketGuard, TicketRegistry};
 pub use signer::{
