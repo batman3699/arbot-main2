@@ -3765,14 +3765,58 @@ fn scenario_ev_is_not_a_product_of_independent_probabilities() {
 }
 ```
 
-- [ ] **Step 2: Run and observe the failures.** **Step 3: Implement** `scenario.rs` with the conservative Phase-3 scenario subset and `prior=unmeasured` telemetry flags. **Step 4: Observe the passes.** **Step 5: Commit.**
+- [x] **Step 2: Run and observe the failures.** **Step 3: Implement** `scenario.rs` with the conservative Phase-3 scenario subset and `prior=unmeasured` telemetry flags. **Step 4: Observe the passes.** **Step 5: Commit.**
+
+**Delivered 2026-09-23, with a correction to the clause count.**
+
+**§2.3 has EIGHT clauses, not nine.** The test above and acceptance criterion 3
+both say *"all 9 from §2.3"*; the blueprint lists eight, joined by seven
+`AND`s. The ninth clause is real but belongs to **§2.1's robust gate** —
+`Pr(Π(a,s) > 0) ≥ p_min` — and is implemented and attributed there. `Clause`
+carries a `source()` and a test asserts exactly eight clauses come from §2.3,
+so the miscount cannot quietly return.
+
+**INV-20 is structural before it is tested.** *"A USD mark may never admit a
+trade"* is usually guarded by perturbing the mark and comparing admitted sets.
+That test exists, over both the stated ±50% and arbitrary marks from 1e-9 to
+1e9. But it is the weaker half: **`EligibilityContext` has no USD field**, so
+there is nothing for a clause to read. USD lives in `apex_types::pnl::UsdBounds`
+on the reporting path and the gate cannot name it. The property test confirms
+no USD leaks in by another route; the struct is what makes it impossible.
+
+**Why the product form was wrong, measured.** `EV = P_land·P_state·P_exec·P_net
+− C_failure` asserts independence, and these are not independent: the same
+competitor that takes the pool is why the state changed, why execution reverts,
+and why the net came in under forecast. On the conservative fixture,
+`J = 505,500` against a naive `418,750` — the product **understates by 17% of
+the expected value**. The direction is the informative part: four probabilities
+below one compound, so the product is pessimistic in a benign case and
+*optimistic* under correlated failure, where the factors are mostly redescribing
+one event. That asymmetry is why a product cannot be repaired by tuning its
+inputs.
+
+**A partial scenario set is refused, never normalised.** A set summing to 0.9
+is missing a tenth of the outcome space, and the missing tenth is exactly where
+the unmodelled disasters live. Normalising would redistribute that mass across
+the scenarios somebody did think of.
+
+**The irrecoverable cost sits outside the sum**, because it is not conditional
+on a scenario — the L1 data fee of an included-and-reverted transaction is paid
+in every world. Folding it into each scenario's profit would make it look like
+something the distribution could avoid.
+
+**One rejection, not five.** `evaluate` returns the *first* failing clause, so
+the §27 histogram counts what stopped a candidate rather than everything wrong
+with it. Because the clauses are evaluated in a fixed order, breaking exactly
+one and observing that clause reported is also what proves each is reachable
+rather than shadowed by an earlier one.
 
 **Tests:** as above, plus property tests on cost monotonicity and a fork test reproducing three recorded Base receipts' total cost within 1%.
 **Benchmarks:** `T_size` p99 ≤ 20 ms; cost model evaluation ≤ 200 µs.
 **Acceptance criteria:**
 1. Continuous-to-candidate conversion is a compile error.
 2. L1 data fee reproduces recorded Base receipts within 1% across ≥ 50 receipts.
-3. All nine §2.3 eligibility clauses independently gate.
+3. All eligibility clauses independently gate — **eight from §2.3** plus §2.1's probability-of-profit gate, which the original "nine from §2.3" miscounted as one of them.
 4. USD perturbation ±50% leaves the admitted set unchanged over a 24 h replay.
 5. Flash selection matches a hand-computed optimum on a 20-case table.
 

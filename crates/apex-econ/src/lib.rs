@@ -14,6 +14,8 @@
 //! — not by convention, by type.
 
 pub mod cost;
+pub mod eligibility;
+pub mod ev;
 pub mod flash;
 pub mod sizing;
 
