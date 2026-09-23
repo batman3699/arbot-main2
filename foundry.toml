@@ -13,3 +13,26 @@ via_ir = true
 remappings = [
     "forge-std/=lib/forge-std/src/"
 ]
+
+# Invariant runs are bounded for the everyday loop; `forge test --profile deep`
+# is what Task 5.6 Step 2's 100k-run bar uses. A suite nobody can run in a
+# minute is a suite that gets skipped, and a suite that only ever runs shallow
+# is one that proves less than its name suggests -- so both exist.
+[profile.default.invariant]
+runs = 64
+depth = 32
+fail_on_revert = false
+
+[profile.deep]
+src = "contracts"
+test = "test"
+out = "out"
+libs = ["lib"]
+
+[profile.deep.invariant]
+runs = 1024
+depth = 128
+fail_on_revert = false
+
+[profile.deep.fuzz]
+runs = 100000

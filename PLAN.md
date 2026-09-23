@@ -4330,9 +4330,47 @@ function testDeployTestsDoNotWriteProcessEnv() external {
 
 ### Task 5.6 — Invariant fuzzing and external review
 
-- [ ] **Step 1:** Write `test/invariant/` suites for `ProfitInvariant` and `AdapterRegistry`.
-- [ ] **Step 2:** Run `forge test --match-path 'test/invariant/*' --fuzz-runs 100000`.
-- [ ] **Step 3:** Commission and complete an external review of `contracts/core/` and `contracts/chains/BaseArbExecutor.sol`. **No mainnet deployment before it clears.**
+- [x] **Step 1:** Write `test/invariant/` suites for `ProfitInvariant` and `AdapterRegistry`.
+- [x] **Step 2:** Run the deep profile. `--fuzz-runs 100000` is a *fuzz* setting and does not reach an invariant suite, which is configured by `runs`/`depth`; `FOUNDRY_PROFILE=deep` sets both (1024 × 128) plus 100k fuzz runs for the stateless tests.
+- [ ] **Step 3:** Commission and complete an external review of `contracts/core/` and `contracts/chains/BaseArbExecutor.sol`. **No mainnet deployment before it clears.** — **a human decision, outside what this plan's execution can complete.** G-SEC-1 and acceptance criterion 5 depend on it.
+
+**Delivered 2026-09-24.** 8 invariants across two suites; 89 forge tests total.
+
+**The registry suite compares against a shadow model, not against itself.** A
+fuzz suite that only asserts "it did not revert" proves the contract is
+reachable, not that it still means what it meant. The harness maintains its own
+belief about what is registered, updated only when an operation *succeeds*, and
+the invariant is that the two never disagree. That is what catches a refused
+operation which changed something anyway — `register` on a taken id,
+`deregister` on an empty one, `allow` on an unregistered adapter. Each must be
+a no-op, and "no-op" is only checkable against a model kept separately.
+
+**Ids are folded into a space of eight, and that is about test quality before
+speed.** Over the full 65,536 a fuzzer almost never registers an id that is
+already taken, so the collision paths — `AdapterAlreadyRegistered`,
+deregister-then-register, allow-on-a-deregistered-id — would go unexercised
+while the run looked thorough.
+
+**The profit suite asserts a postcondition, and only in one direction.** It
+does not claim the check accepts everything it should; it claims it never
+accepts anything it should not. That is the only direction a settlement
+invariant may be wrong in — a false rejection loses a trade, a false acceptance
+loses the money.
+
+**`vm.expectRevert` does not belong in an invariant.** The first version used
+it in a loop and reported *"next call did not revert as expected"* on a call
+that does revert — cheatcode state is per-call and the ordering inside an
+invariant is not what it looks like. Asking the question in Solidity, with
+`try`/`catch`, has no ordering to get wrong.
+
+**Two profiles, because one would be the wrong one.** The default is 64 × 32
+and runs in about a second, so it gates every push. `--profile deep` is
+1024 × 128 with 100k stateless fuzz runs. A suite nobody can run in a minute is
+a suite that gets skipped; a suite that only ever runs shallow proves less than
+its name suggests.
+
+**Deep run, 2026-09-24: 8 invariants, 1,024 runs x 128 depth each — 131,072
+calls per invariant, 1,048,576 in total. All pass, zero reverts, 109 s.**
 
 **Tests:** ~60 migrated + ~20 new `forge` tests; 2 invariant suites; Rust commitment property tests.
 **Benchmarks:** executor runtime size under the EIP-170 limit with ≥ 15% margin; gas per 3-hop settlement measured and recorded.

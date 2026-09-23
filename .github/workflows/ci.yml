@@ -78,6 +78,12 @@ jobs:
       - run: forge build
       - name: test (Deploy* quarantined -- B-13)
         run: forge test --no-match-path 'test/Deploy*'
+      - name: invariant suites
+        # Bounded runs. Task 5.6 Step 2's 100k bar is `--profile deep`, which
+        # takes minutes rather than seconds and belongs in a scheduled run
+        # instead of on every push -- but a suite that only ever runs deep is
+        # one that never runs, so the shallow pass gates here.
+        run: forge test --match-path 'test/invariant/*'
       - name: no arbitrary-call surface (INV-33, B-1)
         # Wired here rather than in the gates job because the bytecode half
         # needs a build. It was unwired through Phases 0-4 for a stated reason
