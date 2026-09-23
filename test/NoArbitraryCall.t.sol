@@ -93,7 +93,8 @@ contract NoArbitraryCallTest is Test {
             cycleSlippageBps: 0,
             steps: steps,
             minProfit: 0,
-            declaredResidue: 0
+            declaredResidue: 0,
+            commitment: bytes32(0)
         });
     }
 

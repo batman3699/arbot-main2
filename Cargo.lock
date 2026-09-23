@@ -257,6 +257,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "ethers-core",
+ "proptest",
  "serde",
  "serde_json",
 ]

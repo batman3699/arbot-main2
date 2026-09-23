@@ -247,6 +247,15 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
         /// overtaken, and keeping it quietly lets the contract's balance sheet
         /// drift from what the planner believes.
         uint256 declaredResidue;
+        /// keccak256 over every parameter that decides what this plan DOES,
+        /// computed by whoever built it (§25, INV-06). The executor recomputes
+        /// it and reverts on mismatch.
+        ///
+        /// `bytes32(0)` means "not committed" and is accepted, because the
+        /// commitment arrives with the encoder that produces it and a plan
+        /// built before that encoder is not malformed. Once the encoder always
+        /// sets it, Phase 7 makes a zero commitment a rejection.
+        bytes32 commitment;
     }
 
     struct ActiveLoanContext {
@@ -318,6 +327,10 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
     error Permit2AmountOverflow();
     error CircuitOpen();
     error InvalidLoanCount();
+    /// The plan does not hash to the commitment it carries (§25, INV-06).
+    /// Both values are reported so the mismatch can be diffed against the
+    /// ticket rather than merely observed.
+    error CommitmentMismatch(bytes32 declared, bytes32 recomputed);
     error InvalidProviderAddress();
     error EmptyRevertData();
     error UnsupportedPlanVersion();
@@ -508,6 +521,66 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
         return address(0);
     }
 
+    /// Recompute a plan's commitment (§25, INV-06).
+    ///
+    /// # What the on-chain check actually catches
+    ///
+    /// Worth stating plainly, because it is easy to claim more. The plan and
+    /// its commitment arrive in the same calldata from the same caller, so an
+    /// executor that wanted to run a different trade could simply commit to
+    /// the different trade. This check does **not** constrain a malicious
+    /// executor.
+    ///
+    /// What it does constrain is everything between the planner and the chain:
+    /// an encoder that builds a plan the planner did not describe, a field
+    /// dropped or reordered by an ABI change, a transport that corrupts one
+    /// word. Those are the failures that are otherwise invisible — the trade
+    /// executes, it is simply not the trade that was simulated, risk-checked
+    /// and sized. The off-chain half of INV-06 (a signer refusing a payload
+    /// whose recomputed commitment differs from the ticket's) is what
+    /// constrains the executor, and the two halves catch different things.
+    ///
+    /// # What is in it
+    ///
+    /// Everything that decides what the plan does, and nothing that a correct
+    /// execution may legitimately vary. `block.chainid` and `address(this)`
+    /// are in: a plan committed for one deployment must not execute on
+    /// another, which is INV-05's wrong-chain submission expressed where it
+    /// can actually be enforced. Gas price, deadline buffer and block number
+    /// are out: they vary between commitment and inclusion by design.
+    function planCommitment(PlanV2 memory p) public view returns (bytes32) {
+        bytes32 loansHash;
+        bytes32 stepsHash;
+        uint256 len = p.loans.length;
+        for (uint256 i; i < len;) {
+            Loan memory l = p.loans[i];
+            loansHash = keccak256(
+                abi.encode(loansHash, l.token, l.amount, uint8(l.provider), l.providerAddr)
+            );
+            unchecked { ++i; }
+        }
+        len = p.steps.length;
+        for (uint256 i; i < len;) {
+            // The step's data is hashed rather than concatenated, so a long
+            // payload cannot be split across a boundary to collide with a
+            // different step list.
+            stepsHash = keccak256(abi.encode(stepsHash, uint8(p.steps[i].op), keccak256(p.steps[i].data)));
+            unchecked { ++i; }
+        }
+        return keccak256(
+            abi.encode(
+                block.chainid,
+                address(this),
+                PLAN_VERSION_V2,
+                loansHash,
+                p.cycleSlippageBps,
+                stepsHash,
+                p.minProfit,
+                p.declaredResidue
+            )
+        );
+    }
+
     function _encodeContext(uint8 version, bytes memory payload) private pure returns (bytes memory ctx) {
         ctx = abi.encode(version, payload);
     }
@@ -529,6 +602,10 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
 
     function _initiateLoanV2(PlanV2 memory p) internal {
         if (p.loans.length != 1) revert InvalidLoanCount();
+        if (p.commitment != bytes32(0)) {
+            bytes32 recomputed = planCommitment(p);
+            if (recomputed != p.commitment) revert CommitmentMismatch(p.commitment, recomputed);
+        }
         Loan memory loan = p.loans[0];
         _setActiveStartBalance(loan.token);
         bytes memory ctx = _encodeContext(PLAN_VERSION_V2, abi.encode(p));
@@ -849,7 +926,7 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
     function _legacyToV2(PlanLegacy calldata p) private pure returns (PlanV2 memory out) {
         Loan[] memory loans = new Loan[](1);
         loans[0] = Loan({token: p.loanToken, amount: p.amountIn, provider: p.loanProvider, providerAddr: address(0)});
-        out = PlanV2({loans: loans, cycleSlippageBps: p.cycleSlippageBps, steps: p.steps, minProfit: p.minProfit, declaredResidue: 0});
+        out = PlanV2({loans: loans, cycleSlippageBps: p.cycleSlippageBps, steps: p.steps, minProfit: p.minProfit, declaredResidue: 0, commitment: bytes32(0)});
     }
 
     function _validateLegacyProvider(LoanProvider provider) private pure {

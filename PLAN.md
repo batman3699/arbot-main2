@@ -4180,8 +4180,43 @@ occur tells an integrator to handle a failure mode that does not exist.
 
 ### Task 5.3 — Commitment verification (INV-06, §25)
 
-- [ ] **Step 1: Write the failing tests** — `testCommitmentMismatchReverts` (mutate one field of the plan after computing the commitment); Rust side `exec::commitment_is_stable_under_reencode` (property: encode → decode → re-encode yields the same hash).
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 1: Write the failing tests** — `testCommitmentMismatchReverts` (mutate one field of the plan after computing the commitment); Rust side `exec::commitment_is_stable_under_reencode` (property: encode → decode → re-encode yields the same hash).
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-24.** 8 Solidity tests, 6 Rust tests including a property
+over arbitrary commitments. 70 forge tests, 1536 Rust tests.
+
+**What the on-chain check actually catches, stated rather than implied.** The
+plan and its commitment arrive in the same calldata from the same caller, so
+an executor that wanted to run a different trade could simply commit to the
+different trade. **This does not constrain a malicious executor**, and a test
+asserts exactly that — `testTheOnChainCheckDoesNotConstrainTheCallerItself`
+passes, deliberately.
+
+What it constrains is everything between the planner and the chain: an encoder
+that builds a plan the planner did not describe, a field dropped or reordered
+by an ABI change, a transport that corrupts a word. Those are the failures that
+are otherwise invisible — the trade executes, it is simply not the trade that
+was simulated, risk-checked and sized. The off-chain half (a signer refusing a
+payload whose recomputed commitment differs from the ticket's) is what
+constrains the executor. Two halves, two different failure modes, and claiming
+either covers the other would be the mistake.
+
+**`block.chainid` and `address(this)` are in the commitment**, so a plan
+committed for one deployment cannot execute on another. That is INV-05's
+wrong-chain submission expressed where it can actually be enforced, rather than
+as a counter that notices afterwards.
+
+**A step's payload is hashed, not concatenated** — on both sides. Without it,
+two steps whose payloads concatenate to the same bytes hash identically, so
+`[0xaabb, 0xcc]` and `[0xaa, 0xbbcc]` would be the same plan. The Rust side has
+the same problem in `exact_inputs`/`slippage_constraints` and solves it with
+length prefixes; both are tested at the boundary they exist for.
+
+**A zero commitment is accepted, and that is temporary and deliberate.** The
+encoder that fills the field arrives in Phase 7; a plan built before it is not
+malformed. `bytes32(0)` means *"not committed"*, never *"committed to zero"*,
+and Phase 7 is where it becomes a rejection.
 
 ### Task 5.4 — Route validator and remaining invariants
 

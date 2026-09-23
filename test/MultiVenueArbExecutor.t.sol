@@ -750,7 +750,7 @@ contract MultiVenueArbExecutorAbiV2Test is Test {
         steps[0] = MultiVenueArbImplementation.Step({op: MultiVenueArbImplementation.Op.GENERIC, data: genericData});
 
         MultiVenueArbImplementation.PlanV2 memory plan =
-            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 77, steps: steps, minProfit: 1 ether, declaredResidue: 0});
+            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 77, steps: steps, minProfit: 1 ether, declaredResidue: 0, commitment: bytes32(0)});
 
         bytes memory payload = abi.encode(plan);
         MultiVenueArbImplementation.PlanV2 memory decoded = abi.decode(payload, (MultiVenueArbImplementation.PlanV2));
@@ -779,7 +779,7 @@ contract MultiVenueArbExecutorAbiV2Test is Test {
         MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](0);
 
         MultiVenueArbImplementation.PlanV2 memory plan =
-            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 10, steps: steps, minProfit: 5, declaredResidue: 0});
+            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 10, steps: steps, minProfit: 5, declaredResidue: 0, commitment: bytes32(0)});
 
         bytes memory ctx = abi.encode(uint8(2), abi.encode(plan));
         (uint8 version, bytes memory payload) = abi.decode(ctx, (uint8, bytes));
@@ -867,7 +867,7 @@ contract MultiVenueArbExecutorErc3156Test is Test {
         });
 
         plan =
-            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: minProfit, declaredResidue: 0});
+            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: minProfit, declaredResidue: 0, commitment: bytes32(0)});
     }
 
     /// The adapter id the fixtures register the profit donor under.
@@ -1150,7 +1150,7 @@ contract MultiVenueArbExecutorUniFlashTest is Test {
         });
 
         MultiVenueArbImplementation.PlanV2 memory plan =
-            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: 1 ether, declaredResidue: 0});
+            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: 1 ether, declaredResidue: 0, commitment: bytes32(0)});
 
         executor.startV2(plan);
 
@@ -1187,7 +1187,7 @@ contract MultiVenueArbExecutorUniFlashTest is Test {
         });
 
         MultiVenueArbImplementation.PlanV2 memory plan =
-            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: 1 ether, declaredResidue: 0});
+            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: 1 ether, declaredResidue: 0, commitment: bytes32(0)});
 
         executor.startV2(plan);
 
@@ -1222,7 +1222,7 @@ contract MultiVenueArbExecutorUniFlashTest is Test {
         });
 
         MultiVenueArbImplementation.PlanV2 memory plan =
-            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: 1 ether, declaredResidue: 0});
+            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: 1 ether, declaredResidue: 0, commitment: bytes32(0)});
 
         executor.startV2(plan);
 
@@ -1381,7 +1381,7 @@ contract MultiVenueArbExecutorAccessControlTest is Test {
         MultiVenueArbImplementation.Loan[] memory loans = new MultiVenueArbImplementation.Loan[](0);
         MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](0);
         MultiVenueArbImplementation.PlanV2 memory planV2 =
-            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: 0, declaredResidue: 0});
+            MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: 0, declaredResidue: 0, commitment: bytes32(0)});
 
         bool okLegacy = caller.callStart(address(router), planLegacy);
         bool okV2 = caller.callStartV2(address(router), planV2);
