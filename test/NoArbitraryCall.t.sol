@@ -94,7 +94,9 @@ contract NoArbitraryCallTest is Test {
             steps: steps,
             minProfit: 0,
             declaredResidue: 0,
-            commitment: bytes32(0)
+            commitment: bytes32(0),
+            chainId: 0,
+            deadline: 0
         });
     }
 
@@ -153,6 +155,7 @@ contract NoArbitraryCallTest is Test {
     /// approval; it cannot say who receives it.
     function testAnApprovalCanOnlyEverNameTheResolvedAdapter() external {
         executor.registerAdapter(DONOR_ID, address(donor));
+        executor.allowSelector(DONOR_ID, Donor.donate.selector);
         loanToken.mint(address(executor), 20 ether);
 
         address outsider = address(0xCAFE);
@@ -181,6 +184,7 @@ contract NoArbitraryCallTest is Test {
     /// settlement would not be a fix.
     function testARegisteredAdapterStillSettlesAPlan() external {
         executor.registerAdapter(DONOR_ID, address(donor));
+        executor.allowSelector(DONOR_ID, Donor.donate.selector);
         loanToken.mint(address(donor), 5 ether);
 
         bytes memory payload = abi.encode(
@@ -198,6 +202,7 @@ contract NoArbitraryCallTest is Test {
     function testAnAdapterIdCannotBeSilentlyRepointed() external {
         Attacker atk = new Attacker();
         executor.registerAdapter(DONOR_ID, address(donor));
+        executor.allowSelector(DONOR_ID, Donor.donate.selector);
 
         vm.expectRevert(abi.encodeWithSelector(AdapterAlreadyRegistered.selector, DONOR_ID));
         executor.registerAdapter(DONOR_ID, address(atk));
@@ -223,6 +228,7 @@ contract NoArbitraryCallTest is Test {
     /// The boundary that always held, kept so the severity is not overstated.
     function testAnUnauthorisedCallerStillCannotStart() external {
         executor.registerAdapter(DONOR_ID, address(donor));
+        executor.allowSelector(DONOR_ID, Donor.donate.selector);
         bytes memory payload = abi.encode(DONOR_ID, address(0), uint256(0), bytes(""));
 
         vm.prank(address(0xDEAD));

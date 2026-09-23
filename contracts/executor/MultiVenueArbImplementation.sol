@@ -256,6 +256,20 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
         /// built before that encoder is not malformed. Once the encoder always
         /// sets it, Phase 7 makes a zero commitment a rejection.
         bytes32 commitment;
+        /// The chain this plan was built for (INV-30). Zero means unstated.
+        uint64 chainId;
+        /// Unix seconds after which this route is stale (INV-31). Zero means
+        /// no expiry.
+        ///
+        /// Zero-as-absent is weaker here than it is for `commitment`, and the
+        /// asymmetry is deliberate rather than overlooked: an unstated
+        /// commitment simply skips a check, while an unstated deadline means a
+        /// plan never expires. That is the status quo -- today's contract has
+        /// no plan deadline at all, deriving one from `block.timestamp` at
+        /// execution, which is not an expiry but a fresh clock every time. So
+        /// this is not a regression, and Phase 7's encoder is where zero
+        /// becomes a rejection.
+        uint64 deadline;
     }
 
     struct ActiveLoanContext {
@@ -331,6 +345,10 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
     /// Both values are reported so the mismatch can be diffed against the
     /// ticket rather than merely observed.
     error CommitmentMismatch(bytes32 declared, bytes32 recomputed);
+    /// The plan was built for a different chain (INV-30).
+    error WrongChain(uint64 planChainId, uint256 actualChainId);
+    /// The route's validity window has passed (INV-31).
+    error RouteExpired(uint64 deadline, uint256 blockTimestamp);
     error InvalidProviderAddress();
     error EmptyRevertData();
     error UnsupportedPlanVersion();
@@ -345,6 +363,15 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
     /// transactions, so a substitution cannot happen silently in one.
     function deregisterAdapter(uint16 adapterId) external onlyOwner {
         _deregisterAdapter(adapterId);
+    }
+
+    /// Allow one function on a registered adapter (INV-26).
+    function allowSelector(uint16 adapterId, bytes4 selector) external onlyOwner {
+        _allowSelector(adapterId, selector);
+    }
+
+    function revokeSelector(uint16 adapterId, bytes4 selector) external onlyOwner {
+        _revokeSelector(adapterId, selector);
     }
 
     modifier onlyOwner() {
@@ -576,7 +603,14 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
                 p.cycleSlippageBps,
                 stepsHash,
                 p.minProfit,
-                p.declaredResidue
+                p.declaredResidue,
+                // Both of these are checked BEFORE the commitment, so leaving
+                // them out would let a plan be re-aimed at another chain or
+                // given a new expiry without the commitment noticing -- which
+                // is exactly what `testEveryCommittedFieldMovesTheCommitment`
+                // exists to catch.
+                p.chainId,
+                p.deadline
             )
         );
     }
@@ -602,6 +636,12 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
 
     function _initiateLoanV2(PlanV2 memory p) internal {
         if (p.loans.length != 1) revert InvalidLoanCount();
+        if (p.chainId != 0 && p.chainId != block.chainid) {
+            revert WrongChain(p.chainId, block.chainid);
+        }
+        if (p.deadline != 0 && block.timestamp > p.deadline) {
+            revert RouteExpired(p.deadline, block.timestamp);
+        }
         if (p.commitment != bytes32(0)) {
             bytes32 recomputed = planCommitment(p);
             if (recomputed != p.commitment) revert CommitmentMismatch(p.commitment, recomputed);
@@ -874,6 +914,9 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
             abi.decode(data, (uint16, address, uint256, bytes));
 
         address target = _resolveAdapter(adapterId);
+        // INV-26: an adapter is a contract with more functions than the one a
+        // route needs.
+        _requireAllowedCall(adapterId, callData);
 
         if (approveAmount != 0) {
             if (token == address(0)) revert InvalidGenericAction();
@@ -926,7 +969,7 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
     function _legacyToV2(PlanLegacy calldata p) private pure returns (PlanV2 memory out) {
         Loan[] memory loans = new Loan[](1);
         loans[0] = Loan({token: p.loanToken, amount: p.amountIn, provider: p.loanProvider, providerAddr: address(0)});
-        out = PlanV2({loans: loans, cycleSlippageBps: p.cycleSlippageBps, steps: p.steps, minProfit: p.minProfit, declaredResidue: 0, commitment: bytes32(0)});
+        out = PlanV2({loans: loans, cycleSlippageBps: p.cycleSlippageBps, steps: p.steps, minProfit: p.minProfit, declaredResidue: 0, commitment: bytes32(0), chainId: 0, deadline: 0});
     }
 
     function _validateLegacyProvider(LoanProvider provider) private pure {

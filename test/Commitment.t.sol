@@ -44,6 +44,7 @@ contract CommitmentTest is Test {
         loanToken.mint(address(lender), 1_000 ether);
         loanToken.mint(address(donor), 100 ether);
         executor.registerAdapter(DONOR_ID, address(donor));
+        executor.allowSelector(DONOR_ID, Donor.donate.selector);
     }
 
     function _plan(uint256 profit)
@@ -76,7 +77,9 @@ contract CommitmentTest is Test {
             steps: steps,
             minProfit: 0,
             declaredResidue: 0,
-            commitment: bytes32(0)
+            commitment: bytes32(0),
+            chainId: 0,
+            deadline: 0
         });
     }
 

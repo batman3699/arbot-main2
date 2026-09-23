@@ -4220,8 +4220,52 @@ and Phase 7 is where it becomes a rejection.
 
 ### Task 5.4 — Route validator and remaining invariants
 
-- [ ] **Step 1: Write the failing tests** for INV-24, INV-25 (existing, migrated), INV-26, INV-28, INV-30, INV-31, INV-32.
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 1: Write the failing tests** for INV-24, INV-25 (existing, migrated), INV-26, INV-28, INV-30, INV-31, INV-32.
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-24.** 11 tests in `test/SettlementInvariants.t.sol`; 81
+forge tests total. INV-25, INV-27, INV-29 and INV-33 were already covered by
+existing suites and are not duplicated.
+
+**Two invariants were not implemented at all, only named.**
+
+* **INV-31 — expired routes revert.** The contract had *no plan deadline*. It
+  derived one from `block.timestamp + deadlineBuffer` at execution, which is a
+  **fresh clock every time** rather than an expiry: a plan that sat in a queue
+  for two minutes executed against two-minute-old prices with nothing to
+  object. `PlanV2` now carries a `deadline`, and the boundary is inclusive — a
+  plan is valid *at* its deadline, tested.
+* **INV-30 — wrong chain cannot execute.** There was no chain field either.
+  `planCommitment` bound `block.chainid`, which catches a *committed* plan
+  aimed at the wrong chain, but an uncommitted one had nothing to check.
+
+Both new fields go **into the commitment**. They are checked *before* it, so
+leaving them out would let a plan be re-aimed at another chain or given a new
+expiry without the commitment noticing — which is what
+`testEveryCommittedFieldMovesTheCommitment` exists to catch, and a test now
+asserts it directly.
+
+**INV-26's selector half is real defence, not bookkeeping.** Resolving the
+*address* stops a plan calling anywhere. It does not stop a plan calling a
+registered adapter's admin surface, its upgrade hook, or a `transfer` it
+happens to expose — and every real venue contract has more functions than the
+one a route needs. The fixture's adapter carries a `sweep` alongside its
+`donate` for exactly that reason. Empty calldata is refused outright: it
+invokes `receive`/`fallback`, a function nobody allowlisted and one a selector
+check cannot see because there is no selector.
+
+The pool and token halves of INV-26 stay with the adapter. The executor can
+check *which contract* and *which function* without knowing venue semantics; it
+cannot check whether a pool address is a real Aerodrome pool, and the adapter
+is the only thing that can.
+
+**A zero-fee flash loan borrowed and returned untouched satisfies the
+repayment invariant trivially** — the executor holds exactly what it owes. That
+is correct, and it is why the first version of `testRepaymentShortfallReverts`
+did not revert. The test uses a lender with a fee, so a no-op plan is short by
+precisely the fee: the smallest honest shortfall available.
+
+Executor now 21,199 bytes, 3,377 of margin — 86% of EIP-170, still above Phase 5's 15% benchmark but no longer comfortably. Task 5.6 adds no runtime code; anything after it that does will need another deletion first.
 
 ### Task 5.5 — Remove excluded features (C-03, C-04)
 
