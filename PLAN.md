@@ -3859,8 +3859,35 @@ rather than shadowed by an earlier one.
 
 ### Task 4.1 — `Simulator` trait and Tier 0
 
-- [ ] **Step 1: Write the failing test** — Tier 0 rejects a candidate whose gross profit is below `TotalExecutionCost::conservative_total`, in ≤ 50 µs, without any RPC call (assert the mock provider recorded zero requests).
-- [ ] **Step 2: Run and observe the failure.** **Step 3: Implement.** **Step 4: Observe the pass.** **Step 5: Commit.**
+- [x] **Step 1: Write the failing test** — Tier 0 rejects a candidate whose gross profit is below `TotalExecutionCost::conservative_total`, in ≤ 50 µs, without any RPC call (assert the mock provider recorded zero requests).
+- [x] **Step 2: Run and observe the failure.** **Step 3: Implement.** **Step 4: Observe the pass.** **Step 5: Commit.**
+
+**Delivered 2026-09-23.**
+
+**"Assert the mock provider recorded zero requests" is the weaker half, and
+the test says so.** The mock exists and records zero — because **there is no
+way to give it to `screen`**, which is a synchronous `fn` taking a
+`&Tier0Input` and nothing else. A mock that *could* have been called and
+happened not to be would be a weaker result than a signature with nothing to
+call. `scripts/ci/tier0_is_pure.sh` keeps it true as the module changes: it
+fails the build if `tier0.rs` names a provider type, becomes `async`, or
+awaits. Mutation-tested.
+
+**The 50 µs budget is measured amortised, not once.** A single timing on a
+loaded runner measures the scheduler. Ten thousand screenings over a rotating
+set of candidates, after a warm-up, with `black_box` so the work is not
+optimised away. The real figure is tens of nanoseconds — this is arithmetic on
+a struct — so the assertion has three orders of magnitude of headroom and
+exists to catch a Tier 0 that *starts doing something*, not to benchmark one
+that does not.
+
+**The ladder is one-directional, and that is the whole safety argument.** A
+lower tier may only reject, because nothing runs after it to catch what it
+admits. So Tier 0 screens against the **conservative** total — p99 gas, full
+failure cost — and a test pins that: the same candidate priced at p50 would
+have cleared. Breaking even exactly is a rejection, because a trade that nets
+zero has still consumed a simulation slot, a signer, and a block's worth of
+attention.
 
 ### Task 4.2 — Base `eth_simulateV1` backend (§24.6)
 
@@ -3884,7 +3911,32 @@ fn simulate_v1_sends_explicit_block_and_state_context() {
 }
 ```
 
-- [ ] **Step 2: Run and observe the failures.** **Step 3: Implement** the backend; `eth_call` becomes the fallback and the quorum verifier. **Step 4: Observe the passes.** **Step 5: Commit.**
+- [x] **Step 2: Run and observe the failures.** **Step 3: Implement** the backend; `eth_call` becomes the fallback and the quorum verifier. **Step 4: Observe the passes.** **Step 5: Commit.**
+
+**Delivered 2026-09-23 — the request builders, not the transport.**
+
+**Request construction is separated from sending, and that is what made this
+task possible at all here.** The capture-critical decisions live in the request
+*shape*: `validation: true`, an explicit block rather than `pending`, state
+overrides pinning what was simulated against. A backend that builds and sends
+in one `async fn` can only be tested by mocking the transport, which tests the
+mock. A builder returning `serde_json::Value` can be asserted on exactly — with
+no node, which this environment does not have.
+
+**Two properties worth naming beyond the specified ones:**
+
+* **Neither backend may address a tag**, checked on both paths rather than only
+  the primary. A fallback that silently used `pending` would make the quorum's
+  *agreement* meaningless precisely when the primary was right.
+* **An unchecked chain falls back rather than assuming.** `eth_simulateV1` is
+  not universally available; claiming it for a chain nobody verified produces a
+  backend that fails at runtime on the one path that must not fail.
+
+**`validation: true` is the difference between two questions.** With it off the
+node reports what happens when the calls execute. With it on it also applies
+nonce, balance, intrinsic-gas and fee-cap checks — the ones that decide whether
+the transaction would be *accepted*. Simulating without it answers "would this
+succeed if it ran" when the question is "would this run".
 
 ### Task 4.3 — Tier 2 result completeness
 

@@ -60,7 +60,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ --all-targets -- -D warnings
+      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ -p apex-sim --all-targets -- -D warnings
 
   solidity:
     name: forge
@@ -98,6 +98,8 @@ jobs:
         run: ./scripts/ci/no_ignored_sources.sh
       - name: no code reads the fabricated venue list (B-7)
         run: ./scripts/ci/no_fabricated_venue_sources.sh
+      - name: tier 0 cannot reach the network (§20)
+        run: ./scripts/ci/tier0_is_pure.sh
       - name: no VenueAdapter method has a default body (§10.4)
         run: ./scripts/ci/no_adapter_defaults.sh
       - name: no shared mutable published state (INV-11)

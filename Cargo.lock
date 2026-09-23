@@ -231,6 +231,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "apex-sim"
+version = "0.1.0"
+dependencies = [
+ "apex-types",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "apex-state"
 version = "0.1.0"
 dependencies = [
