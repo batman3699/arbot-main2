@@ -32,39 +32,33 @@ const QUORUM_MODE_ENV: &str = "ARBOT_SIM_QUORUM_MODE";
 const QUORUM_TIMEOUT_ENV: &str = "ARBOT_SIM_QUORUM_TIMEOUT_MS";
 const DEFAULT_QUORUM_TIMEOUT_MS: u64 = 1_500;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuorumMode {
-    Off,
-    BestEffort,
-    Strict,
-}
 
-impl QuorumMode {
-    fn from_env() -> Self {
-        match std::env::var(QUORUM_MODE_ENV)
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "off" | "disabled" | "0" => QuorumMode::Off,
-            "strict" => QuorumMode::Strict,
-            _ => QuorumMode::BestEffort,
-        }
+// The mode itself lives in `apex_sim::quorum`; only the env lookup stays
+// here, because `apex-sim` does not read the environment.
+pub use apex_sim::quorum::QuorumMode;
+
+fn quorum_mode_from_env() -> QuorumMode {
+    match std::env::var(QUORUM_MODE_ENV)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "off" | "disabled" | "0" => QuorumMode::Off,
+        "strict" => QuorumMode::Strict,
+        _ => QuorumMode::BestEffort,
     }
 }
 
-#[derive(Debug)]
-enum VerifierVerdict {
-    /// Call succeeded and the returned profit meets the plan threshold.
-    Confirmed { profit: U256 },
-    /// Call succeeded (or reverted) with a result that contradicts the
-    /// primary simulation: revert, malformed return, or profit below the
-    /// threshold the primary claimed to clear.
-    Contradicted { detail: String },
-    /// Endpoint did not produce a usable answer (transport error / timeout).
-    Unavailable { detail: String },
-}
+// The verdict taxonomy and the veto rule moved to `apex_sim::quorum` in
+// Phase 4: classifying an answer and concluding from a set of answers are
+// pure, and the rule that ONE contradiction vetoes -- however many endpoints
+// confirmed -- is the part that stops a bad trade. It is testable without a
+// node only if it does not hold one.
+//
+// What stays here is the transport: the providers, the timeouts, the
+// concurrency, and redacting endpoint credentials before they reach a log.
+use apex_sim::quorum::{classify, conclude, QuorumOutcome, VerifierVerdict};
 
 pub struct SimQuorum {
     chain: String,
@@ -78,7 +72,7 @@ impl SimQuorum {
     /// With fewer than two endpoints there is nothing independent to ask, so
     /// verification is disabled with a loud warning.
     pub fn from_endpoints(chain: &str, endpoints: &[String]) -> Self {
-        let mode = QuorumMode::from_env();
+        let mode = quorum_mode_from_env();
         let timeout_ms = std::env::var(QUORUM_TIMEOUT_ENV)
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
@@ -170,6 +164,17 @@ independently cross-checked (single-RPC trust). Add fallback RPC URLs to enable 
             return Ok(0);
         }
 
+        // A threshold above 2^128 wei is not a threshold, it is a decode
+        // error. Saturating would make every verifier contradict; truncating
+        // would make every verifier confirm. Both are worse than refusing.
+        let min_profit_u128 = if min_profit > U256::from(u128::MAX) {
+            return Err(anyhow!(
+                "simulation quorum: min_profit {min_profit} does not fit in 128 bits"
+            ));
+        } else {
+            min_profit.as_u128()
+        };
+
         let futures = self.verifiers.iter().map(|(url, provider)| {
             let url = url.clone();
             async move {
@@ -182,41 +187,8 @@ independently cross-checked (single-RPC trust). Add fallback RPC URLs to enable 
                 )
                 .await
                 {
-                    Ok(Ok(raw)) => {
-                        if raw.len() < 32 {
-                            VerifierVerdict::Contradicted {
-                                detail: format!(
-                                    "returned {} bytes; expected 32-byte profit",
-                                    raw.len()
-                                ),
-                            }
-                        } else {
-                            let profit = U256::from_big_endian(&raw[..32]);
-                            if profit >= min_profit {
-                                VerifierVerdict::Confirmed { profit }
-                            } else {
-                                VerifierVerdict::Contradicted {
-                                    detail: format!(
-                                        "profit {profit} below required {min_profit}"
-                                    ),
-                                }
-                            }
-                        }
-                    }
-                    Ok(Err(err)) => {
-                        let text = err.to_string();
-                        // JSON-RPC execution reverts come back as call errors;
-                        // they are a substantive contradiction of the primary
-                        // simulation, unlike transport failures.
-                        if text.contains("revert")
-                            || text.contains("execution reverted")
-                            || text.contains("VM execution error")
-                        {
-                            VerifierVerdict::Contradicted { detail: text }
-                        } else {
-                            VerifierVerdict::Unavailable { detail: text }
-                        }
-                    }
+                    Ok(Ok(raw)) => classify(Ok(raw.as_ref()), min_profit_u128),
+                    Ok(Err(err)) => classify(Err(&err.to_string()), min_profit_u128),
                     Err(_) => VerifierVerdict::Unavailable {
                         detail: format!("timeout after {:?}", self.timeout),
                     },
@@ -227,56 +199,49 @@ independently cross-checked (single-RPC trust). Add fallback RPC URLs to enable 
 
         let results = futures_util::future::join_all(futures).await;
 
-        let mut confirmations = 0usize;
-        let mut unavailable = 0usize;
-        for (url, verdict) in results {
-            // Verifier URLs are provider endpoints with embedded credentials;
-            // this value reaches both the log stream and a returned error.
-            let safe_url = crate::util::redact_endpoint(&url);
+        // Endpoint URLs carry embedded provider credentials, so every one is
+        // redacted before it reaches a log line or a returned error.
+        let redacted: Vec<(String, VerifierVerdict)> = results
+            .into_iter()
+            .map(|(url, verdict)| (crate::util::redact_endpoint(&url), verdict))
+            .collect();
+
+        for (endpoint, verdict) in &redacted {
             match verdict {
-                VerifierVerdict::Confirmed { profit } => {
-                    confirmations += 1;
-                    info!(
-                        target: "sim_quorum",
-                        chain = %self.chain,
-                        endpoint = %safe_url,
-                        profit = %profit,
-                        "independent endpoint confirmed simulation profit"
-                    );
-                }
-                VerifierVerdict::Contradicted { detail } => {
-                    warn!(
-                        target: "sim_quorum",
-                        chain = %self.chain,
-                        endpoint = %safe_url,
-                        detail = %detail,
-                        "independent endpoint CONTRADICTED primary simulation; vetoing dispatch"
-                    );
-                    return Err(anyhow!(
-                        "simulation quorum veto: endpoint {safe_url} contradicted primary result ({detail})"
-                    ));
-                }
-                VerifierVerdict::Unavailable { detail } => {
-                    unavailable += 1;
-                    warn!(
-                        target: "sim_quorum",
-                        chain = %self.chain,
-                        endpoint = %safe_url,
-                        detail = %detail,
-                        "simulation quorum verifier unavailable"
-                    );
-                }
+                VerifierVerdict::Confirmed { profit_wei } => info!(
+                    target: "sim_quorum",
+                    chain = %self.chain,
+                    endpoint = %endpoint,
+                    profit = %profit_wei,
+                    "independent endpoint confirmed simulation profit"
+                ),
+                VerifierVerdict::Contradicted { detail } => warn!(
+                    target: "sim_quorum",
+                    chain = %self.chain,
+                    endpoint = %endpoint,
+                    detail = %detail,
+                    "independent endpoint CONTRADICTED primary simulation; vetoing dispatch"
+                ),
+                VerifierVerdict::Unavailable { detail } => warn!(
+                    target: "sim_quorum",
+                    chain = %self.chain,
+                    endpoint = %endpoint,
+                    detail = %detail,
+                    "simulation quorum verifier unavailable"
+                ),
             }
         }
 
-        if self.mode == QuorumMode::Strict && confirmations == 0 {
-            return Err(anyhow!(
+        match conclude(&redacted, self.mode) {
+            QuorumOutcome::Proceed { confirmations } => Ok(confirmations),
+            QuorumOutcome::Veto { endpoint, detail } => Err(anyhow!(
+                "simulation quorum veto: endpoint {endpoint} contradicted primary result ({detail})"
+            )),
+            QuorumOutcome::NoConfirmation { unavailable } => Err(anyhow!(
                 "simulation quorum (strict): no independent endpoint confirmed the result \
 ({unavailable} unavailable); refusing to dispatch on single-RPC trust"
-            ));
+            )),
         }
-
-        Ok(confirmations)
     }
 }
 

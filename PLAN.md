@@ -4010,6 +4010,41 @@ full sample count before it can move again. A ladder that falls back faster
 than it rises oscillates, and an oscillating gate is one nobody trusts — the
 operator learns to ignore it, which is worse than not having it.
 
+### Quorum decision extracted, recorded 2026-09-23 (acceptance criterion 4)
+
+`sim_quorum.rs` is 354 lines holding `Provider<Http>` handles. Moving it whole
+into `apex-sim` would have pulled `ethers` into a crate that currently has
+none — and that absence is what makes the Task 4.2 request builders testable
+without a node. So it was split on the same line as Phase 2's crate boundary:
+**the decision is pure, the transport is not.**
+
+`apex_sim::quorum` holds the verdict taxonomy, the classification of a
+verifier's raw answer, and the conclusion rule. `arb_exec::sim_quorum` keeps
+the providers, the timeouts, the concurrency, and the credential redaction —
+and now calls into `apex-sim` rather than carrying a second copy of the rule.
+Its five existing tests still pass.
+
+**A quorum is not a vote, and the extraction makes that testable.** One
+contradiction vetoes, however many endpoints confirmed — asserted for zero
+through seven confirmations. Endpoints are not independent witnesses: they run
+the same client on the same consensus, so agreement is cheap and disagreement
+is expensive information. Identical reasoning to `apex_state::FeedArbiter`
+having no `Majority` variant.
+
+**Contradiction and unavailability are different answers**, and conflating them
+either vetoes on a network blip or ignores a real disagreement. Revert
+detection is substring matching, because provider error text is not a stable
+format — and the bias is chosen rather than inherited: a false *contradiction*
+loses an opportunity, a false *unavailable* dispatches a bad trade, so an
+ambiguous message is read as a contradiction. Tested.
+
+**Two decode paths that would have read as confirmations, now refused.** A
+profit that does not fit in 128 bits is a decode error rather than an enormous
+confirmation — saturating would turn malformed data into the most convincing
+answer available. And a `min_profit` above 2^128 wei is refused outright, since
+saturating makes every verifier contradict and truncating makes every verifier
+confirm.
+
 ### Task 4.5 — Red/blue for simulation
 
 - [ ] **Step 1:** Run both backends on every candidate for 7 days; write `docs/apex/reports/sim-diff-<date>.csv`.
