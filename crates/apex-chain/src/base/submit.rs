@@ -224,6 +224,39 @@ impl BaseTransactionStatus {
     }
 }
 
+/// **INV-36: no public leakage by default.**
+///
+/// §24.4 makes `Public` "the fallback, never the default", and this is where
+/// that is decided. The rule is one line and the reason it is a function rather
+/// than a comment is that the obvious implementation -- "pick the first
+/// eligible lane" -- silently satisfies it today and stops satisfying it the
+/// first time a public lane is listed before a private one.
+///
+/// A candidate asking for protection gets a protected lane or **nothing**. It
+/// never falls back to public: falling back is precisely the leak, and it is
+/// the kind that looks like resilience in a dashboard.
+pub fn choose_lane(
+    lanes: &[SubmissionLane],
+    required: SubmissionPolicy,
+    now: UnixNanos,
+) -> Option<&SubmissionLane> {
+    let mut eligible = lanes.iter().filter(|l| l.may_dispatch(now).is_ok());
+    match required {
+        // An explicit request for the public mempool is honoured -- §24.4 calls
+        // it a fallback, not a prohibition -- but it must be asked for by name.
+        SubmissionPolicy::Public => eligible.find(|l| l.policy == SubmissionPolicy::Public),
+        // Anything else takes the highest-confidence protected lane, and no
+        // public lane is a candidate at any confidence.
+        _ => eligible
+            .filter(|l| l.policy != SubmissionPolicy::Public)
+            .max_by(|a, b| {
+                a.privacy_confidence(now)
+                    .partial_cmp(&b.privacy_confidence(now))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+    }
+}
+
 /// Why a redundant send stopped early.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RedundancyOutcome {

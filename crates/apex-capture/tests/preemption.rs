@@ -3,10 +3,11 @@
 //! Acceptance criterion 4: "Under 10x overload, `Authorized` tickets are never
 //! preempted and `U_capture` stays >= 0.99."
 
+include!("fixtures.rs");
+
+use apex_capture::registry::TicketRegistry;
 use apex_capture::scheduler::{Scheduler, Work, WorkClass};
-use apex_types::ids::TicketId;
-use apex_types::ticket::TicketStatus;
-use apex_types::time::UnixNanos;
+use apex_types::ticket::{TerminalFailure, TicketOutcome};
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
 use std::collections::VecDeque;
@@ -121,7 +122,7 @@ fn run_fifo() -> Outcome {
 
 /// **INV-09 and acceptance criterion 4.**
 #[test]
-fn authorized_ticket_never_preempted_under_overload() {
+fn authorized_ticket_never_preempted() {
     let o = run_priority();
     println!(
         "priority: {}/{} tickets in time, U_capture = {:.4}",
@@ -132,6 +133,66 @@ fn authorized_ticket_never_preempted_under_overload() {
     assert_eq!(o.authorized_shed, 0, "an authorized live ticket was preempted");
     let u = Scheduler::u_capture(o.tickets_in_time, o.tickets_admitted);
     assert!(u >= 0.99, "U_capture was {u} over {} tickets", o.tickets_admitted);
+}
+
+/// **INV-02, by failure injection.** `ticket_drop_count == 0` while the
+/// scheduler is actively shedding.
+///
+/// The two halves of the system have to be run together to mean anything: the
+/// scheduler decides what to stop working on, and the registry decides what
+/// that does to a ticket. Shedding is precisely the moment a ticket could be
+/// silently forgotten -- the work item vanishes from the queue, and if nothing
+/// closes the ticket behind it, it is gone. So this sheds hard, then asks the
+/// registry whether it lost anything.
+#[test]
+fn no_drop_under_preemption() {
+    let reg = TicketRegistry::in_memory();
+    let mut sched = Scheduler::new();
+    let mut ids = Vec::new();
+
+    // Every ticket is real and admitted; the scheduler's work items reference
+    // them. A test that shed synthetic work would prove nothing about tickets.
+    for i in 0..40u64 {
+        let id = reg.admit(ticket()).expect("admitted");
+        ids.push(id);
+        let class = if i.is_multiple_of(4) {
+            WorkClass::AuthorizedLiveTicket
+        } else {
+            WorkClass::HighEvCandidate
+        };
+        sched.admit(work(id.0, class, 100 + i, 1));
+    }
+
+    // Shed to nothing, repeatedly. Anything sheddable goes.
+    for capacity in [8usize, 4, 1, 0] {
+        for shed in sched.shed(capacity) {
+            // A shed work item is work abandoned. The ticket behind it must be
+            // closed explicitly -- which is the registry's job, and the point
+            // of the test is that nothing else quietly does it instead.
+            let _ = reg.close(
+                TicketId(shed.id.0),
+                TicketOutcome::ExplicitFailure {
+                    code: TerminalFailure::RiskRejected { rule: "shed under overload".to_string() },
+                    at: UnixNanos(1),
+                    state: Box::new(fingerprint()),
+                    cause: "the scheduler preempted this work".to_string(),
+                },
+            );
+        }
+    }
+
+    // Authorized tickets were never shed, so they are still live; the sweep is
+    // what closes them.
+    reg.sweep(UnixNanos(u64::MAX));
+
+    let m = reg.metrics();
+    assert_eq!(m.ticket_drop_count(), 0, "INV-02: a ticket was lost while shedding");
+    assert_eq!(m.tickets_live, 0);
+    assert_eq!(m.tickets_admitted, 40);
+    assert_eq!(m.tickets_admitted, m.tickets_terminal_success + m.tickets_terminal_failure);
+    for id in ids {
+        assert!(reg.outcome(id).is_some(), "ticket {} has no outcome", id.0);
+    }
 }
 
 /// §46.1: FIFO is forbidden on the final capture path. Run both ways, because

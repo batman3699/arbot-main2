@@ -15511,8 +15511,12 @@ mod tests {
     fn validate_global_config_accepts_valid_private_key() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let prior = env::var("PRIVATE_KEY").ok();
+        // A real key is needed because the validator checks the format. This is
+        // hardhat/anvil's published test account #1 -- the most widely
+        // published private key in Ethereum, controlling nothing on any chain
+        // this system trades.
         env::set_var(
-            "PRIVATE_KEY",
+            "PRIVATE_KEY", // secret-scan:allow published anvil test key
             "0x59c6995e998f97a5a0044966f0945382d4a4d1d3786ea5e1473f2e0b64c1f0b7",
         );
 

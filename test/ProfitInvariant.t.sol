@@ -51,7 +51,7 @@ contract ProfitInvariantTest is Test {
 
     /// Every borrowed asset returns to at least its starting balance plus what
     /// is owed, for one through four assets and arbitrary amounts.
-    function testFuzzMultiAssetInvariantHolds(
+    function testMultiAssetInvariantHolds(
         uint8 rawCount,
         uint96 start,
         uint96 repay,

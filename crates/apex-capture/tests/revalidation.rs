@@ -146,7 +146,7 @@ fn the_profit_floor_is_inclusive() {
 /// compile-fail half -- forging the token, and calling `new` without one -- is
 /// in `revalidate.rs`'s doctests, per the convention in `apex_types::candidate`.
 #[test]
-fn a_signing_authorization_can_only_be_built_from_a_pass() {
+fn sign_requires_revalidation_token() {
     let c = passing();
     let proof = last_mile(&c).expect("a passing context");
     let auth = SigningAuthorization::new(c.ticket, c.nonce, proof);

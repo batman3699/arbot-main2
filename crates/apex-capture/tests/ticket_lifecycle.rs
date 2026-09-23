@@ -188,7 +188,7 @@ fn status_may_not_run_backwards() {
 /// **INV-03.** A ticket nobody ever touches is the case the RAII guard
 /// structurally cannot see, because there is no guard to drop.
 #[test]
-fn a_forgotten_ticket_is_closed_at_its_deadline() {
+fn expiry_is_always_explained() {
     let clock = ManualClock::at(1_700_000_000_000_000_000);
     let reg = TicketRegistry::new(Box::new(InMemoryJournal::new()), Box::new(clock));
     let id = reg.admit(ticket()).unwrap();
@@ -331,7 +331,7 @@ proptest! {
     /// test would only prove that tickets somebody *touched* terminate, and the
     /// forgotten ticket is the one that actually loses money.
     #[test]
-    fn every_admitted_ticket_reaches_exactly_one_terminal_state(
+    fn ticket_always_terminates(
         ops in prop::collection::vec(op_strategy(), 0..24)
     ) {
         let reg = TicketRegistry::in_memory();

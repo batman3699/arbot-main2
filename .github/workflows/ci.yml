@@ -146,12 +146,13 @@ jobs:
         run: ./scripts/ci/no_shared_env_keys.sh
       - name: no chain-identity branching outside apex-chain (§20)
         run: ./scripts/ci/no_chain_string_matching.sh
-      # secret_scan.sh is NOT wired yet. It is red on arrival, but only on test
-      # fixtures -- `/v2/test-key`, `/v2/test`, `/v2/abc123` and a doc-comment
-      # example in a shadow script. No real credential is exposed. It needs a
-      # placeholder filter before it can gate, and weakening a secret scanner to
-      # make CI green is the wrong instinct to act on under time pressure.
-      # Tracked as a Phase 0 follow-up.
+      # This comment used to say secret_scan.sh was "NOT wired yet" and "red on
+      # arrival". It described a file that had never been committed. The script
+      # was written 2026-09-24, when `invariant_coverage.sh` was taught to check
+      # enforcement artefacts other than Rust tests and INV-46's turned out to
+      # be missing. It is green and it gates.
+      - name: no credentials in source, logs or metrics (INV-46, §43)
+        run: ./scripts/ci/secret_scan.sh
       # check_placeholder_endpoints.sh is NOT wired yet. It is red on arrival
       # for a real reason: config/registry.json:363 carries ${ALCHEMY_KEY} for
       # `abstract`, one of the six non-live chains. Same root cause as

@@ -45,12 +45,15 @@ fn pool(lanes: u16) -> SignerPool {
     )
 }
 
+/// **INV-04**, named as §8 names it: `capture::nonce_never_reused`, a loom
+/// model over the lane state machine.
+///
 /// Two threads, two lanes, one reservation each. The hazard is both threads
 /// surveying the pool, both seeing lane 0 free, and both taking it -- after
 /// which they hold one nonce stream between them and hand out the same number
 /// twice. `assign` re-checks `busy` under the lock for exactly this.
 #[test]
-fn no_cross_lane_nonce_reuse() {
+fn nonce_never_reused() {
     loom::model(|| {
         let pool = Arc::new(pool(2));
         let seen: Arc<Mutex<Vec<(SignerLaneId, u64)>>> = Arc::new(Mutex::new(Vec::new()));

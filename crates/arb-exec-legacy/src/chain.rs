@@ -2186,6 +2186,9 @@ mod tests {
     fn secret_looks_placeholder_detects_template_values() {
         assert!(secret_looks_placeholder("REPLACE_ME"));
         assert!(secret_looks_placeholder("REPLACE_WITH_NEW_ROTATED_KEY"));
+        // secret-scan:allow a fabricated 64-hex value, not a key to anything.
+        // The assertion needs a string that does NOT look like a placeholder,
+        // which by definition means it has to look like a key.
         assert!(!secret_looks_placeholder(
             "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356"
         ));

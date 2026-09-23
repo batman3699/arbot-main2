@@ -114,9 +114,41 @@ fn time_alone_cannot_leave_a_global_halt() {
 
 // ------------------------------------------------------------------ INV-43
 
-/// **The plan's `every_loss_is_classified`.** Every class has a budget; a class
-/// without one is a class whose gate never tightens, which is the silent
-/// failure INV-43 exists to prevent.
+/// **INV-43**, named as §8 names it.
+///
+/// "Every loss is classified into one of the §28.2 classes." The enforcement is
+/// that `LossClass` has no catch-all variant and the ledger takes a class
+/// rather than inferring one — so a caller with a loss it cannot name has no
+/// way to record it, which is the point. This asserts the closed world and that
+/// the ledger accepts every member of it.
+#[test]
+fn every_loss_is_classified() {
+    let mut ledger = LossLedger::with_default_budgets();
+    // The taxonomy is closed: nine classes, no `Other`. An exhaustive match is
+    // the check -- a tenth variant added later fails to compile here.
+    for c in LossClass::ALL {
+        let label = match c {
+            LossClass::Pricing => "pricing",
+            LossClass::State => "state",
+            LossClass::Simulation => "simulation",
+            LossClass::Venue => "venue",
+            LossClass::Inclusion => "inclusion",
+            LossClass::FeeModel => "fee_model",
+            LossClass::Contract => "contract",
+            LossClass::OperatorConfig => "operator_config",
+            LossClass::ExternalProtocol => "external_protocol",
+        };
+        assert!(!label.is_empty());
+        // And every one of them can actually be recorded. A class the ledger
+        // silently ignored would be a loss that happened and was not counted.
+        ledger.record(c, U256::from(1u64), T0);
+        assert_eq!(ledger.count_in_window(c, T0), 1, "{c:?} was not recorded");
+    }
+    assert_eq!(LossClass::ALL.len(), 9, "§28.2 names nine classes");
+}
+
+/// Every class has a budget; a class without one is a class whose gate never
+/// tightens, which is the silent failure INV-43 exists to prevent.
 #[test]
 fn every_loss_class_has_a_budget() {
     let ledger = LossLedger::with_default_budgets();

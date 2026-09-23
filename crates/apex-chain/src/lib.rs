@@ -22,7 +22,7 @@ pub use base::flashblock::{
 pub use base::observe::{Receipt, TransactionObservation};
 pub use base::reconcile::{reconcile, BalanceDelta, ReconcileError, ReconcileInputs};
 pub use base::submit::{
-    blockpi_base_lane, send_redundantly, BaseTransactionStatus, EndpointKind, LaneRefusal,
+    blockpi_base_lane, choose_lane, send_redundantly, BaseTransactionStatus, EndpointKind, LaneRefusal,
     PrivacyEvidence, RedundancyOutcome, SubmissionLane,
 };
 pub use regime::{

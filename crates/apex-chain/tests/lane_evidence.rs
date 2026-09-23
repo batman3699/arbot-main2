@@ -1,7 +1,7 @@
 //! Tasks 7.3 and 7.3a — §21.1, §21.5, §24.2, §24.4. INV-10, INV-34, B-14.
 
 use apex_chain::base::submit::{
-    blockpi_base_lane, send_redundantly, BaseTransactionStatus, EndpointKind, LaneRefusal,
+    blockpi_base_lane, choose_lane, send_redundantly, BaseTransactionStatus, EndpointKind, LaneRefusal,
     PrivacyEvidence, RedundancyOutcome, SubmissionLane, BLOCKPI_ATTESTATION_TTL,
 };
 use apex_types::ack::LifecycleStage;
@@ -179,10 +179,74 @@ fn base_transaction_status_known_maps_to_node_known_not_included() {
     assert_eq!(BaseTransactionStatus::Rejected.stage(), None);
 }
 
+/// **INV-36**, named as §8 names it: no public leakage by default.
+///
+/// §24.4 makes `Public` the fallback, never the default. A candidate asking for
+/// protection gets a protected lane or **nothing** — it never falls back to
+/// public, because falling back is precisely the leak, and it is the kind that
+/// looks like resilience in a dashboard.
+#[test]
+fn public_is_not_default() {
+    let lanes = configured_lanes();
+
+    // Protection requested: the private lane, never the public one.
+    let chosen = choose_lane(&lanes, SubmissionPolicy::Private, at(1)).expect("a protected lane");
+    assert_eq!(chosen.id, SubmissionLaneId(1));
+    assert_ne!(chosen.policy, SubmissionPolicy::Public);
+
+    // The public lane is reachable only by asking for it by name.
+    let public = choose_lane(&lanes, SubmissionPolicy::Public, at(1)).expect("the fallback");
+    assert_eq!(public.id, SubmissionLaneId(2));
+
+    // **The leak this exists to stop.** With the private lane's evidence stale
+    // it is no longer dispatchable, and the public lane is right there -- a
+    // "pick the first eligible lane" rule would take it. Protection asked for
+    // and not available means no lane.
+    let stale = at(BLOCKPI_ATTESTATION_TTL.0 + 1);
+    assert!(lanes[0].may_dispatch(stale).is_err());
+    assert!(lanes[1].may_dispatch(stale).is_ok(), "the public lane is still up");
+    assert!(
+        choose_lane(&lanes, SubmissionPolicy::Private, stale).is_none(),
+        "a protected candidate fell back to the public mempool"
+    );
+    assert!(choose_lane(&lanes, SubmissionPolicy::PrivateBundle, stale).is_none());
+}
+
+/// Ordering must not decide it either. The obvious implementation -- take the
+/// first eligible lane -- passes the test above by accident and fails here.
+#[test]
+fn listing_a_public_lane_first_does_not_make_it_the_default() {
+    let mut lanes = configured_lanes();
+    lanes.reverse();
+    assert_eq!(lanes[0].policy, SubmissionPolicy::Public, "public is now first");
+
+    let chosen = choose_lane(&lanes, SubmissionPolicy::Private, at(1)).expect("a protected lane");
+    assert_eq!(chosen.policy, SubmissionPolicy::Private);
+}
+
+/// Between two protected lanes, the better-evidenced one wins — which is what
+/// makes upgrading a lane to `Measured` worth doing.
+#[test]
+fn the_better_evidenced_protected_lane_wins() {
+    let mut lanes = configured_lanes();
+    lanes.push(SubmissionLane {
+        id: SubmissionLaneId(4),
+        endpoint: EndpointKind::FlashblocksAwareRpc,
+        policy: SubmissionPolicy::Private,
+        privacy_evidence: Some(PrivacyEvidence::Measured {
+            probe: "mempool-absence",
+            checked_at: T0,
+            ttl: DurationNanos(u64::MAX),
+        }),
+    });
+    let chosen = choose_lane(&lanes, SubmissionPolicy::Private, at(1)).expect("a lane");
+    assert_eq!(chosen.id, SubmissionLaneId(4), "the measured lane should win");
+}
+
 /// **INV-10.** Every lane gets the same bytes, and the function has no way to
 /// give them anything else.
 #[test]
-fn redundant_transport_sends_identical_signed_bytes() {
+fn redundant_transport_sends_identical_bytes() {
     let signed = vec![0xAB, 0xCD, 0xEF, 0x01];
     let seen: RefCell<Vec<(SubmissionLaneId, Vec<u8>)>> = RefCell::new(Vec::new());
 
