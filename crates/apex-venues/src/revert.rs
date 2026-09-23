@@ -41,7 +41,18 @@ const PANIC_UINT: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
 const CUSTOM_ERRORS: &[(&str, RevertClass)] = &[
     // The executor's own guards (contracts/executor).
     ("SlippageExceeded(uint256,uint256,uint256)", RevertClass::MinOutNotMet),
-    ("InsufficientFinalBalance(uint256,uint256)", RevertClass::ProfitInvariantViolated),
+    // `DebtNotRepaid` replaced `InsufficientFinalBalance` when the settlement
+    // moved onto `ProfitInvariant` (Phase 5 Task 5.2). It carries the token as
+    // well as the two balances, which is what makes a multi-asset shortfall
+    // readable -- "short by 1e18" does not say short of what.
+    ("DebtNotRepaid(address,uint256,uint256)", RevertClass::ProfitInvariantViolated),
+    ("UnaccountedResidue(address,uint256,uint256)", RevertClass::ProfitInvariantViolated),
+    ("ProfitTokenNotBorrowed(address)", RevertClass::ProfitInvariantViolated),
+    ("DuplicateDebtToken(address)", RevertClass::ProfitInvariantViolated),
+    // The settlement refused to call an address that is not on the adapter
+    // allowlist (B-1's fix). Not a market failure: a plan aimed at something
+    // the owner never registered.
+    ("UnknownAdapter(uint16)", RevertClass::Unauthorized),
     ("InvalidDeadline()", RevertClass::Expired),
     ("NotExecutor()", RevertClass::Unauthorized),
     ("NotOwner()", RevertClass::Unauthorized),
