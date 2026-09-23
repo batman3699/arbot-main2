@@ -3612,10 +3612,61 @@ directions, tested at every boundary value including `U256::MAX` and 2^255.
 ### Task 3.2 — `TotalExecutionCost` and gas-limit/gas-used separation (INV-19)
 
 - [ ] **Step 1: Write the failing tests** — all nine cost components present and non-defaultable; `GasLimit`/`GasUsed` non-convertible (trybuild); `conservative_total` uses p99 gas and full failure cost; an OP Stack L1 data fee derived from compressed size reproduces a recorded real receipt's `l1Fee` within 1%.
-- [ ] **Step 2: Run and observe the failures.**
-- [ ] **Step 3: Implement** `cost/`, with `l1_data.rs` computing the OP Stack L1 fee from compressed calldata size and Ethereum base/blob fee conditions, validated against recorded Base receipts in `tests/fixtures/base_receipts.json`.
-- [ ] **Step 4: Run and observe the passes.**
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run and observe the failures.**
+- [x] **Step 3: Implement** `cost/`, with `l1_data.rs` computing the OP Stack L1 fee from compressed calldata size and Ethereum base/blob fee conditions, ~~validated against recorded Base receipts in `tests/fixtures/base_receipts.json`~~ — **the validation is NOT done.** See below.
+- [x] **Step 4: Run and observe the passes.**
+- [x] **Step 5: Commit.**
+
+**Delivered 2026-09-23**, minus the validation, which is blocked.
+
+**Acceptance criterion 2 is not met and cannot be met here.** *"L1 data fee
+reproduces recorded Base receipts within 1% across ≥ 50 receipts"* needs Base
+receipts. There are none in this repository — `broadcast/` holds Ethereum
+deploy artifacts, which carry no `l1Fee` — and the development environment has
+no egress to Base. The Fjord arithmetic is implemented from the published
+constants and exercised by its own algebra; **whether those constants match
+what Base's oracle currently holds is unverified.**
+
+That is carried in the type, not in a comment. `L1FeeModel` reports a
+`Validation`, whose only constructible value today is
+`FromPublishedConstantsOnly`, and `may_price_a_live_dispatch()` is false for
+it. `CompressedSize` is separately `Measured` or `Estimated`, and a fee is
+authoritative only when both halves are — a validated model fed an estimated
+size is still an estimate. `the_l1_model_has_not_been_checked_against_a_receipt`
+exists to **fail** when someone validates it, forcing the evidence into the
+type. Same device as `no_venue_gas_figure_has_been_measured_yet`.
+
+**Why model it locally at all**, given the oracle answers exactly: the legacy
+path calls `GasPriceOracle.getL1Fee(bytes)` once per estimate, which is a round
+trip on the hot path and, more decisively, makes Task 3.3 impossible — choosing
+between encodings means pricing several of them.
+
+**Three things the implementation surfaced:**
+
+* **The Fjord intercept is negative** (−42,585,600), so the linear term goes
+  below zero for transactions under ~51 compressed bytes and the
+  `minTransactionSize` clamp is the *operative branch*, not a safety rail.
+  Computing that in unsigned arithmetic wraps; the near-miss version —
+  saturating at zero — would quietly charge every small transaction the floor
+  for the wrong reason. Tested both ways.
+* **A reverted transaction pays the whole L1 data fee.** The calldata reached
+  Ethereum the moment the transaction was included; the revert is an L2
+  detail L1 never learns. So the failure cost is not a fraction of the success
+  cost — its L1 half is identical and only its L2 half is smaller. On a Base-
+  shaped fixture the naive "scale the total by the gas ratio" model understates
+  the failure cost by **over 50%**, in the direction that makes marginal trades
+  look acceptable. Measured in `scaling_the_total_by_a_gas_ratio_understates_the_failure_cost`.
+* **The fee is linear in the L1 prices only up to a wei of truncation**, and
+  the truncation rounds *against the trader* — `floor(2a) ≥ 2·floor(a)` — so a
+  cost model built on it cannot understate.
+
+**INV-19 now has an in-language proof.** §23.4's `GasLimit`/`GasUsed`
+separation was guarded only by `scripts/ci/no_gas_conversion.sh`, with the
+recorded reason that Rust has no negative trait bounds. `compile_fail`
+doctests are that proof, version-independent and paired with a compiling twin;
+**mutation-verified** by adding a `From<GasLimit> for GasUsed` impl, which
+turns one case green and the test red. The grep guard stays: it also catches
+`as`-casts and field-level conversions that a trait-based test cannot see.
 
 ### Task 3.3 — Calldata optimizer (§23.3)
 

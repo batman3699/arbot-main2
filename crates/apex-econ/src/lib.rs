@@ -13,6 +13,7 @@
 //! demands. A continuous result cannot be assigned to `Candidate::input_amount`
 //! — not by convention, by type.
 
+pub mod cost;
 pub mod sizing;
 
 /// Crate version, exposed so workspace wiring is testable before any sizing
