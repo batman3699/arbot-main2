@@ -14,6 +14,7 @@
 //! — not by convention, by type.
 
 pub mod cost;
+pub mod flash;
 pub mod sizing;
 
 /// Crate version, exposed so workspace wiring is testable before any sizing

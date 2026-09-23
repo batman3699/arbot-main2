@@ -3670,8 +3670,60 @@ turns one case green and the test red. The grep guard stays: it also catches
 
 ### Task 3.3 — Calldata optimizer (§23.3)
 
-- [ ] **Step 1: Write the failing test** — two encodings of the same route with different calldata sizes produce different `l1_data_fee` and the optimizer picks the smaller when the outputs are economically identical.
-- [ ] **Step 2: Run and observe the failure.** **Step 3: Implement.** **Step 4: Observe the pass.** **Step 5: Commit.**
+- [x] **Step 1: Write the failing test** — two encodings of the same route with different calldata sizes produce different `l1_data_fee` and the optimizer picks the smaller when the outputs are economically identical.
+- [x] **Step 2: Run and observe the failure.** **Step 3: Implement.** **Step 4: Observe the pass.** **Step 5: Commit.**
+
+**Delivered 2026-09-23, with the task's premise corrected.** *"Picks the
+smaller"* is the wrong rule. Fjord prices the **FastLZ-compressed** size, and
+ABI encoding pads everything to 32-byte words — so a "wasteful" padded encoding
+is mostly zero bytes in a long repeating pattern, which is what a compressor
+removes. Measured on a fixture: a 384-byte padded encoding costs **less** than
+a 200-byte packed one. The optimizer therefore ranks by **modelled fee** and
+`cheapest` is deliberately unable to see a byte count at all.
+
+**The estimator is a proxy and says so.** Fjord's input is
+`flzCompressLen(tx_bytes)`; this crate does **not** implement FastLZ. A port
+written from memory would produce an authoritative-looking number that cannot
+be checked against Base from here — the same shape of mistake as a fabricated
+venue address, in a different costume. `byte_class_size` is the pre-Ecotone
+Bedrock measure (`4·zeros + 16·nonzeros`) used as a compressibility proxy:
+right about what dominates here, wrong about everything a real compressor does
+with repetition.
+
+That is enough for ranking and not enough for a fee, which is the reason
+`CompressedSize` carries its provenance. **Ranking needs the estimator to be
+monotone in the truth; quoting a fee needs it to be equal to the truth.** One
+number, two jobs, two accuracy requirements — and the test asserts the
+monotonicity it actually depends on rather than an accuracy it does not have.
+
+### Task 3.4 — Flash-source router (§19)
+
+**Delivered 2026-09-23.**
+
+**§19's objective is missing an input, and the omission matters.** The rule is
+`argmin(premium + gas_overhead·gasPrice + failure_risk_cost + availability_penalty)`.
+Three terms are properties of the provider. The fourth is not: an availability
+penalty is `P(unavailable) × (what the outage costs)`, and what an outage costs
+is the **opportunity**, which belongs to the trade. A provider that is 1% flaky
+is fine for a trade worth a cent and unacceptable for one worth ten thousand
+dollars. So `select` takes the opportunity's value rather than pretending a
+quote can be ranked alone, and a test pins the crossover: with a 0.002 ETH
+premium gap and a 2% outage rate the two providers swap at an opportunity of
+**0.1 ETH**, exactly `gap / outage_rate`.
+
+**Probabilities cross into wei exactly once, and pessimistically.**
+`availability_probability` and `reliability_score` are `f64`; every cost is
+wei. `to_ppm` converts once and rounds **down**, treating a provider as
+slightly less available than it claims — rounding the other way would shave the
+penalty on precisely the providers whose availability is least certain. A NaN
+availability becomes zero, which *excludes* the provider rather than scoring it
+well.
+
+**Exclusion is not a bad score.** Insufficient capacity, a zero availability
+and a wrong asset remove a provider from the ranking and are reported with the
+reason, which is what makes §19.4's outage requirement checkable at all. Every
+provider excluded returns `None` — a different fact from "the cheapest one is
+expensive", and reported as such rather than by a sentinel.
 
 ### Task 3.4 — Flash-source router (§19)
 
