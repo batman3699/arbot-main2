@@ -4595,8 +4595,28 @@ fn each_revalidation_check_can_reject() {
 
 ### Task 6.6 — Acknowledgement ladder and null dispatcher (INV-34)
 
-- [ ] **Step 1: Write the failing tests** — all seven stages observable with independent timeouts; `transport_accepted` never sets `included`.
-- [ ] **Step 2–5:** as usual, with a `NullDispatcher` that records what *would* have been sent.
+- [x] **Step 1: Write the failing tests** — all seven stages observable with independent timeouts; `transport_accepted` never sets `included`.
+- [x] **Step 2–5:** as usual, with a `NullDispatcher` that records what *would* have been sent.
+
+**Delivered 2026-09-24.** `src/dispatch/{mod,ack,router}.rs`; 11 tests. Workspace 1,616 passing.
+
+**C-09's fix, stated as a function.** `LifecycleStage::implies_inclusion` is true for two of seven variants, and nothing else in the module asks the question a second way. The legacy `dispatch_call` treats a successful `send_raw_transaction` as the submission outcome and `classify_receipt` then jumps to the mined receipt — the seven stages between those two points are exactly where a transaction is lost, so collapsing them reports every one of those losses as the same thing.
+
+**Plan discrepancy resolved: §21.5 lists six stages and omits `builder_acknowledged`; §24.3 and INV-34 both say seven.** Seven is taken as authoritative. A builder that has not acknowledged is a distinguishable state on a chain with a builder market, and dropping it puts two different failures in one bucket.
+
+**The escalation rules are judgement calls and are marked as such.** §24.3 says "each stage has its own timeout and escalation rule" without enumerating them, so they live in one `match` where they can be argued with rather than buried in a scheduler. Two are load-bearing and constrained by the plan: `NodeKnown` and `SequencerReceived` escalate to `ResendSameBytes`, because INV-10 says transport redundancy sends the *same signed bytes* and an economically distinct duplicate needs an explicit policy flag; and no variant escalates gas, because §27.4 forbids blind escalation. A test asserts both.
+
+**A gap is reported but not rejected.** The stages come from different sources — a transport response, a node query, a sequencer feed, a receipt — and any of them can be missed while a later one is perfectly real. Refusing an `Included` because `NodeKnown` never arrived would throw away the most important observation the system makes. The error exists so the gap can be counted; the stage is recorded either way.
+
+**`timed_out` escalates the stage it is *waiting for*, not the last rung.** A ladder sitting at `Preconfirmed` has not timed out on `Finalized`; it is waiting for `Included`, and reporting the wrong one escalates the wrong thing.
+
+**The null dispatcher returns `TransportAccepted` and nothing more.** One that returned a ladder reaching `Included` would make every shadow run report a 100% landing rate — and those numbers are what a decision to go live would rest on. This is the single most load-bearing line in the module and it has its own test and its own mutation.
+
+**Two type-level gates now meet at dispatch.** `DispatchRequest` holds a `SigningAuthorization`, which cannot exist without a `Revalidated` (Task 6.4), and `Dispatcher::dispatch` takes a `DispatchPermit`, which cannot exist before reconciliation (Task 6.2). Dispatching without revalidating, or before reconciling, are both programs that do not compile.
+
+**Six mutations, each caught:** `TransportAccepted` implying inclusion (3 tests); the null dispatcher claiming `Included`; `timed_out` reporting the last rung; an out-of-order observation silently accepted; a stage observable twice; `NodeKnown` escalating to another lane instead of resending the same bytes.
+
+**Acceptance criterion 6 is a 7-day shadow run** — wall-clock work, not an implementation step. Recorded with the other long-running items in §4.7.
 
 ### Task 6.7 — Risk posture ladder and loss classification (INV-42, INV-43)
 

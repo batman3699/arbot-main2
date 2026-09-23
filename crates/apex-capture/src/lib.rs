@@ -5,6 +5,7 @@
 //! built in shadow, before any live dispatch exists in the v4 path.
 
 pub mod clock;
+pub mod dispatch;
 pub mod journal;
 pub mod recover;
 pub mod registry;
@@ -15,6 +16,10 @@ pub(crate) mod sync;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use journal::{FileJournal, InMemoryJournal, Journal, JournalEntry};
+pub use dispatch::{
+    AckError, AckLadder, DispatchError, DispatchRequest, Dispatcher, Escalation, LifecycleStage,
+    NullDispatcher, WouldHaveSent,
+};
 pub use recover::{
     scan, ChainOutcomeSource, Disposition, DispatchGate, DispatchPermit, JournalScan,
     ReconciliationComplete, RecoveryError,
