@@ -4097,10 +4097,40 @@ function testGenericStepCanCallAnyTarget() external {
 }
 ```
 
-- [ ] **Step 2: Run it and observe it PASS** against the current contract — the vulnerability is now demonstrated and recorded in `docs/apex/reports/security-B1.md`.
-- [ ] **Step 3: Implement** `AdapterRegistry` + typed `Step { adapterId, poolKey, payload }`; delete `_execGeneric` and `_execModule`; invert the test to `testNoArbitraryCallSurfaceExists` asserting the attacker call reverts with `UnknownAdapter`.
-- [ ] **Step 4: Run and observe** the inverted test pass and `scripts/ci/check_no_generic_call.sh` pass (source grep + runtime bytecode scan).
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run it and observe it PASS** against the current contract — the vulnerability is now demonstrated and recorded in `docs/apex/reports/security-B1.md`.
+- [x] **Step 3: Implement** `AdapterRegistry` + typed `Step { adapterId, poolKey, payload }`; delete `_execGeneric` and `_execModule`; invert the test to `testNoArbitraryCallSurfaceExists` asserting the attacker call reverts with `UnknownAdapter`.
+- [x] **Step 4: Run and observe** the inverted test pass and `scripts/ci/check_no_generic_call.sh` pass (source grep + runtime bytecode scan).
+- [x] **Step 5: Commit.**
+
+**Delivered 2026-09-24.** 53 forge tests pass; 8 of them are the inverted B-1
+suite. `check_no_generic_call.sh` is wired into the forge job — it was unwired
+through Phases 0–4 for a recorded reason (the hole still existed, so the gate
+would have been red on arrival and switched off), and Task 5.1 is what lets it
+gate.
+
+**`_execModule` was never a function.** The Phase 0 finding under that name was
+about `_executeSteps`'s delegatecall dispatch, and I downgraded it to
+Informational B-1b after verifying the four modules are `immutable` and
+constructor-deployed. There is nothing to delete; the gate asserts the dispatch
+still only reaches those immutables.
+
+**The payload shape is `(uint16 adapterId, address token, uint256
+approveAmount, bytes callData)`, not §5.1's sketched `{ adapterId, poolKey,
+payload }`.** `poolKey` belongs to a venue adapter's own payload, not to the
+envelope — the executor does not need to know what a pool key is, and putting
+one in the envelope would make every adapter's key format the executor's
+problem. The `token`/`approveAmount` pair is in the envelope because the
+*approval* is the executor's decision: an adapter may be approved, and the
+envelope is where the contract can see that it is approving the address it
+resolved.
+
+**The source half of the gate enumerates call sites rather than grepping for a
+name.** My first version looked for "an address decoded from a payload" and
+flagged `_execBalancer` decoding a pool's token addresses, which is not a
+target. There are exactly three low-level calls in the contract — `SafeCall`'s
+primitive, the module delegatecall, and `_execAdapter` — so enumerating them is
+exact where a pattern was not. Mutation-tested both ways: a second `safeCall`
+and a registry bypass are each caught.
 
 ### Task 5.2 — Multi-asset profit invariant (INV-27, INV-29)
 

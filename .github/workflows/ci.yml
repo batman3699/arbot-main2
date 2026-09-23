@@ -78,6 +78,12 @@ jobs:
       - run: forge build
       - name: test (Deploy* quarantined -- B-13)
         run: forge test --no-match-path 'test/Deploy*'
+      - name: no arbitrary-call surface (INV-33, B-1)
+        # Wired here rather than in the gates job because the bytecode half
+        # needs a build. It was unwired through Phases 0-4 for a stated reason
+        # -- `_execGeneric` still existed, so the gate would have been red on
+        # arrival and switched off. Task 5.1 removed the hole, so it can gate.
+        run: ./scripts/ci/check_no_generic_call.sh
       - name: deployable contract sizes (EIP-170)
         run: ./scripts/ci/check_executor_size.sh
 

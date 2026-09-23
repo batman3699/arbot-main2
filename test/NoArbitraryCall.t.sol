@@ -3,6 +3,12 @@ pragma solidity ^0.8.21;
 
 import {MultiVenueArbImplementation} from "../contracts/executor/MultiVenueArbImplementation.sol";
 import {ArbitrageCloneFactory} from "../contracts/executor/ArbitrageCloneFactory.sol";
+import {
+    UnknownAdapter,
+    InvalidAdapter,
+    AdapterAlreadyRegistered
+} from "../contracts/core/AdapterRegistry.sol";
+import {NotOwner} from "../contracts/executor/MultiVenueArbImplementation.sol";
 import {MockERC20} from "../contracts/mocks/MockERC20.sol";
 import {MockERC3156Lender} from "../contracts/mocks/MockERC3156Lender.sol";
 import {Test} from "forge-std/Test.sol";
@@ -18,58 +24,33 @@ contract Attacker {
     }
 }
 
-/// Minimal Permit2 stand-in: `initialise` requires a non-zero address and the
-/// generic path never touches it.
+/// A registered adapter, standing in for a venue.
+contract Donor {
+    function donate(address token, address to, uint256 amount) external {
+        MockERC20(token).transfer(to, amount);
+    }
+}
+
 contract PermitStub {}
 
-/// PLAN.md Task 5.1 Step 1–2: **demonstrate B-1 against the contract as it
-/// stands.**
+/// B-1 closed. These tests were written to **pass against the vulnerable
+/// contract** and are now inverted — the git history holds both halves, which
+/// is the evidence that the hole was real and is gone.
 ///
-/// These tests are written to PASS today. That is the point of them: an
-/// asserted vulnerability is a vulnerability somebody has proved, and the
-/// alternative — describing it in a document and fixing it in the same commit
-/// — leaves no evidence that the hole was ever real.
+/// What was proved before the fix, and what the fix does about each:
 ///
-/// Step 3 inverts them into `testNoArbitraryCallSurfaceExists`.
-///
-/// # What B-1 actually is
-///
-/// `_execGeneric` decodes `(target, callData, action, token, amount)` from a
-/// step's payload and ends with `target.safeCall(callData)` — an arbitrary
-/// call, to an arbitrary address, with arbitrary calldata, against no
-/// allowlist.
-///
-/// Before the call it also branches on `action`:
-///
-/// * `action == 1` grants `target` an ERC-20 allowance over the executor's
-///   holdings;
-/// * `action == 2` transfers the executor's tokens to `target` outright.
-///
-/// **Measured, not assumed: those two are not equally dangerous.** The
-/// transfer is caught — `InsufficientFinalBalance` fires at settlement and the
-/// whole transaction reverts, so the theft is undone. The *allowance* is not:
-/// granting one moves no tokens, so the profit invariant sees nothing wrong,
-/// the settlement succeeds, and the approval **survives the transaction**. The
-/// holder then drains the executor later, from any address, with no executor
-/// key involved.
-///
-/// So the unmitigated hole is narrower than "move the money anywhere" and
-/// worse in shape: a single successful settlement can leave behind a standing,
-/// unlimited claim on everything the contract will ever hold.
-///
-/// # Why `onlyExecutor` does not make this acceptable
-///
-/// Reaching a generic step requires an authorised executor, so this is not
-/// open to the public. It is still the highest-severity item in the plan,
-/// because **an executor is authorised to trade, not to transfer.** A
-/// settlement contract exists so that the key which routes trades cannot also
-/// empty the account; `_execGeneric` collapses that distinction, and every
-/// operational control above it — signer separation, capital limits, the risk
-/// ladder — rests on a boundary the contract does not enforce.
+/// | Before | Now |
+/// |---|---|
+/// | a step reached any target with any calldata | the target is resolved from the registry; the payload has no target field to supply |
+/// | a step granted any address an allowance over the executor | the approval spender **is** the resolved adapter; there is no expression a payload can steer |
+/// | a step transferred tokens to any address (caught by the balance check, but a second way to reach a target) | the transfer path is gone entirely |
 contract NoArbitraryCallTest is Test {
+    uint16 internal constant DONOR_ID = 1;
+
     MultiVenueArbImplementation internal executor;
     MockERC3156Lender internal lender;
     MockERC20 internal loanToken;
+    Donor internal donor;
 
     function setUp() public {
         MultiVenueArbImplementation implementation = new MultiVenueArbImplementation();
@@ -78,25 +59,21 @@ contract NoArbitraryCallTest is Test {
 
         loanToken = new MockERC20("Loan", "LN", 18);
         lender = new MockERC3156Lender(address(loanToken), 0);
+        donor = new Donor();
         PermitStub permit2 = new PermitStub();
 
-        // `address(this)` becomes both owner and the authorised executor, which
-        // is what a compromised or careless operator key looks like.
         executor.initialise(address(this), address(1), address(1), address(0), address(permit2), 0, 0, 1);
-
         loanToken.mint(address(lender), 1_000 ether);
     }
 
-    function _genericStep(bytes memory payload)
+    function _step(bytes memory payload)
         internal
         pure
         returns (MultiVenueArbImplementation.Step[] memory steps)
     {
         steps = new MultiVenueArbImplementation.Step[](1);
-        steps[0] = MultiVenueArbImplementation.Step({
-            op: MultiVenueArbImplementation.Op.GENERIC,
-            data: payload
-        });
+        steps[0] =
+            MultiVenueArbImplementation.Step({op: MultiVenueArbImplementation.Op.GENERIC, data: payload});
     }
 
     function _plan(MultiVenueArbImplementation.Step[] memory steps)
@@ -119,132 +96,135 @@ contract NoArbitraryCallTest is Test {
         });
     }
 
-    /// B-1, part one: a generic step reaches any target with any calldata.
-    function testGenericStepCanCallAnyTarget() external {
+    /// The inversion of `testGenericStepCanCallAnyTarget`.
+    ///
+    /// An unregistered id is refused by name, so the failure says *why* rather
+    /// than surfacing as an undifferentiated revert.
+    function testNoArbitraryCallSurfaceExists() external {
         Attacker atk = new Attacker();
-        bytes memory payload = abi.encode(
-            address(atk),
-            abi.encodeCall(Attacker.pwn, ()),
-            uint256(0),
-            address(0),
-            uint256(0)
-        );
-
-        // The plan needs enough profit to repay the loan; fund the executor so
-        // the settlement invariant is satisfied and the attack is not masked by
-        // an unrelated revert.
         loanToken.mint(address(executor), 10 ether);
 
-        executor.startV2(_plan(_genericStep(payload)));
+        // The attacker's address cannot appear in a payload at all; the only
+        // way to aim a step is by id, and this one is not registered.
+        uint16 unregistered = 99;
+        bytes memory payload =
+            abi.encode(unregistered, address(0), uint256(0), abi.encodeCall(Attacker.pwn, ()));
 
-        assertTrue(atk.pwned(), "arbitrary call surface is reachable");
-        assertEq(
-            atk.lastCaller(),
-            address(executor),
-            "and the call arrives as the executor, carrying its authority"
-        );
+        vm.expectRevert(abi.encodeWithSelector(UnknownAdapter.selector, unregistered));
+        executor.startV2(_plan(_step(payload)));
+
+        assertFalse(atk.pwned(), "the arbitrary call surface is gone");
     }
 
-    /// B-1, part two — and a **defence that works**, recorded because getting
-    /// the severity right matters more than making it sound bad.
-    ///
-    /// `action == 2` does transfer the executor's tokens to an arbitrary
-    /// address. It does not succeed: the settlement's final-balance check sees
-    /// the shortfall and reverts the whole transaction, so the transfer is
-    /// undone. Measured here rather than reasoned about — the first version of
-    /// this test asserted the theft completed, and it failed with
-    /// `InsufficientFinalBalance(1.6e19, 2.1e19)`.
-    function testGenericStepTransferIsCaughtByTheProfitInvariant() external {
-        address thief = address(0xBEEF);
-        uint256 stolen = 5 ether;
+    /// Registering the attacker is the only route left, and it is `onlyOwner`
+    /// — which is the separation the whole fix rests on: an executor may
+    /// trade, and may not choose what the contract calls.
+    function testAnExecutorCannotRegisterItsOwnTarget() external {
+        Attacker atk = new Attacker();
+        address executorKey = address(0xE0);
+        executor.setExecutor(executorKey, true);
 
-        loanToken.mint(address(executor), 20 ether);
-        uint256 before = loanToken.balanceOf(address(executor));
+        vm.prank(executorKey);
+        vm.expectRevert(NotOwner.selector);
+        executor.registerAdapter(42, address(atk));
 
-        bytes memory payload = abi.encode(
-            thief,
-            bytes(""),
-            uint256(2), // action == 2: _safeTransfer(token, target, amount)
-            address(loanToken),
-            stolen
+        assertEq(executor.adapterOf(42), address(0));
+    }
+
+    /// The old payload shape is not merely rejected, it no longer decodes.
+    /// `(address, bytes, uint256, address, uint256)` is not
+    /// `(uint16, address, uint256, bytes)`.
+    function testTheOldGenericPayloadNoLongerDecodes() external {
+        Attacker atk = new Attacker();
+        loanToken.mint(address(executor), 10 ether);
+
+        bytes memory legacyPayload = abi.encode(
+            address(atk), abi.encodeCall(Attacker.pwn, ()), uint256(0), address(0), uint256(0)
         );
 
         vm.expectRevert();
-        executor.startV2(_plan(_genericStep(payload)));
-
-        assertEq(loanToken.balanceOf(thief), 0, "the transfer was rolled back");
-        assertEq(loanToken.balanceOf(address(executor)), before);
+        executor.startV2(_plan(_step(legacyPayload)));
+        assertFalse(atk.pwned());
     }
 
-    /// B-1, part three — **the half no existing defence catches.**
-    ///
-    /// `action == 1` grants an arbitrary spender an allowance over the
-    /// executor's holdings. No tokens move, so the final-balance check that
-    /// caught the transfer sees nothing wrong and the settlement succeeds. The
-    /// approval outlives the transaction.
-    function testGenericStepCanGrantAllowanceToAnyAddress() external {
-        address spender = address(0xCAFE);
+    /// The approval spender is the resolved adapter. A payload can ask for an
+    /// approval; it cannot say who receives it.
+    function testAnApprovalCanOnlyEverNameTheResolvedAdapter() external {
+        executor.registerAdapter(DONOR_ID, address(donor));
         loanToken.mint(address(executor), 20 ether);
 
+        address outsider = address(0xCAFE);
         bytes memory payload = abi.encode(
-            spender,
-            bytes(""),
-            uint256(1), // action == 1: _ensureDirectAllowance(token, target, amount)
+            DONOR_ID,
             address(loanToken),
-            type(uint256).max
+            type(uint256).max,
+            abi.encodeCall(Donor.donate, (address(loanToken), address(executor), 0))
         );
-
-        executor.startV2(_plan(_genericStep(payload)));
+        executor.startV2(_plan(_step(payload)));
 
         assertGt(
-            loanToken.allowance(address(executor), spender),
+            loanToken.allowance(address(executor), address(donor)),
             0,
-            "an arbitrary spender holds a standing allowance over the executor"
+            "the registered adapter may be approved -- a router has to pull"
+        );
+        assertEq(
+            loanToken.allowance(address(executor), outsider),
+            0,
+            "and nobody else can be, whatever the payload says"
         );
     }
 
-    /// And the allowance is not theoretical: the holder drains the contract in
-    /// a **later transaction**, from an address that was never an executor.
-    ///
-    /// This is what makes part three the finding rather than part one. An
-    /// arbitrary call is bounded by the settlement invariant that runs after
-    /// it. A standing approval is not bounded by anything — it is still there
-    /// on the next block, and on every block after, against every token
-    /// balance the contract acquires.
-    function testTheGrantedAllowanceDrainsTheExecutorLater() external {
-        address spender = address(0xCAFE);
-        loanToken.mint(address(executor), 20 ether);
+    /// The substitution preserved the mechanism: a registered adapter still
+    /// settles a profitable plan. A fix that closed the hole by breaking
+    /// settlement would not be a fix.
+    function testARegisteredAdapterStillSettlesAPlan() external {
+        executor.registerAdapter(DONOR_ID, address(donor));
+        loanToken.mint(address(donor), 5 ether);
 
         bytes memory payload = abi.encode(
-            spender,
-            bytes(""),
-            uint256(1),
-            address(loanToken),
-            type(uint256).max
+            DONOR_ID,
+            address(0),
+            uint256(0),
+            abi.encodeCall(Donor.donate, (address(loanToken), address(executor), 2 ether))
         );
-        executor.startV2(_plan(_genericStep(payload)));
-
-        // A different transaction, a different sender, no executor authority.
-        uint256 balance = loanToken.balanceOf(address(executor));
-        assertGt(balance, 0);
-        vm.prank(spender);
-        loanToken.transferFrom(address(executor), spender, balance);
-
-        assertEq(loanToken.balanceOf(address(executor)), 0, "the executor was emptied");
-        assertEq(loanToken.balanceOf(spender), balance);
+        uint256 profit = executor.startV2(_plan(_step(payload)));
+        assertEq(profit, 2 ether, "the adapter path still realises profit");
     }
 
-    /// The boundary that does hold, stated so the severity is not overclaimed:
-    /// an unauthorised caller cannot reach any of this.
-    function testAnUnauthorisedCallerCannotReachTheGenericStep() external {
+    /// An id may not be silently re-pointed. Replacing an adapter is two
+    /// deliberate transactions, so a substitution cannot ride in on one.
+    function testAnAdapterIdCannotBeSilentlyRepointed() external {
         Attacker atk = new Attacker();
-        bytes memory payload =
-            abi.encode(address(atk), abi.encodeCall(Attacker.pwn, ()), uint256(0), address(0), uint256(0));
+        executor.registerAdapter(DONOR_ID, address(donor));
+
+        vm.expectRevert(abi.encodeWithSelector(AdapterAlreadyRegistered.selector, DONOR_ID));
+        executor.registerAdapter(DONOR_ID, address(atk));
+        assertEq(executor.adapterOf(DONOR_ID), address(donor));
+
+        // The deliberate path still works, and leaves a trace.
+        executor.deregisterAdapter(DONOR_ID);
+        executor.registerAdapter(DONOR_ID, address(atk));
+        assertEq(executor.adapterOf(DONOR_ID), address(atk));
+    }
+
+    /// An address with no code is never registered. A step naming it would
+    /// `safeCall` into nothing and **succeed silently**, which is the failure
+    /// an allowlist exists to prevent.
+    function testAnAddressWithNoCodeIsNeverRegistered() external {
+        vm.expectRevert(InvalidAdapter.selector);
+        executor.registerAdapter(7, address(0xDEAD));
+
+        vm.expectRevert(InvalidAdapter.selector);
+        executor.registerAdapter(7, address(0));
+    }
+
+    /// The boundary that always held, kept so the severity is not overstated.
+    function testAnUnauthorisedCallerStillCannotStart() external {
+        executor.registerAdapter(DONOR_ID, address(donor));
+        bytes memory payload = abi.encode(DONOR_ID, address(0), uint256(0), bytes(""));
 
         vm.prank(address(0xDEAD));
         vm.expectRevert();
-        executor.startV2(_plan(_genericStep(payload)));
-
-        assertFalse(atk.pwned(), "onlyExecutor holds; the surface is not public");
+        executor.startV2(_plan(_step(payload)));
     }
 }

@@ -869,15 +869,24 @@ contract MultiVenueArbExecutorErc3156Test is Test {
             MultiVenueArbImplementation.PlanV2({loans: loans, cycleSlippageBps: 0, steps: steps, minProfit: minProfit});
     }
 
+    /// The adapter id the fixtures register the profit donor under.
+    ///
+    /// A step names an adapter by ID now, never by address (B-1), so the donor
+    /// has to be on the allowlist before a plan can reach it. That is the
+    /// point: `_profitStep` carries the id and the caller registers the
+    /// address, which is exactly the separation the fix introduces.
+    uint16 internal constant DONOR_ADAPTER_ID = 1;
+
     function _profitStep(address donor, address token, address recipient, uint256 amount)
         internal
         pure
         returns (MultiVenueArbImplementation.Step memory)
     {
+        donor; // the address reaches the contract through the registry, not the plan
         bytes memory callData = abi.encodeCall(ProfitDonor.donate, (token, recipient, amount));
         return MultiVenueArbImplementation.Step({
             op: MultiVenueArbImplementation.Op.GENERIC,
-            data: abi.encode(donor, callData, uint256(0), address(0), uint256(0))
+            data: abi.encode(DONOR_ADAPTER_ID, address(0), uint256(0), callData)
         });
     }
 
@@ -893,6 +902,7 @@ contract MultiVenueArbExecutorErc3156Test is Test {
         loanToken.mint(address(donor), profit);
 
         MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](1);
+        executor.registerAdapter(DONOR_ADAPTER_ID, address(donor));
         steps[0] = _profitStep(address(donor), address(loanToken), address(executor), profit);
 
         MultiVenueArbImplementation.PlanV2 memory plan =
@@ -917,6 +927,7 @@ contract MultiVenueArbExecutorErc3156Test is Test {
         loanToken.mint(address(donor), profit);
 
         MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](1);
+        executor.registerAdapter(DONOR_ADAPTER_ID, address(donor));
         steps[0] = _profitStep(address(donor), address(loanToken), address(executor), profit);
 
         MultiVenueArbImplementation.PlanV2 memory plan =
@@ -943,6 +954,7 @@ contract MultiVenueArbExecutorErc3156Test is Test {
         loanToken.mint(address(donor), profit);
 
         MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](1);
+        executor.registerAdapter(DONOR_ADAPTER_ID, address(donor));
         steps[0] = _profitStep(address(donor), address(loanToken), address(executor), profit);
 
         MultiVenueArbImplementation.PlanV2 memory plan =
@@ -976,6 +988,7 @@ contract MultiVenueArbExecutorErc3156Test is Test {
         loanToken.mint(address(donor), profit);
 
         MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](1);
+        executor.registerAdapter(DONOR_ADAPTER_ID, address(donor));
         steps[0] = _profitStep(address(donor), address(loanToken), address(executor), profit);
 
         MultiVenueArbImplementation.PlanV2 memory plan =
@@ -1085,15 +1098,24 @@ contract MultiVenueArbExecutorUniFlashTest is Test {
         executor.initialise(address(this), address(0), address(1), address(0), address(permit2), 0, 0, 1);
     }
 
+    /// The adapter id the fixtures register the profit donor under.
+    ///
+    /// A step names an adapter by ID now, never by address (B-1), so the donor
+    /// has to be on the allowlist before a plan can reach it. That is the
+    /// point: `_profitStep` carries the id and the caller registers the
+    /// address, which is exactly the separation the fix introduces.
+    uint16 internal constant DONOR_ADAPTER_ID = 1;
+
     function _profitStep(address donor, address token, address recipient, uint256 amount)
         internal
         pure
         returns (MultiVenueArbImplementation.Step memory)
     {
+        donor; // the address reaches the contract through the registry, not the plan
         bytes memory callData = abi.encodeCall(ProfitDonor.donate, (token, recipient, amount));
         return MultiVenueArbImplementation.Step({
             op: MultiVenueArbImplementation.Op.GENERIC,
-            data: abi.encode(donor, callData, uint256(0), address(0), uint256(0))
+            data: abi.encode(DONOR_ADAPTER_ID, address(0), uint256(0), callData)
         });
     }
 
@@ -1109,6 +1131,7 @@ contract MultiVenueArbExecutorUniFlashTest is Test {
         loanToken.mint(address(donor), profit);
 
         MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](1);
+        executor.registerAdapter(DONOR_ADAPTER_ID, address(donor));
         steps[0] = _profitStep(address(donor), address(loanToken), address(executor), profit);
 
         MultiVenueArbImplementation.Loan[] memory loans = new MultiVenueArbImplementation.Loan[](1);
@@ -1145,6 +1168,7 @@ contract MultiVenueArbExecutorUniFlashTest is Test {
         executor.setUniswapV2FlashFeeBps(address(pair), pairFeeBps);
 
         MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](1);
+        executor.registerAdapter(DONOR_ADAPTER_ID, address(donor));
         steps[0] = _profitStep(address(donor), address(loanToken), address(executor), profit);
 
         MultiVenueArbImplementation.Loan[] memory loans = new MultiVenueArbImplementation.Loan[](1);
@@ -1179,6 +1203,7 @@ contract MultiVenueArbExecutorUniFlashTest is Test {
         loanToken.mint(address(donor), profit);
 
         MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](1);
+        executor.registerAdapter(DONOR_ADAPTER_ID, address(donor));
         steps[0] = _profitStep(address(donor), address(loanToken), address(executor), profit);
 
         MultiVenueArbImplementation.Loan[] memory loans = new MultiVenueArbImplementation.Loan[](1);

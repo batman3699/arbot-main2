@@ -3,6 +3,7 @@ pragma solidity ^0.8.21;
 
 import {SwapExecutor} from "./steps/SwapExecutor.sol";
 import {GenericExecutor} from "./steps/GenericExecutor.sol";
+import {AdapterRegistry, UnknownAdapter} from "../core/AdapterRegistry.sol";
 import {FullMath} from "../libraries/FullMath.sol";
 import {TickMath} from "../libraries/TickMath.sol";
 import {LiquidityAmounts} from "../libraries/LiquidityAmounts.sol";
@@ -182,7 +183,7 @@ library ConfigCodec {
     }
 }
 
-contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156FlashBorrower, ReentrancyGuard {
+contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleReceiver, IERC3156FlashBorrower, ReentrancyGuard {
     using SafeCall for address;
 
     uint8 private constant PLAN_VERSION_V2 = 2;
@@ -316,6 +317,18 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
     error InvalidProviderAddress();
     error EmptyRevertData();
     error UnsupportedPlanVersion();
+
+    /// Put an adapter on the allowlist. `onlyOwner`: see `AdapterRegistry`
+    /// for why the executor role is deliberately not enough.
+    function registerAdapter(uint16 adapterId, address adapter) external onlyOwner {
+        _registerAdapter(adapterId, adapter);
+    }
+
+    /// Take one off. Replacing an adapter is deregister-then-register, two
+    /// transactions, so a substitution cannot happen silently in one.
+    function deregisterAdapter(uint16 adapterId) external onlyOwner {
+        _deregisterAdapter(adapterId);
+    }
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -707,7 +720,7 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
 
     function moduleExecGeneric(bytes memory data) external {
         if (msg.sender != address(this)) revert InvalidGenericAction();
-        _execGeneric(data);
+        _execAdapter(data);
     }
 
 
@@ -759,19 +772,35 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         vault.batchSwap(IBalancerVault.SwapKind.GIVEN_IN, swaps, assets, fm, limits, deadline);
     }
 
-    function _execGeneric(bytes memory data) internal {
-        (address target, bytes memory callData, uint256 action, address token, uint256 amount) =
-            abi.decode(data, (address, bytes, uint256, address, uint256));
-        if (action == 1) {
-            if (token == address(0) || target == address(0)) revert InvalidGenericAction();
-            _ensureDirectAllowance(token, target, amount);
-        } else if (action == 2) {
-            if (token == address(0) || target == address(0)) revert InvalidGenericAction();
-            _safeTransfer(token, target, amount);
-        } else if (action != 0) {
-            revert InvalidGenericAction();
+    /// Execute one step against a **registered** adapter (B-1's fix).
+    ///
+    /// The payload names an adapter by id and the contract resolves it. Three
+    /// things that used to come from the caller no longer do:
+    ///
+    /// * **the target**, now `adapters[adapterId]`, so a step can only reach
+    ///   an address the owner put on the allowlist;
+    /// * **the approval spender**, now that same resolved adapter rather than
+    ///   a separate address from the payload — which is what made a single
+    ///   successful settlement able to leave behind an unlimited standing
+    ///   claim on everything the contract holds;
+    /// * **an outright transfer destination**, which is gone entirely. A
+    ///   settlement contract has no business sending tokens to an address a
+    ///   plan chose. That path was already caught by the final-balance check,
+    ///   so removing it costs nothing and closes a way to reach a target
+    ///   without calling it.
+    function _execAdapter(bytes memory data) internal {
+        (uint16 adapterId, address token, uint256 approveAmount, bytes memory callData) =
+            abi.decode(data, (uint16, address, uint256, bytes));
+
+        address target = _resolveAdapter(adapterId);
+
+        if (approveAmount != 0) {
+            if (token == address(0)) revert InvalidGenericAction();
+            // The spender is the resolved adapter. There is no expression here
+            // that a payload can steer.
+            _ensureDirectAllowance(token, target, approveAmount);
         }
-        // wrap external generic calls to capture revert data via SafeCall
+
         target.safeCall(callData);
     }
 
