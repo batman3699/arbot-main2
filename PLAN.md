@@ -4510,8 +4510,31 @@ fn dropping_a_nonterminal_ticket_records_an_explicit_failure() {
 
 ### Task 6.3 — Signer pool and nonce lanes (INV-04, §27.5, §27.6)
 
-- [ ] **Step 1: Write the failing tests** — the seven §18.2 requirement tests plus a `loom` model asserting no cross-lane nonce reuse under every interleaving.
-- [ ] **Step 2: Run and observe the failures.** **Step 3: Implement** `SignerPool` with per-lane `NonceManager` (ADAPTed, comments preserved), health scoring, per-lane breaker, and the healthiest-free-lane assignment rule. **Step 4: Observe the passes.** **Step 5: Commit.**
+- [x] **Step 1: Write the failing tests** — the seven §18.2 requirement tests plus a `loom` model asserting no cross-lane nonce reuse under every interleaving.
+- [x] **Step 2: Run and observe the failures.** **Step 3: Implement** `SignerPool` with per-lane `NonceManager` (ADAPTed, comments preserved), health scoring, per-lane breaker, and the healthiest-free-lane assignment rule. **Step 4: Observe the passes.** **Step 5: Commit.**
+
+**Delivered 2026-09-24.** `src/signer/{mod,nonce,pool}.rs`, `src/sync.rs`; 19 tests plus 3 `loom` models. Workspace 1,586 passing. All seven §18.2 requirements have their named test.
+
+**The `NonceManager` is ADAPTed, and the comments migrated with it.** `main.rs:2694-2764`'s authoritative-pending-nonce start point and gap-recovery path encode a real historical bug fix, and both comment blocks are in `signer/nonce.rs` verbatim, with tests that state what they claim: `the_chain_pending_nonce_is_the_authoritative_floor`, `the_local_floor_guards_against_a_lagging_rpc_view`, `a_failed_highest_nonce_is_reclaimed`, `a_failed_nonce_below_an_in_flight_one_is_not_reclaimed`, `a_landed_nonce_is_never_reclaimed`.
+
+**Two changes beyond making it per-lane.** First, **the chain's pending nonce is an input, not a fetch** — the legacy version called `get_transaction_count` inside `get_next`, which makes the allocator async, provider-shaped and impossible to model-check. Same crate-split seam as everywhere else: the decision is pure, the I/O is the caller's. Second, `mark_confirmed`/`mark_failed` are folded into one `release(nonce, landed)` tied to the ticket's terminal close, because a lane that leaks a reservation by calling the wrong one of two methods is a lane that stops allocating.
+
+**`ReservedNonce` carries its lane.** A bare `u64` handed to the wrong lane's signer is a mistake nothing in the type system would notice; this one is refused (`a_nonce_cannot_be_used_on_another_lane`).
+
+**Everything per-lane, because one shared breaker is the easy design and it is wrong.** A single breaker would let one stuck nonce or one drained reserve halt every lane, turning a local fault into a total capture outage. §18.2 requires the opposite. `NoLane` has four variants rather than being a bool, because "no lane" is otherwise a silent capture miss and the four causes call for four different responses — wait, fund, fix authorization, investigate.
+
+**The loom work produced the most useful finding in this task.** The first model asserted the requirement as written — no cross-lane nonce reuse — and it passed. Then deleting `assign`'s re-check under the lock, the line that stops two threads both claiming a lane they both surveyed as free, **did not make it fail**. It cannot: `NonceLane::reserve` is itself atomic, so two holders of one lane still get distinct numbers out of it. The re-check buys **exclusivity**, and uniqueness is bought by the nonce mutex; a model asserting only the latter would have let the former be deleted. `a_lane_has_at_most_one_holder` now asserts exclusivity directly, from inside the critical section. Each mutation now fails exactly the model whose property it violates, and no other:
+
+| Mutation | Fails |
+|---|---|
+| `assign` drops its re-check under the lock | `a_lane_has_at_most_one_holder` only |
+| `reserve` stops advancing the high-water mark | the two uniqueness models only |
+
+**loom is a separate CI job**, not another line in the rust one: `src/sync.rs` swaps the primitives under `--cfg loom` and the whole crate rebuilds. `tests/nonce_loom.rs` is `#![cfg(loom)]`, so it is inert in the default build — stated in its name, its module docs and the CI step, because a `#[test]` that silently does nothing is worse than no test.
+
+**Deferred with reason: no key material.** §18.4 says Phase 6 ships in-process keys behind a `Secret<LocalWallet>` wrapper (INV-46). The pool holds none — it assigns lanes and allocates nonces, and nothing here signs. The wrapper lands with the code that actually produces a signature (Task 6.6's dispatcher), where the invariant can be tested rather than merely declared. Holding a key in a type that never uses it would be an unnecessary copy of the most dangerous value in the system.
+
+**Also deferred: §18.4's pool sizing and rotation.** `SignerPool::new` takes the lane list; it does not choose four. Expansion before saturation, contraction on sustained low utilization, and quarantine-then-reconcile-then-return are scheduler behaviour and land with Task 6.5, whose overload test is where a sizing rule can be measured rather than asserted.
 
 ### Task 6.4 — Last-mile revalidation (INV-35)
 

@@ -13,3 +13,15 @@ serde_json = "1"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+
+# loom explores every interleaving of `tests/nonce_loom.rs`, which is only
+# possible if the primitives it is exploring are its own -- so `src/sync.rs`
+# swaps them in under `--cfg loom`. A regular dependency rather than a dev one:
+# `src/sync.rs` is in the LIB, and a lib cannot see dev-dependencies. Not a
+# default-cfg test either -- a loom run is
+# minutes, not milliseconds, and it gates in CI rather than on every save.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

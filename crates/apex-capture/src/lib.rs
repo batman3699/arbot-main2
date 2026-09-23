@@ -8,6 +8,8 @@ pub mod clock;
 pub mod journal;
 pub mod recover;
 pub mod registry;
+pub mod signer;
+pub(crate) mod sync;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use journal::{FileJournal, InMemoryJournal, Journal, JournalEntry};
@@ -16,3 +18,7 @@ pub use recover::{
     ReconciliationComplete, RecoveryError,
 };
 pub use registry::{RegistryError, RegistryMetrics, TicketGuard, TicketRegistry};
+pub use signer::{
+    ExecutorAuth, LaneAssignment, LaneConfig, LaneHealth, LaneRequirements, NoLane, NonceError,
+    NonceLane, ReservedNonce, SignerPool,
+};

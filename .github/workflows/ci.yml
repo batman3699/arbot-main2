@@ -61,6 +61,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ -p apex-sim -p apex-capture --all-targets -- -D warnings
 
+  loom:
+    name: loom (signer lanes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # §18.2's seventh hard requirement: no cross-lane nonce reuse, under every
+      # interleaving rather than the ones a test author thought of. loom needs
+      # its own primitives, so `src/sync.rs` swaps them in under this cfg and
+      # the whole crate rebuilds -- which is why this is a separate job rather
+      # than another line in the rust one.
+      - name: no cross-lane nonce reuse (INV-04, §18.2)
+        run: RUSTFLAGS="--cfg loom" cargo test -p apex-capture --test nonce_loom
+
   solidity:
     name: forge
     runs-on: ubuntu-latest
