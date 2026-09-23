@@ -4885,6 +4885,23 @@ That **refines §23's wording**, which reads as though the clamp is always the o
 **Failure criteria:** eligibility accuracy < 90%; any signing before eligibility rejection; latency budget breach.
 **Exit gate:** **G-BASE-1**, **G-SUB-1**.
 
+**Phase 7 status, 2026-09-24. All five tasks implemented; three of five
+acceptance criteria are met and two need Base traffic.**
+
+| Criterion | Status |
+|---|---|
+| 1. `earliest_eligible_flashblock` validated against ≥ 500 observed transactions at ≥ 90% | **Egress-blocked.** The model's *structure* is tested — one constructor, observations only, p10 rather than median, `Unknown` where samples are thin — but every number in it is a fixture that says so in its own doc comment. §4.7 |
+| 2. Gas-limit minimization measurably lowers `actual_flashblock_index` versus a fixed-limit control | **Met in the model, not on the chain.** `a_smaller_gas_limit_can_buy_an_earlier_window` shows a 5M-gas candidate landing at window 0 where a 25M one lands at 3. Measuring it against a live control is criterion 1's run |
+| 3. No retroactive-entry logic exists (property test) | **Met.** `no_retroactive_flashblock_entry`, plus a 20,000-case property that also runs against a *gapped* model — which is the only place a clamp and a search differ |
+| 4. Ack ladder distinguishes all seven stages on real Base traffic | **Met in the type, blocked on the traffic.** `Known → NodeKnown` is pinned, and the mapping refuses to produce `Included` from anything short of it |
+| 5. `T_signal→submit` p99 < 200 ms | **Not measured.** Needs a running system |
+
+**Crate:** `apex-chain` — `adapter`, `regime`, and `base/{adapter, flashblock, submit, observe, reconcile}`. **63 tests** across five files plus two doctests. Workspace **1,693 passing**; CI green.
+
+**Four plan corrections came out of this phase**, all recorded in place rather than reconciled quietly: the trait has eleven methods and not ten; `optimize_submission_cost` needs a time it was not given; `observe_outcome` cannot return the miss ledger's `ObservedOutcome`; and §23's clamp is operative for small transactions rather than always. The last is the only one supported by measurement — twelve real Base receipts, already in this repository.
+
+**What Phase 7 deliberately did not do:** move `rpc_failover.rs`, `base_fast.rs`'s feed or `util.rs`. §3.4 classifies `chain.rs` as **REBUILD** — a config struct is not an adapter — and that is what happened. The three moves are mechanical relocations of working code with upward dependencies into `main.rs`, and the migration rule is to measure before moving; they belong with the phase that ports their consumers, not with the phase that builds their replacement's interface.
+
 ---
 
 ## PHASE 8 — Observability, missed-opportunity accounting, coverage auditing → FIRST PROFITABLE TRADE
