@@ -9,6 +9,7 @@ pub mod journal;
 pub mod recover;
 pub mod registry;
 pub mod revalidate;
+pub mod scheduler;
 pub mod signer;
 pub(crate) mod sync;
 
@@ -22,6 +23,7 @@ pub use revalidate::{
     last_mile, LastMileCheck, LastMileContext, Revalidated, RevalidationFailure, SigningAuthorization,
 };
 pub use registry::{RegistryError, RegistryMetrics, TicketGuard, TicketRegistry};
+pub use scheduler::{Scheduler, Work, WorkClass};
 pub use signer::{
     ExecutorAuth, LaneAssignment, LaneConfig, LaneHealth, LaneRequirements, NoLane, NonceError,
     NonceLane, ReservedNonce, SignerPool,

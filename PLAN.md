@@ -4576,8 +4576,22 @@ fn each_revalidation_check_can_reject() {
 
 ### Task 6.5 — Priority scheduling and preemption (INV-09)
 
-- [ ] **Step 1: Write the failing test** — under synthetic overload (10× candidate rate, 1 signer lane), assert no `Authorized` ticket is preempted and that shedding happens in the §57.1.2 order.
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 1: Write the failing test** — under synthetic overload (10× candidate rate, 1 signer lane), assert no `Authorized` ticket is preempted and that shedding happens in the §57.1.2 order.
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-24.** `src/scheduler.rs`; 9 tests including a 20,000-case property run. Workspace 1,605 passing.
+
+**Acceptance criterion 4 met, measured:** 10× candidate rate against one lane, 200 rounds, 50 live tickets — **`U_capture` = 1.0000, and zero authorized tickets preempted.**
+
+**FIFO is run as a comparison, on the same workload, and it scores 0.0000.** "Priority scheduling helps" is otherwise an untested adjective, and if FIFO had also passed then this whole module would be ceremony. The FIFO baseline is given an **unbounded** queue on purpose: a bounded one also fails, but for a second reason — tail-drop discards the newest arrival, which is the live ticket — and the comparison would then be measuring the drop policy as much as the service order. §46.1's claim is about *order*, so FIFO gets the most generous shape available and still loses every ticket.
+
+**`shed` misses its target rather than preempting.** `capacity` is a target, not a licence: when everything left is an authorized live ticket the queue stays over capacity and the caller sees it. That is what drives §16.5's remediation ladder — shed, expand lanes, fail over, raise admission thresholds — instead of the queue quietly dropping the one thing that was about to make money.
+
+**`WorkClass`'s variant order is the priority**, like `TicketStatus`'s, and the doc says so: do not reorder to group them prettily. Ordering is lexicographic rather than a weighted score, because a weighted score is exactly how an enormous research batch out-votes one live ticket. `WorkClass::of_ticket` is defined off `TicketStatus::is_authorized_or_later` rather than re-deriving the boundary, so INV-09's line and the reserved-resources line cannot drift apart.
+
+**Five mutations, each caught:** an authorized ticket becoming preemptible (3 tests); class no longer dominating the key; the deadline comparison flipping; the class boundary moving from `Authorized` to `Signed`; and the variant order reversed (5 tests).
+
+**Deferred with reason:** §16.5's automatic remediation ladder — lane expansion, RPC failover, admission-threshold reduction — is an action ladder over a live system, and it lands with Task 6.6's dispatcher where there is something to fail over *to*. The scheduler provides the signal it triggers on.
 
 ### Task 6.6 — Acknowledgement ladder and null dispatcher (INV-34)
 
