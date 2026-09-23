@@ -176,3 +176,26 @@ ARBOT_TIP_BPS
 ARBOT_UNIV3_QUEUE_WAIT_TIMEOUT_SECS
 ARBOT_UNIV3_TOTAL_DEADLINE_SECS
 ```
+
+## Contract size, measured 2026-09-23 (first CI run)
+
+`MultiVenueArbImplementation` compiles to **24,403 bytes** of runtime code.
+EIP-170's limit is 24,576. **173 bytes of margin — 99.3% of the ceiling.**
+
+This is a hard constraint on Phase 5, which replaces `_execGeneric` and folds
+`BatchRouter`'s ownership into `contracts/core/ExecutionAuth.sol`. Any net
+addition to the implementation fails to deploy. Phase 5 has to remove before it
+adds, and `_execGeneric`'s deletion is what buys the room.
+
+It is also why `forge build --sizes` failed on the first CI run:
+`JitRemoveHarness` (test/MultiVenueArbExecutor.t.sol) extends the
+implementation and adds scaffolding, so it lands at 25,790 — 1,214 over. Every
+subclass of a contract with 173 bytes left is over by construction. Nothing
+deploys that harness, and JIT is Retired in the migration matrix (§1.4), so the
+harness dies with the feature.
+
+`scripts/ci/check_executor_size.sh` now asks the question that matters: every
+**deployable** contract, meaning everything not declared under `test/` or
+`contracts/mocks/`, against EIP-170. It prints the margin for anything within
+1 KiB of the ceiling, so 24,403 is visible in every run rather than discovered
+the next time someone adds a function.

@@ -64,10 +64,15 @@ jobs:
         with:
           submodules: recursive
       - uses: foundry-rs/foundry-toolchain@v1
-      - run: forge build --sizes
+      # `forge build`, not `forge build --sizes`: the latter fails the build
+      # when ANY contract is over EIP-170, test harnesses included, and
+      # `JitRemoveHarness` extends the executor -- which has 173 bytes of
+      # margin -- so it is structurally over by construction. The size question
+      # that matters is asked below, over deployable contracts only.
+      - run: forge build
       - name: test (Deploy* quarantined -- B-13)
         run: forge test --no-match-path 'test/Deploy*'
-      - name: executor runtime size
+      - name: deployable contract sizes (EIP-170)
         run: ./scripts/ci/check_executor_size.sh
 
   gates:
