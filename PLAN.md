@@ -4762,8 +4762,22 @@ fn no_safe_gas_limit_rejects_before_signing() {
 
 ### Task 7.3 — Base submission lane and acknowledgement
 
-- [ ] **Step 1: Write the failing tests** — dispatch goes to a Flashblocks-aware RPC endpoint (never the raw infrastructure stream); `base_transactionStatus = Known` maps to `node_known`, **not** `included`; redundant transport sends identical signed bytes (INV-10); a stale opportunity cancels the fallback before dispatch.
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 1: Write the failing tests** — dispatch goes to a Flashblocks-aware RPC endpoint (never the raw infrastructure stream); `base_transactionStatus = Known` maps to `node_known`, **not** `included`; redundant transport sends identical signed bytes (INV-10); a stale opportunity cancels the fallback before dispatch.
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-24** with Task 7.3a, in `src/base/submit.rs`; 12 tests. Workspace 1,675 passing.
+
+**`EndpointKind::RawInfrastructureStream` exists so a lane can be *described*, and `may_dispatch` refuses it.** Describing the stream is necessary — it is a real thing the system reads from — and dispatching to it is a category error. No amount of privacy evidence makes it a lane, which the test asserts by handing it perfect evidence and expecting the refusal anyway.
+
+**`Known → NodeKnown` is the rung where INV-34 is most tempting to cross**, because `Known` *sounds* like the transaction is safe. §21.5 is explicit: it is evidence the preconfirmation node received it, and nothing about a Flashblock. Neither `Unknown` nor `Rejected` maps to a rung at all — an absence is not a stage.
+
+**INV-10 is structural rather than asserted.** `send_redundantly` takes one `&[u8]` and hands the same slice to every lane: no per-lane payload parameter, no builder, no re-signing hook. A lane receiving different bytes is a signature the function cannot produce.
+
+**Freshness is consulted before *each* send, not once.** The whole point of the stale check is that a fallback must not go out after the opportunity has already died on the primary — mutating it to a single up-front check turns `a_stale_opportunity_cancels_the_fallback_before_dispatch` red, which is how the distinction is pinned.
+
+**An ineligible lane is skipped, not fatal.** The primary landing while a misconfigured fallback is skipped is a good outcome; refusing the whole send would turn one bad lane into a total outage. Which is also what makes a one-hour evidence TTL safe to run with: a lane that goes stale drops out of the redundant set rather than stopping dispatch.
+
+Six mutations, each caught: `Known` mapping to `Included`; the raw stream becoming dispatchable; stale evidence still counting; an unevidenced private lane allowed; an attestation weighted as a measurement; freshness checked once.
 
 ### Task 7.3a — Record what each submission lane actually guarantees (B-14)
 
@@ -4793,10 +4807,20 @@ fn evidence_distinguishes_provider_attestation_from_measurement() {
 }
 ```
 
-- [ ] **Step 2: Run and observe the failures** — no lane carries evidence today.
-- [ ] **Step 3: Implement** `PrivacyEvidence { ProviderAttested { source, checked_at, ttl } | Measured { probe, checked_at, ttl } }`. Seed Base's BlockPI lane as `ProviderAttested` (MEV protection is a per-endpoint toggle, on by default) and schedule a periodic re-check, because the guarantee is a **dashboard setting** that can change without a deploy.
-- [ ] **Step 4: Run and observe the passes.** Upgrade at least one lane to `Measured` once the Phase 9 competitor model can observe pre-inclusion visibility.
-- [ ] **Step 5: Commit** (named paths only).
+- [x] **Step 2: Run and observe the failures** — no lane carries evidence today.
+- [x] **Step 3: Implement** `PrivacyEvidence { ProviderAttested { source, checked_at, ttl } | Measured { probe, checked_at, ttl } }`. Seed Base's BlockPI lane as `ProviderAttested` (MEV protection is a per-endpoint toggle, on by default) and schedule a periodic re-check, because the guarantee is a **dashboard setting** that can change without a deploy.
+- [x] **Step 4: Run and observe the passes.** Upgrade at least one lane to `Measured` once the Phase 9 competitor model can observe pre-inclusion visibility.
+- [ ] **Step 5: Commit** (named paths only). — done; the `Measured` upgrade above stays open and is **Phase 9 work**, recorded here rather than ticked.
+
+**Delivered 2026-09-24.** Base's lane is seeded `ProviderAttested`, not `Measured`, and a test enforces that: recording it as measured would overstate what is known — nothing has observed a transaction's absence from the public mempool — and §14.1 would then price the lane above its evidence.
+
+**Evidence past its TTL is *none*, not less.** The guarantee is a dashboard setting somebody can change without a deploy, so an old attestation says what was true then and nothing about now. `privacy_confidence` returns `0.0` for a stale lane rather than a decayed figure, because a decayed figure is still a claim.
+
+**The TTL is one hour**, which a test enforces an upper bound on (≤ 24 h). "Schedule a periodic re-check" is expressed as an expiry rather than as a scheduled job: a job that stops running leaves the old answer in place looking valid, whereas an expiry fails closed on its own.
+
+**§24.2's `public_mempool_jitter_bps` audit — the confirmation the plan asked for.** `apply_public_mempool_jitter` **is** reachable, on exactly one branch: `main.rs:8924`, under `BroadcastEndpoint::Public`. It perturbs the gas price by ±35 bps (±75 on the other chains) and affects nothing else. So it is live on the public fallback and is not load-bearing for correctness.
+
+**Not deleted from the legacy binary, deliberately.** Removing it now is a behaviour change on a live fallback path for no Phase 7 benefit, and that path retires wholesale in Phase 17. The new `apex-chain` lane has no jitter at all, which is §24.2's actual requirement — the heuristic is absent from the v4 submission path by construction rather than removed from the old one by edit.
 
 > **`public_mempool_jitter_bps: 35`.** §24.2 removes `apply_public_mempool_jitter` as an unjustified leakage-shaping heuristic. With protection on the lane it is most likely vestigial, so removal is low-risk — but confirm it is not load-bearing for a fallback path before deleting it.
 

@@ -3,3 +3,4 @@
 
 pub mod adapter;
 pub mod flashblock;
+pub mod submit;
