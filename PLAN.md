@@ -4393,6 +4393,20 @@ calls per invariant, 1,048,576 in total. All pass, zero reverts, 109 s.**
 **Failure criteria:** any reachable arbitrary call; any invariant without a test; any unresolved high/critical review finding.
 **Exit gate:** **G-SOL-1** and **G-SEC-1**.
 
+**Phase 5 status, 2026-09-24. G-SOL-1 satisfied; G-SEC-1 open, and it is the
+only thing open.** Tasks 5.1–5.5 and 5.7 are delivered, and 5.6 Steps 1–2 are.
+Acceptance criteria 1, 2, 3, 4 and 6 are met; criterion 5 is the external review,
+which is a commissioning decision rather than an implementation step. `forge
+test` is 107/0 over 10 consecutive runs with no exclusions, and CI enforces it
+unqualified for the first time since Phase 0.
+
+**R-03 therefore still stands.** Task 5.1 replaced `_execGeneric` with
+`_execAdapter`, which was R-03's stated precondition for funding the executor
+beyond canary size — but §39 pairs that with G-SEC-1, and "no mainnet deployment
+before the review clears" is Task 5.6's own wording. Phases 6 and 7 are shadow
+work and need no funded executor, so this blocks nothing downstream until
+Phase 8.
+
 ---
 
 ## PHASE 6 — Capture Assurance Controller and signer pool (SHADOW)
@@ -4434,7 +4448,38 @@ fn dropping_a_nonterminal_ticket_records_an_explicit_failure() {
 }
 ```
 
-- [ ] **Step 2: Run and observe the failures.** **Step 3: Implement** the registry with an RAII checkout guard whose `Drop` closes non-terminal tickets explicitly, plus the append-only journal with `fsync` at/after `AUTHORIZED`. **Step 4: Observe the passes.** **Step 5: Commit.**
+- [x] **Step 2: Run and observe the failures.** **Step 3: Implement** the registry with an RAII checkout guard whose `Drop` closes non-terminal tickets explicitly, plus the append-only journal with `fsync` at/after `AUTHORIZED`. **Step 4: Observe the passes.** **Step 5: Commit.**
+
+**Delivered 2026-09-24.** `crates/apex-capture/{clock,journal,registry}.rs`; 19 tests (12 lifecycle incl. the 100,000-case property run, 7 journal). Workspace 1,555 passing.
+
+**Process deviation, stated plainly: the implementation was written before the tests, so Step 2's red was never observed.** What stands in its place is stronger evidence, not weaker: eight mutations of the implementation, each producing a *named* failing test.
+
+| Mutation | Caught by |
+|---|---|
+| `Drop` stops closing an abandoned ticket | 5 tests incl. the property run |
+| `sweep` stops skipping checked-out tickets | `the_sweep_leaves_a_checked_out_ticket_to_its_owner` |
+| `admit` trusts the caller's id | `admit_assigns_the_id_rather_than_trusting_the_caller`, property run |
+| `close_locked` drops its `AlreadyClosed` guard | `releasing_a_guard_allows_another_checkout_...` |
+| `FileJournal` always `fsync`s | `a_file_journal_syncs_only_at_the_boundary` |
+| `FileJournal` truncates on open | 4 journal tests |
+| `TicketStatus` may run backwards | `status_may_not_run_backwards` |
+| `close_locked` forgets to decrement `tickets_live` | property run, `dropping_a_nonterminal_ticket_...` |
+
+**INV-01 is enforced by closing paths, not by adding checks.** There is exactly one removal path, `close`, and it records an outcome *before* it removes; work happens under a `TicketGuard` whose `Drop` closes a still-live ticket; and a ticket nobody ever checks out is closed by `sweep` at its dispatch deadline. The third is the case the RAII guard structurally cannot see — there is no guard to drop — and it is the one that actually loses money, so the property test's final sweep is at `u64::MAX` rather than at a plausible time.
+
+**Deviation from §8's INV-01 row: `Drop` records, it does not panic in debug.** A panic in `Drop` while unwinding from another panic aborts the process, so the specified debug behaviour would convert a single recoverable fault into a hard abort at precisely the moment a ticket is most likely to be dropped — and it would make this task's own property test unrunnable, since that test drops guards deliberately. Loudness moved to a distinct counter, `tickets_closed_by_guard_drop`, which a shadow run wants at zero.
+
+**`TerminalFailure::Abandoned { at_status }` added to `apex-types`.** The guard's fallback needs a code and none of the existing eleven is true; `RiskRejected { rule: "dropped" }` would put a lie in the miss ledger, and §46.1's whole point is that an unclassifiable outcome is the one forbidden state. `at_status` records where the ticket got to, which is what names the code path that let go of it.
+
+**`ticket_drop_count` is derived, not incremented** — `admitted − success − failure − live`. A counter bumped only where the author remembered to bump it proves the author's attention, not the invariant; subtracting what is accounted for from what was admitted catches a removal path that forgets to record *whether or not it knew about the field*. The derivation is itself cross-checked: the property test asserts `tickets_live` against `live_ids().len()`, because a counter that drifted from the map it counts would make the subtraction agree with itself and prove nothing (mutation 8).
+
+**No `unwrap`/`expect` on the runtime path, which `no_runtime_panics.sh` enforces.** A poisoned lock recovers its inner value rather than propagating. That is safe *because* of how the invariant is measured: an accounting update interrupted half-way shows up in the derived `ticket_drop_count()`, so the damage announces itself through the metric that exists to detect it — instead of being converted into an abort that would strand every other live ticket in memory.
+
+**Why `fsync` only at `Authorized` is sufficient rather than merely cheap:** `fsync` flushes the whole file, so the first durable write after a run of buffered ones makes all of them durable too. A ticket that reached `Authorized` therefore has its `Admitted` record on disk, which is what recovery needs to know what the ticket *was*.
+
+**`replay` tolerates a truncated final line and refuses a corrupt interior one.** A half-written last line is the expected shape of a crash mid-append, and by construction it was never `fsync`ed, so the journal never promised it; refusing to start over one would turn a routine crash into an outage. Corruption anywhere else means the file was rewritten behind us, and recovery decides what is still owed on-chain — guessing there is how a ticket gets settled twice.
+
+**The clock is injected.** `SystemClock` in production, `ManualClock` in tests. A deadline test against `SystemTime::now` has to sleep, and a sleeping test is a slow test that still races.
 
 ### Task 6.2 — Crash recovery (INV-39)
 

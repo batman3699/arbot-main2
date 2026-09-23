@@ -82,6 +82,16 @@ pub enum TerminalFailure {
     CompetitorWon { observed_tx: Option<B256> },
     Reverted { revert_class: RevertClass, data: Vec<u8> },
     Diverged { branch: StateBranchId },
+    /// The work was abandoned without a decision -- a cancelled task, a panic
+    /// upstream, a `TicketGuard` that went out of scope. Added in Phase 6 Task
+    /// 6.1, because the registry's RAII fallback needs a code and none of the
+    /// others is true. Calling it `RiskRejected { rule: "dropped" }` would put
+    /// a lie in the miss ledger, and §46.1's whole point is that an outcome
+    /// nobody can classify is the one forbidden state.
+    ///
+    /// It is a *bug report*, not a normal outcome: `at_status` is where the
+    /// ticket got to, which is what tells you which code path let go of it.
+    Abandoned { at_status: TicketStatus },
 }
 
 /// The closed world. §46.1: exactly one of these, always.

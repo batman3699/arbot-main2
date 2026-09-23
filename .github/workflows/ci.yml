@@ -8,11 +8,10 @@
 #   pre-existing across arb-exec-legacy, and a gate that is red on arrival gets
 #   switched off. Each crate joins as it is migrated.
 #
-#   forge excludes test/Deploy*. Those 15 tests are flaky, not red (B-13): they
-#   configure themselves with vm.setEnv, which writes the shared forge process
-#   environment, so they race each other and the auto-loaded .env. Measured 3 of
-#   8 runs failing with a varying subset. Quarantined until Phase 5 Task 5.7.
-#   The other 52 are green deterministically.
+#   forge runs the whole suite. It used to exclude test/Deploy* -- those tests
+#   configured themselves with vm.setEnv, which writes the shared forge process
+#   environment, so they raced each other and the auto-loaded .env (B-13).
+#   Task 5.7 gave Deploy.s.sol a DeployConfig seam and the quarantine is gone.
 
 name: CI
 on:
@@ -60,7 +59,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ -p apex-sim --all-targets -- -D warnings
+      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ -p apex-sim -p apex-capture --all-targets -- -D warnings
 
   solidity:
     name: forge
