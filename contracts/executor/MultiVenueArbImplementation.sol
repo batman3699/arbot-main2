@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.21;
 
-import {BridgeLib} from "../libraries/BridgeLib.sol";
 import {SwapExecutor} from "./steps/SwapExecutor.sol";
 import {GenericExecutor} from "./steps/GenericExecutor.sol";
-import {JitExecutor} from "./steps/JitExecutor.sol";
-import {BridgeExecutor} from "./steps/BridgeExecutor.sol";
 import {FullMath} from "../libraries/FullMath.sol";
 import {TickMath} from "../libraries/TickMath.sol";
 import {LiquidityAmounts} from "../libraries/LiquidityAmounts.sol";
@@ -190,13 +187,15 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
 
     uint8 private constant PLAN_VERSION_V2 = 2;
 
+    /// §1.4 excludes JIT liquidity and cross-chain bridging, so `BRIDGE`,
+    /// `JIT_LP_ADD` and `JIT_LP_REMOVE` are gone. Removing enum variants
+    /// renumbers nothing here -- they were the last three -- so an old plan
+    /// naming one of them now decodes as an out-of-range `Op` and reverts,
+    /// which is the outcome wanted.
     enum Op {
         UNIV3,
         BALANCER,
-        GENERIC,
-        BRIDGE,
-        JIT_LP_ADD,
-        JIT_LP_REMOVE
+        GENERIC
     }
 
     enum LoanProvider {
@@ -249,19 +248,12 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         LoanProvider provider;
     }
 
-    struct JitPosition {
-        int24 tickLower;
-        int24 tickUpper;
-        uint128 liquidity;
-    }
 
     address public owner;
     IBalancerVault public vault;
     ISwapRouter02 public uniV3;
     IPermit2 public permit2;
     IAaveV3Pool public aavePool;
-    mapping(address => JitPosition) internal jitPositions;
-    address private jitMintPool;
 
     PackedConfig internal config;
     bool private initialised;
@@ -282,8 +274,6 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
 
     address private immutable swapExecutorModule;
     address private immutable genericExecutorModule;
-    address private immutable jitExecutorModule;
-    address private immutable bridgeExecutorModule;
 
     uint256 private constant BPS = 10_000;
     uint32 private constant MAX_DEADLINE_BUFFER = 3600;
@@ -293,8 +283,6 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
     constructor() {
         swapExecutorModule = address(new SwapExecutor());
         genericExecutorModule = address(new GenericExecutor());
-        jitExecutorModule = address(new JitExecutor());
-        bridgeExecutorModule = address(new BridgeExecutor());
         initialised = true;
     }
 
@@ -694,12 +682,6 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
             } else if (s.op == Op.GENERIC) {
                 module = genericExecutorModule;
                 callData = abi.encodeWithSelector(GenericExecutor.execute.selector, s.data);
-            } else if (s.op == Op.BRIDGE) {
-                module = bridgeExecutorModule;
-                callData = abi.encodeWithSelector(BridgeExecutor.execute.selector, s.data, address(permit2));
-            } else if (s.op == Op.JIT_LP_ADD || s.op == Op.JIT_LP_REMOVE) {
-                module = jitExecutorModule;
-                callData = abi.encodeWithSelector(JitExecutor.execute.selector, uint8(s.op), s.data, deadline);
             } else {
                 revert InvalidGenericAction();
             }
@@ -728,21 +710,7 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         _execGeneric(data);
     }
 
-    function moduleExecBridge(bytes memory data) external {
-        if (msg.sender != address(this)) revert InvalidGenericAction();
-        _execBridge(data);
-    }
 
-    function moduleExecJit(uint8 op, bytes memory data, uint256 deadline) external {
-        if (msg.sender != address(this)) revert InvalidGenericAction();
-        if (op == uint8(Op.JIT_LP_ADD)) {
-            _execJitAdd(data);
-        } else if (op == uint8(Op.JIT_LP_REMOVE)) {
-            _execJitRemove(data, deadline);
-        } else {
-            revert InvalidGenericAction();
-        }
-    }
 
     function _execUniswap(bytes memory data, uint256 deadline, address recipient) internal {
         if (address(uniV3) == address(0)) revert InvalidRouter();
@@ -807,24 +775,6 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         target.safeCall(callData);
     }
 
-    function _execBridge(bytes memory data) internal {
-        (
-            address adapter,
-            address token,
-            uint256 amount,
-            uint256 targetChainId,
-            uint256 maxDuration,
-            bytes memory callData
-        ) = abi.decode(data, (address, address, uint256, uint256, uint256, bytes));
-        if (adapter == address(0) || token == address(0)) revert InvalidGenericAction();
-        if (amount > 0) {
-            _ensurePermit2Allowance(token, adapter, amount);
-        }
-        BridgeLib.BridgeParams memory params = BridgeLib.BridgeParams({
-            bridge: adapter, targetChainId: targetChainId, callData: callData, maxDuration: maxDuration
-        });
-        BridgeLib.executeBridge(params);
-    }
 
     function _repay(LoanProvider provider, address token, uint256 amount, address target) internal {
         if (
@@ -838,84 +788,9 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         }
     }
 
-    function _execJitAdd(bytes memory data) internal {
-        (address pool, address token0, address token1, uint256 amount0, uint256 amount1, uint256 tickRangeRaw) =
-            abi.decode(data, (address, address, address, uint256, uint256, uint256));
-        if (pool == address(0) || (amount0 == 0 && amount1 == 0)) revert InvalidGenericAction();
-        if (address(uniV3) == address(0)) revert InvalidGenericAction();
-        if (jitPositions[pool].liquidity != 0) revert InvalidGenericAction();
-        if (tickRangeRaw > uint256(uint24(type(int24).max))) revert InvalidGenericAction();
 
-        IUniswapV3Pool v3 = IUniswapV3Pool(pool);
-        if (v3.token0() != token0 || v3.token1() != token1) revert InvalidGenericAction();
 
-        (, int24 tick,,,,,) = v3.slot0();
-        // Tick-range and liquidity math are isolated in pure helpers so their
-        // intermediate locals (spacing/base/range/sqrt prices) do not all stay
-        // live here. Keeps legacy (non-viaIR) codegen under the EVM stack limit.
-        (int24 tickLower, int24 tickUpper) = _jitTickRange(tick, v3.tickSpacing(), tickRangeRaw);
 
-        uint128 liquidity = _jitLiquidity(tick, tickLower, tickUpper, amount0, amount1);
-        if (liquidity == 0) revert InvalidGenericAction();
-
-        _jitMintAndStore(v3, pool, tickLower, tickUpper, liquidity);
-    }
-
-    /// Mints the JIT position and records it. The post-mint liquidity re-check
-    /// (re-entrancy guard against the mint callback) and the storage write keep the
-    /// exact ordering of the previous inline version. mint()'s returned used0/used1
-    /// were already ignored, so they are simply not bound here.
-    function _jitMintAndStore(
-        IUniswapV3Pool v3,
-        address pool,
-        int24 tickLower,
-        int24 tickUpper,
-        uint128 liquidity
-    ) private {
-        jitMintPool = pool;
-        v3.mint(address(this), tickLower, tickUpper, liquidity, abi.encode(pool));
-        jitMintPool = address(0);
-
-        if (jitPositions[pool].liquidity != 0) revert InvalidGenericAction();
-
-        jitPositions[pool] = JitPosition({tickLower: tickLower, tickUpper: tickUpper, liquidity: liquidity});
-    }
-
-    /// Aligns the current tick to `spacing` and widens by `tickRangeRaw` spacings on
-    /// each side. Pure; identical math/checks to the previous inline version.
-    function _jitTickRange(int24 tick, int24 spacing, uint256 tickRangeRaw)
-        private
-        pure
-        returns (int24 tickLower, int24 tickUpper)
-    {
-        if (spacing <= 0) revert InvalidGenericAction();
-        int256 base = (int256(tick) / int256(spacing)) * int256(spacing);
-        int256 range = int256(uint256(uint24(tickRangeRaw))) * int256(spacing);
-        int256 tickLowerI = base - range;
-        int256 tickUpperI = base + range;
-        if (tickLowerI < int256(type(int24).min) || tickUpperI > int256(type(int24).max)) {
-            revert InvalidGenericAction();
-        }
-        tickLower = int24(tickLowerI);
-        tickUpper = int24(tickUpperI);
-        if (tickLower >= tickUpper) revert InvalidGenericAction();
-    }
-
-    /// Liquidity for the given current/lower/upper ticks and token amounts. Pure;
-    /// identical to the previous inline sqrt-price computation.
-    function _jitLiquidity(int24 tick, int24 tickLower, int24 tickUpper, uint256 amount0, uint256 amount1)
-        private
-        pure
-        returns (uint128)
-    {
-        return LiquidityAmounts.getLiquidityForAmounts(
-            TickMath.getSqrtRatioAtTick(tick),
-            TickMath.getSqrtRatioAtTick(tickLower),
-            TickMath.getSqrtRatioAtTick(tickUpper),
-            amount0,
-            amount1
-        );
-    }
 
     function _validateActiveLoanAndSender(LoanProvider provider, bytes calldata data) private view returns (address sender) {
         sender = msg.sender;
@@ -952,53 +827,6 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         revert InvalidGenericAction();
     }
 
-    function _execJitRemove(bytes memory data, uint256 deadline) internal {
-        (address pool, address targetToken, uint256 feeRaw, uint256 minOut) =
-            abi.decode(data, (address, address, uint256, uint256));
-        if (pool == address(0) || targetToken == address(0)) revert InvalidGenericAction();
-        if (address(uniV3) == address(0)) revert InvalidGenericAction();
-
-        JitPosition memory pos = jitPositions[pool];
-        if (pos.liquidity == 0) revert InvalidGenericAction();
-
-        IUniswapV3Pool v3 = IUniswapV3Pool(pool);
-        address token0 = v3.token0();
-        address token1 = v3.token1();
-        uint256 before0 = IERC20(token0).balanceOf(address(this));
-        uint256 before1 = IERC20(token1).balanceOf(address(this));
-
-        v3.burn(pos.tickLower, pos.tickUpper, pos.liquidity);
-        v3.collect(address(this), pos.tickLower, pos.tickUpper, type(uint128).max, type(uint128).max);
-        delete jitPositions[pool];
-
-        uint256 received0 = IERC20(token0).balanceOf(address(this)) - before0;
-        uint256 received1 = IERC20(token1).balanceOf(address(this)) - before1;
-
-        uint24 fee = uint24(feeRaw);
-        if (fee == 0) {
-            fee = v3.fee();
-        }
-
-        if (targetToken == token0 && received1 > 0) {
-            if (minOut == 0) revert();
-            _ensureAllowance(token1, address(uniV3), received1);
-            bytes memory path = abi.encodePacked(token1, fee, token0);
-            ISwapRouter02.ExactInputParams memory ep = ISwapRouter02.ExactInputParams({
-                path: path, recipient: address(this), amountIn: received1, amountOutMinimum: minOut
-            });
-            uniV3.exactInput(ep);
-        } else if (targetToken == token1 && received0 > 0) {
-            if (minOut == 0) revert();
-            _ensureAllowance(token0, address(uniV3), received0);
-            bytes memory path = abi.encodePacked(token0, fee, token1);
-            ISwapRouter02.ExactInputParams memory ep = ISwapRouter02.ExactInputParams({
-                path: path, recipient: address(this), amountIn: received0, amountOutMinimum: minOut
-            });
-            uniV3.exactInput(ep);
-        } else if (targetToken != token0 && targetToken != token1) {
-            revert InvalidGenericAction();
-        }
-    }
 
     function _tokenAt(bytes memory path, uint256 idx) private pure returns (address t) {
         if (path.length < 43 || (path.length - 20) % 23 != 0) revert InvalidGenericAction();
@@ -1076,17 +904,6 @@ contract MultiVenueArbImplementation is IAaveFlashLoanSimpleReceiver, IERC3156Fl
         }
     }
 
-    function uniswapV3MintCallback(uint256 amount0, uint256 amount1, bytes calldata data) external {
-        address pool = abi.decode(data, (address));
-        if (msg.sender != pool || jitMintPool != pool) revert InvalidGenericAction();
-
-        if (amount0 > 0) {
-            _safeTransfer(IUniswapV3Pool(pool).token0(), msg.sender, amount0);
-        }
-        if (amount1 > 0) {
-            _safeTransfer(IUniswapV3Pool(pool).token1(), msg.sender, amount1);
-        }
-    }
 
     function _ensurePermit2SpenderApproval(address token, uint256 minNeeded) private {
         (bool ok, bytes memory ret) =

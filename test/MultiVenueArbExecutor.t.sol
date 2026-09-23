@@ -4,7 +4,6 @@ pragma solidity ^0.8.21;
 import {MultiVenueArbImplementation, ISwapRouter02, IBalancerVault, NotExecutor} from "../contracts/executor/MultiVenueArbImplementation.sol";
 import {ArbitrageCloneFactory} from "../contracts/executor/ArbitrageCloneFactory.sol";
 import {BatchRouter} from "../contracts/executor/BatchRouter.sol";
-import {IBridgeAdapter} from "../contracts/libraries/BridgeLib.sol";
 import {MockERC20} from "../contracts/mocks/MockERC20.sol";
 import {MockERC3156Lender, ERC3156CallbackProxy} from "../contracts/mocks/MockERC3156Lender.sol";
 import {MockUSDT} from "../contracts/mocks/MockUSDT.sol";
@@ -45,26 +44,6 @@ contract MockPermit2 {
     }
 }
 
-contract PullingBridgeAdapter is IBridgeAdapter {
-    MockERC20 public immutable token;
-    MockPermit2 public immutable permit2;
-    address public lastSender;
-    uint256 public lastAmount;
-
-    constructor(address token_, address permit2_) {
-        token = MockERC20(token_);
-        permit2 = MockPermit2(permit2_);
-    }
-
-    function bridge(bytes calldata data) external override returns (bytes32 transferId, uint256 feePaid) {
-        lastSender = msg.sender;
-        lastAmount = abi.decode(data, (uint256));
-        require(lastAmount <= type(uint160).max, "overflow");
-        permit2.transferFrom(msg.sender, address(this), uint160(lastAmount), address(token));
-        transferId = bytes32(uint256(1));
-        feePaid = 0;
-    }
-}
 
 contract MockSwapRouter is ISwapRouter02 {
     address public immutable tokenIn;
@@ -93,54 +72,7 @@ contract MockSwapRouter is ISwapRouter02 {
 }
 
 
-contract MockJitRemovePool {
-    address public immutable token0;
-    address public immutable token1;
-    uint24 public immutable fee;
 
-    constructor(address token0_, address token1_, uint24 fee_) {
-        token0 = token0_;
-        token1 = token1_;
-        fee = fee_;
-    }
-
-    function tickSpacing() external pure returns (int24) {
-        return 1;
-    }
-
-    function slot0() external pure returns (uint160, int24, uint16, uint16, uint16, uint8, bool) {
-        return (0, 0, 0, 0, 0, 0, false);
-    }
-
-    function flash(address, uint256, uint256, bytes calldata) external {}
-
-    function mint(address, int24, int24, uint128, bytes calldata) external pure returns (uint256, uint256) {
-        return (0, 0);
-    }
-
-    function burn(int24, int24, uint128) external pure returns (uint256, uint256) {
-        return (0, 0);
-    }
-
-    function collect(address, int24, int24, uint128, uint128) external pure returns (uint256, uint256) {
-        return (0, 0);
-    }
-}
-
-contract JitRemoveHarness is MultiVenueArbImplementation {
-    constructor(address uni) {
-        owner = msg.sender;
-        uniV3 = ISwapRouter02(uni);
-    }
-
-    function seedJitPosition(address pool, int24 tickLower, int24 tickUpper, uint128 liquidity) external {
-        jitPositions[pool] = JitPosition({tickLower: tickLower, tickUpper: tickUpper, liquidity: liquidity});
-    }
-
-    function execJitRemove(bytes memory data, uint256 deadline) external {
-        _execJitRemove(data, deadline);
-    }
-}
 
 contract MockBalancerVault is IBalancerVault {
     MultiVenueArbImplementation public immutable executor;
@@ -268,43 +200,6 @@ contract ProfitDonor {
     }
 }
 
-contract MockJitPool {
-    address public immutable token0;
-    address public immutable token1;
-    int24 public immutable currentTick;
-    int24 public immutable spacing;
-
-    constructor(address token0_, address token1_, int24 tick_, int24 spacing_) {
-        token0 = token0_;
-        token1 = token1_;
-        currentTick = tick_;
-        spacing = spacing_;
-    }
-
-    function fee() external pure returns (uint24) {
-        return 3000;
-    }
-
-    function tickSpacing() external view returns (int24) {
-        return spacing;
-    }
-
-    function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, uint8, bool) {
-        return (79228162514264337593543950336, currentTick, 0, 0, 0, 0, false);
-    }
-
-    function mint(address, int24, int24, uint128, bytes calldata) external pure returns (uint256 amount0, uint256 amount1) {
-        return (0, 0);
-    }
-
-    function burn(int24, int24, uint128) external pure returns (uint256 amount0, uint256 amount1) {
-        return (0, 0);
-    }
-
-    function collect(address, int24, int24, uint128, uint128) external pure returns (uint256 amount0, uint256 amount1) {
-        return (0, 0);
-    }
-}
 
 contract MockUniV3RouterNoop {
     uint256 public lastAmountIn;
@@ -318,53 +213,6 @@ contract MockUniV3RouterNoop {
     }
 }
 
-contract MockJitPoolWithCollect {
-    address public immutable token0;
-    address public immutable token1;
-    int24 public immutable spacing;
-    int24 public immutable currentTick;
-    uint256 public collect0;
-    uint256 public collect1;
-
-    constructor(address token0_, address token1_, int24 tick_, int24 spacing_) {
-        token0 = token0_;
-        token1 = token1_;
-        currentTick = tick_;
-        spacing = spacing_;
-    }
-
-    function setCollect(uint256 amount0, uint256 amount1) external {
-        collect0 = amount0;
-        collect1 = amount1;
-    }
-
-    function fee() external pure returns (uint24) {
-        return 3000;
-    }
-
-    function tickSpacing() external view returns (int24) {
-        return spacing;
-    }
-
-    function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, uint8, bool) {
-        return (79228162514264337593543950336, currentTick, 0, 0, 0, 0, false);
-    }
-
-    function mint(address, int24, int24, uint128, bytes calldata) external pure returns (uint256 amount0, uint256 amount1) {
-        return (0, 0);
-    }
-
-    function burn(int24, int24, uint128) external pure returns (uint256 amount0, uint256 amount1) {
-        return (0, 0);
-    }
-
-    function collect(address recipient, int24, int24, uint128, uint128) external returns (uint256 amount0, uint256 amount1) {
-        amount0 = collect0;
-        amount1 = collect1;
-        if (amount0 > 0) MockERC20(token0).mint(recipient, amount0);
-        if (amount1 > 0) MockERC20(token1).mint(recipient, amount1);
-    }
-}
 
 contract NonOwnerStarter {
     function callStart(address executor, MultiVenueArbImplementation.PlanLegacy memory plan)
@@ -620,49 +468,6 @@ contract MultiVenueArbExecutorTest is Test {
         executor.start(plan);
     }
 
-    function testBridgeStepApprovesAndTransfers() external {
-        MultiVenueArbImplementation implementation = new MultiVenueArbImplementation();
-        ArbitrageCloneFactory factory = new ArbitrageCloneFactory(address(implementation));
-        MultiVenueArbImplementation executor = MultiVenueArbImplementation(factory.deployClone(bytes32("bridge")));
-
-        BridgeVaultMock vault = new BridgeVaultMock(executor);
-
-        MockPermit2 permit2 = new MockPermit2();
-
-        executor.initialise(address(this), address(vault), address(1), address(0), address(permit2), 0, 0, 1);
-
-        MockERC20 loanToken = new MockERC20("Mock Loan", "MLN", 18);
-        MockERC20 token = new MockERC20("Mock Token", "MCK", 18);
-        PullingBridgeAdapter bridge = new PullingBridgeAdapter(address(token), address(permit2));
-
-        uint256 bridgeAmount = 50 ether;
-        token.mint(address(executor), bridgeAmount);
-
-        MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](1);
-        bytes memory bridgeCall = abi.encode(bridgeAmount);
-        steps[0] = MultiVenueArbImplementation.Step({
-            op: MultiVenueArbImplementation.Op.BRIDGE,
-            data: abi.encode(address(bridge), address(token), bridgeAmount, uint256(137), uint256(60), bridgeCall)
-        });
-
-        MultiVenueArbImplementation.PlanLegacy memory plan = MultiVenueArbImplementation.PlanLegacy({
-            loanToken: address(loanToken),
-            amountIn: 0,
-            loanProvider: MultiVenueArbImplementation.LoanProvider.BALANCER,
-            cycleSlippageBps: 0,
-            steps: steps,
-            minProfit: 0
-        });
-
-        executor.start(plan);
-
-        assertEq(bridge.lastSender(), address(executor), "adapter should be called by executor");
-        assertEq(bridge.lastAmount(), bridgeAmount, "bridge should receive requested amount");
-        assertEq(token.balanceOf(address(bridge)), bridgeAmount, "bridge should pull tokens");
-        assertEq(token.balanceOf(address(executor)), 0, "executor should have transferred tokens");
-        (uint160 remaining,,) = permit2.allowance(address(executor), address(token), address(bridge));
-        assertEq(uint256(remaining), 0, "permit2 allowance should be consumed");
-    }
 
     function testSequentialUniswapSwapsWithZeroFirstToken() external {
         MultiVenueArbImplementation implementation = new MultiVenueArbImplementation();
@@ -987,9 +792,6 @@ contract MultiVenueArbExecutorAbiV2Test is Test {
         assertEq(uint8(MultiVenueArbImplementation.Op.UNIV3), 0, "UNIV3");
         assertEq(uint8(MultiVenueArbImplementation.Op.BALANCER), 1, "BALANCER");
         assertEq(uint8(MultiVenueArbImplementation.Op.GENERIC), 2, "GENERIC");
-        assertEq(uint8(MultiVenueArbImplementation.Op.BRIDGE), 3, "BRIDGE");
-        assertEq(uint8(MultiVenueArbImplementation.Op.JIT_LP_ADD), 4, "JIT ADD");
-        assertEq(uint8(MultiVenueArbImplementation.Op.JIT_LP_REMOVE), 5, "JIT REMOVE");
     }
 
     function testLoanProviderEnumOrderingIsStable() external {
@@ -1002,39 +804,6 @@ contract MultiVenueArbExecutorAbiV2Test is Test {
 }
 
 
-contract MultiVenueArbExecutorJitRemoveTest is Test {
-    function testJitRemoveUsesCollectedBalancesForSwap() external {
-        MockERC20 token0 = new MockERC20("Token0", "TK0", 18);
-        MockERC20 token1 = new MockERC20("Token1", "TK1", 18);
-        MockSwapRouter router = new MockSwapRouter(address(token1), address(token0));
-        JitRemoveHarness harness = new JitRemoveHarness(address(router));
-        MockJitPoolWithCollect pool = new MockJitPoolWithCollect(address(token0), address(token1), 0, 1);
-
-        harness.seedJitPosition(address(pool), -120, 120, 1);
-        pool.setCollect(0, 2 ether);
-        token0.mint(address(router), 1 ether);
-
-        bytes memory data = abi.encode(address(pool), address(token0), uint256(0), uint256(1 ether));
-        harness.execJitRemove(data, block.timestamp + 60);
-
-        assertEq(router.swapCount(), 1, "swap triggered using collected token1 balance");
-        assertEq(token1.balanceOf(address(harness)), 0, "token1 swapped out");
-        assertEq(token0.balanceOf(address(harness)), 1 ether, "token0 received from router");
-    }
-
-    function testJitRemoveRevertsWhenRouterUnset() external {
-        MockERC20 token0 = new MockERC20("Token0", "TK0", 18);
-        MockERC20 token1 = new MockERC20("Token1", "TK1", 18);
-        JitRemoveHarness harness = new JitRemoveHarness(address(0));
-        MockJitRemovePool pool = new MockJitRemovePool(address(token0), address(token1), 500);
-
-        harness.seedJitPosition(address(pool), -120, 120, 1);
-        bytes memory data = abi.encode(address(pool), address(token0), uint256(500), uint256(1));
-
-        vm.expectRevert(MultiVenueArbImplementation.InvalidGenericAction.selector);
-        harness.execJitRemove(data, block.timestamp + 60);
-    }
-}
 
 contract MultiVenueArbExecutorErc3156Test is Test {
     function _deploy(uint256 feeBps)
@@ -1279,61 +1048,8 @@ contract MultiVenueArbExecutorErc3156Test is Test {
         executor.startV2(plan);
     }
 
-    function testErc3156JitAddRevertsWhenTickRangeExceedsInt24() external {
-        (MultiVenueArbImplementation executor, MockERC3156Lender lender, MockERC20 loanToken,,) = _deployWithUniV3(0, address(1));
-        MockJitPool pool = new MockJitPool(address(loanToken), address(new MockERC20("Other", "OT", 18)), 0, 1);
 
-        loanToken.mint(address(lender), 10 ether);
 
-        MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](1);
-        steps[0] = MultiVenueArbImplementation.Step({
-            op: MultiVenueArbImplementation.Op.JIT_LP_ADD,
-            data: abi.encode(address(pool), address(loanToken), address(pool.token1()), 1 ether, 1 ether, uint256(uint24(type(int24).max)) + 1)
-        });
-
-        MultiVenueArbImplementation.PlanV2 memory plan =
-            _singleLoanPlan(address(loanToken), 10 ether, address(lender), steps, 0);
-
-        vm.expectRevert(MultiVenueArbImplementation.InvalidGenericAction.selector);
-        executor.startV2(plan);
-    }
-
-    function testErc3156JitAddRevertsWhenExistingPositionPresent() external {
-        (MultiVenueArbImplementation executor, MockERC3156Lender lender, MockERC20 loanToken,,) = _deployWithUniV3(0, address(1));
-        MockJitPool pool = new MockJitPool(address(loanToken), address(new MockERC20("Other", "OT", 18)), 0, 1);
-
-        loanToken.mint(address(lender), 10 ether);
-
-        MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](2);
-        bytes memory jitAddData = abi.encode(address(pool), address(loanToken), address(pool.token1()), 1 ether, 1 ether, uint256(100));
-        steps[0] = MultiVenueArbImplementation.Step({op: MultiVenueArbImplementation.Op.JIT_LP_ADD, data: jitAddData});
-        steps[1] = MultiVenueArbImplementation.Step({op: MultiVenueArbImplementation.Op.JIT_LP_ADD, data: jitAddData});
-
-        MultiVenueArbImplementation.PlanV2 memory plan =
-            _singleLoanPlan(address(loanToken), 10 ether, address(lender), steps, 0);
-
-        vm.expectRevert(MultiVenueArbImplementation.InvalidGenericAction.selector);
-        executor.startV2(plan);
-    }
-
-    function testErc3156JitAddRevertsWhenUniV3RouterUnset() external {
-        (MultiVenueArbImplementation executor, MockERC3156Lender lender, MockERC20 loanToken,,) = _deployWithUniV3(0, address(0));
-        MockJitPool pool = new MockJitPool(address(loanToken), address(new MockERC20("Other", "OT", 18)), 0, 1);
-
-        loanToken.mint(address(lender), 10 ether);
-
-        MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](1);
-        steps[0] = MultiVenueArbImplementation.Step({
-            op: MultiVenueArbImplementation.Op.JIT_LP_ADD,
-            data: abi.encode(address(pool), address(loanToken), address(pool.token1()), 1 ether, 1 ether, uint256(100))
-        });
-
-        MultiVenueArbImplementation.PlanV2 memory plan =
-            _singleLoanPlan(address(loanToken), 10 ether, address(lender), steps, 0);
-
-        vm.expectRevert(MultiVenueArbImplementation.InvalidGenericAction.selector);
-        executor.startV2(plan);
-    }
 
     function testErc3156UniswapStepRevertsOnMalformedPath() external {
         MockUniV3RouterNoop router = new MockUniV3RouterNoop();
@@ -1355,36 +1071,6 @@ contract MultiVenueArbExecutorErc3156Test is Test {
         executor.startV2(plan);
     }
 
-    function testErc3156JitRemoveUsesCollectedBalancesForSwapInput() external {
-        MockUniV3RouterNoop router = new MockUniV3RouterNoop();
-        (MultiVenueArbImplementation executor, MockERC3156Lender lender, MockERC20 loanToken,,) =
-            _deployWithUniV3(0, address(router));
-        MockERC20 token1 = new MockERC20("Other", "OT", 18);
-        MockJitPoolWithCollect pool = new MockJitPoolWithCollect(address(loanToken), address(token1), 0, 1);
-        ProfitDonor donor = new ProfitDonor();
-        pool.setCollect(0, 2 ether);
-
-        loanToken.mint(address(lender), 10 ether);
-        token1.mint(address(donor), 1 ether);
-
-        MultiVenueArbImplementation.Step[] memory steps = new MultiVenueArbImplementation.Step[](3);
-        bytes memory callData = abi.encodeCall(ProfitDonor.donate, (address(token1), address(executor), 1 ether));
-        steps[0] = MultiVenueArbImplementation.Step({
-            op: MultiVenueArbImplementation.Op.GENERIC,
-            data: abi.encode(address(donor), callData, uint256(0), address(0), uint256(0))
-        });
-        bytes memory jitAddData = abi.encode(address(pool), address(loanToken), address(token1), 1 ether, 1 ether, uint256(10));
-        bytes memory jitRemoveData = abi.encode(address(pool), address(loanToken), uint256(3000), uint256(1));
-        steps[1] = MultiVenueArbImplementation.Step({op: MultiVenueArbImplementation.Op.JIT_LP_ADD, data: jitAddData});
-        steps[2] = MultiVenueArbImplementation.Step({op: MultiVenueArbImplementation.Op.JIT_LP_REMOVE, data: jitRemoveData});
-
-        MultiVenueArbImplementation.PlanV2 memory plan =
-            _singleLoanPlan(address(loanToken), 10 ether, address(lender), steps, 0);
-
-        executor.startV2(plan);
-
-        assertEq(router.lastAmountIn(), 2 ether, "swap input should equal collected token amount");
-    }
 }
 
 

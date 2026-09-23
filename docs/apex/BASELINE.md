@@ -199,3 +199,16 @@ harness dies with the feature.
 `contracts/mocks/`, against EIP-170. It prints the margin for anything within
 1 KiB of the ceiling, so 24,403 is visible in every run rather than discovered
 the next time someone adds a function.
+
+### Resolved 2026-09-24 — Phase 5 Task 5.5
+
+Deleting the JIT and bridge paths freed **5,980 bytes**. The implementation is
+now **18,423 bytes, 6,153 to spare — 75.0% of EIP-170**, against Phase 5's
+benchmark of 15% margin. The 173-byte cliff above is history, and the room
+Task 5.1's `AdapterRegistry` substitution needs is there.
+
+`JitRemoveHarness` went with the feature, so `forge build --sizes` would now
+pass on its own. The CI build step stays as plain `forge build` regardless: any
+future test harness that extends the executor will put `--sizes` back over the
+limit for the same non-reason, and `check_executor_size.sh` asks the question
+that actually matters.

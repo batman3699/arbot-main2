@@ -4121,10 +4121,34 @@ function testGenericStepCanCallAnyTarget() external {
 
 ### Task 5.5 — Remove excluded features (C-03, C-04)
 
-- [ ] **Step 1:** Delete JIT and bridge ops, libraries, step contracts, mocks and their tests.
-- [ ] **Step 2:** Run `forge test` and `make check-contract-size`; confirm the runtime size gate passes with margin.
-- [ ] **Step 3:** Resolve `BatchRouter.sol` from `UNKNOWN`: trace callers; if none, remove.
-- [ ] **Step 4:** Commit.
+**Done FIRST, before Task 5.1, and the reordering is measured rather than
+stylistic.** `MultiVenueArbImplementation` had **173 bytes** of EIP-170 margin
+— 99.3% of the ceiling. Task 5.1 substitutes an `AdapterRegistry` and typed
+steps for `_execGeneric`; that is net new code, and there was no room for it.
+5.5 is pure deletion of features §1.4 already excludes, so it is the safe way
+to buy the space. **5,980 bytes freed: 24,403 → 18,423, margin 173 → 6,153,
+75.0% of the limit** against Phase 5's 15%-margin benchmark.
+
+- [x] **Step 1:** Delete JIT and bridge ops, libraries, step contracts, mocks and their tests.
+- [x] **Step 2:** Run `forge test` and confirm the runtime size gate passes with margin.
+- [ ] **Step 3:** Resolve `BatchRouter.sol` from `UNKNOWN`: trace callers; if none, remove. **Already resolved in §4.7** — `script/Deploy.s.sol:90` constructs it and `test/DeployOwnership.t.sol` asserts it owns the executor clone. It stays.
+- [x] **Step 4:** Commit.
+
+50 forge tests pass, exactly accounted for: 52 before, minus 7 JIT/bridge
+tests, plus the 5 that prove B-1.
+
+`JitRemoveHarness` — the harness that put `forge build --sizes` 1,214 bytes
+over EIP-170 on the first CI run — went with the feature it tested. The CI
+build step stays plain `forge build` regardless: a future harness extending the
+executor would break `--sizes` again for the same non-reason, and
+`check_executor_size.sh` asks the question that matters.
+
+**Storage layout note.** `jitPositions` and `jitMintPool` were storage slots,
+and removing them shifts everything below. No live clone is affected:
+`ArbitrageCloneFactory` pins its implementation at construction, so existing
+clones keep pointing at the old code and a new implementation needs a new
+factory. Recorded because a storage-layout change that nobody wrote down is how
+an upgrade goes wrong later.
 
 ### Task 5.7 — Retire the deploy tests' process-global env dependence (B-13)
 
