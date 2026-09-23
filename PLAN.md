@@ -4656,6 +4656,24 @@ Three deliberate differences, all outside the trip decision, all documented in t
 **Failure criteria:** any non-terminal ticket; any nonce reuse; any preempted authorized ticket; dispatch enabled before reconciliation.
 **Exit gate:** **G-CAP-1**, **G-CAP-2**, **G-SIGN-1**, **G-RISK-1**.
 
+**Phase 6 status, 2026-09-24. All seven tasks delivered; one acceptance
+criterion is wall-clock work, not an implementation step.**
+
+| Criterion | Status |
+|---|---|
+| 1. 100,000-case property run, zero non-terminal tickets | **Met** (Task 6.1) |
+| 2. `loom` proves no cross-lane nonce reuse | **Met** (Task 6.3), and a second model proves lane exclusivity, which the first could not see |
+| 3. `SIGKILL` recovery blocks dispatch, 20 consecutive cycles | **Met** (Task 6.2), with real `SIGKILL`s of a real process |
+| 4. 10× overload: no preemption, `U_capture` ≥ 0.99 | **Met** (Task 6.5), measured at **1.0000** against FIFO's 0.0000 |
+| 5. All 11 last-mile checks gate; signing without a token is a compile error | **Met** (Task 6.4) |
+| 6. 7-day shadow run with the null dispatcher | **Blocked on wall-clock time**, not on code. The null dispatcher and the three zero-tolerance counters exist and are tested; the run is an operator activity |
+
+**Crates:** `apex-capture` (clock, journal, registry, recover, revalidate, scheduler, signer, dispatch) and `apex-risk` (posture, loss, breaker). Workspace **1,640 tests passing**; CI green across all five jobs including the new `loom` job.
+
+**Three type-level gates now compose**, and this is the part worth stating as a whole rather than task by task. A `DispatchRequest` cannot be built without a `SigningAuthorization`; a `SigningAuthorization` cannot be built without a `Revalidated`; and `Dispatcher::dispatch` cannot be called without a `DispatchPermit`, which only boot-time reconciliation produces. So *dispatching without revalidating*, and *dispatching before reconciling*, are not bugs to catch in review — they are programs that do not compile. INV-35 and INV-39 are structural.
+
+**Still to come before this phase can actually run:** the signer itself. §18.4's `Secret<LocalWallet>` (INV-46) lands with the code that produces a signature, where the invariant can be tested rather than declared; Phase 6 holds no key material at all, which is the right amount for a phase that dispatches nothing.
+
 ---
 
 ## PHASE 7 — Base execution adapter
