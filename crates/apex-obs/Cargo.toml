@@ -1,0 +1,17 @@
+[package]
+name = "apex-obs"
+version = "0.1.0"
+edition = "2021"
+description = "Observability: the missed-opportunity ledger, coverage auditing, P&L attribution."
+
+[dependencies]
+apex-types = { path = "../apex-types" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+apex-capture = { path = "../apex-capture" }
+apex-chain = { path = "../apex-chain" }
+apex-econ = { path = "../apex-econ" }
+apex-sim = { path = "../apex-sim" }
+apex-venues = { path = "../apex-venues" }
+alloy-primitives = { version = "0.8", features = ["serde"] }

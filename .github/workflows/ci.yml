@@ -59,7 +59,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ -p apex-sim -p apex-capture -p apex-risk -p apex-chain --all-targets -- -D warnings
+      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ -p apex-sim -p apex-capture -p apex-risk -p apex-chain -p apex-obs --all-targets -- -D warnings
 
   loom:
     name: loom (signer lanes)
@@ -153,6 +153,8 @@ jobs:
       # be missing. It is green and it gates.
       - name: no credentials in source, logs or metrics (INV-46, §43)
         run: ./scripts/ci/secret_scan.sh
+      - name: every rejection type explains its miss (INV-40, §33)
+        run: ./scripts/ci/every_rejection_explains.sh
       # check_placeholder_endpoints.sh is NOT wired yet. It is red on arrival
       # for a real reason: config/registry.json:363 carries ${ALCHEMY_KEY} for
       # `abstract`, one of the six non-live chains. Same root cause as

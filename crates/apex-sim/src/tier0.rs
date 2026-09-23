@@ -176,3 +176,13 @@ mod tests {
         assert!(!screen(&input(i128::MIN, 0)).escalates());
     }
 }
+
+/// INV-40. Tier 0 declines for exactly one economic reason: the candidate
+/// cannot pay for itself. `Escalate` is not a rejection and maps to the same
+/// bucket only because the trait is total -- a caller asks this of a verdict it
+/// has already decided is a rejection.
+impl apex_types::miss::ExplainsMiss for Tier0Verdict {
+    fn miss_reason(&self) -> apex_types::miss::MissReason {
+        apex_types::miss::MissReason::LowEv
+    }
+}

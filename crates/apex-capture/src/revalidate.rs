@@ -92,6 +92,30 @@ impl std::fmt::Display for LastMileCheck {
     }
 }
 
+/// INV-40. Each of §24.6's eleven checks, in the bucket its failure belongs to.
+///
+/// These are the most informative miss reasons the system produces, because a
+/// last-mile rejection happened after everything else said yes -- so the bucket
+/// names exactly which assumption the last 3 ms falsified.
+impl apex_types::miss::ExplainsMiss for LastMileCheck {
+    fn miss_reason(&self) -> apex_types::miss::MissReason {
+        use apex_types::miss::MissReason as R;
+        match self {
+            // A chain or executor mismatch is a configuration fault reaching
+            // the signing path, which is a risk event before it is a miss.
+            Self::ChainId | Self::ExecutorFingerprint | Self::SignerBalance => R::RiskFail,
+            Self::NonceOwnership => R::NonceUnavailable,
+            Self::Deadline => R::TooSlow,
+            Self::MinProfit => R::LowEv,
+            Self::FeeCeiling => R::GasFail,
+            Self::GasEligibility => R::EarliestFlashblockTooLate,
+            Self::FlashAvailability => R::NoFlashLiquidity,
+            Self::HookFingerprint => R::HookModelIncomplete,
+            Self::CriticalPoolState => R::StaleState,
+        }
+    }
+}
+
 /// Everything the eleven checks read. Both sides of every comparison are here
 /// explicitly -- committed versus live -- because a check that reads one side
 /// from ambient state is a check whose answer depends on when it ran.

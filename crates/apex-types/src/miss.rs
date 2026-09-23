@@ -12,7 +12,12 @@ use serde::{Deserialize, Serialize};
 /// value of this ledger (§27) is that it is the counterfactual dataset deciding
 /// where the next engineering dollar goes. "Other" would silently become the
 /// largest bucket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Ord` keys a `BTreeMap`/`BTreeSet` for the histogram and for reachability
+/// checks, and iterates deterministically. As with `LossClass` and
+/// `SearchPath`, the order is a map key and **not** a ranking -- nothing may
+/// take a max over it, and a `MissReason` is never "worse" than another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum MissReason {
     LowEv,
     StaleState,
@@ -79,12 +84,37 @@ impl MissReason {
     }
 }
 
+/// **INV-40's mechanism.** Every way this system can decline a candidate
+/// answers with a [`MissReason`].
+///
+/// §27 asks for an exhaustive test enumerating "every `return Reject` / `None`
+/// path in the candidate pipeline". Enumerating return statements is a textual
+/// exercise that a refactor silently invalidates. This is the compile-checked
+/// form of the same claim: a rejection is a *type*, that type implements this
+/// trait with an exhaustive `match`, and `scripts/ci/every_rejection_explains.sh`
+/// fails the build when a rejection type appears without an implementation.
+///
+/// So a new rejection path cannot be added without answering the question, and
+/// a new *variant* of an existing one cannot be added without answering it
+/// either — the `match` stops compiling.
+///
+/// The mapping is lossy on purpose. [`MissReason`] is the **economic** bucket
+/// the ledger aggregates over, not a diagnosis; the diagnosis stays in the
+/// rejection value itself, which the record carries.
+pub trait ExplainsMiss {
+    fn miss_reason(&self) -> MissReason;
+}
+
 /// Which plane produced the rejection.
 ///
 /// Exists because the current candidate log mixes both and has to be filtered on
 /// `edges_scanned == 0` to isolate fast-path rejections. Recording it directly
 /// removes that filter and the chance of forgetting it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Ord` is derived so it can key a `BTreeMap` and the ledger's per-plane
+/// histogram iterates deterministically. As with `LossClass`, the order is a
+/// map key and **not** a severity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SearchPath {
     Fast,
     Slow,

@@ -133,6 +133,24 @@ impl std::fmt::Display for LaneRefusal {
 
 impl std::error::Error for LaneRefusal {}
 
+/// INV-40. A lane that cannot be dispatched through is a candidate that does
+/// not trade, so it is a miss like any other.
+///
+/// All three are `RiskFail` and that is not laziness: every one of them means
+/// a *policy* requirement was not met -- the endpoint is not a dispatch target,
+/// the protection claim has no evidence, or the evidence expired. None is a
+/// market condition, and filing them anywhere else would let a configuration
+/// fault hide in a bucket operators read as "the market was quiet".
+impl apex_types::miss::ExplainsMiss for LaneRefusal {
+    fn miss_reason(&self) -> apex_types::miss::MissReason {
+        match self {
+            Self::NotADispatchTarget(_)
+            | Self::UnevidencedPolicy { .. }
+            | Self::StaleEvidence { .. } => apex_types::miss::MissReason::RiskFail,
+        }
+    }
+}
+
 impl SubmissionLane {
     /// Everything that must be true before anything is sent here.
     pub fn may_dispatch(&self, now: UnixNanos) -> Result<(), LaneRefusal> {

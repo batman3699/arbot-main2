@@ -4974,6 +4974,31 @@ It is written and wired now, and it is deliberately strict:
 **One plan self-contradiction surfaced:** §8 called INV-37's test `chain::no_safe_limit_rejects_pre_sign` while Task 7.2's Step 1 sketch called the same test `no_safe_gas_limit_rejects_before_signing`. §8 now matches the task, which is the name that was implemented.
 
 ### Task 8.1 — Missed-opportunity ledger (INV-40)
+
+**Delivered 2026-09-24.** `crates/apex-obs/src/miss.rs`, `scripts/ci/every_rejection_explains.sh`, `ExplainsMiss` in `apex-types`, and impls in six crates; 6 tests. Workspace 1,704 passing. Invariant coverage 36/46 → **37/46**.
+
+**"Enumerate every `return Reject` / `None` path" — enumerated how is the whole question.** Counting return statements is a textual exercise a refactor invalidates silently, and it cannot tell a rejection from an early return. The enumeration is over **types**: every way the system declines a candidate is a value of some rejection enum, each implements `ExplainsMiss` with an exhaustive `match`, and `every_rejection_path_records_a_miss` walks all 34 variants across six crates.
+
+Three ways coverage can rot, and each is closed by something different:
+
+| Rot | Closed by |
+|---|---|
+| A new **variant** of an existing rejection | The `match` stops compiling |
+| A rejection that produces **no record** | `MissLedger::record` takes the rejection and derives the bucket, so there is nothing else to call |
+| A new rejection **type** nobody mapped | `scripts/ci/every_rejection_explains.sh` |
+
+The third is the one that would actually happen. §6.5 records this repository's "written but never wired" pattern four times over; a rejection enum nobody mapped is the same shape, and it would show up as a quiet gap in the one dataset that decides where engineering effort goes. **The gate found three unmapped types on its first run** — `LaneRefusal`, `VerifierVerdict` and `StepDownRefused`.
+
+**`StepDownRefused` is the interesting one: it is not a candidate rejection at all.** It declines an *operator action*. Nothing in it corresponds to an opportunity that was available and went untaken, and filing one would put operator activity in the counterfactual dataset. It opts out with a `not-a-candidate-rejection:` marker at its declaration, carrying the reason — the same idiom as `secret_scan.sh`'s suppression, and for the same reason: the claim is made where the type is, and the count prints on every run.
+
+**`MissLedger::record` takes a rejection, not a reason.** A `record(ctx, MissReason::LowEv)` signature would let a caller under deadline pressure file anything as low-EV, and `LOW_EV` would become the largest and least informative bucket — which is exactly the failure a catch-all variant would cause, arriving by a different route.
+
+**The ledger ranks by declined EV, not by count.** A thousand dust rejections matter less than three large ones, and a count-only histogram says the opposite. `the_ledger_ranks_by_declined_ev_not_by_count` pins the inversion: 50 dust misses at 10 wei against one at 5,000,000.
+
+**Seven of §33's seventeen buckets are not yet reachable from a rejection type**, and the test names each with its phase rather than leaving the gap silent — `CompetitorWon` and the two submission rejections come from observations rather than rejections, `PackingNotWorthwhile` and `ConflictRejected` need Phases 11–12, and `L1DataCostFail` surfaces through a `Clause` today. Writing `SimFail` into that list was the first draft's mistake and the test caught it: it *is* reachable, through `Clause::SimulationFidelity`. Asserting the list in both directions is what made that visible.
+
+**Four mutations, each caught:** a new rejection type with no mapping (gate); the opt-out marker removed (gate); a clause mapped to the wrong bucket (3 tests); `record` ignoring the rejection's answer (3 tests).
+
 ### Task 8.2 — Coverage auditor (INV-41)
 ### Task 8.3 — P&L attribution by optimization layer
 ### Task 8.4 — Control plane assembly (`apex-runtime`)

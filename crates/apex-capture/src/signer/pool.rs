@@ -336,3 +336,16 @@ impl Drop for LaneAssignment<'_> {
         self.pool.release(self.index);
     }
 }
+
+/// INV-40. "No lane" is a miss, and the four causes are three different
+/// buckets: waiting for capacity is slowness, and everything else is a risk or
+/// funding state that stopped the trade.
+impl apex_types::miss::ExplainsMiss for NoLane {
+    fn miss_reason(&self) -> apex_types::miss::MissReason {
+        use apex_types::miss::MissReason as R;
+        match self {
+            Self::AllBusy => R::TooSlow,
+            Self::NoneFunded | Self::NotAuthorized | Self::AllOutOfTheHotPool => R::RiskFail,
+        }
+    }
+}

@@ -258,6 +258,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "apex-obs"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "apex-capture",
+ "apex-chain",
+ "apex-econ",
+ "apex-sim",
+ "apex-types",
+ "apex-venues",
+ "serde",
+]
+
+[[package]]
 name = "apex-risk"
 version = "0.1.0"
 dependencies = [

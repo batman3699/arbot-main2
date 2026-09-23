@@ -320,3 +320,27 @@ mod tests {
         assert!(EligibilityGate::evaluate(&ctx, &EligibilityPolicy::default()).admits());
     }
 }
+
+/// INV-40. Which economic bucket a failed clause lands in.
+///
+/// Four clauses collapse into `LowEv` and that is correct: §2.3's gate is a
+/// conjunction, and every way of failing it means the trade did not clear.
+/// What distinguishes them is *why*, which stays in the `Clause` the record
+/// carries -- the ledger aggregates over the bucket, and a reader chasing a
+/// spike opens the records.
+impl apex_types::miss::ExplainsMiss for Clause {
+    fn miss_reason(&self) -> apex_types::miss::MissReason {
+        use apex_types::miss::MissReason as R;
+        match self {
+            Self::ExpectedNetEvPositive | Self::RobustnessMargin | Self::ProbabilityOfProfit => {
+                R::LowEv
+            }
+            Self::StateFreshness => R::StaleState,
+            Self::SimulationFidelity => R::SimFail,
+            Self::ExecutionPathHealthy => R::VenueDisabled,
+            Self::FlashLiquidityAvailable => R::NoFlashLiquidity,
+            Self::RouteAuthorizationValid => R::RiskFail,
+            Self::CostEstimateConfidence => R::GasFail,
+        }
+    }
+}

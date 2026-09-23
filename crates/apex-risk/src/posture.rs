@@ -137,6 +137,11 @@ pub enum StepDownAuthority {
 }
 
 /// Why the ladder refused to step down.
+///
+/// not-a-candidate-rejection: this declines an **operator action**, not a
+/// trade. Nothing here corresponds to an opportunity that was available and
+/// went untaken, so it has no `MissReason` and filing one would put operator
+/// activity in the counterfactual dataset that decides engineering priorities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StepDownRefused {
     /// Already at the bottom.

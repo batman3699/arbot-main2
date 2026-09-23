@@ -376,3 +376,19 @@ impl From<(U256, u64)> for BytecodeEvidence {
         }
     }
 }
+
+/// INV-40. Four of the five mean the same thing economically: this pool cannot
+/// be priced correctly, so no trade through it is admissible. `TooShallow` is
+/// different -- the pool is fine and the opportunity is not.
+impl apex_types::miss::ExplainsMiss for AdmissionError {
+    fn miss_reason(&self) -> apex_types::miss::MissReason {
+        use apex_types::miss::MissReason as R;
+        match self {
+            Self::MissingField(_)
+            | Self::NoBytecode { .. }
+            | Self::WrongFactory { .. }
+            | Self::UnknownVenue(_) => R::VenueDisabled,
+            Self::TooShallow { .. } => R::LowEv,
+        }
+    }
+}

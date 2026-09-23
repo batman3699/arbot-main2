@@ -239,3 +239,23 @@ pub trait ChainExecutionAdapter: Send + Sync {
 
     async fn reconcile_final_state(&self, h: B256) -> AdapterResult<PnlAttribution>;
 }
+
+/// INV-40. A submission decision that declines still has to say which bucket
+/// the lost opportunity belongs in.
+///
+/// `GasHeadroomExceedsEdge` is `GasFail` rather than `LowEv`, and the
+/// distinction matters to the ledger: the candidate DID clear its costs as
+/// priced, and what killed it was §21.3's headroom over the p99. A spike in
+/// this bucket says the gas model's tail is too fat, not that the market went
+/// quiet.
+impl apex_types::miss::ExplainsMiss for RejectReason {
+    fn miss_reason(&self) -> apex_types::miss::MissReason {
+        use apex_types::miss::MissReason as R;
+        match self {
+            Self::NoSafeGasLimit { .. } => R::EarliestFlashblockTooLate,
+            Self::StateExpiresFirst { .. } => R::StaleState,
+            Self::GasHeadroomExceedsEdge { .. } => R::GasFail,
+            Self::NoLaneForPolicy => R::RiskFail,
+        }
+    }
+}
