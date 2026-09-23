@@ -1,0 +1,11 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+# Provenance: this seed came from a deliberate MUTATION (earliest_eligible_from
+# clamping instead of searching), not from a defect that ever shipped. `current = 5`
+# is the gapped model's unmeasured index, which is the only place a clamp and a
+# search disagree. Kept because it is the minimal case for INV-38.
+cc b802c1714cf18fbbe81f2ddf18ac5403d3fe3978aa40621c1606938e80e8ae5e # shrinks to current = 5, gas = 21000

@@ -29,6 +29,7 @@
 //! - [`state::ReconstructionStatus`] has no `Default`.
 //! - [`state::StateFingerprint`] has no `Default`.
 
+pub mod ack;
 pub mod candidate;
 pub mod commitment;
 pub mod compat;

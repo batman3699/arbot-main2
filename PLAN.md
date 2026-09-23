@@ -432,6 +432,7 @@ These may be compiled and shadowed but are **prohibited from the production exec
 | `src/liquidity_cache.rs` external TVL source | Third-party numbers used in ranking; §18.5 forbids external feeds as truth | **AUDITED 2026-09-23 — the confirmation FAILS.** See below. | **Reclassified ADAPT**, constraint recorded; the fix is Phase 3's |
 | `config/registry.json` addresses | Not bytecode-verified | On-chain `extcodehash` verification of every production address | **PARTIAL**: `scripts/data/verify_registry_bytecode.py` exists and is self-tested against a stub; Optimism verified 11/11; Base and Ethereum unreachable from the dev environment (HTTP 403). Needs one run with egress. |
 | `ops/inputs.yaml` `features:` block | Unknown how many flags still have live effect after the config rebuild | Enumerate and prove each flag's consumer | Phase 0 |
+| `MeasuredCapacityModel`'s observations | The model is built and tested from a **fixture**, not from Base. Its structure is right — one constructor, observations only, p10 rather than median, `Unknown` where samples are thin — but every number in it was written by hand | Acceptance criterion 1: ≥ 500 observed Base transactions, eligibility predicted at ≥ 90% accuracy. Blocked the same way as the registry bytecode check: HTTP 403 from this environment | Phase 7, needs egress. **Until then the model must not price a live ticket** — the fixture says so in its own doc comment |
 
 ### Task 2.7 audit — `liquidity_cache` reaches execution, and the env manifest covered a prefix
 
@@ -4689,8 +4690,24 @@ criterion is wall-clock work, not an implementation step.**
 
 ### Task 7.1 — `ChainExecutionAdapter` trait and the Base impl skeleton
 
-- [ ] **Step 1: Write the failing test** — `BaseAdapter` implements all ten methods; a CI grep asserts no `match chain_name` / `chain == "base"` outside `apex-chain`.
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 1: Write the failing test** — `BaseAdapter` implements all ten methods; a CI grep asserts no `match chain_name` / `chain == "base"` outside `apex-chain`.
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-24.** `crates/apex-chain/src/{adapter,regime,base/{mod,adapter,flashblock}}.rs`, `scripts/ci/no_chain_string_matching.sh`; 23 tests. Workspace 1,663 passing. **Tasks 7.1 and 7.2 landed together** — `optimize_submission_cost` cannot be written without the eligibility model, and a skeleton returning a placeholder decision would have been a lie with a test attached.
+
+**Plan correction: the trait has eleven methods, not ten.** §20's code block defines `chain_id`, `state_feed`, `pending_state`, `simulate`, `estimate_total_fee`, `estimate_inclusion_probability`, `optimize_submission_cost`, `submit`, `replacement_policy`, `observe_outcome`, `reconcile_final_state` — eleven. Three places say ten (§3.4's file table, §7's crate table, BP-030). The code block is the specification; the count in the prose is wrong. Recorded rather than quietly reconciled, because a trait whose method count nobody agrees on is a trait somebody will implement partially. Twelve as shipped, with `regime()` added below.
+
+**Three deviations from §20's signature, each with a reason:**
+
+1. **`regime(&self, now) -> AdapterResult<ChainRegime>` added.** §20.1 says a chain whose regime cannot be discovered is not admitted to live trading, and there was no method through which a caller could ask. Without one the rule is a paragraph.
+2. **`optimize_submission_cost` takes `now`.** §21.2's own decision flow ends "→ state validity at that time → submit / reject", and *at that time* cannot be evaluated without a time. The alternative was to drop the clause, which would move the check to last-mile revalidation and leave the scheduler choosing windows a candidate cannot survive to — a signature spent on a dead trade. Found by a test, not by reading: the first implementation invented a `valid_for` from the candidate's `state_age` and produced nonsense.
+3. **`estimate_inclusion_probability` takes `UnixNanos`, not `Instant`.** `Instant` has no epoch and cannot be compared to a `deadline`.
+
+**The RPC is injected.** `BaseAdapter<R: BaseRpc>` needs five things from a node; everything else it computes. So the decisions — gas-limit minimization, eligibility, fee correction, replacement — are pure and tested offline, which matters here more than elsewhere: egress from this environment is blocked, and an adapter that owned a `Provider` would be an adapter nobody could test at all.
+
+**`ChainRegime` cannot be written down.** Its private `Discovered` marker means the only constructor is `RegimeDiscovery::discovered`, and the only accessor is `admit_to_live_trading(now, ttl)` — which also rejects a regime that has aged past its TTL, because "discovered at startup **and periodically thereafter**" means a regime discovered once and never re-checked is a hard-coded assumption with extra steps. `RegimeDiscovery` has no `Assumed` variant.
+
+**The CI gate has three patterns and one stated limit.** It forbids a chain identifier compared against a string literal, a chain id compared against a `ChainId::` constant (the same defect with better spelling), and a `match` on chain identity — scoped to the new crates, since §3.5 records 338 such branches in the legacy binary that retire with it. It does **not** catch a branch keyed on a chain id held in a variable derived from a literal elsewhere; that limit is written into the script so the gate is not mistaken for a proof. Three mutations, each caught.
 
 ### Task 7.2 — Flashblock capacity model and eligibility (INV-37, INV-38)
 
@@ -4724,7 +4741,24 @@ fn no_safe_gas_limit_rejects_before_signing() {
 }
 ```
 
-- [ ] **Step 2: Run and observe the failures.** **Step 3: Implement** `flashblock.rs` with `MeasuredCapacityModel` learned from observed budgets. **Step 4: Observe the passes.** **Step 5: Commit.**
+- [x] **Step 2: Run and observe the failures.** **Step 3: Implement** `flashblock.rs` with `MeasuredCapacityModel` learned from observed budgets. **Step 4: Observe the passes.** **Step 5: Commit.**
+
+**Delivered 2026-09-24 with Task 7.1.**
+
+**`Q(k)` is cumulative capacity through window `k`, not the increment at `k`.** Asking whether a transaction fits one increment would reject everything larger than a single flashblock's share, which is not how the chain behaves — and it is the reading that makes the plan's own fixture (`25_000_000 → Some(3)`) impossible.
+
+**`MeasuredCapacityModel` has one constructor and it takes observations.** No `Default`, no `from_fraction`, no constructor taking a block gas limit. §22.2 is explicit that a fixed fractional rule must not be hard-coded, and a model that *could* be built from a fraction is one that eventually will be. `a_different_chain_gives_different_eligibility` is the counterweight to the plan's own fixture test: without it, a constant that happened to agree with the fixture would pass.
+
+**`Q(k)` reports p10, not the median.** A median is right half the time, and the half it is wrong about is a transaction signed for a window it does not fit — costing a nonce, a lane and the opportunity. Being early is free; being optimistic is not. Every quantile is an observed value rather than interpolated (`every_quantile_is_an_observed_value` asserts it): an interpolated p10 is a capacity nobody saw, which is the opposite of a *measured* allocation policy.
+
+**A thinly-sampled index is `Unknown`, and eligibility skips it.** §5.6 forbids converting a gap into "probably the usual", and immediately before signing is where that conversion is most expensive.
+
+**Two mutations survived the first pass, and both were findings rather than gaps:**
+
+1. **Replacing the search in `earliest_eligible_from` with a clamp broke nothing.** On a model whose capacity rises with the index, clamping upward always lands somewhere with more room — so the two agree everywhere the test looked. They differ only across a **gap**, which is not hypothetical: it is exactly what a thinly-sampled index produces. `locking_the_order_searches_rather_than_clamping` is the case, and the INV-38 property now runs against a gapped model as well as a dense one.
+2. **Two early-exit guards in `estimate_inclusion_probability` turned out to be dead.** The saturating subtraction already yields zero windows past the deadline, and at zero windows `1 − 1/(1+0)` is already exactly `0.0`. Both were removed with the reasoning left in place: code that reads as load-bearing but is not is worse than no code at all — it is the first thing a future reader trusts and the last thing they test.
+
+**Acceptance criterion 1 is outstanding and egress-blocked.** "Eligibility validated against ≥ 500 observed transactions at ≥ 90% accuracy" needs Base traffic; HTTP requests from this environment return 403. The fixture in `tests/flashblock.rs` says so in its own doc comment rather than presenting itself as data. Recorded in §4.7 alongside the Phase 2–4 measurements blocked the same way.
 
 ### Task 7.3 — Base submission lane and acknowledgement
 

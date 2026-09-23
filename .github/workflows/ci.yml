@@ -59,7 +59,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ -p apex-sim -p apex-capture -p apex-risk --all-targets -- -D warnings
+      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ -p apex-sim -p apex-capture -p apex-risk -p apex-chain --all-targets -- -D warnings
 
   loom:
     name: loom (signer lanes)
@@ -144,6 +144,8 @@ jobs:
         run: ./scripts/ci/invariant_coverage.sh
       - name: no test file contends for a process-global env key (B-13)
         run: ./scripts/ci/no_shared_env_keys.sh
+      - name: no chain-identity branching outside apex-chain (§20)
+        run: ./scripts/ci/no_chain_string_matching.sh
       # secret_scan.sh is NOT wired yet. It is red on arrival, but only on test
       # fixtures -- `/v2/test-key`, `/v2/test`, `/v2/abc123` and a doc-comment
       # example in a shadow script. No real credential is exposed. It needs a

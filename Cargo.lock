@@ -211,6 +211,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "apex-chain"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "apex-state",
+ "apex-types",
+ "async-trait",
+ "proptest",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "apex-config"
 version = "0.1.0"
 dependencies = [
