@@ -426,12 +426,59 @@ These may be compiled and shadowed but are **prohibited from the production exec
 | Component | Why UNKNOWN | Evidence needed | Resolving phase |
 |---|---|---|---|
 | ~~`contracts/executor/BatchRouter.sol`~~ | ~~No test references it~~ — **RESOLVED 2026-09-22, the claim was wrong.** `script/Deploy.s.sol:90` does `router = new BatchRouter(clone)` and then `initialise({_owner: address(router), …})`, so **the router owns the executor clone**, and `test/DeployOwnership.t.sol:22-25` asserts exactly that. It is load-bearing in the production deploy path. | — | **Reclassified KEEP**; folded into `contracts/core/ExecutionAuth.sol`'s ownership model in Phase 5 |
-| `src/quote_curve.rs` exactness | No differential test against a Curve pool exists | Differential run vs on-chain `get_dy` across the admitted pool set | Phase 2 |
-| `src/quote_balancer.rs` exactness | Same | Differential run vs `queryBatchSwap` | Phase 2 |
+| ~~`src/quote_curve.rs` exactness~~ | ~~No differential test against a Curve pool exists~~ — **RESOLVED 2026-09-23: the question was mis-posed.** `quote_curve.rs` is an `abigen!` client for `get_dy`; it *is* the on-chain quoter. There is no local StableSwap implementation to differential against it, so "exactness" was never a property it could have. | — | **Reclassified**: `CurveAdapter` exists, returns `NotRepresentable` from `quote_exact`, and is `Exactness::Approximate` by construction. A local engine is new work, not a test. |
+| ~~`src/quote_balancer.rs` exactness~~ | ~~Same~~ — **RESOLVED 2026-09-23, same finding.** `abigen!` client for `queryBatchSwap`, no local weighted-pool maths. | — | **Reclassified**: `BalancerAdapter`, same shape. |
 | `data/base/uniswap_v4/pools.json` | V4 pools inventoried but the pricer is a stub; hook addresses unrecorded | Hook fingerprinting pass | Phase 11 |
-| `src/liquidity_cache.rs` external TVL source | Third-party numbers used in ranking; §18.5 forbids external feeds as truth | Confirm non-authoritative use at every call site | Phase 2 |
-| `config/registry.json` addresses | Not bytecode-verified | On-chain `extcodehash` verification of every production address | Phase 2 |
+| `src/liquidity_cache.rs` external TVL source | Third-party numbers used in ranking; §18.5 forbids external feeds as truth | **AUDITED 2026-09-23 — the confirmation FAILS.** See below. | **Reclassified ADAPT**, constraint recorded; the fix is Phase 3's |
+| `config/registry.json` addresses | Not bytecode-verified | On-chain `extcodehash` verification of every production address | **PARTIAL**: `scripts/data/verify_registry_bytecode.py` exists and is self-tested against a stub; Optimism verified 11/11; Base and Ethereum unreachable from the dev environment (HTTP 403). Needs one run with egress. |
 | `ops/inputs.yaml` `features:` block | Unknown how many flags still have live effect after the config rebuild | Enumerate and prove each flag's consumer | Phase 0 |
+
+### Task 2.7 audit — `liquidity_cache` reaches execution, and the env manifest covered a prefix
+
+**The `liquidity_cache` confirmation fails.** `PoolDepthCache` fetches token
+liquidity from **DexScreener** (`api.dexscreener.com`) and
+`main::compute_base_amounts` turns it into a `TradeSizing` per token, whose two
+fields go to different places:
+
+* `base_amount = depth / ARBOT_DEPTH_DIVISOR` (default 100, i.e. 1% of depth),
+  clamped into the flash-loan band. This is the **probe size** for the search —
+  ranking and filtering, which §18.5 permits.
+* `slippage_tolerance_bps`, derived from `usage = probe / depth` and clamped to
+  `[min(5, EDGE_SLIPPAGE_BPS), EDGE_SLIPPAGE_BPS]`. This one flows through
+  `venues.rs` at **eight** sites into `Edge::tolerance_bps`, which `util.rs`
+  documents as *"the EXECUTION min_out margin"* — the on-chain floor.
+
+So a third-party API's liquidity number participates in setting the on-chain
+`min_out`. It is bounded on both sides by operator configuration, and
+`EDGE_SLIPPAGE_BPS` defaults to 30 with a floor of 5 — and `plan.rs`
+records the measured tolerance on live Slipstream edges as **5**, the floor,
+which means `usage` is currently so small that the external number is
+saturating the clamp rather than discriminating. **The violation is latent, not
+active.** It becomes active the moment probe size approaches depth, or the
+moment DexScreener understates a pool.
+
+Constraint recorded: **`tolerance_bps` must come from measured on-chain depth,
+not from an external feed.** `venues.rs` has the real reserves at all eight
+sites. Changing the min_out floor is a live-behaviour change that needs its own
+measurement, so it belongs with Phase 3's cost model rather than here.
+
+**The env migration manifest covered a prefix, not the configuration.** Task
+0.5 accounted for "every legacy `ARBOT_*` variable" — 84 entries — and its test
+scanned for that literal prefix. The code reads **192** distinct environment
+variables. The 132 outside the prefix had no recorded destination, including
+`PRIVATE_KEY`, `ALCHEMY_KEY`, `TAX_EXCHANGE_API_KEY`, and `EDGE_SLIPPAGE_BPS`
+— the ceiling on the tolerance band above. A manifest that is complete over a
+prefix and silent about everything else is worse than an obviously partial one,
+because nothing reads as missing.
+
+Now 250 entries with two new destinations: `Observability` (metrics, logs,
+alerting, P&L accounting) and **`Secret`**, which is not a migration
+destination at all but a prohibition — a credential never becomes a plain
+`ApexConfig` field and never appears in a log, a metric label or a snapshot
+(§43, INV-46). The scanner now unions two strategies, because neither is
+sufficient alone: the call-form scan cannot see a variable read through a local
+helper (`base_fast` has `f("ARBOT_COST_GAS_BPS", 5.0)`), and the prefix scan
+cannot see anything outside the prefix.
 
 ## 4.8 Preserved engineering capital — explicit register
 

@@ -1,8 +1,19 @@
-//! Where every legacy `ARBOT_*` variable goes.
+//! Where every legacy environment variable goes.
 //!
 //! Blueprint §2.4 forbids late configuration lookup on the dispatch path, and
-//! this repository reads 84 distinct `ARBOT_*` variables at call sites
-//! throughout the hot path. Retiring them is not one change -- each belongs to
+//! this repository reads **192** distinct environment variables at call sites
+//! throughout the hot path.
+//!
+//! # The `ARBOT_` prefix was never the boundary
+//!
+//! This table covered 84 `ARBOT_*` variables and its test scanned for that
+//! literal prefix, so it read as complete while **132** variables went
+//! unaccounted for — including `PRIVATE_KEY`, `ALCHEMY_KEY` and
+//! `EDGE_SLIPPAGE_BPS`, which sets the ceiling on the per-edge tolerance band
+//! that becomes the on-chain `min_out` floor. A manifest that is complete over
+//! a prefix and silent about everything else is worse than an obviously
+//! partial one, because nothing reads as missing. Found 2026-09-23 while
+//! resolving §4.7's `liquidity_cache` entry. Retiring them is not one change -- each belongs to
 //! the crate that will own its behaviour, and most of those crates do not exist
 //! yet.
 //!
@@ -35,6 +46,12 @@ pub enum Destination {
     /// Operator/research tooling that legitimately stays environment-driven
     /// because it is invoked ad hoc, not on the trading path.
     Tooling,
+    /// Metrics, logs, alerting and P&L accounting -> `apex-obs` (§26, §27).
+    Observability,
+    /// A CREDENTIAL. Never becomes a plain `ApexConfig` field, never appears in
+    /// a log, a metric label or a snapshot (§43, INV-46). `apex_config::Secret`
+    /// carries it; §18's signer pool replaces the key itself.
+    Secret,
 }
 
 pub struct LegacyEnvVar {
@@ -157,6 +174,178 @@ pub const LEGACY_ENV_VARS: &[LegacyEnvVar] = &[
     v("ARBOT_TEST_ENV_FLAG_9", TestOnly, "fixture for util::env_flag"),
     v("ARBOT_TEST_ENV_PARSE_9", TestOnly, "fixture for util::env_parse_opt"),
     v("ARBOT_TEST_ENV_U256_9", TestOnly, "fixture for util::env_u256_opt"),
+
+    // ======================================================================
+    // Variables outside the `ARBOT_` prefix, added 2026-09-23.
+    // ======================================================================
+    v("PRIVATE_KEY", Secret, "the signing key itself; §18 replaces it with a signer pool and a KMS/keystore boundary"),
+    v("ALCHEMY_KEY", Secret, "provider API key, interpolated into RPC URLs"),
+    v("TAX_EXCHANGE_API_KEY", Secret, "exchange API key for fiat conversion"),
+    v("BASE_RPC_URL", Chain, "single Base HTTP endpoint (superseded by the plural form)"),
+    v("BASE_RPC_URLS", Chain, "Base HTTP endpoint list, the primary transport"),
+    v("BASE_RPC_HTTP", Chain, "Base HTTP endpoint, a third spelling of the same thing"),
+    v("BASE_FLASHBLOCK_HTTP_URL", Chain, "Flashblocks preconfirmation feed (§21)"),
+    v("RPC_URL", Chain, "chain-agnostic HTTP endpoint, single form"),
+    v("RPC_URLS", Chain, "chain-agnostic HTTP endpoint list"),
+    v("RPC_MAX_BACKOFF_SECS", Chain, "provider backoff ceiling"),
+    v("WS_CONNECT_TIMEOUT_SECS", Chain, "websocket connect timeout"),
+    v("PRIVATE_RELAY_URL", Chain, "private submission lane (§24)"),
+    v("PRIVATE_RELAY_URLS", Chain, "private submission lanes"),
+    v("PRIVATE_RELAY_TIMEOUT_MS", Chain, "private lane timeout"),
+    v("CHAIN", Config, "which chain this process trades; §23 makes it a typed ChainId"),
+    v("CHAIN_LIST", Config, "chains enabled for a multi-chain run (§23)"),
+    v("BASE_EXECUTOR_ADDRESS", Config, "deployed executor; §19 makes it a verified registry entry"),
+    v("BASE_UNIV3_FACTORY", Config, "venue factory address; §6.3 admission verifies it on chain"),
+    v("BASE_UNIV3_QUOTER", Config, "venue quoter address; same"),
+    v("REGISTRY_PATH", Config, "path to registry.json, the venue and token registry"),
+    v("REGISTRY_CACHE_PATH", Config, "parsed-registry cache"),
+    v("REGISTRY_EXPECTED_HASH", Config, "content hash pin for the registry"),
+    v("OPS_INPUTS_STRICT", Config, "refuse unknown keys in ops/inputs.yaml"),
+    v("POOL_DATA_ROOT", Config, "pool inventory root; §32 makes it a manifest with a content hash"),
+    v("OFFLINE_MODE", Config, "run the engine with no node attached, for replay"),
+    v("MEV_ROLE", Config, "operator role selector for multi-process deployments"),
+    v("UNIV2_LOAD_CONCURRENCY", Venues, "reserve-load fan-out"),
+    v("UNIV3_BOOTSTRAP_MAX_PAIRS", Venues, "discovery bound"),
+    v("UNIV3_BOOTSTRAP_MAX_POOLS", Venues, "discovery bound"),
+    v("UNIV3_MAX_CONCURRENT_POOL_TASKS", Venues, "discovery fan-out"),
+    v("UNIV3_MIN_FORCED_QUOTES", Venues, "forced-quote floor during bootstrap"),
+    v("UNIV3_QUOTE_CONCURRENCY", Venues, "quoter fan-out"),
+    v("SLIPSTREAM_BOOTSTRAP_MAX_PAIRS", Venues, "discovery bound"),
+    v("SLIPSTREAM_BOOTSTRAP_MAX_POOLS", Venues, "discovery bound"),
+    v("SLIPSTREAM_MAX_CONCURRENT_POOL_TASKS", Venues, "discovery fan-out"),
+    v("SLIPSTREAM_MIN_FORCED_QUOTES", Venues, "forced-quote floor"),
+    v("SOLIDLY_STATE_CONCURRENCY", Venues, "state-load fan-out"),
+    v("ENABLE_UNIV4_FIXED_PRICE_QUOTES", Venues, "the V4 stub's gate; dies with the stub in Phase 11"),
+    v("CB_MAX_CONSECUTIVE_FAILURES", Venues, "consecutive failures that trip the breaker"),
+    v("CB_REVERT_MIN_SAMPLES", Venues, "minimum samples before a revert rate is actionable"),
+    v("CB_REVERT_RATE_LIMIT", Venues, "circuit-breaker revert-rate ceiling before tripping"),
+    v("CB_REVERT_WINDOW_SECS", Venues, "circuit-breaker revert measurement window"),
+    v("CB_RPC_ERROR_LIMIT", Venues, "circuit-breaker RPC-error ceiling before tripping"),
+    v("CB_RPC_ERROR_WINDOW_SECS", Venues, "circuit-breaker RPC-error measurement window"),
+    v("LOW_LIQUIDITY_FACTORIES", Venues, "factories whose pools are treated as thin"),
+    v("LOW_LIQUIDITY_LOOKBACK_BLOCKS", Venues, "thin-pool detection window"),
+    v("LOW_LIQUIDITY_MAX_TOTAL_TOKENS", Venues, "thin-pool bound"),
+    v("LOW_LIQUIDITY_PRICE_DEVIATION_BPS", Venues, "thin-pool price-deviation bound"),
+    v("POOL_MONITOR_POLL_MS", Venues, "pool state poll cadence"),
+    v("POOL_MONITOR_STALE_MS", Venues, "pool state staleness ceiling"),
+    v("POOL_DEPTH_REFRESH_SECS", Venues, "third-party depth refresh; §18.5 bounds what that number may decide"),
+    v("BELLMAN_MAX_RELAXATIONS", Search, "relaxation budget (§29 compute budget)"),
+    v("MAX_BELLMAN_CYCLES", Search, "cycle-enumeration cap"),
+    v("MAX_HOPS_CAP", Search, "hop ceiling; §13 replaces it with ComplexityCost"),
+    v("DETECTION_HAIRCUT_BPS", Search, "Stage-1 rate haircut; now a field on Graph, read once at construction"),
+    v("EDGE_SLIPPAGE_BPS", Search, "ceiling on the per-edge tolerance band"),
+    v("EDGE_MIN_HEALTH_SCORE_BPS", Search, "edge admission score floor"),
+    v("STRICT_HUB_INTERMEDIATES", Search, "restrict intermediate tokens to hubs"),
+    v("STRICT_START_TOKEN_HUB_ONLY", Search, "restrict cycle starts to hubs"),
+    v("DYNAMIC_TOP_TOKENS_30D", Search, "token universe from 30-day volume"),
+    v("TOKEN_WHITELIST_MAX", Search, "universe size cap"),
+    v("MIN_LIQUIDITY_TOKENS", Search, "token admission floor"),
+    v("RANK_AERO_USD", Search, "ranking price stand-in for AERO when no feed is present"),
+    v("RANK_CBTC_USD", Search, "ranking price stand-in for cbBTC when no feed is present"),
+    v("HOT_POOL_ACTIVITY_LOOKBACK_BLOCKS", Search, "hot-pool ranking window"),
+    v("HOT_POOL_FEE_AWARE", Search, "whether hot-pool ranking charges venue fees"),
+    v("HOT_POOL_MAX_VOLUME_SAMPLES", Search, "hot-pool sampling bound"),
+    v("HOT_POOL_RANK_BY_ACTIVITY", Search, "hot-pool ranking mode"),
+    v("HOT_POOL_RANK_CONCURRENCY", Search, "hot-pool ranking fan-out"),
+    v("HOT_POOL_RPC_TIMEOUT_MS", Search, "hot-pool RPC timeout"),
+    v("HOT_POOL_SKIP_VOLUME", Search, "skip the volume pass when ranking hot pools"),
+    v("HOT_POOL_VOLUME_TIMEOUT_MS", Search, "volume-pass timeout"),
+    v("BACKRUN_MINED_POLL_MS", Search, "backrun mined-poll cadence (Phase 13)"),
+    v("BACKRUN_MIN_PRICE_IMPACT_BPS", Search, "backrun trigger floor"),
+    v("BACKRUN_MONITOR", Search, "which mempool/log monitor supplies backrun targets (Phase 13)"),
+    v("BACKRUN_MONITOR_ENABLED", Search, "backrun master switch"),
+    v("BACKRUN_POLL_INTERVAL_MS", Search, "backrun poll cadence"),
+    v("BACKRUN_POST_STATE", Search, "whether to rebuild state after a backrun target"),
+    v("MAX_QUOTE_BLOCK_LAG", State, "how stale a quote may be; §5 makes it a StateVersion comparison"),
+    v("BASE_AMOUNT_WEI", Econ, "default probe size when no per-token sizing exists"),
+    v("PROFIT_MARGIN_BPS", Econ, "minimum margin a candidate must clear"),
+    v("CROSS_CHAIN_PROFIT_BPS", Econ, "minimum margin for a cross-chain candidate"),
+    v("COMPETITION_EMA_ALPHA", Econ, "competition-pressure smoothing (§9)"),
+    v("CONGESTION_EMA_ALPHA", Econ, "congestion smoothing"),
+    v("MAX_GAS_PRICE_CONGESTION_BPS", Econ, "gas-price ceiling under congestion"),
+    v("NATIVE_PRICE_CONCURRENCY", Econ, "native-price fan-out"),
+    v("NATIVE_PRICE_TTL_SECS", Econ, "native-price staleness ceiling"),
+    v("NATIVE_USD_PRICE", Econ, "manual native/USD override when no feed is available"),
+    v("AAVE_FLASH_FEE_BPS", Econ, "flash-loan fee (§14 makes it a measured cost term)"),
+    v("ERC3156_FEE_BPS", Econ, "ERC-3156 flash fee"),
+    v("ERC3156_LENDER", Econ, "ERC-3156 flash-loan lender address"),
+    v("SIZE_SEARCH_EXPAND_ITERS", Econ, "sizing search expansion budget"),
+    v("SIZE_SEARCH_REFINE_ITERS", Econ, "sizing search refinement budget"),
+    v("SIPHON_BPS", Econ, "fraction of realised profit withdrawn from the executor"),
+    v("SIPHON_TARGET_ADDRESS", Econ, "withdrawal destination; unset today (R-11)"),
+    v("REINVEST_BPS", Econ, "fraction of realised profit retained as working capital"),
+    v("TAX_RESERVE_BPS", Econ, "fraction of realised profit set aside for tax"),
+    v("TAX_STABLECOIN_SYMBOL", Econ, "denomination the tax reserve is held in"),
+    v("TAX_WALLET_ADDRESS", Econ, "destination address for the tax reserve"),
+    v("TAX_EXCHANGE_API_URL", Econ, "endpoint used to convert the tax reserve to fiat"),
+    v("SHADOW_MODE", Capture, "run without dispatching (§35 red/blue)"),
+    v("SHADOW_TAG", Capture, "label distinguishing one shadow run from another (§35)"),
+    v("SHADOW_LOG_PATH", Capture, "where shadow-mode output is written (§35)"),
+    v("SHADOW_EXECUTOR_MAX_SLIPPAGE_BPS", Capture, "shadow executor bound"),
+    v("PROMETHEUS_PORT", Observability, "port the metrics endpoint listens on (§26)"),
+    v("RUST_LOG", Observability, "tracing filter directives for the whole process"),
+    v("CANDIDATE_LOG_PATH", Observability, "candidate decision log (§27)"),
+    v("CANDIDATE_LOG_BUFFER", Observability, "candidate log channel depth"),
+    v("ACCOUNTING_ENABLED", Observability, "P&L accounting master switch (§26)"),
+    v("ACCOUNTING_DIR", Observability, "accounting output root directory (§26)"),
+    v("ACCOUNTING_TRADE_LOG", Observability, "per-trade log"),
+    v("ACCOUNTING_EVENT_LOG", Observability, "accounting event log path (§26 P&L attribution)"),
+    v("ACCOUNTING_DAILY_SUMMARY", Observability, "daily P&L rollup output path (§26)"),
+    v("ALERT_WEBHOOK_URL", Observability, "webhook the alert router posts to (§26)"),
+    v("ALERT_DAILY_NET_TARGET_WEI", Observability, "daily net-profit target the alerting compares against"),
+    v("ALERT_REVERT_RATE_THRESHOLD", Observability, "revert-rate threshold that fires an alert"),
+    v("ALERT_RPC_ERROR_RATE_THRESHOLD", Observability, "RPC-error-rate threshold that fires an alert"),
+    v("CHAOS_BROADCAST_DELAY_MS", TestOnly, "fault injection"),
+    v("CHAOS_DISABLE_WS", TestOnly, "fault injection"),
+    v("CHAOS_PUBLIC_REJECT_BPS", TestOnly, "fault injection"),
+    v("CHAOS_RELAY_REJECT_BPS", TestOnly, "fault injection"),
+    v("CHAOS_WS_GAP_SECS", TestOnly, "fault injection"),
+    v("JIT_LP_ENABLED", Retired, "JIT liquidity is out of scope (§1.4)"),
+    v("JIT_MIN_AMOUNT_WEI", Retired, "JIT position floor; JIT liquidity is out of scope (§1.4)"),
+    v("JIT_SEED_BPS", Retired, "JIT seed size; JIT liquidity is out of scope (§1.4)"),
+    v("JIT_TICK_RANGE", Retired, "JIT position width; JIT liquidity is out of scope (§1.4)"),
+    v("SANDWICH_MONITOR", Retired, "sandwich target monitor; sandwich.rs is deleted (§4)"),
+    v("SANDWICH_MONITOR_ENABLED", Retired, "sandwich monitor switch; sandwich.rs is deleted (§4)"),
+    v("PUBLIC_MEMPOOL_JITTER_BPS", Retired, "apply_public_mempool_jitter is deleted (§4)"),
+    v("BRIDGE_MAX_TIME_SECS", Retired, "bridge.rs is deleted (§4)"),
+    v("BRIDGE_ROUTES", Retired, "inline bridge route table; bridge.rs is deleted (§4)"),
+    v("BRIDGE_ROUTES_FILE", Retired, "bridge route table path; bridge.rs is deleted (§4)"),
+
+    // ---- found by the call-form scan, added 2026-09-23 --------------------
+    v("APP_ENV", Config, "deployment environment label read at boot"),
+    v("NODE_ENV", Config, "deployment environment label, second spelling"),
+    v("RUN_MODE", Config, "process run mode selector read at boot"),
+    v("DOTENV_FILE", Config, "which .env file dotenvy loads at startup"),
+    v("ARB_RPC_URL", Chain, "Arbitrum HTTP endpoint (§23 chain expansion)"),
+    v("ARB_WS_RPC_URLS", Chain, "Arbitrum websocket endpoints (§23)"),
+    v("ARB_TOKENS", Search, "Arbitrum token universe seed list (§23)"),
+    v("BASE_BALANCER_VAULT", Config, "Balancer vault address on Base; §6.3 verifies it on chain"),
+    v("BASE_BAL_VAULT", Config, "Balancer vault address, second spelling"),
+    v("BASE_BAL_FLASHLOAN_TOKENS", Econ, "tokens Balancer will flash-lend on Base"),
+    v("ETH_BAL_VAULT", Config, "Balancer vault address on Ethereum"),
+    v("ETH_UNIV3_ROUTER", Config, "Uniswap V3 router on Ethereum; §6.3 verifies it"),
+    v("ETH_UNIV3_VALIDATION_AMOUNT_WEI", Venues, "probe size used to validate a UniV3 pool at bootstrap"),
+    v("CYCLE_SEARCH_TIMEOUT_MS", Search, "wall-clock budget for one cycle search (§29)"),
+    v("MAX_CANDIDATE_PATHS", Search, "cap on candidate paths kept per scan"),
+    v("MAX_HOPS", Search, "hop ceiling; §13 replaces it with ComplexityCost"),
+    v("MIN_HOPS", Search, "hop floor for candidate admission"),
+    v("EDGE_PRUNE_LIQUIDITY_WEIGHT", Search, "edge-pruning score weight for liquidity"),
+    v("EDGE_PRUNE_MAX_SLIPPAGE_BPS", Search, "edge-pruning slippage ceiling"),
+    v("EDGE_PRUNE_MIN_SCORE", Search, "edge-pruning admission score floor"),
+    v("EDGE_PRUNE_PROFIT_WEIGHT", Search, "edge-pruning score weight for profit"),
+    v("EDGE_PRUNE_SLIPPAGE_WEIGHT", Search, "edge-pruning score weight for slippage"),
+    v("QUOTE_BUDGET_MS", Sim, "wall-clock budget for quoting a candidate (§29)"),
+    v("SIMULATION_BUDGET_MS", Sim, "wall-clock budget for simulation (§20, §29)"),
+    v("REGISTRY_FILE", Config, "registry path, second spelling"),
+    v("REGISTRY_URL", Config, "remote registry source"),
+    v("REGISTRY_IPFS_CID", Config, "registry content id for IPFS retrieval"),
+    v("REGISTRY_IPFS_GATEWAY", Config, "IPFS gateway used to fetch the registry"),
+    v("REGISTRY_IPNS", Config, "IPNS name resolving to the current registry"),
+    v("TEST_EXECUTOR_ADDRESS", TestOnly, "executor address used by integration fixtures"),
+    v("TEST_PERMIT2", TestOnly, "Permit2 address used by fixtures"),
+    v("TEST_PERMIT2_ADDRESS", TestOnly, "Permit2 address, second spelling, used by fixtures"),
+    v("TEST_RPC_KEY", TestOnly, "provider key used only by integration fixtures"),
+    v("PINTEST_EXECUTOR_CODEHASH", TestOnly, "executor codehash pinned by a deployment test"),
 ];
 
 /// Lookup used by the coverage test.

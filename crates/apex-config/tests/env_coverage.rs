@@ -25,30 +25,106 @@ fn vars_in_source() -> BTreeSet<String> {
     let root = format!("{}/..", env!("CARGO_MANIFEST_DIR"));
     let mut found = BTreeSet::new();
     walk(std::path::Path::new(&root), &mut |text| {
-        let bytes = text.as_bytes();
-        let mut i = 0;
-        while let Some(rel) = text[i..].find("ARBOT_") {
-            let start = i + rel;
-            let mut end = start + "ARBOT_".len();
-            while end < bytes.len()
-                && (bytes[end].is_ascii_uppercase() || bytes[end].is_ascii_digit() || bytes[end] == b'_')
-            {
-                end += 1;
-            }
-            // A bare `ARBOT_` with nothing after it is a PREFIX, not a
-            // variable -- `apex-config` tests one. Requiring a suffix keeps
-            // the scan from inventing a name nobody can migrate.
-            if end > start + "ARBOT_".len() {
-                found.insert(text[start..end].to_string());
-            }
-            i = end.max(start + 1);
-        }
+        collect_env_names(text, &mut found);
+        collect_prefixed(text, &mut found);
     });
     found
 }
 
+/// Any `ARBOT_`-prefixed token, wherever it appears.
+///
+/// Kept alongside the call-form scan because neither is sufficient alone. The
+/// call forms cannot see a variable read through a local helper -- `base_fast`
+/// has `f("ARBOT_COST_GAS_BPS", 5.0)` and `main` passes names to a wrapper
+/// across several lines -- and enumerating every helper is a losing game. The
+/// prefix scan cannot see the 132 variables outside the prefix. The union has
+/// the blind spot of neither, at the cost of a scan that is slightly eager
+/// about `ARBOT_` in prose, which is the safe direction: an extra entry in the
+/// table is a line of documentation, a missing one is a variable nobody
+/// retires.
+fn collect_prefixed(text: &str, out: &mut BTreeSet<String>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = text[i..].find("ARBOT_") {
+        let start = i + rel;
+        let mut end = start + "ARBOT_".len();
+        while end < bytes.len()
+            && (bytes[end].is_ascii_uppercase() || bytes[end].is_ascii_digit() || bytes[end] == b'_')
+        {
+            end += 1;
+        }
+        if end > start + "ARBOT_".len() {
+            out.insert(text[start..end].to_string());
+        }
+        i = end.max(start + 1);
+    }
+}
+
 /// Files whose contents would make the scan answer its own question.
 const SELF_REFERENTIAL: [&str; 2] = ["env_migration.rs", "env_coverage.rs"];
+
+/// Variables that belong to the build or the operating system, not to this
+/// engine's configuration. Listing them in a MIGRATION manifest would be
+/// noise: nothing here is going to be ported to a crate.
+const NOT_OUR_CONFIGURATION: [&str; 7] = [
+    "HOME",
+    "PATH",
+    "CARGO_MANIFEST_DIR",
+    "CARGO_PKG_VERSION",
+    "OUT_DIR",
+    "RUST_BACKTRACE",
+    "TMPDIR",
+];
+
+/// The call forms that read or write a process environment variable.
+///
+/// Scanning for the literal `ARBOT_` was the original approach and it made the
+/// manifest read as complete while 132 variables outside that prefix went
+/// unaccounted for. Matching the CALL instead of the name covers every
+/// variable and still cannot be fooled by prose: a doc comment mentioning
+/// `PRIVATE_KEY` has no `env::var(` in front of it.
+const READERS: &[&str] = &[
+    "env::var(",
+    "env::var_os(",
+    "env::set_var(",
+    "env::remove_var(",
+    "env_flag(",
+    "env_parse_opt(",
+    // `env_parse_opt::<T>("NAME")` -- the turbofish sits between the name and
+    // the paren, so the marker has to stop before it.
+    "env_parse_opt::",
+];
+
+fn collect_env_names(text: &str, out: &mut BTreeSet<String>) {
+    for marker in READERS {
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(marker) {
+            let after = from + rel + marker.len();
+            from = after;
+            // Skip to the opening quote of the first argument, tolerating a
+            // turbofish and a leading `&`.
+            let Some(q) = text[after..].find('"') else { break };
+            let between = &text[after..after + q];
+            if between.len() > 40 || between.contains(';') || between.contains('\n') {
+                continue;
+            }
+            let start = after + q + 1;
+            let Some(end_rel) = text[start..].find('"') else { break };
+            let name = &text[start..start + end_rel];
+            // At least one letter: an all-digit literal such as a wei amount
+            // is an argument, not a variable name.
+            if name.len() >= 3
+                && name.chars().any(|c| c.is_ascii_uppercase())
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                && !NOT_OUR_CONFIGURATION.contains(&name)
+            {
+                out.insert(name.to_string());
+            }
+        }
+    }
+}
 
 fn walk(dir: &std::path::Path, f: &mut impl FnMut(&str)) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
