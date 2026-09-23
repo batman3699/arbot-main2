@@ -4,6 +4,7 @@ pragma solidity ^0.8.21;
 import {SwapExecutor} from "./steps/SwapExecutor.sol";
 import {GenericExecutor} from "./steps/GenericExecutor.sol";
 import {AdapterRegistry, UnknownAdapter} from "../core/AdapterRegistry.sol";
+import {ProfitInvariant} from "../core/ProfitInvariant.sol";
 import {FullMath} from "../libraries/FullMath.sol";
 import {TickMath} from "../libraries/TickMath.sol";
 import {LiquidityAmounts} from "../libraries/LiquidityAmounts.sol";
@@ -239,6 +240,13 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
         uint16 cycleSlippageBps;
         Step[] steps;
         uint256 minProfit;
+        /// How much of a non-profit token this route expects to be left
+        /// holding. Zero for a route that ends flat, which is every route the
+        /// planner currently builds. A surplus above it reverts: an
+        /// intermediate balance nobody expected means a hop was mispriced or
+        /// overtaken, and keeping it quietly lets the contract's balance sheet
+        /// drift from what the planner believes.
+        uint256 declaredResidue;
     }
 
     struct ActiveLoanContext {
@@ -302,14 +310,10 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
     error InvalidRouter();
     error InvalidAavePool();
     error InvalidGenericAction();
-    /// The cycle ended holding LESS of the start token than it began with.
-    ///
-    /// Previously this reverted as `InvalidGenericAction()`, which the contract
-    /// raises at ~40 unrelated sites — so a plan that simply lost money was
-    /// indistinguishable from malformed calldata, a bad adapter, or a failed
-    /// approval. Carries both balances so the shortfall is readable directly
-    /// from the revert instead of being inferred.
-    error InsufficientFinalBalance(uint256 finalBalance, uint256 requiredBalance);
+    // `InsufficientFinalBalance` was declared here and is gone. Nothing raises
+    // it any more -- `ProfitInvariant.DebtNotRepaid` carries the same two
+    // balances plus the token -- and an error in the ABI that cannot occur
+    // tells an integrator to handle a failure mode that does not exist.
     error InvalidPermit2();
     error Permit2AmountOverflow();
     error CircuitOpen();
@@ -845,7 +849,7 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
     function _legacyToV2(PlanLegacy calldata p) private pure returns (PlanV2 memory out) {
         Loan[] memory loans = new Loan[](1);
         loans[0] = Loan({token: p.loanToken, amount: p.amountIn, provider: p.loanProvider, providerAddr: address(0)});
-        out = PlanV2({loans: loans, cycleSlippageBps: p.cycleSlippageBps, steps: p.steps, minProfit: p.minProfit});
+        out = PlanV2({loans: loans, cycleSlippageBps: p.cycleSlippageBps, steps: p.steps, minProfit: p.minProfit, declaredResidue: 0});
     }
 
     function _validateLegacyProvider(LoanProvider provider) private pure {
@@ -994,14 +998,20 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
 
         uint256 repay = amount + fee;
         uint256 startBalance = _getActiveStartBalance(token);
-        uint256 balanceAfterPlan = IERC20(token).balanceOf(address(this));
 
+        // Both branches are the same invariant in different shapes, and both
+        // now go through `ProfitInvariant` rather than checking inline. The
+        // library is the code path while only one loan is permitted, so
+        // lifting that restriction later is a data change rather than a
+        // rewrite of the settlement -- and a library nothing calls is one
+        // nobody finds out is wrong.
+        //
+        // ERC3156 pulls its repayment AFTER this returns, so the contract must
+        // still be holding it. Every other provider is repaid first, so by the
+        // time the check runs the debt is zero.
         if (loan.provider == LoanProvider.ERC3156) {
-            if (balanceAfterPlan < startBalance + repay) {
-                revert InsufficientFinalBalance(balanceAfterPlan, startBalance + repay);
-            }
-
-            uint256 profitDelta = balanceAfterPlan - startBalance - repay;
+            uint256 profitDelta =
+                _assertSettled(token, startBalance, repay, p.declaredResidue);
             lastGrossProfit = profitDelta;
 
             _distributeProfit(token, profitDelta, p.minProfit);
@@ -1009,18 +1019,37 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
         } else {
             _repay(loan.provider, token, repay, providerAddr);
 
-            uint256 finalBalance = IERC20(token).balanceOf(address(this));
-            if (finalBalance < startBalance) {
-                revert InsufficientFinalBalance(finalBalance, startBalance);
-            }
-
-            uint256 profitDelta = finalBalance - startBalance;
+            uint256 profitDelta = _assertSettled(token, startBalance, 0, p.declaredResidue);
             lastGrossProfit = profitDelta;
 
             _distributeProfit(token, profitDelta, p.minProfit);
         }
 
         _clearActiveStartBalance();
+    }
+
+    /// One borrowed asset, expressed as the multi-asset invariant.
+    ///
+    /// The array is length one today because `p.loans.length != 1` still
+    /// holds: borrowing from several providers at once needs nested callbacks,
+    /// which is a capability rather than a restriction to delete, and it is
+    /// not what INV-27 is about. What INV-27 is about is that the check is
+    /// per-asset and the profit is denominated in exactly one declared token,
+    /// and that is true here whether the array holds one entry or four.
+    function _assertSettled(
+        address token,
+        uint256 startBalance,
+        uint256 repayment,
+        uint256 declaredResidue
+    ) private view returns (uint256) {
+        ProfitInvariant.Debt[] memory debts = new ProfitInvariant.Debt[](1);
+        debts[0] = ProfitInvariant.Debt({
+            token: token,
+            startBalance: startBalance,
+            repayment: repayment,
+            declaredResidue: declaredResidue
+        });
+        return ProfitInvariant.assertMultiAsset(debts, token);
     }
 
     function _executePlan(uint16 cycleSlippageBps, Step[] memory steps) private {

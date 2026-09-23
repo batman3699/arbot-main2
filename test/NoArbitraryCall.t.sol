@@ -92,7 +92,8 @@ contract NoArbitraryCallTest is Test {
             loans: loans,
             cycleSlippageBps: 0,
             steps: steps,
-            minProfit: 0
+            minProfit: 0,
+            declaredResidue: 0
         });
     }
 

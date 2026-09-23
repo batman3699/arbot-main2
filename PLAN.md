@@ -4134,10 +4134,49 @@ and a registry bypass are each caught.
 
 ### Task 5.2 — Multi-asset profit invariant (INV-27, INV-29)
 
-- [ ] **Step 1: Write the failing tests** — `testMultiAssetInvariantHolds` (fuzz over asset count 1–4 and amounts), `testPartialRepaymentReverts`, `testUnaccountedResidueReverts`, `testDeclaredResiduePathAccountsExactly`.
-- [ ] **Step 2: Run and observe the failures** — the current contract reverts with `InvalidLoanCount` on any multi-asset plan.
-- [ ] **Step 3: Implement** `ProfitInvariant.assertMultiAsset(Debt[] memory)` and remove the single-loan restriction.
-- [ ] **Step 4: Observe the passes.** **Step 5: Commit.**
+- [x] **Step 1: Write the failing tests** — `testMultiAssetInvariantHolds` (fuzz over asset count 1–4 and amounts), `testPartialRepaymentReverts`, `testUnaccountedResidueReverts`, `testDeclaredResiduePathAccountsExactly`.
+- [x] **Step 2: Run and observe the failures.**
+- [x] **Step 3: Implement** `ProfitInvariant.assertMultiAsset(Debt[] memory)` ~~and remove the single-loan restriction~~ — see below.
+- [x] **Step 4: Observe the passes.** **Step 5: Commit.**
+
+**Delivered 2026-09-24**, 9 new tests including a fuzz over 1–4 assets. 62
+forge tests total.
+
+**A multi-asset invariant is not N copies of the single-asset one, and the gap
+is where the money goes.** A plan can end holding more of asset A and less of
+asset B and look profitable if you only check A. Netting them requires a price,
+and **the contract has none** — any rate it used would be one the plan
+supplied, which is the same class of mistake as letting the plan supply a call
+target. So the check is per-asset and profit is denominated in exactly one
+declared token, which must be one of the borrowed assets.
+
+**Residue is a signal, not a windfall.** A route ending with an intermediate
+token it did not expect has either mispriced a hop or been overtaken
+mid-route. Keeping it quietly lets the contract's balance sheet drift from what
+the planner believes, and the next plan prices against a balance nobody
+accounted for. A surplus above what the plan *declared* reverts — and the
+declaration is exact, not a tolerance band: one wei over still reverts.
+
+**The single-loan restriction stays, and that is a scope judgement rather than
+an omission.** `p.loans.length != 1` is not a line to delete: borrowing from
+several providers at once needs **nested callbacks** — borrow A, and inside A's
+callback borrow B, and inside that run the plan — because each provider has its
+own callback protocol. That is a capability, not a restriction, and it is not
+what INV-27 is about. What INV-27 is about is that the check is per-asset and
+the profit is denominated in one declared token, which now holds whether the
+array carries one entry or four.
+
+**The invariant is the code path, not a library waiting for a caller.** Both
+settlement branches go through `ProfitInvariant` today with an array of one, so
+lifting the restriction later is a data change rather than a rewrite — and a
+library nothing calls is one nobody finds out is wrong. Cost: **1,014 bytes**,
+leaving 5,139 of EIP-170 margin.
+
+**`InsufficientFinalBalance` is gone.** `DebtNotRepaid` carries the same two
+balances plus the token, which is the field that matters the moment a plan can
+owe more than one asset — "short by 1e18" does not say short of what. The old
+error is removed rather than left declared: an error in the ABI that cannot
+occur tells an integrator to handle a failure mode that does not exist.
 
 ### Task 5.3 — Commitment verification (INV-06, §25)
 
