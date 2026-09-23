@@ -1,0 +1,10 @@
+[package]
+name = "apex-risk"
+version = "0.1.0"
+edition = "2021"
+description = "Risk as a hard execution gate: posture ladder, loss classification, circuit breaker."
+
+[dependencies]
+apex-types = { path = "../apex-types" }
+alloy-primitives = { version = "0.8", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }

@@ -39,6 +39,7 @@ apex-math = { path = "../apex-math" }
 apex-types = { path = "../apex-types" }
 apex-sim = { path = "../apex-sim" }
 apex-venues = { path = "../apex-venues" }
+apex-risk = { path = "../apex-risk" }
 anyhow = "1"
 ethers = { version = "2.0.14", features = ["abigen", "ws", "rustls"] }
 tokio = { version = "1", features = ["full", "test-util"] }

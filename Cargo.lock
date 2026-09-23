@@ -244,6 +244,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "apex-risk"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "apex-types",
+ "serde",
+]
+
+[[package]]
 name = "apex-sim"
 version = "0.1.0"
 dependencies = [
@@ -304,6 +313,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "apex-math",
+ "apex-risk",
  "apex-sim",
  "apex-types",
  "apex-venues",

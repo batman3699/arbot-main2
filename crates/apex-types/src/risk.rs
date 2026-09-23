@@ -37,7 +37,13 @@ impl RiskPosture {
 /// §28.2. Exhaustive: a loss class that exceeds its expected frequency
 /// automatically tightens its gate, which is impossible if losses can land in
 /// an "other" bucket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Ord` is derived so a class can key a `BTreeMap` and the loss ledger iterates
+/// deterministically. **Unlike [`RiskPosture`], this order is NOT severity** --
+/// there is no sense in which a pricing error is "less" than a venue error, and
+/// nothing may take a max over it. Severity lives in the per-class budget's
+/// `on_breach` posture (`apex_risk::loss::ClassBudget`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum LossClass {
     Pricing,
     State,

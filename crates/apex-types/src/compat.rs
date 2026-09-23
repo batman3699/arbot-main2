@@ -19,6 +19,13 @@
 //! call scattered through the economics.
 
 use alloy_primitives::U256 as AlloyU256;
+
+/// Re-exported so a crate on the ethers side of the boundary can *name* the
+/// alloy type without taking a direct `alloy-primitives` dependency. C-10 is
+/// explicit that the ~310 legacy call sites are not ported ahead of the first
+/// dollar, and a second dependency edge is how that decision gets reversed by
+/// accident.
+pub use alloy_primitives::U256 as Alloy256;
 use ethers_core::types::U256 as EthersU256;
 
 /// ethers → alloy.

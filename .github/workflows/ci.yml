@@ -59,7 +59,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ -p apex-sim -p apex-capture --all-targets -- -D warnings
+      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ -p apex-sim -p apex-capture -p apex-risk --all-targets -- -D warnings
 
   loom:
     name: loom (signer lanes)

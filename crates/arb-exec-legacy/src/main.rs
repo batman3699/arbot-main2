@@ -10277,6 +10277,149 @@ fn display_status(chain: &str, snapshot: StatusSnapshot) {
     println!("========================================\n");
 }
 
+/// Phase 6 Task 6.7: the differential that stands in for a MOVE.
+///
+/// `apex_risk::CircuitBreaker` is a reimplementation, not a relocation -- the
+/// legacy type is `async fn`s over `tokio::sync::Mutex`, keyed on `Instant`,
+/// denominated in `ethers::U256`, and reads five thresholds from the process
+/// environment, and moving it would drag all four into a crate whose purpose is
+/// to be pure. A move preserves the code; this preserves the *behaviour*, and
+/// fails if either side drifts.
+///
+/// Time-independent scenarios only. The legacy breaker reads `Instant::now()`
+/// inside every method, so window expiry cannot be driven on both sides from
+/// one script -- and window expiry is not where the trip decision lives. What
+/// is compared is the part that decides: the thresholds, the comparison
+/// operators, the precedence order, and the reason strings.
+#[cfg(test)]
+mod breaker_differential {
+    use super::CircuitBreaker as LegacyBreaker;
+    use apex_risk::CircuitBreaker as NewBreaker;
+    use apex_types::time::UnixNanos;
+    use apex_types::compat::{u256_to_alloy, Alloy256 as NewU256};
+    use ethers::types::U256 as LegacyU256;
+
+    const T: UnixNanos = UnixNanos(1_000_000_000_000);
+
+    /// `alloy` is not a dependency of this crate and must not become one --
+    /// C-10 is explicit that the ~310 legacy call sites are not ported ahead of
+    /// the first dollar. `apex_types::compat` is the single conversion boundary
+    /// the plan put there for exactly this.
+    fn wei(v: u64) -> (LegacyU256, NewU256) {
+        let l = LegacyU256::from(v);
+        (l, u256_to_alloy(l))
+    }
+
+    /// One scripted scenario, applied to both.
+    struct Script {
+        name: &'static str,
+        hourly_limit: u64,
+        daily_limit: u64,
+        consecutive_limit: u32,
+        failures: Vec<u64>,
+        successes: usize,
+        reverts: Vec<bool>,
+        rpc_errors: usize,
+    }
+
+    async fn run(s: &Script) {
+        let (lh, nh) = wei(s.hourly_limit);
+        let (ld, nd) = wei(s.daily_limit);
+        let legacy = LegacyBreaker::new(lh, ld, s.consecutive_limit);
+        let mut new = NewBreaker::new(nh, nd, s.consecutive_limit);
+
+        for (i, loss) in s.failures.iter().enumerate() {
+            let (ll, nl) = wei(*loss);
+            legacy.record_failure(ll).await;
+            new.record_failure(nl, UnixNanos(T.0 + i as u64));
+        }
+        for _ in 0..s.successes {
+            legacy.record_success().await;
+            new.record_success();
+        }
+        for (i, reverted) in s.reverts.iter().enumerate() {
+            legacy.record_execution_outcome(*reverted).await;
+            new.record_execution_outcome(*reverted, UnixNanos(T.0 + i as u64));
+        }
+        for i in 0..s.rpc_errors {
+            legacy.record_rpc_error().await;
+            new.record_rpc_error(UnixNanos(T.0 + i as u64));
+        }
+
+        let a = legacy.current_status().await;
+        let b = new.current_status(UnixNanos(T.0 + 1_000_000));
+
+        assert_eq!(a.is_tripped, b.is_tripped, "{}: trip decision diverged", s.name);
+        assert_eq!(
+            a.consecutive_failures, b.consecutive_failures,
+            "{}: consecutive count diverged", s.name
+        );
+        assert_eq!(
+            a.hourly_loss_wei.to_string(), b.hourly_loss_wei.to_string(),
+            "{}: hourly total diverged", s.name
+        );
+        assert_eq!(
+            a.daily_loss_wei.to_string(), b.daily_loss_wei.to_string(),
+            "{}: daily total diverged", s.name
+        );
+        assert_eq!(a.active_reason(), b.active_reason(), "{}: reason diverged", s.name);
+    }
+
+    #[tokio::test]
+    async fn the_new_breaker_trips_exactly_where_the_old_one_does() {
+        let scripts = vec![
+            Script { name: "quiet", hourly_limit: 0, daily_limit: 0, consecutive_limit: 0,
+                     failures: vec![], successes: 0, reverts: vec![], rpc_errors: 0 },
+            Script { name: "zero limits absorb everything", hourly_limit: 0, daily_limit: 0,
+                     consecutive_limit: 0, failures: vec![u64::MAX; 5], successes: 0,
+                     reverts: vec![true; 200], rpc_errors: 0 },
+            Script { name: "hourly loss exactly at the limit", hourly_limit: 100, daily_limit: 0,
+                     consecutive_limit: 0, failures: vec![60, 40], successes: 0,
+                     reverts: vec![], rpc_errors: 0 },
+            Script { name: "hourly loss one over", hourly_limit: 100, daily_limit: 0,
+                     consecutive_limit: 0, failures: vec![60, 41], successes: 0,
+                     reverts: vec![], rpc_errors: 0 },
+            Script { name: "daily before hourly in precedence", hourly_limit: 0, daily_limit: 10,
+                     consecutive_limit: 0, failures: vec![11], successes: 0,
+                     reverts: vec![], rpc_errors: 0 },
+            Script { name: "consecutive exactly at the limit", hourly_limit: 0, daily_limit: 0,
+                     consecutive_limit: 3, failures: vec![0, 0, 0], successes: 0,
+                     reverts: vec![], rpc_errors: 0 },
+            Script { name: "consecutive one over", hourly_limit: 0, daily_limit: 0,
+                     consecutive_limit: 3, failures: vec![0; 4], successes: 0,
+                     reverts: vec![], rpc_errors: 0 },
+            Script { name: "a success clears the streak", hourly_limit: 0, daily_limit: 0,
+                     consecutive_limit: 3, failures: vec![0; 10], successes: 1,
+                     reverts: vec![], rpc_errors: 0 },
+            Script { name: "49 reverts does not arm", hourly_limit: 0, daily_limit: 0,
+                     consecutive_limit: 0, failures: vec![], successes: 0,
+                     reverts: vec![true; 49], rpc_errors: 0 },
+            Script { name: "50 reverts arms", hourly_limit: 0, daily_limit: 0,
+                     consecutive_limit: 0, failures: vec![], successes: 0,
+                     reverts: vec![true; 50], rpc_errors: 0 },
+            Script { name: "the 65% band", hourly_limit: 0, daily_limit: 0, consecutive_limit: 0,
+                     failures: vec![], successes: 0,
+                     reverts: (0..200).map(|i| i % 20 < 13).collect(), rpc_errors: 0 },
+            Script { name: "a broken deploy at 98%", hourly_limit: 0, daily_limit: 0,
+                     consecutive_limit: 0, failures: vec![], successes: 0,
+                     reverts: (0..200).map(|i| i % 50 != 0).collect(), rpc_errors: 0 },
+            Script { name: "exactly 90% does not trip", hourly_limit: 0, daily_limit: 0,
+                     consecutive_limit: 0, failures: vec![], successes: 0,
+                     reverts: (0..100).map(|i| i % 10 != 0).collect(), rpc_errors: 0 },
+            Script { name: "29 rpc errors", hourly_limit: 0, daily_limit: 0, consecutive_limit: 0,
+                     failures: vec![], successes: 0, reverts: vec![], rpc_errors: 29 },
+            Script { name: "30 rpc errors", hourly_limit: 0, daily_limit: 0, consecutive_limit: 0,
+                     failures: vec![], successes: 0, reverts: vec![], rpc_errors: 30 },
+            Script { name: "several triggers at once picks the first", hourly_limit: 1,
+                     daily_limit: 1, consecutive_limit: 1, failures: vec![100; 5], successes: 0,
+                     reverts: vec![true; 60], rpc_errors: 40 },
+        ];
+        for s in &scripts {
+            run(s).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod runner_tests {
     use super::*;
