@@ -4483,8 +4483,30 @@ fn dropping_a_nonterminal_ticket_records_an_explicit_failure() {
 
 ### Task 6.2 — Crash recovery (INV-39)
 
-- [ ] **Step 1: Write the failing test** — `crash_recovery.rs` spawns the runtime, admits tickets, `SIGKILL`s mid-flight, restarts, and asserts (a) dispatch stays disabled until reconciliation completes and (b) every journaled ticket ends terminal.
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 1: Write the failing test** — `crash_recovery.rs` spawns the runtime, admits tickets, `SIGKILL`s mid-flight, restarts, and asserts (a) dispatch stays disabled until reconciliation completes and (b) every journaled ticket ends terminal.
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-24.** `crates/apex-capture/src/recover.rs` + `src/bin/crash_victim.rs`; 12 tests and 3 doctests. Workspace 1,567 passing.
+
+**The kill is real.** `crash_victim` is a separate process that puts tickets in flight and then blocks forever; the tests `SIGKILL` it and read the journal it left. An in-process simulation would only ever produce the file shape its author already imagined, and the whole question is what a journal looks like after a process stops existing between two writes. It has no clean shutdown path on purpose — a victim that *could* exit cleanly would eventually be made to, and then the test would stop testing a crash.
+
+**The `Signed` boundary is the load-bearing idea.** A ticket the journal last saw below `Signed` cannot have a transaction on chain, because no signature was produced for it; §17.1 says literally "a transition that is not recorded did not happen". So recovery splits the survivors: `NeverSigned` is closeable from local knowledge, `MaybeOnChain` is not, and only the latter costs a chain query. **This is sound only if the protocol journals the intent before the irreversible act** — `advance(Signed)` must return `Ok` before the signer is called. Write-ahead logging, in the ordinary database sense; recorded here as a binding constraint on Tasks 6.3 and 6.6, and the reason `requires_durable_write` starts at `Authorized` rather than at `Signed`.
+
+**An RPC outage must never be able to look like "it did not land".** `ChainOutcomeSource::resolve` is fallible, and a failure aborts reconciliation with the gate still shut rather than defaulting to a miss — filing a ticket that moved money as a miss is how the P&L ledger (§2.10) starts lying. Recovery still closes the never-signed tickets first, so an outage leaves *less* outstanding than it found rather than the same amount and a longer outage.
+
+**Everything is restored into the registry before anything is resolved.** So a chain source that dies half way leaves one place that knows what is still owed, and `live_ids()` is the retry's worklist. Resolving as it went would have left the unresolved tickets known only to a `JournalScan` the caller might drop.
+
+**`ReconciliationComplete` is an unforgeable capability**, and `DispatchGate::permit()` returns `None` without it. INV-39 becomes structural rather than a convention: a caller who merely believes recovery went well has nothing to pass. Proved by a `compile_fail` doctest pair — forging the struct, and `::default()` — each with a compiling twin that goes through `reconcile`.
+
+**Two defects the tests found, both about id reuse.** They are the reason this task took a second pass:
+
+1. **The twenty-cycle test went red at cycle 2.** The victim's fresh registry restarted its counter at 1, so the second generation re-used the first's ids and the journal contained `Admitted(1), Closed(1), Admitted(1)`. `scan` read the second ticket as already settled. One id naming two tickets *cannot* be reconciled — there is no way to say which a `Closed` entry settled, and the plausible reading is the dangerous one: recovery walks past a transaction that may be on chain. `scan` now refuses such a journal outright (`DuplicateAdmission`), and a process booting on an existing journal must reserve ids through `max_ticket_id` first.
+
+2. **Two mutations survived the first mutation pass**, and the reason was instructive: `reconcile`'s `reserve_ids_through` and `restore`'s own id bump were each covering for the other, so deleting either broke nothing and *neither was actually tested*. They are separated now — `the_highest_id_may_belong_to_an_already_closed_ticket` is the case only the former can handle (the highest id is never restored, because it was already closed), and `restore_alone_reserves_the_id_it_restored` is the mirror.
+
+**Seven mutations, each caught by a named test:** the seal off `ReconciliationComplete` (compile_fail goes green); the boundary moved from `Signed` to `Dispatching`; `scan` tolerating a duplicate admission; a chain error swallowed as "did not land"; `reconcile` not reserving ids; the gate starting open; `restore` not reserving its id.
+
+**Acceptance criterion 3 met:** `twenty_consecutive_kill_cycles_each_recover_cleanly` — twenty real `SIGKILL`s, each recovering the last one's leavings, with the journal accumulating across all twenty so the final cycle replays nineteen closed generations alongside its own live one.
 
 ### Task 6.3 — Signer pool and nonce lanes (INV-04, §27.5, §27.6)
 

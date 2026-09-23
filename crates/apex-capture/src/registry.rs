@@ -74,6 +74,10 @@ pub struct RegistryMetrics {
     pub tickets_closed_by_guard_drop: u64,
     /// Closed by [`TicketRegistry::sweep`] at the dispatch deadline (INV-03).
     pub tickets_closed_by_deadline: u64,
+    /// Put back by recovery rather than admitted fresh. Counted into
+    /// `tickets_admitted` as well, so the INV-02 accounting still balances --
+    /// a restored ticket is one this process is now responsible for closing.
+    pub tickets_restored: u64,
 }
 
 impl RegistryMetrics {
@@ -151,6 +155,41 @@ impl TicketRegistry {
         inner.metrics.tickets_admitted += 1;
         inner.metrics.tickets_live += 1;
         Ok(id)
+    }
+
+    /// Put a ticket back, with the id and status the journal recorded.
+    ///
+    /// Recovery's entry point, and deliberately NOT `admit`: `admit` assigns a
+    /// fresh id and journals an `Admitted` entry, both of which would be wrong
+    /// here. The ticket was already admitted -- in the run that died -- and
+    /// re-admitting it would put a second `Admitted` record in the journal for
+    /// one ticket, which is exactly the ambiguity recovery exists to resolve.
+    pub fn restore(&self, ticket: OpportunityTicket) -> Result<(), RegistryError> {
+        let id = ticket.ticket_id;
+        let mut inner = self.lock();
+        if inner.outcomes.contains_key(&id) {
+            return Err(RegistryError::AlreadyClosed(id));
+        }
+        if inner.live.contains_key(&id) {
+            return Err(RegistryError::AlreadyCheckedOut(id));
+        }
+        inner.next_id = inner.next_id.max(id.0 + 1);
+        inner.live.insert(id, ticket);
+        inner.metrics.tickets_admitted += 1;
+        inner.metrics.tickets_live += 1;
+        inner.metrics.tickets_restored += 1;
+        Ok(())
+    }
+
+    /// Guarantee no future [`Self::admit`] reissues an id at or below `max`.
+    ///
+    /// Called with the highest id the journal ever mentioned. Two tickets
+    /// sharing an id is how one ticket's outcome overwrites another's, and
+    /// after a crash the in-memory counter has no idea what the previous run
+    /// handed out.
+    pub fn reserve_ids_through(&self, max: u64) {
+        let mut inner = self.lock();
+        inner.next_id = inner.next_id.max(max.saturating_add(1));
     }
 
     /// Take exclusive working possession of a live ticket.

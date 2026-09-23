@@ -6,10 +6,10 @@ description = "Capture Assurance Controller: ticket lifecycle, journal, reservat
 
 [dependencies]
 apex-types = { path = "../apex-types" }
+alloy-primitives = { version = "0.8", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
 proptest = "1"
-alloy-primitives = { version = "0.8", features = ["serde"] }
 tempfile = "3"

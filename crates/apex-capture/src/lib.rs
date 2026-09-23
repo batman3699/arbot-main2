@@ -6,8 +6,13 @@
 
 pub mod clock;
 pub mod journal;
+pub mod recover;
 pub mod registry;
 
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use journal::{FileJournal, InMemoryJournal, Journal, JournalEntry};
+pub use recover::{
+    scan, ChainOutcomeSource, Disposition, DispatchGate, DispatchPermit, JournalScan,
+    ReconciliationComplete, RecoveryError,
+};
 pub use registry::{RegistryError, RegistryMetrics, TicketGuard, TicketRegistry};
