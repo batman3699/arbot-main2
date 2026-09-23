@@ -59,6 +59,52 @@ pub struct FeeModel {
 /// §20.1's seven fields. **Constructible only through [`RegimeDiscovery`]**:
 /// the private marker means a caller cannot write one down and call it
 /// discovered.
+///
+/// ```compile_fail
+/// use apex_chain::regime::{ChainRegime, Discovered, FeeModel, OrderingMode,
+///     PriorityFeeSemantics, ReplacementRules};
+/// use apex_types::ids::ChainId;
+/// use apex_types::time::{DurationNanos, UnixNanos};
+/// // `Discovered`'s field is private, so this literal cannot be written.
+/// let assumed = ChainRegime {
+///     chain: ChainId::BASE,
+///     ordering_mode: OrderingMode::Sequencer,
+///     priority_fee_semantics: PriorityFeeSemantics::RanksWithinWindow,
+///     round_length: DurationNanos(2_000_000_000),
+///     fast_feed_available: true,
+///     private_feed_available: true,
+///     replacement_rules: ReplacementRules::NotSupported,
+///     gas_and_data_fee_model: FeeModel {
+///         has_l1_data_fee: true, l1_data_fee_uses_blobs: true,
+///         has_priority_fee: true, has_builder_payment: false,
+///     },
+///     discovered_at: UnixNanos(0),
+///     _discovered: Discovered(()),
+/// };
+/// ```
+///
+/// The twin, differing only in going through the constructor:
+///
+/// ```
+/// use apex_chain::regime::{FeeModel, OrderingMode, PriorityFeeSemantics,
+///     RegimeDiscovery, ReplacementRules};
+/// use apex_types::ids::ChainId;
+/// use apex_types::time::{DurationNanos, UnixNanos};
+/// let discovered = RegimeDiscovery::discovered(
+///     ChainId::BASE,
+///     OrderingMode::Sequencer,
+///     PriorityFeeSemantics::RanksWithinWindow,
+///     DurationNanos(2_000_000_000),
+///     true, true,
+///     ReplacementRules::NotSupported,
+///     FeeModel {
+///         has_l1_data_fee: true, l1_data_fee_uses_blobs: true,
+///         has_priority_fee: true, has_builder_payment: false,
+///     },
+///     UnixNanos(0),
+/// );
+/// assert!(discovered.admit_to_live_trading(UnixNanos(0), DurationNanos(1)).is_ok());
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainRegime {
     pub chain: ChainId,

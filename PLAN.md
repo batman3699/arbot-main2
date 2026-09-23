@@ -4826,13 +4826,52 @@ fn evidence_distinguishes_provider_attestation_from_measurement() {
 
 ### Task 7.4 — Regime discovery
 
-- [ ] **Step 1: Write the failing test** — a chain whose regime cannot be discovered is not admitted to live trading.
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 1: Write the failing test** — a chain whose regime cannot be discovered is not admitted to live trading.
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-24.** `src/regime.rs` (built with Task 7.1, tested here); 6 tests plus a `compile_fail` pair.
+
+**`RegimeDiscovery` has no `Assumed` variant and `ChainRegime` cannot be written down.** A private `Discovered(())` marker makes `RegimeDiscovery::discovered` the only constructor, so §20.1's rule is structural rather than a paragraph somebody has to remember. Proved by a `compile_fail` doctest on the struct literal, paired with a compiling twin that differs only in going through the constructor.
+
+**"and periodically thereafter" is the load-bearing half of §20.1.** `admit_to_live_trading(now, ttl)` is the only accessor and it refuses a regime that has aged past its TTL — a regime discovered once and never re-checked is a hard-coded assumption with extra steps. Refused, not downgraded: a stale answer about chain parameters is not a weaker answer, it is a different chain's answer.
 
 ### Task 7.5 — Outcome observation and reconciliation
 
-- [ ] **Step 1: Write the failing tests** — `observe_outcome` distinguishes preconfirmed / included / finalized; `reconcile_final_state` produces a `PnlAttribution` from the receipt and balance deltas that matches a recorded real trade within 1 wei.
-- [ ] **Step 2–5:** as usual.
+- [x] **Step 1: Write the failing tests** — `observe_outcome` distinguishes preconfirmed / included / finalized; `reconcile_final_state` produces a `PnlAttribution` from the receipt and balance deltas that matches a recorded real trade within 1 wei.
+- [x] **Step 2–5:** as usual.
+
+**Delivered 2026-09-24.** `src/base/{observe,reconcile}.rs`, `tests/fixtures/base_receipt.json`; 12 tests. Workspace 1,693 passing.
+
+**Plan correction: `observe_outcome` cannot return `apex_types::miss::ObservedOutcome`.** That type is `{ landed_by_competitor, realized_profit_estimate }` — the **miss ledger's** question, "did somebody else take it?". It cannot answer "where is our transaction?", so the adapter returns `TransactionObservation { tx, stage, observed_at, receipt }`. Reusing the miss type would have made the three-way distinction the task asks for unrepresentable.
+
+**The three stages are three different facts about money**, and a preconfirmation structurally has no receipt — which is the mechanical reason it cannot be mistaken for an inclusion. `is_settled()` is `Finalized` alone: an included transaction can still be reorganized out, and a ledger that books at inclusion records trades that later un-happen. `has_executed()` is the weaker question — enough to stop competing, not enough to book.
+
+**Finalization is supplied, not derived.** It is a fact about the **L1 batch**; an L2 receipt cannot tell you whether the batch containing it has finalized.
+
+**Reconciliation reads; it does not re-derive.** The L1 data fee especially: recomputing it with the estimator's own Fjord formula would report the estimator's opinion as the realized cost and make the estimator unfalsifiable. The realized gas figure collapses to a point rather than a distribution — reporting `p50 != p99` would invent uncertainty about something already observed — and the priority fee is zero because it is already inside `effective_gas_price`.
+
+**A revert and a missing profit token are refused, not reconciled to zero.** A reverted transaction has a P&L (the gas was spent) but `PnlAttribution` is not the type for it; §28.2's `LossClass` is, and it needs a cause. A profit token that never moved means the route did not do what it said or the wrong token was named — reporting zero would put a false zero in the ledger.
+
+### The "recorded real trade within 1 wei" — met, with a stated limit
+
+**`tests/fixtures/base_receipt.json` is a real Base transaction** (`0xff234d40…`, block 47,130,125), recorded by forge during a deploy and already tracked in this repository. The reconciled realized cost matches it exactly: 5,917,443 gas × 6,000,000 wei = **35,504,658,000,000 wei** of L2 execution fee, plus **1,369,630,898 wei** of L1 data fee read from the receipt. A separate test parses the committed JSON and asserts the hard-coded numbers agree with it, so the fixture is load-bearing rather than decorative.
+
+**The limit, stated plainly:** this validates the *cost* half against a real receipt. The *profit* half needs a recorded arbitrage trade with balance deltas, and the repository has none — the recorded Base transactions are deploys. That remains outstanding and is egress-blocked like the rest.
+
+### A finding worth more than the task: the OP Stack L1 fee relation, validated offline
+
+`broadcast/Deploy.s.sol/8453/` holds **twelve distinct real Base receipts**, all tracked in git, each carrying `l1Fee`, `l1GasUsed`, `l1GasPrice`, `l1BaseFeeScalar`, `l1BlobBaseFee` and `l1BlobBaseFeeScalar`. Checked against them:
+
+```text
+l1Fee = estimatedSizeScaled × (l1BaseFeeScalar × l1BaseFee × 16
+                             + l1BlobBaseFeeScalar × l1BlobBaseFee) / 1e12
+```
+
+**reproduces all twelve exactly.** The implied `estimatedSizeScaled / 1e6` ranges from 100 to 15,456 bytes, and **two of the twelve sit at exactly 100 — the `MIN_TX_SIZE` clamp.**
+
+That **refines §23's wording**, which reads as though the clamp is always the operative branch because the Fjord intercept is negative: it is operative for small transactions and not for large ones, and both cases are present in this data. `the_receipt_pins_the_l1_fee_relation_at_the_clamp` pins the clamp case.
+
+**This is evidence `apex-econ`'s Fjord estimator can be validated against without egress**, which the plan currently lists as blocked. What is still needed is the `fastlz` compressed size of each transaction's calldata to predict `estimatedSizeScaled` independently rather than solving for it — the calldata is in the same broadcast files. Recorded as available work, not done here: it is `apex-econ`'s validation (§23, G-ECON-1), not Phase 7's.
 
 **Tests:** flashblock property tests, submission lane tests, regime discovery, fork-based reconciliation against recorded trades.
 **Benchmarks:** `T_submit` p99 ≤ 20 ms to transport ack; end-to-end `T_signal→submit` p99 ≤ 135 ms.

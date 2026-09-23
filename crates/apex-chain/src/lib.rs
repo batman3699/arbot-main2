@@ -19,6 +19,8 @@ pub use base::flashblock::{
     earliest_eligible, earliest_eligible_from, Capacity, FlashblockObservation,
     MeasuredCapacityModel, ModelError,
 };
+pub use base::observe::{Receipt, TransactionObservation};
+pub use base::reconcile::{reconcile, BalanceDelta, ReconcileError, ReconcileInputs};
 pub use base::submit::{
     blockpi_base_lane, send_redundantly, BaseTransactionStatus, EndpointKind, LaneRefusal,
     PrivacyEvidence, RedundancyOutcome, SubmissionLane,

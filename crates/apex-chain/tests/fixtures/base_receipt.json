@@ -1,0 +1,25 @@
+{
+  "transactionHash": "0xff234d403b58ff0e72d5f8adea9ce99959c040bf4d29c80d0334c406224f09cd",
+  "blockNumber": "0x2cf260d",
+  "blockHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "status": "0x1",
+  "gasUsed": "0x5a4b03",
+  "cumulativeGasUsed": "0xe3b528",
+  "effectiveGasPrice": "0x5b8d80",
+  "l1Fee": "0x51a2e8b2",
+  "l1GasUsed": "0x3c2eb",
+  "l1GasPrice": "0x8141375",
+  "l1BaseFeeScalar": "0x8dd",
+  "l1BlobBaseFee": "0x7ed644",
+  "l1BlobBaseFeeScalar": "0x101c12",
+  "daFootprintGasScalar": "0x94",
+  "type": "0x2",
+  "from": "0xd7a4d612e572b5877b0e2fc7ce8683e36360f04c",
+  "to": null,
+  "_provenance": {
+    "source": "broadcast/Deploy.s.sol/8453/run-1781049614240.json",
+    "chain": 8453,
+    "note": "A real Base transaction, recorded by forge at deploy time and trimmed to its fee fields (logs removed). The source run file is tracked in git, so this copy is checkable against it. Eleven further recorded Base receipts sit alongside it; the l1Fee relation reproduces all twelve exactly, and two of the twelve sit on the 100-byte MIN_TX_SIZE clamp.",
+    "recorded_at_unix": 1781049614240
+  }
+}

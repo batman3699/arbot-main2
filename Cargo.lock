@@ -220,6 +220,7 @@ dependencies = [
  "async-trait",
  "proptest",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
