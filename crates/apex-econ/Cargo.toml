@@ -1,0 +1,17 @@
+[package]
+name = "apex-econ"
+version = "0.1.0"
+edition = "2021"
+description = "Sizing, cost and expected value: the economics that decide whether a candidate trades."
+
+[dependencies]
+apex-types = { path = "../apex-types" }
+apex-math = { path = "../apex-math" }
+# The route evaluation this crate sizes against speaks ethers U256; the
+# candidate it produces speaks alloy. `apex_types::compat` is the one place
+# those meet (C-10).
+ethers-core = "2.0.14"
+alloy-primitives = "0.8"
+
+[dev-dependencies]
+proptest = "1"

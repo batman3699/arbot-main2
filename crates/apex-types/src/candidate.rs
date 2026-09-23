@@ -19,6 +19,54 @@ use serde::{Deserialize, Serialize};
 /// type `Candidate::input_amount` accepts moves that from a review rule to a
 /// compile error -- `apex-econ`'s `sizing::discrete::refine` is the only thing
 /// that can mint one.
+///
+/// # The compile error, as a test
+///
+/// Task 3.1 asked for a `trybuild` compile-fail fixture. These are
+/// `compile_fail` doctests instead, for a specific reason: `trybuild` compares
+/// the full stderr against a recorded file, which pins the test to a rustc
+/// version and turns a diagnostic reword into a red build. `compile_fail`
+/// asserts only that the code does not compile, which is the actual claim.
+///
+/// The known weakness of a `compile_fail` test is that it also passes when the
+/// snippet fails for an unrelated reason -- a typo, a missing import. Each one
+/// below is therefore paired with a twin that differs **only** in the forbidden
+/// step and does compile, so a snippet broken for the wrong reason would take
+/// its twin down with it. Verified by mutation: making this field `pub` turns
+/// the first case green, and the test fails.
+///
+/// A raw amount cannot become a size:
+///
+/// ```compile_fail
+/// use apex_types::candidate::DiscreteSize;
+/// use alloy_primitives::U256;
+/// // The field is private: this is the assignment §14.3 forbids.
+/// let size = DiscreteSize(U256::from(1_000u64));
+/// ```
+///
+/// The twin, differing only in going through the refinement path:
+///
+/// ```
+/// use apex_types::candidate::{DiscreteRefined, DiscreteSize};
+/// use alloy_primitives::U256;
+/// let size = DiscreteSize::from_refinement(U256::from(1_000u64), DiscreteRefined::new());
+/// assert_eq!(size.get(), U256::from(1_000u64));
+/// ```
+///
+/// And there is no conversion to reach for either. A `U256`:
+///
+/// ```compile_fail
+/// use apex_types::candidate::DiscreteSize;
+/// use alloy_primitives::U256;
+/// let size: DiscreteSize = U256::from(1_000u64).into();
+/// ```
+///
+/// ...nor a continuous optimum, which is an `f64` and has no path here at all:
+///
+/// ```compile_fail
+/// use apex_types::candidate::DiscreteSize;
+/// let size: DiscreteSize = (1_000.0_f64).into();
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DiscreteSize(U256);
 

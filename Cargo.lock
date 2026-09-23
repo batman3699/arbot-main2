@@ -210,6 +210,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "apex-econ"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "apex-math",
+ "apex-types",
+ "ethers-core",
+ "proptest",
+]
+
+[[package]]
 name = "apex-math"
 version = "0.1.0"
 dependencies = [
@@ -233,6 +244,7 @@ name = "apex-types"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "ethers-core",
  "serde",
  "serde_json",
 ]

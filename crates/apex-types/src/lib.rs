@@ -31,6 +31,7 @@
 
 pub mod candidate;
 pub mod commitment;
+pub mod compat;
 pub mod cost;
 pub mod flash;
 pub mod ids;

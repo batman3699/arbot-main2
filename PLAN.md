@@ -3563,10 +3563,51 @@ fn no_profitable_size_returns_none_not_zero() {
 }
 ```
 
-- [ ] **Step 2: Run and observe the failures.**
-- [ ] **Step 3: Implement** `DiscreteSize(U256)` with a private field and a single constructor `discrete::refine(...) -> Option<DiscreteSize>`; change `Candidate::input_amount` to `DiscreteSize`.
-- [ ] **Step 4: Run and observe the passes.**
-- [ ] **Step 5: Commit.**
+- [x] **Step 2: Run and observe the failures.**
+- [x] **Step 3: Implement** `DiscreteSize(U256)` with a private field and a single constructor `discrete::refine(...) -> Option<DiscreteSize>`; change `Candidate::input_amount` to `DiscreteSize`.
+- [x] **Step 4: Run and observe the passes.**
+- [x] **Step 5: Commit.**
+
+**Delivered 2026-09-23.** `apex-econ` with `sizing::{continuous, discrete}`,
+12 tests including two property tests.
+
+**`compile_fail` doctests, not `trybuild`.** `trybuild` compares full stderr
+against a recorded file, pinning the test to a rustc version and turning a
+diagnostic reword into a red build. `compile_fail` asserts only that the code
+does not compile, which is the actual claim. Its known weakness — it also
+passes when a snippet fails for an unrelated reason — is answered by pairing
+each forbidden case with a twin that differs *only* in the forbidden step and
+does compile. **Mutation-verified:** making `DiscreteSize`'s field `pub` turns
+the first case green and the test goes red.
+
+**`--all-targets` does not run doctests.** It expands to `--lib --bins --tests
+--benches --examples`. The INV-18 guards live in doc comments, so CI would
+never have executed them — a type-level proof that was decorative from the
+moment it was written. A `cargo test --workspace --doc` step now runs them.
+
+**The guarantee holds by construction, not by cleverness.** The refined size is
+never worse than the nearest integer to the continuous optimum because the
+climb *starts* there and only ever moves to a strictly better point. The
+alternative framing — "search the range and trust it beats the warm start" — is
+a claim about the optimiser, and optimisers on a lattice with truncating
+integer arithmetic are where quiet regressions live. Net profit is concave so
+the climb also finds the global integer optimum, but the guarantee does not
+depend on that.
+
+**Three reasons an f64 optimum is not a size**, recorded on `continuous.rs`
+because only the first is obvious: no AMM accepts a fractional wei; `f64` has
+53 bits of mantissa and a wei-denominated size routinely exceeds 2^53, so the
+continuous stage cannot *represent* every integer in its own search range
+(tested — two adjacent wei above 2^60 collapse to the same `f64`); and the two
+stages evaluate the objective in different arithmetic, with integer truncation
+always rounding against the trader.
+
+**`apex_types::compat` landed here, not in Phase 1.** `lib.rs` reserved it for
+*"Phase 1, when the first crate actually has to cross it"*. Phase 1's state
+primitives never did. `discrete::refine` is the first thing that does: it reads
+a size from `apex-math`'s route evaluation (ethers) and mints an
+`apex_types::DiscreteSize` (alloy). The conversion is total and exact in both
+directions, tested at every boundary value including `U256::MAX` and 2^255.
 
 ### Task 3.2 — `TotalExecutionCost` and gas-limit/gas-used separation (INV-19)
 

@@ -38,6 +38,12 @@ jobs:
         # (lib.rs declares 42 modules, main.rs 58) and declares five binaries.
         # `--lib` alone misses the sizing and hot_pools tests entirely.
         run: cargo test --workspace --all-targets --locked
+      - name: doctests
+        # `--all-targets` does NOT include doctests -- it expands to
+        # --lib --bins --tests --benches --examples. The INV-18 `compile_fail`
+        # guards on `DiscreteSize` live in doc comments, so without this step
+        # they would never run and the type-level proof would be decorative.
+        run: cargo test --workspace --doc --locked
       - name: exhaustive maths (release)
         # apex-math's tick tables are checked at EVERY tick, not at a sample:
         # 1.8M iterations, 2.5 s in release and 73 s in debug. Ignored by
@@ -54,7 +60,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues --all-targets -- -D warnings
+      - run: cargo clippy -p apex-types -p apex-config -p apex-state -p apex-math -p apex-venues -p apex-econ --all-targets -- -D warnings
 
   solidity:
     name: forge

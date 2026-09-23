@@ -9,6 +9,10 @@ description = "APEX-MEV v4 shared vocabulary: no I/O, no async, no provider type
 # revm 20, so this adds no new dependency to the tree, and Phase 4's
 # eth_simulateV1 backend needs it because ethers 2.0.14 cannot type that call.
 alloy-primitives = { version = "0.8", features = ["serde"] }
+# ethers-core is here for ONE module: `compat`, the single alloy<->ethers
+# conversion boundary (C-10). It brings no provider and no async; the types
+# crate still cannot name a `Provider`.
+ethers-core = "2.0.14"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
