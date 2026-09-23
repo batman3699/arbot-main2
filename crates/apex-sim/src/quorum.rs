@@ -165,6 +165,21 @@ pub fn conclude(verdicts: &[(String, VerifierVerdict)], mode: QuorumMode) -> Quo
     QuorumOutcome::Proceed { confirmations }
 }
 
+/// INV-40. A verdict that stops a candidate is a miss, and which kind matters.
+///
+/// `Contradicted` is `SimFail`: a verifier disagreed with the primary, so the
+/// simulation cannot be trusted. `Unavailable` is **also** `SimFail` and not
+/// `TooSlow`, which is the distinction worth being careful about -- a verifier
+/// that did not answer leaves the quorum unable to confirm, and filing that as
+/// slowness would point an operator at latency when the problem is a verifier
+/// that is down. `Confirmed` never rejects; the trait is total, and a caller
+/// asks this of a verdict it has already decided is a rejection.
+impl apex_types::miss::ExplainsMiss for VerifierVerdict {
+    fn miss_reason(&self) -> apex_types::miss::MissReason {
+        apex_types::miss::MissReason::SimFail
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,17 +359,3 @@ mod tests {
     }
 }
 
-/// INV-40. A verdict that stops a candidate is a miss, and which kind matters.
-///
-/// `Contradicted` is `SimFail`: a verifier disagreed with the primary, so the
-/// simulation cannot be trusted. `Unavailable` is **also** `SimFail` and not
-/// `TooSlow`, which is the distinction worth being careful about -- a verifier
-/// that did not answer leaves the quorum unable to confirm, and filing that as
-/// slowness would point an operator at latency when the problem is a verifier
-/// that is down. `Confirmed` never rejects; the trait is total, and a caller
-/// asks this of a verdict it has already decided is a rejection.
-impl apex_types::miss::ExplainsMiss for VerifierVerdict {
-    fn miss_reason(&self) -> apex_types::miss::MissReason {
-        apex_types::miss::MissReason::SimFail
-    }
-}

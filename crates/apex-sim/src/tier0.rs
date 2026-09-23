@@ -75,6 +75,16 @@ pub fn screen(input: &Tier0Input) -> Tier0Verdict {
 /// The tier this module implements, for the ladder.
 pub const TIER: SimulationTier = SimulationTier::Tier0Analytic;
 
+/// INV-40. Tier 0 declines for exactly one economic reason: the candidate
+/// cannot pay for itself. `Escalate` is not a rejection and maps to the same
+/// bucket only because the trait is total -- a caller asks this of a verdict it
+/// has already decided is a rejection.
+impl apex_types::miss::ExplainsMiss for Tier0Verdict {
+    fn miss_reason(&self) -> apex_types::miss::MissReason {
+        apex_types::miss::MissReason::LowEv
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,12 +187,3 @@ mod tests {
     }
 }
 
-/// INV-40. Tier 0 declines for exactly one economic reason: the candidate
-/// cannot pay for itself. `Escalate` is not a rejection and maps to the same
-/// bucket only because the trait is total -- a caller asks this of a verdict it
-/// has already decided is a rejection.
-impl apex_types::miss::ExplainsMiss for Tier0Verdict {
-    fn miss_reason(&self) -> apex_types::miss::MissReason {
-        apex_types::miss::MissReason::LowEv
-    }
-}
