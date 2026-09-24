@@ -223,15 +223,64 @@ fn an_unclassified_token_makes_the_pool_shadow_only() {
     assert!(fully_known.exactness().may_authorize_live_dispatch());
 }
 
-/// A known fee-on-transfer token is a DETERMINATION, not an unknown: the
-/// engine can price around it.
+/// **A known fee-on-transfer token is still shadow-only, and this test used to
+/// assert the opposite.**
+///
+/// It read: *"A known fee-on-transfer token is a DETERMINATION, not an unknown:
+/// the engine can price around it"* — and asserted `Proven`. The premise was
+/// false. Nothing outside `admission.rs` has ever read `FeeOnTransfer`'s `bps`,
+/// and no quote path applies a transfer fee, so "the engine can price around
+/// it" described an engine that was never written. §6.5 records this
+/// repository's "written but never wired" pattern four times over; this was the
+/// fifth, and the only one with money attached.
+///
+/// The consequence was precise and bad: a token whose fee somebody had measured
+/// was treated as **more** trustworthy than one nobody had measured, while the
+/// measurement went unused. At the 500 bps this test uses, every quote through
+/// the pool overstated its output by 5% per hop — and `Proven` is what INV-17
+/// checks before authorizing live dispatch.
+///
+/// Found by taking a SolidityScan finding class — "ACCOUNTING ISSUE FEES ON
+/// TOKEN TRANSFER" — and applying it to the Rust admission path rather than to
+/// the Solidity it was raised against.
 #[test]
-fn a_known_fee_on_transfer_token_is_not_the_same_as_an_unclassified_one() {
-    let mut record = complete();
-    record.transfer_semantics = Some((
-        TransferSemantics::Standard,
+fn a_known_fee_on_transfer_token_is_still_shadow_only() {
+    for semantics in [
         TransferSemantics::FeeOnTransfer { bps: 500 },
-    ));
-    let admitted = registry().admit(record).expect("admitted");
+        // One basis point is still unpriced, and "small" is not a safety
+        // argument when nothing applies the number at all.
+        TransferSemantics::FeeOnTransfer { bps: 1 },
+        // Rebasing has the same defect for the same reason.
+        TransferSemantics::Rebasing,
+    ] {
+        let mut record = complete();
+        record.transfer_semantics = Some((TransferSemantics::Standard, semantics));
+        let admitted = registry().admit(record).expect("still admitted");
+        assert_eq!(admitted.exactness(), Exactness::Approximate, "{semantics:?}");
+        assert!(
+            !admitted.exactness().may_authorize_live_dispatch(),
+            "{semantics:?} reached live dispatch with an unpriced transfer fee"
+        );
+
+        // And it is on the other side too -- the check must not be
+        // position-dependent.
+        let mut flipped = complete();
+        flipped.transfer_semantics = Some((semantics, TransferSemantics::Standard));
+        assert_eq!(
+            registry().admit(flipped).expect("admitted").exactness(),
+            Exactness::Approximate,
+            "{semantics:?} in token0 position"
+        );
+    }
+}
+
+/// The one shape that is `Proven`: standard on both sides. Stated separately so
+/// the positive case cannot be satisfied by an `exactness()` that returns
+/// `Approximate` unconditionally.
+#[test]
+fn only_standard_semantics_on_both_sides_is_proven() {
+    let admitted = registry().admit(complete()).expect("admitted");
+    assert_eq!(admitted.transfer_semantics, (TransferSemantics::Standard, TransferSemantics::Standard));
     assert_eq!(admitted.exactness(), Exactness::Proven);
+    assert!(admitted.exactness().may_authorize_live_dispatch());
 }

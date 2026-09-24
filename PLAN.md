@@ -4343,6 +4343,46 @@ function testDeployTestsDoNotWriteProcessEnv() external {
 - [x] **Step 2:** Run the deep profile. `--fuzz-runs 100000` is a *fuzz* setting and does not reach an invariant suite, which is configured by `runs`/`depth`; `FOUNDRY_PROFILE=deep` sets both (1024 × 128) plus 100k fuzz runs for the stateless tests.
 - [ ] **Step 3:** Commission and complete an external review of `contracts/core/` and `contracts/chains/BaseArbExecutor.sol`. **No mainnet deployment before it clears.** — **a human decision, outside what this plan's execution can complete.** G-SEC-1 and acceptance criterion 5 depend on it.
 
+#### A SolidityScan report was supplied 2026-09-24. **It does not clear G-SEC-1, and the reason is not a judgement call.**
+
+`solidityscan.com/qs-report/4afbc1c8…` — score 52.85/100, 432 findings: 14 Critical (all one bug type, `INCORRECT ACCESS CONTROL`), 1 High, 11 Medium, 40 Low, 314 Informational, 52 Gas. Status: 0 Fixed, 2 False Positive, 432 Pending Fix.
+
+**It scanned the wrong code.** The report's Commit Hash field is `-` and it names the repository, not a ref, so it scanned the default branch — `main`. Verified against `origin/main`:
+
+- `contracts/core/` **does not exist there**. `AdapterRegistry.sol` and `ProfitInvariant.sol` — the two files G-SEC-1 names first — were never in scope.
+- `contracts/executor/steps/{GenericExecutor,BridgeExecutor,JitExecutor}.sol` and `BridgeLib.sol` are still there. Phase 5 deleted all of them.
+- `MultiVenueArbImplementation.sol:148` on `main` is `(bool ok, bytes memory ret) = target.call(data);` inside `_execGeneric`. **That is B-1**, the arbitrary-call hole Task 5.1 removed. The scanner was pointed at the version that still has it.
+
+So the report describes the pre-Phase-5 contracts. Its 14 criticals may well be real — **about code that no longer exists on the branch this work lives on**. A scan of `phase0-workspace-split`, or of a pinned commit, is a different report.
+
+**Separately, and independently: an automated static scan is not the review §5.6 asks for.** The report's own Audit Methodology field reads "Static Scanning", it carries "This audit report has not been verified by the SolidityScan team", and its disclaimer says *"As one audit-based assessment cannot be considered comprehensive, we always recommend proceeding with several independent manual audits including manual audit and a public bug bounty program."* The tool's authors and this plan agree. **R-03 stands; G-SEC-1 remains open.**
+
+**What the report was nonetheless worth.** Its finding *classes* are a checklist, and applying them to the code that does matter found a real defect. Checked against `phase0-workspace-split`:
+
+| Class | Result on the current branch |
+|---|---|
+| H001 UNCHECKED TRANSFER | **Does not reproduce.** Every ERC-20 movement goes through `_safeTransfer` → `safeCallOptionalReturnBool`. The one bare call is `permit2.approve`, declared `external;` with no return value |
+| M002 INCORRECT TOKEN INTERACTION | Does not reproduce, same reason |
+| L001 FLOATING PRAGMA ×8 | **Reproduces.** All 21 `.sol` files are `pragma solidity ^0.8.21`. Real, low, and unfixed — recorded, not closed |
+| L004 OUTDATED COMPILER ×8 | Same pragma; same status |
+| C001 INCORRECT ACCESS CONTROL ×14 | Unverifiable — the report's File Location and Line No. columns are `--`, paywalled behind "Unlock report". `contracts/core/` has exactly one non-`internal` entry point, `ProfitInvariant.assertMultiAsset`, which is `internal view` |
+| **M001 ACCOUNTING ISSUE FEES ON TOKEN TRANSFER** | **Reproduced, in Rust rather than Solidity, and it was a live hole.** See below |
+
+#### The finding: a measured fee-on-transfer token was trusted more than an unmeasured one
+
+`PoolAdmission::exactness()` returned `Proven` when both tokens' `TransferSemantics` were *determined* — i.e. anything but `Unknown`. `FeeOnTransfer { bps }` is determined. So:
+
+- An **unclassified** token → `Approximate` → shadow-only. Correct.
+- A **classified 5% fee-on-transfer** token → `Proven` → eligible for live dispatch under INV-17.
+
+The justification was written down, in a test named `a_known_fee_on_transfer_token_is_not_the_same_as_an_unclassified_one`: *"A known fee-on-transfer token is a DETERMINATION, not an unknown: the engine can price around it."*
+
+**No engine prices around it.** Nothing outside `admission.rs` has ever read `FeeOnTransfer`'s `bps`, and no quote path applies a transfer fee — both verified by grep across every crate. The engine that "can price around it" was never written. §6.5 records this repository's *written but never wired* pattern four times over; this is the fifth, and the only one with money attached: every quote through such a pool overstated its output by the fee, per hop, while the pool was marked fit for live dispatch.
+
+**Fixed.** `TransferSemantics::prices_exactly()` replaces `is_determined()` and is `true` only for `Standard`, with an exhaustive match so a sixth variant cannot be added without deciding the question. `FeeOnTransfer` may return to `true` only in the same change that makes a quote apply its `bps` — the test that now asserts the safe behaviour is what fails otherwise. `Rebasing` is excluded for the same reason: balances move without a transfer, so a quote's input can be stale before it executes.
+
+Four mutations, each caught: `FeeOnTransfer` exact again; `Rebasing` exact; `exactness` ignoring token0; and everything `Approximate`, which is the lazy fix that would pass the negative test alone — `only_standard_semantics_on_both_sides_is_proven` exists to catch exactly that.
+
 **Delivered 2026-09-24.** 8 invariants across two suites; 89 forge tests total.
 
 **The registry suite compares against a shadow model, not against itself.** A

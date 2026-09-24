@@ -140,8 +140,33 @@ pub enum TransferSemantics {
 }
 
 impl TransferSemantics {
-    const fn is_determined(self) -> bool {
-        !matches!(self, Self::Unknown)
+    /// Whether a quote over this token is exact **as the pricing layer is
+    /// written today**.
+    ///
+    /// Only `Standard`. The previous rule was "not `Unknown`", which let a
+    /// *classified* fee-on-transfer token price as exact on the stated
+    /// reasoning that "the engine can price around it". No engine does:
+    /// nothing outside this module has ever read `FeeOnTransfer`'s `bps`, and
+    /// no quote path applies a transfer fee. A token whose fee somebody had
+    /// measured was therefore treated as more trustworthy than one nobody had
+    /// measured, with the measurement unused.
+    ///
+    /// The match is exhaustive on purpose. A sixth variant cannot be added
+    /// without deciding this question, and `FeeOnTransfer` may only move back
+    /// to `true` in the same change that makes a quote apply its `bps` --
+    /// `a_known_fee_on_transfer_token_is_still_shadow_only` is what fails
+    /// otherwise.
+    const fn prices_exactly(self) -> bool {
+        match self {
+            Self::Standard => true,
+            // Eats part of every hop, and nothing subtracts it.
+            Self::FeeOnTransfer { .. } => false,
+            // Balances move without a transfer, so a quote's input can be stale
+            // by the time it executes.
+            Self::Rebasing => false,
+            // Nobody has looked.
+            Self::Unknown => false,
+        }
     }
 }
 
@@ -220,11 +245,12 @@ pub struct PoolAdmission {
 impl PoolAdmission {
     /// INV-17 composed with §7.2: an admitted pool may still be shadow-only.
     ///
-    /// A token whose transfer semantics nobody has determined can silently eat
-    /// part of a hop, and every downstream quote assumes it does not. Ranking
-    /// such a pool is fine; dispatching against it is not.
+    /// A token that eats part of a hop -- whether because nobody classified it
+    /// or because it is a known fee-on-transfer token nothing prices -- makes
+    /// every downstream quote overstate its output. Ranking such a pool is
+    /// fine; dispatching against it is not.
     pub const fn exactness(&self) -> Exactness {
-        if self.transfer_semantics.0.is_determined() && self.transfer_semantics.1.is_determined() {
+        if self.transfer_semantics.0.prices_exactly() && self.transfer_semantics.1.prices_exactly() {
             Exactness::Proven
         } else {
             Exactness::Approximate
