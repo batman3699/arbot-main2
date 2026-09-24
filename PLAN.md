@@ -1322,7 +1322,7 @@ Every invariant below is mapped to implementation, test, monitor, failure respon
 |---|---|---|---|---|---|---|
 | **INV-24** | Only the authorized caller can execute (§35.3) | `ExecutionAuth.onlyExecutor` | `forge` `testOnlyExecutorCanStart` | on-chain event | — | G-SOL-1 |
 | **INV-25** | Only an approved provider can call back (§35.3) | Per-provider callback-sender check + `ctxHash` binding (**existing, KEEP**) | `forge` `testErc3156RevertsWhenCallbackSenderMismatch` and siblings (existing) | — | — | G-SOL-1 |
-| **INV-26** | Only approved venues/pools/tokens/selectors can be called (§26.1, §26.2) | `AdapterRegistry` + `RouteValidator` | `forge` `testAnApprovalCanOnlyEverNameTheResolvedAdapter`, `testAnExecutorCannotRegisterItsOwnTarget`, `testTheOldGenericPayloadNoLongerDecodes` | `unauthorized_adapter_call` | Emergency pause | G-SOL-1 |
+| **INV-26** | Only approved venues/pools/tokens/selectors can be called (§26.1, §26.2) | `AdapterRegistry` + `RouteValidator` | **Target and selector only.** `forge` `testAnApprovalCanOnlyEverNameTheResolvedAdapter`, `testAnExecutorCannotRegisterItsOwnTarget`, `testTheOldGenericPayloadNoLongerDecodes`; `testUnlistedPoolReverts` and `testUnlistedTokenReverts` **do not exist, because the pool and token allowlists do not exist** — see §19.1's four lists against `AdapterRegistry`'s two | `unauthorized_adapter_call` | Emergency pause | G-SOL-1 |
 | **INV-27** | Per-debt-asset repayment: `Balance_after,j ≥ Debt_j + FlashFee_j + RequiredReturn_j` (§26.3) | `ProfitInvariant.assertMultiAsset(Debt[] memory)` | `forge` `testMultiAssetInvariantHolds`, `testPartialRepaymentReverts` (fuzz over asset count and amounts) | revert-class counter | — | G-SOL-1 |
 | **INV-28** | `Profit_realized ≥ MinimumProfit` in the designated profit asset (§26.3) | `ProfitInvariant.assertProfit` | `forge` `testProfitBelowMinimumReverts` (existing, extended) | — | — | G-SOL-1 |
 | **INV-29** | Unaccounted residue cannot create silent loss (§26.3, §26.4) | Terminal state must be all-debt-repaid + required-profit + **exactly zero** allowed residue, or a declared residue path with deterministic accounting | `forge` `testUnaccountedResidueReverts`, `testDeclaredResiduePathAccountsExactly` (fuzz) | residue counter | — | G-SOL-1 |
@@ -4398,6 +4398,32 @@ The substitution is **proved, not argued**. `test/SelectorExtraction.t.sol` keep
 Cost: the executor's runtime grew 57 bytes, 21,199 → **21,256**, leaving 3,320 of EIP-170 margin. `forge test` 107 → 113.
 
 **None of this changes G-SEC-1's status.** Two false positives and one readability fix are not an external security review, and the fourteen Critical `INCORRECT ACCESS CONTROL` instances remain unverifiable while their File Location and Line No. columns read `--`. **R-03 stands.**
+
+#### Located findings for `ProfitInvariant.sol`, supplied 2026-09-25
+
+**`10:4` — "No return: `IERC20Balance.balanceOf(address)` defines a return type but never explicitly returns a value" — false positive.** Line 10 is inside `interface IERC20Balance`. An interface function has no body by definition; there is nothing that could return. Nothing to change.
+
+**`1:1` — "more than one contract per file, 2 contracts found" — true, and left as it is, with the trade-off stated.** The file holds `interface IERC20Balance` alongside `library ProfitInvariant`, and `balanceOf` is indeed declared twice in the tree (here and `MultiVenueArbImplementation.sol:64`).
+
+The tempting fix is not the split but a redesign: have `assertMultiAsset` take each final balance as an argument instead of reading it. The library would become `pure`, the interface would vanish, and the check-effects finding below would evaporate with it. **That is the wrong trade.** A library that reads the balance itself cannot be lied to by its own caller; one that accepts a balance can be handed a stale or fabricated number by the very code whose settlement it is supposed to police. Three duplicated lines of interface are a small price for an invariant that sources its own facts.
+
+**`60:8` — "Potential violation of Checks-Effects-Interaction … could potentially lead to re-entrancy" — false positive as stated, and worth following anyway.**
+
+`assertMultiAsset` is `internal view`. CEI orders state changes against external calls; a `view` function has no state changes to order, so the pattern has no referent here. `IERC20Balance.balanceOf` is declared `view`, so Solidity emits `STATICCALL`, under which no state change is possible at all. There is no reentrancy of the classic kind to have.
+
+**But the prompt points somewhere real.** `assertMultiAsset` calls `balanceOf` on `debt.token`, an address that arrives in the plan — and **nothing allowlists tokens.** Grep across `contracts/` finds no token allowlist and no pool allowlist.
+
+What that is worth, honestly: **little, and only because of defence in depth.** A lying `balanceOf` cannot steal the loan, because every lender enforces repayment independently (ERC-3156 verifies the return, Aave and Balancer verify the balance). It cannot be paid out in a worthless token, because `ProfitTokenNotBorrowed` requires the profit token to be one a lender actually sent. Under `STATICCALL` it cannot write. What remains is gas griefing of our own transaction and read-only reentrancy that can read but not write. None of that is a fund loss, and the finding should not be reported as one.
+
+#### The real defect underneath it: INV-26 is half-enforced, and I marked it covered
+
+§19.1 and §26.1 both specify `AdapterRegistry` as holding **four** allowlists — `adapterId → (target, selector set, pool set, token set)`. It implements **two**: `adapters` and `allowedSelectors`. There is no on-chain pool or token check anywhere in `contracts/`.
+
+INV-26 reads *"only approved venues/pools/tokens/selectors can be called"*. During Task 8.0 I expanded §8's shorthand `testUnlisted{Target,Selector,Pool,Token}Reverts` into three tests that exist — and those three cover targets and selectors. I reconciled a *name* and recorded the invariant as enforced without checking that all four nouns were. **That is precisely the failure the coverage gate exists to catch, committed by the audit that was catching it**, and it is worth more attention than the finding that surfaced it.
+
+Corrected: INV-26's Test column now names `testUnlistedPoolReverts` and `testUnlistedTokenReverts` and states that they do not exist because the allowlists do not. Coverage drops **37 → 36**, and the floor is lowered to match — deliberately, with the reason recorded in `docs/apex/.invariant-floor` itself rather than only in a commit message. The gate now reads its floor from the first non-comment line so that every movement can carry its justification beside the number; a drop still fails the build, which is how this was found.
+
+**Implementing the two missing allowlists is not done here.** Per-adapter pool and token sets change the executor's operational model — every token and pool must be registered before a trade can name it — and that is a design decision with real running costs, not a reflex fix mid-audit. It is exactly the kind of deviation from §26.1 that the G-SEC-1 review should rule on. **Recorded as an open gap; R-03 stands.**
 
 **Delivered 2026-09-24.** 8 invariants across two suites; 89 forge tests total.
 

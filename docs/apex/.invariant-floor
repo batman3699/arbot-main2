@@ -1,1 +1,18 @@
-37
+# The number of PLAN.md §8 invariants whose every named enforcement artefact
+# exists. Raised automatically by scripts/ci/invariant_coverage.sh; a drop fails
+# the build, and lowering it is a deliberate edit that belongs with its reason.
+#
+# 2026-09-24  0 -> 36  The gate was rewritten to see forge tests, CI scripts and
+#                      process gates, not only Rust tests. The "24/54" it had
+#                      been reporting was a number about nothing.
+# 2026-09-24  36 -> 37  INV-40's ledger landed.
+# 2026-09-25  37 -> 36  LOWERED, and the 37 was never true. INV-26 is "only
+#                      approved venues/pools/tokens/selectors can be called".
+#                      I had mapped it to three tests covering targets and
+#                      selectors and marked it covered, without checking that
+#                      pools and tokens were covered too. They are not: §19.1
+#                      gives AdapterRegistry four allowlists and it implements
+#                      two. Reconciling a name is not the same as checking a
+#                      claim, which is the failure this gate exists to catch --
+#                      committed here by the audit that was catching it.
+36

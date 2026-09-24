@@ -85,8 +85,13 @@ while IFS= read -r row; do
   fi
 done < <(section | grep '^| \*\*INV-')
 
+# The floor file carries the number on its first non-comment line, and the
+# reason for every movement in `#` comments above it. A ratchet whose history
+# lives only in `git log` is one nobody reads at the moment it matters -- which
+# is when somebody is deciding whether to lower it.
 floor=0
-[ -f "$FLOOR_FILE" ] && floor=$(cat "$FLOOR_FILE")
+[ -f "$FLOOR_FILE" ] && floor=$(grep -vE '^\s*(#|$)' "$FLOOR_FILE" | head -1)
+floor=${floor:-0}
 
 echo "invariants fully enforced: ${covered}/${rows} (floor ${floor}); ${#uncheckable[@]} name no checkable artefact"
 
@@ -99,7 +104,10 @@ if [ "$covered" -lt "$floor" ]; then
 fi
 
 if [ "$covered" -gt "$floor" ]; then
-  echo "$covered" > "$FLOOR_FILE"
+  # Raising is automatic; lowering is not. A drop fails above, and moving the
+  # number down is a deliberate edit with a `#` reason beside it.
+  { grep -E '^\s*#' "$FLOOR_FILE" 2>/dev/null || true; echo "$covered"; } > "${FLOOR_FILE}.tmp"
+  mv "${FLOOR_FILE}.tmp" "$FLOOR_FILE"
   echo "floor raised to ${covered} -- commit ${FLOOR_FILE}"
 fi
 
