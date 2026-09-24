@@ -7,1343 +7,1262 @@ use ethers::contract::abigen;
 abigen!(
     MultiVenueArbExecutor,
     r#"[
-        {
+            {
                 "type": "constructor",
                 "inputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "_executeSteps",
                 "inputs": [
-                        {
-                                "name": "steps",
-                                "type": "tuple[]",
-                                "internalType": "struct MultiVenueArbImplementation.Step[]",
-                                "components": [
-                                        {
-                                                "name": "op",
-                                                "type": "uint8",
-                                                "internalType": "enum MultiVenueArbImplementation.Op"
-                                        },
-                                        {
-                                                "name": "data",
-                                                "type": "bytes",
-                                                "internalType": "bytes"
-                                        }
-                                ]
-                        },
-                        {
-                                "name": "deadline",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "self",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "vaultAddr",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "steps",
+                        "type": "tuple[]",
+                        "internalType": "struct MultiVenueArbImplementation.Step[]",
+                        "components": [
+                            {
+                                "name": "op",
+                                "type": "uint8",
+                                "internalType": "enum MultiVenueArbImplementation.Op"
+                            },
+                            {
+                                "name": "data",
+                                "type": "bytes",
+                                "internalType": "bytes"
+                            }
+                        ]
+                    },
+                    {
+                        "name": "deadline",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    },
+                    {
+                        "name": "self",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "vaultAddr",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "aavePool",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "contract IAaveV3Pool"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "contract IAaveV3Pool"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "canonicalProfitToken",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "circuitCooldown",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        }
+                    {
+                        "name": "",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "clearCanonicalProfitToken",
                 "inputs": [],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "configAdmins",
                 "inputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "bool",
-                                "internalType": "bool"
-                        }
+                    {
+                        "name": "",
+                        "type": "bool",
+                        "internalType": "bool"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "executeOperation",
                 "inputs": [
-                        {
-                                "name": "asset",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "amount",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "premium",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "initiator",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "params",
-                                "type": "bytes",
-                                "internalType": "bytes"
-                        }
+                    {
+                        "name": "asset",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "amount",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    },
+                    {
+                        "name": "premium",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    },
+                    {
+                        "name": "initiator",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "params",
+                        "type": "bytes",
+                        "internalType": "bytes"
+                    }
                 ],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "bool",
-                                "internalType": "bool"
-                        }
+                    {
+                        "name": "",
+                        "type": "bool",
+                        "internalType": "bool"
+                    }
                 ],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "executors",
                 "inputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "bool",
-                                "internalType": "bool"
-                        }
+                    {
+                        "name": "",
+                        "type": "bool",
+                        "internalType": "bool"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "feeRecipient",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "getConfig",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "feeBps",
-                                "type": "uint16",
-                                "internalType": "uint16"
-                        },
-                        {
-                                "name": "maxSlippageBps",
-                                "type": "uint16",
-                                "internalType": "uint16"
-                        },
-                        {
-                                "name": "deadlineBuffer",
-                                "type": "uint32",
-                                "internalType": "uint32"
-                        }
+                    {
+                        "name": "feeBps",
+                        "type": "uint16",
+                        "internalType": "uint16"
+                    },
+                    {
+                        "name": "maxSlippageBps",
+                        "type": "uint16",
+                        "internalType": "uint16"
+                    },
+                    {
+                        "name": "deadlineBuffer",
+                        "type": "uint32",
+                        "internalType": "uint32"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "initialise",
                 "inputs": [
-                        {
-                                "name": "_owner",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "_vault",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "_uni",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "_aavePool",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "_permit2",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "feeBps",
-                                "type": "uint16",
-                                "internalType": "uint16"
-                        },
-                        {
-                                "name": "maxSlippageBps",
-                                "type": "uint16",
-                                "internalType": "uint16"
-                        },
-                        {
-                                "name": "deadlineBuffer",
-                                "type": "uint32",
-                                "internalType": "uint32"
-                        }
+                    {
+                        "name": "_owner",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "_vault",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "_uni",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "_aavePool",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "_permit2",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "feeBps",
+                        "type": "uint16",
+                        "internalType": "uint16"
+                    },
+                    {
+                        "name": "maxSlippageBps",
+                        "type": "uint16",
+                        "internalType": "uint16"
+                    },
+                    {
+                        "name": "deadlineBuffer",
+                        "type": "uint32",
+                        "internalType": "uint32"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "isCircuitOpen",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "bool",
-                                "internalType": "bool"
-                        }
+                    {
+                        "name": "",
+                        "type": "bool",
+                        "internalType": "bool"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "lastCircuitTrip",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        }
+                    {
+                        "name": "",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
-                "type": "function",
-                "name": "moduleExecBridge",
-                "inputs": [
-                        {
-                                "name": "data",
-                                "type": "bytes",
-                                "internalType": "bytes"
-                        }
-                ],
-                "outputs": [],
-                "stateMutability": "nonpayable"
-        },
-        {
-                "type": "function",
-                "name": "moduleExecGeneric",
-                "inputs": [
-                        {
-                                "name": "data",
-                                "type": "bytes",
-                                "internalType": "bytes"
-                        }
-                ],
-                "outputs": [],
-                "stateMutability": "nonpayable"
-        },
-        {
-                "type": "function",
-                "name": "moduleExecJit",
-                "inputs": [
-                        {
-                                "name": "op",
-                                "type": "uint8",
-                                "internalType": "uint8"
-                        },
-                        {
-                                "name": "data",
-                                "type": "bytes",
-                                "internalType": "bytes"
-                        },
-                        {
-                                "name": "deadline",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        }
-                ],
-                "outputs": [],
-                "stateMutability": "nonpayable"
-        },
-        {
-                "type": "function",
-                "name": "moduleExecSwap",
-                "inputs": [
-                        {
-                                "name": "op",
-                                "type": "uint8",
-                                "internalType": "uint8"
-                        },
-                        {
-                                "name": "data",
-                                "type": "bytes",
-                                "internalType": "bytes"
-                        },
-                        {
-                                "name": "deadline",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "recipient",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "vaultAddr",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "address"
-                        }
-                ],
-                "outputs": [],
-                "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "onFlashLoan",
                 "inputs": [
-                        {
-                                "name": "initiator",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "token",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "amount",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "fee",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "data",
-                                "type": "bytes",
-                                "internalType": "bytes"
-                        }
+                    {
+                        "name": "initiator",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "token",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "amount",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    },
+                    {
+                        "name": "fee",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    },
+                    {
+                        "name": "data",
+                        "type": "bytes",
+                        "internalType": "bytes"
+                    }
                 ],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "bytes32",
-                                "internalType": "bytes32"
-                        }
+                    {
+                        "name": "",
+                        "type": "bytes32",
+                        "internalType": "bytes32"
+                    }
                 ],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "owner",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "permit2",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "contract IPermit2"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "contract IPermit2"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "profitRecipient",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "receiveFlashLoan",
                 "inputs": [
-                        {
-                                "name": "tokens",
-                                "type": "address[]",
-                                "internalType": "address[]"
-                        },
-                        {
-                                "name": "amounts",
-                                "type": "uint256[]",
-                                "internalType": "uint256[]"
-                        },
-                        {
-                                "name": "fees",
-                                "type": "uint256[]",
-                                "internalType": "uint256[]"
-                        },
-                        {
-                                "name": "userData",
-                                "type": "bytes",
-                                "internalType": "bytes"
-                        }
+                    {
+                        "name": "tokens",
+                        "type": "address[]",
+                        "internalType": "address[]"
+                    },
+                    {
+                        "name": "amounts",
+                        "type": "uint256[]",
+                        "internalType": "uint256[]"
+                    },
+                    {
+                        "name": "fees",
+                        "type": "uint256[]",
+                        "internalType": "uint256[]"
+                    },
+                    {
+                        "name": "userData",
+                        "type": "bytes",
+                        "internalType": "bytes"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "resetCircuit",
                 "inputs": [],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "setCanonicalProfitToken",
                 "inputs": [
-                        {
-                                "name": "token",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "token",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "setCircuitCooldown",
                 "inputs": [
-                        {
-                                "name": "_cooldown",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        }
+                    {
+                        "name": "_cooldown",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "setConfigAdmin",
                 "inputs": [
-                        {
-                                "name": "account",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "allowed",
-                                "type": "bool",
-                                "internalType": "bool"
-                        }
+                    {
+                        "name": "account",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "allowed",
+                        "type": "bool",
+                        "internalType": "bool"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "setExecutor",
                 "inputs": [
-                        {
-                                "name": "account",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "allowed",
-                                "type": "bool",
-                                "internalType": "bool"
-                        }
+                    {
+                        "name": "account",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "allowed",
+                        "type": "bool",
+                        "internalType": "bool"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "setFeeRecipient",
                 "inputs": [
-                        {
-                                "name": "recipient",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "recipient",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "setProfitRecipient",
                 "inputs": [
-                        {
-                                "name": "recipient",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "recipient",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "setTokenApprovals",
                 "inputs": [
-                        {
-                                "name": "approvals",
-                                "type": "tuple[]",
-                                "internalType": "struct MultiVenueArbImplementation.TokenApproval[]",
-                                "components": [
-                                        {
-                                                "name": "token",
-                                                "type": "address",
-                                                "internalType": "address"
-                                        },
-                                        {
-                                                "name": "spender",
-                                                "type": "address",
-                                                "internalType": "address"
-                                        },
-                                        {
-                                                "name": "amount",
-                                                "type": "uint256",
-                                                "internalType": "uint256"
-                                        }
-                                ]
-                        }
-                ],
-                "outputs": [],
-                "stateMutability": "nonpayable"
-        },
-        {
-                "type": "function",
-                "name": "setUniswapV2FlashFeeBps",
-                "inputs": [
-                        {
-                                "name": "pair",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "feeBps",
-                                "type": "uint16",
-                                "internalType": "uint16"
-                        }
-                ],
-                "outputs": [],
-                "stateMutability": "nonpayable"
-        },
-        {
-                "type": "function",
-                "name": "start",
-                "inputs": [
-                        {
-                                "name": "p",
-                                "type": "tuple",
-                                "internalType": "struct MultiVenueArbImplementation.PlanLegacy",
-                                "components": [
-                                        {
-                                                "name": "loanToken",
-                                                "type": "address",
-                                                "internalType": "address"
-                                        },
-                                        {
-                                                "name": "amountIn",
-                                                "type": "uint256",
-                                                "internalType": "uint256"
-                                        },
-                                        {
-                                                "name": "loanProvider",
-                                                "type": "uint8",
-                                                "internalType": "enum MultiVenueArbImplementation.LoanProvider"
-                                        },
-                                        {
-                                                "name": "cycleSlippageBps",
-                                                "type": "uint16",
-                                                "internalType": "uint16"
-                                        },
-                                        {
-                                                "name": "steps",
-                                                "type": "tuple[]",
-                                                "internalType": "struct MultiVenueArbImplementation.Step[]",
-                                                "components": [
-                                                        {
-                                                                "name": "op",
-                                                                "type": "uint8",
-                                                                "internalType": "enum MultiVenueArbImplementation.Op"
-                                                        },
-                                                        {
-                                                                "name": "data",
-                                                                "type": "bytes",
-                                                                "internalType": "bytes"
-                                                        }
-                                                ]
-                                        },
-                                        {
-                                                "name": "minProfit",
-                                                "type": "uint256",
-                                                "internalType": "uint256"
-                                        }
-                                ]
-                        }
-                ],
-                "outputs": [
-                        {
-                                "name": "grossProfit",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        }
-                ],
-                "stateMutability": "nonpayable"
-        },
-        {
-                "type": "function",
-                "name": "startLegacy",
-                "inputs": [
-                        {
-                                "name": "p",
-                                "type": "tuple",
-                                "internalType": "struct MultiVenueArbImplementation.PlanLegacy",
-                                "components": [
-                                        {
-                                                "name": "loanToken",
-                                                "type": "address",
-                                                "internalType": "address"
-                                        },
-                                        {
-                                                "name": "amountIn",
-                                                "type": "uint256",
-                                                "internalType": "uint256"
-                                        },
-                                        {
-                                                "name": "loanProvider",
-                                                "type": "uint8",
-                                                "internalType": "enum MultiVenueArbImplementation.LoanProvider"
-                                        },
-                                        {
-                                                "name": "cycleSlippageBps",
-                                                "type": "uint16",
-                                                "internalType": "uint16"
-                                        },
-                                        {
-                                                "name": "steps",
-                                                "type": "tuple[]",
-                                                "internalType": "struct MultiVenueArbImplementation.Step[]",
-                                                "components": [
-                                                        {
-                                                                "name": "op",
-                                                                "type": "uint8",
-                                                                "internalType": "enum MultiVenueArbImplementation.Op"
-                                                        },
-                                                        {
-                                                                "name": "data",
-                                                                "type": "bytes",
-                                                                "internalType": "bytes"
-                                                        }
-                                                ]
-                                        },
-                                        {
-                                                "name": "minProfit",
-                                                "type": "uint256",
-                                                "internalType": "uint256"
-                                        }
-                                ]
-                        }
-                ],
-                "outputs": [],
-                "stateMutability": "nonpayable"
-        },
-        {
-                "type": "function",
-                "name": "startV2",
-                "inputs": [
-                        {
-                                "name": "p",
-                                "type": "tuple",
-                                "internalType": "struct MultiVenueArbImplementation.PlanV2",
-                                "components": [
-                                        {
-                                                "name": "loans",
-                                                "type": "tuple[]",
-                                                "internalType": "struct MultiVenueArbImplementation.Loan[]",
-                                                "components": [
-                                                        {
-                                                                "name": "token",
-                                                                "type": "address",
-                                                                "internalType": "address"
-                                                        },
-                                                        {
-                                                                "name": "amount",
-                                                                "type": "uint256",
-                                                                "internalType": "uint256"
-                                                        },
-                                                        {
-                                                                "name": "provider",
-                                                                "type": "uint8",
-                                                                "internalType": "enum MultiVenueArbImplementation.LoanProvider"
-                                                        },
-                                                        {
-                                                                "name": "providerAddr",
-                                                                "type": "address",
-                                                                "internalType": "address"
-                                                        }
-                                                ]
-                                        },
-                                        {
-                                                "name": "cycleSlippageBps",
-                                                "type": "uint16",
-                                                "internalType": "uint16"
-                                        },
-                                        {
-                                                "name": "steps",
-                                                "type": "tuple[]",
-                                                "internalType": "struct MultiVenueArbImplementation.Step[]",
-                                                "components": [
-                                                        {
-                                                                "name": "op",
-                                                                "type": "uint8",
-                                                                "internalType": "enum MultiVenueArbImplementation.Op"
-                                                        },
-                                                        {
-                                                                "name": "data",
-                                                                "type": "bytes",
-                                                                "internalType": "bytes"
-                                                        }
-                                                ]
-                                        },
-                                        {
-                                                "name": "minProfit",
-                                                "type": "uint256",
-                                                "internalType": "uint256"
-                                        }
-                                ]
-                        }
-                ],
-                "outputs": [
-                        {
-                                "name": "grossProfit",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        }
-                ],
-                "stateMutability": "nonpayable"
-        },
-        {
-                "type": "function",
-                "name": "sweep",
-                "inputs": [
-                        {
+                    {
+                        "name": "approvals",
+                        "type": "tuple[]",
+                        "internalType": "struct MultiVenueArbImplementation.TokenApproval[]",
+                        "components": [
+                            {
                                 "name": "token",
                                 "type": "address",
                                 "internalType": "address"
-                        },
-                        {
-                                "name": "to",
+                            },
+                            {
+                                "name": "spender",
                                 "type": "address",
                                 "internalType": "address"
-                        },
-                        {
+                            },
+                            {
                                 "name": "amount",
                                 "type": "uint256",
                                 "internalType": "uint256"
-                        }
+                            }
+                        ]
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
+                "type": "function",
+                "name": "setUniswapV2FlashFeeBps",
+                "inputs": [
+                    {
+                        "name": "pair",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "feeBps",
+                        "type": "uint16",
+                        "internalType": "uint16"
+                    }
+                ],
+                "outputs": [],
+                "stateMutability": "nonpayable"
+            },
+            {
+                "type": "function",
+                "name": "start",
+                "inputs": [
+                    {
+                        "name": "p",
+                        "type": "tuple",
+                        "internalType": "struct MultiVenueArbImplementation.PlanLegacy",
+                        "components": [
+                            {
+                                "name": "loanToken",
+                                "type": "address",
+                                "internalType": "address"
+                            },
+                            {
+                                "name": "amountIn",
+                                "type": "uint256",
+                                "internalType": "uint256"
+                            },
+                            {
+                                "name": "loanProvider",
+                                "type": "uint8",
+                                "internalType": "enum MultiVenueArbImplementation.LoanProvider"
+                            },
+                            {
+                                "name": "cycleSlippageBps",
+                                "type": "uint16",
+                                "internalType": "uint16"
+                            },
+                            {
+                                "name": "steps",
+                                "type": "tuple[]",
+                                "internalType": "struct MultiVenueArbImplementation.Step[]",
+                                "components": [
+                                    {
+                                        "name": "op",
+                                        "type": "uint8",
+                                        "internalType": "enum MultiVenueArbImplementation.Op"
+                                    },
+                                    {
+                                        "name": "data",
+                                        "type": "bytes",
+                                        "internalType": "bytes"
+                                    }
+                                ]
+                            },
+                            {
+                                "name": "minProfit",
+                                "type": "uint256",
+                                "internalType": "uint256"
+                            }
+                        ]
+                    }
+                ],
+                "outputs": [
+                    {
+                        "name": "grossProfit",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    }
+                ],
+                "stateMutability": "nonpayable"
+            },
+            {
+                "type": "function",
+                "name": "startLegacy",
+                "inputs": [
+                    {
+                        "name": "p",
+                        "type": "tuple",
+                        "internalType": "struct MultiVenueArbImplementation.PlanLegacy",
+                        "components": [
+                            {
+                                "name": "loanToken",
+                                "type": "address",
+                                "internalType": "address"
+                            },
+                            {
+                                "name": "amountIn",
+                                "type": "uint256",
+                                "internalType": "uint256"
+                            },
+                            {
+                                "name": "loanProvider",
+                                "type": "uint8",
+                                "internalType": "enum MultiVenueArbImplementation.LoanProvider"
+                            },
+                            {
+                                "name": "cycleSlippageBps",
+                                "type": "uint16",
+                                "internalType": "uint16"
+                            },
+                            {
+                                "name": "steps",
+                                "type": "tuple[]",
+                                "internalType": "struct MultiVenueArbImplementation.Step[]",
+                                "components": [
+                                    {
+                                        "name": "op",
+                                        "type": "uint8",
+                                        "internalType": "enum MultiVenueArbImplementation.Op"
+                                    },
+                                    {
+                                        "name": "data",
+                                        "type": "bytes",
+                                        "internalType": "bytes"
+                                    }
+                                ]
+                            },
+                            {
+                                "name": "minProfit",
+                                "type": "uint256",
+                                "internalType": "uint256"
+                            }
+                        ]
+                    }
+                ],
+                "outputs": [],
+                "stateMutability": "nonpayable"
+            },
+            {
+                "type": "function",
+                "name": "startV2",
+                "inputs": [
+                    {
+                        "name": "p",
+                        "type": "tuple",
+                        "internalType": "struct MultiVenueArbImplementation.PlanV2",
+                        "components": [
+                            {
+                                "name": "loans",
+                                "type": "tuple[]",
+                                "internalType": "struct MultiVenueArbImplementation.Loan[]",
+                                "components": [
+                                    {
+                                        "name": "token",
+                                        "type": "address",
+                                        "internalType": "address"
+                                    },
+                                    {
+                                        "name": "amount",
+                                        "type": "uint256",
+                                        "internalType": "uint256"
+                                    },
+                                    {
+                                        "name": "provider",
+                                        "type": "uint8",
+                                        "internalType": "enum MultiVenueArbImplementation.LoanProvider"
+                                    },
+                                    {
+                                        "name": "providerAddr",
+                                        "type": "address",
+                                        "internalType": "address"
+                                    }
+                                ]
+                            },
+                            {
+                                "name": "cycleSlippageBps",
+                                "type": "uint16",
+                                "internalType": "uint16"
+                            },
+                            {
+                                "name": "steps",
+                                "type": "tuple[]",
+                                "internalType": "struct MultiVenueArbImplementation.Step[]",
+                                "components": [
+                                    {
+                                        "name": "op",
+                                        "type": "uint8",
+                                        "internalType": "enum MultiVenueArbImplementation.Op"
+                                    },
+                                    {
+                                        "name": "data",
+                                        "type": "bytes",
+                                        "internalType": "bytes"
+                                    }
+                                ]
+                            },
+                            {
+                                "name": "minProfit",
+                                "type": "uint256",
+                                "internalType": "uint256"
+                            }
+                        ]
+                    }
+                ],
+                "outputs": [
+                    {
+                        "name": "grossProfit",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    }
+                ],
+                "stateMutability": "nonpayable"
+            },
+            {
+                "type": "function",
+                "name": "sweep",
+                "inputs": [
+                    {
+                        "name": "token",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "to",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "amount",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    }
+                ],
+                "outputs": [],
+                "stateMutability": "nonpayable"
+            },
+            {
                 "type": "function",
                 "name": "transferOwnership",
                 "inputs": [
-                        {
-                                "name": "newOwner",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "newOwner",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "tripCircuit",
                 "inputs": [],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "uniV3",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "contract ISwapRouter02"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "contract ISwapRouter02"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "uniswapV2Call",
                 "inputs": [
-                        {
-                                "name": "sender",
-                                "type": "address",
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "amount0",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "amount1",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "data",
-                                "type": "bytes",
-                                "internalType": "bytes"
-                        }
+                    {
+                        "name": "sender",
+                        "type": "address",
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "amount0",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    },
+                    {
+                        "name": "amount1",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    },
+                    {
+                        "name": "data",
+                        "type": "bytes",
+                        "internalType": "bytes"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "uniswapV2FlashFeeBps",
                 "inputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "address"
+                    }
                 ],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "uint16",
-                                "internalType": "uint16"
-                        }
+                    {
+                        "name": "",
+                        "type": "uint16",
+                        "internalType": "uint16"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "uniswapV3FlashCallback",
                 "inputs": [
-                        {
-                                "name": "fee0",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "fee1",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "data",
-                                "type": "bytes",
-                                "internalType": "bytes"
-                        }
+                    {
+                        "name": "fee0",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    },
+                    {
+                        "name": "fee1",
+                        "type": "uint256",
+                        "internalType": "uint256"
+                    },
+                    {
+                        "name": "data",
+                        "type": "bytes",
+                        "internalType": "bytes"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
-                "type": "function",
-                "name": "uniswapV3MintCallback",
-                "inputs": [
-                        {
-                                "name": "amount0",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "amount1",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "data",
-                                "type": "bytes",
-                                "internalType": "bytes"
-                        }
-                ],
-                "outputs": [],
-                "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "updateConfig",
                 "inputs": [
-                        {
-                                "name": "feeBps",
-                                "type": "uint16",
-                                "internalType": "uint16"
-                        },
-                        {
-                                "name": "maxSlippageBps",
-                                "type": "uint16",
-                                "internalType": "uint16"
-                        },
-                        {
-                                "name": "deadlineBuffer",
-                                "type": "uint32",
-                                "internalType": "uint32"
-                        }
+                    {
+                        "name": "feeBps",
+                        "type": "uint16",
+                        "internalType": "uint16"
+                    },
+                    {
+                        "name": "maxSlippageBps",
+                        "type": "uint16",
+                        "internalType": "uint16"
+                    },
+                    {
+                        "name": "deadlineBuffer",
+                        "type": "uint32",
+                        "internalType": "uint32"
+                    }
                 ],
                 "outputs": [],
                 "stateMutability": "nonpayable"
-        },
-        {
+            },
+            {
                 "type": "function",
                 "name": "vault",
                 "inputs": [],
                 "outputs": [
-                        {
-                                "name": "",
-                                "type": "address",
-                                "internalType": "contract IBalancerVault"
-                        }
+                    {
+                        "name": "",
+                        "type": "address",
+                        "internalType": "contract IBalancerVault"
+                    }
                 ],
                 "stateMutability": "view"
-        },
-        {
-                "type": "event",
-                "name": "BridgeExecuted",
-                "inputs": [
-                        {
-                                "name": "bridge",
-                                "type": "address",
-                                "indexed": true,
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "transferId",
-                                "type": "bytes32",
-                                "indexed": true,
-                                "internalType": "bytes32"
-                        },
-                        {
-                                "name": "feePaid",
-                                "type": "uint256",
-                                "indexed": false,
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "elapsed",
-                                "type": "uint256",
-                                "indexed": false,
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "targetChainId",
-                                "type": "uint256",
-                                "indexed": false,
-                                "internalType": "uint256"
-                        }
-                ],
-                "anonymous": false
-        },
-        {
+            },
+            {
                 "type": "event",
                 "name": "CanonicalProfitTokenUpdated",
                 "inputs": [
-                        {
-                                "name": "token",
-                                "type": "address",
-                                "indexed": true,
-                                "internalType": "address"
-                        }
+                    {
+                        "name": "token",
+                        "type": "address",
+                        "indexed": true,
+                        "internalType": "address"
+                    }
                 ],
                 "anonymous": false
-        },
-        {
+            },
+            {
                 "type": "event",
                 "name": "CircuitReset",
                 "inputs": [
-                        {
-                                "name": "timestamp",
-                                "type": "uint256",
-                                "indexed": false,
-                                "internalType": "uint256"
-                        }
+                    {
+                        "name": "timestamp",
+                        "type": "uint256",
+                        "indexed": false,
+                        "internalType": "uint256"
+                    }
                 ],
                 "anonymous": false
-        },
-        {
+            },
+            {
                 "type": "event",
                 "name": "CircuitTripped",
                 "inputs": [
-                        {
-                                "name": "timestamp",
-                                "type": "uint256",
-                                "indexed": false,
-                                "internalType": "uint256"
-                        }
+                    {
+                        "name": "timestamp",
+                        "type": "uint256",
+                        "indexed": false,
+                        "internalType": "uint256"
+                    }
                 ],
                 "anonymous": false
-        },
-        {
+            },
+            {
                 "type": "event",
                 "name": "ConfigAdminUpdated",
                 "inputs": [
-                        {
-                                "name": "account",
-                                "type": "address",
-                                "indexed": true,
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "allowed",
-                                "type": "bool",
-                                "indexed": false,
-                                "internalType": "bool"
-                        }
+                    {
+                        "name": "account",
+                        "type": "address",
+                        "indexed": true,
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "allowed",
+                        "type": "bool",
+                        "indexed": false,
+                        "internalType": "bool"
+                    }
                 ],
                 "anonymous": false
-        },
-        {
+            },
+            {
                 "type": "event",
                 "name": "ConfigUpdated",
                 "inputs": [
-                        {
-                                "name": "feeBps",
-                                "type": "uint16",
-                                "indexed": false,
-                                "internalType": "uint16"
-                        },
-                        {
-                                "name": "maxSlippageBps",
-                                "type": "uint16",
-                                "indexed": false,
-                                "internalType": "uint16"
-                        },
-                        {
-                                "name": "deadlineBuffer",
-                                "type": "uint32",
-                                "indexed": false,
-                                "internalType": "uint32"
-                        }
+                    {
+                        "name": "feeBps",
+                        "type": "uint16",
+                        "indexed": false,
+                        "internalType": "uint16"
+                    },
+                    {
+                        "name": "maxSlippageBps",
+                        "type": "uint16",
+                        "indexed": false,
+                        "internalType": "uint16"
+                    },
+                    {
+                        "name": "deadlineBuffer",
+                        "type": "uint32",
+                        "indexed": false,
+                        "internalType": "uint32"
+                    }
                 ],
                 "anonymous": false
-        },
-        {
+            },
+            {
                 "type": "event",
                 "name": "ExecutorUpdated",
                 "inputs": [
-                        {
-                                "name": "account",
-                                "type": "address",
-                                "indexed": true,
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "allowed",
-                                "type": "bool",
-                                "indexed": false,
-                                "internalType": "bool"
-                        }
+                    {
+                        "name": "account",
+                        "type": "address",
+                        "indexed": true,
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "allowed",
+                        "type": "bool",
+                        "indexed": false,
+                        "internalType": "bool"
+                    }
                 ],
                 "anonymous": false
-        },
-        {
+            },
+            {
                 "type": "event",
                 "name": "ProfitRealised",
                 "inputs": [
-                        {
-                                "name": "token",
-                                "type": "address",
-                                "indexed": true,
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "grossProfit",
-                                "type": "uint256",
-                                "indexed": false,
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "ownerFee",
-                                "type": "uint256",
-                                "indexed": false,
-                                "internalType": "uint256"
-                        }
+                    {
+                        "name": "token",
+                        "type": "address",
+                        "indexed": true,
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "grossProfit",
+                        "type": "uint256",
+                        "indexed": false,
+                        "internalType": "uint256"
+                    },
+                    {
+                        "name": "ownerFee",
+                        "type": "uint256",
+                        "indexed": false,
+                        "internalType": "uint256"
+                    }
                 ],
                 "anonymous": false
-        },
-        {
+            },
+            {
                 "type": "event",
                 "name": "TokenApprovalSet",
                 "inputs": [
-                        {
-                                "name": "token",
-                                "type": "address",
-                                "indexed": true,
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "spender",
-                                "type": "address",
-                                "indexed": true,
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "amount",
-                                "type": "uint256",
-                                "indexed": false,
-                                "internalType": "uint256"
-                        }
+                    {
+                        "name": "token",
+                        "type": "address",
+                        "indexed": true,
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "spender",
+                        "type": "address",
+                        "indexed": true,
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "amount",
+                        "type": "uint256",
+                        "indexed": false,
+                        "internalType": "uint256"
+                    }
                 ],
                 "anonymous": false
-        },
-        {
+            },
+            {
                 "type": "event",
                 "name": "UniswapV2FlashFeeBpsUpdated",
                 "inputs": [
-                        {
-                                "name": "pair",
-                                "type": "address",
-                                "indexed": true,
-                                "internalType": "address"
-                        },
-                        {
-                                "name": "feeBps",
-                                "type": "uint16",
-                                "indexed": false,
-                                "internalType": "uint16"
-                        }
+                    {
+                        "name": "pair",
+                        "type": "address",
+                        "indexed": true,
+                        "internalType": "address"
+                    },
+                    {
+                        "name": "feeBps",
+                        "type": "uint16",
+                        "indexed": false,
+                        "internalType": "uint16"
+                    }
                 ],
                 "anonymous": false
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "AlreadyInitialised",
                 "inputs": []
-        },
-        {
-                "type": "error",
-                "name": "BridgeFailed",
-                "inputs": []
-        },
-        {
-                "type": "error",
-                "name": "BridgeTimeout",
-                "inputs": [
-                        {
-                                "name": "elapsed",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        },
-                        {
-                                "name": "maxDuration",
-                                "type": "uint256",
-                                "internalType": "uint256"
-                        }
-                ]
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "CircuitOpen",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "EmptyRevertData",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidAavePool",
                 "inputs": []
-        },
-        {
-                "type": "error",
-                "name": "InvalidBridge",
-                "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidCanonicalProfitToken",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidDeadline",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidFeeBps",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidGenericAction",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidLoanCount",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidMaxSlippage",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidOwner",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidPermit2",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidProviderAddress",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidRoleAccount",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidRouter",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "InvalidVault",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "NotConfigAdmin",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "NotExecutor",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "NotOwner",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "Permit2AmountOverflow",
                 "inputs": []
-        },
-        {
+            },
+            {
                 "type": "error",
                 "name": "UnsupportedPlanVersion",
                 "inputs": []
-        }
-]"#,
+            }
+        ]"#,
 );
 
 pub use multi_venue_arb_executor::{
     Loan as ExecutorLoan, PlanLegacy as ExecutorPlanLegacy, PlanV2 as ExecutorPlan,
     Step as ExecutorStep,
 };
+
+#[cfg(test)]
+mod abi_matches_the_contract {
+    /// **The ABI must not declare what the executor does not.**
+    ///
+    /// `apex_venues::revert::the_executor_really_declares_these_errors` guards
+    /// the error list this way already. Nothing guarded the rest, and it had
+    /// drifted: Phase 5 removed the bridge and JIT paths and left
+    /// `BridgeFailed`, `BridgeTimeout`, `InvalidBridge`, `BridgeExecuted`,
+    /// `moduleExecBridge`, `moduleExecJit` and `uniswapV3MintCallback` behind
+    /// here, and Task 5.5 added `moduleExecGeneric` and `moduleExecSwap` to the
+    /// pile. Nine dead entries, found only because an audit finding pointed at
+    /// the trampolines.
+    ///
+    /// A dead entry is not inert. `abigen!` generates a callable binding for
+    /// it, so the Rust side keeps offering a function the chain will answer
+    /// with a bare revert -- the same shape as §6.5's "written but never
+    /// wired", arriving from the other direction.
+    ///
+    /// This does **not** check the converse. An executor function missing from
+    /// the ABI is a feature we simply do not call yet, which is normal; a
+    /// binding for something that no longer exists is not.
+    #[test]
+    fn the_abi_declares_nothing_the_executor_lacks() {
+        let root = format!("{}/../../contracts", env!("CARGO_MANIFEST_DIR"));
+        let mut sol = String::new();
+        collect_sol(std::path::Path::new(&root), &mut sol);
+        assert!(!sol.is_empty(), "no Solidity found at {root} -- test is broken");
+
+        // This test lives in the file it parses, so the search is bounded to
+        // the part above it -- `rfind(']')` over the whole file finds a bracket
+        // in this module's own source, which is how the first draft failed.
+        let whole = include_str!("abi.rs");
+        let src = &whole[..whole.find("#[cfg(test)]").unwrap_or(whole.len())];
+        let start = src.find('[').expect("the abigen! JSON array");
+        let end = src.rfind(']').expect("the abigen! JSON array") + 1;
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(&src[start..end]).expect("abi.rs holds valid JSON");
+        assert!(items.len() > 40, "parsed {} entries -- the parser is broken", items.len());
+
+        // A `public` state variable generates a getter, so the name is
+        // declared even though no `function` line spells it out.
+        let public_vars: Vec<String> = sol
+            .split("public")
+            .skip(1)
+            .filter_map(|rest| {
+                let word: String =
+                    rest.trim_start().chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                (!word.is_empty()).then_some(word)
+            })
+            .collect();
+
+        let mut dead = Vec::new();
+        for item in &items {
+            let (Some(kind), Some(name)) =
+                (item.get("type").and_then(|v| v.as_str()), item.get("name").and_then(|v| v.as_str()))
+            else {
+                continue;
+            };
+            if !matches!(kind, "function" | "error" | "event") {
+                continue;
+            }
+            if sol.contains(&format!("{kind} {name}")) {
+                continue;
+            }
+            if kind == "function" && public_vars.iter().any(|v| v == name) {
+                continue;
+            }
+            dead.push(format!("{kind} {name}"));
+        }
+        assert!(
+            dead.is_empty(),
+            "the ABI declares {} thing(s) no contract does -- either they were \
+             removed from Solidity and left here, or renamed: {dead:?}",
+            dead.len()
+        );
+    }
+
+    fn collect_sol(dir: &std::path::Path, out: &mut String) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_sol(&p, out);
+            } else if p.extension().is_some_and(|x| x == "sol") {
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    out.push_str(&text);
+                }
+            }
+        }
+    }
+}

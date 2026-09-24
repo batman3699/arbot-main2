@@ -4270,7 +4270,37 @@ Executor now 21,199 bytes, 3,377 of margin — 86% of EIP-170, still above Phase
 
 ### Task 5.5 — Remove excluded features (C-03, C-04)
 
-> **INCOMPLETE, found 2026-09-25.** JIT and bridge went; `contracts/executor/steps/{GenericExecutor,SwapExecutor}.sol` did not, and §4.5 dispositions the whole `steps/*.sol` trampoline set as REMOVE. They are still constructor-deployed and still dispatched to, and since `_execAdapter` moved into the implementation they are pure indirection — a `delegatecall` into a two-line contract that calls straight back. See the G-SEC-1 findings log under Task 5.6 Step 3.
+**Completed 2026-09-25.** JIT and bridge went in Phase 5; `contracts/executor/steps/{GenericExecutor,SwapExecutor}.sol` did not, though §4.5 dispositions the whole trampoline set as REMOVE. Found by following a SolidityScan gas finding that pointed at `GenericExecutor.execute`.
+
+**They had stopped doing anything.** The modules were a **contract-size** workaround (B-1b): four `immutable`, constructor-deployed contracts, `delegatecall`ed by `Op`. Once Task 5.1 moved the adapter path into `_execAdapter` — an `internal` function of the implementation — every step was taking two extra hops to reach code that was already local:
+
+```text
+_executeSteps  --delegatecall-->  GenericExecutor.execute   (runs in OUR storage)
+               --external call-->  this.moduleExecGeneric(data)
+                           -->  _execAdapter(data)          <- line 912, always here
+```
+
+`_executeSteps` now calls `_execUniswap`, `_execBalancer` and `_execAdapter` directly. `moduleExecSwap`, `moduleExecGeneric`, both `immutable` module addresses, both constructor deployments and both module contracts are gone.
+
+**Measured, which is why the task was worth doing rather than merely tidy:**
+
+| | Before | After | Δ |
+|---|---|---|---|
+| Executor runtime | 21,256 | **20,732** | −524 |
+| Executor init | 22,528 | **20,783** | −1,745 |
+| Deployment gas | 4,993,799 | **4,603,772** | **−390,027 (−7.8%)** |
+| EIP-170 margin | 3,320 | **3,844** | +524 |
+| `SwapExecutor` + `GenericExecutor` | 967 bytes deployed | **not deployed** | — |
+| Gas per GENERIC step | — | — | **≈ −3,200** |
+| Deployable contracts | 21 | 19 | −2 |
+
+**Behaviour pinned before the change, not after.** `test/StepDispatch.t.sol` was written against the trampolines and made green there, so "nothing changed" is a measurement. Seven properties: each op reaches its handler, every step runs and in order, an empty list settles, a failing later step aborts everything, `_executeSteps` refuses an outside caller, and — the one most at risk — **a custom error survives the trip out with its arguments**. Revert data used to cross a `delegatecall` boundary and be re-raised by hand with `assembly { revert(add(ret, 0x20), mload(ret)) }`; it now propagates natively. A test asserting only *that* something reverted would not have noticed an error losing its arguments, so two tests assert the arguments — one single-argument, one two-argument raised a frame deeper.
+
+That hand-written re-raise is also **a third assembly block removed from security-critical code this week**. Two remain in the executor and both earn their place: the single `safeCall` revert re-raise that `check_no_generic_call.sh` counts, and a packed-path address read.
+
+**A second drift, found while checking nothing else depended on the modules.** `crates/arb-exec-legacy/src/abi.rs` still declared **nine** things the executor does not: `BridgeFailed`, `BridgeTimeout`, `InvalidBridge`, `BridgeExecuted`, `moduleExecBridge`, `moduleExecJit` and `uniswapV3MintCallback` — all left behind by Phase 5's bridge and JIT removal — plus `moduleExecGeneric` and `moduleExecSwap` from this task. `abigen!` generates a callable binding for each, so the Rust side kept offering functions the chain would answer with a bare revert: §6.5's "written but never wired", arriving from the other direction.
+
+Removed, and guarded. `abi_matches_the_contract::the_abi_declares_nothing_the_executor_lacks` walks the ABI and fails on anything no `.sol` file declares, accounting for the getters that `public` state variables generate. It deliberately does **not** check the converse — an executor function absent from the ABI is a feature we have not wired yet, which is normal; a binding for something that no longer exists is not. `apex_venues::revert::the_executor_really_declares_these_errors` already guarded the error list this way; nothing guarded the rest. Mutation-tested by putting a dead entry back.
 
 **Done FIRST, before Task 5.1, and the reordering is measured rather than
 stylistic.** `MultiVenueArbImplementation` had **173 bytes** of EIP-170 margin

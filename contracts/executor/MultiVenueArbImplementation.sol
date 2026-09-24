@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.21;
 
-import {SwapExecutor} from "./steps/SwapExecutor.sol";
-import {GenericExecutor} from "./steps/GenericExecutor.sol";
 import {AdapterRegistry, UnknownAdapter} from "../core/AdapterRegistry.sol";
 import {ProfitInvariant} from "../core/ProfitInvariant.sol";
 import {FullMath} from "../libraries/FullMath.sol";
@@ -304,8 +302,6 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
     mapping(address => bool) public configAdmins;
     mapping(address => uint16) public uniswapV2FlashFeeBps;
 
-    address private immutable swapExecutorModule;
-    address private immutable genericExecutorModule;
 
     uint256 private constant BPS = 10_000;
     uint32 private constant MAX_DEADLINE_BUFFER = 3600;
@@ -313,8 +309,6 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
     bytes32 private constant ERC3156_CALLBACK_SUCCESS = keccak256("ERC3156FlashBorrower.onFlashLoan");
 
     constructor() {
-        swapExecutorModule = address(new SwapExecutor());
-        genericExecutorModule = address(new GenericExecutor());
         initialised = true;
     }
 
@@ -808,42 +802,18 @@ contract MultiVenueArbImplementation is AdapterRegistry, IAaveFlashLoanSimpleRec
         uint256 len = steps.length;
         for (uint256 i; i < len;) {
             Step calldata s = steps[i];
-            bytes memory callData;
-            address module;
-            if (s.op == Op.UNIV3 || s.op == Op.BALANCER) {
-                module = swapExecutorModule;
-                callData = abi.encodeWithSelector(SwapExecutor.execute.selector, uint8(s.op), s.data, deadline, self, vaultAddr, address(uniV3));
+            if (s.op == Op.UNIV3) {
+                _execUniswap(s.data, deadline, self);
+            } else if (s.op == Op.BALANCER) {
+                _execBalancer(s.data, deadline, vaultAddr);
             } else if (s.op == Op.GENERIC) {
-                module = genericExecutorModule;
-                callData = abi.encodeWithSelector(GenericExecutor.execute.selector, s.data);
+                _execAdapter(s.data);
             } else {
                 revert InvalidGenericAction();
-            }
-            (bool ok, bytes memory ret) = module.delegatecall(callData);
-            if (!ok) {
-                if (ret.length == 0) revert InvalidGenericAction();
-                assembly { revert(add(ret, 0x20), mload(ret)) }
             }
             unchecked { ++i; }
         }
     }
-
-    function moduleExecSwap(uint8 op, bytes memory data, uint256 deadline, address recipient, address vaultAddr, address) external {
-        if (msg.sender != address(this)) revert InvalidGenericAction();
-        if (op == uint8(Op.UNIV3)) {
-            _execUniswap(data, deadline, recipient);
-        } else if (op == uint8(Op.BALANCER)) {
-            _execBalancer(data, deadline, vaultAddr);
-        } else {
-            revert InvalidGenericAction();
-        }
-    }
-
-    function moduleExecGeneric(bytes memory data) external {
-        if (msg.sender != address(this)) revert InvalidGenericAction();
-        _execAdapter(data);
-    }
-
 
 
     function _execUniswap(bytes memory data, uint256 deadline, address recipient) internal {
