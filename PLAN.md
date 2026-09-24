@@ -4270,6 +4270,8 @@ Executor now 21,199 bytes, 3,377 of margin — 86% of EIP-170, still above Phase
 
 ### Task 5.5 — Remove excluded features (C-03, C-04)
 
+> **INCOMPLETE, found 2026-09-25.** JIT and bridge went; `contracts/executor/steps/{GenericExecutor,SwapExecutor}.sol` did not, and §4.5 dispositions the whole `steps/*.sol` trampoline set as REMOVE. They are still constructor-deployed and still dispatched to, and since `_execAdapter` moved into the implementation they are pure indirection — a `delegatecall` into a two-line contract that calls straight back. See the G-SEC-1 findings log under Task 5.6 Step 3.
+
 **Done FIRST, before Task 5.1, and the reordering is measured rather than
 stylistic.** `MultiVenueArbImplementation` had **173 bytes** of EIP-170 margin
 — 99.3% of the ceiling. Task 5.1 substitutes an `AdapterRegistry` and typed
@@ -4424,6 +4426,34 @@ INV-26 reads *"only approved venues/pools/tokens/selectors can be called"*. Duri
 Corrected: INV-26's Test column now names `testUnlistedPoolReverts` and `testUnlistedTokenReverts` and states that they do not exist because the allowlists do not. Coverage drops **37 → 36**, and the floor is lowered to match — deliberately, with the reason recorded in `docs/apex/.invariant-floor` itself rather than only in a commit message. The gate now reads its floor from the first non-comment line so that every movement can carry its justification beside the number; a drop still fails the build, which is how this was found.
 
 **Implementing the two missing allowlists is not done here.** Per-adapter pool and token sets change the executor's operational model — every token and pool must be registered before a trade can name it — and that is a design decision with real running costs, not a reflex fix mid-audit. It is exactly the kind of deviation from §26.1 that the G-SEC-1 review should rule on. **Recorded as an open gap; R-03 stands.**
+
+#### `GenericExecutor` / `SwapExecutor` gas finding, supplied 2026-09-25
+
+**`GenericExecutor.sol:9:4` — "Gas requirement of function `GenericExecutor.execute` is infinite" — false positive, and the remediation text describes nothing in the function.** `execute` is two lines: it calls `IMultiVenueGenericModule(address(this)).moduleExecGeneric(data)`. No loop, no storage write, no array. "Infinite" is what solc's static estimator reports for *any* function containing an external call it cannot analyse, which is every function that calls anything.
+
+**The class, followed to where it does apply, lands on `_executeSteps` — and stops there.** That loop is unbounded over `steps.length`. It is not exploitable:
+
+- `startV2` is `onlyExecutor nonReentrant`, so `steps` arrives only from us. No third party can inflate it.
+- `p.loans.length != 1` is already enforced, so `ProfitInvariant`'s O(n²) duplicate check runs over a single element.
+- `planCommitment` is `public view`, so a large array there costs the caller and nobody else.
+
+An oversized plan is therefore a transaction of ours that runs out of gas. Nothing is lost but the gas, and Phase 7 already refuses it earlier and better: `safe_gas_limit` takes the p99 of the gas distribution and `earliest_eligible_from` returns `None` → `RejectReason::NoSafeGasLimit`, **before signing**. **No `MAX_STEPS` constant added** — it would be a magic number, which §6.3 forbids, and deriving an honest one needs measured gas-per-step against the measured Flashblock capacity. That measurement is worth doing when the capacity model stops being a fixture (§4.7); inventing a constant now would replace a known gap with an unexamined number.
+
+#### What the finding did surface: Task 5.5 is incomplete, and the trampolines are now pure indirection
+
+§4.5 dispositions `_execModule` and the `steps/*.sol` trampolines as **REMOVE** — *"removed because the v4 adapter set replaces the size workaround with `call` to registry-resolved adapters, which is simpler"*. Phase 5 removed `_execGeneric`, `JitExecutor` and `BridgeExecutor`. **`GenericExecutor.sol` and `SwapExecutor.sol` are still here, still deployed by the constructor, still dispatched to.**
+
+They no longer do anything. The `Op.GENERIC` path is now:
+
+```text
+_executeSteps  --delegatecall-->  GenericExecutor.execute      (runs in OUR storage)
+GenericExecutor.execute  --external call-->  this.moduleExecGeneric(data)
+moduleExecGeneric  -->  _execAdapter(data)
+```
+
+`_execAdapter` is at `MultiVenueArbImplementation.sol:912` — **in the implementation itself**. So the round trip is a `delegatecall` into a two-line contract whose only act is to call back into the contract it was delegated from, to reach a function that was always local. The modules existed as a *contract-size* workaround (B-1b); now that the adapter path is internal, they cost a deployment, a `delegatecall` and an external call per generic step, and they add two contracts to the audit surface for nothing.
+
+**Not removed here.** It changes the settlement hot path and the size budget mid-audit, and it is Task 5.5's scope rather than a finding response. Recorded as **Task 5.5 incomplete** with the measurement it needs: whether folding the dispatch back into `_executeSteps` fits inside the executor's remaining 3,320 bytes of EIP-170 margin. B-1 itself stays closed either way — `moduleExecGeneric` is `msg.sender == address(this)` gated and routes to the registry-checked `_execAdapter`, which is why `check_no_generic_call.sh` is green and correct.
 
 **Delivered 2026-09-24.** 8 invariants across two suites; 89 forge tests total.
 
