@@ -83,10 +83,21 @@ abstract contract AdapterRegistry {
     /// selector check cannot see.
     function _requireAllowedCall(uint16 adapterId, bytes memory callData) internal view {
         if (callData.length < 4) revert EmptyCallData();
-        bytes4 selector;
-        assembly {
-            selector := mload(add(callData, 32))
-        }
+        // No assembly. This was `mload(add(callData, 32))`, which is the
+        // idiomatic way to read a selector and is also unreadable to every
+        // static analyser -- including the one that flagged it here, whose
+        // note was "static analysis modules do not parse inline Assembly, this
+        // can lead to wrong analysis results". This function is the allowlist
+        // enforcement that closes B-1, so it is the single worst place in the
+        // codebase for a tool, or a reviewer, to have to skip.
+        //
+        // The cast truncates, which is what `forge-lint` objects to; the
+        // length check above is what makes that safe, and it is the same guard
+        // the assembly needed. `test/SelectorExtraction.t.sol` holds the old
+        // implementation and fuzzes the two against each other, so the
+        // equivalence is a checked property rather than a claim made once.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        bytes4 selector = bytes4(callData);
         if (!allowedSelectors[adapterId][selector]) {
             revert SelectorNotAllowed(adapterId, selector);
         }

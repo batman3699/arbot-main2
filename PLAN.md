@@ -4383,6 +4383,22 @@ The justification was written down, in a test named `a_known_fee_on_transfer_tok
 
 Four mutations, each caught: `FeeOnTransfer` exact again; `Rebasing` exact; `exactness` ignoring token0; and everything `Approximate`, which is the lazy fix that would pass the negative test alone — `only_standard_semantics_on_both_sides_is_proven` exists to catch exactly that.
 
+#### Located findings for `AdapterRegistry.sol`, supplied 2026-09-25
+
+Three positions, and they correct the scope conclusion above: `contracts/core/AdapterRegistry.sol` exists **only** on `phase0-workspace-split` (re-verified after a fresh `git fetch`), and line 87 there is exactly `assembly {`. So a scan did reach the current branch, whatever the summary page's blank Commit Hash field said. The "it scanned `main`" reading was right about the summary page and wrong as a claim about every finding.
+
+**`102:18` and `121:18` — "Delete from dynamic array" — false positive, both.** `AdapterRegistry.sol` contains no array of any kind: its entire storage is `mapping(uint16 => address) adapters` and `mapping(uint16 => mapping(bytes4 => bool)) allowedSelectors`, and the file has no `[]`, no `.push`, no `.pop`, and no `.length` except `callData.length` and `adapter.code.length`. Line 102 is `delete allowedSelectors[adapterId][selector]` and line 121 is `delete adapters[adapterId]` — both mapping entries, where `delete` is the documented way to clear one. The advice ("the length of the array remains the same … you need to shift items manually") has no referent: mappings have no length, the registry is lookup-by-id with no enumeration, and `_registerAdapter` treats `address(0)` as "not registered", so zeroing *is* deregistration.
+
+**`87:18` — inline assembly — kept, and acted on.** Not because it was wrong. `assembly { selector := mload(add(callData, 32)) }` is the idiomatic selector read and it was correct. The useful half of the finding is the second sentence: *"static analysis modules do not parse inline Assembly, this can lead to wrong analysis results."* That assembly sat inside `_requireAllowedCall` — **the allowlist enforcement that closes B-1** — so the tool was reporting that it could not read the one function in this codebase that most needs reading. A human reviewer under G-SEC-1 reads assembly more slowly and more suspiciously for the same reason.
+
+Replaced with `bytes4(callData)`, which Solidity has supported for `bytes memory` since 0.8.5. `contracts/core/` now contains no assembly at all.
+
+The substitution is **proved, not argued**. `test/SelectorExtraction.t.sol` keeps the old assembly as a reference implementation and fuzzes the two against each other; they agreed over **200,000 runs** under `--profile deep`, plus the boundary cases and a test that trailing argument data never shifts the selector. Where the forms *do* differ — below four bytes, where the cast zero-pads and the assembly reads whatever follows in memory — `_requireAllowedCall` reverts before either runs, and a test asserts that for every length 0–3. That guard is what makes the substitution safe rather than merely equivalent, and it is also what answers `forge-lint`'s truncation objection.
+
+Cost: the executor's runtime grew 57 bytes, 21,199 → **21,256**, leaving 3,320 of EIP-170 margin. `forge test` 107 → 113.
+
+**None of this changes G-SEC-1's status.** Two false positives and one readability fix are not an external security review, and the fourteen Critical `INCORRECT ACCESS CONTROL` instances remain unverifiable while their File Location and Line No. columns read `--`. **R-03 stands.**
+
 **Delivered 2026-09-24.** 8 invariants across two suites; 89 forge tests total.
 
 **The registry suite compares against a shadow model, not against itself.** A
