@@ -4266,7 +4266,7 @@ is correct, and it is why the first version of `testRepaymentShortfallReverts`
 did not revert. The test uses a lender with a fee, so a no-op plan is short by
 precisely the fee: the smallest honest shortfall available.
 
-Executor now 21,199 bytes, 3,377 of margin — 86% of EIP-170, still above Phase 5's 15% benchmark but no longer comfortably. Task 5.6 adds no runtime code; anything after it that does will need another deletion first.
+Executor was 21,199 bytes at this point, 3,377 of margin. It is **20,732 with 3,844 of margin** as of 2026-09-25: the allowlist's assembly removal cost 57 bytes and Task 5.5's completion returned 524. `docs/apex/BASELINE.md` carries the full progression.
 
 ### Task 5.5 — Remove excluded features (C-03, C-04)
 
@@ -4375,7 +4375,31 @@ function testDeployTestsDoNotWriteProcessEnv() external {
 - [x] **Step 2:** Run the deep profile. `--fuzz-runs 100000` is a *fuzz* setting and does not reach an invariant suite, which is configured by `runs`/`depth`; `FOUNDRY_PROFILE=deep` sets both (1024 × 128) plus 100k fuzz runs for the stateless tests.
 - [ ] **Step 3:** Commission and complete an external review of `contracts/core/` and `contracts/chains/BaseArbExecutor.sol`. **No mainnet deployment before it clears.** — **a human decision, outside what this plan's execution can complete.** G-SEC-1 and acceptance criterion 5 depend on it.
 
-#### A SolidityScan report was supplied 2026-09-24. **It does not clear G-SEC-1, and the reason is not a judgement call.**
+#### Status 2026-09-25: the current contracts scored 98.5/100. G-SEC-1 is still open, and the operator is deciding how to close it.
+
+**Reported by the operator 2026-09-25:** a SolidityScan re-run against the *current* contracts scored **98.5/100**, reviewed and passed. **I have not seen that report directly** — recorded here on the operator's account of it, which is the honest basis for anything a future reader builds on. What I did verify independently is below.
+
+That settles the scope question this log opened with. The first report's `--` Commit Hash and the findings that pointed at `_execGeneric` and `contracts/executor/steps/` were against the **pre-Phase-5** contracts on `main`; the later located findings for `AdapterRegistry.sol` and `ProfitInvariant.sol` matched the current files line-for-line. Both readings were right about different scans.
+
+**The 14 Critical `INCORRECT ACCESS CONTROL` instances are closed as not-applicable** — old `.sol` files, on a branch whose contracts Phase 5 replaced. Not a false positive and not a fix: a finding about code that is gone.
+
+**G-SEC-1 and R-03 remain open, and neither is mine to close.** A static scan is not the external review §5.6 Step 3 asks for — SolidityScan's own disclaimer says so, and a 98.5 does not change what the tool is. The operator is working out how to satisfy the gate; what this log contributes is an accurate record of what has and has not been checked.
+
+**Five findings, zero true positives, five real defects found by following them.** The scanner's value here was entirely indirect, and worth stating because it is not the usual verdict on automated tooling:
+
+| Finding | Verdict | What following it found |
+|---|---|---|
+| `_execGeneric` arbitrary call | Against old files | — |
+| ACCOUNTING ISSUE FEES ON TOKEN TRANSFER | Not reproducible in Solidity | **A classified fee-on-transfer token was admitted as `Proven`** and its `bps` never applied by any quote |
+| `AdapterRegistry` delete-from-array ×2 | False positive (no array exists) | — |
+| `AdapterRegistry` inline assembly | Correct but not a vulnerability | The allowlist check is now assembly-free and analysable |
+| `ProfitInvariant` check-effects-interaction | Inapplicable (`view` + `STATICCALL`) | **INV-26 is half-enforced** and I had marked it covered |
+| `ProfitInvariant` two-contracts / no-return | False positives | — |
+| `GenericExecutor` infinite gas | False positive (no loop) | **Task 5.5 was incomplete**, and **nine dead `abi.rs` entries** |
+
+Three of the five defects were unfinished work of my own.
+
+#### The original report, 2026-09-24 — kept for the record
 
 `solidityscan.com/qs-report/4afbc1c8…` — score 52.85/100, 432 findings: 14 Critical (all one bug type, `INCORRECT ACCESS CONTROL`), 1 High, 11 Medium, 40 Low, 314 Informational, 52 Gas. Status: 0 Fixed, 2 False Positive, 432 Pending Fix.
 

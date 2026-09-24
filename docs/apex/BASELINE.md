@@ -237,3 +237,25 @@ pass on its own. The CI build step stays as plain `forge build` regardless: any
 future test harness that extends the executor will put `--sizes` back over the
 limit for the same non-reason, and `check_executor_size.sh` asks the question
 that actually matters.
+
+### Re-measured 2026-09-25, after Phases 5–7
+
+The 18,423 above was Task 5.5's first pass. Everything since then moved it, in
+both directions:
+
+```text
+  24,403   first CI run (173 bytes of margin, 99.3% of EIP-170)
+  18,423   after the JIT and bridge deletions
+  21,199   after Tasks 5.1–5.4: AdapterRegistry, ProfitInvariant, the commitment
+           and the route validator
+  21,256   after removing the last assembly from the allowlist check (+57)
+  20,732   after Task 5.5's completion folded the delegatecall trampolines away
+```
+
+**Current: 20,732 bytes of runtime, 3,844 to spare — 84.4% of EIP-170**, against
+Phase 5's benchmark of 15% margin. Init code is 20,783 and deployment costs
+4,603,772 gas.
+
+Two contracts left the deployable set with the trampolines
+(`SwapExecutor` 536 bytes, `GenericExecutor` 431), so `check_executor_size.sh`
+now covers 19 rather than 21.
