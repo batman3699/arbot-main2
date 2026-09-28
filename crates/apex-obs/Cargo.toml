@@ -6,6 +6,7 @@ description = "Observability: the missed-opportunity ledger, coverage auditing, 
 
 [dependencies]
 apex-types = { path = "../apex-types" }
+alloy-primitives = { version = "0.8", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]

@@ -6,6 +6,7 @@
 #                      process gates, not only Rust tests. The "24/54" it had
 #                      been reporting was a number about nothing.
 # 2026-09-24  36 -> 37  INV-40's ledger landed.
+# 2026-09-29  36 -> 37  INV-41's coverage auditor landed.
 # 2026-09-25  37 -> 36  LOWERED, and the 37 was never true. INV-26 is "only
 #                      approved venues/pools/tokens/selectors can be called".
 #                      I had mapped it to three tests covering targets and
@@ -15,4 +16,4 @@
 #                      two. Reconciling a name is not the same as checking a
 #                      claim, which is the failure this gate exists to catch --
 #                      committed here by the audit that was catching it.
-36
+37

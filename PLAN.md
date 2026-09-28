@@ -5166,6 +5166,24 @@ The third is the one that would actually happen. §6.5 records this repository's
 **Four mutations, each caught:** a new rejection type with no mapping (gate); the opt-out marker removed (gate); a clause mapped to the wrong bucket (3 tests); `record` ignoring the rejection's answer (3 tests).
 
 ### Task 8.2 — Coverage auditor (INV-41)
+
+**Delivered 2026-09-29.** `crates/apex-obs/src/coverage.rs`; 10 tests. Workspace 1,716 passing. Invariant coverage 36/46 → **37/46**.
+
+**§28's own sentence decided the design:** *"The purpose is not to pretend the auditor is omniscient — it is to prevent the engine from silently losing known opportunity classes."* An auditor built to be an authority reports a number and invites trust in it. This one is built to be **falsifiable**, and three things follow.
+
+**1. An empty oracle scores `Recall::Undefined`, never 1.0.** "We both found nothing" and "we found everything there was" are the same arithmetic and opposite facts — and the first is what a broken oracle produces on *every* window. A gauge reading perfect while the oracle is dead is worse than no gauge. `Recall::meets(floor)` returns `false` for `Undefined`, so acceptance criterion 2's `hot_path_recall ≥ 0.95` cannot be cleared by an absent measurement, and `response()` escalates nothing — treating a dead oracle as a discovery problem would send the ladder after the wrong thing.
+
+**2. An oracle that misses what the fast path found is not an oracle.** `oracle_gaps` reports those, and `oracle_was_complete()` is asked separately from the figures rather than folded into them: a caller charting `hot_path_recall` needs to know the series has a hole, not to receive a silently adjusted value. The test that pins this is the uncomfortable one — recall reads a perfect `1.0` on the naive arithmetic while the reference is provably not a superset.
+
+**3. The oracle's results arrive as data.** This module cannot call a search; it takes two lists and compares them. That is what keeps `apex-obs` free of any dependency on the search crates, and it is the structural form of §2.7's "**independent** broad-search oracle" — an auditor sharing code with the thing it audits would hide a bug in both.
+
+**Misses are weighted by EV, not counted** — the same lesson as the miss ledger, and the test makes the divergence concrete: fifty dust opportunities seen and one 5,000,000 missed gives a count-based recall of 50/51, which *clears* the 0.95 floor, against an EV-weighted miss rate above 0.99. A missed negative-EV opportunity costs nothing by value, because skipping it is the fast path working.
+
+**Recall pools across windows rather than averaging rates**, so a quiet window holding one opportunity does not weigh the same as a busy one holding a hundred. The first implementation reconstructed each window's denominator from its rate and miss count — `missed / (1 − recall)` — which is exactly zero at `recall == 1.0` and **silently dropped every window the fast path had covered completely**. Deriving a count from a rounded float was the mistake; `oracle_count` is now carried on the report, which is independently useful: a recall of 1.0 over one opportunity is a different statement from the same figure over a hundred.
+
+**Six mutations, each caught:** an empty oracle scoring 1.0; `Undefined` clearing the floor; oracle gaps unreported; the miss rate counting instead of weighting; a negative-EV miss counting against the value rate; and pooled recall averaging again.
+
+**What this task does not do.** The oracle itself is not built — §28's "delayed, broader, more expensive discovery on reserved slow-path resources" is a search, and it belongs to the crate that owns searching. The auditor is the comparison and the response ladder; giving it a real oracle is what makes `hot_path_recall` a measurement rather than a shape. Acceptance criterion 2 stays open until then.
 ### Task 8.3 — P&L attribution by optimization layer
 ### Task 8.4 — Control plane assembly (`apex-runtime`)
 ### Task 8.5 — Full-system shadow run
