@@ -5185,6 +5185,18 @@ The third is the one that would actually happen. §6.5 records this repository's
 
 **What this task does not do.** The oracle itself is not built — §28's "delayed, broader, more expensive discovery on reserved slow-path resources" is a search, and it belongs to the crate that owns searching. The auditor is the comparison and the response ladder; giving it a real oracle is what makes `hot_path_recall` a measurement rather than a shape. Acceptance criterion 2 stays open until then.
 ### Task 8.3 — P&L attribution by optimization layer
+
+**Delivered 2026-09-29.** `crates/apex-obs/src/pnl.rs`; 11 tests. Workspace 1,727 passing.
+
+**Some dimensions partition a trade's profit and some do not, and that is a type distinction rather than a footnote.** A trade has exactly one chain and one strategy, so those columns add up to the total. It has several venues and several optimization layers, so those columns **do not** — every trade touching two layers is counted twice in the layer column, and adding it gives a number larger than the profit that was made.
+
+That is not a flaw to be corrected by splitting profit between layers. **Splitting requires a rule, and every such rule invents a fact.** A trade that used a parallel split *and* a V4 route did not earn 60% of its profit from one of them; it earned all of it from both. So `Partition<K>` can be summed and its total checked against the trades, while `Overlapping<K>` cannot: it has no method called `total`, it reports `sum_of_rows()` and `double_counted()` beside it, and the real figure comes from `total_net()`. Naming the sum `total` is exactly how it ends up on a dashboard next to one.
+
+**`happens_to_partition()` exists because a single-venue day is a fact about today.** On a quiet day the layer and venue columns do sum to the total, and it would be easy to conclude they always will. They stay `Overlapping`, so the next trade touching two layers cannot silently turn a dashboard column into a lie.
+
+**§26's word is *incremental*, and where a real counterfactual exists it is used.** The Optimization family already records `single_route_ev` alongside `split_route_ev` for the same opportunity; their difference is what the split layer actually contributed. `Counterfactual` carries a baseline the system computed at decision time rather than one this module invents. **`incremental` is `None` when nobody supplied one** — "this layer contributed nothing" and "nobody measured what this layer contributed" are different claims and must not print the same. A layer that made things worse reports a negative increment rather than being dropped: a layer nobody can turn off because its cost is invisible is how a system accumulates them.
+
+**Six mutations caught, one survived and it was the interesting one.** Making `sums_to` return `true` unconditionally broke nothing, because every test asserted only that a correct partition sums. A predicate never exercised in its false direction is not tested — it is decoration that happens to be true. `sums_to_discriminates` now checks it rejects a wrong total, and the mutation fails.
 ### Task 8.4 — Control plane assembly (`apex-runtime`)
 ### Task 8.5 — Full-system shadow run
 ### Task 8.6 — Canary promotion

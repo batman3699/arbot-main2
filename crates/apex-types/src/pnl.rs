@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 
 /// §32 "Attribution": incremental P&L must be attributable to each optimization
 /// layer, because §1.4 disables any module that cannot show incremental P&L.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `Ord` keys a `BTreeMap` so attribution iterates deterministically. As with
+/// `LossClass`, `MissReason` and `SearchPath`, the order is a map key and
+/// **not** a ranking — no layer is "greater" than another, and nothing may take
+/// a max over it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum OptimizationLayer {
     SinglePath,
     ParallelSplit,
