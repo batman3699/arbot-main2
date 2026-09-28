@@ -133,6 +133,13 @@ if [ "$fail" -ne 0 ]; then
   echo "fixture is exactly where a real key hides." >&2
   exit 1
 fi
-suppressions=$(grep -rc 'secret-scan:allow' -- "${tracked[@]}" 2>/dev/null \
+# Counted over the files this scan examines for findings, and NOT over its own
+# source or over prose. The first version counted both: three mentions in this
+# script plus one in PLAN.md made the total 6 when two suppressions existed,
+# which defeats the point of printing it -- a real third suppression would take
+# 6 to 7 and nobody could tell that from a doc edit.
+suppressions=$(grep -rc 'secret-scan:allow' \
+                 -- $(printf '%s\n' "${tracked[@]}" \
+                      | grep -Ev '(^scripts/ci/secret_scan\.sh$|\.md$)') 2>/dev/null \
                | awk -F: '$2 > 0 {n += $2} END {print n + 0}')
 echo "ok: no credential material in tracked source, logs or metrics (${suppressions} site suppressions)"
