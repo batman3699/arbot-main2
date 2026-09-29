@@ -3681,7 +3681,35 @@ So the order is **frontier → Engine D → Engine C → assembly → Engine A**
 
   The budget mutation is worth naming separately: `Budgets` was tested in isolation by `resource_classes_isolated`, and **nothing asserted the plane actually consults it on this path**. That is §6.5's "written but never wired" in its smallest form, and `a_saturated_pricing_budget_declines_rather_than_queues` closes it.
 
-- [ ] **2b.6 — Engine A: incremental negative-cycle (BP-045, BP-060).** `graph.rs` adapted: edges carry `state_version` and search consumes immutable snapshots. Last, deliberately — §52, and the measurement that 4× the cycles changed nothing. Failing test: the migrated Bellman-Ford tests, plus one asserting a stale snapshot cannot produce a candidate.
+- [x] **2b.6 — Engine A: incremental negative-cycle (BP-045, BP-060).** **Delivered 2026-09-29.** `crates/apex-search/src/engine_a.rs`, `tests/negative_cycle.rs`; 16 tests. Workspace 1,809 → **1,825**.
+
+  **`state_version` on the edge is the new requirement, and it is what the tests are mostly about.** §4's audit row asks that "edges must carry `state_version`, and search must consume immutable snapshots". Without it a snapshot cannot say which of its edges have moved, and a cycle through a moved pool prices against state that is gone — while looking exactly like a live one all the way to the sizing path.
+
+  Staleness is **per edge, not per snapshot**: one moved pool invalidates the cycles through it, not the graph. Refusing the whole snapshot would discard every cycle on every block, which on Base is every two seconds. And it is removed **before** the search rather than filtered after — a relaxation through a stale edge can shift a path a later cycle is extracted from, so a cycle with no stale edge of its own can still be a consequence of one.
+
+  Three refusals, deliberately distinct, because they call for different responses: `StaleEdge` (a pool moved), `UnknownVenue` (a pool nobody is watching — an ingestion gap, not a pricing one), `Unpriceable` (a quote that is not a weight).
+
+  **Bounded enumeration rather than Bellman-Ford, and the bound is the reason.** §12.2 wants Top-K cycles up to a small hop count; Bellman-Ford detects *that* a negative cycle exists and needs a separate walk to extract one, and extracting K distinct ones is where the legacy implementation's complexity comes from. With `max_hops` at 4 over a frontier-sized edge set, enumerating bounded walks gives every cycle rather than one per predecessor tree, and carries its own §29.3 budget honestly.
+
+  **The approximation is licensed and the license matters.** The weight is `−ln(rate) × WEIGHT_SCALE` in `f64`, which can differ in the last digit from the legacy `rust_decimal` implementation — enough to flip a marginal verdict. §12.2 says "the graph layer is *allowed* to be approximate because it only proposes", and the band where one ulp matters is exactly the 60–65 bps band where Engine A proposes and Engine C refuses. The refusal is the answer either way, so making this layer exact would buy nothing and cost the log transform the search depends on. The proposal's `size_hint` is therefore **always `None`**: a rate-only search cannot express a quantity, and saying nothing is the honest form.
+
+  `i64::MAX` is preserved as "do not traverse", with the legacy comment's reasoning: *"Overflow implies an absurd rate. Exclude rather than guess a sign — guessing negative would fabricate an arbitrage out of a broken quote."*
+
+  #### A real defect, and four dead things
+
+  **The first draft glued cycles together.** It forbade repeated pools but not repeated tokens, so with a 1↔2 cycle and a 1↔3 cycle in one graph it reported `2→1→3→1→2` — both cycles in one transaction. Its rate product is larger than either, so it **outranked the two real cycles it was made of**, while costing more gas for the same edge. §13's `ComplexityCost` and the census both say deeper routes cost more for no gain, so a glued cycle is a strictly worse duplicate of proposals the search already made. Found by a test of mine that was wrong about the implementation; the implementation was wrong too.
+
+  **Eleven mutations, three survived, and each survivor was informative.**
+
+  - *The impassable-edge prune changed nothing*, because `i64::MAX` also makes every path sum positive — correctness was resting on the sentinel's **magnitude** rather than on the check, which would break silently if the constant ever changed. Now the prune reports `Unpriceable`, which makes it observable (a broken quote is exactly what §2.7's auditor is looking for) and the arithmetic no longer load-bearing.
+  - *The sign guard looked redundant with the `rate <= 0.0` check* — and is not, for one case: **both negative gives a positive rate.** `−1 / −1` is `1.0`, finite and positive, read as parity rather than refused. The test now covers it.
+  - *Deleting the sort changed nothing*, because the fixture's enumeration order happened to match its weight order. Rebuilt so the weaker cycle is enumerated first, which is what the LIFO walk actually does.
+
+  And a fourth: `GraphSnapshot` carried a `by_token` index nothing read — **clippy** caught that one, not a mutation. It could not be read: the walk needs adjacency over the *usable* subset, and an index over all edges is the wrong set.
+
+  #### What is not migrated, and why
+
+  `graph.rs` is 4,805 lines. Hub-anchored cycle search, incremental adjacency refresh, the two-hop probe and cycle input capacity are **not** here. They are search topologies and capacity arithmetic over the same edge set; they are §52's "candidate count"; and the module they live in carries upward dependencies on `metrics` and `util`, so the crate-split discipline says rebuild rather than move. Rebuilding 4,400 lines to raise a number the measurements say does not bind would be the wrong dollar — which is the same judgement that put this task last.
 
 - [x] **2b.7 — `apex-exec`: commitment and encoding.** **Delivered 2026-09-29.** `crates/apex-exec/{Cargo.toml,src/lib.rs,src/commitment.rs,src/encode/mod.rs,src/sign.rs}`, `test/PlanCommitmentFixture.t.sol`, two tracked fixtures; 15 Rust tests + 2 doctests + 5 forge tests. Workspace 1,794 → **1,809**; forge 120 → **125**.
 

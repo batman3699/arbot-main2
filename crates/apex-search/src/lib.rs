@@ -43,10 +43,12 @@
 //! matters is the event-driven one, and broad graph search is the fallback rather
 //! than the product. §52 reaches the same conclusion from the other direction.
 
+pub mod engine_a;
 pub mod engine_c;
 pub mod engine_d;
 pub mod frontier;
 
+pub use engine_a::{Edge, GraphSnapshot, NegativeCycle, NoCycle, SearchLimits, Weight, WEIGHT_SCALE};
 pub use engine_c::{Declined, FiniteSizeEngine, Proposals, TemplatePricer};
 pub use engine_d::{EventEngine, Response, Skipped, StaleAttribute, TemplateAction};
 pub use frontier::{
