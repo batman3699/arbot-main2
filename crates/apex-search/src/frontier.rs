@@ -239,7 +239,14 @@ impl Revalued {
 /// have needed a zero window — and a zero recency window makes every
 /// `recency_score` exactly 0, silently disabling the tiebreak. The absent impl
 /// upstream is doing its job.
-#[derive(Debug)]
+///
+/// `Clone` is for copy-on-write. INV-11 / §5.3 forbids a lock on the read path,
+/// so `apex-runtime` holds this in an `apex_state::Versioned` and swaps a fresh
+/// one on every update. That is affordable for a measured reason rather than an
+/// optimistic one — the tradeable set on Base is 8–11 cross-venue pairs, so this
+/// holds tens of entries. If it ever holds thousands, this derive is the line
+/// that has to change.
+#[derive(Clone, Debug)]
 pub struct Frontier {
     templates: BTreeMap<RouteId, RouteTemplate>,
     /// pool → templates touching it. The whole point: an event names pools, and

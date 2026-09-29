@@ -35,6 +35,7 @@
 
 pub mod bus;
 pub mod plane;
+pub mod search;
 pub mod shutdown;
 pub mod supervise;
 pub mod workers;

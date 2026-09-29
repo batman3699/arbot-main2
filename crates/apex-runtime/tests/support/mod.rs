@@ -23,9 +23,10 @@ use apex_chain::adapter::{
 use apex_chain::regime::ChainRegime;
 use apex_runtime::bus::{EventKind, StateEvent};
 use apex_runtime::plane::{
-    CandidateSource, Commitments, Decline, Economics, LiveReader, LiveReadings, RiskGate,
+    Commitments, Decline, Economics, LiveReader, LiveReadings, Refinement, RiskGate, RouteSource,
     SettlementFeed, Signer, Simulator,
 };
+use apex_search::frontier::{ProposalOrigin, RouteProposal};
 use apex_types::ack::LifecycleStage;
 use apex_types::candidate::{Candidate, DiscreteRefined, DiscreteSize};
 use apex_types::cost::{GasDistribution, GasLimit, GasUsed, TotalExecutionCost};
@@ -160,8 +161,13 @@ pub fn candidate(id: u64, block: u64, net: i128) -> Candidate {
 
 // ---------------------------------------------------------------- ports
 
-/// Hands out a fixed candidate list per event, so a stream of N events with a
+/// Hands out a fixed proposal list per event, so a stream of N events with a
 /// duplicate produces a known number of distinct commitments.
+///
+/// It is built from `Candidate`s for the tests' convenience and **emits
+/// proposals**, which is the shape `apex-search` can actually produce: a route,
+/// the state it was found against, and a size *hint*. The candidate the tests
+/// name is what `Economics::assemble` will reconstruct from it.
 pub struct FixedSearch {
     pub per_event: Vec<Candidate>,
     pub calls: AtomicU64,
@@ -174,38 +180,105 @@ impl FixedSearch {
 }
 
 #[async_trait::async_trait]
-impl CandidateSource for FixedSearch {
-    async fn candidates(&self, ev: &StateEvent) -> Vec<Candidate> {
+impl RouteSource for FixedSearch {
+    async fn propose(&self, ev: &StateEvent) -> Vec<RouteProposal> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.per_event
             .iter()
-            .map(|c| {
-                let mut c = c.clone();
-                c.state_fingerprint = ev.fingerprint.clone();
-                c
+            .map(|c| RouteProposal {
+                chain: c.chain_id,
+                route: c.route.clone(),
+                venue_set: c.venue_set.clone(),
+                state_fingerprint: ev.fingerprint.clone(),
+                found_at: ev.observed_at,
+                origin: ProposalOrigin::FiniteSize,
+                flash_source: c.flash_source.as_ref().map(|f| f.provider),
+                size_hint: Some(c.input_amount.get()),
             })
             .collect()
     }
 }
 
+/// Emits the **same** proposal whatever the event, fingerprint included.
+///
+/// That is what makes commitment-level suppression testable across two
+/// *different* observations: identical proposals produce identical commitments,
+/// which is §17.4's case and the one the event-level window cannot see.
+pub struct PinnedSearch {
+    pub proposal: RouteProposal,
+}
+
+#[async_trait::async_trait]
+impl RouteSource for PinnedSearch {
+    async fn propose(&self, _ev: &StateEvent) -> Vec<RouteProposal> {
+        vec![self.proposal.clone()]
+    }
+}
+
+/// The proposal `FixedSearch` would emit for a candidate. Exposed so a test that
+/// drives `refine_concurrently` directly speaks the same shape the plane does.
+pub fn proposal_for(c: &Candidate) -> RouteProposal {
+    RouteProposal {
+        chain: c.chain_id,
+        route: c.route.clone(),
+        venue_set: c.venue_set.clone(),
+        state_fingerprint: c.state_fingerprint.clone(),
+        found_at: UnixNanos(1_000_000_000),
+        origin: ProposalOrigin::FiniteSize,
+        flash_source: c.flash_source.as_ref().map(|f| f.provider),
+        size_hint: Some(c.input_amount.get()),
+    }
+}
+
+/// Reconstructs the candidate a test named, from the proposal and the join.
+///
+/// In production this is `apex-econ`: the four stages produce numbers and this
+/// decides what they mean. Here it is the inverse of `FixedSearch`, so a test can
+/// still say "this candidate" and have the plane see it.
+fn assembled(template: &Candidate, p: &RouteProposal, r: Refinement) -> Candidate {
+    let mut c = template.clone();
+    c.chain_id = p.chain;
+    c.route = p.route.clone();
+    c.venue_set = p.venue_set.clone();
+    c.state_fingerprint = p.state_fingerprint.clone();
+    c.expected_output = r.expected_output;
+    c.input_amount = r.input_amount;
+    c.robustness_margin = r.robustness_margin;
+    c.total_execution_cost = r.costs;
+    c
+}
+
 /// Returns the candidate's own numbers back. The point of a passthrough here is
 /// that the plane must still *join* four independent answers — if it read the
 /// candidate directly instead, the concurrency test could not tell.
-pub struct PassThroughEconomics;
+pub struct PassThroughEconomics(pub Candidate);
+
+impl Default for PassThroughEconomics {
+    fn default() -> Self {
+        Self(candidate(1, 47_079_437, 320_000_000_000))
+    }
+}
 
 #[async_trait::async_trait]
 impl Economics for PassThroughEconomics {
-    async fn reprice(&self, c: &Candidate) -> Result<U256, Decline> {
-        Ok(c.expected_output)
+    async fn reprice(&self, _p: &RouteProposal) -> Result<U256, Decline> {
+        Ok(self.0.expected_output)
     }
-    async fn size(&self, c: &Candidate) -> Result<DiscreteSize, Decline> {
-        Ok(c.input_amount)
+    async fn size(&self, p: &RouteProposal) -> Result<DiscreteSize, Decline> {
+        // The hint is an input, not the answer. INV-18: only `apex-econ`'s
+        // refinement path mints a `DiscreteSize`, and this double stands in for
+        // it -- so it MINTS one rather than converting the hint.
+        let _ = p.size_hint;
+        Ok(self.0.input_amount)
     }
-    async fn scenarios(&self, c: &Candidate) -> Result<f64, Decline> {
-        Ok(c.robustness_margin)
+    async fn scenarios(&self, _p: &RouteProposal) -> Result<f64, Decline> {
+        Ok(self.0.robustness_margin)
     }
-    async fn refresh_costs(&self, c: &Candidate) -> Result<TotalExecutionCost, Decline> {
-        Ok(c.total_execution_cost.clone())
+    async fn refresh_costs(&self, _p: &RouteProposal) -> Result<TotalExecutionCost, Decline> {
+        Ok(self.0.total_execution_cost.clone())
+    }
+    fn assemble(&self, p: &RouteProposal, r: Refinement) -> Result<Candidate, Decline> {
+        Ok(assembled(&self.0, p, r))
     }
 }
 
@@ -215,17 +288,20 @@ pub struct DecliningEconomics(pub Decline);
 
 #[async_trait::async_trait]
 impl Economics for DecliningEconomics {
-    async fn reprice(&self, c: &Candidate) -> Result<U256, Decline> {
-        Ok(c.expected_output)
+    async fn reprice(&self, _p: &RouteProposal) -> Result<U256, Decline> {
+        Ok(U256::from(1u64))
     }
-    async fn size(&self, _c: &Candidate) -> Result<DiscreteSize, Decline> {
+    async fn size(&self, _p: &RouteProposal) -> Result<DiscreteSize, Decline> {
         Err(self.0.clone())
     }
-    async fn scenarios(&self, c: &Candidate) -> Result<f64, Decline> {
-        Ok(c.robustness_margin)
+    async fn scenarios(&self, _p: &RouteProposal) -> Result<f64, Decline> {
+        Ok(0.3)
     }
-    async fn refresh_costs(&self, c: &Candidate) -> Result<TotalExecutionCost, Decline> {
-        Ok(c.total_execution_cost.clone())
+    async fn refresh_costs(&self, _p: &RouteProposal) -> Result<TotalExecutionCost, Decline> {
+        Ok(costs())
+    }
+    fn assemble(&self, _p: &RouteProposal, _r: Refinement) -> Result<Candidate, Decline> {
+        Err(self.0.clone())
     }
 }
 
@@ -250,6 +326,39 @@ impl Simulator for AlwaysSucceeds {
         };
         r.result_hash = r.canonical_hash();
         Ok(r)
+    }
+}
+
+/// Parks the **first** caller until released, then behaves like
+/// [`AlwaysSucceeds`].
+///
+/// A barrier cannot create the overlap this needs any more. Task 2b.5 moved
+/// §46.2's join *before* step 1 — the commitment covers `exact_inputs`, so it
+/// cannot exist until the size does — and a barrier before the lock releases
+/// both callers without their lock windows ever overlapping. Simulation happens
+/// *inside* the lock, so parking there is what holds a commitment while a second
+/// caller tries for it.
+///
+/// One-way rather than symmetric on purpose: the second caller is suppressed and
+/// never reaches the simulator, so a barrier of two would deadlock.
+pub struct ParkingSimulator {
+    first: std::sync::atomic::AtomicBool,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl ParkingSimulator {
+    pub fn new(release: Arc<tokio::sync::Notify>) -> Self {
+        Self { first: std::sync::atomic::AtomicBool::new(true), release }
+    }
+}
+
+#[async_trait::async_trait]
+impl Simulator for ParkingSimulator {
+    async fn simulate(&self, c: &Candidate) -> Result<SimulationResult, Decline> {
+        if self.first.swap(false, Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        AlwaysSucceeds.simulate(c).await
     }
 }
 
@@ -473,25 +582,35 @@ pub fn pending_swap(target: u8) -> EventKind {
 /// deadlocks here; see `workers::independent_tasks_run_concurrently`.
 pub struct BarrieredEconomics {
     pub barrier: Arc<tokio::sync::Barrier>,
+    pub candidate: Candidate,
+}
+
+impl BarrieredEconomics {
+    pub fn new(barrier: Arc<tokio::sync::Barrier>, candidate: Candidate) -> Self {
+        Self { barrier, candidate }
+    }
 }
 
 #[async_trait::async_trait]
 impl Economics for BarrieredEconomics {
-    async fn reprice(&self, c: &Candidate) -> Result<U256, Decline> {
+    async fn reprice(&self, _p: &RouteProposal) -> Result<U256, Decline> {
         self.barrier.wait().await;
-        Ok(c.expected_output)
+        Ok(self.candidate.expected_output)
     }
-    async fn size(&self, c: &Candidate) -> Result<DiscreteSize, Decline> {
+    async fn size(&self, _p: &RouteProposal) -> Result<DiscreteSize, Decline> {
         self.barrier.wait().await;
-        Ok(c.input_amount)
+        Ok(self.candidate.input_amount)
     }
-    async fn scenarios(&self, c: &Candidate) -> Result<f64, Decline> {
+    async fn scenarios(&self, _p: &RouteProposal) -> Result<f64, Decline> {
         self.barrier.wait().await;
-        Ok(c.robustness_margin)
+        Ok(self.candidate.robustness_margin)
     }
-    async fn refresh_costs(&self, c: &Candidate) -> Result<TotalExecutionCost, Decline> {
+    async fn refresh_costs(&self, _p: &RouteProposal) -> Result<TotalExecutionCost, Decline> {
         self.barrier.wait().await;
-        Ok(c.total_execution_cost.clone())
+        Ok(self.candidate.total_execution_cost.clone())
+    }
+    fn assemble(&self, p: &RouteProposal, r: Refinement) -> Result<Candidate, Decline> {
+        Ok(assembled(&self.candidate, p, r))
     }
 }
 

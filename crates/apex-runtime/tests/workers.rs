@@ -29,12 +29,13 @@ use support::*;
 #[tokio::test]
 async fn independent_tasks_run_concurrently() {
     let barrier = Arc::new(tokio::sync::Barrier::new(4));
-    let econ = Arc::new(BarrieredEconomics { barrier: Arc::clone(&barrier) });
     let c = candidate(1, 47_079_437, 320_000_000_000);
+    let econ = Arc::new(BarrieredEconomics::new(Arc::clone(&barrier), c.clone()));
+    let proposal = proposal_for(&c);
 
     let joined = tokio::time::timeout(
         Duration::from_secs(5),
-        apex_runtime::workers::refine_concurrently(econ.as_ref(), &c),
+        apex_runtime::workers::refine_concurrently(econ.as_ref(), &proposal),
     )
     .await;
 

@@ -42,8 +42,8 @@
 //!
 //! | Port | Crate | Phase |
 //! |---|---|---|
-//! | [`CandidateSource`] | `apex-search` | 2, 12 |
-//! | [`Economics`] | `apex-econ` | 3, 10 |
+//! | [`RouteSource`] | `apex-search` | 2b |
+//! | [`Economics`] | `apex-econ` | 3, 10, 2b |
 //! | [`Simulator`] | `apex-sim` | 3, 9 |
 //! | [`RiskGate`] | `apex-risk` | 6, 8 |
 //! | [`Commitments`] | `apex-exec` | 5 |
@@ -75,6 +75,7 @@
 //! records `Included`, and that is the correct journal.
 
 use crate::bus::StateEvent;
+use apex_search::frontier::RouteProposal;
 use crate::workers::{refine_concurrently, Budgets, ResourceClass};
 use apex_capture::dispatch::{DispatchError, DispatchRequest, Dispatcher};
 use apex_capture::recover::{reconcile, scan, ChainOutcomeSource, DispatchGate, RecoveryError};
@@ -231,24 +232,50 @@ impl std::error::Error for Suppressed {}
 
 // ------------------------------------------------------------------ ports
 
+/// **Renamed from `CandidateSource`, and it returns proposals rather than
+/// candidates (Task 2b.5).**
+///
+/// Task 8.4 named this `CandidateSource`, had it return `Vec<Candidate>`, and
+/// named `apex-search` as the crate that would implement it. `apex-search` could
+/// not: §6.1 runs `apex-search → apex-econ`, `Candidate::input_amount` is a
+/// `DiscreteSize`, and only `apex-econ`'s refinement path can mint one (INV-18).
+/// A `Candidate` also carries `total_execution_cost`, `robust_ev`,
+/// `capture_probability`, `certificate_status` and `simulation_tier` — every one
+/// an `apex-econ` or `apex-sim` output. **The port was named for a crate that
+/// could not satisfy it**, and no amount of care inside `apex-search` would have
+/// fixed that.
+///
+/// A search proposes a route; economics decides whether and at what size it is a
+/// trade. That is §6.1's graph, and it is now the signature.
 #[async_trait::async_trait]
-pub trait CandidateSource: Send + Sync {
-    async fn candidates(&self, event: &StateEvent) -> Vec<Candidate>;
+pub trait RouteSource: Send + Sync {
+    async fn propose(&self, event: &StateEvent) -> Vec<RouteProposal>;
 }
 
-/// §46.2's four independent answers. Four methods rather than one, because
-/// [`refine_concurrently`] has to be able to have all four in flight at once —
-/// a single `refine` method would make the concurrency an implementation detail
-/// of whoever implements this trait, which is exactly where it would quietly
-/// become serial again.
+/// §46.2's four independent answers, **over a proposal**. Four methods rather
+/// than one, because [`refine_concurrently`] has to be able to have all four in
+/// flight at once — a single `refine` method would make the concurrency an
+/// implementation detail of whoever implements this trait, which is exactly
+/// where it would quietly become serial again.
+///
+/// The join is what turns a proposal into a `Candidate`, and [`Economics::assemble`]
+/// is where that happens: the plane owns *when* the stages run, `apex-econ` owns
+/// *what the numbers mean*. A plane that assembled a candidate itself would be
+/// inventing economics, which is the god-object shape one layer up.
 #[async_trait::async_trait]
 pub trait Economics: Send + Sync {
-    async fn reprice(&self, c: &Candidate) -> Result<U256, Decline>;
+    async fn reprice(&self, p: &RouteProposal) -> Result<U256, Decline>;
     /// Returns a [`DiscreteSize`], which only `apex-econ`'s refinement path can
-    /// mint (INV-18). The plane carries sizes; it never invents one.
-    async fn size(&self, c: &Candidate) -> Result<DiscreteSize, Decline>;
-    async fn scenarios(&self, c: &Candidate) -> Result<f64, Decline>;
-    async fn refresh_costs(&self, c: &Candidate) -> Result<TotalExecutionCost, Decline>;
+    /// mint (INV-18). The proposal carries a `size_hint: Option<U256>` — an input
+    /// to this refinement, never a substitute for it.
+    async fn size(&self, p: &RouteProposal) -> Result<DiscreteSize, Decline>;
+    async fn scenarios(&self, p: &RouteProposal) -> Result<f64, Decline>;
+    async fn refresh_costs(&self, p: &RouteProposal) -> Result<TotalExecutionCost, Decline>;
+
+    /// Join the four into a candidate. Synchronous: it is arithmetic over four
+    /// answers that are already in hand, and an `async` here would be a place to
+    /// put an RPC call.
+    fn assemble(&self, p: &RouteProposal, r: Refinement) -> Result<Candidate, Decline>;
 }
 
 /// What the four stages produced, joined.
@@ -348,7 +375,7 @@ pub struct Ports {
     pub gate: Arc<DispatchGate>,
     pub dispatcher: Arc<dyn Dispatcher + Send + Sync>,
     pub chain: Arc<dyn ChainExecutionAdapter>,
-    pub search: Arc<dyn CandidateSource>,
+    pub search: Arc<dyn RouteSource>,
     pub econ: Arc<dyn Economics>,
     pub sim: Arc<dyn Simulator>,
     pub risk: Arc<dyn RiskGate>,
@@ -356,6 +383,80 @@ pub struct Ports {
     pub signer: Arc<dyn Signer>,
     pub live: Arc<dyn LiveReader>,
     pub settlement: Arc<dyn SettlementFeed>,
+}
+
+/// Observations already handled, by `(chain, ordinal)`.
+///
+/// **A second, cheaper dedup, and Task 2b.5 is what justified it.** §17.4's
+/// commitment hash covers `exact_inputs` and `min_profit`, so the commitment
+/// cannot exist until the size does — which means the §46.2 join runs *before*
+/// step 1 and a redelivered observation pays for a full refinement before
+/// anything notices it is a duplicate. On the hot path that is the §29 compute
+/// budget spent on work already done.
+///
+/// So the two levels catch different things, and neither subsumes the other:
+///
+/// - **Here**, by `(chain, Ordinal)`: the same observation arriving twice — a
+///   websocket reconnect replaying, two feeds carrying one block. Cheap, and it
+///   fires before any pricing.
+/// - **[`InFlight`]**, by commitment hash: two *different* events proposing the
+///   same trade. Exact, and it is the one that protects the money.
+///
+/// Bounded, and eviction is by age rather than by any cleverness: feed
+/// redelivery is a recent-window phenomenon, so a window is the right shape. A
+/// duplicate older than the window costs a refinement and is then caught by the
+/// commitment, which is the correct place for a rare case.
+#[derive(Debug)]
+struct SeenEvents {
+    inner: Mutex<SeenInner>,
+    capacity: usize,
+}
+
+#[derive(Debug, Default)]
+struct SeenInner {
+    set: BTreeSet<(u64, apex_state::Ordinal)>,
+    order: std::collections::VecDeque<(u64, apex_state::Ordinal)>,
+}
+
+impl SeenEvents {
+    /// 256 observations. Base seals a block every 2 s and emits a flashblock
+    /// every 200 ms, so this is roughly a minute of feed — comfortably longer
+    /// than a websocket reconnect and far shorter than anything that would make
+    /// the set a memory concern.
+    const DEFAULT_CAPACITY: usize = 256;
+
+    fn new(capacity: usize) -> Self {
+        Self { inner: Mutex::new(SeenInner::default()), capacity: capacity.max(1) }
+    }
+
+    /// `true` when this observation is new. Recovering from a poisoned lock
+    /// rather than propagating: refusing every event because one panic happened
+    /// mid-insert would halt the chain, which is far worse than the duplicate
+    /// this set exists to prevent.
+    fn take(&self, chain: ChainId, at: apex_state::Ordinal) -> bool {
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let key = (chain.0, at);
+        if !inner.set.insert(key) {
+            return false;
+        }
+        inner.order.push_back(key);
+        while inner.order.len() > self.capacity {
+            if let Some(old) = inner.order.pop_front() {
+                inner.set.remove(&old);
+            }
+        }
+        true
+    }
+
+    fn len(&self) -> usize {
+        match self.inner.lock() {
+            Ok(g) => g.set.len(),
+            Err(p) => p.into_inner().set.len(),
+        }
+    }
 }
 
 /// The commitment hashes currently held by an in-flight opportunity (§17.4).
@@ -472,11 +573,17 @@ pub enum Handled {
     Declined(Decline),
     /// §17.4: an identical commitment is already in flight. **Not a miss.**
     Suppressed(Suppressed),
+    /// The feed redelivered an observation already handled. **Not a miss either**
+    /// — and distinct from `Suppressed`, because the two say different things
+    /// about the feed: this one means a source repeated itself, that one means
+    /// two different observations described the same trade.
+    Redelivered { chain: ChainId, at: apex_state::Ordinal },
 }
 
 pub struct Plane {
     ports: Ports,
     inflight: InFlight,
+    seen: SeenEvents,
     misses: Mutex<MissLedger>,
     budgets: Budgets,
 }
@@ -487,7 +594,18 @@ impl Plane {
     }
 
     pub fn with_budgets(ports: Ports, budgets: Budgets) -> Self {
-        Self { ports, inflight: InFlight::default(), misses: Mutex::new(MissLedger::new()), budgets }
+        Self {
+            ports,
+            inflight: InFlight::default(),
+            seen: SeenEvents::new(SeenEvents::DEFAULT_CAPACITY),
+            misses: Mutex::new(MissLedger::new()),
+            budgets,
+        }
+    }
+
+    /// How many observations the redelivery window currently holds.
+    pub fn observations_seen(&self) -> usize {
+        self.seen.len()
     }
 
     pub fn registry(&self) -> &TicketRegistry {
@@ -573,8 +691,14 @@ impl Plane {
         }
     }
 
-    /// One event, end to end, for every candidate it produces.
+    /// One event, end to end, for every proposal it produces.
     pub async fn on_event(&self, event: &StateEvent) -> Vec<Handled> {
+        // The cheapest check first, and before any budget is spent: has this
+        // exact observation already been handled? See `SeenEvents`.
+        if !self.seen.take(event.chain, event.at) {
+            return vec![Handled::Redelivered { chain: event.chain, at: event.at }];
+        }
+
         // §29.3: candidate generation is a bounded class. Reserved before the
         // search runs, so an overloaded process refuses work loudly instead of
         // queuing it.
@@ -583,15 +707,39 @@ impl Plane {
             return vec![Handled::Declined(self.file(None, &d))];
         };
 
-        let candidates = self.ports.search.candidates(event).await;
-        let mut out = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            out.push(self.handle(event, &candidate).await);
+        let proposals = self.ports.search.propose(event).await;
+        let mut out = Vec::with_capacity(proposals.len());
+        for proposal in proposals {
+            out.push(self.handle(event, &proposal).await);
         }
         out
     }
 
-    async fn handle(&self, event: &StateEvent, candidate: &Candidate) -> Handled {
+    async fn handle(&self, event: &StateEvent, proposal: &RouteProposal) -> Handled {
+        // §46.2's four stages, concurrently, and their join is what makes a
+        // candidate exist at all. Before this point there is a route; after it
+        // there is a trade with a size.
+        //
+        // It runs before the gate check and before step 1 because a proposal has
+        // no commitment: `ExecutionCommitment` covers `exact_inputs` and
+        // `min_profit`, so the dedup key does not exist until the size does.
+        let candidate = match self.refine(proposal).await {
+            Ok(c) => c,
+            Err(d) => return Handled::Declined(self.file_proposal(proposal, &d)),
+        };
+        self.handle_candidate(event, &candidate).await
+    }
+
+    /// §29.3's budget, then the join, then `apex-econ`'s assembly.
+    async fn refine(&self, proposal: &RouteProposal) -> Result<Candidate, Decline> {
+        let Some(_permit) = self.budgets.reserve(ResourceClass::ExactPricing) else {
+            return Err(Decline::NoBudget(ResourceClass::ExactPricing));
+        };
+        let refinement = refine_concurrently(self.ports.econ.as_ref(), proposal).await?;
+        self.ports.econ.assemble(proposal, refinement)
+    }
+
+    async fn handle_candidate(&self, event: &StateEvent, candidate: &Candidate) -> Handled {
         // INV-39, before anything else. §46.1 forbids new live dispatch until
         // reconciliation completes, so the honest response is to not create the
         // ticket -- a ticket admitted here would only ever reach the drain.
@@ -701,14 +849,16 @@ impl Plane {
         let nonce = assignment.reserve_nonce(readings.chain_pending_nonce, now);
         self.advance(guard, TicketStatus::Reserved)?;
 
-        // ---- Step 3: reserve compute. §46.2's four stages run inside it.
-        let refinement = {
-            let Some(_permit) = self.budgets.reserve(ResourceClass::ExactPricing) else {
-                return Err(Decline::NoBudget(ResourceClass::ExactPricing));
-            };
-            refine_concurrently(self.ports.econ.as_ref(), candidate).await?
+        // ---- Step 3: reserve compute.
+        //
+        // §46.2's four stages already ran, in `refine`, and their join is what
+        // made this candidate. Running them again here would be the second
+        // sizing of one trade -- two answers to one question, with the later one
+        // winning for no stated reason.
+        let Some(_sim_budget) = self.budgets.reserve(ResourceClass::SizingAllocation) else {
+            return Err(Decline::NoBudget(ResourceClass::SizingAllocation));
         };
-        let repriced = repriced_candidate(candidate, &refinement);
+        let repriced = candidate.clone();
         self.advance(guard, TicketStatus::Exacting)?;
 
         let sim = {
@@ -825,6 +975,34 @@ impl Plane {
         guard.advance(to).map_err(|e| Decline::Uncommittable { detail: e.to_string() })
     }
 
+    /// INV-40 for a decline that happened **before** a candidate existed.
+    ///
+    /// A proposal has no `CandidateId`, no EV and no capture probability — those
+    /// are exactly what the four stages were about to produce. Filing zeros would
+    /// put invented numbers in the dataset that decides where engineering effort
+    /// goes, so the record carries what is actually known: the route's own hash
+    /// as its identity, and an EV of 0 meaning *unmeasured* rather than *nil*.
+    ///
+    /// The distinction is visible downstream because a proposal-stage miss has a
+    /// `capture_probability` of 0.0 and no simulated EV, which no priced
+    /// candidate produces.
+    fn file_proposal(&self, proposal: &RouteProposal, decline: &Decline) -> Decline {
+        let ctx = MissContext {
+            candidate_id: apex_types::ids::CandidateId(
+                u64::from_be_bytes(
+                    proposal.route.route_hash.0[..8].try_into().unwrap_or([0u8; 8]),
+                ),
+            ),
+            state_fingerprint: proposal.state_fingerprint.clone(),
+            simulated_ev: 0,
+            estimated_capture_probability: 0.0,
+            path: SearchPath::Fast,
+            submission_policy: apex_types::ticket::SubmissionPolicy::Private,
+        };
+        self.locked_misses(|l| l.record(&ctx, decline));
+        decline.clone()
+    }
+
     /// INV-40. One place, so a new early return cannot forget it.
     fn file(&self, candidate: Option<&Candidate>, decline: &Decline) -> Decline {
         if let Some(c) = candidate {
@@ -913,16 +1091,6 @@ fn ticket_snapshot(guard: &TicketGuard<'_>, candidate: &Candidate) -> Opportunit
     };
     t.ticket_id = guard.id();
     t
-}
-
-/// The candidate as the §46.2 join now describes it.
-fn repriced_candidate(candidate: &Candidate, r: &Refinement) -> Candidate {
-    let mut c = candidate.clone();
-    c.expected_output = r.expected_output;
-    c.input_amount = r.input_amount;
-    c.robustness_margin = r.robustness_margin;
-    c.total_execution_cost = r.costs.clone();
-    c
 }
 
 #[allow(clippy::too_many_arguments)]

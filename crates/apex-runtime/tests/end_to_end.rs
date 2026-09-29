@@ -75,7 +75,7 @@ fn plane_with(
 fn landing_plane() -> Plane {
     plane_with(
         Arc::new(FixedSearch::new(vec![candidate(1, 47_079_437, 320_000_000_000)])),
-        Arc::new(PassThroughEconomics),
+        Arc::new(PassThroughEconomics::default()),
         Arc::new(LandsAndFinalizes),
     )
 }
@@ -91,6 +91,7 @@ async fn the_recorded_stream_drives_a_ticket_to_reconciled() {
     assert_eq!(stream.len(), 4, "the fixture is four events, one of them a redelivery");
 
     let mut reconciled = 0;
+    let mut redelivered = 0;
     for event in &stream {
         for handled in plane.on_event(event).await {
             match handled {
@@ -98,12 +99,19 @@ async fn the_recorded_stream_drives_a_ticket_to_reconciled() {
                     assert!(outcome.is_success(), "the fixture lands: {outcome:?}");
                     reconciled += 1;
                 }
+                Handled::Redelivered { .. } => redelivered += 1,
                 other => panic!("expected a closed ticket, got {other:?}"),
             }
         }
     }
 
-    assert_eq!(reconciled, 4, "one ticket per delivered event");
+    // Four events, one of them a byte-identical redelivery of another. Three
+    // observations, three tickets -- the fourth arrival is the feed repeating
+    // itself, and trading on it would price against state our own first trade
+    // had already moved.
+    assert_eq!(reconciled, 3, "one ticket per distinct observation");
+    assert_eq!(redelivered, 1, "and the repeat says so rather than vanishing");
+    assert_eq!(plane.observations_seen(), 3);
     let m = plane.registry().metrics();
     assert_eq!(m.tickets_terminal_success, reconciled);
     assert_eq!(m.ticket_drop_count(), 0, "INV-01: nothing may disappear");
@@ -173,7 +181,7 @@ async fn the_journal_records_every_transition_in_order() {
 async fn an_unobserved_stage_is_not_recorded() {
     let plane = plane_with(
         Arc::new(FixedSearch::new(vec![candidate(1, 47_079_437, 320_000_000_000)])),
-        Arc::new(PassThroughEconomics),
+        Arc::new(PassThroughEconomics::default()),
         Arc::new(IncludesWithoutPreconfirming),
     );
     plane.boot(&NoChain, BOOT).expect("boot");
@@ -242,7 +250,7 @@ async fn a_concurrent_redelivery_produces_one_ticket() {
     let barrier = Arc::new(tokio::sync::Barrier::new(4));
     let plane = plane_with(
         Arc::new(FixedSearch::new(vec![candidate(1, 47_079_438, 320_000_000_000)])),
-        Arc::new(BarrieredEconomics { barrier }),
+        Arc::new(BarrieredEconomics::new(barrier, candidate(1, 47_079_438, 320_000_000_000))),
         Arc::new(LandsAndFinalizes),
     );
     plane.boot(&NoChain, BOOT).expect("boot");
@@ -252,40 +260,112 @@ async fn a_concurrent_redelivery_produces_one_ticket() {
     let (second, third) = (&stream[1], &stream[2]);
     assert_eq!(second, third, "the fixture's redelivery must be identical");
 
-    // Bounded, and not merely out of caution. `BarrieredEconomics` makes a serial
-    // §46.2 join **deadlock** rather than fail, which is the right shape for
-    // `workers::independent_tasks_run_concurrently` -- and would hang this test
-    // forever without a bound. A hanging test is worse than a failing one: CI
-    // reports a timeout with no name attached to it.
     let (a, b) = tokio::time::timeout(
         Duration::from_secs(5),
         async { tokio::join!(plane.on_event(second), plane.on_event(third)) },
     )
     .await
-    .expect("the plane did not park: a serial refine would deadlock the barrier");
+    .expect("neither call hung");
     let all: Vec<&Handled> = a.iter().chain(b.iter()).collect();
 
     let closed = all.iter().filter(|h| matches!(h, Handled::Closed { .. })).count();
-    let suppressed = all.iter().filter(|h| matches!(h, Handled::Suppressed(_))).count();
+    let redelivered = all.iter().filter(|h| matches!(h, Handled::Redelivered { .. })).count();
     assert_eq!(closed, 1, "one trade for one opportunity: {all:?}");
-    assert_eq!(suppressed, 1, "and the duplicate says so rather than vanishing: {all:?}");
+    assert_eq!(redelivered, 1, "and the duplicate says so rather than vanishing: {all:?}");
 
     assert_eq!(plane.registry().metrics().tickets_admitted, 1);
-    // A suppression is NOT a miss: the opportunity was captured, by the other
+    // A redelivery is NOT a miss: the opportunity was captured, by the other
     // delivery. Filing it would put trades the system took into the dataset that
     // decides where engineering effort goes.
+    assert_eq!(plane.misses().len(), 0, "a redelivered observation is not a missed opportunity");
+    assert_eq!(plane.observations_seen(), 1, "one observation, however many times it arrived");
+}
+
+/// **§17.4's own case, which the event window cannot see.**
+///
+/// Two *different* observations proposing the same trade. The `(chain, Ordinal)`
+/// check does not fire — the events genuinely differ — so the commitment hash is
+/// what catches it, which is why both levels exist.
+///
+/// The barriered economics makes this deterministic: the first call parks inside
+/// §46.2's join, so the second is guaranteed to reach the lock while the first
+/// still holds it.
+#[tokio::test]
+async fn two_different_events_proposing_one_trade_produce_one_ticket() {
+    let c = candidate(1, 47_079_438, 320_000_000_000);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let plane = Plane::new(Ports {
+        registry: Arc::new(TicketRegistry::new(
+            Box::new(InMemoryJournal::new()),
+            Box::new(ManualClock::at(BOOT.0)),
+        )),
+        pool: Arc::new(pool()),
+        gate: Arc::new(DispatchGate::shut()),
+        dispatcher: Arc::new(NullDispatcher::new()),
+        chain: Arc::new(FakeChain::landing()),
+        search: Arc::new(PinnedSearch { proposal: proposal_for(&c) }),
+        econ: Arc::new(PassThroughEconomics(c)),
+        sim: Arc::new(ParkingSimulator::new(Arc::clone(&release))),
+        risk: Arc::new(AlwaysAdmits),
+        commitments: Arc::new(FixtureCommitments),
+        signer: Arc::new(EchoSigner),
+        live: Arc::new(FixedReadings(readings())),
+        settlement: Arc::new(LandsAndFinalizes),
+    });
+    plane.boot(&NoChain, BOOT).expect("boot");
+
+    let stream = recorded_stream();
+    // Events 2 and 4 differ in block, kind and ordinal -- so the redelivery
+    // window is silent and only the commitment can catch this.
+    let (second, fourth) = (&stream[1], &stream[3]);
+    assert_ne!(second.at, fourth.at, "the two observations must genuinely differ");
+
+    // The first call parks inside simulation, which is inside the commitment
+    // lock; the second therefore reaches the lock while the first still holds it.
+    let (a, b) = tokio::time::timeout(
+        Duration::from_secs(5),
+        async {
+            tokio::join!(plane.on_event(second), async {
+                let r = plane.on_event(fourth).await;
+                release.notify_one();
+                r
+            })
+        },
+    )
+    .await
+    .expect("neither call hung");
+    let all: Vec<&Handled> = a.iter().chain(b.iter()).collect();
+
+    assert_eq!(
+        all.iter().filter(|h| matches!(h, Handled::Redelivered { .. })).count(),
+        0,
+        "these are different observations; the window must not claim otherwise"
+    );
+    assert_eq!(all.iter().filter(|h| matches!(h, Handled::Closed { .. })).count(), 1, "{all:?}");
+    assert_eq!(
+        all.iter().filter(|h| matches!(h, Handled::Suppressed(_))).count(),
+        1,
+        "the commitment hash is what catches this one: {all:?}"
+    );
+    assert_eq!(plane.registry().metrics().tickets_admitted, 1);
     assert_eq!(plane.misses().len(), 0, "a suppressed duplicate is not a missed opportunity");
 }
 
-/// ...and suppression is about concurrency, not about history.
+/// **The redelivery window covers a repeat arriving later, not only a concurrent
+/// one** — and that is the correction Task 2b.5 forced.
 ///
-/// A redelivery arriving after the first ticket closed produces a second ticket,
-/// and that is correct: §17.4's words are "an **in-flight** ticket". The plane does
-/// not second-guess the search about whether the same edge is worth taking twice —
-/// a plane that suppressed on history would refuse the second leg of a genuinely
-/// repeating opportunity, which on Base is most of them.
+/// The earlier version of this test asserted the opposite, on the reasoning that
+/// §17.4's words are "an **in-flight** ticket" and history is not the plane's to
+/// second-guess. The first half is still true and is why the commitment check
+/// stays scoped to in-flight work. The conclusion was wrong: a *redelivered
+/// observation* is not a second opportunity at all. The state did not change —
+/// the feed repeated itself — and trading on the repeat would price against
+/// state our own first trade had already moved.
+///
+/// The two levels say different things, which is why both exist. This one is
+/// about the feed; the commitment hash is about the trade.
 #[tokio::test]
-async fn a_sequential_redelivery_is_a_new_opportunity() {
+async fn a_sequential_redelivery_is_not_a_new_opportunity() {
     let plane = landing_plane();
     plane.boot(&NoChain, BOOT).expect("boot");
     let stream = recorded_stream();
@@ -294,7 +374,16 @@ async fn a_sequential_redelivery_is_a_new_opportunity() {
     let again = plane.on_event(&stream[2]).await;
 
     assert!(matches!(first.first(), Some(Handled::Closed { .. })), "{first:?}");
-    assert!(matches!(again.first(), Some(Handled::Closed { .. })), "{again:?}");
+    assert!(
+        matches!(again.first(), Some(Handled::Redelivered { .. })),
+        "the same observation arriving again is the feed repeating itself: {again:?}"
+    );
+    assert_eq!(plane.registry().metrics().tickets_admitted, 1);
+
+    // ...and a genuinely different observation still trades, so the window is
+    // not simply refusing everything after the first.
+    let later = plane.on_event(&stream[3]).await;
+    assert!(matches!(later.first(), Some(Handled::Closed { .. })), "{later:?}");
     assert_eq!(plane.registry().metrics().tickets_admitted, 2);
 }
 
@@ -333,12 +422,17 @@ async fn a_declined_candidate_files_a_miss_and_admits_no_ticket() {
     let stream = recorded_stream();
     let handled = plane.on_event(stream.first().expect("an event")).await;
 
-    // The ticket was already admitted when the decline happened, so INV-01
-    // applies: it closes with an explicit code rather than disappearing.
-    let Some(Handled::Closed { outcome, .. }) = handled.first() else {
-        panic!("expected an explicit failure, got {handled:?}");
-    };
-    assert!(!outcome.is_success());
+    // **No ticket at all**, and that is Task 2b.5's reordering doing its job. The
+    // §46.2 join now runs before admission, because the commitment hash covers
+    // `exact_inputs` and `min_profit` and therefore cannot exist until the size
+    // does. A candidate that has no profitable size never becomes a ticket, so
+    // there is nothing for INV-01 to account for -- which is strictly better
+    // than admitting one and closing it a microsecond later.
+    assert!(
+        matches!(handled.first(), Some(Handled::Declined(_))),
+        "expected a decline before any ticket existed, got {handled:?}"
+    );
+    assert_eq!(plane.registry().metrics().tickets_admitted, 0, "no ticket for a decline");
     assert_eq!(plane.registry().metrics().ticket_drop_count(), 0);
 
     let ledger = plane.misses();
@@ -357,7 +451,7 @@ async fn a_declined_candidate_files_a_miss_and_admits_no_ticket() {
 async fn a_transport_acknowledgement_is_not_an_inclusion() {
     let plane = plane_with(
         Arc::new(FixedSearch::new(vec![candidate(1, 47_079_437, 320_000_000_000)])),
-        Arc::new(PassThroughEconomics),
+        Arc::new(PassThroughEconomics::default()),
         Arc::new(NeverLands),
     );
     plane.boot(&NoChain, BOOT).expect("boot");
@@ -415,7 +509,7 @@ async fn the_status_is_journalled_before_the_irreversible_act() {
         dispatcher: Arc::clone(&dispatcher) as Arc<dyn apex_capture::dispatch::Dispatcher + Send + Sync>,
         chain: Arc::new(FakeChain::landing()),
         search: Arc::new(FixedSearch::new(vec![candidate(1, 47_079_437, 320_000_000_000)])),
-        econ: Arc::new(PassThroughEconomics),
+        econ: Arc::new(PassThroughEconomics::default()),
         sim: Arc::new(AlwaysSucceeds),
         risk: Arc::new(AlwaysAdmits),
         commitments: Arc::new(FixtureCommitments),
@@ -438,5 +532,52 @@ async fn the_status_is_journalled_before_the_irreversible_act() {
         dispatcher.seen(),
         vec![("dispatch", Some(TicketStatus::Dispatching))],
         "and already said Dispatching when anything was sent"
+    );
+}
+
+/// The redelivery window is **bounded**, and what falls out of it is caught by
+/// the commitment rather than lost.
+///
+/// An unbounded set would grow for the life of the process, which on a 14-day
+/// shadow run is millions of entries for a problem that only ever concerns the
+/// last few seconds of feed. Bounding it means a duplicate older than the window
+/// costs a full refinement — and is then still caught by the commitment hash,
+/// which is why both levels exist and why this bound is safe to take.
+#[tokio::test]
+async fn the_redelivery_window_is_bounded() {
+    let plane = landing_plane();
+    plane.boot(&NoChain, BOOT).expect("boot");
+
+    let stream = recorded_stream();
+    let base = stream.first().expect("an event").clone();
+
+    // More distinct observations than the window holds.
+    for block in 0..300u64 {
+        let mut e = base.clone();
+        e.at = apex_state::Ordinal::confirmed(block, 0, 0);
+        let _ = plane.on_event(&e).await;
+    }
+
+    assert!(
+        plane.observations_seen() <= 256,
+        "the window grew without bound: {}",
+        plane.observations_seen()
+    );
+
+    // The most recent observation is still remembered...
+    let mut recent = base.clone();
+    recent.at = apex_state::Ordinal::confirmed(299, 0, 0);
+    assert!(
+        matches!(plane.on_event(&recent).await.first(), Some(Handled::Redelivered { .. })),
+        "a recent repeat must still be caught"
+    );
+
+    // ...and the oldest has been evicted, so it is handled again rather than
+    // being remembered for ever.
+    let mut ancient = base.clone();
+    ancient.at = apex_state::Ordinal::confirmed(0, 0, 0);
+    assert!(
+        !matches!(plane.on_event(&ancient).await.first(), Some(Handled::Redelivered { .. })),
+        "an observation older than the window is outside it, by definition"
     );
 }

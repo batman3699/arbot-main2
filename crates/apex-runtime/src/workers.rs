@@ -28,7 +28,7 @@
 
 use crate::bus::Lane;
 use crate::plane::{Decline, Economics, Refinement};
-use apex_types::candidate::Candidate;
+use apex_search::frontier::RouteProposal;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 /// §29's nine classes, verbatim.
@@ -197,13 +197,13 @@ impl Budgets {
 /// refreshed, and the §29 compute it would spend is the scarce thing.
 pub async fn refine_concurrently(
     econ: &dyn Economics,
-    candidate: &Candidate,
+    proposal: &RouteProposal,
 ) -> Result<Refinement, Decline> {
     let (expected_output, input_amount, robustness_margin, costs) = tokio::try_join!(
-        econ.reprice(candidate),
-        econ.size(candidate),
-        econ.scenarios(candidate),
-        econ.refresh_costs(candidate),
+        econ.reprice(proposal),
+        econ.size(proposal),
+        econ.scenarios(proposal),
+        econ.refresh_costs(proposal),
     )?;
 
     Ok(Refinement { expected_output, input_amount, robustness_margin, costs })

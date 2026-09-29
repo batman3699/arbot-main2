@@ -3647,7 +3647,39 @@ So the order is **frontier → Engine D → Engine C → assembly → Engine A**
 
   **`apex-math` gained a dependency on `apex-types`**, for `ExplainsMiss` alone. Both are zero-I/O and no-async, `tier0_is_pure.sh` still passes, and §6.1 places `apex-types` below it.
 
-- [ ] **2b.5 — `CandidateSource`, assembled.** The port `apex-runtime::plane` takes, wired to the frontier and the engines, with the §29 resource classes respected. Failing test: the Task 8.4 end-to-end test drives a real search instead of `FixedSearch`, and a ticket still reaches `Reconciled`.
+- [x] **2b.5 — `RouteSource`, assembled.** **Delivered 2026-09-29.** `crates/apex-runtime/src/search.rs`, `tests/real_search.rs`, plane rewired; 6 new tests. Workspace 1,786 → **1,794**.
+
+  #### Task 8.4 named a port for a crate that could not satisfy it
+
+  `CandidateSource` took a `StateEvent` and returned `Vec<Candidate>`, and §7 named `apex-search` as its implementor. `apex-search` could not: §6.1 runs `apex-search → apex-econ`, `Candidate::input_amount` is a `DiscreteSize`, and **only `apex-econ`'s refinement path can mint one** (INV-18). A `Candidate` also carries `total_execution_cost`, `robust_ev`, `capture_probability`, `certificate_status` and `simulation_tier` — every one an econ or sim output. No amount of care inside `apex-search` would have fixed that.
+
+  It is `RouteSource` now, returning `RouteProposal`s. A search proposes a route; economics decides whether and at what size it is a trade. The `Economics` port's four §46.2 stages take a proposal, and their join is what makes a candidate exist — the plane owns *when* they run, `apex-econ` owns *what the numbers mean*.
+
+  #### The reordering forced two real corrections
+
+  **The §46.2 join now runs before step 1**, because `ExecutionCommitment` covers `exact_inputs` and `min_profit` — **the dedup key cannot exist until the size does**. Two consequences, both found by tests that started failing:
+
+  1. **A candidate with no profitable size never becomes a ticket.** Previously it was admitted and closed a microsecond later; now the decline happens before admission. Strictly better, and INV-40 still files the miss — through `file_proposal`, which records the route hash as identity and an EV of 0 meaning *unmeasured*, because a proposal has no simulated EV and writing zeros would put invented numbers in the dataset that decides where engineering effort goes.
+
+  2. **A redelivered observation now costs a full refinement before anything notices.** That is the §29 budget spent on work already done, so there is a second, cheaper dedup: a bounded window on `(chain, Ordinal)`. The two levels catch different things and neither subsumes the other — the window catches *a source repeating itself*, the commitment hash catches *two different observations describing one trade*. Both have their own test, and the second uses a one-way gate inside simulation rather than a barrier, because a barrier before the lock releases both callers without their lock windows ever overlapping.
+
+  **And it corrected a test I had asserted backwards.** `a_sequential_redelivery_is_a_new_opportunity` claimed a later repeat should produce a second ticket, reasoning from §17.4's "an **in-flight** ticket". The premise was right and the conclusion was wrong: a redelivered *observation* is not a second opportunity — the state did not change, the feed repeated itself, and trading on the repeat prices against state our own first trade already moved. It is `a_sequential_redelivery_is_not_a_new_opportunity` now, and it also checks a genuinely different observation still trades, so the window is not simply refusing everything.
+
+  #### The frontier is shared truth, so it is `Versioned`
+
+  Search workers read it concurrently and events mutate it. INV-11 / §5.3 forbids a lock on the read path, so `FrontierSearch` holds it in `apex_state::Versioned` — wait-free reads, copy-on-write updates. Affordable for a measured reason rather than an optimistic one: the tradeable set on Base is 8–11 cross-venue pairs, so the structure being cloned holds tens of entries. The comment naming that is on the `Clone` derive, which is the line that has to change if it ever holds thousands.
+
+  **An invalidated template is removed from service rather than marked**, which is a deviation from Engine D's own design note and is stated as one: marking needs a ninth `RouteTemplate` attribute §12.1 does not list, so it waits for the task that refreshes templates. Until then the safe direction is to stop pricing — losing a recency score costs ranking; pricing against a stale tick costs money.
+
+  **`ReconstructionStatus` is taken as a parameter and is `Unsafe` for a hand-seeded frontier.** `Versioned::new` demands it because *"callers must say which they mean"*, and this repository has a specific reason to care: `base_venues_complete.yaml` was found to invent router and quoter addresses. **Nothing consults it yet — that is INV-08, still open** — and it is taken and exposed anyway so the input exists when the gate is written. Recording the gap beats a half-enforcement that looks like one.
+
+  #### Six mutations, two survived, both dead code
+
+  Caught: the redelivery window never refusing; the window unbounded; an invalidated template priced anyway; the pricing budget not reserved; the declined counter dropped.
+
+  Survived: an early return on an empty `revalue` set — `FiniteSizeEngine::propose` over an empty hit list already produces an empty result, so it was a redundant shortcut reading like a guard. **Third one this phase**, after the frontier's chain filter and Engine C's gain check. Removed.
+
+  The budget mutation is worth naming separately: `Budgets` was tested in isolation by `resource_classes_isolated`, and **nothing asserted the plane actually consults it on this path**. That is §6.5's "written but never wired" in its smallest form, and `a_saturated_pricing_budget_declines_rather_than_queues` closes it.
 
 - [ ] **2b.6 — Engine A: incremental negative-cycle (BP-045, BP-060).** `graph.rs` adapted: edges carry `state_version` and search consumes immutable snapshots. Last, deliberately — §52, and the measurement that 4× the cycles changed nothing. Failing test: the migrated Bellman-Ford tests, plus one asserting a stale snapshot cannot produce a candidate.
 
