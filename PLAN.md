@@ -3745,6 +3745,28 @@ So the order is **frontier → Engine D → Engine C → assembly → Engine A**
 
 **Task order note:** 2b.7 was executed before 2b.6. Engine A is §52-deprioritised and the measurements agree; `apex-exec` is two of the three missing ports and the one the shadow run cannot start without.
 
+### Phase 2b status, 2026-09-29: six of seven tasks delivered; one acceptance criterion open
+
+| Task | State |
+|---|---|
+| 2b.1 `StateEvent` moves down | ✅ + `crate_dependency_direction.sh` |
+| 2b.2 The route frontier | ✅ BP-176 |
+| 2b.3 Engine D, event templates | ✅ BP-063 |
+| 2b.4 Engine C, finite-size search | ✅ BP-062 |
+| 2b.5 `RouteSource`, assembled | ✅ — the plane runs on a real search |
+| 2b.6 Engine A, negative cycles | ✅ BP-045, BP-060 |
+| 2b.7 `apex-exec` | **Partial.** Commitment and encoding delivered and differentially tested; `Commitments` needs venue fingerprints, `Signer` needs key material |
+
+**Acceptance criteria:** 2 ✅ (Engine C produces a finite-size-only opportunity and nothing else does), 3 ✅ (all eight event classes, exhaustively), 4 ✅ (revaluation before discovery, proven structurally), 5 ✅ (`plan.rs` and `abi.rs` are not the production encoders — `apex-exec` is). **1 is open**: `RouteSource` has an implementation and the end-to-end test drives it, but `Commitments` and `Signer` do not.
+
+**What criterion 1 still needs, precisely:**
+
+- **`venue_fingerprints`** — `ExecutionCommitment` carries a `B256` per venue and `apex-venues` has no such concept. It is a Phase 2 gap this phase surfaced rather than created.
+- **Key material** — §43 and INV-46 govern how it may be held. `apex-exec` produces the payload and `SignedPlan::check` refuses a mismatched commitment; the signature is an operational input.
+- **A decision on which commitment is the dedup key.** `plan_commitment` covers everything that decides what a plan does and is the value the chain agrees with, which makes it the better candidate and would replace two commitments with one. Deferred deliberately: it would be a third structural change to the plane in one session.
+
+**Four pieces of dead code were removed over the phase**, three found by mutation and one by clippy: the frontier's chain filter, Engine C's gain guard, the search's empty-revalue early return, and `GraphSnapshot`'s unread index. Each read like a guard and protected nothing, and the recurrence is worth naming — a guard that cannot fail is indistinguishable from one that has never been tested, and only a mutation tells them apart.
+
 **Tests:** frontier revaluation order; the eight event classes, exhaustively; a finite-size-only opportunity; the migrated Bellman-Ford suite; commitment round-trip against the deployed ABI.
 **Benchmarks:** frontier revaluation p99 within §29.5's budget for the fast path; Engine A's broad search runs on the slow lane and is measured **there**, so it cannot borrow the fast path's number.
 **Acceptance criteria:**
