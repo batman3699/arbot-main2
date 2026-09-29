@@ -3521,6 +3521,72 @@ restructure that record anyway.
 
 ---
 
+## PHASE 2b — Candidate generation (`apex-search`) and transaction construction (`apex-exec`)
+
+**Written 2026-09-29, after Phase 8, because that is when its absence became undeniable.** It is numbered 2b rather than 18 because that is where the plan already put it, and renumbering would hide the miss.
+
+### Why this phase did not exist
+
+§12.2's engine table assigns Engine A, Engine C and Engine D to **Phase 2**. §7's directory tree lists `crates/apex-search/`. §12 says "Crate: `apex-search`". §4's audit table sends `graph.rs`, `cycle_index.rs`, `hot_path.rs`, `mempool.rs` and `backrun_state.rs` there. BP-045, BP-060, BP-062, BP-063 and BP-176 name five of its files and four of its tests. Phase 13 adds `crates/apex-search/src/backrun/` *into* it.
+
+**No phase's Files block contains `CREATE crates/apex-search/{…}`.** Phase 2's objective is "one `ExactPricingEngine` trait, one `VenueAdapter` trait, differential-proven exactness, and a verified pool/venue inventory" — pricing and admission — and its Files block creates `apex-math` and `apex-venues`. `git log --all --diff-filter=A -- 'crates/apex-search/*'` is empty: the crate has never existed in any branch.
+
+`apex-exec` failed differently. Phase 5's Files block **does** create it (`src/commitment.rs`, `src/encode/{mod,steps}.rs`, `src/abi.rs`), and Phase 5 delivered the contracts, the `DeployConfig` seam and the invariant suites without it. `plan.rs` and `abi.rs` are still in `arb-exec-legacy`.
+
+Task 8.4's port table is what made both undeniable: three of the control plane's eight ports — `CandidateSource`, `Commitments`, `Signer` — have no implementation, and two of the three belong to crates nobody has created. **Phase 8's Tasks 8.5 and 8.6 are blocked on this phase, and so is everything downstream** — Phases 9, 10 and 11 all list Phase 8 as a dependency, and Phase 9 specifically needs realized outcomes to calibrate against.
+
+### What the repository's own measurements say this phase should build
+
+Five findings, all recorded in this repository before v4 began, and together they decide the task order.
+
+| Finding | Consequence for this phase |
+|---|---|
+| **Opportunity density is not the constraint.** 4× the cycles produced the same 96% `no_profitable_size`. | Engine A is not the lever. §52 says so independently. |
+| **More hops is strictly worse.** ~1,200 samples across 2/3/4-hop, none profitable; 2-hop dominates at every percentile. | The frontier is a 2-hop structure first. Deeper routes are not free candidates, they are worse ones. |
+| **The tradeable set is small and fee-selected.** ~8–11 cross-venue pairs at 1.6–7 bps and ≥ $100k depth; fee-aware selection cut the hurdle from −247 bps to −10 bps median. | A *resident* frontier over a small set is the right shape. §12.1 already says so. |
+| **Event-triggered sampling found the first net-positive samples.** 88% of net-positive samples followed a swap ≥ $5k; continuous sampling measures the wrong moment. | **Engine D is the empirically load-bearing engine**, not a later enhancement. |
+| **The sweet spot is $300–$1,000 notional** — below it gas dominates, above it price impact does. | A finite-size phenomenon that infinitesimal rates cannot express. §12.2 already calls Engine C "the engine the repository's measurements most demand". |
+
+So the order is **frontier → Engine D → Engine C → assembly → Engine A**, and Engine A is last on purpose. That is not a deprioritisation invented here; it is §52's next-dollar rule applied to measurements this repository already has.
+
+**Dependencies:** Phases 1, 2 (state, math, venues). Executed after Phase 8 because that is when the gap was found.
+
+**Files:**
+- MOVE `StateEvent`/`EventKind` from `apex-runtime::bus` → `crates/apex-state/src/feed/event.rs` (dependency direction; see Task 2b.1)
+- CREATE `crates/apex-search/{Cargo.toml,src/lib.rs,src/frontier.rs,src/engine_d.rs,src/events/,src/engine_c.rs,src/finite_size.rs,src/engine_a.rs,src/graph.rs,src/source.rs}`
+- CREATE `crates/apex-exec/{Cargo.toml,src/lib.rs,src/commitment.rs,src/encode/{mod.rs,steps.rs},src/sign.rs}`
+- MODIFY `crates/apex-runtime/src/plane.rs` to wire the real ports
+
+**Tasks (TDD):**
+
+- [ ] **2b.1 — `StateEvent` moves down to `apex-state`.** `apex-runtime` depends on `apex-search`, so a `CandidateSource` implemented in `apex-search` cannot take a type defined in `apex-runtime`. The same argument `apex-types::ack` makes for `LifecycleStage` — *"the controller calls adapters, so the adapter crate cannot depend on the controller, which leaves exactly one honest place for the shared words"* — applies here, and points at `apex-state`: a state event carries a `StateFingerprint` and an `Ordinal`, both of which are that crate's vocabulary. The bus, the lanes and the loss counters stay in `apex-runtime`; they are plumbing, not vocabulary. Failing test: `apex-search` compiles against `StateEvent` without depending on `apex-runtime`.
+
+- [ ] **2b.2 — The route frontier (BP-176).** §12.1's `RouteTemplate` with all eight attributes, and `Frontier::revalue(event)` returning known routes touching the event's pools **before** any discovery runs. Failing test: `search::frontier_revalues_first` — an event on a pool in a resident template yields that template without the graph being consulted, and the test proves the graph was not consulted rather than asserting a latency number. `cycle_index.rs` supplies topology and `hot_path.rs` the recency signal; the other six attributes are new.
+
+- [ ] **2b.3 — Engine D: event templates (BP-063).** §12.4's eight classes: large swap, liquidity removal/addition, liquidation, oracle-sensitive mutation, stablecoin dislocation, tick transition, hook state mutation, fee-tier/dynamic-fee change. Failing test: `search::event_templates` — each class maps to the template set it should revalue, exhaustively, so a ninth class cannot be added without answering the question. **The decode half of `mempool.rs` is the input, not the design**: it carries five upward dependencies (`ingestion`, `math`, `metrics`, `token_refresh`, `util`) into three different future crates, so this is built fresh and differentialled against it rather than moved.
+
+- [ ] **2b.4 — Engine C: finite-size route search (BP-062).** §12.3's families, starting with the two the measurements support — pairwise cross-venue mismatch and same-pair split — and the size grid the census found ($300–$1,000). Failing test: `search::finds_finite_size_only_opportunity` — a route whose infinitesimal rate is unprofitable and whose finite-size evaluation is profitable must be produced. That test is the whole argument for the engine, and it must be constructed from a real AMM curve rather than a fixture that asserts the shape.
+
+- [ ] **2b.5 — `CandidateSource`, assembled.** The port `apex-runtime::plane` takes, wired to the frontier and the engines, with the §29 resource classes respected. Failing test: the Task 8.4 end-to-end test drives a real search instead of `FixedSearch`, and a ticket still reaches `Reconciled`.
+
+- [ ] **2b.6 — Engine A: incremental negative-cycle (BP-045, BP-060).** `graph.rs` adapted: edges carry `state_version` and search consumes immutable snapshots. Last, deliberately — §52, and the measurement that 4× the cycles changed nothing. Failing test: the migrated Bellman-Ford tests, plus one asserting a stale snapshot cannot produce a candidate.
+
+- [ ] **2b.7 — `apex-exec`: commitment, encoding, signing.** Phase 5's unbuilt file list. `Commitments::commit` builds the §25 `ExecutionCommitment` the executor independently recomputes — including the `venue_fingerprints` the control plane cannot supply — and `Signer::sign` produces the exact committed payload (INV-06: the signer refuses a payload whose recomputed commitment differs from the ticket's). Failing test: a commitment whose route is altered after signing fails the on-chain recomputation, proven against the real contract.
+
+**Tests:** frontier revaluation order; the eight event classes, exhaustively; a finite-size-only opportunity; the migrated Bellman-Ford suite; commitment round-trip against the deployed ABI.
+**Benchmarks:** frontier revaluation p99 within §29.5's budget for the fast path; Engine A's broad search runs on the slow lane and is measured **there**, so it cannot borrow the fast path's number.
+**Acceptance criteria:**
+1. `CandidateSource`, `Commitments` and `Signer` all have implementations, and `apex-runtime`'s end-to-end test drives them rather than test doubles.
+2. A finite-size-only opportunity is produced by Engine C and by nothing else.
+3. Every §12.4 event class maps to a template set, checked exhaustively.
+4. The frontier revalues known routes before discovery, proven structurally rather than by timing.
+5. `plan.rs` and `abi.rs` are no longer the production encoders.
+
+**Failure criteria:** a `CandidateSource` that returns fabricated candidates; a frontier whose "revalue first" is a comment rather than a control-flow fact; Engine A shipped before Engines C and D, which would repeat the measurement that already failed.
+**Exit gate:** **G-PRICE-1** (BP-045, BP-060, BP-062, BP-063, BP-176), and it unblocks **Task 8.5**.
+
+---
+
 ## PHASE 3 — Exact sizing and the complete cost model
 
 **Objective:** Discrete integer sizing that is structurally impossible to bypass, and a `TotalExecutionCost` that models Base's real economics.
@@ -5387,8 +5453,9 @@ Three mutations, each caught: `Undefined` clearing the floor; an empty window re
 
 Task 8.4's port table is the honest statement of what that costs: three of the eight ports the control plane is written against — `CandidateSource`, `Commitments`, `Signer` — have no implementation, and two of the three belong to crates nobody has created. **The remaining work before a shadow run is not Phase 9; it is those two crates.**
 
-- [ ] Create `crates/apex-search/` and implement `CandidateSource` — the missing phase. §12.1's frontier is primary, and `cycle_index.rs` is already ~70% of it.
-- [ ] Create `crates/apex-exec/` per Phase 5's file list and implement `Commitments` + `Signer`.
+**The missing phase is now written: PHASE 2b**, inserted after Phase 2 because that is where §12.2's engine table already assigned Engines A, C and D. It carries the task breakdown, and its exit gate unblocks this one.
+
+- [ ] **Phase 2b** — `apex-search` (frontier, Engines D/C/A, `CandidateSource`) and `apex-exec` (`Commitments`, `Signer`).
 - [ ] Then the 14-day run, against a criterion 1 that can now fail.
 
 Everything else this task needs is built: the plane, the journal, the two-lane feed, the nine budgets, supervision, the drain, the miss ledger, the coverage auditor, the P&L attribution.
