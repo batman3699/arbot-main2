@@ -24,7 +24,19 @@ cd "$(dirname "$0")/../.."
 # A rejection type is one whose name says it declines something. Deliberately
 # narrow: this is a naming convention the gate enforces, not a guess about
 # semantics, and the error message says how to opt out.
-pattern='^pub enum ([A-Za-z0-9]*(Reject|Refusal|Refused|AdmissionError|NoLane|Verdict|Clause|LastMileCheck)[A-Za-z0-9]*)'
+# `No[A-Z]…` rather than `NoLane` specifically, widened 2026-09-29 (Task 2b.4).
+# The original list named `NoLane` because that was the `No*` type that existed,
+# and the convention it was really expressing is "a type called No<thing>,
+# returned as an error, is a refusal". `apex_math::finite_size::NoSize` was the
+# cost of the narrower version: `NoProfitableSize` is **the** rejection in this
+# system's measured history -- 96% of candidates -- and the gate never asked
+# about it, because it was not on the list.
+#
+# That is the standing blind spot of a naming gate: it catches naming. Widening
+# a class is the cheap half of the fix; the expensive half is that a rejection
+# type named something else entirely still slips through, which is why the
+# exhaustive `every_rejection_path_records_a_miss` test exists alongside it.
+pattern='^pub enum ([A-Za-z0-9]*(Reject|Refusal|Refused|AdmissionError|Verdict|Clause|LastMileCheck)[A-Za-z0-9]*|No[A-Z][A-Za-z0-9]*)'
 
 missing=()
 while IFS= read -r line; do

@@ -253,6 +253,7 @@ name = "apex-math"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "apex-types",
  "ethers-core",
  "proptest",
 ]
@@ -265,9 +266,11 @@ dependencies = [
  "apex-capture",
  "apex-chain",
  "apex-econ",
+ "apex-math",
  "apex-sim",
  "apex-types",
  "apex-venues",
+ "ethers-core",
  "serde",
 ]
 
@@ -309,6 +312,7 @@ dependencies = [
  "apex-state",
  "apex-types",
  "apex-venues",
+ "ethers-core",
  "proptest",
  "serde",
 ]

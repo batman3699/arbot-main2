@@ -154,6 +154,39 @@ pub enum NoSize {
     NoProfitableSize { best: SizedOpportunity },
 }
 
+/// **INV-40.** The most common rejection this system makes has to say which miss
+/// it is.
+///
+/// It had no implementation until Task 2b.4, and the reason is worth recording:
+/// `scripts/ci/every_rejection_explains.sh` is a *naming* convention, its list
+/// named `NoLane` because that was the `No*` type that existed, and `NoSize` was
+/// therefore never asked. This is the rejection that matters most — this
+/// repository measured **96% of candidates** ending in `no_profitable_size`, so
+/// the single largest bucket in the missed-opportunity ledger was the one type
+/// the gate could not see. The pattern is `No[A-Z]…` now.
+///
+/// `NoProfitableSize` is `LowEv` and not `SimFail`: the route priced fine at
+/// every size. Nothing failed — it simply does not pay, which is what `LOW_EV`
+/// means and is the whole content of the finding.
+///
+/// `Unpriceable` is `SimFail`: a venue refused to price, which is a *failure to
+/// evaluate* rather than an economic verdict, and conflating the two would hide a
+/// broken adapter inside the largest bucket.
+///
+/// `RangeEmpty` is `NoFlashLiquidity`: the route's thinnest hop cannot absorb the
+/// minimum input, which is a depth fact about the venue and not about this
+/// trade's economics.
+impl apex_types::miss::ExplainsMiss for NoSize {
+    fn miss_reason(&self) -> apex_types::miss::MissReason {
+        use apex_types::miss::MissReason as R;
+        match self {
+            Self::NoProfitableSize { .. } => R::LowEv,
+            Self::Unpriceable => R::SimFail,
+            Self::RangeEmpty => R::NoFlashLiquidity,
+        }
+    }
+}
+
 /// Find the input that maximises net profit, or say why there is none.
 ///
 /// `net(x) = output(x) - x - fixed_cost` is concave — a concave function minus

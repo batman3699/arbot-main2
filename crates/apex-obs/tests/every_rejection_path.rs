@@ -24,6 +24,7 @@ use apex_capture::revalidate::LastMileCheck;
 use apex_capture::signer::NoLane;
 use apex_chain::adapter::RejectReason;
 use apex_econ::eligibility::Clause;
+use apex_math::finite_size::{NoSize, SizedOpportunity, Surplus};
 use apex_obs::{MissContext, MissLedger};
 use apex_sim::tier0::Tier0Verdict;
 use apex_types::cost::GasLimit;
@@ -71,6 +72,25 @@ fn every_rejection() -> Vec<Box<dyn RejectionCase>> {
         out.push(Box::new(c));
     }
     for n in [NoLane::AllBusy, NoLane::NoneFunded, NoLane::NotAuthorized, NoLane::AllOutOfTheHotPool] {
+        out.push(Box::new(n));
+    }
+    // `NoSize`, added 2026-09-29 (Task 2b.4). It was missing from this
+    // enumeration for the same reason it was missing an `ExplainsMiss` impl:
+    // `every_rejection_explains.sh` is a naming convention and `NoSize` was not
+    // on its list. It is the rejection that matters most -- this repository
+    // measured 96% of candidates ending in `no_profitable_size` -- so the
+    // largest bucket in the ledger was the one type neither check could see.
+    for n in [
+        NoSize::Unpriceable,
+        NoSize::RangeEmpty,
+        NoSize::NoProfitableSize {
+            best: SizedOpportunity {
+                amount_in: ethers_core::types::U256::from(1_000u64),
+                output: ethers_core::types::U256::from(990u64),
+                net: Surplus::Loss(ethers_core::types::U256::from(10u64)),
+            },
+        },
+    ] {
         out.push(Box::new(n));
     }
     for r in [
@@ -122,8 +142,9 @@ impl<T: ExplainsMiss + std::fmt::Debug> RejectionCase for T {
 fn every_rejection_path_records_a_miss() {
     let cases = every_rejection();
     // 9 eligibility clauses + 11 last-mile checks + 4 lane refusals
-    // + 4 submission rejections + 5 admission errors + 1 tier-0 verdict.
-    assert_eq!(cases.len(), 34, "the rejection surface changed; update the enumeration");
+    // + 4 submission rejections + 5 admission errors + 1 tier-0 verdict
+    // + 3 finite-size verdicts.
+    assert_eq!(cases.len(), 37, "the rejection surface changed; update the enumeration");
 
     let mut ledger = MissLedger::new();
     for (i, case) in cases.iter().enumerate() {

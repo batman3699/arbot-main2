@@ -15,6 +15,12 @@ description = "Exact pricing mathematics: pure, total, no provider, no environme
 # would hide a rounding change inside a file move.
 ethers-core = "2.0.14"
 anyhow = "1"
+# For `ExplainsMiss` only (INV-40). `apex-types` is tier 0 in §6.1's graph and
+# is itself zero-I/O and no-async, so this adds no capability this crate is
+# forbidden -- `scripts/ci/tier0_is_pure.sh` still holds. A rejection type that
+# cannot say which miss it is, is a rejection nobody can count, and
+# `NoProfitableSize` is 96% of them.
+apex-types = { path = "../apex-types" }
 
 [dev-dependencies]
 # Already in Cargo.lock via the alloy/revm tree, so this adds nothing new.

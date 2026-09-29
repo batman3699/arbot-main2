@@ -281,3 +281,46 @@ proptest! {
         );
     }
 }
+
+/// **The contract every consumer relies on: `Ok` is a gain.**
+///
+/// `best_size`'s tail is `Some(b) if b.net.is_gain() => Ok(b)` and
+/// `Some(b) => Err(NoProfitableSize { best: b })`, so a caller need not re-check.
+/// `apex-search`'s Engine C does not, and a mutation there proved the re-check
+/// was dead code — which means the contract is now load-bearing at a distance
+/// and belongs pinned at its source rather than defended at each consumer.
+///
+/// Swept across the band where the two engines disagree, so this is not one
+/// hand-picked case: below ~63 bps nothing clears ~1 cent of gas, above ~65 bps
+/// something does, and the assertion has to hold on both sides.
+#[test]
+fn best_size_returns_ok_only_for_a_gain() {
+    let mut saw_ok = false;
+    let mut saw_err = false;
+
+    for spread in [50u64, 60, 61, 63, 65, 80, 200, 1_000] {
+        let route = cycle(spread, 30, 20_000_000_000_000);
+        match best_size(&route, SearchBudget::default()) {
+            Ok(found) => {
+                assert!(
+                    found.net.is_gain(),
+                    "spread {spread} bps returned Ok with a loss; every caller reads Ok as a gain"
+                );
+                saw_ok = true;
+            }
+            Err(NoSize::NoProfitableSize { best }) => {
+                assert!(
+                    !best.net.is_gain(),
+                    "spread {spread} bps returned NoProfitableSize carrying a gain"
+                );
+                saw_err = true;
+            }
+            Err(_) => {}
+        }
+    }
+
+    // Both outcomes must occur, or the sweep is not crossing the boundary and
+    // the assertion is vacuous on one side.
+    assert!(saw_ok, "no spread in the sweep was profitable");
+    assert!(saw_err, "no spread in the sweep was unprofitable");
+}

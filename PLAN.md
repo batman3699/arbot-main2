@@ -3611,7 +3611,41 @@ So the order is **frontier → Engine D → Engine C → assembly → Engine A**
 
   **Original task text.** §12.4's eight classes: large swap, liquidity removal/addition, liquidation, oracle-sensitive mutation, stablecoin dislocation, tick transition, hook state mutation, fee-tier/dynamic-fee change. Failing test: `search::event_templates` — each class maps to the template set it should revalue, exhaustively, so a ninth class cannot be added without answering the question. **The decode half of `mempool.rs` is the input, not the design**: it carries five upward dependencies (`ingestion`, `math`, `metrics`, `token_refresh`, `util`) into three different future crates, so this is built fresh and differentialled against it rather than moved.
 
-- [ ] **2b.4 — Engine C: finite-size route search (BP-062).** §12.3's families, starting with the two the measurements support — pairwise cross-venue mismatch and same-pair split — and the size grid the census found ($300–$1,000). Failing test: `search::finds_finite_size_only_opportunity` — a route whose infinitesimal rate is unprofitable and whose finite-size evaluation is profitable must be produced. That test is the whole argument for the engine, and it must be constructed from a real AMM curve rather than a fixture that asserts the shape.
+- [ ] **2b.4 — Engine C: finite-size *search* (BP-062).**
+
+  **Corrected 2026-09-29, before implementation, because the task above was written without reading Phase 2.** Two things in it were wrong.
+
+  First, **Engine C's evaluator already exists**: Task 2.5 delivered `apex-math::finite_size` on 2026-09-23 — `SizedRoute`, `best_size`, `SearchBudget`, `NoSize`. What Task 2.5 explicitly listed as *not* delivered is the rest: "k-shortest simple routes, k-shortest cycles, same-pair split, event-targeted, backrun and liquidation templates… search *topologies* over the same finite-size evaluator." That is what this task builds.
+
+  Second, **the failing test I specified is the fixture Task 2.5 proved impossible.** Its correction is worth restating because I reproduced the error it records: *"No fixture exists where infinitesimal rates show no negative cycle and a finite size is profitable. Every venue this repository prices has an output concave in its input and zero at zero… the finite-size gross can never exceed the marginal gross. 'Infinitesimal rates say no, finite size says yes' describes a **convex** market."*
+
+  **Engine C earns its place by refusing, not by finding.** `graph.rs`'s edge weights are rate-only, so Engine A calls any cycle above parity a negative cycle regardless of whether any size pays for the transaction — and on this repository's own fixture, three of six spreads in the 60–65 bps band cannot be traded at any size. That band is where the cheap frontier sits.
+
+  Failing test: **`search::engine_c_refuses_what_engine_a_proposes`** — a template whose marginal gross exceeds parity and whose best size cannot clear the fixed cost produces no proposal and a `NoProfitableSize` decline.
+
+  **Delivered 2026-09-29.** `crates/apex-search/src/engine_c.rs`, `tests/finite_size_search.rs`; 6 tests, plus 3 rejection cases and 1 contract test elsewhere. Workspace 1,771 → **1,786**.
+
+  The test is built on a real constant-product round trip rather than a fixture asserting the shape, and the 61 bps case is the measured one: marginal gross above parity, and 300× short of ~1 cent of gas. Its complement widens the spread to 200 bps and requires a proposal *with a size* — without it, "refuses" is satisfied by an engine that refuses everything. A third test re-asserts Task 2.5's concavity claim over a spread sweep, because this module's whole argument rests on it.
+
+  **The budget cut falls where the ranking put it.** The frontier hands templates back fee-first, so pricing a prefix means the unpriced remainder is the most expensive routes — the ones least likely to clear anyway. That is 2b.2's ranking earning its keep rather than decorating a log line. What goes unpriced is **reported and is not a decline**: nothing was evaluated, so calling it `LOW_EV` would be a claim nobody measured — the same line Engine D draws between a skip and a miss.
+
+  #### INV-40's largest bucket had no implementation, and the gate could not see it
+
+  `apex_math::finite_size::NoSize` had no `ExplainsMiss` impl and was absent from `every_rejection_path_records_a_miss`. The reason is structural: `scripts/ci/every_rejection_explains.sh` is a **naming** convention, its pattern listed `NoLane` because that was the `No*` type that existed, and `NoSize` was therefore never asked about.
+
+  **That is the single most common rejection this system makes** — this repository measured 96% of candidates ending in `no_profitable_size` — so the largest bucket in the missed-opportunity ledger was the one type neither check could see. The pattern is `No[A-Z]…` now, which caught it immediately on the first run after widening; the enumeration is 34 → 37 cases.
+
+  The mapping distinguishes three verdicts that a single bucket would hide: `NoProfitableSize → LowEv` (the route priced fine and does not pay), `Unpriceable → SimFail` (a venue would not price, which is a failure to *evaluate* and would otherwise hide a broken adapter inside the largest bucket), `RangeEmpty → NoFlashLiquidity` (a depth fact about the venue, not about this trade).
+
+  **Worth naming as a standing limitation:** a naming gate catches naming. Widening a class is the cheap half; a rejection type named something else entirely still slips through, which is why the exhaustive test exists alongside it.
+
+  #### A second dead guard, found the same way as the first
+
+  **Five mutations, one survived.** Replacing `Ok(best) if best.net.is_gain()` with `if true` changed nothing — because `best_size`'s own tail is `Some(b) if b.net.is_gain() => Ok(b)` / `Some(b) => Err(NoProfitableSize)`. `Ok` **is** a gain, so the guard was dead and the loss arm unreachable. The same shape as the frontier's chain filter earlier in this phase and the two guards Task 7.2 removed.
+
+  Both were deleted, and the contract is pinned **at its source** rather than defended at each consumer: `apex-math`'s `best_size_returns_ok_only_for_a_gain` sweeps the band where the two engines disagree and requires both outcomes to occur, so the assertion cannot be vacuous on one side. Mutating `best_size` to return `Ok` for a loss now fails three tests. Caught on re-run, along with: the template budget ignored, unpriced templates reported as declines, `Unpriceable` mapped to `LowEv`, and the size hint dropped.
+
+  **`apex-math` gained a dependency on `apex-types`**, for `ExplainsMiss` alone. Both are zero-I/O and no-async, `tier0_is_pure.sh` still passes, and §6.1 places `apex-types` below it.
 
 - [ ] **2b.5 — `CandidateSource`, assembled.** The port `apex-runtime::plane` takes, wired to the frontier and the engines, with the §29 resource classes respected. Failing test: the Task 8.4 end-to-end test drives a real search instead of `FixedSearch`, and a ticket still reaches `Reconciled`.
 

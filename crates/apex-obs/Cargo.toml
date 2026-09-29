@@ -13,6 +13,8 @@ serde = { version = "1", features = ["derive"] }
 apex-capture = { path = "../apex-capture" }
 apex-chain = { path = "../apex-chain" }
 apex-econ = { path = "../apex-econ" }
+apex-math = { path = "../apex-math" }
+ethers-core = "2.0.14"
 apex-sim = { path = "../apex-sim" }
 apex-venues = { path = "../apex-venues" }
 alloy-primitives = { version = "0.8", features = ["serde"] }
