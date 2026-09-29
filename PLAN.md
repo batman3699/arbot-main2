@@ -1811,7 +1811,7 @@ The controller **owns the invariant that no admitted ticket can disappear silent
 
 ## 16.2 The mandatory capture protocol (§46.1)
 
-Implemented literally as an 11-step state machine in `apex-capture/src/protocol.rs`:
+Implemented as an 11-step state machine. **Corrected 2026-09-29 (Task 8.4):** the steps live in `apex-capture`'s `registry` / `revalidate` / `signer` / `dispatch` / `recover` modules, each returning a typed token consumed by the next; the **sequencing** is `apex-runtime/src/plane.rs`. There is no `apex-capture/src/protocol.rs` and there was never a commit that created one.
 
 ```text
  1. LOCK opportunity commitment
@@ -5146,7 +5146,7 @@ reachable. Both cases mutation-tested.
 **Files:**
 - CREATE `crates/apex-obs/{Cargo.toml,src/lib.rs,src/metrics.rs,src/miss.rs,src/coverage.rs,src/pnl.rs,src/attribution.rs}`
 - MOVE `src/metrics.rs` → `crates/apex-obs/src/metrics.rs`; `src/accounting.rs` → `crates/apex-obs/src/accounting.rs`
-- CREATE `crates/apex-runtime/{Cargo.toml,src/main.rs,src/plane.rs,src/bus.rs,src/workers.rs,src/supervise.rs,src/shutdown.rs}`
+- CREATE `crates/apex-runtime/{Cargo.toml,src/lib.rs,src/main.rs,src/plane.rs,src/bus.rs,src/workers.rs,src/supervise.rs,src/shutdown.rs}` — **`src/lib.rs` added 2026-09-29:** `tests/` can only link a lib, so a crate with only `main.rs` cannot be driven end to end, which is the defect this task exists to repair
 - CREATE `scripts/canary/{run_canary.sh,promote.sh}`
 - MODIFY `ops/observability/` dashboards
 
@@ -5250,6 +5250,117 @@ That is not a flaw to be corrected by splitting profit between layers. **Splitti
 
 **Six mutations caught, one survived and it was the interesting one.** Making `sums_to` return `true` unconditionally broke nothing, because every test asserted only that a correct partition sums. A predicate never exercised in its false direction is not tested — it is decoration that happens to be true. `sums_to_discriminates` now checks it rejects a wrong total, and the mutation fails.
 ### Task 8.4 — Control plane assembly (`apex-runtime`)
+
+**Delivered 2026-09-29.** `crates/apex-runtime/` — `lib.rs`, `bus.rs`, `workers.rs`, `plane.rs`, `supervise.rs`, `shutdown.rs`, `main.rs`; `tests/{end_to_end,workers,lifecycle}.rs` and `tests/fixtures/recorded_stream.json`; 26 tests plus 5 doctests. Workspace 1,727 → **1,753 passing**. Invariant coverage unchanged at 37/46.
+
+**The thing being replaced was never too long — it was unreachable.** §4.4's verdict on `Runner`/`RunnerConfig` is *"working, untestable as components"*, and audit P2-7 recorded it growing 27.8% while flagged, to 16,659 lines. A 16,000-line file assembled from independently testable parts would be ugly; that one could not be driven at all without a node, a key and a network. So the replacement's specification is its test: **the whole ticket lifecycle runs from a recorded event stream with no socket open**, and every external effect sits behind a port to make that possible.
+
+**Reaching `Reconciled` is the task's wording and it is not the assertion.** `Reconciled` is the last `TicketStatus` variant and `TicketGuard::advance` accepts any forward move, so a plane that did nothing but `advance(Reconciled)` satisfies the sentence exactly — no reservation, no revalidation, no dispatch, no receipt. The destination is cheap. The assertion is therefore over the **journal**, which records an `Advanced` entry per transition: that is BP-177's "every control-plane transition is observable" in its literal form, and a skipped step is a missing line. `the_journal_records_every_transition_in_order` pins all eleven.
+
+**And the eleven are not a list the plane walks.** `an_unobserved_stage_is_not_recorded` runs the same plane against a chain that includes a transaction without ever preconfirming it, and asserts the journal has **no** `Preconfirmed` entry while the ticket still reaches `Reconciled`. Without that test the first one is satisfied by a hardcoded sequence; with it, every status has to come from the observation that earned it.
+
+#### Step 1 had never been built, and it is the step that costs money when it is absent
+
+§17.4: *"`ExecutionCommitment::hash()` is the deduplication key. An in-flight ticket with an identical commitment hash suppresses a new one."* §7's crate table assigns §25 duplicate suppression to `apex-capture`. **Nothing in `apex-capture` mentions `ExecutionCommitment`**, and Phase 6's record does not claim it.
+
+It lands in `apex-runtime::plane` because the key is the commitment and the registry neither knows nor should know what a commitment is — the registry *accounts for* tickets; suppression decides whether a ticket should exist. That decision is step 1 of §16.2, and `Locked` is now the token `Plane::admit` requires, so a ticket cannot be created without it.
+
+**It matters because a state feed redelivers.** A websocket reconnect replays; §5.6's feed arbiter exists precisely because more than one source is watched. Without suppression one opportunity becomes two signed transactions for a trade that can only land once.
+
+**Suppression is about concurrency, not history, and the pair of tests says so.** `a_concurrent_redelivery_produces_one_ticket` replays the fixture's identical pair through `tokio::join!` and gets one ticket and one explicit suppression; `a_sequential_redelivery_is_a_new_opportunity` replays them one after another and gets two tickets — correctly, because §17.4's word is *in-flight*. A plane that suppressed on history would refuse the second leg of a genuinely repeating opportunity, which on Base is most of them. **A suppressed duplicate is also not a miss**, and carries the `not-a-candidate-rejection:` marker saying so: the opportunity was captured, by the other delivery, and filing it would put trades the system *took* into the dataset that decides where engineering effort goes.
+
+#### Write-ahead, and the test that can see it
+
+`recover::scan` divides crash survivors on whether the journal saw `Signed` — below it no signature exists, so the ticket closes without asking the chain. That division is sound **only** if the intent is journalled before the irreversible act. Reversed, a crash mid-sign looks like a ticket that was never signed, and the next boot closes it as abandoned while the transaction lands.
+
+No assertion about the recorded status *sequence* can see this: the sequence is identical either way. `the_status_is_journalled_before_the_irreversible_act` asks the signer and the dispatcher what status they saw when they were called, and requires `Signed` and `Dispatching` respectively.
+
+**`TicketStatus::may_be_on_chain()` now states that line once**, in `apex-types`, and both `recover::scan` and the shutdown drain call it. Two `>= Signed` comparisons in two crates could disagree about one ticket, and then a ticket shutdown closed would be one boot never asked the chain about — the money moving with no record on either side of the restart. It is also deliberately a *later* line than `is_authorized_or_later`: an `Authorized` ticket holds reserved resources (so INV-09 will not preempt it) and has no payload (so it is still safely closeable). Two questions, two answers, two functions.
+
+#### Shutdown must not classify what it cannot observe
+
+A drain that closed an in-flight signed ticket as `Abandoned` would write a terminal *failure* for a transaction about to land: a falsehood in the one dataset §46.1 says must never contain one, a lie to the P&L ledger, and a released nonce that is still in use. So an unfinished signed ticket is **handed over, not closed** — the journal plus boot reconciliation is the only thing that can ask the chain.
+
+Three phases, and the order is enforced rather than documented: stop admitting, stop the sources, drain the sinks. `Shutdown::stop_workers` returns `WorkersStopped`, which `Drain::run` requires, so "drain after the feeds are off" is a type. The grace period bounds the **wait**, never the honesty of the answer.
+
+The drain also refuses to close a ticket it *could* classify while somebody owns it. `TicketRegistry::sweep` already reasoned that way about deadlines — *"a checked-out ticket has an owner who is responsible for it"* — so `is_checked_out` is now exposed and the drain asks the registry rather than reaching its own conclusion.
+
+#### Nine resource classes, and what §29.2 does not say
+
+§29 names nine classes; §29.3 forbids an unbounded queue; `Budgets` gives each class its own permits, because one shared pool lets the *most numerous* work win and candidate generation is always the most numerous.
+
+§29.2 names three classes to **protect** — state ingestion, exact simulation, submission. Its shed list ("exotic searches", "low-confidence routes", "expensive low-hit-rate strategies") describes properties of *work*, not the nine classes, so **there is no total order over the classes to be had**. `ResourceClass` therefore does not derive `Ord`: a derived order would look like a priority and would be a fabrication. `is_protected` matches exhaustively so a tenth class is a compile error at the one place that decision must be conscious.
+
+#### A barrier, not a stopwatch
+
+The obvious BP-175 test times four 50 ms stages and asserts the total is under 200 ms. That is a measurement — flaky under load, and it passes for the wrong reason on a fast machine, because a serial implementation with four 1 ms stages also finishes quickly. A `Barrier` of four makes serialisation **deadlock**, and `tokio::time::timeout` turns the deadlock into a deterministic failure. What is asserted is not "it was fast" but "all four were in flight at once", which is what §46.2 says.
+
+The cost surfaced immediately: any *other* test using the barriered double would hang rather than fail if the join went serial, and a hanging test is worse than a failing one because CI reports a timeout with no name attached. `a_concurrent_redelivery_produces_one_ticket` is bounded for that reason.
+
+#### The bus protects the fast path by dropping slow-path work, so the drop is counted
+
+§2.6/BP-022: both paths are mandatory and the slow one never delays the fast one. Each subscriber gets its own bounded queue and `publish` is non-blocking, so a stalled subscriber **loses events** instead of applying backpressure. A shared queue would let the slowest consumer set the pace; a blocking send would let a stalled coverage auditor stall the capture path.
+
+The same mechanism that protects the fast path is the one that drops slow-path work, so the two lanes are counted separately and mean different things. Slow-lane loss is §29.2's shedding happening. **Fast-lane loss is a lost opportunity**, and §16.6 puts unexplained pre-dispatch loss on the zero-tolerance list — `fast_lane_is_lossless()` is asked separately so expected shedding cannot mask a capture failure.
+
+#### Fifteen mutations, one survived, and it was the familiar shape
+
+| Mutation | Caught by |
+|---|---|
+| `may_be_on_chain` moved to `Authorized` | `the_drain_and_recovery_draw_the_same_line` |
+| the drain closes everything it finds | **survived — see below** |
+| the drain ignores an outstanding guard | `the_drain_does_not_close_a_ticket_out_from_under_its_owner` |
+| `refine_concurrently` becomes four `await`s | `independent_tasks_run_concurrently` (barrier) |
+| one shared semaphore for all nine classes | `resource_classes_isolated` |
+| `shed()` sheds the protected classes too | `shedding_leaves_the_protected_classes_working` |
+| `InFlight::take` never refuses | 2 suppression tests |
+| `Locked::drop` does not release | 4 tests |
+| the plane jumps straight to `Reconciled` | 6 tests |
+| ladder statuses walked unconditionally | `an_unobserved_stage_is_not_recorded` |
+| sign before journalling `Signed` | `the_status_is_journalled_before_the_irreversible_act` |
+| the boot gate is not checked | `a_plane_that_never_booted_admits_nothing` |
+| the bus does not count a dropped event | 2 bus tests |
+| a miss is not filed | 2 miss tests |
+| `is_included` not required for success | `a_transport_acknowledgement_is_not_an_inclusion` |
+
+**Replacing the drain's `may_be_on_chain` check with `if false` broke nothing.** Every signed ticket in every test was *also* checked out, so the owner-check caught it — two guards covering for each other, which is the same failure as Task 6.2's `reserve_ids_through`/`restore` pair and Task 8.3's `sums_to`.
+
+The missing case is a `Signed` ticket **nobody owns**, and it is not exotic: `recover::reconcile` restores every outstanding ticket into the registry *before* resolving any of them, so a shutdown arriving during recovery finds restored tickets at their journalled status with no guard at all. Closing one would discard exactly the record recovery had just recovered. `a_restored_signed_ticket_is_handed_over_even_with_no_owner` and its discriminating complement `a_restored_unsigned_ticket_is_closed` now pin both directions, and the mutation fails.
+
+#### The `compile_fail` twin earned its keep immediately
+
+The repository's convention — stated in `apex_types::candidate` and `recover.rs` — is that every `compile_fail` doctest is paired with a twin differing **only** in the forbidden step, because a `compile_fail` snippet also passes when it breaks for an unrelated reason. `Locked`'s first draft had no twin, and the twin's first draft was red: `fn peek(l: &Locked<'_>) -> &ExecutionCommitment` needs a named lifetime, so **both halves were failing on E0106 rather than on privacy**. Exactly the weakness the convention exists for, caught by following it.
+
+Mutation then found something worth writing down. Making `Locked`'s fields `pub` turns the *read* case green — so that one does test field privacy — but leaves the *construction* case red, because `InFlight` is a private type and the third field cannot be named either. Two independent barriers hold, either alone suffices, and the doc comment now says which snippet is evidence for which claim. A reader who later makes `InFlight` public would otherwise believe the construction case still proved field privacy.
+
+#### `main.rs` reports its own readiness rather than pretending to trade
+
+Three of the eight ports are implemented by crates that do not exist — `apex-search` (Phases 2/12) and `apex-exec` (Phase 5) — so there is no candidate source to drive and no payload builder to sign with. A `main` that started a loop over stub ports would produce a process that looks alive and captures nothing, which is §6.5's "written but never wired" pattern with a PID.
+
+So `apex` does the four things that are real: load and validate configuration fail-closed, replay the journal and report what reconciliation would owe the chain *without* opening the gate, bring up the two-lane bus under real supervision, and drain on SIGINT/SIGTERM. Its log says which ports are missing. A reader who runs it learns what is wired.
+
+**`apex-config`'s `env_coverage` gate caught the first draft**, which read `APEX_INPUTS` and `APEX_JOURNAL` from the environment. The gate was right and registering them would have been the wrong repair: `LEGACY_ENV_VARS` is a list of 84 variables being *retired*, and adding two new arrivals to it is a category error. They are command-line arguments now — §2.4's complaint is late configuration lookup, a bootstrap path cannot come from the file it points at, and an argument is the explicit form: visible in the process table, impossible to inherit by accident from an operator's shell.
+
+**A supervised worker cannot own a resource it cannot recreate.** `spawn_supervised` takes `FnMut` so a restart gets a fresh future, which means the factory cannot move a `Subscription` out of itself — and that constraint is a statement, not an obstacle. The subscription is shared and borrowed per attempt, so the queue keeps filling while the worker is down, up to its capacity and then as counted drops. Which is how the loss counter ends up telling you a worker was restarting.
+
+#### Plan corrections and gaps recorded
+
+1. **`crates/apex-runtime/src/lib.rs` is missing from the Phase 8 file list.** A crate with only `main.rs` cannot be driven by an integration test — `tests/` links a lib — and "untestable as components" is the defect being repaired. The crate is a lib first and a thin bin second.
+
+2. **§20's `observe_outcome` cannot drive §2.5's ladder statuses.** It returns `apex_types::miss::ObservedOutcome`, whose fields are `landed_by_competitor` and `realized_profit_estimate` — a *miss-ledger* record, the right answer to "what happened to the opportunity we did not take", and unable to say which lifecycle stage **our own** transaction reached. `apex-chain` already has the right type: `TransactionObservation` carries a `LifecycleStage` and, from `Included` onward, a receipt. It is simply not on the trait. Bridged with a `SettlementFeed` port rather than a twelfth method, because §20's method count is something the plan settled deliberately (§7's prose says ten, the code block says eleven, and that disagreement is already recorded in `adapter.rs`).
+
+3. **`apex-capture/src/protocol.rs` does not exist**, though §16.2 and BP-018, BP-110 and BP-173 all name it, and `capture::protocol_steps_cannot_be_skipped` and `capture::no_config_read_on_dispatch_path` have no implementations anywhere. Phase 6 distributed the eleven steps across `registry`/`revalidate`/`signer`/`dispatch`/`recover` with typed tokens, which satisfies §16.2's *property* — a step cannot be skipped — without the named file. The **sequencing** is what was missing, and `apex-runtime/src/plane.rs` is now it. Recorded rather than quietly reconciled: §16.2's "Implemented literally as an 11-step state machine in `apex-capture/src/protocol.rs`" is wrong about the location, and the two named tests remain unwritten.
+
+4. **§33 has no bucket for an infrastructure failure between authorization and dispatch.** A signer that refuses and a chain that cannot be asked are both real and neither is one of the seventeen. `Decline`'s mapping states a rule rather than overloading `RISK_FAIL` into the largest and least informative bucket (Task 8.1's warning): **a refusal by our machinery is `RiskFail`; work that did not happen in time is `TooSlow`.** An eighteenth bucket was not invented mid-task.
+
+5. **`DispatchError` carries no builder/sequencer distinction**, which §33 splits on. It knows the lane refused, not what kind of thing the lane talks to. `SequencerRejected` is true for Base and Base is the only chain this system submits to; an Ethereum adapter must carry the distinction on the error rather than have a mapping function guess.
+
+6. **BP-022's test is named `state::fast_path_never_blocks_on_slow_path`** while its file is `crates/apex-runtime/src/workers.rs`. The crate prefix is wrong; implemented as `runtime::fast_path_never_blocks_on_slow_path`. §8's naming policy applies — the register and the code now agree.
+
+7. `TicketStatus::may_be_on_chain` and `TicketRegistry::is_checked_out` were added to `apex-types` and `apex-capture`, both to give an existing comparison one home rather than two.
+
+**What this task does not do.** It does not trade, and it does not benchmark. Phase 8's exit requires the complete §29.5 latency budget table measured and recorded; the four §46.2 stages are measurable now, but the numbers that matter are the ones a real search and a real node produce, so the table stays open. Acceptance criteria 1, 3, 6 and 7 are Tasks 8.5–8.6.
+
 ### Task 8.5 — Full-system shadow run
 ### Task 8.6 — Canary promotion
 
@@ -5900,7 +6011,7 @@ Every material requirement in `APEX_MEV_v4_Final_Architect_Blueprint.md` receive
 | BP-019 | The 10 named internal failures are engineering defects, not market failures (§2.4) | 6 | `apex-capture` | `src/{reserve,scheduler,journal}.rs` | chaos suite §29.4 | G-CAP-1 |
 | BP-020 | Opportunity Ticket with all 19 fields, created before any live submission work (§2.5) | 6 | `apex-types::ticket` | `crates/apex-types/src/ticket.rs` | `ticket_monotonic` | G-CAP-1 |
 | BP-021 | Monotonic ticket status + explicit terminal loss states + hard TTL (§2.5) | 6 | `apex-capture::ticket` | `src/ticket.rs` | `capture::expiry_is_always_explained` | G-CAP-1 |
-| BP-022 | Fast path and slow path are both mandatory; slow never delays fast (§2.6) | 2, 8 | `apex-search`, `apex-runtime` | `crates/apex-runtime/src/workers.rs` | `state::fast_path_never_blocks_on_slow_path` | G-CAP-2 |
+| BP-022 | Fast path and slow path are both mandatory; slow never delays fast (§2.6) | 2, 8 | `apex-search`, `apex-runtime` | `crates/apex-runtime/src/bus.rs` | `runtime::fast_path_never_blocks_on_slow_path` ✅ | G-CAP-2 |
 | BP-023 | Opportunity-coverage auditor with the 7 named metrics and automatic response (§2.7) | 8 | `apex-obs::coverage` | `crates/apex-obs/src/coverage.rs` | `obs::auditor_detects_injected_miss` | G-OBS-1 |
 | BP-024 | Resource reservation before signing; multiple signer lanes mandatory (§2.8) | 6 | `apex-capture::reserve`, `::signer` | `src/reserve.rs`, `src/signer/pool.rs` | `capture::reservation_precedes_signing` | G-CAP-1 |
 | BP-025 | `SYSTEM_CAPTURE_ASSURANCE` and `MARKET_CAPTURE` reported separately; never conflated (§2.9) | 8 | `apex-obs::metrics` | `crates/apex-obs/src/metrics.rs` | `obs::two_capture_metrics_are_distinct` | G-OBS-1 |
@@ -6010,7 +6121,7 @@ Every material requirement in `APEX_MEV_v4_Final_Architect_Blueprint.md` receive
 | BP-129 | Risk is a hard gate; all 14 named triggers (§28) | 6 | `apex-risk::policy` | `crates/apex-risk/src/policy.rs` | `risk::every_trigger_maps_to_a_posture` | G-RISK-1 |
 | BP-130 | Graduated response ladder (6 levels) (§28.1) | 6 | `apex-risk::posture` | `src/posture.rs` | `risk::posture_ladder` | G-RISK-1 |
 | BP-131 | Loss classification into 9 classes; over-frequency tightens the gate (§28.2) | 6 | `apex-risk::loss` | `src/loss.rs` | `types::loss_class_is_exhaustive` (taxonomy, Phase 0 ✅); `risk::every_loss_is_classified` (runtime, Phase 6) | G-RISK-1 |
-| BP-132 | Separate resource classes (9) (§29) | 8 | `apex-runtime::workers` | `crates/apex-runtime/src/workers.rs` | `runtime::resource_classes_isolated` | G-CAP-2 |
+| BP-132 | Separate resource classes (9) (§29) | 8 | `apex-runtime::workers` | `crates/apex-runtime/src/workers.rs` | `runtime::resource_classes_isolated` ✅ | G-CAP-2 |
 | BP-133 | Compute opportunity score `Priority(q)` subject to deadlines (§29.1) | 8 | `apex-econ::compute` | `src/compute/mod.rs` | `econ::priority_is_dollars_per_ms` | G-CAP-2 |
 | BP-134 | Budgeting/shedding order when overloaded (§29.2) | 8 | `apex-capture::scheduler` | `src/scheduler.rs` | `capture::shedding_order` | G-CAP-2 |
 | BP-135 | Admission control: no unbounded queue; 5 named bounds (§29.3) | 8 | `apex-capture::scheduler` | `src/scheduler.rs` | `capture::no_unbounded_queue` | G-CAP-2 |
@@ -6053,7 +6164,7 @@ Every material requirement in `APEX_MEV_v4_Final_Architect_Blueprint.md` receive
 | BP-172 | Capture Assurance Controller sits between the risk gate and transaction lifecycle (§46.1) | 6 | `apex-capture` | `crates/apex-capture/src/` | `capture::ticket_always_terminates` | G-CAP-1 |
 | BP-173 | The 11-step mandatory capture protocol (§46.1) | 6 | `apex-capture::protocol` | `src/protocol.rs` | `capture::protocol_steps_cannot_be_skipped` | G-CAP-1 |
 | BP-174 | Hard capture invariant: exactly one terminal outcome; no crash/timeout/queue may create an unclassified outcome; recovery reconciles from durable state (§46.1) | 6 | `apex-capture::{registry,journal,reconcile}` | `src/journal.rs` | `capture::boot_blocks_dispatch_until_reconciled` | G-CAP-1 |
-| BP-175 | Parallel execution, not serial architecture; no artificial serialization of independent tasks (§46.2) | 8 | `apex-runtime::workers` | `crates/apex-runtime/src/workers.rs` | `runtime::independent_tasks_run_concurrently` | G-PERF-1 |
+| BP-175 | Parallel execution, not serial architecture; no artificial serialization of independent tasks (§46.2) | 8 | `apex-runtime::workers` | `crates/apex-runtime/src/workers.rs` | `runtime::independent_tasks_run_concurrently` ✅ | G-PERF-1 |
 | BP-176 | Precomputed route frontier with 8 carried attributes; events revalue known routes first (§46.3) | 2 | `apex-search::frontier` | `crates/apex-search/src/frontier.rs` | `search::frontier_revalues_first` | G-PRICE-1 |
 | BP-177 | Every control-plane transition is observable and idempotent (§46.3) | 6, 8 | `apex-capture`, `apex-obs` | `src/ticket.rs`, `src/metrics.rs` | `capture::transitions_are_idempotent` | G-OBS-1 |
 | BP-178 | Adaptive opportunity allocation: `ROI_k` per strategy class, allocated under hard safety constraints (§47) | 15 | `apex-econ::allocator` | `src/allocator/mod.rs` | `econ::roi_allocation` | G-CHAIN-1 |
@@ -6063,7 +6174,7 @@ Every material requirement in `APEX_MEV_v4_Final_Architect_Blueprint.md` receive
 | BP-182 | v3→v4 coverage matrix: every preserved concept retained, every excluded one absent (§53) | all | — | §4 of this plan | migration matrix | all |
 | BP-183 | Production doctrine DO/DO-NOT list (§54) | all | process | `docs/apex/GATES.md` | review rule | all |
 | BP-184 | Success requires the 5-part measured evidence chain (§55) | 8 | `apex-obs` | `docs/apex/reports/` | G-PROD-1 checklist | G-PROD-1 |
-| BP-185 | §57.1 mandatory capture protocol as the end-to-end flow | 6–8 | `apex-runtime` + `apex-capture` | §6.2 of this plan | end-to-end integration test | G-CAP-1 |
+| BP-185 | §57.1 mandatory capture protocol as the end-to-end flow | 6–8 | `apex-runtime` + `apex-capture` | `crates/apex-runtime/src/plane.rs` | `runtime::the_recorded_stream_drives_a_ticket_to_reconciled` ✅ | G-CAP-1 |
 | BP-186 | §57.1.1 no-loss-of-opportunity invariant: 8 named hard failures | 6 | `apex-capture` | `src/{scheduler,reserve,journal,revalidate}.rs` | chaos suite §29.4 | G-CAP-1 |
 | BP-187 | §57.1.2 preemption invariant: authorized live tickets are never preempted | 6 | `apex-capture::scheduler` | `src/scheduler.rs` | `capture::authorized_ticket_never_preempted` | G-CAP-2 |
 | BP-188 | §57.1.3 capacity invariant: expand before measured saturation degrades capture assurance | 6 | `apex-capture::signer::pool` | `src/signer/pool.rs` | `signer::pool_expands_before_saturation` | G-CAP-2 |

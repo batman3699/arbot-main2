@@ -1,0 +1,38 @@
+[package]
+name = "apex-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "The §46 control plane: event bus, resource classes, capture-protocol assembly, supervision, graceful shutdown."
+
+# The crate is a lib FIRST and a bin second, and that order is the whole point
+# of the task. `src/main.rs` alone cannot be driven by an integration test --
+# `tests/` can only import a lib -- and "untestable as components" is the exact
+# defect recorded against the 16,659-line `main.rs` this replaces. A binary that
+# is a thin `main` over a testable lib is the shape that makes the end-to-end
+# test possible at all.
+[lib]
+name = "apex_runtime"
+path = "src/lib.rs"
+
+[[bin]]
+name = "apex"
+path = "src/main.rs"
+
+[dependencies]
+apex-types = { path = "../apex-types" }
+apex-capture = { path = "../apex-capture" }
+apex-chain = { path = "../apex-chain" }
+apex-config = { path = "../apex-config" }
+apex-obs = { path = "../apex-obs" }
+apex-risk = { path = "../apex-risk" }
+apex-state = { path = "../apex-state" }
+alloy-primitives = { version = "0.8", features = ["serde"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+serde_json = "1"

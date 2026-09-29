@@ -49,7 +49,7 @@ pub struct Miss {
     pub detail: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct MissLedger {
     misses: Vec<Miss>,
 }

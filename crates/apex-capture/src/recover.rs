@@ -37,7 +37,7 @@
 use crate::journal::{Journal, JournalEntry};
 use crate::registry::{RegistryError, TicketRegistry};
 use apex_types::ids::TicketId;
-use apex_types::ticket::{OpportunityTicket, TerminalFailure, TicketOutcome, TicketStatus};
+use apex_types::ticket::{OpportunityTicket, TerminalFailure, TicketOutcome};
 use apex_types::time::UnixNanos;
 use std::collections::BTreeMap;
 
@@ -166,8 +166,12 @@ pub fn scan(journal: &dyn Journal) -> Result<JournalScan, RecoveryError> {
         .iter()
         .filter(|id| !closed.contains_key(id))
         .filter_map(|id| tickets.get(id).cloned())
+        // `TicketStatus::may_be_on_chain`, not a `>= Signed` comparison written
+        // here. `apex-runtime`'s shutdown drain asks the same question, and the
+        // two must never be able to disagree about one ticket -- see that
+        // predicate's docs for what disagreeing would cost.
         .map(|t| {
-            if t.status >= TicketStatus::Signed {
+            if t.status.may_be_on_chain() {
                 Disposition::MaybeOnChain(Box::new(t))
             } else {
                 Disposition::NeverSigned(Box::new(t))

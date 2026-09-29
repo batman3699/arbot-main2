@@ -232,6 +232,19 @@ impl TicketRegistry {
         self.lock().live.keys().copied().collect()
     }
 
+    /// Whether some `TicketGuard` currently owns this ticket.
+    ///
+    /// [`Self::sweep`] already needed the answer -- "a checked-out ticket has an
+    /// owner who is responsible for it" -- and so does
+    /// `apex_runtime::shutdown::Drain`, for the same reason and with more at
+    /// stake: closing a ticket out from under the task that is signing it writes
+    /// a terminal outcome for work that is still happening. Exposed rather than
+    /// duplicated, so the two callers cannot come to different conclusions about
+    /// the same ticket.
+    pub fn is_checked_out(&self, id: TicketId) -> bool {
+        self.lock().checked_out.contains_key(&id)
+    }
+
     /// The only removal path.
     pub fn close(&self, id: TicketId, outcome: TicketOutcome) -> Result<(), RegistryError> {
         let at = self.clock.now();

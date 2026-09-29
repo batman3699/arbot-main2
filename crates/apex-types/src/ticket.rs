@@ -46,6 +46,29 @@ impl TicketStatus {
     pub const fn requires_durable_write(self) -> bool {
         self.is_authorized_or_later()
     }
+
+    /// Whether a transaction bearing this ticket's nonce could exist.
+    ///
+    /// **The one place this line is drawn.** §17.1 -- "a transition that is not
+    /// recorded did not happen" -- lets a journal below [`Self::Signed`] prove
+    /// that no signature was produced, so such a ticket can be closed from local
+    /// knowledge. At `Signed` or later it cannot: §46.1 does not permit a guess
+    /// about something the chain may already carry.
+    ///
+    /// `apex_capture::recover::scan` and `apex_runtime::shutdown::Drain` both ask
+    /// this question, and they must give the same answer about the same ticket.
+    /// If shutdown closed one that recovery would have gone to the chain about,
+    /// boot would find nothing to reconcile and the money could move with no
+    /// record. So the predicate is here, once, rather than as a `>= Signed`
+    /// comparison in each of them.
+    ///
+    /// Note this is a *later* line than [`Self::is_authorized_or_later`]: an
+    /// `Authorized` ticket holds reserved resources but has no payload, so it is
+    /// preemption-exempt and still safely closeable. Two different questions,
+    /// two different answers, which is why they are two functions.
+    pub const fn may_be_on_chain(self) -> bool {
+        (self as u8) >= (Self::Signed as u8)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
