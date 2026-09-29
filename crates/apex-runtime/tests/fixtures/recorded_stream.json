@@ -3,12 +3,19 @@
     "what_is_real": "Block 47079437 (0x2cf260d) is a real Base block: it is the block of the transaction in crates/apex-chain/tests/fixtures/base_receipt.json, which forge recorded at deploy time and whose source run file (broadcast/Deploy.s.sol/8453/run-1781049614240.json) is tracked in git. The observed_at timestamps derive from that recording's recorded_at_unix. The two following block heights are that block's successors.",
     "what_is_constructed": "The fingerprints, the venue state versions and the swap target are constructed. This is NOT a capture of a live Base state feed -- capturing one is Task 8.5's 14-day shadow run, and this file is the shape that run replaces.",
     "why_a_file_and_not_a_literal": "Task 8.5 has to replay real traffic through the same plane. A stream expressed as a Rust literal could not be swapped for a real capture without rewriting whatever asserts against it; a file can be.",
-    "the_duplicate_is_deliberate": "Events 2 and 3 are byte-identical. A websocket reconnect replays, and §5.6's feed arbiter exists because more than one source is watched. tests/end_to_end.rs replays the pair concurrently, which is the case §17.4's suppression is about."
+    "the_duplicate_is_deliberate": "Events 2 and 3 are byte-identical. A websocket reconnect replays, and \u00a75.6's feed arbiter exists because more than one source is watched. tests/end_to_end.rs replays the pair concurrently, which is the case \u00a717.4's suppression is about.",
+    "schema_note": "Task 2b.1 moved StateEvent to apex-state and gave EventKind \u00a712.4's eight template classes. PendingSwap now carries the pools it touched -- which is what the frontier revalues on -- and the notional, because the census that found the edge triggered on swaps >= $5,000 and a threshold baked into a type is a threshold nobody can change."
   },
   "events": [
     {
       "chain": 8453,
-      "at": { "block": 47079437, "flashblock_index": 0, "tx_index": 12, "log_index": 0, "payload_id": 0 },
+      "at": {
+        "block": 47079437,
+        "flashblock_index": 0,
+        "tx_index": 12,
+        "log_index": 0,
+        "payload_id": 0
+      },
       "observed_at": 1781049614240000000,
       "fingerprint": {
         "chain_id": 8453,
@@ -19,18 +26,33 @@
         "state_root_or_equivalent": null,
         "block_hash_if_available": null,
         "state_delta_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "venue_state_version": { "1": 1 },
+        "venue_state_version": {
+          "1": 1
+        },
         "external_dependency_fingerprint": null
       },
       "kind": {
         "PendingSwap": {
-          "target": "0x7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f"
+          "target": "0x7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f",
+          "pools": [
+            {
+              "chain": 8453,
+              "address": "0x3333333333333333333333333333333333333333"
+            }
+          ],
+          "notional_usd": 7500.0
         }
       }
     },
     {
       "chain": 8453,
-      "at": { "block": 47079438, "flashblock_index": 0, "tx_index": 0, "log_index": 0, "payload_id": 0 },
+      "at": {
+        "block": 47079438,
+        "flashblock_index": 0,
+        "tx_index": 0,
+        "log_index": 0,
+        "payload_id": 0
+      },
       "observed_at": 1781049616240000000,
       "fingerprint": {
         "chain_id": 8453,
@@ -41,14 +63,22 @@
         "state_root_or_equivalent": null,
         "block_hash_if_available": null,
         "state_delta_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "venue_state_version": { "1": 1 },
+        "venue_state_version": {
+          "1": 1
+        },
         "external_dependency_fingerprint": null
       },
       "kind": "Block"
     },
     {
       "chain": 8453,
-      "at": { "block": 47079438, "flashblock_index": 0, "tx_index": 0, "log_index": 0, "payload_id": 0 },
+      "at": {
+        "block": 47079438,
+        "flashblock_index": 0,
+        "tx_index": 0,
+        "log_index": 0,
+        "payload_id": 0
+      },
       "observed_at": 1781049616240000000,
       "fingerprint": {
         "chain_id": 8453,
@@ -59,14 +89,22 @@
         "state_root_or_equivalent": null,
         "block_hash_if_available": null,
         "state_delta_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "venue_state_version": { "1": 1 },
+        "venue_state_version": {
+          "1": 1
+        },
         "external_dependency_fingerprint": null
       },
       "kind": "Block"
     },
     {
       "chain": 8453,
-      "at": { "block": 47079439, "flashblock_index": 3, "tx_index": 0, "log_index": 0, "payload_id": 991 },
+      "at": {
+        "block": 47079439,
+        "flashblock_index": 3,
+        "tx_index": 0,
+        "log_index": 0,
+        "payload_id": 991
+      },
       "observed_at": 1781049617840000000,
       "fingerprint": {
         "chain_id": 8453,
@@ -77,7 +115,9 @@
         "state_root_or_equivalent": null,
         "block_hash_if_available": null,
         "state_delta_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "venue_state_version": { "1": 1 },
+        "venue_state_version": {
+          "1": 1
+        },
         "external_dependency_fingerprint": null
       },
       "kind": "Preconfirmation"

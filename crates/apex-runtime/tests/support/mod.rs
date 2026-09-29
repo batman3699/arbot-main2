@@ -456,8 +456,17 @@ pub fn recorded_stream() -> Vec<StateEvent> {
     serde_json::from_value(events).expect("events matching StateEvent")
 }
 
+pub fn pool(id: u8) -> PoolId {
+    PoolId { chain: BASE, address: Address::repeat_byte(id) }
+}
+
 pub fn pending_swap(target: u8) -> EventKind {
-    EventKind::PendingSwap { target: B256::repeat_byte(target) }
+    EventKind::PendingSwap {
+        target: B256::repeat_byte(target),
+        pools: vec![pool(0x33)],
+        // The census that found the edge triggered on swaps >= $5,000.
+        notional_usd: Some(7_500.0),
+    }
 }
 
 /// The four §46.2 stages, each waiting on a 4-way barrier. A serial join

@@ -155,6 +155,12 @@ jobs:
         run: ./scripts/ci/secret_scan.sh
       - name: every rejection type explains its miss (INV-40, §33)
         run: ./scripts/ci/every_rejection_explains.sh
+      # cargo refuses a dependency CYCLE. It does not refuse a single
+      # wrong-direction edge, which is not a cycle -- and that is exactly how
+      # `StateEvent` ended up in `apex-runtime` where `apex-search` could not
+      # reach it (Task 2b.1).
+      - name: §6.1's crate dependency direction
+        run: ./scripts/ci/crate_dependency_direction.sh
       # check_placeholder_endpoints.sh is NOT wired yet. It is red on arrival
       # for a real reason: config/registry.json:363 carries ${ALCHEMY_KEY} for
       # `abstract`, one of the six non-live chains. Same root cause as

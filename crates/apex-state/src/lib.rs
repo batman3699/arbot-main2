@@ -11,5 +11,6 @@ pub mod feed;
 pub mod ordinal;
 mod versioned;
 
+pub use feed::event::{EventClass, EventKind, StateEvent};
 pub use ordinal::Ordinal;
 pub use versioned::{Snapshot, VerifiedState, Versioned};

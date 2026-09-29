@@ -6,6 +6,8 @@ description = "Canonical and speculative state: versions, branches, feed integri
 
 [dependencies]
 apex-types = { path = "../apex-types" }
+# StateEvent carries a transaction hash. apex-types already speaks alloy.
+alloy-primitives = { version = "0.8", features = ["serde"] }
 # Already a workspace dependency (arb-exec uses it). The point of Versioned<T>
 # is a lock-free read on the fast path; a Mutex there is the thing being removed.
 arc-swap = "1"

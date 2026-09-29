@@ -36,11 +36,6 @@
 //! merely tidiness: a lock around the subscriber list would put a lock on the
 //! publish path, where §2.4 says a reader must never wait behind a writer.
 
-use apex_state::Ordinal;
-use apex_types::ids::ChainId;
-use apex_types::state::StateFingerprint;
-use apex_types::time::UnixNanos;
-use alloy_primitives::B256;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -56,35 +51,19 @@ pub enum Lane {
     Slow,
 }
 
-/// What the plane reacts to.
+/// §12.4's event vocabulary, defined in `apex-state` and re-exported here.
 ///
-/// Serialisable because the stream is **data**. `tests/fixtures/` holds one and
-/// replays it; Task 8.5's 14-day shadow run replaces the file rather than the
-/// test. A stream expressed as a Rust literal could not be swapped for a real
-/// capture without rewriting whatever asserts against it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct StateEvent {
-    pub chain: ChainId,
-    /// Position in the chain's total order (§5.2). Two feeds delivering the same
-    /// observation agree here, which is what makes redelivery detectable.
-    pub at: Ordinal,
-    pub observed_at: UnixNanos,
-    pub fingerprint: StateFingerprint,
-    pub kind: EventKind,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EventKind {
-    /// A sealed block.
-    Block,
-    /// A preconfirmation payload — a Base flashblock (§22).
-    Preconfirmation,
-    /// A pending transaction worth reacting to: §12.5's backrun trigger. The
-    /// measured result in this repository is that 88% of net-positive samples
-    /// came from swap triggers rather than quiet blocks, so this is the
-    /// event kind that matters most.
-    PendingSwap { target: B256 },
-}
+/// It lived in this module until Task 2b.1, which was wrong in a way that only
+/// showed up when `apex-search` came to exist: §6.1 runs `apex-state → … →
+/// apex-search → … → apex-runtime`, so a `CandidateSource` implemented four
+/// tiers above the runtime cannot take a type defined in it. `apex_types::ack`
+/// had already made the same argument for `LifecycleStage`.
+///
+/// The re-export is for callers who think of an event as something that arrives
+/// on this bus, which is most of them. `scripts/ci/crate_dependency_direction.sh`
+/// keeps the definition where it belongs — cargo will not, because one
+/// wrong-direction edge is not a cycle.
+pub use apex_state::feed::event::{EventClass, EventKind, StateEvent};
 
 struct Subscriber {
     name: String,
