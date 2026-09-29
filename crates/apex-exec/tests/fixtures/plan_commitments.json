@@ -1,0 +1,13 @@
+{
+  "_provenance": "Produced by test/PlanCommitmentFixture.t.sol from the real MultiVenueArbImplementation, 2026-09-29. Both halves of the differential assert against this file and NEITHER writes it: a test that regenerated it would make the two sides agree by construction, which is the one thing a differential must not do. Regenerate deliberately with `forge test --match-test testPrintPlanCommitments -vv` and say why in the commit.",
+  "block_chain_id": 31337,
+  "executor": "0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f",
+  "cases": {
+    "empty": "0x82a35d35c40c263cceef32885b008b8e350074a95dc51b8d48fceb05a9efbb81",
+    "one_loan": "0xb7b1d5e6ab39abf46263867df2b9a6613aa3b02886385e0f359d41e161829075",
+    "loan_and_steps": "0x01b07bb73b9b2a528df611e48c7ed15ba357504d1ed5a6f5a8ffc497cc5c5489",
+    "split_payload_a": "0xcb6739ddb794d813e94743efee82669f7059505ef7c4146f809f08dc81fa89ea",
+    "split_payload_b": "0xc51d6e271efa610aa5b20f08a55ef0b5781734c37f8232de13e2bf79393770ec",
+    "every_field_set": "0x0084a39f004be6745e65c4f216c52f791fdae5517028ce10c4f5ad33e7a79801"
+  }
+}

@@ -249,6 +249,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "apex-exec"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "apex-search",
+ "apex-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "apex-math"
 version = "0.1.0"
 dependencies = [

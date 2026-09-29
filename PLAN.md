@@ -3683,7 +3683,39 @@ So the order is **frontier → Engine D → Engine C → assembly → Engine A**
 
 - [ ] **2b.6 — Engine A: incremental negative-cycle (BP-045, BP-060).** `graph.rs` adapted: edges carry `state_version` and search consumes immutable snapshots. Last, deliberately — §52, and the measurement that 4× the cycles changed nothing. Failing test: the migrated Bellman-Ford tests, plus one asserting a stale snapshot cannot produce a candidate.
 
-- [ ] **2b.7 — `apex-exec`: commitment, encoding, signing.** Phase 5's unbuilt file list. `Commitments::commit` builds the §25 `ExecutionCommitment` the executor independently recomputes — including the `venue_fingerprints` the control plane cannot supply — and `Signer::sign` produces the exact committed payload (INV-06: the signer refuses a payload whose recomputed commitment differs from the ticket's). Failing test: a commitment whose route is altered after signing fails the on-chain recomputation, proven against the real contract.
+- [x] **2b.7 — `apex-exec`: commitment and encoding.** **Delivered 2026-09-29.** `crates/apex-exec/{Cargo.toml,src/lib.rs,src/commitment.rs,src/encode/mod.rs,src/sign.rs}`, `test/PlanCommitmentFixture.t.sol`, two tracked fixtures; 15 Rust tests + 2 doctests + 5 forge tests. Workspace 1,794 → **1,809**; forge 120 → **125**.
+
+  #### §25's commitment and the one the contract recomputes are not the same commitment
+
+  §25 specifies `apex_types::commitment::ExecutionCommitment`, whose `hash()` covers a domain separator, executor address and version, venue fingerprints, a state-fingerprint hash, a route hash, exact inputs, min profit, slippage constraints, a deadline and a submission policy. §17.4 makes that hash the deduplication key and §25 says *"the executor recomputes this on-chain and reverts on mismatch"*.
+
+  **The deployed executor recomputes something else.** `MultiVenueArbImplementation.planCommitment(PlanV2)` hashes `block.chainid`, `address(this)`, a plan version, a rolling hash over the loans, `cycleSlippageBps`, a rolling hash over the steps, `minProfit`, `declaredResidue`, `chainId` and `deadline` — and reverts `CommitmentMismatch` on a mismatch. The two overlap and are not the same, and **a `Commitments` implementation built against §25's Rust type would produce a value every live transaction rejects.**
+
+  Also worth recording: §7's tree lists `contracts/core/` as "ExecutionAuth, RouteValidator, ProfitInvariant, FlashSourceRouter". It contains `AdapterRegistry.sol` and `ProfitInvariant.sol`. `RouteValidator.sol` and `ExecutionAuth.sol` do not exist; the commitment check lives in the executor itself, which is where it is enforced and which is what matters.
+
+  So `apex-exec::commitment` mirrors **the contract**, and `ExecutionCommitment` keeps its place as the off-chain ticket-level record — it carries things the chain has no way to check, such as the state fingerprint a trade was priced against. The divergence is recorded rather than reconciled by changing a reviewed contract mid-phase.
+
+  **Follow-up, not done here: which commitment should be the dedup key?** `plan_commitment` covers everything that decides what a plan *does* and is the value the chain agrees with, which makes it the better candidate — and it would replace two commitments with one. The plane currently dedups on `ExecutionCommitment::hash()`. That is a third structural change to the plane in one session and it deserves its own task rather than churn.
+
+  #### The differential runs in both directions and neither side generates it
+
+  A Rust mirror of a Solidity hash drifts unless something holds the two together, and the honest thing to hold them together with is the contract's own answer. `crates/apex-exec/tests/fixtures/plan_commitments.json` holds six cases the contract produced; `test/PlanCommitmentFixture.t.sol` asserts the contract still produces them and `apex-exec` asserts the Rust encoder reproduces them.
+
+  **Neither side writes the fixture**, and that is the load-bearing part. A test that regenerated it would make the two agree by construction — the Solidity half would emit whatever the contract now says and the Rust half would assert against a moving target. Reading it means a change to either half fails loudly with the case name that moved. (Foundry's write sandbox refused the first draft, which was the write-based design; the refusal was right.)
+
+  The encoder half is checked by **decoding rather than hashing**: `testUniV3StepsDecode` runs `abi.decode` over the bytes `apex-exec` produced and asserts the fields. An ABI offset wrong by one word does not revert — it decodes as garbage — so a hash comparison would say the bytes changed and a decode says what they now mean.
+
+  Cases are chosen for the shapes a naive encoder gets wrong: empty loan and step lists (whose rolling hashes must stay `bytes32(0)`), and two step lists whose payloads concatenate identically — the boundary the contract's own comment names, *"a long payload cannot be split across a boundary to collide with a different step list"*.
+
+  **Seven mutations, each caught:** the ABI offset as `0x20` instead of `0x60`; the path tail unpadded; the fee packed little-endian; `address` right-padded instead of left-padded; the step data concatenated rather than hashed; `block.chainid` dropped; `apply_slippage` returning zero instead of saturating to 1.
+
+  #### What is **not** delivered, and why each is a refusal rather than an omission
+
+  - **`Signer` needs key material.** §7's responsibility list for `apex-exec` is commitment, calldata, route-validator inputs and calldata-size optimisation — **signing is not on it**, and Task 8.4's port table saying "`apex-exec` + key management" put the missing half in the wrong crate. `sign.rs` delivers what a signer is *handed*: the plan, the commitment, and `SignedPlan::check` refusing a mismatch — INV-06's off-chain half, which is the half that constrains the executor (the contract's own note says its check does not). The signature itself needs a key under §43 and INV-46, which is an operational input this task will not fabricate.
+  - **`Commitments` needs venue fingerprints.** `ExecutionCommitment::venue_fingerprints` comes from the venue adapters and `apex-venues` has no such concept yet. Inventing one would put a fabricated value inside the hash the system dedups on.
+  - **Balancer and generic-adapter calldata.** Each needs its own encoder and its own differential. A stub producing plausible bytes would be decoded by the contract into a trade nobody described — which is exactly the failure the commitment exists to catch, discovered the worst way.
+
+**Task order note:** 2b.7 was executed before 2b.6. Engine A is §52-deprioritised and the measurements agree; `apex-exec` is two of the three missing ports and the one the shadow run cannot start without.
 
 **Tests:** frontier revaluation order; the eight event classes, exhaustively; a finite-size-only opportunity; the migrated Bellman-Ford suite; commitment round-trip against the deployed ABI.
 **Benchmarks:** frontier revaluation p99 within §29.5's budget for the fast path; Engine A's broad search runs on the slow lane and is measured **there**, so it cannot borrow the fast path's number.

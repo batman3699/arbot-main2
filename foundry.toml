@@ -14,6 +14,13 @@ remappings = [
     "forge-std/=lib/forge-std/src/"
 ]
 
+# Read-only, and scoped to one directory. `PlanCommitmentFixture.t.sol` asserts
+# that `crates/apex-exec/tests/fixtures/plan_commitments.json` still describes
+# this contract; `apex-exec` asserts its Rust encoder reproduces the same file.
+# Neither side may write it -- a test that regenerated the fixture would make the
+# two agree by construction, which is the one thing a differential must not do.
+fs_permissions = [{ access = "read", path = "./crates/apex-exec/tests/fixtures" }]
+
 # Invariant runs are bounded for the everyday loop; `forge test --profile deep`
 # is what Task 5.6 Step 2's 100k-run bar uses. A suite nobody can run in a
 # minute is a suite that gets skipped, and a suite that only ever runs shallow
