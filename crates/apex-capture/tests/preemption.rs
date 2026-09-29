@@ -6,7 +6,7 @@
 include!("fixtures.rs");
 
 use apex_capture::registry::TicketRegistry;
-use apex_capture::scheduler::{Scheduler, Work, WorkClass};
+use apex_capture::scheduler::{CaptureAssurance, Scheduler, Work, WorkClass};
 use apex_types::ticket::{TerminalFailure, TicketOutcome};
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
@@ -132,7 +132,7 @@ fn authorized_ticket_never_preempted() {
     );
     assert_eq!(o.authorized_shed, 0, "an authorized live ticket was preempted");
     let u = Scheduler::u_capture(o.tickets_in_time, o.tickets_admitted);
-    assert!(u >= 0.99, "U_capture was {u} over {} tickets", o.tickets_admitted);
+    assert!(u.meets(0.99), "U_capture was {u} over {} tickets", o.tickets_admitted);
 }
 
 /// **INV-02, by failure injection.** `ticket_drop_count == 0` while the
@@ -206,10 +206,10 @@ fn fifo_loses_the_workload_the_scheduler_survives() {
 
     let u_fair = Scheduler::u_capture(fair.tickets_in_time, fair.tickets_admitted);
     let u_fifo = Scheduler::u_capture(fifo.tickets_in_time, fifo.tickets_admitted);
-    println!("U_capture: priority {u_fair:.4}, FIFO {u_fifo:.4}");
-    assert!(u_fair >= 0.99);
+    println!("U_capture: priority {u_fair}, FIFO {u_fifo}");
+    assert!(u_fair.meets(0.99));
     assert!(
-        u_fifo < 0.5,
+        !u_fifo.meets(0.5),
         "FIFO kept U_capture at {u_fifo}; the overload is not actually loading the queue"
     );
 }
@@ -365,4 +365,47 @@ proptest! {
             );
         }
     }
+}
+
+
+/// **Acceptance criterion 1 cannot be cleared by a system that does nothing.**
+///
+/// `u_capture` returned `1.0` on an empty window until Task 8.4. Phase 8's
+/// criterion 1 is "14-day continuous shadow on Base with
+/// `SYSTEM_CAPTURE_ASSURANCE >= 0.99` and every hard-zero counter at 0" -- and a
+/// shadow run that admits no ticket scores 1.0 on that arithmetic while every
+/// hard-zero counter sits at zero because nothing happened. It passes. For
+/// fourteen days. Immediately before the first live trade.
+///
+/// Which is not a hypothetical: `apex-search` does not exist, so the control
+/// plane delivered in Task 8.4 admits nothing at all today.
+#[test]
+fn an_empty_window_does_not_clear_the_floor() {
+    let empty = Scheduler::u_capture(0, 0);
+    assert_eq!(empty, CaptureAssurance::Undefined);
+    assert!(!empty.meets(0.99), "an absent measurement is not a passing one");
+    assert!(!empty.meets(0.0), "not even a floor of zero: there is nothing to measure");
+    assert_eq!(empty.value(), None, "and there is no number to put on a dashboard");
+
+    // The complement, so the pair discriminates: a real perfect window does pass.
+    let perfect = Scheduler::u_capture(100, 100);
+    assert!(perfect.meets(0.99));
+    assert_eq!(perfect.value(), Some(1.0));
+
+    // And the two must not print the same, because an operator has to tell them
+    // apart at a glance.
+    assert_ne!(empty.to_string(), perfect.to_string());
+}
+
+/// A window with tickets admitted and none dispatched is `Measured(0.0)`, not
+/// `Undefined`. The distinction is the whole point: zero-of-a-hundred is a total
+/// capture failure and must fire the §16.5 ladder, while zero-of-zero is a
+/// question for whatever was supposed to produce candidates.
+#[test]
+fn nothing_dispatched_is_not_the_same_as_nothing_admitted() {
+    let total_failure = Scheduler::u_capture(0, 100);
+    assert_eq!(total_failure, CaptureAssurance::Measured(0.0));
+    assert!(!total_failure.meets(0.99));
+    assert_eq!(total_failure.value(), Some(0.0));
+    assert_ne!(total_failure, Scheduler::u_capture(0, 0));
 }

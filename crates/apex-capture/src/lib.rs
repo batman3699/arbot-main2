@@ -28,7 +28,7 @@ pub use revalidate::{
     last_mile, LastMileCheck, LastMileContext, Revalidated, RevalidationFailure, SigningAuthorization,
 };
 pub use registry::{RegistryError, RegistryMetrics, TicketGuard, TicketRegistry};
-pub use scheduler::{Scheduler, Work, WorkClass};
+pub use scheduler::{CaptureAssurance, Scheduler, Work, WorkClass};
 pub use signer::{
     ExecutorAuth, LaneAssignment, LaneConfig, LaneHealth, LaneRequirements, NoLane, NonceError,
     NonceLane, ReservedNonce, SignerPool,

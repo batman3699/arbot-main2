@@ -5362,6 +5362,37 @@ So `apex` does the four things that are real: load and validate configuration fa
 **What this task does not do.** It does not trade, and it does not benchmark. Phase 8's exit requires the complete §29.5 latency budget table measured and recorded; the four §46.2 stages are measurable now, but the numbers that matter are the ones a real search and a real node produce, so the table stays open. Acceptance criteria 1, 3, 6 and 7 are Tasks 8.5–8.6.
 
 ### Task 8.5 — Full-system shadow run
+
+**Blocked 2026-09-29, and not on wall-clock time.** Two findings, and the second is the one that matters.
+
+#### Acceptance criterion 1 could be passed by a system that does nothing
+
+Criterion 1 reads: *"14-day continuous shadow on Base with `SYSTEM_CAPTURE_ASSURANCE ≥ 0.99` and every hard-zero counter at 0."* `Scheduler::u_capture` — delivered in Phase 6, Task 6.5 — returned **`1.0` when `admitted_live == 0`**.
+
+So a shadow run that admits no ticket at all scores 1.0, and every hard-zero counter (`ticket_drop_count`, `nonce_reuse`, `wrong_chain_submission`, …) sits at zero because nothing happened. **It passes.** For fourteen days. Immediately before the first live trade, which is what this gate exists to authorise.
+
+That is not hypothetical. `apex-search` does not exist (see below), so the control plane delivered in Task 8.4 admits nothing today. A 14-day run started now would produce a green criterion 1 and an empty journal.
+
+**It is the same defect Task 8.2 found in `hot_path_recall` against an empty oracle**, one gauge further down the same pipeline, and it had the same cause: "nothing was dispatched late" and "everything was dispatched on time" are the same arithmetic and opposite facts. Fixed the same way — `CaptureAssurance::{Undefined, Measured}`, mirroring `Recall` deliberately so a reader who understood one does not have to re-learn the other. `meets(floor)` is `false` for `Undefined` at **any** floor, including zero. `Display` prints `undefined (nothing admitted)` rather than a number, because an operator has to tell it from both 1.0000 and 0.0000 at a glance. `Measured(0.0)` stays distinct from `Undefined`: zero-of-a-hundred is a total capture failure that must fire §16.5's ladder, while zero-of-zero is a question for whatever was supposed to produce candidates.
+
+Three mutations, each caught: `Undefined` clearing the floor; an empty window reporting `Measured(1.0)`; `Display` printing the two the same.
+
+#### `apex-search` is named by the plan and created by no phase
+
+§7's directory tree lists `crates/apex-search/` ("candidate generation + route frontier"), §12 says "Crate: `apex-search`", and §4's audit table sends five legacy modules there — `graph.rs`, `cycle_index.rs`, `hot_path.rs`, `mempool.rs`, `backrun_state.rs`. Phase 13 adds `crates/apex-search/src/backrun/` *into* it.
+
+**No phase's Files block contains `CREATE crates/apex-search/{…}`.** Phase 2's objective is exact pricing and venue adapters; it creates `apex-math` and `apex-venues` and nothing else. `git log --all --diff-filter=A -- 'crates/apex-search/*'` is empty: the crate has never existed in any branch.
+
+`apex-exec` has the opposite problem — Phase 5's Files block **does** create it (`src/commitment.rs`, `src/encode/`, `src/abi.rs`), and Phase 5 delivered contracts, the `DeployConfig` seam and the invariant suites without it. `plan.rs` and `abi.rs` are still in `arb-exec-legacy`.
+
+Task 8.4's port table is the honest statement of what that costs: three of the eight ports the control plane is written against — `CandidateSource`, `Commitments`, `Signer` — have no implementation, and two of the three belong to crates nobody has created. **The remaining work before a shadow run is not Phase 9; it is those two crates.**
+
+- [ ] Create `crates/apex-search/` and implement `CandidateSource` — the missing phase. §12.1's frontier is primary, and `cycle_index.rs` is already ~70% of it.
+- [ ] Create `crates/apex-exec/` per Phase 5's file list and implement `Commitments` + `Signer`.
+- [ ] Then the 14-day run, against a criterion 1 that can now fail.
+
+Everything else this task needs is built: the plane, the journal, the two-lane feed, the nine budgets, supervision, the drain, the miss ledger, the coverage auditor, the P&L attribution.
+
 ### Task 8.6 — Canary promotion
 
 Each follows the same five-step TDD cycle. Task 8.1's failing test is the exhaustive `obs::every_rejection_path_records_a_miss`; Task 8.2's is `obs::auditor_detects_injected_miss`; Task 8.3's asserts that a trade touching two optimization layers attributes to both; Task 8.4's is an integration test driving a recorded event stream end-to-end and asserting a ticket reaches `Reconciled`; Task 8.5 is operational; Task 8.6 gates on §38.
@@ -5369,7 +5400,7 @@ Each follows the same five-step TDD cycle. Task 8.1's failing test is the exhaus
 **Tests:** exhaustive rejection-path test, injected-miss test, attribution test, full-system integration on recorded traffic, all §29.4 chaos scenarios.
 **Benchmarks:** the complete §29.5 latency budget table, measured and recorded.
 **Acceptance criteria — the first-profitable-trade gate:**
-1. 14-day continuous shadow on Base with `SYSTEM_CAPTURE_ASSURANCE ≥ 0.99` and every hard-zero counter at 0.
+1. 14-day continuous shadow on Base with `SYSTEM_CAPTURE_ASSURANCE ≥ 0.99` and every hard-zero counter at 0. **The assurance figure must be `Measured`** — Task 8.5 records why: an empty window used to score 1.0 and clear this line while nothing at all had happened.
 2. `hot_path_recall ≥ 0.95` against the coverage auditor, or every gap explained and accepted.
 3. Simulation fidelity `F_sim` inside band for every admitted strategy×venue.
 4. Every §29.4 chaos scenario passes.

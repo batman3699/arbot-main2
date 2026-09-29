@@ -188,10 +188,72 @@ impl Scheduler {
     /// Reported over live tickets only -- shedding a research task is the
     /// scheduler working, not a capture miss, and folding the two together
     /// would let a busy research queue paper over a lost trade.
-    pub fn u_capture(dispatched_in_time: u64, admitted_live: u64) -> f64 {
+    ///
+    /// # An empty window is `Undefined`, not 1.0
+    ///
+    /// **Corrected 2026-09-29 (Task 8.4).** This returned `1.0` when nothing had
+    /// been admitted, and Phase 8's acceptance criterion 1 reads "14-day
+    /// continuous shadow on Base with `SYSTEM_CAPTURE_ASSURANCE >= 0.99` and every
+    /// hard-zero counter at 0". A system that admits no ticket at all scores 1.0
+    /// on the old arithmetic and has every hard-zero counter at zero because
+    /// nothing happened -- so it **passes**, for fourteen days, immediately before
+    /// the first live trade.
+    ///
+    /// "Nothing was dispatched late" and "everything was dispatched on time" are
+    /// the same arithmetic and opposite facts. It is the same defect Task 8.2
+    /// found in `hot_path_recall` against an empty oracle, in the gauge one step
+    /// further down the same pipeline, and the same fix: an absent measurement is
+    /// not a passing one.
+    pub fn u_capture(dispatched_in_time: u64, admitted_live: u64) -> CaptureAssurance {
         if admitted_live == 0 {
-            return 1.0;
+            return CaptureAssurance::Undefined;
         }
-        dispatched_in_time as f64 / admitted_live as f64
+        #[allow(clippy::cast_precision_loss)]
+        CaptureAssurance::Measured(dispatched_in_time as f64 / admitted_live as f64)
+    }
+}
+
+/// §16.7's `SYSTEM_CAPTURE_ASSURANCE`, with the absent case in the type.
+///
+/// Mirrors `apex_obs::coverage::Recall` deliberately: the two are the engineering
+/// and the discovery halves of the same measurement loop, and a reader who has
+/// understood one should not have to re-learn the other.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CaptureAssurance {
+    /// No live ticket was admitted in this window. There is nothing to be 100%
+    /// of, and the right response is upstream -- a shadow run admitting nothing
+    /// has a search problem, not a scheduling one, so this escalates no
+    /// remediation ladder either.
+    Undefined,
+    Measured(f64),
+}
+
+impl CaptureAssurance {
+    /// §16.5's alert band, and acceptance criterion 1's `>= 0.99`.
+    ///
+    /// `false` for [`Self::Undefined`]: a floor that an empty window clears is not
+    /// a floor.
+    pub fn meets(self, floor: f64) -> bool {
+        matches!(self, Self::Measured(v) if v >= floor)
+    }
+
+    /// The figure, when there is one. Named so that reaching for a number where
+    /// none exists is a deliberate `unwrap_or`, not a field access.
+    pub const fn value(self) -> Option<f64> {
+        match self {
+            Self::Undefined => None,
+            Self::Measured(v) => Some(v),
+        }
+    }
+}
+
+impl std::fmt::Display for CaptureAssurance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Not "1.0000", and not "0.0000" either. An operator reading a
+            // dashboard has to be able to tell "nothing was admitted" from both.
+            Self::Undefined => f.write_str("undefined (nothing admitted)"),
+            Self::Measured(v) => write!(f, "{v:.4}"),
+        }
     }
 }
