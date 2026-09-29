@@ -4373,7 +4373,48 @@ function testDeployTestsDoNotWriteProcessEnv() external {
 
 - [x] **Step 1:** Write `test/invariant/` suites for `ProfitInvariant` and `AdapterRegistry`.
 - [x] **Step 2:** Run the deep profile. `--fuzz-runs 100000` is a *fuzz* setting and does not reach an invariant suite, which is configured by `runs`/`depth`; `FOUNDRY_PROFILE=deep` sets both (1024 × 128) plus 100k fuzz runs for the stateless tests.
-- [ ] **Step 3:** Commission and complete an external review of `contracts/core/` and `contracts/chains/BaseArbExecutor.sol`. **No mainnet deployment before it clears.** — **a human decision, outside what this plan's execution can complete.** G-SEC-1 and acceptance criterion 5 depend on it.
+- [x] **Step 3:** Commission and complete an external review of `contracts/core/` and `contracts/chains/BaseArbExecutor.sol`. **No mainnet deployment before it clears.** — **a human decision, outside what this plan's execution can complete.** G-SEC-1 and acceptance criterion 5 depend on it. **Closed by the operator 2026-09-29; see the status block below.**
+
+#### Status 2026-09-29: G-SEC-1 is open. R-03 clears with it. The deployed address is still not fundable.
+
+**Reported by the operator 2026-09-29:** the contracts have been **peer reviewed
+by developers from a Web3 security community**, and the operator opens G-SEC-1
+on that basis. Step 3 is the one step of this plan that was always going to be
+closed by a person rather than by its execution — its own wording is "a human
+decision, outside what this plan's execution can complete" — so the operator's
+judgement is the deciding input and this is the record of it, not a second
+opinion on it.
+
+**I have not seen the review**, the same standing as the 98.5/100 scan above.
+What a future reader is entitled to know is which parts of this log rest on
+evidence in the repository and which rest on the operator's account, and this
+paragraph is the line between them.
+
+**R-03 clears, but not for the reason offered.** The operator's note was that
+R-03 "should now be clear since we have now merged to main". The merge is not
+the mechanism: R-03 is a funding restriction — *do not fund the executor beyond
+canary size* — and §39 pairs it with G-SEC-1, while Task 5.1 had already
+satisfied its other precondition by replacing `_execGeneric` with
+`_execAdapter`. R-03 therefore clears **because G-SEC-1 clears**. Same
+conclusion; the reason is written down because it is the thing a reader will
+rely on the next time one of the two moves without the other.
+
+**What is now unblocked is a deployment, not a transfer.** The review covered
+the contracts in this repository. `0xDbFB219b4F1CE08fA61C5cD3c08C1307760cAec6`
+does **not** hold those contracts — it holds pre-Phase-5 bytecode containing
+`_execGeneric` and its `target.call(data)`, which is precisely what R-03 was
+about, and which no review of `contracts/` can have covered because
+`AdapterRegistry.sol` was first committed long after that address was created.
+Sending funds there would fund the unreviewed contract while believing the gate
+had been cleared for it. `docs/apex/DEPLOYED.md` holds the detail and the
+redeploy conditions.
+
+So the order is: deploy the reviewed contracts from `script/Deploy.s.sol`
+(Task 5.7's `DeployConfig` seam makes that a function of explicit inputs), take
+the new address, update `ops/inputs.yaml` and `docs/apex/DEPLOYED.md` **in the
+same change**, then fund at canary size. Phase 8's acceptance criterion 6 — 100
+live trades at minimum size — starts after that, and criterion 1's 14-day shadow
+does not need a funded executor at all, so it can start immediately.
 
 #### Status 2026-09-25: the current contracts scored 98.5/100. G-SEC-1 is still open, and the operator is deciding how to close it.
 
@@ -4560,6 +4601,11 @@ calls per invariant, 1,048,576 in total. All pass, zero reverts, 109 s.**
 **Failure criteria:** any reachable arbitrary call; any invariant without a test; any unresolved high/critical review finding.
 **Exit gate:** **G-SOL-1** and **G-SEC-1**.
 
+**Phase 5 status, 2026-09-24, amended 2026-09-29: G-SOL-1 and G-SEC-1 are both
+satisfied. Phase 5 is closed.** The paragraph below is the 2026-09-24 reading and
+is kept because it states what G-SEC-1 was waiting on; Task 5.6 Step 3's status
+block records who closed it and on what evidence.
+
 **Phase 5 status, 2026-09-24. G-SOL-1 satisfied; G-SEC-1 open, and it is the
 only thing open.** Tasks 5.1–5.5 and 5.7 are delivered, and 5.6 Steps 1–2 are.
 Acceptance criteria 1, 2, 3, 4 and 6 are met; criterion 5 is the external review,
@@ -4573,6 +4619,12 @@ beyond canary size — but §39 pairs that with G-SEC-1, and "no mainnet deploym
 before the review clears" is Task 5.6's own wording. Phases 6 and 7 are shadow
 work and need no funded executor, so this blocks nothing downstream until
 Phase 8.
+
+**Superseded 2026-09-29: R-03 cleared with G-SEC-1.** The pairing above is
+exactly why — the precondition Task 5.1 satisfied was never the whole of it. The
+one thing that does not change is that the funding target must be a **freshly
+deployed** executor: the reviewed contracts are not the bytecode at
+`0xDbFB…cAec6`.
 
 ---
 
