@@ -23,7 +23,7 @@ use apex_capture::registry::TicketRegistry;
 use apex_capture::signer::{ExecutorAuth, LaneConfig, SignerPool};
 use apex_capture::{InMemoryJournal, ManualClock, NullDispatcher};
 use apex_runtime::plane::{
-    Economics, Handled, Plane, Ports, SettlementFeed,
+    Economics, Handled, LockFailure, Locked, Plane, Ports, SettlementFeed,
 };
 use apex_types::ids::SignerLaneId;
 use apex_types::ticket::TicketStatus;
@@ -224,18 +224,20 @@ async fn an_identical_commitment_cannot_be_locked_twice() {
     let plane = landing_plane();
     let c = candidate(1, 47_079_437, 320_000_000_000);
 
-    let a = plane.lock_exclusive(&c);
-    let b = plane.lock_exclusive(&c);
+    let a = plane.lock(&c);
+    let b = plane.lock(&c);
     assert!(a.is_ok(), "the first lock takes the commitment");
-    let Err(suppressed) = b else { panic!("the second lock must be suppressed") };
+    let Err(LockFailure::Suppressed(suppressed)) = b else {
+        panic!("the second lock must be suppressed, not declined: {b:?}")
+    };
     assert_eq!(
         suppressed.commitment,
-        a.as_ref().map(|l| l.hash()).unwrap_or_default(),
+        a.as_ref().map(Locked::hash).unwrap_or_default(),
         "the suppression names the commitment it collided with"
     );
 
     drop(a);
-    assert!(plane.lock_exclusive(&c).is_ok(), "releasing the lock frees the commitment");
+    assert!(plane.lock(&c).is_ok(), "releasing the lock frees the commitment");
 }
 
 /// The same thing through the plane, concurrently — which is the case that

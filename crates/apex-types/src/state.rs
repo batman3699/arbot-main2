@@ -2,7 +2,7 @@
 
 use crate::ids::{ChainId, FeedSourceId, VenueId};
 use crate::time::UnixNanos;
-use alloy_primitives::B256;
+use alloy_primitives::{keccak256, B256};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -40,6 +40,86 @@ pub struct StateFingerprint {
     pub state_delta_hash: B256,
     pub venue_state_version: BTreeMap<VenueId, u64>,
     pub external_dependency_fingerprint: Option<B256>,
+}
+
+/// Domain separator for [`StateFingerprint::hash`], so it cannot collide with
+/// any other keccak in this system.
+pub const STATE_FINGERPRINT_DOMAIN: &[u8] = b"apex.state.fingerprint.v1";
+
+impl StateFingerprint {
+    /// The value §25's `ExecutionCommitment` carries as `state_fingerprint_hash`.
+    ///
+    /// # Length prefixes, and why this one needs them
+    ///
+    /// `venue_state_version` is a **variable-length** map, so without a count in
+    /// front `{A:1, B:2}` and `{A:1}` followed by whatever came next could
+    /// serialise identically — the boundary problem `ExecutionCommitment::hash`
+    /// documents for `exact_inputs` and `slippage_constraints`.
+    ///
+    /// Worth contrasting with `apex_venues::fingerprint`, which has **no** length
+    /// prefix and is right not to: every element there is fixed-width, so the
+    /// preimage parses uniquely. The rule is about the elements, not about hashes
+    /// in general, and stating it once in each place is how it stays true.
+    ///
+    /// # Every `Option` writes a tag
+    ///
+    /// `None` is a byte, not an absence. Skipping an absent field would let a
+    /// fingerprint with `preconf_sequence: None` produce the same preimage as one
+    /// where the next field happened to start with the same bytes — the same
+    /// boundary problem in a different costume.
+    ///
+    /// `BTreeMap` rather than `HashMap` for `venue_state_version` is already the
+    /// type's choice and it is load-bearing here: the hash must be order-stable,
+    /// and a `HashMap` iterates in an unspecified order, so two processes holding
+    /// the same fingerprint would disagree about its hash.
+    pub fn hash(&self) -> B256 {
+        let mut buf = Vec::with_capacity(256);
+        buf.extend_from_slice(STATE_FINGERPRINT_DOMAIN);
+        buf.extend_from_slice(&self.chain_id.0.to_be_bytes());
+        buf.extend_from_slice(self.parent_block_hash.as_slice());
+        buf.extend_from_slice(&self.confirmed_block_number.to_be_bytes());
+
+        let mut tagged_u64 = |v: Option<u64>| match v {
+            None => buf.push(0),
+            Some(x) => {
+                buf.push(1);
+                buf.extend_from_slice(&x.to_be_bytes());
+            }
+        };
+        tagged_u64(self.preconf_sequence);
+        match self.flashblock_index {
+            None => buf.push(0),
+            Some(x) => {
+                buf.push(1);
+                buf.extend_from_slice(&x.to_be_bytes());
+            }
+        }
+        for opt in [self.state_root_or_equivalent, self.block_hash_if_available] {
+            match opt {
+                None => buf.push(0),
+                Some(h) => {
+                    buf.push(1);
+                    buf.extend_from_slice(h.as_slice());
+                }
+            }
+        }
+        buf.extend_from_slice(self.state_delta_hash.as_slice());
+
+        buf.extend_from_slice(&(self.venue_state_version.len() as u32).to_be_bytes());
+        for (venue, version) in &self.venue_state_version {
+            buf.extend_from_slice(&venue.0.to_be_bytes());
+            buf.extend_from_slice(&version.to_be_bytes());
+        }
+
+        match self.external_dependency_fingerprint {
+            None => buf.push(0),
+            Some(h) => {
+                buf.push(1);
+                buf.extend_from_slice(h.as_slice());
+            }
+        }
+        keccak256(&buf)
+    }
 }
 
 /// How a state version came to exist (§5.6). Carried so that two disagreeing

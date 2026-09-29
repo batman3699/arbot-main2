@@ -308,6 +308,7 @@ dependencies = [
  "apex-search",
  "apex-state",
  "apex-types",
+ "apex-venues",
  "async-trait",
  "ethers-core",
  "serde",

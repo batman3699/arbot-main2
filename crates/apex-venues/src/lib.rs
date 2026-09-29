@@ -23,6 +23,7 @@ pub mod breaker;
 pub mod cl_load;
 pub mod cl_ticks;
 pub mod discovery;
+pub mod fingerprint;
 pub mod path;
 pub mod quote_balancer;
 pub mod quote_cl;

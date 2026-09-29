@@ -151,6 +151,14 @@ pub enum Decline {
     ChainUnavailable { detail: String },
     /// A commitment could not be built for this candidate.
     Uncommittable { detail: String },
+    /// A venue on this route has not been verified: an unadmitted pool, or code
+    /// evidence older than the bound.
+    ///
+    /// Distinct from [`Self::Uncommittable`] because the response is different
+    /// and specific — go verify the venue — and because `VenueDisabled` is the
+    /// §33 bucket that says so. Folding it into a generic failure would put a
+    /// venue problem in a bucket nobody acts on.
+    VenueUnverified { detail: String },
 }
 
 impl std::fmt::Display for Decline {
@@ -171,6 +179,7 @@ impl std::fmt::Display for Decline {
             Self::Unsigned { detail } => write!(f, "the signer refused: {detail}"),
             Self::ChainUnavailable { detail } => write!(f, "the chain could not be asked: {detail}"),
             Self::Uncommittable { detail } => write!(f, "no commitment could be built: {detail}"),
+            Self::VenueUnverified { detail } => write!(f, "venue not verified: {detail}"),
         }
     }
 }
@@ -197,6 +206,10 @@ impl ExplainsMiss for Decline {
             Self::NoBudget(_) | Self::ChainUnavailable { .. } | Self::Uncommittable { .. } => {
                 MissReason::TooSlow
             }
+            // Not a refusal by our machinery and not a timeout: the venue is not
+            // usable for this route until somebody verifies it, which is exactly
+            // what this bucket is for and is the actionable reading.
+            Self::VenueUnverified { .. } => MissReason::VenueDisabled,
             // §33 splits submission rejection into builder and sequencer, and a
             // `DispatchError` carries neither: it knows the lane refused, not
             // what kind of thing the lane talks to. Base has a sequencer and is
@@ -221,6 +234,33 @@ impl ExplainsMiss for Decline {
 pub struct Suppressed {
     pub commitment: B256,
 }
+
+/// Why step 1 did not produce a lock.
+///
+/// Two outcomes that must not be folded together: a **suppression** is the system
+/// already capturing this opportunity, and a **decline** is the system unable to
+/// describe it. The first is not a miss and the second is, so a single error type
+/// would put trades the system took into the dataset that decides where
+/// engineering effort goes.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LockFailure {
+    /// §17.4: an identical commitment is already in flight.
+    Suppressed(Suppressed),
+    /// The commitment could not be built — an unverified venue, an executor
+    /// version that does not fit, a route with no hops.
+    Declined(Decline),
+}
+
+impl std::fmt::Display for LockFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Suppressed(s) => write!(f, "{s}"),
+            Self::Declined(d) => write!(f, "{d}"),
+        }
+    }
+}
+
+impl std::error::Error for LockFailure {}
 
 impl std::fmt::Display for Suppressed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -651,43 +691,29 @@ impl Plane {
         Ok(self.ports.gate.open(proof))
     }
 
-    /// **Step 1.** Build the commitment and take it, or say who has it.
-    pub fn lock(&self, candidate: &Candidate) -> Result<Locked<'_>, Decline> {
-        let min_profit = U256::from(u128::try_from(candidate.expected_net_profit.max(1))
-            .unwrap_or(u128::MAX));
-        let commitment =
-            self.ports.commitments.commit(candidate, self.ports.pool.auth(), min_profit)?;
+    /// **Step 1.** Build the commitment and take it, or say why not.
+    ///
+    /// Two methods collapsed into one, and a real `Commitments` is what forced
+    /// it. The first draft had a `Decline`-returning `lock` for the pipeline and
+    /// a `Suppressed`-returning `lock_exclusive` for tests, with the second
+    /// reporting `B256::ZERO` when the commitment could not be built at all.
+    /// That sentinel discarded the reason — and with `VenueCommitments` in place
+    /// the reason is the actionable part: an unadmitted pool is `VenueDisabled`,
+    /// which tells an operator to go verify the venue, and it was arriving as a
+    /// generic `TooSlow`.
+    pub fn lock(&self, candidate: &Candidate) -> Result<Locked<'_>, LockFailure> {
+        let min_profit =
+            U256::from(u128::try_from(candidate.expected_net_profit.max(1)).unwrap_or(u128::MAX));
+        let commitment = self
+            .ports
+            .commitments
+            .commit(candidate, self.ports.pool.auth(), min_profit)
+            .map_err(LockFailure::Declined)?;
         let hash = commitment.hash();
         if self.inflight.take(hash) {
             Ok(Locked { commitment, hash, inflight: &self.inflight })
         } else {
-            Err(Decline::Uncommittable { detail: format!("commitment {hash} is already in flight") })
-        }
-    }
-
-    /// Step 1, with the suppression distinguishable from a failure to commit.
-    ///
-    /// Two callers want two different things here: the pipeline wants a single
-    /// error type it can file, and a test wants to know *which* of the two
-    /// happened. Returning `Result<_, Suppressed>` for the second and keeping
-    /// [`Self::lock`] for the first means neither has to inspect a string.
-    pub fn lock_exclusive(&self, candidate: &Candidate) -> Result<Locked<'_>, Suppressed> {
-        let min_profit = U256::from(
-            u128::try_from(candidate.expected_net_profit.max(1)).unwrap_or(u128::MAX),
-        );
-        match self.ports.commitments.commit(candidate, self.ports.pool.auth(), min_profit) {
-            Ok(commitment) => {
-                let hash = commitment.hash();
-                if self.inflight.take(hash) {
-                    Ok(Locked { commitment, hash, inflight: &self.inflight })
-                } else {
-                    Err(Suppressed { commitment: hash })
-                }
-            }
-            // A candidate that cannot be committed is not a duplicate. Reported
-            // as `B256::ZERO` rather than silently succeeding, because the only
-            // caller of this form is a test asking about suppression.
-            Err(_) => Err(Suppressed { commitment: B256::ZERO }),
+            Err(LockFailure::Suppressed(Suppressed { commitment: hash }))
         }
     }
 
@@ -748,15 +774,15 @@ impl Plane {
             return Handled::Declined(self.file(Some(candidate), &d));
         }
 
-        let locked = match self.lock_exclusive(candidate) {
+        let locked = match self.lock(candidate) {
             Ok(l) => l,
-            Err(s) => {
-                if s.commitment == B256::ZERO {
-                    let d = Decline::Uncommittable { detail: "no commitment".to_string() };
-                    return Handled::Declined(self.file(Some(candidate), &d));
-                }
-                return Handled::Suppressed(s);
+            // The reason survives. A venue that could not be verified reaches the
+            // ledger as `VENUE_DISABLED` rather than as a catch-all, which is the
+            // difference between "go verify the pool" and "something was slow".
+            Err(LockFailure::Declined(d)) => {
+                return Handled::Declined(self.file(Some(candidate), &d))
             }
+            Err(LockFailure::Suppressed(s)) => return Handled::Suppressed(s),
         };
 
         match self.drive(event, candidate, &locked).await {
@@ -1172,6 +1198,9 @@ fn terminal_for(d: &Decline, at: TicketStatus, lane: SubmissionLaneId) -> Termin
         // honest part of that code.
         Decline::ChainUnavailable { .. } => TerminalFailure::Abandoned { at_status: at },
         Decline::Uncommittable { .. } => TerminalFailure::Abandoned { at_status: at },
+        Decline::VenueUnverified { detail } => {
+            TerminalFailure::RiskRejected { rule: detail.clone() }
+        }
     }
 }
 

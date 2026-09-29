@@ -26,6 +26,7 @@ apex-config = { path = "../apex-config" }
 apex-obs = { path = "../apex-obs" }
 apex-risk = { path = "../apex-risk" }
 apex-search = { path = "../apex-search" }
+apex-venues = { path = "../apex-venues" }
 apex-state = { path = "../apex-state" }
 alloy-primitives = { version = "0.8", features = ["serde"] }
 async-trait = "0.1"

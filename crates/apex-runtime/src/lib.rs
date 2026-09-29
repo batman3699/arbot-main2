@@ -34,6 +34,7 @@
 //! is step 1 of §16.2, and step 1 is here.
 
 pub mod bus;
+pub mod commit;
 pub mod plane;
 pub mod search;
 pub mod shutdown;

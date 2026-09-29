@@ -3755,15 +3755,67 @@ So the order is **frontier → Engine D → Engine C → assembly → Engine A**
 | 2b.4 Engine C, finite-size search | ✅ BP-062 |
 | 2b.5 `RouteSource`, assembled | ✅ — the plane runs on a real search |
 | 2b.6 Engine A, negative cycles | ✅ BP-045, BP-060 |
-| 2b.7 `apex-exec` | **Partial.** Commitment and encoding delivered and differentially tested; `Commitments` needs venue fingerprints, `Signer` needs key material |
+| 2b.7 `apex-exec` | **Partial.** Commitment and encoding delivered and differentially tested; `Commitments` **wired 2026-09-30** (2b.8); `Signer` needs key material |
+| 2b.8 Venue fingerprints + `Commitments` | ✅ — the plane commits on verified venue code |
 
 **Acceptance criteria:** 2 ✅ (Engine C produces a finite-size-only opportunity and nothing else does), 3 ✅ (all eight event classes, exhaustively), 4 ✅ (revaluation before discovery, proven structurally), 5 ✅ (`plan.rs` and `abi.rs` are not the production encoders — `apex-exec` is). **1 is open**: `RouteSource` has an implementation and the end-to-end test drives it, but `Commitments` and `Signer` do not.
 
 **What criterion 1 still needs, precisely:**
 
-- **`venue_fingerprints`** — `ExecutionCommitment` carries a `B256` per venue and `apex-venues` has no such concept. It is a Phase 2 gap this phase surfaced rather than created.
-- **Key material** — §43 and INV-46 govern how it may be held. `apex-exec` produces the payload and `SignedPlan::check` refuses a mismatched commitment; the signature is an operational input.
+- ~~**`venue_fingerprints`**~~ — **closed 2026-09-30, Task 2b.8.**
+- **Key material** — §43 and INV-46 govern how it may be held. `apex-exec` produces the payload and `SignedPlan::check` refuses a mismatched commitment; the signature is an operational input. **This is now the only port without an implementation.**
 - **A decision on which commitment is the dedup key.** `plan_commitment` covers everything that decides what a plan does and is the value the chain agrees with, which makes it the better candidate and would replace two commitments with one. Deferred deliberately: it would be a third structural change to the plane in one session.
+
+### Task 2b.8 — Venue code fingerprints, and `Commitments` wired
+
+**Delivered 2026-09-30.** `crates/apex-venues/src/fingerprint.rs`, `crates/apex-runtime/src/commit.rs`, `StateFingerprint::hash` in `apex-types`; 16 + 9 tests. Workspace 1,825 → **1,850**.
+
+#### A fingerprint of what, exactly
+
+§25's commitment covers "chain_id, executor_version, **venue/version fingerprints**, …", and §28 lists **contract code fingerprint change** among the risk triggers. Together those say what it is: a fingerprint of the **code the venue will execute**, so a trade committed against one version of a venue cannot be confused with the same trade against another.
+
+**The material was already collected and already verified.** `PoolAdmission` carries `BytecodeEvidence { extcodehash, observed_at_block }` and the factory `factory()` reported, and `VenueRegistry::admit` refuses a pool whose factory disagrees with its claimed venue. So the fingerprint is a fold over facts checked against the chain rather than read from a file — B-7's lesson carried to the commitment layer.
+
+**Only an admitted pool can contribute, and that is the point.** `fingerprints` takes `&[PoolAdmission]`, the sealed type; a `PoolAdmissionRecord` — the thing a file produces — cannot reach it. The fabricated router and quoter addresses in `base_venues_complete.yaml`, and the 33 pools filed under Uniswap V3 that PancakeSwap had deployed, are not *caught* here: they are **unable to arrive**. `for_route` then refuses a route naming any unadmitted pool, so a commitment over code nobody verified cannot be built.
+
+#### Three things deliberately left out, and one deliberately left in
+
+- **`observed_at_block` is carried and not hashed.** Hashing it would give unchanged code a different fingerprint every block, so every commitment would differ and §17.4's deduplication — the thing the commitment hash is *for* — would never fire. The age is carried alongside instead, because how old the evidence is and what it says are different questions.
+- **"How old is too old" is asked, not assumed.** `is_fresh_at` takes both the head and the bound. A constant would be a policy nobody could change.
+- **A venue with no admitted pool has no fingerprint, not `B256::ZERO`.** Two such venues would share that hash. Same lesson as `Recall::Undefined` and `CaptureAssurance::Undefined`.
+- **The factory is in**, because a venue whose factory changed is a different venue — the fact `admit`'s `WrongFactory` check is about.
+
+**The age reported is the oldest, not the newest**: a fingerprint is only as current as its stalest input, and reporting the newest would let one freshly-read pool vouch for nine nobody has looked at since deployment.
+
+#### Every narrowing is checked rather than assumed
+
+Three fields arrive wider than the commitment holds them, and each is a place a silent conversion loses the distinction the field exists for.
+
+- **`ExecutorAuth::executor_version` is `[u8; 32]`; the commitment holds a `u32`.** Truncating would let two deployments differing only in their high bytes share a commitment — exactly the change a version field exists to notice. `narrow_executor_version` refuses instead, which also turns the repository's "a `u32` in the low four bytes" convention into something enforced at the one place it is relied on. **Widening `ExecutionCommitment::executor_version` to 32 bytes is the better repair**; it changes `LastMileContext` too and is recorded here rather than done in passing.
+- **The deadline truncates to seconds rather than rounding.** Rounding up would give the trade a later deadline than it was priced against; too early costs an opportunity, too late executes a stale trade.
+- **`slippage_constraints` is one bound per hop, from policy.** It cannot be derived from a candidate — the candidate carries its expected output, not the bound a caller will accept on it.
+
+#### `StateFingerprint::hash` needs length prefixes; the venue fingerprint does not
+
+Both are added here, and the contrast is worth stating once in each place. `venue_state_version` is a **variable-length map**, so without a count in front `{A:1, B:2}` and `{A:1}` followed by whatever came next could serialise identically. The venue fingerprint's elements are all fixed-width — 20-byte address, 32-byte hash — so its preimage parses uniquely and a prefix distinguishes nothing.
+
+That was a surviving mutation: the first draft had a length prefix and deleting it changed nothing. Removed, with the condition that would make it necessary again written down (**any variable-length per-pool field**) and a test pinning the fixed-width invariant the argument rests on.
+
+Every `Option` in `StateFingerprint::hash` writes a tag byte, because `None` is a byte and not an absence — skipping an absent field is the same boundary problem in a different costume.
+
+#### A shortcut that a real implementation exposed
+
+`Plane::lock_exclusive` reported `Suppressed { commitment: B256::ZERO }` when the commitment could not be built at all, and `handle` turned that into `Decline::Uncommittable { detail: "no commitment" }`. With a real `Commitments` in place **the reason is the actionable part**: an unadmitted pool is `VENUE_DISABLED`, which tells an operator to go verify the venue, and it was arriving as a generic `TOO_SLOW`.
+
+The two lock methods are one now, returning `LockFailure::{Suppressed, Declined}`. The two outcomes must not fold together for a reason beyond diagnosis: **a suppression is not a miss and a decline is**, so a single error type would put trades the system took into the dataset that decides where engineering effort goes.
+
+#### Seventeen mutations, one survived
+
+Caught, in `apex-venues`: the observation block hashed; the newest age reported instead of the oldest; the factory dropped; the extcodehash dropped; an unadmitted pool skipped rather than refused; pools unsorted; duplicates not removed; `is_fresh_at` exclusive at the bound.
+
+Caught, in the wiring: the executor version truncated; the staleness bound unchecked; an unverified venue reported as `Uncommittable`; the state-fingerprint hash dropped; `StateFingerprint::hash` ignoring `venue_state_version`; the deadline rounding up; a decline folded into a suppression; one slippage entry rather than one per hop.
+
+Survived: the length prefix, as above.
 
 **Four pieces of dead code were removed over the phase**, three found by mutation and one by clippy: the frontier's chain filter, Engine C's gain guard, the search's empty-revalue early return, and `GraphSnapshot`'s unread index. Each read like a guard and protected nothing, and the recurrence is worth naming — a guard that cannot fail is indistinguishable from one that has never been tested, and only a mutation tells them apart.
 
