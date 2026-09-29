@@ -1,0 +1,16 @@
+[package]
+name = "apex-search"
+version = "0.1.0"
+edition = "2021"
+description = "Candidate generation: the §46.3 route frontier and §12's production engines."
+
+[dependencies]
+apex-types = { path = "../apex-types" }
+apex-state = { path = "../apex-state" }
+apex-math = { path = "../apex-math" }
+apex-venues = { path = "../apex-venues" }
+alloy-primitives = { version = "0.8", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"

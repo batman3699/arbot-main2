@@ -301,6 +301,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "apex-search"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "apex-math",
+ "apex-state",
+ "apex-types",
+ "apex-venues",
+ "proptest",
+ "serde",
+]
+
+[[package]]
 name = "apex-sim"
 version = "0.1.0"
 dependencies = [
