@@ -56,6 +56,7 @@ fn admissible() -> Candidate {
     c.robustness_margin = 0.30;
     c.state_age = DurationNanos(500_000_000);
     c.capture_probability = 0.60;
+    c.probability_of_profit_ppm = 600_000;
     c.certificate_status = CertificateStatus::Proven;
     c
 }
@@ -190,7 +191,7 @@ fn every_clause_can_stop_a_candidate() {
     cases.push((Clause::CostEstimateConfidence, c.clone(), good_sim(&c)));
 
     let mut c = base.clone();
-    c.capture_probability = 0.01;
+    c.probability_of_profit_ppm = 10_000;
     cases.push((Clause::ProbabilityOfProfit, c.clone(), good_sim(&c)));
 
     assert_eq!(cases.len(), 9, "one perturbation per clause");
@@ -307,6 +308,39 @@ fn an_absent_cost_estimate_is_not_a_confident_one() {
     let ctx = context_for(&c, &good_sim(&c), NOW);
     assert_eq!(ctx.cost_confidence_bps, u32::MAX, "absent, so it fails at every policy");
     assert!(healthy_gate().admit(&c, &good_sim(&c)).is_err());
+}
+
+/// **`Pr(Π > 0)` is not `P(lands)`, and the gate reads the right one.**
+///
+/// The first draft read `capture_probability` for §2.1's robust-gate clause,
+/// because that was the only probability a `Candidate` carried. They are
+/// different quantities: **a route that lands every time and loses money on nine
+/// scenarios out of ten** has a capture probability of 1.0 and a profit
+/// probability of 0.1. Reading the first for the second admits exactly the trades
+/// the clause exists to refuse, and this is that route.
+#[test]
+fn a_route_that_always_lands_and_usually_loses_is_refused() {
+    let mut c = admissible();
+    c.capture_probability = 1.0;
+    c.probability_of_profit_ppm = 100_000;
+
+    let ctx = context_for(&c, &good_sim(&c), NOW);
+    assert_eq!(ctx.probability_of_profit_ppm, 100_000, "the clause reads Pr(profit)");
+
+    let err = healthy_gate().admit(&c, &good_sim(&c)).expect_err("0.1 is below p_min");
+    let Decline::RiskRefused { rule } = err else { panic!("{err:?}") };
+    assert!(rule.contains(Clause::ProbabilityOfProfit.label()), "{rule}");
+
+    // The complement: a route that lands rarely but is profitable when it does
+    // clears this clause. Landing is priced elsewhere -- §21.2's capture curve --
+    // and conflating the two would refuse it here for the wrong reason.
+    let mut rare = admissible();
+    rare.capture_probability = 0.05;
+    rare.probability_of_profit_ppm = 900_000;
+    assert!(
+        healthy_gate().admit(&rare, &good_sim(&rare)).is_ok(),
+        "a low landing rate is not a §2.1 failure"
+    );
 }
 
 /// `execution_path_healthy` reads **three** facts from the simulation, and each

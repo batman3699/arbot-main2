@@ -5729,6 +5729,16 @@ So Task 8.5 is not "blocked on wall-clock time". It is blocked on three ports th
 
 **All nine clauses are asserted reachable.** A clause no candidate can fail is a clause nothing tests — the same argument as Task 8.3's surviving `sums_to` mutation.
 
+#### A defect shipped and fixed within the hour: `Pr(Π > 0)` is not `P(lands)`
+
+The first `LiveRiskGate` read `Candidate::capture_probability` for §2.1's robust-gate clause, because that was the only probability a `Candidate` carried. **They are different quantities.** `capture_probability` is §21.2's capture curve — will this land. §2.1's clause is `Pr(Π(a,s) > 0) ≥ p_min` — will it make money. `EligibilityContext` even names its source: *"from `ev::scenario::probability_of_profit_ppm`"*.
+
+**A route that lands every time and loses money on nine scenarios out of ten** has a capture probability of 1.0 and a profit probability of 0.1. Reading the first for the second admits exactly the trades the clause exists to refuse, and the gate would have been passing them for the most confident-looking reason available.
+
+`Candidate::probability_of_profit_ppm` was added for it — integer ppm rather than an `f64`, because it is compared against a policy threshold in a hard gate and a gate whose comparison depends on float rounding decides differently on two machines. `LiveEconomics` fills it from `probability_of_profit_ppm(set)`. `capture_probability` gained a doc comment saying what it is and is not.
+
+`a_route_that_always_lands_and_usually_loses_is_refused` is the test, with its complement: a route that lands *rarely* but is profitable when it does must still clear this clause, because landing is priced elsewhere and conflating the two would refuse it here for the wrong reason. Re-introducing the original mapping fails two tests.
+
 **One gap recorded rather than papered over:** `Candidate` carries a `state_age` and no `observed_at`, so the gate cannot tell how long a candidate has been in flight and the freshness clause reads the value the search recorded. Computing a freshness number from a field that does not mean what the clause needs would be worse than using what exists and saying so.
 
 **Eight mutations, each caught:** posture unchecked; breaker unchecked; route authorization always valid; the tier read from the candidate; a canary ranked above Tier 2; an absent cost estimate read as confident; borrowing nothing read as unavailable; `execution_path_healthy` reading only `success`.

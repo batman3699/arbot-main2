@@ -180,8 +180,15 @@ pub fn context_for(
             apex_types::route::CertificateStatus::Proven
         ),
         cost_confidence_bps: cost_confidence_bps(c),
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        probability_of_profit_ppm: (c.capture_probability.clamp(0.0, 1.0) * 1_000_000.0) as u32,
+        // **`Pr(Π > 0)`, not `P(lands)`.** The first draft read
+        // `capture_probability` here, because that was the only probability a
+        // `Candidate` carried — and they are different quantities. A route that
+        // lands every time and loses money on nine scenarios out of ten has a
+        // capture probability of 1.0 and a profit probability of 0.1, so reading
+        // the first for the second admits exactly the trades §2.1's robust gate
+        // exists to refuse. `Candidate::probability_of_profit_ppm` was added for
+        // this, filled by `apex-econ` from `probability_of_profit_ppm(set)`.
+        probability_of_profit_ppm: c.probability_of_profit_ppm,
     }
 }
 

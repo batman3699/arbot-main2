@@ -159,6 +159,7 @@ fn candidate(p99_gas: u64, net_profit: i128) -> Candidate {
         certificate_status: CertificateStatus::Heuristic,
         simulation_tier: SimulationTier::Tier2FullEvm,
         capture_probability: 0.9,
+        probability_of_profit_ppm: 600_000,
         robustness_margin: 0.25,
         deadline: UnixNanos(T0.0 + 2_000_000_000),
         submission_policy: SubmissionPolicy::Private,

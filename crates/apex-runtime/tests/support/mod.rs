@@ -153,6 +153,7 @@ pub fn candidate(id: u64, block: u64, net: i128) -> Candidate {
         certificate_status: CertificateStatus::Proven,
         simulation_tier: SimulationTier::Tier2FullEvm,
         capture_probability: 0.6,
+        probability_of_profit_ppm: 600_000,
         robustness_margin: 0.3,
         deadline: UnixNanos(2_000_000_000),
         submission_policy: SubmissionPolicy::Private,

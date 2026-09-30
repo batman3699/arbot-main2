@@ -137,7 +137,26 @@ pub struct Candidate {
     pub robust_ev: i128,
     pub certificate_status: CertificateStatus,
     pub simulation_tier: SimulationTier,
+    /// `P(this lands)` — §21.2's capture curve. **Not** the probability that it
+    /// makes money.
     pub capture_probability: f64,
+    /// **`Pr(Π > 0)` in ppm**, from `apex_econ::ev::scenario::probability_of_profit_ppm`.
+    ///
+    /// §2.1's robust gate is "admit only when `J(a) > 0` **and**
+    /// `Pr(Π(a,s) > 0) ≥ p_min`", and this is the second conjunct. It was added
+    /// 2026-09-30 because `LiveRiskGate` had nothing else to read and was using
+    /// [`Self::capture_probability`] — **a different quantity**. A route that
+    /// lands every time and loses money on nine scenarios out of ten has a
+    /// capture probability of 1.0 and a profit probability of 0.1, so reading the
+    /// first for the second admits exactly the trades the clause exists to
+    /// refuse.
+    ///
+    /// Integer ppm rather than an `f64`, matching
+    /// `EligibilityContext::probability_of_profit_ppm`: this multiplies nothing,
+    /// but it is compared against a policy threshold in a hard gate, and a gate
+    /// whose comparison depends on float rounding is a gate that decides
+    /// differently on two machines.
+    pub probability_of_profit_ppm: u32,
     pub robustness_margin: f64,
     pub deadline: UnixNanos,
     pub submission_policy: SubmissionPolicy,
