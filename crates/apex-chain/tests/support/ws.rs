@@ -31,6 +31,8 @@ pub struct Script {
     pub close_after: bool,
     /// Answer this subscription (by request order, from 1) with an error.
     pub refuse: Option<usize>,
+    /// Subscriptions to answer before pushing; `None` is the feed tests' three.
+    pub subscriptions: Option<usize>,
 }
 
 pub struct WsNode {
@@ -115,8 +117,9 @@ impl WsNode {
     }
 }
 
-/// Every test here subscribes to three kinds; the node waits for all three
-/// before pushing, so no notification races its own subscription id.
-fn expected_subscriptions(_s: &Script) -> usize {
-    3
+/// The node waits for every subscription before pushing, so no notification
+/// races its own subscription id. The feed tests subscribe to three kinds; a
+/// flashblock sample, to one.
+fn expected_subscriptions(s: &Script) -> usize {
+    s.subscriptions.unwrap_or(3)
 }

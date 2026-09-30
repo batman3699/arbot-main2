@@ -188,6 +188,9 @@ impl FeedHandler {
                 book.mark_rebuilding();
                 vec![Effect::FullReload]
             }
+            // Not the capture feed's: flashblocks are sampled on a connection of
+            // their own, for the capacity model (R5). One here changes no pool.
+            Notification::Flashblock(_) => Vec::new(),
             Notification::Log(l) if l.removed => vec![Effect::Reload(vec![l.address])],
             Notification::Log(l) => match l.topics.first() {
                 Some(t) if *t == MINT || *t == BURN => vec![Effect::Reload(vec![l.address])],

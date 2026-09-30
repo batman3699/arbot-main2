@@ -1,8 +1,8 @@
 //! Read-only subscriptions over a provider websocket (Task 8.5 R1, §31).
 //!
-//! # What it subscribes to, and why those three
+//! # What it subscribes to, and why those four
 //!
-//! Probed against BlockPI's keyed Base endpoint 2026-09-30:
+//! Probed against BlockPI's keyed Base endpoint 2026-09-30 and 2026-10-01:
 //!
 //! - `newHeads` — every sealed block (2 s). The block ordinal, the base fee, and
 //!   the liveness signal: a feed that has seen no head for `stall_after` is
@@ -13,8 +13,15 @@
 //!   the confirmed ones. The event census found the edge in the block or two
 //!   after a large swap, so this is the subscription the capture path lives on.
 //!   publicnode no longer delivers it; BlockPI does.
+//! - `newFlashblocks` — each flashblock, as the pending block built through it:
+//!   cumulative gas, eleven per block. What §22.2's capacity model is measured
+//!   from. **Heavy** — every notification re-sends the block's transactions so
+//!   far as full objects, 153 KiB on average and ~750 KiB/s, and no parameter
+//!   the provider accepts makes it lighter — so it runs on **its own
+//!   connection**, never the capture feed's, and is sampled rather than held
+//!   open.
 //!
-//! [`Subscription`] has exactly these three variants, and the only request this
+//! [`Subscription`] has exactly these four variants, and the only request this
 //! module can make is `eth_subscribe` of one of them. There is no send path to
 //! guard, because there is nothing here that could express one.
 //!
@@ -55,7 +62,7 @@ pub struct LogFilter {
     pub topics0: Vec<B256>,
 }
 
-/// The three reads a feed can subscribe to. Nothing else is expressible.
+/// The four reads a feed can subscribe to. Nothing else is expressible.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Subscription {
     NewHeads,
@@ -63,6 +70,9 @@ pub enum Subscription {
     Logs(LogFilter),
     /// Preconfirmed: in a flashblock the sequencer has published.
     PendingLogs(LogFilter),
+    /// Each flashblock as the pending block built through it. Heavy: its own
+    /// connection, never the capture feed's (see the module docs).
+    NewFlashblocks,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +80,7 @@ pub enum Kind {
     NewHeads,
     Logs,
     PendingLogs,
+    NewFlashblocks,
 }
 
 impl Subscription {
@@ -78,6 +89,7 @@ impl Subscription {
             Self::NewHeads => Kind::NewHeads,
             Self::Logs(_) => Kind::Logs,
             Self::PendingLogs(_) => Kind::PendingLogs,
+            Self::NewFlashblocks => Kind::NewFlashblocks,
         }
     }
 }
@@ -88,6 +100,7 @@ pub fn subscribe_request(id: u64, s: &Subscription) -> Value {
         Subscription::NewHeads => json!(["newHeads"]),
         Subscription::Logs(f) => json!(["logs", filter_json(f)]),
         Subscription::PendingLogs(f) => json!(["pendingLogs", filter_json(f)]),
+        Subscription::NewFlashblocks => json!(["newFlashblocks"]),
     };
     json!({ "jsonrpc": "2.0", "id": id, "method": "eth_subscribe", "params": params })
 }
@@ -123,10 +136,27 @@ pub struct RawLog {
     pub log_index: Option<u64>,
 }
 
+/// One flashblock, as the pending block built through it. Base's flashblock
+/// index is **not** in the payload; `base::flashblock::FlashblockRecorder`
+/// derives it, and says why only whole blocks count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Flashblock {
+    pub number: u64,
+    /// Cumulative through this flashblock.
+    pub gas_used: u64,
+    pub gas_limit: u64,
+    /// Cumulative through this flashblock.
+    pub transactions: usize,
+    /// Of those, deposits (type `0x7e`). A block's first flashblock holds
+    /// nothing else, which is how the recorder knows it saw index 0.
+    pub deposits: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notification {
     Head(Head),
     Log(RawLog),
+    Flashblock(Flashblock),
     /// The socket was re-established after `outage`. Whatever happened in that
     /// window was not seen. Emitted before anything from the new session.
     Reconnected { outage: Duration, attempt: u32 },
@@ -156,6 +186,22 @@ pub fn parse_notification(msg: &Value, ids: &BTreeMap<String, Kind>) -> Option<N
             gas_used: quantity(r.get("gasUsed")?)?,
             gas_limit: quantity(r.get("gasLimit")?)?,
         })),
+        Kind::NewFlashblocks => {
+            let txs = r.get("transactions")?.as_array()?;
+            Some(Notification::Flashblock(Flashblock {
+                number: quantity(r.get("number")?)?,
+                gas_used: quantity(r.get("gasUsed")?)?,
+                gas_limit: quantity(r.get("gasLimit")?)?,
+                transactions: txs.len(),
+                // A hash is not a transaction object and has no type: it counts
+                // as no deposit, so a provider sending hashes anchors no block
+                // and the model fails closed rather than guessing index 0.
+                deposits: txs
+                    .iter()
+                    .filter(|t| t.get("type").and_then(Value::as_str) == Some("0x7e"))
+                    .count(),
+            }))
+        }
         Kind::Logs | Kind::PendingLogs => {
             let topics = r
                 .get("topics")?

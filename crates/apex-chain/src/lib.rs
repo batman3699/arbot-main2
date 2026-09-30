@@ -17,7 +17,7 @@ pub use adapter::{
 };
 pub use base::adapter::{BaseAdapter, BaseRpc, FLASHBLOCK, GAS_HEADROOM_BPS};
 pub use base::flashblock::{
-    earliest_eligible, earliest_eligible_from, Capacity, FlashblockObservation,
+    earliest_eligible, earliest_eligible_from, Capacity, FlashblockObservation, FlashblockRecorder,
     MeasuredCapacityModel, ModelError,
 };
 pub use base::observe::{Receipt, TransactionObservation};
