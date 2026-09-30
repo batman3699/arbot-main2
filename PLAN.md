@@ -5779,15 +5779,28 @@ INV-17 guards *live dispatch*, and the design keeps it exactly that:
 
 **The dry run, and a finding in it.** The first "dry run" ran at **block 1**: `forge script` does not fork from `ETH_RPC_URL` alone, so it simulated an empty local chain where the Slipstream router had no code — and reported `InvalidAdapter()`, which looked like a contract defect. A probe logging `block.number` exposed it before it was reported as a Base result. `foundry.toml` now has `[rpc_endpoints] base = …/${BLOCKPI_KEY}`, so `--rpc-url base` forks for real **and** keeps the key off the command line. Against the real fork (block ≈ 51.985M) every step succeeds — deploy, `setExecutor`, adapter, selector — at ≈ 8.0M gas, ≈ 0.000086 ETH at 0.0107 gwei (forge's estimate; Base's L1 data fee comes on top).
 
-**Blocking the broadcast: the configured owner cannot pay.** `BASE_EXECUTOR_OWNER` = `0xD7A4…f04c` holds ≈ 1.0e-7 ETH (nonce 16); simulating with its real balance fails "lack of funds for max fee". Before broadcasting, the operator either funds it (≈ 0.0005 ETH covers gas and the L1 fee with margin) or names a different admin address as `BASE_EXECUTOR_OWNER` for the run. `out/` also holds artifacts from the deleted pre-Phase-5 `steps/` contracts: `forge clean` first.
+**Blocking the broadcast: the owner.** The broadcaster *is* the owner — the wiring calls are owner-only — so the owner must be an admin address that is **not** the trading key's (§18.1: the script refuses with `TradingKeyMayNotDeploy` / `TradingKeyMayNotOwn`), and it must hold ETH. `0xD7A4…f04c` holds ≈ 1.0e-7 ETH (nonce 16), and a dry run as it fails forge's on-chain check, "lack of funds … for max fee": fund it with ≈ 0.0005 ETH, or name another non-trading admin. **Measured 2026-10-01** on a local anvil fork of Base (block 52,001,852) with the owner given exactly 0.0005 ETH: `SIMULATION COMPLETE`, six transactions, 8,023,171 gas ≈ 0.000084 ETH at 0.0105 gwei, plus ≈ 0.0000005 ETH of L1 data fee from Base's gas-price oracle — about a sixth of the 0.0005. **Also found 2026-10-01:** `.env`'s `BASE_EXECUTOR_OWNER` had been changed to the trading address `0x69D5…8A3`, which the script refuses; the commands below set the owner inline so `.env` does not choose it, and `PRIVATE_KEY=` stops forge's `.env` autoload handing the script the trading key as broadcaster.
+
+**Clean, then let the script compile only itself.** `out/` holds artifacts of the deleted pre-Phase-5 `steps/` contracts (`GenericExecutor.sol`, `SwapExecutor.sol`, removed in `e3e2b2b`), and forge warns "artifacts built from source files that no longer exist" until `forge clean`. Do **not** follow it with `forge build`: that compiles the 21 test and forge-std test files too (≈ 4 min under `via_ir`), and a script run over the cached result then prints one `WARN … failed to parse contract definitions` for each file it did not parse itself — harmless trace-mapping noise, but 21 lines of it in the output read before an irreversible broadcast. `forge script` alone compiles its own 35 files in ≈ 40 s and prints neither. A guard's revert shows first as a raw `Failed to decode return value: 0x…`, then decoded on the last line: `script failed: <Guard>(…)`.
 
 ```bash
-forge clean && forge build
+forge clean
+
+# 1. Dry run. Must print "Script ran successfully." and "SIMULATION COMPLETE".
 PRIVATE_KEY= \
+BASE_EXECUTOR_OWNER=<admin address> \
 BASE_EXECUTOR_TRADER=0x69d54e5fc0b9325d7250f0d0a11690327a3dd8a3 \
 BASE_SLIPSTREAM_ROUTER=0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5 \
 forge script script/DeployAndConfigure.s.sol:DeployAndConfigure \
-  --rpc-url base --sender <owner address> --interactive --broadcast
+  --rpc-url base --sender <admin address>
+
+# 2. Broadcast: the same, plus --interactive --broadcast. Signs as <admin address>.
+PRIVATE_KEY= \
+BASE_EXECUTOR_OWNER=<admin address> \
+BASE_EXECUTOR_TRADER=0x69d54e5fc0b9325d7250f0d0a11690327a3dd8a3 \
+BASE_SLIPSTREAM_ROUTER=0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5 \
+forge script script/DeployAndConfigure.s.sol:DeployAndConfigure \
+  --rpc-url base --sender <admin address> --interactive --broadcast
 ```
 
 After it lands, in one change: `ops/inputs.yaml`'s Base `executor_address` and `batch_router_address`, and `docs/apex/DEPLOYED.md`, which says the deployed executor predates Phase 5 and stops being true at that moment.
@@ -5796,15 +5809,19 @@ After it lands, in one change: `ops/inputs.yaml`'s Base `executor_address` and `
 
 Measured against the code on 2026-09-30, not estimated from the port table. **`main.rs` never builds a `Plane`**, and no production implementation exists for `TemplatePricer`, `RouteCurves`, the live feed, pool state, the frontier, the call builder, the simulator, the live reader or the capacity model. Each item below is its own commit.
 
-- [ ] **R1 — websocket feed** (`apex-chain::rpc::ws`). BlockPI's Base websocket was probed 2026-09-30: `newHeads` (2 s), confirmed `logs`, and **`pendingLogs`** — preconfirmed logs at flashblock latency, arriving ahead of and outnumbering confirmed ones. publicnode no longer delivers `pendingLogs`. Subscriptions are reads; the allowlist principle carries over.
-- [ ] **R2 — pool book.** The event census's universe, which is the one with evidence behind it: pairs carrying ≥ 2 pools at ≤ 500 ppm and ≥ $100k depth, Uniswap v3 and Slipstream. `ClPoolState` plus a bounded `TickLadder` per pool, loaded at a pinned block, held in `apex_state::Versioned` (INV-11).
-- [ ] **R3 — feed → state → events.** `Swap` carries the post-swap `sqrtPriceX96`, `liquidity` and `tick`, so a swap updates a pool exactly; `Mint`/`Burn` reload its ladder. Swaps ≥ $7,500 (measured) become `PendingSwap` events on the fast lane.
-- [ ] **R4 — local pricer.** A `SizedRoute` over `quote_exact_input_multi_tick` for each hop, serving both `TemplatePricer` (Engine C) and `RouteCurves` (`LiveEconomics`). **Multi-tick, with the ladder's bounds honoured**: an exhausted ladder is a refusal, never a quote at the last known liquidity — the constant-liquidity error behind the legacy fast path's ~140 bps.
+- [x] **R1 — websocket feed** (`apex-chain::rpc::ws`), `844d923`. BlockPI's Base websocket was probed 2026-09-30: `newHeads` (2 s), confirmed `logs`, and **`pendingLogs`** — preconfirmed logs at flashblock latency, arriving ahead of and outnumbering confirmed ones. publicnode no longer delivers `pendingLogs`. Subscriptions are reads; the allowlist principle carries over.
+- [x] **R2 — pool book**, `be863dc`. The event census's universe, which is the one with evidence behind it: pairs carrying ≥ 2 pools at ≤ 500 ppm and ≥ $100k depth, Uniswap v3 and Slipstream. `ClPoolState` plus a bounded `TickLadder` per pool, loaded at a pinned block, held in `apex_state::Versioned` (INV-11).
+- [x] **R3 — feed → state → events** (`live::feed`). `Swap` carries the post-swap `sqrtPriceX96`, `liquidity` and `tick`, so a swap updates a pool exactly; `Mint`/`Burn` and removed logs reload it; a gap makes the book `Rebuilding`. Every applied swap becomes a `PendingSwap` carrying its USD notional, and Engine D's floor admits the large ones. **Four defects found on the way, each now pinned by a test that fails without its fix** (19 mutants, all killed):
+  - **The route's venue version could stand still while a pool changed.** It was the latest `(block, log index)` among the route's pools, and a maximum of positions does not move when a reload reads at the sealed block behind another pool's preconfirmed swap, or a swap the preconfirmed feed missed arrives confirmed behind one it delivered. It is now the book's write sequence, which every write advances.
+  - **It was read after pricing.** `assemble` re-read it once the four stages had each priced their own snapshot, absorbing any write that landed meanwhile — last-mile would pass a ticket priced against state that had moved. Engine C now reads it **before** `best_size` (`TemplatePricer::route_fingerprint`), and `assemble` commits the proposal's.
+  - **A read could be rolled back.** A pool read at block *n* re-applied *n*'s own confirmed logs, which trail the preconfirmed feed by 0.5–2 s, rolling it back mid-block; and a reload at the sealed block overwrote a preconfirmed swap from the next — the ladder-exit reload is triggered by exactly such a swap. A read now counts as all of its block, and a reload keeps a newer swap's price while taking the fresh ladder and balances.
+  - **`Verified` could be restored over a gap (INV-08).** `reload` and `apply_swap` read the status outside the writer lock and stored it back inside, so a reload in flight could write `Verified` over the feed's `Rebuilding`. The status is read under the lock, and a full reload clears only a gap marked before it began.
+- [x] **R4 — local pricer**, `a081ce1` (the gross fix it exposed, `b0ea7da`). A `SizedRoute` over `quote_exact_input_multi_tick` for each hop, serving both `TemplatePricer` (Engine C) and `RouteCurves` (`LiveEconomics`). **Multi-tick, with the ladder's bounds honoured**: an exhausted ladder is a refusal, never a quote at the last known liquidity — the constant-liquidity error behind the legacy fast path's ~140 bps.
 - [ ] **R5 — capacity model.** `MeasuredCapacityModel` from observed flashblocks. Observed cumulative gas **used** is a lower bound on the cumulative **budget**, so a model built from it errs conservative, which is the permitted direction (§22.2 forbids the fixed one-tenth rule).
 - [ ] **R6 — call builder.** `UNIV3` op for Uniswap v3 hops, `GENERIC` via adapter 1 (`exactInputSingle`) for Slipstream, a Balancer vault flash loan. A route through anything else is refused as `VenueDisabled`.
 - [ ] **R7 — Tier 2 simulator.** `eth_simulateV1`, block pinned, as the assigned lane, against the deployed Phase 5 executor. Until the deploy lands every simulation fails, and each is filed as `SIM_FAIL` rather than hidden.
 - [ ] **R8 — live reader.** Executor code, base fee, fee ceiling, block gas, signer balance, flash availability, pending nonce.
-- [ ] **R9 — `apex shadow`.** Assembly over `DispatchLane::Shadow`, its own journal (so recovery can truthfully say nothing was sent), a periodic capture-assurance and funnel report, supervised restarts.
+- [ ] **R9 — `apex shadow`.** Assembly over `DispatchLane::Shadow`, its own journal (so recovery can truthfully say nothing was sent), a periodic capture-assurance and funnel report, supervised restarts. **The reload task, from what R3 learned:** one reload at a time, each at the latest block (the book refuses a read older than one it holds, `ReloadError::Older`); requests coalesced; a pool whose price is still off its fresh ladder — its read predates a swap it holds — queued again for the next block; and a pool refused on reload is *removed*, so the report counts removals and a periodic full reload must re-admit from the universe, or a 14-day run's universe erodes one transient read failure at a time.
 - [ ] **R10 — start the run**, and check it is producing events, proposals and declines before leaving it.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
