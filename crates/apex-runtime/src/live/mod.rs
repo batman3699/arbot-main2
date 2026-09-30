@@ -7,6 +7,8 @@
 //! and the one rule each piece enforces, stated where it is enforced.
 
 pub mod abi;
+pub mod adapter;
+pub mod admission;
 pub mod book;
 pub mod calls;
 pub mod feed;
