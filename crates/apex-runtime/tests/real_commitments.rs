@@ -20,7 +20,7 @@ use apex_capture::registry::TicketRegistry;
 use apex_capture::signer::{ExecutorAuth, LaneConfig, SignerPool};
 use apex_capture::{InMemoryJournal, ManualClock, NullDispatcher};
 use apex_runtime::commit::{deadline_seconds, narrow_executor_version, VenueCommitments};
-use apex_runtime::plane::{Commitments, Decline, Handled, Plane, Ports};
+use apex_runtime::plane::{Commitments, Decline, DispatchLane, Handled, Plane, Ports};
 use apex_types::ids::{PoolId, SignerLaneId, TokenId};
 use apex_types::miss::{ExplainsMiss, MissReason};
 use apex_types::route::{RouteCommitment, RouteHop};
@@ -262,7 +262,7 @@ async fn the_plane_runs_on_a_real_commitments() {
         )),
         pool: Arc::new(signers()),
         gate: Arc::new(DispatchGate::shut()),
-        dispatcher: Arc::new(NullDispatcher::new()),
+        dispatch: DispatchLane::Live(Arc::new(NullDispatcher::new())),
         chain: Arc::new(FakeChain::landing()),
         search: Arc::new(FixedSearch::new(vec![c.clone()])),
         econ: Arc::new(PassThroughEconomics(c)),
@@ -300,7 +300,7 @@ async fn an_unverified_venue_stops_the_plane_before_a_ticket_exists() {
         )),
         pool: Arc::new(signers()),
         gate: Arc::new(DispatchGate::shut()),
-        dispatcher: Arc::new(NullDispatcher::new()),
+        dispatch: DispatchLane::Live(Arc::new(NullDispatcher::new())),
         chain: Arc::new(FakeChain::landing()),
         search: Arc::new(FixedSearch::new(vec![c.clone()])),
         econ: Arc::new(PassThroughEconomics(c)),

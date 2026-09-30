@@ -19,7 +19,7 @@ use apex_capture::registry::TicketRegistry;
 use apex_capture::signer::{ExecutorAuth, LaneConfig, SignerPool};
 use apex_capture::{InMemoryJournal, ManualClock, NullDispatcher};
 use apex_math::finite_size::{best_size, NoSize, SearchBudget, SizedOpportunity, SizedRoute};
-use apex_runtime::plane::{Handled, Plane, Ports};
+use apex_runtime::plane::{DispatchLane, Handled, Plane, Ports};
 use apex_runtime::search::FrontierSearch;
 use apex_search::engine_c::{FiniteSizeEngine, TemplatePricer};
 use apex_search::engine_d::EventEngine;
@@ -174,7 +174,7 @@ fn plane_over(search: Arc<FrontierSearch>) -> Plane {
         )),
         pool: Arc::new(pool_signers()),
         gate: Arc::new(DispatchGate::shut()),
-        dispatcher: Arc::new(NullDispatcher::new()),
+        dispatch: DispatchLane::Live(Arc::new(NullDispatcher::new())),
         chain: Arc::new(FakeChain::landing()),
         search,
         econ: Arc::new(PassThroughEconomics::default()),
@@ -328,7 +328,7 @@ async fn a_saturated_pricing_budget_declines_rather_than_queues() {
             )),
             pool: Arc::new(pool_signers()),
             gate: Arc::new(DispatchGate::shut()),
-            dispatcher: Arc::new(NullDispatcher::new()),
+            dispatch: DispatchLane::Live(Arc::new(NullDispatcher::new())),
             chain: Arc::new(FakeChain::landing()),
             search,
             econ: Arc::new(PassThroughEconomics::default()),

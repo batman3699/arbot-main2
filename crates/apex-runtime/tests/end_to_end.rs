@@ -23,7 +23,7 @@ use apex_capture::registry::TicketRegistry;
 use apex_capture::signer::{ExecutorAuth, LaneConfig, SignerPool};
 use apex_capture::{InMemoryJournal, ManualClock, NullDispatcher};
 use apex_runtime::plane::{
-    Economics, Handled, LockFailure, Locked, Plane, Ports, SettlementFeed,
+    DispatchLane, Economics, Handled, LockFailure, Locked, Plane, Ports, SettlementFeed,
 };
 use apex_types::ids::SignerLaneId;
 use apex_types::ticket::TicketStatus;
@@ -59,7 +59,7 @@ fn plane_with(
         )),
         pool: Arc::new(pool()),
         gate: Arc::new(DispatchGate::shut()),
-        dispatcher: Arc::new(NullDispatcher::new()),
+        dispatch: DispatchLane::Live(Arc::new(NullDispatcher::new())),
         chain: Arc::new(FakeChain::landing()),
         search,
         econ,
@@ -303,7 +303,7 @@ async fn two_different_events_proposing_one_trade_produce_one_ticket() {
         )),
         pool: Arc::new(pool()),
         gate: Arc::new(DispatchGate::shut()),
-        dispatcher: Arc::new(NullDispatcher::new()),
+        dispatch: DispatchLane::Live(Arc::new(NullDispatcher::new())),
         chain: Arc::new(FakeChain::landing()),
         search: Arc::new(PinnedSearch { proposal: proposal_for(&c) }),
         econ: Arc::new(PassThroughEconomics(c)),
@@ -508,7 +508,9 @@ async fn the_status_is_journalled_before_the_irreversible_act() {
         registry: Arc::clone(&registry),
         pool: Arc::new(pool()),
         gate: Arc::new(DispatchGate::shut()),
-        dispatcher: Arc::clone(&dispatcher) as Arc<dyn apex_capture::dispatch::Dispatcher + Send + Sync>,
+        dispatch: DispatchLane::Live(
+            Arc::clone(&dispatcher) as Arc<dyn apex_capture::dispatch::Dispatcher + Send + Sync>,
+        ),
         chain: Arc::new(FakeChain::landing()),
         search: Arc::new(FixedSearch::new(vec![candidate(1, 47_079_437, 320_000_000_000)])),
         econ: Arc::new(PassThroughEconomics::default()),

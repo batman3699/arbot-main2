@@ -41,7 +41,7 @@
 //! acceptable only because the alternative is a breaker that reports stale
 //! windows, and a breaker that under-reports loss is worse than a microsecond.
 
-use crate::plane::{Decline, RiskGate};
+use crate::plane::{Admission, Decline, LaneKind, RiskGate};
 use apex_econ::eligibility::{Clause, Decision, EligibilityContext, EligibilityPolicy};
 use apex_econ::eligibility::EligibilityGate;
 use apex_risk::breaker::CircuitBreaker;
@@ -102,7 +102,12 @@ impl LiveRiskGate {
 }
 
 impl RiskGate for LiveRiskGate {
-    fn admit(&self, c: &Candidate, sim: &SimulationResult) -> Result<(), Decline> {
+    fn admit(
+        &self,
+        c: &Candidate,
+        sim: &SimulationResult,
+        lane: LaneKind,
+    ) -> Result<Admission, Decline> {
         // ---- 1. Posture. A fact about the system, so it answers first.
         let posture = self.posture();
         if !posture.permits_new_live_tickets() {
@@ -126,8 +131,29 @@ impl RiskGate for LiveRiskGate {
         }
 
         // ---- 3. This candidate, against §2.3's nine clauses.
-        match EligibilityGate::evaluate(&context_for(c, sim, now), &self.policy) {
-            Decision::Admit => Ok(()),
+        let mut ctx = context_for(c, sim, now);
+
+        // INV-17 guards LIVE dispatch: an approximate route may rank and
+        // propose, and may not authorize a transaction. A shadow plane's lane
+        // holds the null dispatcher -- a type that cannot send -- so on a shadow
+        // lane the clause is waived, and **named** on the admission, so shadow
+        // evidence is never read as a trade the live gate would have authorized.
+        //
+        // Exactly this clause and nothing else. Posture and breaker above are
+        // never waived, and neither is any other clause: a shadow run measuring
+        // trades that fail the EV or Pr(profit) clauses would be measuring trades
+        // nothing would ever make. Operator decision, 2026-09-30.
+        let waived = match lane {
+            LaneKind::Shadow if !ctx.route_authorization_valid => {
+                ctx.route_authorization_valid = true;
+                vec![Clause::RouteAuthorizationValid]
+            }
+            LaneKind::Shadow | LaneKind::Live => Vec::new(),
+        };
+
+        match EligibilityGate::evaluate(&ctx, &self.policy) {
+            Decision::Admit if waived.is_empty() => Ok(Admission::Full),
+            Decision::Admit => Ok(Admission::ShadowOnly { waived }),
             Decision::Reject { clause } => Err(Decline::RiskRefused {
                 rule: format!("{} ({})", clause.label(), clause.source()),
             }),

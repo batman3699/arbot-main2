@@ -77,7 +77,9 @@
 use crate::bus::StateEvent;
 use apex_search::frontier::RouteProposal;
 use crate::workers::{refine_concurrently, Budgets, ResourceClass};
-use apex_capture::dispatch::{DispatchError, DispatchRequest, Dispatcher};
+use apex_capture::dispatch::{DispatchError, DispatchRequest, Dispatcher, NullDispatcher};
+use apex_capture::scheduler::{CaptureAssurance, Scheduler};
+use apex_econ::eligibility::Clause;
 use apex_capture::recover::{reconcile, scan, ChainOutcomeSource, DispatchGate, RecoveryError};
 use apex_capture::registry::{TicketGuard, TicketRegistry};
 use apex_capture::revalidate::{
@@ -103,6 +105,7 @@ use apex_types::ticket::{
 use apex_types::time::{DurationNanos, UnixNanos};
 use alloy_primitives::{Address, B256, U256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Why the plane declined a candidate.
@@ -335,8 +338,83 @@ pub trait Simulator: Send + Sync {
 /// Risk is a hard execution gate, not advice (§28). Synchronous because a gate
 /// that can await is a gate something can be waiting behind while a deadline
 /// runs down.
+///
+/// `lane` is where an admission would lead. It exists for exactly one decision:
+/// a gate may waive INV-17 for a [`LaneKind::Shadow`] plane and must say so in
+/// the [`Admission`] it returns. The plane, not the gate, has the last word —
+/// see [`DispatchLane`].
 pub trait RiskGate: Send + Sync {
-    fn admit(&self, c: &Candidate, sim: &SimulationResult) -> Result<(), Decline>;
+    fn admit(
+        &self,
+        c: &Candidate,
+        sim: &SimulationResult,
+        lane: LaneKind,
+    ) -> Result<Admission, Decline>;
+}
+
+/// Where a signed payload goes. Two answers, and the difference between them is
+/// whether money can move.
+///
+/// # The shadow variant holds a concrete type, and that is the guarantee
+///
+/// `Shadow` holds an `Arc<NullDispatcher>` — not a trait object — so a
+/// dispatcher that sends **cannot be put in it**: no value of that type sends.
+/// A shadow plane's waiver of INV-17 is granted only to planes built on this
+/// variant, which makes "a heuristic route reached a lane that sends" a type
+/// error rather than a review finding.
+///
+/// The reverse is harmless and deliberately allowed. `Live` takes any
+/// dispatcher, a null one included, and that is how the lifecycle tests drive
+/// the whole live protocol — the unwaived gate, settlement, reconciliation —
+/// with no network.
+#[derive(Clone)]
+pub enum DispatchLane {
+    /// §16.1's null dispatcher. Records; sends nothing.
+    Shadow(Arc<NullDispatcher>),
+    /// Anything that implements [`Dispatcher`]. Only an [`Admission::Full`]
+    /// reaches it.
+    Live(Arc<dyn Dispatcher + Send + Sync>),
+}
+
+impl DispatchLane {
+    pub const fn kind(&self) -> LaneKind {
+        match self {
+            Self::Shadow(_) => LaneKind::Shadow,
+            Self::Live(_) => LaneKind::Live,
+        }
+    }
+}
+
+/// What the risk gate is told about where its admission would lead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneKind {
+    Shadow,
+    Live,
+}
+
+/// The risk gate's yes, and how much of a yes it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// Every clause held. May reach either lane.
+    Full,
+    /// Every clause held except `waived`, which only a shadow plane may waive.
+    /// **Reaches only [`DispatchLane::Shadow`]**: on a live lane the plane
+    /// refuses it before signing, whatever the gate that granted it was told.
+    ShadowOnly { waived: Vec<Clause> },
+}
+
+impl Admission {
+    /// The clauses this admission did not satisfy. Empty for `Full`.
+    pub fn waived(&self) -> &[Clause] {
+        match self {
+            Self::Full => &[],
+            Self::ShadowOnly { waived } => waived,
+        }
+    }
+}
+
+fn labels(clauses: &[Clause]) -> Vec<String> {
+    clauses.iter().map(|c| c.label().to_string()).collect()
 }
 
 /// §25's commitment. `apex-exec`'s job: the plane cannot build one because
@@ -413,7 +491,7 @@ pub struct Ports {
     pub registry: Arc<TicketRegistry>,
     pub pool: Arc<SignerPool>,
     pub gate: Arc<DispatchGate>,
-    pub dispatcher: Arc<dyn Dispatcher + Send + Sync>,
+    pub dispatch: DispatchLane,
     pub chain: Arc<dyn ChainExecutionAdapter>,
     pub search: Arc<dyn RouteSource>,
     pub econ: Arc<dyn Economics>,
@@ -620,12 +698,28 @@ pub enum Handled {
     Redelivered { chain: ChainId, at: apex_state::Ordinal },
 }
 
+/// How the protocol ended when it did not decline.
+enum Completed {
+    /// Steps 8-10 ran: included, and reconciled against the chain. Boxed
+    /// because `TicketOutcome::Success` holds it boxed anyway.
+    Settled(Box<PnlAttribution>),
+    /// The null dispatcher took it. See `TicketOutcome::ShadowDispatched`.
+    Shadow { at: UnixNanos, in_time: bool, waived: Vec<String> },
+}
+
 pub struct Plane {
     ports: Ports,
     inflight: InFlight,
     seen: SeenEvents,
     misses: Mutex<MissLedger>,
     budgets: Budgets,
+    /// `SYSTEM_CAPTURE_ASSURANCE`'s denominator: tickets the risk gate
+    /// authorized. Counted at `Authorized`, not at admission to the registry —
+    /// a ticket the gate refused is a trade the system decided not to make, and
+    /// counting it would make the figure fall whenever the market went quiet.
+    authorized: AtomicU64,
+    /// Its numerator: tickets a dispatcher accepted before their deadline.
+    dispatched_in_time: AtomicU64,
 }
 
 impl Plane {
@@ -640,7 +734,29 @@ impl Plane {
             seen: SeenEvents::new(SeenEvents::DEFAULT_CAPACITY),
             misses: Mutex::new(MissLedger::new()),
             budgets,
+            authorized: AtomicU64::new(0),
+            dispatched_in_time: AtomicU64::new(0),
         }
+    }
+
+    /// §16.7's `SYSTEM_CAPTURE_ASSURANCE` over this plane's life: tickets that
+    /// reached the dispatcher before their deadline, over tickets the risk gate
+    /// authorized. Acceptance criterion 1's figure.
+    ///
+    /// `Undefined` until something is authorized — an empty window is not a
+    /// passing one (Task 8.5's first finding). Nothing called
+    /// `Scheduler::u_capture` from a running system before this, so criterion 1
+    /// had a definition and no measurement.
+    pub fn capture_assurance(&self) -> CaptureAssurance {
+        Scheduler::u_capture(
+            self.dispatched_in_time.load(Ordering::Relaxed),
+            self.authorized.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Which lane this plane dispatches to.
+    pub const fn lane(&self) -> LaneKind {
+        self.ports.dispatch.kind()
     }
 
     /// How many observations the redelivery window currently holds.
@@ -821,10 +937,17 @@ impl Plane {
             .map_err(|e| Decline::Uncommittable { detail: e.to_string() })?;
 
         match self.protocol(event, candidate, locked, &mut guard, lane, gas_limit, now).await {
-            Ok(realized) => {
-                let outcome = TicketOutcome::Success {
-                    stage: TicketStatus::Reconciled,
-                    realized: Box::new(realized),
+            Ok(completed) => {
+                let outcome = match completed {
+                    Completed::Settled(realized) => {
+                        TicketOutcome::Success { stage: TicketStatus::Reconciled, realized }
+                    }
+                    Completed::Shadow { at, in_time, waived } => TicketOutcome::ShadowDispatched {
+                        stage: TicketStatus::Acknowledged,
+                        at,
+                        in_time,
+                        waived,
+                    },
                 };
                 guard
                     .close(outcome.clone())
@@ -862,7 +985,7 @@ impl Plane {
         lane: SubmissionLaneId,
         gas_limit: GasLimit,
         now: UnixNanos,
-    ) -> Result<PnlAttribution, Decline> {
+    ) -> Result<Completed, Decline> {
         // ---- Step 2: reserve a signer lane and a nonce.
         let need = apex_capture::signer::LaneRequirements {
             chain: candidate.chain_id,
@@ -901,8 +1024,25 @@ impl Plane {
         self.advance(guard, TicketStatus::Simulated)?;
 
         // ---- Risk. A hard gate: everything past here holds reserved resources.
-        self.ports.risk.admit(&repriced, &sim)?;
+        let admission = self.ports.risk.admit(&repriced, &sim, self.ports.dispatch.kind())?;
+
+        // INV-17, structurally. A shadow-only admission never reaches a lane
+        // that sends, **whatever the gate that granted it was told** -- the
+        // gate is one component and this is the plane that owns the lane.
+        // Refused before `Authorized`, so it is a refusal rather than an
+        // admitted ticket that later failed.
+        if let (DispatchLane::Live(_), Admission::ShadowOnly { waived }) =
+            (&self.ports.dispatch, &admission)
+        {
+            return Err(Decline::RiskRefused {
+                rule: format!(
+                    "INV-17: {} was waived for a shadow lane, and this plane's lane sends",
+                    labels(waived).join(", ")
+                ),
+            });
+        }
         self.advance(guard, TicketStatus::Authorized)?;
+        self.authorized.fetch_add(1, Ordering::Relaxed);
 
         // ---- Step 4: last-mile revalidation.
         let ticket = ticket_snapshot(guard, &repriced);
@@ -939,16 +1079,38 @@ impl Plane {
             .budgets
             .reserve(ResourceClass::Submission)
             .ok_or(Decline::NoBudget(ResourceClass::Submission))?;
-        let mut ladder = self
-            .ports
-            .dispatcher
-            .dispatch(&request, &permit, self.ports.registry.now())
-            .map_err(Decline::DispatchFailed)?;
+        let dispatched_at = self.ports.registry.now();
+        let dispatched = match &self.ports.dispatch {
+            DispatchLane::Shadow(null) => null.dispatch(&request, &permit, dispatched_at),
+            DispatchLane::Live(sender) => sender.dispatch(&request, &permit, dispatched_at),
+        };
+        let mut ladder = dispatched.map_err(Decline::DispatchFailed)?;
         drop(submission_permit);
+
+        // §16.7's numerator: a dispatcher accepted it, and before the deadline.
+        // A ticket that got here late was still authorized and still sent -- or
+        // would have been -- so it closes normally and counts against the ratio.
+        let in_time = dispatched_at.0 <= candidate.deadline.0;
+        if in_time {
+            self.dispatched_in_time.fetch_add(1, Ordering::Relaxed);
+        }
 
         // ---- Step 7: the transport's answer, and nothing more (INV-34).
         self.advance(guard, TicketStatus::Acknowledged)?;
         self.ports.pool.record_outcome(assignment.lane(), true);
+
+        // A shadow ticket ends here. Nothing was sent, so steps 8-10 would be
+        // asking the chain about a transaction that does not exist, and the
+        // nonce was never consumed -- it goes back, or every later ticket would
+        // sign against a gap the chain never saw.
+        if let DispatchLane::Shadow(_) = &self.ports.dispatch {
+            let _ = assignment.release_nonce(nonce, false);
+            return Ok(Completed::Shadow {
+                at: dispatched_at,
+                in_time,
+                waived: labels(admission.waived()),
+            });
+        }
 
         // ---- Step 8: preconfirmation and inclusion, from observations.
         for observation in self.ports.settlement.observe(payload.hash).await? {
@@ -992,7 +1154,7 @@ impl Plane {
             .map_err(|e| Decline::ChainUnavailable { detail: e.to_string() })?;
         let _ = assignment.release_nonce(nonce, true);
         self.advance(guard, TicketStatus::Reconciled)?;
-        Ok(realized)
+        Ok(Completed::Settled(Box::new(realized)))
     }
 
     /// Advance, but only forwards and only with somewhere to go. A no-op here

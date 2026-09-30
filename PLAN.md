@@ -5702,6 +5702,41 @@ So Task 8.5 is not "blocked on wall-clock time". It is blocked on three ports th
 - [x] **Tier 0 screen** — wired 2026-09-30 into `LiveEconomics::assemble`. **Not** as a `Simulator`; see below.
 - [ ] **`Simulator`** — **needs a node.** Corrected 2026-09-30: Tier 0 cannot stand in for it.
 - [ ] `Signer`, `LiveReader`, `SettlementFeed`, `Simulator` — external inputs (a key, a node).
+- [x] **The node: `apex-chain::rpc`**, delivered 2026-09-30 (`192cd10`). BlockPI's keyed Base endpoint verified live — `eth_simulateV1` and `base_transactionStatus` both answer, ~260 ms warm. See "The RPC transport" below.
+- [x] **Shadow authorization** — operator decision 2026-09-30, delivered the same day. See below.
+- [x] **`SYSTEM_CAPTURE_ASSURANCE` measured by the running plane**, not only defined. See below.
+
+#### The RPC transport: read-only by type
+
+`apex-chain::rpc::FailoverTransport` is the legacy failover policy (§3.4 **KEEP**) rebuilt without `ethers::providers`: last-known-good affinity, rotate on endpoint faults, **never rotate a revert** (the legacy log measured 75% of rotations wasted on reverts before that rule), backoff only between whole passes. Four additions, each closing a failure the legacy client could not see:
+
+1. **A read allowlist.** `eth_sendRawTransaction` and every other write is refused before a byte leaves the process. A shadow process holding this transport is *unable* to broadcast, not configured not to. An allowlist rather than a denylist because providers add submission methods, and a denylist that did not know one would pass it.
+2. **A per-attempt timeout.** The legacy client had none; a hung endpoint hung the caller.
+3. **Chain-id verification** of every endpoint at boot, and again before the first use of an endpoint that was down at boot. A wrong-chain endpoint refuses the boot — `wrong_chain_submission` is a hard-zero counter, and a wrong-chain *read* transport feeds everything upstream of one.
+4. **Id matching.** An answer with another id answers another question.
+
+INV-46: the key is the URL path, so URLs are `Secret`, endpoints are named by a redacted label, and reqwest errors are stripped of the URL — reqwest's default `Display` embeds it.
+
+**Two tests were too weak as first drafted, and mutation found both.** Affinity was untested because `connect` starts at the first *verified* endpoint, so the dead one was never tried; the key-leak check could not see the refused connection's error because `Exhausted` carries only the last failure. Both rewritten; twelve mutations, each caught by the test written for it.
+
+The legacy `rpc_failover.rs` stays until Phase 17 retires its consumers.
+
+#### Shadow authorization: a heuristic route may reach the null dispatcher, and nothing that sends
+
+**The problem it solves.** INV-17 lets only a `Proven` route authorize, and `LiveEconomics` certifies every candidate `Heuristic` until Phase 12's `certify`. So every candidate was refused at the gate: nothing signed, nothing dispatched, `SYSTEM_CAPTURE_ASSURANCE` `Undefined` for all fourteen days, and criterion 1 unpassable by construction. **Operator decision, 2026-09-30: allow candidates through signing to the null dispatcher.**
+
+INV-17 guards *live dispatch*, and the design keeps it exactly that:
+
+- **`Ports.dispatcher` became `DispatchLane::{Shadow(Arc<NullDispatcher>), Live(Arc<dyn Dispatcher>)}`.** The shadow variant holds a concrete type, so a dispatcher that sends *cannot be put in it*. The reverse is harmless and allowed — the lifecycle tests drive the whole live protocol on `Live(NullDispatcher)`.
+- **The gate waives INV-17 only when told the lane is `Shadow`, and names it.** `RiskGate::admit` returns `Admission::{Full, ShadowOnly { waived }}`. Only `RouteAuthorizationValid` is waivable; posture, breaker and the other eight clauses refuse exactly as on a live lane (`a_shadow_lane_waives_nothing_else`).
+- **The plane has the last word.** A `ShadowOnly` admission on a `Live` lane is refused before `Authorized`, whatever the gate was told (`a_shadow_waiver_cannot_reach_a_live_lane`, with a gate that grants it wrongly).
+- **A shadow ticket closes as `TicketOutcome::ShadowDispatched { stage, at, in_time, waived }`** — a third variant, because it is neither a success (no P&L exists) nor a failure (nothing went wrong), and filing it as either would put every ticket the shadow run *took* into the failure counts and the miss ledger. It is not observed on chain, and its nonce is released: nothing consumed it. `RegistryMetrics::tickets_terminal_shadow` counts it, and the close path is now an exhaustive `match` so a fourth outcome is a compile error where the count is decided.
+
+**Criterion 1 is now measured by the running plane.** `Scheduler::u_capture` had a definition and no caller. The plane counts tickets at `Authorized` (the denominator — not at registry admission, or the figure would fall whenever the market went quiet) and dispatches accepted before the deadline (the numerator); `Plane::capture_assurance()` reports it. An authorized ticket refused at the last mile, or dispatched late, counts against it.
+
+**Ten mutations, one survived, and it was the familiar shape:** the gate waiving on a live lane too was covered by the plane's backstop, whose refusal message names the same clause — two guards covering for each other. The plane-level test now requires the *gate's* refusal text exactly, and gate-level lane tests pin each guard independently.
+
+**Open, and belongs to the shadow binary:** a shadow ticket that crashes between `Signed` and its close is handed over like any other (`may_be_on_chain`), and boot needs a `ChainOutcomeSource` that can say truthfully that nothing was sent. That is true of a shadow process only if its journal is its own, so the binary must keep the shadow journal separate from any live one.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 

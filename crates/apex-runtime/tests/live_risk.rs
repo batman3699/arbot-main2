@@ -10,7 +10,7 @@ mod support;
 use apex_econ::eligibility::{Clause, EligibilityPolicy};
 use apex_risk::breaker::CircuitBreaker;
 use apex_risk::posture::{PostureLadder, RiskTrigger};
-use apex_runtime::plane::{Decline, RiskGate};
+use apex_runtime::plane::{Admission, Decline, LaneKind, RiskGate};
 use apex_runtime::risk::{context_for, LiveRiskGate};
 use apex_types::candidate::Candidate;
 use apex_types::risk::RiskPosture;
@@ -85,7 +85,7 @@ fn good_sim(c: &Candidate) -> SimulationResult {
 #[test]
 fn a_healthy_system_admits_an_admissible_candidate() {
     let c = admissible();
-    assert!(healthy_gate().admit(&c, &good_sim(&c)).is_ok());
+    assert!(healthy_gate().admit(&c, &good_sim(&c), LaneKind::Live).is_ok());
 }
 
 /// **Posture answers first, and the reason names the posture rather than a
@@ -108,7 +108,7 @@ fn a_halted_posture_rejects_before_any_clause_is_evaluated() {
         CircuitBreaker::new(U256::from(u128::MAX), U256::from(u128::MAX), 100),
     );
     let c = admissible();
-    let err = gate.admit(&c, &good_sim(&c)).expect_err("a halted posture refuses");
+    let err = gate.admit(&c, &good_sim(&c), LaneKind::Live).expect_err("a halted posture refuses");
 
     let Decline::RiskRefused { rule } = err else { panic!("{err:?}") };
     assert!(rule.contains("posture"), "the reason names the posture: {rule}");
@@ -130,7 +130,7 @@ fn a_tripped_breaker_rejects_before_any_clause() {
 
     let gate = gate_with(PostureLadder::new(), breaker);
     let c = admissible();
-    let err = gate.admit(&c, &good_sim(&c)).expect_err("a tripped breaker refuses");
+    let err = gate.admit(&c, &good_sim(&c), LaneKind::Live).expect_err("a tripped breaker refuses");
 
     let Decline::RiskRefused { rule } = err else { panic!("{err:?}") };
     assert!(rule.contains("circuit breaker"), "{rule}");
@@ -196,7 +196,7 @@ fn every_clause_can_stop_a_candidate() {
 
     assert_eq!(cases.len(), 9, "one perturbation per clause");
     for (clause, c, sim) in cases {
-        let err = gate.admit(&c, &sim).expect_err("must be refused");
+        let err = gate.admit(&c, &sim, LaneKind::Live).expect_err("must be refused");
         let Decline::RiskRefused { rule } = err else { panic!("{clause:?}: {err:?}") };
         assert!(
             rule.contains(clause.label()),
@@ -237,7 +237,7 @@ fn borrowing_nothing_is_not_a_liquidity_failure() {
     c.flash_source = None;
     let ctx = context_for(&c, &good_sim(&c), NOW);
     assert!(ctx.flash_liquidity_available, "None means borrows nothing, not unavailable");
-    assert!(healthy_gate().admit(&c, &good_sim(&c)).is_ok());
+    assert!(healthy_gate().admit(&c, &good_sim(&c), LaneKind::Live).is_ok());
 }
 
 /// **INV-17.** An approximate route may rank and propose; it may not authorize.
@@ -248,13 +248,58 @@ fn only_a_proven_certificate_authorizes() {
         let mut c = admissible();
         c.certificate_status = status;
         assert!(
-            gate.admit(&c, &good_sim(&c)).is_err(),
+            gate.admit(&c, &good_sim(&c), LaneKind::Live).is_err(),
             "{status:?} must not authorize a live ticket"
         );
     }
     let mut proven = admissible();
     proven.certificate_status = CertificateStatus::Proven;
-    assert!(gate.admit(&proven, &good_sim(&proven)).is_ok());
+    assert!(gate.admit(&proven, &good_sim(&proven), LaneKind::Live).is_ok());
+}
+
+/// **The shadow waiver, at the gate.** On a shadow lane a heuristic route is
+/// admitted `ShadowOnly`, naming INV-17's clause; on a live lane the same route
+/// is refused by it. A proven route waives nothing on either lane.
+#[test]
+fn a_shadow_lane_waives_route_authorization_and_names_it() {
+    let gate = healthy_gate();
+    for status in [CertificateStatus::Heuristic, CertificateStatus::InvalidForCertification] {
+        let mut c = admissible();
+        c.certificate_status = status;
+        assert_eq!(
+            gate.admit(&c, &good_sim(&c), LaneKind::Shadow),
+            Ok(Admission::ShadowOnly { waived: vec![Clause::RouteAuthorizationValid] }),
+            "{status:?} on a shadow lane"
+        );
+    }
+    let proven = admissible();
+    assert_eq!(gate.admit(&proven, &good_sim(&proven), LaneKind::Shadow), Ok(Admission::Full));
+    assert_eq!(gate.admit(&proven, &good_sim(&proven), LaneKind::Live), Ok(Admission::Full));
+}
+
+/// **Nothing else is waivable.** Every other clause refuses on a shadow lane
+/// exactly as on a live one, with the route heuristic as well -- so a waived
+/// INV-17 cannot mask a second failure.
+#[test]
+fn a_shadow_lane_waives_nothing_else() {
+    let gate = healthy_gate();
+    let mut heuristic = admissible();
+    heuristic.certificate_status = CertificateStatus::Heuristic;
+    for (clause, mut c) in [
+        (Clause::ExpectedNetEvPositive, heuristic.clone()),
+        (Clause::ProbabilityOfProfit, heuristic.clone()),
+        (Clause::RobustnessMargin, heuristic.clone()),
+    ] {
+        match clause {
+            Clause::ExpectedNetEvPositive => c.robust_ev = 0,
+            Clause::ProbabilityOfProfit => c.probability_of_profit_ppm = 100_000,
+            Clause::RobustnessMargin => c.robustness_margin = 0.0,
+            _ => unreachable!(),
+        }
+        let err = gate.admit(&c, &good_sim(&c), LaneKind::Shadow).expect_err("must refuse");
+        let Decline::RiskRefused { rule } = err else { panic!("{err:?}") };
+        assert!(rule.starts_with(clause.label()), "{clause:?} refused as: {rule}");
+    }
 }
 
 /// **The tier read is the one that answered, not the one requested.**
@@ -271,7 +316,7 @@ fn the_tier_that_answered_is_what_the_clause_reads() {
     let mut sim = good_sim(&c);
     sim.tier = SimulationTier::Tier0Analytic;
 
-    let err = healthy_gate().admit(&c, &sim).expect_err("Tier 0 is below the policy floor");
+    let err = healthy_gate().admit(&c, &sim, LaneKind::Live).expect_err("Tier 0 is below the policy floor");
     let Decline::RiskRefused { rule } = err else { panic!("{err:?}") };
     assert!(rule.contains(Clause::SimulationFidelity.label()), "{rule}");
 }
@@ -292,7 +337,7 @@ fn a_canary_does_not_outrank_a_full_evm_run() {
         Box::new(apex_capture::ManualClock::at(NOW.0)),
     );
     assert!(
-        strict.admit(&c, &canary).is_err(),
+        strict.admit(&c, &canary, LaneKind::Live).is_err(),
         "a canary must not satisfy a policy that wanted Tier 3"
     );
 }
@@ -307,7 +352,7 @@ fn an_absent_cost_estimate_is_not_a_confident_one() {
     c.total_execution_cost.gas_used_distribution.p50 = apex_types::cost::GasUsed(0);
     let ctx = context_for(&c, &good_sim(&c), NOW);
     assert_eq!(ctx.cost_confidence_bps, u32::MAX, "absent, so it fails at every policy");
-    assert!(healthy_gate().admit(&c, &good_sim(&c)).is_err());
+    assert!(healthy_gate().admit(&c, &good_sim(&c), LaneKind::Live).is_err());
 }
 
 /// **`Pr(Π > 0)` is not `P(lands)`, and the gate reads the right one.**
@@ -327,7 +372,7 @@ fn a_route_that_always_lands_and_usually_loses_is_refused() {
     let ctx = context_for(&c, &good_sim(&c), NOW);
     assert_eq!(ctx.probability_of_profit_ppm, 100_000, "the clause reads Pr(profit)");
 
-    let err = healthy_gate().admit(&c, &good_sim(&c)).expect_err("0.1 is below p_min");
+    let err = healthy_gate().admit(&c, &good_sim(&c), LaneKind::Live).expect_err("0.1 is below p_min");
     let Decline::RiskRefused { rule } = err else { panic!("{err:?}") };
     assert!(rule.contains(Clause::ProbabilityOfProfit.label()), "{rule}");
 
@@ -338,7 +383,7 @@ fn a_route_that_always_lands_and_usually_loses_is_refused() {
     rare.capture_probability = 0.05;
     rare.probability_of_profit_ppm = 900_000;
     assert!(
-        healthy_gate().admit(&rare, &good_sim(&rare)).is_ok(),
+        healthy_gate().admit(&rare, &good_sim(&rare), LaneKind::Live).is_ok(),
         "a low landing rate is not a §2.1 failure"
     );
 }
@@ -361,7 +406,7 @@ fn an_unrepaid_loan_or_a_broken_invariant_is_not_a_healthy_path() {
     ] {
         let mut sim = good_sim(&c);
         mutate(&mut sim);
-        let err = gate.admit(&c, &sim).expect_err("must be refused");
+        let err = gate.admit(&c, &sim, LaneKind::Live).expect_err("must be refused");
         let Decline::RiskRefused { rule } = err else { panic!("{name}: {err:?}") };
         assert!(
             rule.contains(Clause::ExecutionPathHealthy.label()),
@@ -381,7 +426,7 @@ fn the_gate_does_not_record_what_it_sees() {
 
     // Admit the same candidate repeatedly; nothing accumulates, so nothing trips.
     for _ in 0..50 {
-        assert!(gate.admit(&c, &good_sim(&c)).is_ok());
+        assert!(gate.admit(&c, &good_sim(&c), LaneKind::Live).is_ok());
     }
     assert_eq!(gate.posture(), RiskPosture::Normal, "a read path changed no state");
 
@@ -389,7 +434,7 @@ fn the_gate_does_not_record_what_it_sees() {
     // clause is an economic answer, not a risk trigger.
     let mut poor = c.clone();
     poor.robust_ev = 0;
-    assert!(gate.admit(&poor, &good_sim(&poor)).is_err());
+    assert!(gate.admit(&poor, &good_sim(&poor), LaneKind::Live).is_err());
     assert_eq!(gate.posture(), RiskPosture::Normal);
 }
 
@@ -416,7 +461,7 @@ fn a_tier_zero_answer_cannot_authorize_a_live_ticket() {
     // Even with everything else looking healthy.
     assert!(tier0.success && tier0.loan_repaid && tier0.profit_invariant_held);
 
-    let err = gate.admit(&c, &tier0).expect_err("Tier 0 may escalate; it may not authorize");
+    let err = gate.admit(&c, &tier0, LaneKind::Live).expect_err("Tier 0 may escalate; it may not authorize");
     let Decline::RiskRefused { rule } = err else { panic!("{err:?}") };
     assert!(
         rule.contains(Clause::SimulationFidelity.label()),

@@ -67,6 +67,10 @@ pub struct RegistryMetrics {
     pub tickets_admitted: u64,
     pub tickets_terminal_success: u64,
     pub tickets_terminal_failure: u64,
+    /// Closed as `TicketOutcome::ShadowDispatched`: taken as far as a shadow
+    /// plane can take anything. Its own count, because it is neither of the two
+    /// above.
+    pub tickets_terminal_shadow: u64,
     pub tickets_live: u64,
     /// Closed by a guard going out of scope. Not a loss -- the outcome is
     /// recorded -- but every one of these is a code path that let go of a
@@ -92,6 +96,7 @@ impl RegistryMetrics {
         self.tickets_admitted as i64
             - self.tickets_terminal_success as i64
             - self.tickets_terminal_failure as i64
+            - self.tickets_terminal_shadow as i64
             - self.tickets_live as i64
     }
 }
@@ -318,10 +323,13 @@ impl TicketRegistry {
 
         inner.live.remove(&id);
         inner.metrics.tickets_live = inner.metrics.tickets_live.saturating_sub(1);
-        if outcome.is_success() {
-            inner.metrics.tickets_terminal_success += 1;
-        } else {
-            inner.metrics.tickets_terminal_failure += 1;
+        // Exhaustive, so a fourth outcome is a compile error here -- the one
+        // place that has to decide which count it belongs to. An `if
+        // is_success() else` put the shadow variant under failures silently.
+        match &outcome {
+            TicketOutcome::Success { .. } => inner.metrics.tickets_terminal_success += 1,
+            TicketOutcome::ExplicitFailure { .. } => inner.metrics.tickets_terminal_failure += 1,
+            TicketOutcome::ShadowDispatched { .. } => inner.metrics.tickets_terminal_shadow += 1,
         }
         match by {
             Closer::Explicit => {}

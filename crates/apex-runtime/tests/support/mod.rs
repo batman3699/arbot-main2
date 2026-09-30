@@ -366,8 +366,13 @@ impl Simulator for ParkingSimulator {
 pub struct AlwaysAdmits;
 
 impl RiskGate for AlwaysAdmits {
-    fn admit(&self, _c: &Candidate, _sim: &SimulationResult) -> Result<(), Decline> {
-        Ok(())
+    fn admit(
+        &self,
+        _c: &Candidate,
+        _sim: &SimulationResult,
+        _lane: apex_runtime::plane::LaneKind,
+    ) -> Result<apex_runtime::plane::Admission, Decline> {
+        Ok(apex_runtime::plane::Admission::Full)
     }
 }
 

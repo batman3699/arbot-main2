@@ -127,6 +127,23 @@ pub enum TicketOutcome {
         state: Box<StateFingerprint>,
         cause: String,
     },
+    /// §16.1: every step up to dispatch ran for real — reservation, simulation,
+    /// the risk gate, last-mile revalidation, the signature — and the dispatcher
+    /// was the null one. **Nothing was sent, by design.**
+    ///
+    /// Neither a success nor a failure, and that is why it is a third variant
+    /// rather than a code under either. A `Success` needs a realized P&L and a
+    /// shadow ticket has none; filing it as a failure would put every ticket a
+    /// shadow run *took* into the failure counts and the miss ledger — the
+    /// dataset that decides where engineering effort goes.
+    ///
+    /// `in_time` is whether it reached the dispatcher before its dispatch
+    /// deadline: the numerator of `SYSTEM_CAPTURE_ASSURANCE`. `waived` names the
+    /// risk-gate clauses a shadow plane waived to get here — today only INV-17's
+    /// route authorization, because every route is `Heuristic` until Phase 12 —
+    /// so shadow evidence can never be mistaken for evidence of a trade the live
+    /// gate would have authorized.
+    ShadowDispatched { stage: TicketStatus, at: UnixNanos, in_time: bool, waived: Vec<String> },
 }
 
 impl TicketOutcome {
