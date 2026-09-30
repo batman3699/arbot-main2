@@ -5792,6 +5792,21 @@ forge script script/DeployAndConfigure.s.sol:DeployAndConfigure \
 
 After it lands, in one change: `ops/inputs.yaml`'s Base `executor_address` and `batch_router_address`, and `docs/apex/DEPLOYED.md`, which says the deployed executor predates Phase 5 and stops being true at that moment.
 
+#### What starting the run still takes — the remaining build, in order
+
+Measured against the code on 2026-09-30, not estimated from the port table. **`main.rs` never builds a `Plane`**, and no production implementation exists for `TemplatePricer`, `RouteCurves`, the live feed, pool state, the frontier, the call builder, the simulator, the live reader or the capacity model. Each item below is its own commit.
+
+- [ ] **R1 — websocket feed** (`apex-chain::rpc::ws`). BlockPI's Base websocket was probed 2026-09-30: `newHeads` (2 s), confirmed `logs`, and **`pendingLogs`** — preconfirmed logs at flashblock latency, arriving ahead of and outnumbering confirmed ones. publicnode no longer delivers `pendingLogs`. Subscriptions are reads; the allowlist principle carries over.
+- [ ] **R2 — pool book.** The event census's universe, which is the one with evidence behind it: pairs carrying ≥ 2 pools at ≤ 500 ppm and ≥ $100k depth, Uniswap v3 and Slipstream. `ClPoolState` plus a bounded `TickLadder` per pool, loaded at a pinned block, held in `apex_state::Versioned` (INV-11).
+- [ ] **R3 — feed → state → events.** `Swap` carries the post-swap `sqrtPriceX96`, `liquidity` and `tick`, so a swap updates a pool exactly; `Mint`/`Burn` reload its ladder. Swaps ≥ $7,500 (measured) become `PendingSwap` events on the fast lane.
+- [ ] **R4 — local pricer.** A `SizedRoute` over `quote_exact_input_multi_tick` for each hop, serving both `TemplatePricer` (Engine C) and `RouteCurves` (`LiveEconomics`). **Multi-tick, with the ladder's bounds honoured**: an exhausted ladder is a refusal, never a quote at the last known liquidity — the constant-liquidity error behind the legacy fast path's ~140 bps.
+- [ ] **R5 — capacity model.** `MeasuredCapacityModel` from observed flashblocks. Observed cumulative gas **used** is a lower bound on the cumulative **budget**, so a model built from it errs conservative, which is the permitted direction (§22.2 forbids the fixed one-tenth rule).
+- [ ] **R6 — call builder.** `UNIV3` op for Uniswap v3 hops, `GENERIC` via adapter 1 (`exactInputSingle`) for Slipstream, a Balancer vault flash loan. A route through anything else is refused as `VenueDisabled`.
+- [ ] **R7 — Tier 2 simulator.** `eth_simulateV1`, block pinned, as the assigned lane, against the deployed Phase 5 executor. Until the deploy lands every simulation fails, and each is filed as `SIM_FAIL` rather than hidden.
+- [ ] **R8 — live reader.** Executor code, base fee, fee ceiling, block gas, signer balance, flash availability, pending nonce.
+- [ ] **R9 — `apex shadow`.** Assembly over `DispatchLane::Shadow`, its own journal (so recovery can truthfully say nothing was sent), a periodic capture-assurance and funnel report, supervised restarts.
+- [ ] **R10 — start the run**, and check it is producing events, proposals and declines before leaving it.
+
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
 I had this task down as "`Simulator` over `apex-sim::tier0`", on the reasoning that §20 lets a lower tier only *reject* and therefore makes Tier 0 the honest shadow simulator. **The reasoning was right and the conclusion was wrong.**
