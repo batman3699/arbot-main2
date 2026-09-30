@@ -314,6 +314,17 @@ impl LiveEconomics {
         }
     }
 
+    /// Everything a route of `hops` hops costs, in wei: the figure `assemble`
+    /// subtracts from the gross.
+    ///
+    /// Exposed so a pricer's `SizedRoute::fixed_cost` is **the same number**. A
+    /// search that sized routes against one cost while the economics charged
+    /// another would propose routes the economics then refuses, and miss ones it
+    /// would have taken.
+    pub fn route_cost_wei(&self, hops: usize) -> u128 {
+        u128::try_from(cost_i128(&self.total_cost(calldata_for_hops(hops)))).unwrap_or(u128::MAX)
+    }
+
     /// The Fjord fee, with its provenance attached.
     ///
     /// `CompressedSize::Estimated` rather than `Measured`: the real fastlz size
@@ -491,9 +502,13 @@ fn surplus_to_i128(s: Surplus) -> i128 {
 /// compares candidates with. `CompressedSize::Estimated` is what carries that
 /// distinction into the fee.
 fn calldata_estimate(p: &RouteProposal) -> u32 {
+    calldata_for_hops(p.route.hops.len())
+}
+
+fn calldata_for_hops(hops: usize) -> u32 {
     const PER_HOP_BYTES: u32 = 196;
     const OVERHEAD_BYTES: u32 = 132;
-    OVERHEAD_BYTES.saturating_add(PER_HOP_BYTES.saturating_mul(
-        u32::try_from(p.route.hops.len()).unwrap_or(u32::MAX),
-    ))
+    OVERHEAD_BYTES.saturating_add(
+        PER_HOP_BYTES.saturating_mul(u32::try_from(hops).unwrap_or(u32::MAX)),
+    )
 }

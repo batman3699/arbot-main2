@@ -265,6 +265,20 @@ impl PoolBook {
         Ok((pools, refused))
     }
 
+    /// A book over snapshots the caller already holds — a replay, a test.
+    ///
+    /// The caller states the provenance, because `Versioned` requires it and
+    /// defaulting either way is wrong: `Verified` would authorize on state nobody
+    /// read from the chain, and `Unsafe` would make the safe path the one taken by
+    /// forgetting.
+    pub fn from_snapshots(
+        snapshots: impl IntoIterator<Item = PoolSnapshot>,
+        provenance: ReconstructionStatus,
+    ) -> Self {
+        let pools = snapshots.into_iter().map(|p| (p.spec.pool, Arc::new(p))).collect();
+        Self { pools: Versioned::new(pools, provenance), writer: Mutex::new(()) }
+    }
+
     /// One consistent view of every pool. Wait-free.
     pub fn snapshot(&self) -> Arc<BTreeMap<Address, Arc<PoolSnapshot>>> {
         Arc::clone(&self.pools.load().value)
