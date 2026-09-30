@@ -59,6 +59,7 @@
 //! its default `Display` embeds the full request URL, key included.
 
 pub mod failover;
+pub mod ws;
 
 pub use failover::{ConnectError, FailoverSettings, FailoverTransport};
 

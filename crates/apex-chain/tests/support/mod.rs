@@ -18,6 +18,8 @@
 
 #![allow(dead_code)]
 
+pub mod ws;
+
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

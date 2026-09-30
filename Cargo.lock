@@ -220,12 +220,14 @@ dependencies = [
  "apex-state",
  "apex-types",
  "async-trait",
+ "futures-util",
  "proptest",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 
