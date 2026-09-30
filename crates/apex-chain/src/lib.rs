@@ -9,6 +9,7 @@
 pub mod adapter;
 pub mod base;
 pub mod regime;
+pub mod rpc;
 
 pub use adapter::{
     Ack, AdapterError, AdapterResult, ChainExecutionAdapter, PendingState, RejectReason,

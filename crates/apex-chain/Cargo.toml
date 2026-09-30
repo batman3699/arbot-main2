@@ -7,11 +7,26 @@ description = "ChainExecutionAdapter: per-chain execution behaviour, not per-cha
 [dependencies]
 apex-types = { path = "../apex-types" }
 apex-state = { path = "../apex-state" }
+# `Secret`, for the endpoint URLs: the provider key is in the path (INV-46).
+apex-config = { path = "../apex-config" }
+# `quote_common::is_execution_revert`, the single classifier for "the chain said
+# no". A second copy here would be the second place a new node error string has
+# to be added, and the first place it would be forgotten.
+apex-math = { path = "../apex-math" }
 alloy-primitives = { version = "0.8", features = ["serde"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tracing = "0.1"
+tokio = { version = "1", features = ["time"] }
+# The legacy failover's transport, minus `blocking`. rustls rather than native
+# TLS so the binary does not depend on the host's OpenSSL.
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 proptest = "1"
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt"] }
+# `net` and `io-util` are for `tests/support`'s scripted node, which answers on a
+# real local socket so the transport under test is the one that ships.
+tokio = { version = "1", features = ["macros", "rt", "net", "io-util", "time", "sync"] }
