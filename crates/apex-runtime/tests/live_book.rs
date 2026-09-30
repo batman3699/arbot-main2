@@ -9,7 +9,7 @@
 use alloy_primitives::{address, hex, keccak256, Address, U256};
 use apex_chain::rpc::{RpcError, RpcTransport};
 use apex_runtime::live::abi::{self, selector, MULTICALL3};
-use apex_runtime::live::book::{PoolBook, ReloadError, SwapApplied, Unloadable};
+use apex_runtime::live::book::{DynamicFee, PoolBook, ReloadError, SwapApplied, Unloadable};
 use apex_runtime::live::inventory::{self, PoolSpec, UniverseFilter, Venue};
 use apex_runtime::live::reads::ChainReads;
 use apex_types::state::ReconstructionStatus;
@@ -47,6 +47,13 @@ fn every_selector_is_its_signatures_hash() {
         (selector::BALANCE_OF, "balanceOf(address)"),
         (selector::TICK_BITMAP, "tickBitmap(int16)"),
         (selector::TICKS, "ticks(int24)"),
+        (selector::OBSERVE, "observe(uint32[])"),
+        (selector::SWAP_FEE_MODULE, "swapFeeModule()"),
+        (selector::TICK_SPACING_TO_FEE, "tickSpacingToFee(int24)"),
+        (selector::DYNAMIC_FEE_CONFIG, "dynamicFeeConfig(address)"),
+        (selector::DEFAULT_SCALING_FACTOR, "defaultScalingFactor()"),
+        (selector::DEFAULT_FEE_CAP, "defaultFeeCap()"),
+        (selector::SECONDS_AGO, "secondsAgo()"),
     ] {
         assert_eq!(sel, keccak256(sig.as_bytes())[..4], "{sig}");
     }
@@ -260,7 +267,10 @@ const SPACING: i64 = 10;
 
 /// A healthy WETH/USDC pool, with two initialized ticks either side of the price.
 fn healthy(node: &Scripted, factory: Address) {
-    let p = WETH_USDC;
+    healthy_at(node, WETH_USDC, factory);
+}
+
+fn healthy_at(node: &Scripted, p: Address, factory: Address) {
     node.set(p, abi::call0(selector::TOKEN0), wa(WETH));
     node.set(p, abi::call0(selector::TOKEN1), wa(USDC));
     node.set(p, abi::call0(selector::FACTORY), wa(factory));
@@ -509,4 +519,164 @@ async fn a_reload_older_than_the_books_newest_read_is_refused() {
         ReloadError::Older { block: 125, newest: 130 }
     );
     assert_eq!(book.get(WETH_USDC).unwrap().block, 130, "the newer read stands");
+}
+
+// ------------------------------------------------------------------ Slipstream's fee
+
+const SLIP: Address = address!("b2cc224c1c9feE385f8ad6a55b4d94E92359DC59");
+const MODULE: Address = address!("090b2A6bb475c00e2256e2095A60887cD710803b");
+
+fn slip_spec() -> PoolSpec {
+    PoolSpec { pool: SLIP, venue: Venue::Slipstream, ..spec() }
+}
+
+fn observe_answer(c0: i64, c1: i64) -> Vec<u8> {
+    let word = |v: i128| {
+        let mut w = if v < 0 { [0xffu8; 32] } else { [0u8; 32] };
+        w[16..].copy_from_slice(&v.to_be_bytes());
+        w.to_vec()
+    };
+    [0x40, 0xa0, 2, i128::from(c0), i128::from(c1), 2, 0, 0].into_iter().flat_map(word).collect()
+}
+
+/// Cumulatives whose TWAP over 600 s is `twap`.
+fn twap_answer(twap: i64) -> Vec<u8> {
+    observe_answer(0, twap * 600)
+}
+
+/// A healthy Slipstream pool: the Uniswap shape under Slipstream's factory, an
+/// oracle with `cardinality` observations, and the fee module's answers for
+/// WETH/USDC CL100's regime with the TWAP 11 ticks above the price.
+fn slipstream(node: &Scripted, cardinality: u64) {
+    let factory = Venue::Slipstream.factory();
+    healthy_at(node, SLIP, factory);
+    let mut slot0 = w(U256::from(4_109_375_649_317_904_751_454_295u128));
+    slot0.extend(wi(TICK));
+    for v in [0u64, cardinality, cardinality, 1] {
+        slot0.extend(w(U256::from(v)));
+    }
+    node.set(SLIP, abi::call0(selector::SLOT0), slot0);
+    node.set(factory, abi::call0(selector::SWAP_FEE_MODULE), wa(MODULE));
+    node.set(MODULE, abi::call0(selector::DEFAULT_SCALING_FACTOR), w(U256::ZERO));
+    node.set(MODULE, abi::call0(selector::DEFAULT_FEE_CAP), w(U256::from(30_000)));
+    node.set(MODULE, abi::call0(selector::SECONDS_AGO), w(U256::from(600)));
+    let mut cfg = Vec::new();
+    for v in [535u64, 2_000, 14_900_000, 1, 150] {
+        cfg.extend(w(U256::from(v)));
+    }
+    node.set(MODULE, abi::call_address(selector::DYNAMIC_FEE_CONFIG, SLIP), cfg);
+    node.set(factory, abi::call_signed(selector::TICK_SPACING_TO_FEE, SPACING), w(U256::from(500)));
+    node.set(SLIP, abi::call_observe(600), twap_answer(TICK + 11));
+}
+
+/// **A Slipstream pool loads with its fee regime**, read from its factory's
+/// module at the load block, and its fee is the one its tick implies — not the
+/// `fee()` it answered, which in a block with no swap yet is the initial fee.
+#[tokio::test]
+async fn a_slipstream_pool_loads_with_its_fee_regime() {
+    let node = Arc::new(Scripted::default());
+    slipstream(&node, 1_000);
+    let (book, refused) = PoolBook::load(&ChainReads::new(node), &[slip_spec()], 100).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    let p = book.get(SLIP).unwrap();
+    let d = p.dynamic_fee.expect("a Slipstream pool has one");
+    assert_eq!(d, DynamicFee { base: 535, cap: 2_000, scaling: 14_900_000, initial: Some(150), seconds_ago: 600, twap_tick: Some(TICK as i32 + 11) });
+    assert_eq!(p.state.fee_ppm, 698, "535 + 11 × 14.9, not the 500 `fee()` answered");
+}
+
+/// A pool with fewer observations than the window needs — half of it, since
+/// Base writes one every two seconds — gets no dynamic fee, as the module gives
+/// it none: it is priced at its base. Exactly half is enough.
+#[tokio::test]
+async fn too_few_observations_is_no_dynamic_fee() {
+    for (cardinality, twap, fee) in [(299, None, 535), (300, Some(TICK as i32 + 11), 698)] {
+        let node = Arc::new(Scripted::default());
+        slipstream(&node, cardinality);
+        let (book, _) = PoolBook::load(&ChainReads::new(node), &[slip_spec()], 100).await.unwrap();
+        let p = book.get(SLIP).unwrap();
+        assert_eq!((p.dynamic_fee.unwrap().twap_tick, p.state.fee_ppm), (twap, fee), "{cardinality}");
+    }
+}
+
+/// A Slipstream pool whose regime cannot be read is refused, and says which
+/// read: priced at a fee nobody read, it would be wrong by up to its cap.
+#[tokio::test]
+async fn a_slipstream_pool_without_a_readable_fee_is_refused() {
+    let node = Arc::new(Scripted::default());
+    slipstream(&node, 1_000);
+    node.answers.lock().unwrap().remove(&(MODULE, abi::call_address(selector::DYNAMIC_FEE_CONFIG, SLIP)));
+    let (book, refused) = PoolBook::load(&ChainReads::new(node), &[slip_spec()], 100).await.unwrap();
+    assert!(book.get(SLIP).is_none());
+    assert_eq!(refused[0].why, Unloadable::FeeUnreadable { read: "dynamicFeeConfig" });
+}
+
+/// **The fee follows the TWAP between swaps**, and the version moves with it.
+/// A TWAP the pool can no longer serve leaves it without one — the module's own
+/// answer to a reverting `observe` — and a Uniswap pool is not asked.
+#[tokio::test]
+async fn the_fee_follows_the_twap_between_swaps() {
+    let node = Arc::new(Scripted::default());
+    slipstream(&node, 1_000);
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[slip_spec(), spec()], 100).await.unwrap();
+    let before = book.versions_for(&[SLIP]);
+
+    // The TWAP catches up by four ticks: 7 × 14.9.
+    node.set(SLIP, abi::call_observe(600), twap_answer(TICK + 7));
+    assert_eq!(book.refresh_twaps(&reads, 101).await.unwrap(), 1);
+    assert_eq!(book.get(SLIP).unwrap().state.fee_ppm, 639);
+    assert_ne!(book.versions_for(&[SLIP]), before);
+
+    // Unchanged: nothing written.
+    let now = book.versions_for(&[SLIP]);
+    assert_eq!(book.refresh_twaps(&reads, 102).await.unwrap(), 0);
+    assert_eq!(book.versions_for(&[SLIP]), now);
+
+    // Pinned at the cap, a TWAP that moves moves no fee: stored, not counted.
+    book.apply_swap(SLIP, U256::from(4_100_000_000_000_000_000_000_000u128), 7, TICK as i32 - 200, (104, 0));
+    assert_eq!(book.get(SLIP).unwrap().state.fee_ppm, 2_000);
+    node.set(SLIP, abi::call_observe(600), twap_answer(TICK + 9));
+    let at_cap = book.versions_for(&[SLIP]);
+    assert_eq!(book.refresh_twaps(&reads, 105).await.unwrap(), 0, "the fee did not change");
+    assert_eq!(book.get(SLIP).unwrap().dynamic_fee.unwrap().twap_tick, Some(TICK as i32 + 9));
+    assert_ne!(book.versions_for(&[SLIP]), at_cap, "but the pool did");
+
+    node.answers.lock().unwrap().remove(&(SLIP, abi::call_observe(600)));
+    assert_eq!(book.refresh_twaps(&reads, 106).await.unwrap(), 1);
+    let p = book.get(SLIP).unwrap();
+    assert_eq!((p.dynamic_fee.unwrap().twap_tick, p.state.fee_ppm), (None, 535));
+    assert_eq!(book.get(WETH_USDC).unwrap().state.fee_ppm, 500, "a fixed fee is not refreshed");
+}
+
+/// A reload that keeps a newer swap's price states the fee at the **kept**
+/// tick, under the fresh regime.
+#[tokio::test]
+async fn a_reload_that_keeps_a_swap_prices_the_fee_at_the_kept_tick() {
+    let node = Arc::new(Scripted::default());
+    slipstream(&node, 1_000);
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[slip_spec()], 100).await.unwrap();
+    let price = U256::from(4_100_000_000_000_000_000_000_000u128);
+    // Preconfirmed, in block 121: 30 ticks below the TWAP.
+    book.apply_swap(SLIP, price, 7, TICK as i32 - 19, (121, 3));
+    assert_eq!(book.get(SLIP).unwrap().state.fee_ppm, 535 + 30 * 149 / 10);
+    book.reload(&reads, &[SLIP], 120).await.unwrap();
+    let p = book.get(SLIP).unwrap();
+    assert_eq!(p.state.tick, TICK as i32 - 19, "the swap is kept");
+    assert_eq!(p.state.fee_ppm, 535 + 30 * 149 / 10, "and its fee with it");
+}
+
+/// A plain reload states the fee from the fresh regime at the fresh tick —
+/// never the `fee()` the pool answered, which a block with no swap yet serves
+/// as the initial fee.
+#[tokio::test]
+async fn a_reload_states_the_fee_from_the_fresh_regime() {
+    let node = Arc::new(Scripted::default());
+    slipstream(&node, 1_000);
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[slip_spec()], 100).await.unwrap();
+    node.set(SLIP, abi::call_observe(600), twap_answer(TICK + 5));
+    book.reload(&reads, &[SLIP], 120).await.unwrap();
+    assert_eq!(book.get(SLIP).unwrap().state.fee_ppm, 535 + 5 * 149 / 10, "not the 500 `fee()` answered");
 }

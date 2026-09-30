@@ -41,6 +41,20 @@ pub mod selector {
     pub const TICK_BITMAP: [u8; 4] = [0x53, 0x39, 0xc2, 0x96];
     /// `ticks(int24)`
     pub const TICKS: [u8; 4] = [0xf3, 0x0d, 0xba, 0x93];
+    /// `observe(uint32[])` — a pool's oracle: tick cumulatives at each age.
+    pub const OBSERVE: [u8; 4] = [0x88, 0x3b, 0xdb, 0xfd];
+    /// `swapFeeModule()` — the Slipstream factory's fee module.
+    pub const SWAP_FEE_MODULE: [u8; 4] = [0x23, 0xc4, 0x3a, 0x51];
+    /// `tickSpacingToFee(int24)` — the Slipstream factory's default per spacing.
+    pub const TICK_SPACING_TO_FEE: [u8; 4] = [0x38, 0x0d, 0xc1, 0xc2];
+    /// `dynamicFeeConfig(address)` — the fee module's per-pool configuration.
+    pub const DYNAMIC_FEE_CONFIG: [u8; 4] = [0x5b, 0xb5, 0x25, 0xff];
+    /// `defaultScalingFactor()`
+    pub const DEFAULT_SCALING_FACTOR: [u8; 4] = [0xba, 0x74, 0x3e, 0x38];
+    /// `defaultFeeCap()`
+    pub const DEFAULT_FEE_CAP: [u8; 4] = [0xdc, 0xf4, 0xeb, 0x27];
+    /// `secondsAgo()` — the module's TWAP window.
+    pub const SECONDS_AGO: [u8; 4] = [0x63, 0x3d, 0xd1, 0x45];
 }
 
 const WORD: usize = 32;
@@ -67,6 +81,32 @@ pub fn call_signed(sel: [u8; 4], v: i64) -> Vec<u8> {
     out.extend_from_slice(&[fill; 24]);
     out.extend_from_slice(&v.to_be_bytes());
     out
+}
+
+/// `observe([seconds_ago, 0])`: a dynamic `uint32[]` of two, so an offset, a
+/// length and the two ages.
+pub fn call_observe(seconds_ago: u32) -> Vec<u8> {
+    let mut out = selector::OBSERVE.to_vec();
+    push_usize(&mut out, WORD);
+    push_usize(&mut out, 2);
+    push_usize(&mut out, seconds_ago as usize);
+    push_usize(&mut out, 0);
+    out
+}
+
+/// The time-weighted tick over the last `seconds_ago` from `observe([seconds_ago,
+/// 0])`'s answer, computed as Slipstream's fee module computes it:
+/// `int24((cumulatives[1] − cumulatives[0]) / secondsAgo)`, the division
+/// truncating toward zero as Solidity's signed division does. `None` for an
+/// answer that is not two `int56` cumulatives, or a zero window.
+pub fn decode_twap(data: &[u8], seconds_ago: u32) -> Option<i32> {
+    let off = usize_at(data, 0)?;
+    if off % WORD != 0 || seconds_ago == 0 || usize_at(data, off)? != 2 {
+        return None;
+    }
+    let first = off / WORD + 1;
+    let (c0, c1) = (word_int(data, first, 56)?, word_int(data, first + 1, 56)?);
+    i32::try_from((c1 - c0) / i128::from(seconds_ago)).ok().filter(|t| (-(1 << 23)..(1 << 23)).contains(t))
 }
 
 /// `Multicall3.aggregate3(calls)`, every call with `allowFailure = true`.

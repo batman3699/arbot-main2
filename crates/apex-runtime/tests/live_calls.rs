@@ -57,6 +57,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, spacing: i32) -> P
         code_hash: B256::ZERO,
         block: 100,
         last_log: None,
+        dynamic_fee: None,
         seq: 0,
     }
 }

@@ -29,6 +29,19 @@
 //! pricing at the last known liquidity, which is the constant-liquidity error
 //! behind the legacy fast path's ~140 bps.
 //!
+//! # A Slipstream fee is a function of the pool, not a number read once
+//!
+//! Aerodrome Slipstream takes its swap fee from the factory's fee module, and
+//! the module's fee moves: `min(cap, base + |tick − TWAP| × K / 10⁶)` over a
+//! ten-minute TWAP, except that the **first** swap on a pool in a block pays the
+//! module's initial fee (150 ppm against a ~600–900 ppm dynamic fee on WETH/USDC,
+//! measured 2026-10-01). A trigger swap moves the tick off the TWAP and raises
+//! the fee for everything after it in the block, so a fee read at load is wrong
+//! exactly when it matters. The book holds each Slipstream pool's
+//! [`DynamicFee`] and recomputes the fee **from the tick** on every write, and
+//! [`PoolBook::refresh_twaps`] follows the TWAP between swaps. Pricing uses the
+//! after-first fee: ordering within a block is not ours to choose.
+//!
 //! Balances are **not** advanced by swap deltas. A swap seen first preconfirmed
 //! and then confirmed would be counted twice, so balances stay as of the last
 //! full read. They bound how much a pool can pay out, and our trade sizes are a
@@ -68,6 +81,10 @@ pub struct PoolSnapshot {
     pub block: u64,
     /// The last log applied, so an older one is refused.
     pub last_log: Option<LogPosition>,
+    /// Slipstream's fee regime; `None` for a pool with a fixed fee. While set,
+    /// `state.fee_ppm` is its after-first fee at `state.tick`, maintained by
+    /// the book.
+    pub dynamic_fee: Option<DynamicFee>,
     /// The book's write sequence at this pool's last change. **Assigned by the
     /// book** — whatever a caller sets is replaced when the snapshot enters one —
     /// from a counter every write advances, so it moves on every change to this
@@ -81,6 +98,57 @@ impl PoolSnapshot {
     /// it is reloaded.
     pub fn ladder_covers_price(&self) -> bool {
         self.ladder.covers(self.state.tick)
+    }
+
+    /// Set the fee from the tick, for a pool whose fee is a function of it.
+    fn fee_from_tick(&mut self) {
+        if let Some(d) = self.dynamic_fee {
+            self.state.fee_ppm = d.after_first(self.state.tick);
+        }
+    }
+}
+
+/// A Slipstream pool's fee regime, as its factory's `DynamicSwapFeeModule`
+/// computes it (`aerodrome-finance/slipstream`,
+/// `contracts/core/fees/DynamicSwapFeeModule.sol`). Checked against `fee()` on
+/// eleven Base blocks, 2026-10-01, every one exact.
+///
+/// The module's per-origin discount is left out: it is keyed on `tx.origin`,
+/// and no address of ours is registered for one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DynamicFee {
+    /// The pool's base fee, or the factory's for its tick spacing when unset.
+    pub base: u32,
+    /// The pool's cap, or the module's default when the pool has no scaling.
+    pub cap: u32,
+    /// `K`: fee per tick of |tick − TWAP|, scaled by 10⁶.
+    pub scaling: u64,
+    /// What the first swap on the pool in a block pays, when enabled.
+    pub initial: Option<u32>,
+    /// The TWAP's window.
+    pub seconds_ago: u32,
+    /// The pool's time-weighted tick over `seconds_ago`, as last read. `None`
+    /// where the module adds nothing: too few observations, or `observe`
+    /// reverted.
+    pub twap_tick: Option<i32>,
+}
+
+impl DynamicFee {
+    /// The fee on a pool configured to charge nothing (`ZERO_FEE_INDICATOR`).
+    pub const FREE: Self = Self { base: 0, cap: 0, scaling: 0, initial: None, seconds_ago: 0, twap_tick: None };
+
+    /// What a swap pays once the block's first swap on the pool has written its
+    /// observation — what the book prices by.
+    pub fn after_first(&self, tick: i32) -> u32 {
+        let dynamic = self.twap_tick.map_or(0u128, |t| {
+            u128::from((i64::from(tick) - i64::from(t)).unsigned_abs()) * u128::from(self.scaling) / 1_000_000
+        });
+        u32::try_from((u128::from(self.base) + dynamic).min(u128::from(self.cap))).unwrap_or(u32::MAX)
+    }
+
+    /// What the first swap on the pool in a block pays.
+    pub fn first_in_block(&self, tick: i32) -> u32 {
+        self.initial.unwrap_or_else(|| self.after_first(tick))
     }
 }
 
@@ -103,6 +171,9 @@ pub enum Unloadable {
     NoLiquidity,
     /// The tick ladder could not be read.
     LadderUnreadable { detail: String },
+    /// A Slipstream pool's fee regime could not be read: which read failed. A
+    /// pool priced at a fee nobody read is priced wrong by up to its cap.
+    FeeUnreadable { read: &'static str },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -240,6 +311,144 @@ fn decode_state(
     Ok((state, factory, (d0 as u8, d1 as u8)))
 }
 
+/// `ZERO_FEE_INDICATOR`: the module's "configured to charge nothing".
+const ZERO_FEE: u128 = 420;
+
+/// A fee module's defaults: `defaultScalingFactor`, `defaultFeeCap`, and the
+/// TWAP window `secondsAgo`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModuleDefaults {
+    pub scaling: u128,
+    pub cap: u128,
+    pub seconds_ago: u128,
+}
+
+/// One pool's fee regime from its `dynamicFeeConfig(pool)` answer, by the
+/// module's own rules: a pool configured fee-free charges nothing at all; an
+/// unset base is the factory's `tickSpacingToFee` for the pool (`spacing_fee`,
+/// consulted only then); an unset scaling takes the module's default scaling
+/// **and** default cap; an unset initial fee is the base. The TWAP is not here —
+/// it is read after, over the window this names.
+pub fn compose_dynamic_fee(
+    config: &[u8],
+    defaults: ModuleDefaults,
+    spacing_fee: Option<u128>,
+) -> Result<DynamicFee, &'static str> {
+    let word = |w: usize, bits: u32| abi::word_uint(config, w, bits).ok_or("dynamicFeeConfig");
+    let (base, cap, k, on, initial) = (word(0, 24)?, word(1, 24)?, word(2, 64)?, word(3, 1)?, word(4, 24)?);
+    if base == ZERO_FEE {
+        return Ok(DynamicFee::FREE);
+    }
+    let base = if base != 0 { base } else { spacing_fee.ok_or("tickSpacingToFee")? };
+    let (k, cap) = if k != 0 { (k, cap) } else { (defaults.scaling, defaults.cap) };
+    let initial = (on == 1).then_some(match initial {
+        0 => base,
+        ZERO_FEE => 0,
+        x => x,
+    });
+    let n = |v: u128| u32::try_from(v).map_err(|_| "dynamicFeeConfig");
+    Ok(DynamicFee {
+        base: n(base)?,
+        cap: n(cap)?,
+        scaling: u64::try_from(k).map_err(|_| "dynamicFeeConfig")?,
+        initial: initial.map(n).transpose()?,
+        seconds_ago: u32::try_from(defaults.seconds_ago).map_err(|_| "secondsAgo")?,
+        twap_tick: None,
+    })
+}
+
+/// Each Slipstream pool's fee regime at `block`, or which read failed.
+///
+/// Three rounds, because each names what the next reads: the factory's fee
+/// module; then the module's defaults and window, each pool's configuration and
+/// the factory's fee for its spacing; then each pool's TWAP. Composed by the
+/// module's own rules — an unset base is the spacing's, an unset scaling takes
+/// the defaults for scaling *and* cap, an unset initial fee is the base — and a
+/// pool with fewer observations than the window needs gets no TWAP, as the
+/// module gives it no dynamic fee.
+async fn read_dynamic_fees(
+    reads: &ChainReads,
+    pools: &[(Address, Address, i32, u64)],
+    block: u64,
+) -> Result<Vec<(Address, Result<DynamicFee, &'static str>)>, ReadError> {
+    if pools.is_empty() {
+        return Ok(Vec::new());
+    }
+    let factories: Vec<Address> =
+        pools.iter().map(|p| p.1).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let a = reads
+        .multicall(&factories.iter().map(|f| (*f, abi::call0(selector::SWAP_FEE_MODULE))).collect::<Vec<_>>(), block)
+        .await?;
+    let module: BTreeMap<Address, Address> = factories
+        .iter()
+        .zip(a)
+        .filter_map(|(f, r)| Some((*f, abi::word_address(r.as_deref()?, 0)?)))
+        .collect();
+
+    let modules: Vec<Address> = module.values().copied().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let mut calls = Vec::new();
+    for m in &modules {
+        calls.push((*m, abi::call0(selector::DEFAULT_SCALING_FACTOR)));
+        calls.push((*m, abi::call0(selector::DEFAULT_FEE_CAP)));
+        calls.push((*m, abi::call0(selector::SECONDS_AGO)));
+    }
+    for (pool, factory, spacing, _) in pools {
+        calls.push((module.get(factory).copied().unwrap_or(Address::ZERO), abi::call_address(selector::DYNAMIC_FEE_CONFIG, *pool)));
+        calls.push((*factory, abi::call_signed(selector::TICK_SPACING_TO_FEE, i64::from(*spacing))));
+    }
+    let b = reads.multicall(&calls, block).await?;
+    let uint = |i: usize, bits: u32| b[i].as_deref().and_then(|d| abi::word_uint(d, 0, bits));
+    let defaults: BTreeMap<Address, Option<ModuleDefaults>> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let d = (|| {
+                Some(ModuleDefaults {
+                    scaling: uint(3 * i, 64)?,
+                    cap: uint(3 * i + 1, 32)?,
+                    seconds_ago: uint(3 * i + 2, 32)?,
+                })
+            })();
+            (*m, d)
+        })
+        .collect();
+
+    let mut composed = Vec::with_capacity(pools.len());
+    for (j, (pool, factory, _, cardinality)) in pools.iter().enumerate() {
+        let at = 3 * modules.len() + 2 * j;
+        let fee = (|| {
+            let m = module.get(factory).ok_or("swapFeeModule")?;
+            let d = defaults.get(m).copied().flatten().ok_or("module defaults")?;
+            compose_dynamic_fee(b[at].as_deref().ok_or("dynamicFeeConfig")?, d, uint(at + 1, 24))
+        })();
+        // The module reads a TWAP only with the observations its window needs
+        // (`MIN_SECONDS_AGO` = 2); a pool without them pays no dynamic fee.
+        let observable = |d: &DynamicFee| *cardinality >= u64::from(d.seconds_ago) / 2;
+        composed.push((*pool, fee.map(|d| (d, observable(&d)))));
+    }
+
+    let observe: Vec<(Address, Vec<u8>)> = composed
+        .iter()
+        .filter_map(|(p, f)| match f {
+            Ok((d, true)) => Some((*p, abi::call_observe(d.seconds_ago))),
+            _ => None,
+        })
+        .collect();
+    let c = reads.multicall(&observe, block).await?;
+    let twap: BTreeMap<Address, Option<i32>> = observe
+        .iter()
+        .zip(c)
+        .map(|((p, _), r)| {
+            let d = composed.iter().find(|(q, _)| q == p).and_then(|(_, f)| f.as_ref().ok()).map(|(d, _)| d.seconds_ago);
+            (*p, r.as_deref().zip(d).and_then(|(r, sa)| abi::decode_twap(r, sa)))
+        })
+        .collect();
+    Ok(composed
+        .into_iter()
+        .map(|(p, f)| (p, f.map(|(d, _)| DynamicFee { twap_tick: twap.get(&p).copied().flatten(), ..d })))
+        .collect())
+}
+
 impl PoolBook {
     /// Read every proposed pool at `block`. Pools that disagree with the chain
     /// are refused and reported, never loaded.
@@ -300,9 +509,37 @@ impl PoolBook {
                     code_hash,
                     block,
                     last_log: None,
+                    dynamic_fee: None,
                     seq: 0,
                 },
             );
+        }
+
+        // Slipstream's fees, after the states: which pools survived to need one
+        // is known only now.
+        let slip: Vec<(Address, Address, i32, u64)> = specs
+            .iter()
+            .zip(answers.chunks(STATE_READS))
+            .filter(|(s, _)| s.venue == crate::live::inventory::Venue::Slipstream)
+            .filter_map(|(s, a)| {
+                let p = pools.get(&s.pool)?;
+                let cardinality = a[5].as_deref().and_then(|d| abi::word_uint(d, 3, 16)).unwrap_or(0);
+                Some((s.pool, p.factory, p.state.tick_spacing, cardinality as u64))
+            })
+            .collect();
+        for (pool, fee) in read_dynamic_fees(reads, &slip, block).await? {
+            match fee {
+                Ok(d) => {
+                    if let Some(p) = pools.get_mut(&pool) {
+                        p.dynamic_fee = Some(d);
+                        p.fee_from_tick();
+                    }
+                }
+                Err(read) => {
+                    pools.remove(&pool);
+                    refused.push(Unloaded { pool, why: Unloadable::FeeUnreadable { read } });
+                }
+            }
         }
         Ok((pools, refused))
     }
@@ -324,6 +561,8 @@ impl PoolBook {
                 // Replaced, not kept: a caller's larger value would put every
                 // later write to another pool behind it.
                 p.seq = 0;
+                // And a dynamic fee is the book's to state, from the tick.
+                p.fee_from_tick();
                 newest_read = newest_read.max(p.block);
                 (p.spec.pool, Arc::new(p))
             })
@@ -373,6 +612,46 @@ impl PoolBook {
             *v = (*v).max(p.seq);
         }
         out
+    }
+
+    /// Follow each Slipstream pool's TWAP to `block`. The fee moves with it even
+    /// when nothing swaps — ±15 ppm steps between swaps, measured — so without
+    /// this the book's fee drifts off the module's by a tick's worth at a time.
+    /// Returns how many pools' fees changed.
+    ///
+    /// An `observe` that reverts leaves the pool with no TWAP, which is the
+    /// module's own answer to one: it catches the revert and adds no dynamic
+    /// fee. A pool loaded without one stays without until it is reloaded.
+    pub async fn refresh_twaps(&self, reads: &ChainReads, block: u64) -> Result<usize, ReadError> {
+        let snap = self.snapshot();
+        let targets: Vec<(Address, u32)> = snap
+            .values()
+            .filter_map(|p| p.dynamic_fee.filter(|d| d.twap_tick.is_some()).map(|d| (p.spec.pool, d.seconds_ago)))
+            .collect();
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let calls: Vec<(Address, Vec<u8>)> = targets.iter().map(|(p, sa)| (*p, abi::call_observe(*sa))).collect();
+        let answers = reads.multicall(&calls, block).await?;
+        let twaps: Vec<(Address, Option<i32>)> = targets
+            .iter()
+            .zip(answers)
+            .map(|((p, sa), a)| (*p, a.as_deref().and_then(|d| abi::decode_twap(d, *sa))))
+            .collect();
+        Ok(self.write(|map, w, status| {
+            let mut changed = 0;
+            for (pool, twap) in twaps {
+                let Some(old) = map.get(&pool) else { continue };
+                let Some(d) = old.dynamic_fee.filter(|d| d.twap_tick != twap) else { continue };
+                let mut next = (**old).clone();
+                next.dynamic_fee = Some(DynamicFee { twap_tick: twap, ..d });
+                next.fee_from_tick();
+                changed += usize::from(next.state.fee_ppm != old.state.fee_ppm);
+                next.seq = w.seq;
+                map.insert(pool, Arc::new(next));
+            }
+            (changed, status)
+        }))
     }
 
     /// `Verified` after a full read; `Rebuilding` from a feed gap until the next
@@ -446,6 +725,8 @@ impl PoolBook {
             next.state.tick = tick;
             next.block = at.0;
             next.last_log = Some(at);
+            // The swap moved the tick, and on Slipstream the fee with it.
+            next.fee_from_tick();
             next.seq = w.seq;
             let covered = next.ladder_covers_price();
             map.insert(pool, Arc::new(next));
@@ -507,6 +788,8 @@ impl PoolBook {
                     snap.state.tick = old.state.tick;
                     snap.block = old.block;
                     snap.last_log = old.last_log;
+                    // The fresh regime at the kept tick.
+                    snap.fee_from_tick();
                 }
                 snap.seq = w.seq;
                 map.insert(addr, Arc::new(snap));

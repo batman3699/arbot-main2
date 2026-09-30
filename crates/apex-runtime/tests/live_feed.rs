@@ -50,6 +50,7 @@ fn book() -> PoolBook {
         code_hash: B256::ZERO,
         block: 100,
         last_log: None,
+        dynamic_fee: None,
         seq: 0,
     };
     PoolBook::from_snapshots([snap], ReconstructionStatus::Verified)
