@@ -13,5 +13,6 @@ pub mod feed;
 pub mod frontier;
 pub mod inventory;
 pub mod pricing;
+pub mod reader;
 pub mod reads;
 pub mod sim;
