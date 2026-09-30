@@ -11,6 +11,7 @@ pub mod adapter;
 pub mod admission;
 pub mod book;
 pub mod calls;
+pub mod costs;
 pub mod feed;
 pub mod frontier;
 pub mod inventory;

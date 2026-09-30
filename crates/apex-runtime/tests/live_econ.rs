@@ -335,6 +335,29 @@ fn an_estimated_l1_fee_is_not_authoritative() {
 /// The cost grows with hop count, because calldata does. A cost model
 /// indifferent to route length would make a 4-hop route look as cheap as a
 /// 2-hop one — and the census found deeper routes strictly worse.
+/// **A cost refresh prices the next route.** A higher base fee costs more gas
+/// and a new oracle reading a different L1 fee; what the chain does not say —
+/// the settlement's gas, its limit — is kept.
+#[tokio::test]
+async fn a_cost_refresh_prices_the_next_route() {
+    let econ = econ_over(200, L1FeeModel::unvalidated());
+    let p = proposal(2);
+    let before = econ.refresh_costs(&p).await.expect("costs");
+    let route_before = econ.route_cost_wei(2);
+
+    let mut costs = econ.costs();
+    costs.gas_price_wei *= AlloyU256::from(10u64);
+    costs.l1.l1_base_fee *= 2;
+    econ.set_costs(costs);
+    let after = econ.refresh_costs(&p).await.expect("costs");
+
+    assert_eq!(after.l2_execution_fee, before.l2_execution_fee * 10);
+    assert!(after.l1_data_fee > before.l1_data_fee, "{} vs {}", after.l1_data_fee, before.l1_data_fee);
+    assert_eq!(after.gas_used_distribution, before.gas_used_distribution);
+    assert_eq!(after.gas_limit, before.gas_limit);
+    assert!(econ.route_cost_wei(2) > route_before);
+}
+
 #[tokio::test]
 async fn a_longer_route_costs_more() {
     let econ = econ_over(200, L1FeeModel::unvalidated());

@@ -155,6 +155,27 @@ fn a_gap_wider_than_the_fees_has_a_profitable_size() {
     assert!(wins[0].output > wins[0].amount_in, "it returns more than it took");
 }
 
+/// **The pricer sizes against the cost it was last given.** The same gap, once
+/// its cost is more than any size grosses, has no profitable size.
+#[test]
+fn the_pricer_sizes_against_the_cost_it_was_last_given() {
+    let b = book(vec![
+        pool(UNI, Venue::UniswapV3, -197_350, 500, L),
+        pool(SLIP, Venue::Slipstream, -197_300, 80, L),
+    ]);
+    let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
+    let pricer = LivePricer::new(b, cycles.clone(), 0);
+    let (id, win) = cycles
+        .keys()
+        .find_map(|id| pricer.best_size(*id, &fp(), budget()).ok().map(|w| (*id, w)))
+        .expect("the gap pays");
+
+    pricer.set_fixed_cost_wei((win.output - win.amount_in).as_u128() * 1_000);
+    assert_eq!(pricer.fixed_cost_wei(), (win.output - win.amount_in).as_u128() * 1_000);
+    let got = pricer.best_size(id, &fp(), budget());
+    assert!(matches!(got, Err(NoSize::NoProfitableSize { .. })), "{got:?}");
+}
+
 /// The same price in both pools pays nothing once the fees are taken, and the
 /// refusal is the economics' — not the pool's.
 #[test]

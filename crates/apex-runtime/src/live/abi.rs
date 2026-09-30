@@ -55,6 +55,16 @@ pub mod selector {
     pub const DEFAULT_FEE_CAP: [u8; 4] = [0xdc, 0xf4, 0xeb, 0x27];
     /// `secondsAgo()` — the module's TWAP window.
     pub const SECONDS_AGO: [u8; 4] = [0x63, 0x3d, 0xd1, 0x45];
+    /// `l1BaseFee()` — the L1 fee oracle's.
+    pub const L1_BASE_FEE: [u8; 4] = [0x51, 0x9b, 0x4b, 0xd3];
+    /// `blobBaseFee()`
+    pub const BLOB_BASE_FEE: [u8; 4] = [0xf8, 0x20, 0x61, 0x40];
+    /// `baseFeeScalar()`
+    pub const BASE_FEE_SCALAR: [u8; 4] = [0xc5, 0x98, 0x59, 0x18];
+    /// `blobBaseFeeScalar()`
+    pub const BLOB_BASE_FEE_SCALAR: [u8; 4] = [0x68, 0xd5, 0xdc, 0xa6];
+    /// `isFjord()`
+    pub const IS_FJORD: [u8; 4] = [0x96, 0x0e, 0x3a, 0x23];
 }
 
 const WORD: usize = 32;

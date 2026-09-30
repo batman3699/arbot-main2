@@ -117,13 +117,26 @@ pub struct LivePricer {
     /// By route hash, so a proposal — which carries a commitment, not an id —
     /// finds its cycle.
     by_hash: BTreeMap<alloy_primitives::B256, RouteId>,
-    fixed_cost_wei: u128,
+    /// `LiveEconomics::route_cost_wei`, replaced when the economics' costs are.
+    fixed_cost_wei: apex_state::Versioned<u128>,
 }
 
 impl LivePricer {
     pub fn new(book: Arc<PoolBook>, cycles: BTreeMap<RouteId, Cycle>, fixed_cost_wei: u128) -> Self {
         let by_hash = cycles.iter().map(|(id, c)| (c.commitment.route_hash, *id)).collect();
+        let fixed_cost_wei =
+            apex_state::Versioned::new(fixed_cost_wei, apex_types::state::ReconstructionStatus::Verified);
         Self { book, cycles, by_hash, fixed_cost_wei }
+    }
+
+    /// Size every later route against this cost — the economics' new
+    /// `route_cost_wei`, whenever their costs are replaced.
+    pub fn set_fixed_cost_wei(&self, wei: u128) {
+        self.fixed_cost_wei.store(wei, apex_types::state::ReconstructionStatus::Verified);
+    }
+
+    pub fn fixed_cost_wei(&self) -> u128 {
+        *self.fixed_cost_wei.load().value
     }
 
     pub fn cycle(&self, id: RouteId) -> Option<&Cycle> {
@@ -131,7 +144,7 @@ impl LivePricer {
     }
 
     fn live(&self, id: RouteId) -> Option<LiveCycle> {
-        LiveCycle::new(self.cycles.get(&id)?, &self.book.snapshot(), self.fixed_cost_wei)
+        LiveCycle::new(self.cycles.get(&id)?, &self.book.snapshot(), self.fixed_cost_wei())
     }
 }
 

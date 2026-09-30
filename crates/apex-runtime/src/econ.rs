@@ -231,7 +231,8 @@ pub struct FlashTerms {
 pub struct LiveEconomics {
     curves: std::sync::Arc<dyn RouteCurves>,
     priors: ScenarioPriors,
-    costs: ChainCosts,
+    /// Replaced as the chain's prices move ([`Self::set_costs`]).
+    costs: apex_state::Versioned<ChainCosts>,
     continuous: ContinuousBudget,
     refine: RefineBudget,
     strategy: apex_types::ids::StrategyId,
@@ -248,12 +249,26 @@ impl LiveEconomics {
         Self {
             curves,
             priors,
-            costs,
+            costs: apex_state::Versioned::new(costs, apex_types::state::ReconstructionStatus::Verified),
             continuous: ContinuousBudget::default(),
             refine: RefineBudget::default(),
             strategy,
             flash: None,
         }
+    }
+
+    /// The costs a candidate is priced at now.
+    pub fn costs(&self) -> ChainCosts {
+        *self.costs.load().value
+    }
+
+    /// Price every later candidate at `costs`: the base fee moves every block
+    /// and the L1 oracle with every L1 block, so a long run replaces what it
+    /// booted with. A candidate being refined keeps the costs it read — except
+    /// `assemble`'s Tier 0 screen, which reads the price again, so a refresh
+    /// landing mid-candidate can move that screen by one block's base fee.
+    pub fn set_costs(&self, costs: ChainCosts) {
+        self.costs.store(costs, apex_types::state::ReconstructionStatus::Verified);
     }
 
     /// The lender a borrowing route is quoted against. Without it, a proposal
@@ -339,15 +354,17 @@ impl LiveEconomics {
 
     /// §23's total, for a route of this shape.
     fn total_cost(&self, calldata_bytes: u32) -> TotalExecutionCost {
-        let fee = self.l1_fee(calldata_bytes);
+        // Read once: every figure below is at the same prices.
+        let costs = self.costs();
+        let fee = l1_fee_at(&costs, calldata_bytes);
         let l1_wei = u256_to_alloy(fee.wei);
         let failure = expected_failure_cost(
-            self.costs.failure,
-            u256_to_ethers(self.costs.gas_price_wei),
+            costs.failure,
+            u256_to_ethers(costs.gas_price_wei),
             fee.wei,
         );
-        let l2 = AlloyU256::from(self.costs.success_gas.0)
-            .saturating_mul(self.costs.gas_price_wei);
+        let l2 = AlloyU256::from(costs.success_gas.0)
+            .saturating_mul(costs.gas_price_wei);
 
         TotalExecutionCost {
             l2_execution_fee: to_u128(l2),
@@ -363,17 +380,17 @@ impl LiveEconomics {
             expected_failure_cost: to_u128(u256_to_alloy(failure)),
             calldata_bytes,
             compressed_data_estimate: calldata_bytes,
-            gas_limit: self.costs.gas_limit,
+            gas_limit: costs.gas_limit,
             // §23.1 requires a distribution: the risk gate prices at p99 while
             // the EV uses p50, and a single number cannot serve both. The spread
             // is a shape rather than a measurement, which is why the venue's
             // `GasProfile::measured` is false and why the candidate is
             // `Heuristic`.
             gas_used_distribution: GasDistribution {
-                p50: self.costs.success_gas,
-                p90: GasUsed(self.costs.success_gas.0.saturating_mul(11) / 10),
-                p99: GasUsed(self.costs.success_gas.0.saturating_mul(13) / 10),
-                max_observed: GasUsed(self.costs.gas_limit.0),
+                p50: costs.success_gas,
+                p90: GasUsed(costs.success_gas.0.saturating_mul(11) / 10),
+                p99: GasUsed(costs.success_gas.0.saturating_mul(13) / 10),
+                max_observed: GasUsed(costs.gas_limit.0),
             },
         }
     }
@@ -396,10 +413,12 @@ impl LiveEconomics {
     /// size makes the fee non-authoritative even against a validated model, and
     /// that is the honest state for a route nothing has encoded yet.
     pub fn l1_fee(&self, calldata_bytes: u32) -> L1DataFee {
-        self.costs
-            .l1_model
-            .fee(CompressedSize::Estimated(calldata_bytes), self.costs.l1)
+        l1_fee_at(&self.costs(), calldata_bytes)
     }
+}
+
+fn l1_fee_at(costs: &ChainCosts, calldata_bytes: u32) -> L1DataFee {
+    costs.l1_model.fee(CompressedSize::Estimated(calldata_bytes), costs.l1)
 }
 
 fn to_u128(v: AlloyU256) -> u128 {
@@ -489,7 +508,7 @@ impl Economics for LiveEconomics {
             apex_sim::tier0::screen(&apex_sim::tier0::Tier0Input {
                 gross_profit_wei: gross,
                 cost: r.costs.clone(),
-                gas_price_wei: to_u128(self.costs.gas_price_wei),
+                gas_price_wei: to_u128(self.costs().gas_price_wei),
             })
         {
             return Err(Decline::NoProfitableSize);

@@ -54,6 +54,11 @@ fn every_selector_is_its_signatures_hash() {
         (selector::DEFAULT_SCALING_FACTOR, "defaultScalingFactor()"),
         (selector::DEFAULT_FEE_CAP, "defaultFeeCap()"),
         (selector::SECONDS_AGO, "secondsAgo()"),
+        (selector::L1_BASE_FEE, "l1BaseFee()"),
+        (selector::BLOB_BASE_FEE, "blobBaseFee()"),
+        (selector::BASE_FEE_SCALAR, "baseFeeScalar()"),
+        (selector::BLOB_BASE_FEE_SCALAR, "blobBaseFeeScalar()"),
+        (selector::IS_FJORD, "isFjord()"),
     ] {
         assert_eq!(sel, keccak256(sig.as_bytes())[..4], "{sig}");
     }
