@@ -14,6 +14,7 @@ remappings = [
     "forge-std/=lib/forge-std/src/"
 ]
 
+
 # Read-only, and scoped to one directory. `PlanCommitmentFixture.t.sol` asserts
 # that `crates/apex-exec/tests/fixtures/plan_commitments.json` still describes
 # this contract; `apex-exec` asserts its Rust encoder reproduces the same file.
@@ -43,3 +44,14 @@ fail_on_revert = false
 
 [profile.deep.fuzz]
 runs = 100000
+
+# Named endpoints, so a fork or a broadcast never needs the provider key on the
+# command line, where the process table and shell history would keep it
+# (INV-46). forge loads `.env`, and `${BLOCKPI_KEY}` is interpolated from it.
+#
+# **`forge script` does not fork from `ETH_RPC_URL` alone.** A dry run that
+# relied on it simulated against an empty local chain at block 1, where every
+# integration address has no code -- found by a probe, 2026-09-30, before its
+# result was reported as a Base check. Use `--rpc-url base`.
+[rpc_endpoints]
+base = "https://base.blockpi.network/v1/rpc/${BLOCKPI_KEY}"

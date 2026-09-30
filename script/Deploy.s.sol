@@ -14,8 +14,11 @@ contract Deploy is Script {
     error OwnerNotConfigured();
     error MissingRequiredIntegration(string integration, uint256 chainId, string prefix);
 
+    /// `virtual` so `DeployAndConfigure` can replace the entry point while
+    /// reusing everything else.
     function run()
         external
+        virtual
         returns (MultiVenueArbImplementation impl, ArbitrageCloneFactory factory, address clone, BatchRouter router)
     {
         return _run(bytes32(0));
@@ -82,6 +85,24 @@ contract Deploy is Script {
         if (cfg.salt == bytes32(0)) {
             cfg.salt = _envBytes32Or("CREATE2_SALT", bytes32(0));
         }
+    }
+
+    /// What `DeployAndConfigure` wires after the deploy: the trading signer to
+    /// authorize, and Aerodrome Slipstream's router to register as a `GENERIC`
+    /// adapter target.
+    ///
+    /// Declared and read **here** because this file is the only one in the
+    /// Solidity tree that reads the environment (B-13;
+    /// `scripts/ci/no_shared_env_keys.sh` asserts it). A second reader would mean
+    /// that gate had to start checking reads against writes too.
+    struct Wiring {
+        address trader;
+        address slipstreamRouter;
+    }
+
+    function wiringFromEnv() public view returns (Wiring memory w) {
+        w.trader = _envAddressOr("BASE_EXECUTOR_TRADER", address(0));
+        w.slipstreamRouter = _envAddressOr("BASE_SLIPSTREAM_ROUTER", address(0));
     }
 
     /// Fill the gaps and check the result. **Reads no environment.**

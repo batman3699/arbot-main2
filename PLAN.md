@@ -4728,6 +4728,10 @@ same change**, then fund at canary size. Phase 8's acceptance criterion 6 — 10
 live trades at minimum size — starts after that, and criterion 1's 14-day shadow
 does not need a funded executor at all, so it can start immediately.
 
+#### Status 2026-09-30: the operator reports G-SEC-1 satisfied, and a Phase 5 mainnet deploy may run.
+
+**Reported by the operator 2026-09-30, in answer to Task 8.5's simulation-target question:** "G-SEC-1 is now satisfied so a Phase 5 mainnet deploy can run." **Recorded on that account; I have not seen the review**, and nothing below should be read as my assessment of it. R-03's precondition (G-SEC-1) is therefore met on the same account. The deploy itself is the operator's to broadcast — see Task 8.5, "The Phase 5 deploy, prepared and dry-run".
+
 #### Status 2026-09-25: the current contracts scored 98.5/100. G-SEC-1 is still open, and the operator is deciding how to close it.
 
 **Reported by the operator 2026-09-25:** a SolidityScan re-run against the *current* contracts scored **98.5/100**, reviewed and passed. **I have not seen that report directly** — recorded here on the operator's account of it, which is the honest basis for anything a future reader builds on. What I did verify independently is below.
@@ -5762,6 +5766,31 @@ INV-17 guards *live dispatch*, and the design keeps it exactly that:
 **The operator's new key, checked 2026-09-30 by deriving its address through `LaneKey` (the key never left the process's environment):** it signs as `0x69d54e5fc0b9325d7250f0d0a11690327a3dd8a3`. That is **not** the executor owner, so §18.1's separation of trading and admin keys holds. Nonce 0, 0.001506 ETH. It is **not** in the deployed executor's `executors` allowlist — and the deployed executor's `owner()` is the BatchRouter `0x8e04…9954`, not `executor_owner` in `ops/inputs.yaml`. Neither matters to a shadow run, which sends nothing; both matter to a canary, which needs the Phase 5 redeploy (G-SEC-1) and `setExecutor(0x69d5…, true)` on it.
 
 **What a real `CallBuilder` needs, measured against the Phase 5 executor:** the `UNIV3` op calls **one** configured Uniswap `SwapRouter02`, so it cannot reach Aerodrome Slipstream — a different router with a different path format — and Slipstream is where the measured best routes are. The `GENERIC` op calls any allowlisted `(adapterId → target, selector)`, and **Slipstream's router can itself be that target**: register it and allow `exactInputSingle`, no new contract. That registration is deployment configuration, and it has to exist before a Slipstream route can execute.
+
+#### The Phase 5 deploy, prepared and dry-run (operator decision 2026-09-30)
+
+**Decision:** the shadow run's Tier 2 simulation executes against a **real deployed Phase 5 executor**, not injected code — the operator reports G-SEC-1 satisfied. The deploy is an irreversible mainnet transaction paid from the operator's ETH, so **it is prepared and dry-run here and broadcast by the operator.**
+
+`script/DeployAndConfigure.s.sol` deploys and wires in one run: `Deploy.runWith`, then `router.multicall` → `setExecutor(trader, true)`, `registerAdapter(1, Slipstream router)`, `allowSelector(1, exactInputSingle 0xa026383e)`. One run because `forge script` simulates every transaction before broadcasting any, so a wiring step that would revert stops the deploy rather than leaving an executor nobody can trade through.
+
+**It refuses the trading key**, as deployer or owner (§18.1). `Deploy` broadcasts with `PRIVATE_KEY`, forge auto-loads `.env`, and `.env`'s `PRIVATE_KEY` is the trading key — so a naive `Deploy` run makes the trading key the deployer. It also refuses an owner other than the broadcaster, before deploying anything, since the wiring could not then be sent. Six forge tests; `Deploy.s.sol` stays the only env reader (B-13's gate caught the first draft reading two keys itself).
+
+**Every integration address was checked on Base first** (the fabricated-venue history): the Balancer vault, SwapRouter02 (whose `factory()` is Uniswap's Base factory), the Aave pool and Permit2 all have code; Slipstream's router has code, contains the `exactInputSingle` selector, and its `factory()` is Slipstream's.
+
+**The dry run, and a finding in it.** The first "dry run" ran at **block 1**: `forge script` does not fork from `ETH_RPC_URL` alone, so it simulated an empty local chain where the Slipstream router had no code — and reported `InvalidAdapter()`, which looked like a contract defect. A probe logging `block.number` exposed it before it was reported as a Base result. `foundry.toml` now has `[rpc_endpoints] base = …/${BLOCKPI_KEY}`, so `--rpc-url base` forks for real **and** keeps the key off the command line. Against the real fork (block ≈ 51.985M) every step succeeds — deploy, `setExecutor`, adapter, selector — at ≈ 8.0M gas, ≈ 0.000086 ETH at 0.0107 gwei (forge's estimate; Base's L1 data fee comes on top).
+
+**Blocking the broadcast: the configured owner cannot pay.** `BASE_EXECUTOR_OWNER` = `0xD7A4…f04c` holds ≈ 1.0e-7 ETH (nonce 16); simulating with its real balance fails "lack of funds for max fee". Before broadcasting, the operator either funds it (≈ 0.0005 ETH covers gas and the L1 fee with margin) or names a different admin address as `BASE_EXECUTOR_OWNER` for the run. `out/` also holds artifacts from the deleted pre-Phase-5 `steps/` contracts: `forge clean` first.
+
+```bash
+forge clean && forge build
+PRIVATE_KEY= \
+BASE_EXECUTOR_TRADER=0x69d54e5fc0b9325d7250f0d0a11690327a3dd8a3 \
+BASE_SLIPSTREAM_ROUTER=0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5 \
+forge script script/DeployAndConfigure.s.sol:DeployAndConfigure \
+  --rpc-url base --sender <owner address> --interactive --broadcast
+```
+
+After it lands, in one change: `ops/inputs.yaml`'s Base `executor_address` and `batch_router_address`, and `docs/apex/DEPLOYED.md`, which says the deployed executor predates Phase 5 and stops being true at that moment.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
