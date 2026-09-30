@@ -443,6 +443,12 @@ impl Economics for LiveEconomics {
             strategy: self.strategy,
             venue_set: p.venue_set.clone(),
             route: p.route.clone(),
+            // The proposal's, whose venue versions are the route's own pools',
+            // read before the search priced it (`TemplatePricer::
+            // route_fingerprint`). Not re-read here: the four stages each priced
+            // their own snapshot, and a reading taken after them would absorb a
+            // write that landed during pricing — last-mile would then pass a
+            // ticket priced against state that had moved.
             state_fingerprint: p.state_fingerprint.clone(),
             state_age: apex_types::time::DurationNanos(0),
             flash_source: None,

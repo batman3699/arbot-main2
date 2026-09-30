@@ -25,6 +25,8 @@ const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const UNI: Address = address!("d0b53D9277642d899DF5C87A3966A349A798F224");
 const SLIP: Address = address!("dbc6998296caA1652A810dc8D3BaF4A8294330f1");
 const ELSEWHERE: Address = address!("00000000000000000000000000000000000000ee");
+/// Uniswap v3's WETH/USDC 0.3% pool: a second pool of the same venue as `UNI`.
+const UNI_30: Address = address!("6c561B446416E1A00E8E93E221854d6eA4171372");
 
 /// A WETH/USDC pool with constant liquidity `l` over [tick−2000, tick+2000].
 fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, l: u128) -> PoolSnapshot {
@@ -55,6 +57,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, l: u128) -> PoolSn
         code_hash: Default::default(),
         block: 100,
         last_log: None,
+        seq: 0,
     }
 }
 
@@ -216,4 +219,78 @@ fn max_input_is_the_real_holding_and_fails_closed() {
     let b = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L), slip]);
     let snap = b.snapshot();
     assert_eq!(LiveCycle::new(&c, &snap, 0).unwrap().max_input(), U256::zero());
+}
+
+/// A proposal's venue versions are its **route's** pools, read from the book: a
+/// swap on a pool the route does not touch leaves them unchanged, and a swap on
+/// one it does moves them. The event's other fields are kept.
+#[test]
+fn route_versions_move_only_with_the_routes_own_pools() {
+    let mut far = pool(ELSEWHERE, Venue::UniswapV3, -197_340, 100, L);
+    far.spec.token1 = address!("00000000000000000000000000000000000000c3");
+    let b = book(vec![
+        pool(UNI, Venue::UniswapV3, -197_350, 500, L),
+        pool(SLIP, Venue::Slipstream, -197_300, 80, L),
+        far,
+    ]);
+    let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
+    let pricer = LivePricer::new(b.clone(), cycles.clone(), 0);
+    let id = *cycles.keys().next().unwrap();
+    let versions = || pricer.route_fingerprint(id, &fp()).venue_state_version;
+    let before = versions();
+    assert_eq!(before.len(), 2, "one version for each venue on the route: {before:?}");
+    assert_eq!(pricer.route_fingerprint(id, &fp()).confirmed_block_number, 100);
+
+    // Another Uniswap pool swaps: same venue, not on this route.
+    b.apply_swap(ELSEWHERE, alloy_primitives::U256::from(1u64) << 96, 1, -197_341, (200, 0));
+    assert_eq!(versions(), before, "a pool off the route moved the version");
+
+    // A pool on the route swaps.
+    b.apply_swap(UNI, alloy_primitives::U256::from(1u64) << 96, 1, -197_351, (201, 3));
+    assert_ne!(versions(), before);
+}
+
+/// **A write behind another pool's position still moves the version.** The
+/// first version was the latest `(block, log index)` among the route's pools,
+/// and a maximum of positions stays put while a pool changes underneath it:
+/// here a swap the preconfirmed feed missed arrives confirmed, at an earlier
+/// position than one it delivered on the route's other pool of the same venue.
+#[test]
+fn a_write_behind_another_pools_position_still_moves_the_version() {
+    let b = book(vec![
+        pool(UNI, Venue::UniswapV3, -197_350, 500, L),
+        pool(UNI_30, Venue::UniswapV3, -197_300, 3_000, L),
+    ]);
+    let both = [UNI, UNI_30];
+    let sqrt = alloy_primitives::U256::from(1u64) << 96;
+
+    // Preconfirmed: the 0.3% pool at (201, 7).
+    b.apply_swap(UNI_30, sqrt, 1, -197_301, (201, 7));
+    let before = b.versions_for(&both);
+    // Confirmed only: the 0.05% pool at (201, 3) -- newer for that pool, older
+    // than the route's latest position.
+    b.apply_swap(UNI, sqrt, 1, -197_351, (201, 3));
+    assert_ne!(b.versions_for(&both), before, "the 0.05% pool moved and the version did not");
+}
+
+/// The write sequence is the book's own. A snapshot entering with a large `seq`
+/// has it replaced — kept, it would put every later write to the route's other
+/// pool behind it, and the route's version would stop moving.
+#[test]
+fn a_callers_seq_is_replaced() {
+    let mut garbage = pool(UNI, Venue::UniswapV3, -197_350, 500, L);
+    garbage.seq = u64::MAX;
+    let b = book(vec![garbage, pool(UNI_30, Venue::UniswapV3, -197_300, 3_000, L)]);
+    let before = b.versions_for(&[UNI, UNI_30]);
+    b.apply_swap(UNI_30, alloy_primitives::U256::from(1u64) << 96, 1, -197_301, (201, 0));
+    assert_ne!(b.versions_for(&[UNI, UNI_30]), before);
+}
+
+/// A pool the book no longer carries is not "unchanged": the reading is empty,
+/// which last-mile reads as every venue gone (§5.6).
+#[test]
+fn a_pool_the_book_does_not_carry_empties_the_reading() {
+    let b = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L)]);
+    assert_eq!(b.versions_for(&[UNI]).len(), 1);
+    assert!(b.versions_for(&[UNI, ELSEWHERE]).is_empty());
 }

@@ -340,3 +340,57 @@ fn finite_size_gross_never_exceeds_marginal_gross() {
         }
     }
 }
+
+/// **The proposal commits to venue versions read before pricing.**
+///
+/// A pricer over live state narrows the fingerprint to the template's own
+/// pools, and Engine C must ask for it *before* `best_size`: a write that lands
+/// while the template is priced has to be one last-mile sees, and a reading
+/// taken after pricing would absorb it. This pricer's state moves during every
+/// `best_size`, as a swap landing mid-search would.
+#[test]
+fn the_proposal_commits_to_versions_read_before_pricing() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    struct Moving {
+        inner: Fixture,
+        version: AtomicU64,
+    }
+    impl TemplatePricer for Moving {
+        fn best_size(
+            &self,
+            id: RouteId,
+            at: &StateFingerprint,
+            budget: SearchBudget,
+        ) -> Result<SizedOpportunity, NoSize> {
+            self.version.fetch_add(1, Ordering::SeqCst);
+            self.inner.best_size(id, at, budget)
+        }
+        fn commitment(&self, id: RouteId) -> Option<RouteCommitment> {
+            self.inner.commitment(id)
+        }
+        fn route_fingerprint(&self, _id: RouteId, at: &StateFingerprint) -> StateFingerprint {
+            StateFingerprint {
+                venue_state_version: BTreeMap::from([(VenueId(1), self.version.load(Ordering::SeqCst))]),
+                ..at.clone()
+            }
+        }
+    }
+    let mut frontier = Frontier::new();
+    frontier.insert(template(1, 3_000)).expect("consistent");
+    let (hits, permit) = frontier.revalue(&swap());
+    let routes = || BTreeMap::from([(RouteId(1), route_at(200, GAS))]);
+
+    let moving = Moving { inner: Fixture { routes: routes() }, version: AtomicU64::new(7) };
+    let out = FiniteSizeEngine::measured().propose(&hits, &permit, &swap(), &frontier, &moving);
+    let fp = &out.proposals[0].state_fingerprint;
+    assert_eq!(fp.venue_state_version, BTreeMap::from([(VenueId(1), 7)]), "read after pricing");
+    assert_eq!(fp.state_delta_hash, swap().fingerprint.state_delta_hash, "the event's other fields are kept");
+
+    // A pricer that does not narrow commits to the event's own fingerprint,
+    // venue versions and all.
+    let mut event = swap();
+    event.fingerprint.venue_state_version.insert(VenueId(2), 3);
+    let plain = Fixture { routes: routes() };
+    let out = FiniteSizeEngine::measured().propose(&hits, &permit, &event, &frontier, &plain);
+    assert_eq!(out.proposals[0].state_fingerprint, event.fingerprint);
+}

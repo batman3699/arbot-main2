@@ -140,6 +140,15 @@ impl TemplatePricer for LivePricer {
     fn commitment(&self, id: RouteId) -> Option<RouteCommitment> {
         self.cycles.get(&id).map(|c| c.commitment.clone())
     }
+
+    /// The event's fingerprint, with the venue versions of **this cycle's own
+    /// pools**, read now — Engine C asks before pricing. An unknown cycle reads
+    /// as no venues, and is refused by `best_size` in any case.
+    fn route_fingerprint(&self, id: RouteId, at: &StateFingerprint) -> StateFingerprint {
+        let pools: Vec<alloy_primitives::Address> =
+            self.cycles.get(&id).map(|c| c.legs.iter().map(|l| l.pool).collect()).unwrap_or_default();
+        StateFingerprint { venue_state_version: self.book.versions_for(&pools), ..at.clone() }
+    }
 }
 
 impl RouteCurves for LivePricer {

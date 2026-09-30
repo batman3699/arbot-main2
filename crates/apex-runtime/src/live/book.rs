@@ -19,13 +19,15 @@
 //!
 //! A `Swap` log carries the pool's post-swap `sqrtPriceX96`, `liquidity` and
 //! `tick`, so applying one sets the state exactly rather than estimating it. It
-//! is applied only if it is **newer** than the last one applied: a confirmed log
-//! arriving after the preconfirmed copy of a later swap must not roll the pool
-//! back. When a swap moves the price outside the tick range the ladder was built
-//! over, the snapshot says so ([`PoolSnapshot::ladder_covers_price`]) and the
-//! pricer refuses it until the pool is reloaded — the alternative is pricing at
-//! the last known liquidity, which is the constant-liquidity error behind the
-//! legacy fast path's ~140 bps.
+//! is applied only if it is **newer** than what the pool holds — the last log
+//! applied, or, after a read, the whole of the read's block — so neither a
+//! confirmed log trailing a later preconfirmed one nor a log the read already
+//! contains can roll the pool back; and a reload never rolls back a swap newer
+//! than its read. When a swap moves the price outside the tick range the ladder
+//! was built over, the snapshot says so ([`PoolSnapshot::ladder_covers_price`])
+//! and the pricer refuses it until the pool is reloaded — the alternative is
+//! pricing at the last known liquidity, which is the constant-liquidity error
+//! behind the legacy fast path's ~140 bps.
 //!
 //! Balances are **not** advanced by swap deltas. A swap seen first preconfirmed
 //! and then confirmed would be counted twice, so balances stay as of the last
@@ -66,6 +68,11 @@ pub struct PoolSnapshot {
     pub block: u64,
     /// The last log applied, so an older one is refused.
     pub last_log: Option<LogPosition>,
+    /// The book's write sequence at this pool's last change. **Assigned by the
+    /// book** — whatever a caller sets is replaced when the snapshot enters one —
+    /// from a counter every write advances, so it moves on every change to this
+    /// pool and on no other. See [`PoolBook::versions_for`].
+    pub seq: u64,
 }
 
 impl PoolSnapshot {
@@ -118,7 +125,45 @@ pub enum SwapApplied {
 
 pub struct PoolBook {
     pools: Versioned<BTreeMap<Address, Arc<PoolSnapshot>>>,
-    writer: Mutex<()>,
+    writer: Mutex<WriterState>,
+}
+
+/// What the writer lock guards besides the right to write.
+#[derive(Debug, Default)]
+struct WriterState {
+    /// The last write sequence issued.
+    seq: u64,
+    /// The sequence of the last feed gap marked.
+    last_gap: u64,
+    /// The newest block any read has stored.
+    newest_read: u64,
+}
+
+/// Why a reload wrote nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReloadError {
+    Read(ReadError),
+    /// Older than a read the book already holds. Replacing a newer read would
+    /// roll pools back — ladders and balances as well as prices — so the reload
+    /// is refused whole; read again at the latest block.
+    Older { block: u64, newest: u64 },
+}
+
+impl From<ReadError> for ReloadError {
+    fn from(e: ReadError) -> Self {
+        Self::Read(e)
+    }
+}
+
+impl std::fmt::Display for ReloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(e) => write!(f, "{e}"),
+            Self::Older { block, newest } => {
+                write!(f, "a read at block {block} is older than the book's newest, {newest}")
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for PoolBook {
@@ -204,18 +249,14 @@ impl PoolBook {
         block: u64,
     ) -> Result<(Self, Vec<Unloaded>), ReadError> {
         let (pools, refused) = Self::read(reads, specs, block).await?;
-        let book = Self {
-            pools: Versioned::new(pools, ReconstructionStatus::Verified),
-            writer: Mutex::new(()),
-        };
-        Ok((book, refused))
+        Ok((Self::from_snapshots(pools.into_values(), ReconstructionStatus::Verified), refused))
     }
 
     async fn read(
         reads: &ChainReads,
         specs: &[PoolSpec],
         block: u64,
-    ) -> Result<(BTreeMap<Address, Arc<PoolSnapshot>>, Vec<Unloaded>), ReadError> {
+    ) -> Result<(BTreeMap<Address, PoolSnapshot>, Vec<Unloaded>), ReadError> {
         let calls: Vec<(Address, Vec<u8>)> = specs.iter().flat_map(state_calls).collect();
         let answers = reads.multicall(&calls, block).await?;
 
@@ -250,7 +291,7 @@ impl PoolBook {
             let code_hash = reads.code_hash(spec.pool, block).await?;
             pools.insert(
                 spec.pool,
-                Arc::new(PoolSnapshot {
+                PoolSnapshot {
                     spec: spec.clone(),
                     state,
                     ladder,
@@ -259,7 +300,8 @@ impl PoolBook {
                     code_hash,
                     block,
                     last_log: None,
-                }),
+                    seq: 0,
+                },
             );
         }
         Ok((pools, refused))
@@ -275,8 +317,21 @@ impl PoolBook {
         snapshots: impl IntoIterator<Item = PoolSnapshot>,
         provenance: ReconstructionStatus,
     ) -> Self {
-        let pools = snapshots.into_iter().map(|p| (p.spec.pool, Arc::new(p))).collect();
-        Self { pools: Versioned::new(pools, provenance), writer: Mutex::new(()) }
+        let mut newest_read = 0;
+        let pools = snapshots
+            .into_iter()
+            .map(|mut p| {
+                // Replaced, not kept: a caller's larger value would put every
+                // later write to another pool behind it.
+                p.seq = 0;
+                newest_read = newest_read.max(p.block);
+                (p.spec.pool, Arc::new(p))
+            })
+            .collect();
+        Self {
+            pools: Versioned::new(pools, provenance),
+            writer: Mutex::new(WriterState { seq: 0, last_gap: 0, newest_read }),
+        }
     }
 
     /// One consistent view of every pool. Wait-free.
@@ -286,6 +341,38 @@ impl PoolBook {
 
     pub fn get(&self, pool: Address) -> Option<Arc<PoolSnapshot>> {
         self.pools.load().value.get(&pool).cloned()
+    }
+
+    /// The state version of each venue, **over `pools` only**: the latest write
+    /// sequence among them.
+    ///
+    /// Scoped to a route's own pools on purpose. Last-mile revalidation compares
+    /// a reading taken before the route is priced with one taken before signing,
+    /// by equality, and a venue-wide version would refuse a ticket because some
+    /// *other* pool on the venue swapped — noise that would dominate the
+    /// capture-assurance figure and say nothing about the trade.
+    ///
+    /// **A write sequence, not a chain position.** Every write takes a sequence
+    /// newer than every write before it, so the maximum moves whenever any of the
+    /// pools changes. The first version used the latest `(block, log index)`
+    /// applied, and a maximum of positions can stay put while a pool changes
+    /// underneath it: a reload reads at the latest *sealed* block while another
+    /// pool on the route already holds a preconfirmed swap from the block after,
+    /// and a swap the preconfirmed feed missed arrives confirmed behind one it
+    /// delivered. Either way last-mile would have passed a ticket priced against
+    /// state that had moved.
+    ///
+    /// A pool the book no longer carries makes the reading **empty**, which
+    /// last-mile reads as every venue gone rather than as unchanged (§5.6).
+    pub fn versions_for(&self, pools: &[Address]) -> BTreeMap<apex_types::ids::VenueId, u64> {
+        let snap = self.snapshot();
+        let mut out = BTreeMap::new();
+        for a in pools {
+            let Some(p) = snap.get(a) else { return BTreeMap::new() };
+            let v = out.entry(p.spec.venue.id()).or_insert(0);
+            *v = (*v).max(p.seq);
+        }
+        out
     }
 
     /// `Verified` after a full read; `Rebuilding` from a feed gap until the next
@@ -302,16 +389,40 @@ impl PoolBook {
         self.len() == 0
     }
 
-    fn write<R>(&self, f: impl FnOnce(&mut BTreeMap<Address, Arc<PoolSnapshot>>) -> (R, ReconstructionStatus)) -> R {
-        let _w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+    /// Load, modify, store, under the writer lock so no write is lost to
+    /// another. The closure gets the lock's state — `seq` is already this
+    /// write's — and the **current** status, and returns the status to store.
+    ///
+    /// The status is read here, inside the lock, and not by the caller before
+    /// it: the first version read it outside, so a partial reload in flight when
+    /// the feed marked a gap stored its stale `Verified` back over `Rebuilding`,
+    /// and the book authorized on state with a hole in it (INV-08).
+    fn write<R>(
+        &self,
+        f: impl FnOnce(
+            &mut BTreeMap<Address, Arc<PoolSnapshot>>,
+            &mut WriterState,
+            ReconstructionStatus,
+        ) -> (R, ReconstructionStatus),
+    ) -> R {
+        let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        w.seq += 1;
         let current = self.pools.load();
         let mut map = (*current.value).clone();
-        let (r, status) = f(&mut map);
+        let (r, status) = f(&mut map, &mut w, current.reconstruction);
         self.pools.store(map, status);
         r
     }
 
-    /// Apply a `Swap` log's post-swap state.
+    /// Apply a `Swap` log's post-swap state, if it is newer than what the pool
+    /// holds.
+    ///
+    /// Newer than the last log applied — or, for a pool whose state came from a
+    /// read, from a **later block** than the read. A read at block `n` is the
+    /// state after every log in `n`, and the confirmed feed trails the
+    /// preconfirmed one by 0.5–2 s, so a log from `n` arriving after the read is
+    /// already in it; applying it would roll the pool back to the middle of the
+    /// block.
     pub fn apply_swap(
         &self,
         pool: Address,
@@ -320,10 +431,13 @@ impl PoolBook {
         tick: i32,
         at: LogPosition,
     ) -> SwapApplied {
-        let status = self.status();
-        self.write(|map| {
+        self.write(|map, w, status| {
             let Some(old) = map.get(&pool) else { return (SwapApplied::Unknown, status) };
-            if old.last_log.is_some_and(|last| at <= last) || at.0 < old.block {
+            let newer = match old.last_log {
+                Some(last) => at > last,
+                None => at.0 > old.block,
+            };
+            if !newer {
                 return (SwapApplied::Stale, status);
             }
             let mut next = (**old).clone();
@@ -332,26 +446,47 @@ impl PoolBook {
             next.state.tick = tick;
             next.block = at.0;
             next.last_log = Some(at);
+            next.seq = w.seq;
             let covered = next.ladder_covers_price();
             map.insert(pool, Arc::new(next));
             (if covered { SwapApplied::Updated } else { SwapApplied::NeedsReload }, status)
         })
     }
 
-    /// A feed gap: everything may have missed updates. `Rebuilding` until
-    /// [`Self::reload`] reads the whole book again.
+    /// A feed gap: everything may have missed updates. `Rebuilding` until a
+    /// full [`Self::reload`] that **began after** this gap completes.
     pub fn mark_rebuilding(&self) {
-        self.write(|_| ((), ReconstructionStatus::Rebuilding));
+        self.write(|_, w, _| {
+            w.last_gap = w.seq;
+            ((), ReconstructionStatus::Rebuilding)
+        });
     }
 
     /// Re-read `pools` at `block` and replace them; every pool if `pools` is
-    /// empty. A full reload returns the book to `Verified`.
+    /// empty.
+    ///
+    /// **A read never rolls back a swap already applied.** A reload reads at the
+    /// latest sealed block, and a pool may already hold a preconfirmed swap from
+    /// the block after — the ladder-exit reload is triggered by exactly such a
+    /// swap. That pool keeps its price, tick, liquidity and position, and takes
+    /// the fresh ladder and balances. If its price is off the fresh ladder it
+    /// stays unpriceable, and the caller reloads it again once a later block is
+    /// sealed.
+    ///
+    /// A full reload returns the book to `Verified` — unless a gap was marked
+    /// while it was reading: the logs that gap dropped may postdate the read,
+    /// and it is that gap's own full reload that may clear it.
+    ///
+    /// A read older than one the book already holds is refused whole
+    /// ([`ReloadError::Older`]) — checked at the write, because another reload
+    /// may land while this one reads.
     pub async fn reload(
         &self,
         reads: &ChainReads,
         pools: &[Address],
         block: u64,
-    ) -> Result<Vec<Unloaded>, ReadError> {
+    ) -> Result<Vec<Unloaded>, ReloadError> {
+        let started = self.writer.lock().unwrap_or_else(|p| p.into_inner()).seq;
         let current = self.snapshot();
         let full = pools.is_empty();
         let specs: Vec<PoolSpec> = current
@@ -360,19 +495,30 @@ impl PoolBook {
             .map(|p| p.spec.clone())
             .collect();
         let (fresh, refused) = Self::read(reads, &specs, block).await?;
-        let prior = self.status();
-        self.write(|map| {
-            for (addr, snap) in fresh {
-                map.insert(addr, snap);
+        self.write(|map, w, status| {
+            if block < w.newest_read {
+                return (Err(ReloadError::Older { block, newest: w.newest_read }), status);
+            }
+            w.newest_read = block;
+            for (addr, mut snap) in fresh {
+                if let Some(old) = map.get(&addr).filter(|o| o.last_log.is_some_and(|(b, _)| b > block)) {
+                    snap.state.sqrt_price_x96 = old.state.sqrt_price_x96;
+                    snap.state.liquidity = old.state.liquidity;
+                    snap.state.tick = old.state.tick;
+                    snap.block = old.block;
+                    snap.last_log = old.last_log;
+                }
+                snap.seq = w.seq;
+                map.insert(addr, Arc::new(snap));
             }
             // A pool that can no longer be read is removed rather than kept at
             // a state nobody can confirm.
             for r in &refused {
                 map.remove(&r.pool);
             }
-            let status = if full { ReconstructionStatus::Verified } else { prior };
-            ((), status)
-        });
-        Ok(refused)
+            let status =
+                if full && w.last_gap <= started { ReconstructionStatus::Verified } else { status };
+            (Ok(refused), status)
+        })
     }
 }

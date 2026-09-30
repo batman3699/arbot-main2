@@ -68,6 +68,20 @@ pub trait TemplatePricer {
 
     /// The route this template commits to, for the proposal.
     fn commitment(&self, id: RouteId) -> Option<RouteCommitment>;
+
+    /// The fingerprint a proposal for this template commits to. Engine C asks
+    /// **before** pricing the template.
+    ///
+    /// The default is the event's own. A pricer over live state narrows the venue
+    /// versions to the template's own pools: last-mile revalidation compares them
+    /// by equality before signing, and an event's describe only the pool that
+    /// moved. Read before pricing, they are no newer than any state the proposal
+    /// is priced against, so a write at any point after is one last-mile sees —
+    /// where a reading taken after pricing would absorb a write that landed
+    /// during it, and pass a ticket priced against state that had moved.
+    fn route_fingerprint(&self, _id: RouteId, at: &StateFingerprint) -> StateFingerprint {
+        at.clone()
+    }
 }
 
 /// One template that could not be traded, and `apex-math`'s reason.
@@ -161,6 +175,9 @@ impl FiniteSizeEngine {
             // shape as the frontier's chain filter and the two guards Task 7.2
             // removed. `apex-math`'s `best_size_returns_ok_only_for_a_gain` pins
             // the contract at its source, which is the honest place for it.
+            //
+            // The fingerprint first: see `TemplatePricer::route_fingerprint`.
+            let fingerprint = pricer.route_fingerprint(*id, &event.fingerprint);
             match pricer.best_size(*id, &event.fingerprint, self.per_route) {
                 Ok(best) => {
                     let Some(template) = frontier.get(*id) else { continue };
@@ -169,7 +186,7 @@ impl FiniteSizeEngine {
                         chain: template.chain,
                         route,
                         venue_set: venues_of(template),
-                        state_fingerprint: event.fingerprint.clone(),
+                        state_fingerprint: fingerprint,
                         found_at: event.observed_at,
                         origin: ProposalOrigin::FiniteSize,
                         flash_source: flash_source_of(template),

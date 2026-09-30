@@ -9,7 +9,7 @@
 use alloy_primitives::{address, hex, keccak256, Address, U256};
 use apex_chain::rpc::{RpcError, RpcTransport};
 use apex_runtime::live::abi::{self, selector, MULTICALL3};
-use apex_runtime::live::book::{PoolBook, Unloadable, SwapApplied};
+use apex_runtime::live::book::{PoolBook, ReloadError, SwapApplied, Unloadable};
 use apex_runtime::live::inventory::{self, PoolSpec, UniverseFilter, Venue};
 use apex_runtime::live::reads::ChainReads;
 use apex_types::state::ReconstructionStatus;
@@ -152,12 +152,17 @@ fn the_inventory_applies_the_census_filters() {
 /// `(target, calldata) -> return data`.
 type Table = BTreeMap<(Address, Vec<u8>), Vec<u8>>;
 
+/// Something that happens while a read is in flight.
+type DuringRead = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
 /// A Multicall3 node that answers each sub-call from a table, and reports a
 /// failure for anything it does not know. Also answers `eth_getCode`.
 #[derive(Default)]
 struct Scripted {
     answers: Mutex<Table>,
     calls: Mutex<usize>,
+    /// Run once, inside the next `eth_call`, before it is answered.
+    during_read: Mutex<Option<DuringRead>>,
 }
 
 impl Scripted {
@@ -209,6 +214,10 @@ impl RpcTransport for Scripted {
         match method {
             "eth_getCode" => Ok(json!("0x6080")),
             "eth_call" => {
+                let during = self.during_read.lock().unwrap().take();
+                if let Some(f) = during {
+                    f.await;
+                }
                 assert_eq!(params[0]["to"].as_str().unwrap().parse::<Address>().unwrap(), MULTICALL3);
                 let data = hex::decode(params[0]["data"].as_str().unwrap()).unwrap();
                 let answers = self.answers.lock().unwrap();
@@ -387,6 +396,8 @@ async fn a_gap_is_rebuilding_until_a_full_reload() {
 
     book.mark_rebuilding();
     assert_eq!(book.status(), ReconstructionStatus::Rebuilding);
+    book.apply_swap(WETH_USDC, U256::from(1u64) << 96, 42, -150_000, (102, 0));
+    assert_eq!(book.status(), ReconstructionStatus::Rebuilding, "a swap ended the gap");
     book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
     assert_eq!(book.status(), ReconstructionStatus::Rebuilding, "a partial reload is not a full one");
     book.reload(&reads, &[], 121).await.unwrap();
@@ -395,4 +406,107 @@ async fn a_gap_is_rebuilding_until_a_full_reload() {
     assert_eq!(p.state.tick, TICK as i32, "re-read from the chain");
     assert_eq!(p.block, 121);
     assert!(p.ladder_covers_price());
+}
+
+/// A 128-bit signed word is all of `i128`. Computing its range the way narrower
+/// widths do shifts a 1 into the sign bit and overflows — found when swap
+/// amounts, the first 128-bit signed words decoded, reached it.
+#[test]
+fn a_full_width_signed_word_decodes_at_both_extremes() {
+    for v in [i128::MIN, -1, 0, 1, i128::MAX] {
+        let mut w = if v < 0 { [0xffu8; 32] } else { [0u8; 32] };
+        w[16..].copy_from_slice(&v.to_be_bytes());
+        assert_eq!(abi::word_int(&w, 0, 128), Some(v));
+    }
+}
+
+/// A read at block `n` is the state after every log in `n`. The confirmed copy
+/// of a swap from that block, arriving after the read, is already in it — and
+/// applying it would roll the pool back to the middle of the block.
+#[tokio::test]
+async fn a_log_from_the_block_a_pool_was_read_at_is_already_in_it() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let (book, _) = book(node).await; // read at block 100
+    let price = U256::from(4_100_000_000_000_000_000_000_000u128);
+
+    assert_eq!(book.apply_swap(WETH_USDC, price, 7, -197_348, (100, 9)), SwapApplied::Stale);
+    assert_eq!(book.get(WETH_USDC).unwrap().state.tick, TICK as i32, "rolled back into block 100");
+    assert_eq!(book.apply_swap(WETH_USDC, price, 7, -197_348, (101, 0)), SwapApplied::Updated);
+}
+
+/// **A read never rolls back a swap already applied.** A reload reads at the
+/// latest sealed block; a preconfirmed swap from the block after keeps its
+/// price and position, and the pool takes the fresh read's ladder and balances.
+#[tokio::test]
+async fn a_reload_keeps_a_newer_swap_and_takes_the_fresh_read() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    let price = U256::from(4_100_000_000_000_000_000_000_000u128);
+
+    // Preconfirmed, in block 121.
+    assert_eq!(book.apply_swap(WETH_USDC, price, 7, -197_348, (121, 3)), SwapApplied::Updated);
+    // By block 120 the pool's WETH holding had doubled.
+    node.set(WETH, abi::call_address(selector::BALANCE_OF, WETH_USDC), w(U256::from(2 * 10u128.pow(21))));
+    let before = book.versions_for(&[WETH_USDC]);
+
+    book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
+    let p = book.get(WETH_USDC).unwrap();
+    assert_eq!((p.state.tick, p.state.liquidity, p.last_log), (-197_348, 7, Some((121, 3))), "the swap was rolled back");
+    assert_eq!(p.state.balance0, Some(ethers_core::types::U256::from(2 * 10u128.pow(21))), "the fresh read was not taken");
+    // Moved, and forward: a version that went back could fall behind another
+    // pool's on the same route and stop moving it.
+    let newest = |m: BTreeMap<apex_types::ids::VenueId, u64>| m.into_values().max().unwrap();
+    assert!(newest(book.versions_for(&[WETH_USDC])) > newest(before), "the ladder and balances changed");
+
+    // Its confirmed copy is still not newer.
+    assert_eq!(book.apply_swap(WETH_USDC, price, 7, -197_348, (121, 3)), SwapApplied::Stale);
+}
+
+/// A gap marked **while** a full reload is reading keeps the book `Rebuilding`:
+/// the logs it dropped may postdate the read (INV-08). A full reload that begins
+/// after the gap clears it.
+#[tokio::test]
+async fn a_gap_during_a_full_reload_keeps_the_book_rebuilding() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let book = Arc::new(PoolBook::load(&reads, &[spec()], 100).await.unwrap().0);
+
+    let b = Arc::clone(&book);
+    *node.during_read.lock().unwrap() = Some(Box::pin(async move { b.mark_rebuilding() }));
+    book.reload(&reads, &[], 120).await.unwrap();
+    assert_eq!(book.status(), ReconstructionStatus::Rebuilding, "a read that may predate the gap cleared it");
+
+    book.reload(&reads, &[], 121).await.unwrap();
+    assert_eq!(book.status(), ReconstructionStatus::Verified);
+}
+
+/// A read older than one the book holds is refused whole — at the start, and at
+/// the write if a newer reload landed while this one was reading.
+#[tokio::test]
+async fn a_reload_older_than_the_books_newest_read_is_refused() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let book = Arc::new(PoolBook::load(&reads, &[spec()], 100).await.unwrap().0);
+
+    book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
+    assert_eq!(
+        book.reload(&reads, &[WETH_USDC], 110).await.unwrap_err(),
+        ReloadError::Older { block: 110, newest: 120 }
+    );
+
+    // A newer reload lands while this one reads.
+    let (b, n) = (Arc::clone(&book), Arc::clone(&node));
+    *node.during_read.lock().unwrap() = Some(Box::pin(async move {
+        b.reload(&ChainReads::new(n), &[WETH_USDC], 130).await.unwrap();
+    }));
+    assert_eq!(
+        book.reload(&reads, &[WETH_USDC], 125).await.unwrap_err(),
+        ReloadError::Older { block: 125, newest: 130 }
+    );
+    assert_eq!(book.get(WETH_USDC).unwrap().block, 130, "the newer read stands");
 }

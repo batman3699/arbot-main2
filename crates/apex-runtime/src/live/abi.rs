@@ -148,6 +148,12 @@ pub fn word_int(data: &[u8], i: usize, bits: u32) -> Option<i128> {
     if w[..16].iter().any(|b| *b != fill) {
         return None;
     }
+    // At 128 bits the range is all of `i128`, and computing it as below would
+    // shift a 1 into the sign bit and overflow — which is how swap amounts,
+    // the first 128-bit signed words decoded, found it.
+    if bits >= 128 {
+        return Some(low);
+    }
     let max = (1i128 << (bits - 1)) - 1;
     let min = -(1i128 << (bits - 1));
     (min..=max).contains(&low).then_some(low)
