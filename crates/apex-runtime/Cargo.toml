@@ -25,6 +25,9 @@ apex-chain = { path = "../apex-chain" }
 apex-config = { path = "../apex-config" }
 apex-obs = { path = "../apex-obs" }
 apex-econ = { path = "../apex-econ" }
+apex-math = { path = "../apex-math" }
+# apex-econ and apex-math speak ethers U256; apex_types::compat is the bridge.
+ethers-core = "2.0.14"
 apex-risk = { path = "../apex-risk" }
 apex-search = { path = "../apex-search" }
 apex-venues = { path = "../apex-venues" }

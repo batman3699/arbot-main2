@@ -5698,7 +5698,7 @@ I had conflated "`Commitments` is wired" with "everything else is wired". The fi
 So Task 8.5 is not "blocked on wall-clock time". It is blocked on three ports that can be built and three inputs that cannot.
 
 - [x] **`RiskGate`** — `crates/apex-runtime/src/risk.rs`, delivered 2026-09-30. See below.
-- [ ] **`Economics`** — over `apex-econ`'s sizing, cost model and EV.
+- [x] **`Economics`** — over `apex-econ`'s sizing, cost model and EV. **Delivered 2026-09-30**, `crates/apex-runtime/src/econ.rs`, 11 tests. See below.
 - [ ] **`Simulator`** — over `apex-sim::tier0`. §20 says a lower tier may only *reject*, which makes Tier 0 the honest shadow-mode simulator: no node, and it cannot admit something a higher tier would have caught.
 - [ ] `Signer`, `LiveReader`, `SettlementFeed` — external inputs.
 - [ ] Then the 14-day run, against a criterion 1 that can now fail.
@@ -5728,6 +5728,27 @@ So Task 8.5 is not "blocked on wall-clock time". It is blocked on three ports th
 **The gate does not record.** `CircuitBreaker::record_failure` and `LossLedger::record` are the write path and belong where a terminal outcome is known. A gate that also recorded would need `&mut self`, and a gate holding a write lock is a gate on the capture path that a reader waits behind (§2.4). One exception is stated rather than hidden: the breaker's `current_status` takes `&mut self` because it evicts expired loss windows as it reads, so there *is* a lock on the read path — acceptable only because the alternative is a breaker reporting stale windows, and a breaker that under-reports loss is worse than a microsecond.
 
 **All nine clauses are asserted reachable.** A clause no candidate can fail is a clause nothing tests — the same argument as Task 8.3's surviving `sums_to` mutation.
+
+#### `Economics`: where the numbers come from, and where they deliberately do not
+
+**The size is minted in one place and it is not this module.** `apex_econ::sizing::discrete::refine` is the only function in the workspace that can produce a `DiscreteSize`, and the proposal's `size_hint` is an **input** to that search rather than a substitute for it — Engine C found a size against the state *it* saw, and the state has moved. `the_size_is_refined_rather_than_taken_from_the_hint` drives the same route with a hint of 1 and a hint of `u128::MAX` and requires the same answer.
+
+**§14.1's priors are pessimistic, and each number has a source.** The set is the conservative subset — `SameStateImmediate`, `SameStateOneFlashblockLater`, `CompetingSamePoolSwapFirst`, `VenueRevert` — flagged `PriorSource::Unmeasured`, because a measured distribution and a guessed one produce the same `f64` and must never be read as the same claim.
+
+Most of the probability mass is deliberately **not** on the no-interference world: the event census found 88% of net-positive samples followed a swap and the quiet-block control had a median of −1.64 bps, so a model putting the mass on "nothing interferes" is contradicted by this repository's own measurement. `the_priors_do_not_assume_nothing_interferes` pins it. A competitor arriving first keeps 10% of the gross — the census measured the cheap frontier as efficient to within ~0.18 bps, which is what "somebody else got there" costs. And **a revert makes no gross and still pays the cost**: a scenario whose profit was zero would make a revert look free.
+
+**`Pr(Π > 0)` and the EV come from the same set**, which is the structural reason they cannot disagree about which world distribution they describe — the defect below is what made that worth enforcing rather than assuming.
+
+**Four things it refuses to claim:**
+
+- **`certificate_status` is `Heuristic`, never `Proven`.** §16.2: never silently promote a heuristic allocation to optimal. Golden section plus a discrete climb is not a certified optimum; §16's `certify` produces `Proven` and arrives in Phase 12. INV-17 then keeps this out of live dispatch — which is correct for a shadow run, whose job is to measure what the search finds rather than trade it.
+- **`capture_probability` is 0.0.** P(lands) is §21.2's capture curve and Phase 9's to fit. Zero says nothing; a plausible 0.6 would say something nobody measured.
+- **The L1 fee is `CompressedSize::Estimated`, so it is never authoritative** — even against a receipt-validated model, because `is_authoritative` requires both and a validated model fed an estimated size is still an estimate. The real fastlz size comes from `apex-exec`'s encoder.
+- **`priority_fee` is zero.** §4.5 says a priority fee on Base ranks within the sequencer's window; nothing has measured what it buys, and a fabricated bid is a cost the EV would then have to clear.
+
+**One cost accepted with its reasoning stated:** each of the four §46.2 stages evaluates the same curve, so a join runs four evaluations where one would do. A shared cache between them would be shared mutable state on the capture path (INV-11), and §46.2 requires the stages to be *independently* runnable or the plane cannot join them concurrently. Whether the duplication is worth the concurrency is a measurement Phase 8's benchmark table settles.
+
+**Nine mutations, one survived.** `the_failure_branch_is_priced` asserted `expected_failure_cost > 0`, which **gas alone satisfies** — so removing the L1 term from the failure branch passed. `apex-econ`'s own comment is the claim being tested: *"with the L1 fee inside the parentheses, not outside, because it is paid whether or not the execution succeeds."* The assertion is quantitative now — the figure must exceed the gas-only value by the L1 share — and the mutation fails. Caught on re-run, along with: the size taken from the hint; the prior flagged `Measured`; the same-state world taking most of the mass; a revert profiting zero; the candidate claiming `Proven`; `capture_probability` guessed; the L1 size claimed `Measured`; and calldata not growing with hop count.
 
 #### A defect shipped and fixed within the hour: `Pr(Π > 0)` is not `P(lands)`
 
