@@ -521,6 +521,59 @@ async fn a_reload_older_than_the_books_newest_read_is_refused() {
     assert_eq!(book.get(WETH_USDC).unwrap().block, 130, "the newer read stands");
 }
 
+/// **A full reload reads the universe.** A pool one failed read removed comes
+/// back at the next full reload that reads it; a partial reload, which reads
+/// only what the book holds, does not bring it back.
+#[tokio::test]
+async fn a_pool_a_failed_read_removed_returns_at_the_next_full_reload() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let book = PoolBook::load(&reads, &[spec()], 100).await.unwrap().0;
+
+    let key = (WETH_USDC, abi::call0(selector::SLOT0));
+    let slot0 = node.answers.lock().unwrap().remove(&key).unwrap();
+    assert_eq!(book.reload(&reads, &[], 101).await.unwrap().len(), 1);
+    assert!(book.get(WETH_USDC).is_none(), "removed");
+
+    node.answers.lock().unwrap().insert(key, slot0);
+    assert!(book.reload(&reads, &[WETH_USDC], 102).await.unwrap().is_empty());
+    assert!(book.get(WETH_USDC).is_none(), "a partial reload read it");
+    assert!(book.reload(&reads, &[], 103).await.unwrap().is_empty());
+    assert_eq!(book.get(WETH_USDC).map(|p| p.block), Some(103));
+}
+
+/// And the universe is what the book was loaded with, not what it loaded: a
+/// pool that failed its first read is read again by the first full reload.
+#[tokio::test]
+async fn a_pool_refused_at_load_is_read_by_the_first_full_reload() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let key = (WETH_USDC, abi::call0(selector::SLOT0));
+    let slot0 = node.answers.lock().unwrap().remove(&key).unwrap();
+    let reads = ChainReads::new(node.clone());
+    let (book, refused) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    assert_eq!((book.len(), refused.len()), (0, 1));
+
+    node.answers.lock().unwrap().insert(key, slot0);
+    assert!(book.reload(&reads, &[], 101).await.unwrap().is_empty());
+    assert_eq!(book.len(), 1);
+}
+
+/// A book over snapshots a caller held — a replay — is built over those pools,
+/// and a full reload reads them.
+#[tokio::test]
+async fn a_book_over_held_snapshots_reloads_them() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let held = PoolBook::load(&reads, &[spec()], 100).await.unwrap().0.get(WETH_USDC).unwrap();
+    let book = PoolBook::from_snapshots([(*held).clone()], ReconstructionStatus::Rebuilding);
+    assert!(book.reload(&reads, &[], 101).await.unwrap().is_empty());
+    assert_eq!(book.get(WETH_USDC).map(|p| p.block), Some(101));
+    assert_eq!(book.status(), ReconstructionStatus::Verified);
+}
+
 // ------------------------------------------------------------------ Slipstream's fee
 
 const SLIP: Address = address!("b2cc224c1c9feE385f8ad6a55b4d94E92359DC59");

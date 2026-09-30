@@ -197,6 +197,9 @@ pub enum SwapApplied {
 pub struct PoolBook {
     pools: Versioned<BTreeMap<Address, Arc<PoolSnapshot>>>,
     writer: Mutex<WriterState>,
+    /// Every pool the book was built over, whether or not it holds it now: what
+    /// a full reload reads.
+    universe: Vec<PoolSpec>,
 }
 
 /// What the writer lock guards besides the right to write.
@@ -458,7 +461,10 @@ impl PoolBook {
         block: u64,
     ) -> Result<(Self, Vec<Unloaded>), ReadError> {
         let (pools, refused) = Self::read(reads, specs, block).await?;
-        Ok((Self::from_snapshots(pools.into_values(), ReconstructionStatus::Verified), refused))
+        let book = Self::from_snapshots(pools.into_values(), ReconstructionStatus::Verified);
+        // The refused as well: a pool that failed to read at boot is read again
+        // by the first full reload.
+        Ok((Self { universe: specs.to_vec(), ..book }, refused))
     }
 
     async fn read(
@@ -566,10 +572,12 @@ impl PoolBook {
                 newest_read = newest_read.max(p.block);
                 (p.spec.pool, Arc::new(p))
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        let universe = pools.values().map(|p| p.spec.clone()).collect();
         Self {
             pools: Versioned::new(pools, provenance),
             writer: Mutex::new(WriterState { seq: 0, last_gap: 0, newest_read }),
+            universe,
         }
     }
 
@@ -743,8 +751,14 @@ impl PoolBook {
         });
     }
 
-    /// Re-read `pools` at `block` and replace them; every pool if `pools` is
-    /// empty.
+    /// Re-read `pools` at `block` and replace them; if `pools` is empty, every
+    /// pool the book was built over.
+    ///
+    /// **A full reload reads the universe, not what the book still holds.** A
+    /// pool that fails a read is removed, and a full reload over only the pools
+    /// left would never read it again: a 14-day run's universe would erode one
+    /// transient failure at a time. So a removed pool comes back at the next
+    /// full reload that reads it.
     ///
     /// **A read never rolls back a swap already applied.** A reload reads at the
     /// latest sealed block, and a pool may already hold a preconfirmed swap from
@@ -768,13 +782,12 @@ impl PoolBook {
         block: u64,
     ) -> Result<Vec<Unloaded>, ReloadError> {
         let started = self.writer.lock().unwrap_or_else(|p| p.into_inner()).seq;
-        let current = self.snapshot();
         let full = pools.is_empty();
-        let specs: Vec<PoolSpec> = current
-            .values()
-            .filter(|p| full || pools.contains(&p.spec.pool))
-            .map(|p| p.spec.clone())
-            .collect();
+        let specs: Vec<PoolSpec> = if full {
+            self.universe.clone()
+        } else {
+            self.snapshot().values().filter(|p| pools.contains(&p.spec.pool)).map(|p| p.spec.clone()).collect()
+        };
         let (fresh, refused) = Self::read(reads, &specs, block).await?;
         self.write(|map, w, status| {
             if block < w.newest_read {
