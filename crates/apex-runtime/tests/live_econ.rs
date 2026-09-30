@@ -263,9 +263,10 @@ fn a_revert_scenario_still_pays_the_cost() {
 async fn the_profit_probability_and_the_ev_share_one_distribution() {
     let econ = econ_over(200, L1FeeModel::unvalidated());
     let p = proposal(2);
+    let size = econ.size(&p).await.expect("sizable");
     let refinement = Refinement {
-        expected_output: AlloyU256::from(2_000_000_000_000_000u64),
-        input_amount: econ.size(&p).await.expect("sizable"),
+        expected_output: size.get() + AlloyU256::from(2_000_000_000_000_000u64),
+        input_amount: size,
         robustness_margin: econ.scenarios(&p).await.expect("scenarios"),
         costs: econ.refresh_costs(&p).await.expect("costs"),
     };
@@ -289,9 +290,10 @@ async fn the_profit_probability_and_the_ev_share_one_distribution() {
 async fn an_assembled_candidate_is_never_proven() {
     let econ = econ_over(200, L1FeeModel::validated(12, 50));
     let p = proposal(2);
+    let size = econ.size(&p).await.expect("sizable");
     let refinement = Refinement {
-        expected_output: AlloyU256::from(2_000_000_000_000_000u64),
-        input_amount: econ.size(&p).await.expect("sizable"),
+        expected_output: size.get() + AlloyU256::from(2_000_000_000_000_000u64),
+        input_amount: size,
         robustness_margin: 0.3,
         costs: econ.refresh_costs(&p).await.expect("costs"),
     };
@@ -407,10 +409,11 @@ async fn a_candidate_that_cannot_pay_for_itself_is_screened_out() {
     let p = proposal(2);
     let costs = econ.refresh_costs(&p).await.expect("costs");
 
+    let size = econ.size(&p).await.expect("sizable");
     // A gross of 1 wei against a real Base cost.
     let thin = Refinement {
-        expected_output: AlloyU256::from(1u64),
-        input_amount: econ.size(&p).await.expect("sizable"),
+        expected_output: size.get() + AlloyU256::from(1u64),
+        input_amount: size,
         robustness_margin: 0.3,
         costs: costs.clone(),
     };
@@ -423,8 +426,8 @@ async fn a_candidate_that_cannot_pay_for_itself_is_screened_out() {
     // conservative total assembles. Without it, "the screen refuses" is satisfied
     // by a screen that refuses everything.
     let fat = Refinement {
-        expected_output: AlloyU256::from(500_000_000_000_000u64),
-        input_amount: econ.size(&p).await.expect("sizable"),
+        expected_output: size.get() + AlloyU256::from(500_000_000_000_000u64),
+        input_amount: size,
         robustness_margin: 0.3,
         costs,
     };
@@ -454,10 +457,11 @@ async fn the_screen_prices_at_the_conservative_total() {
         + costs.dex_fees
         + costs.expected_failure_cost;
 
+    let size = econ.size(&p).await.expect("sizable");
     // A gross that covers p50 but not p99 must be screened out.
     let between = Refinement {
-        expected_output: AlloyU256::from(at_p50 + non_gas + 1),
-        input_amount: econ.size(&p).await.expect("sizable"),
+        expected_output: size.get() + AlloyU256::from(at_p50 + non_gas + 1),
+        input_amount: size,
         robustness_margin: 0.3,
         costs: costs.clone(),
     };
@@ -469,10 +473,38 @@ async fn the_screen_prices_at_the_conservative_total() {
 
     // And one that covers p99 passes.
     let above = Refinement {
-        expected_output: AlloyU256::from(at_p99 + non_gas + 1),
-        input_amount: econ.size(&p).await.expect("sizable"),
+        expected_output: size.get() + AlloyU256::from(at_p99 + non_gas + 1),
+        input_amount: size,
         robustness_margin: 0.3,
         costs,
     };
     assert!(econ.assemble(&p, above).is_ok());
+}
+
+/// **The seam between `reprice` and `assemble`.** `Refinement::expected_output`
+/// is `reprice`'s answer: the curve's *output* at the refined size, input
+/// included. The gross is what the cycle returns **above what it took**.
+///
+/// The first `assemble` used `expected_output` as the gross itself, which made
+/// every candidate look profitable by roughly its own size — a 1-WETH cycle
+/// returning 1.002 WETH read as a 1.002-WETH profit. Every other test here builds
+/// a `Refinement` by hand with a small `expected_output`, so the join the plane
+/// actually runs was never exercised; this one runs it.
+#[tokio::test]
+async fn the_gross_is_what_the_cycle_returns_above_what_it_took() {
+    let econ = econ_over(200, L1FeeModel::unvalidated());
+    let p = proposal(2);
+    let r = apex_runtime::workers::refine_concurrently(&econ, &p).await.expect("refines");
+    let (output, input) = (r.expected_output, r.input_amount.get());
+    assert!(output > input, "the fixture spread is profitable");
+    let c = econ.assemble(&p, r).expect("assembles");
+
+    assert_eq!(c.gross_profit, output - input, "gross is output minus input");
+    assert!(
+        c.gross_profit < input / AlloyU256::from(10u64),
+        "a 2% spread cannot gross 10% of the size: {} on {}",
+        c.gross_profit,
+        input
+    );
+    assert!(c.expected_net_profit < i128::try_from(output - input).unwrap());
 }

@@ -5869,6 +5869,12 @@ Most of the probability mass is deliberately **not** on the no-interference worl
 
 **Nine mutations, one survived.** `the_failure_branch_is_priced` asserted `expected_failure_cost > 0`, which **gas alone satisfies** — so removing the L1 term from the failure branch passed. `apex-econ`'s own comment is the claim being tested: *"with the L1 fee inside the parentheses, not outside, because it is paid whether or not the execution succeeds."* The assertion is quantitative now — the figure must exceed the gas-only value by the L1 share — and the mutation fails. Caught on re-run, along with: the size taken from the hint; the prior flagged `Measured`; the same-state world taking most of the mass; a revert profiting zero; the candidate claiming `Proven`; `capture_probability` guessed; the L1 size claimed `Measured`; and calldata not growing with hop count.
 
+#### A second defect, found wiring the live pricer: the gross was the whole output
+
+`refine_concurrently` fills `Refinement::expected_output` from `reprice`, which returns the curve's **output** at the refined size — input included. `assemble` used that as the **gross**, so a 1-WETH cycle returning 1.002 WETH read as a 1.002-WETH profit: every live candidate would have looked profitable by roughly its own size, and every downstream gate would have been checking a number that was not a profit. Found 2026-09-30 while building the `RouteCurves` the live run needs; no candidate had ever been produced from a real curve, because none existed.
+
+**Why nothing caught it:** every test built a `Refinement` by hand and called `assemble` directly, with a small `expected_output` meaning "the gross" — so the join the plane actually runs, `reprice` into `assemble`, was never exercised. `the_gross_is_what_the_cycle_returns_above_what_it_took` runs it; the hand-built tests now state the output as `input + gross`. The gross is exact only for a cycle denominated in the native token (the costs are wei), which is why the live frontier prices WETH-start cycles until `LiveEconomics` takes a token price.
+
 #### A defect shipped and fixed within the hour: `Pr(Π > 0)` is not `P(lands)`
 
 The first `LiveRiskGate` read `Candidate::capture_probability` for §2.1's robust-gate clause, because that was the only probability a `Candidate` carried. **They are different quantities.** `capture_probability` is §21.2's capture curve — will this land. §2.1's clause is `Pr(Π(a,s) > 0) ≥ p_min` — will it make money. `EligibilityContext` even names its source: *"from `ev::scenario::probability_of_profit_ppm`"*.

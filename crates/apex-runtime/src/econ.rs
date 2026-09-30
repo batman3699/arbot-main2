@@ -369,7 +369,22 @@ impl Economics for LiveEconomics {
 
     fn assemble(&self, p: &RouteProposal, r: Refinement) -> Result<Candidate, Decline> {
         let cost = cost_i128(&r.costs);
-        let gross = i128::try_from(to_u128(r.expected_output)).unwrap_or(i128::MAX);
+        // **The gross is what the cycle returns above what it took.**
+        // `expected_output` is `reprice`'s answer — the curve's OUTPUT at the
+        // refined size, input included. The first version used it as the gross
+        // itself, so a 1-WETH cycle returning 1.002 WETH read as a 1.002-WETH
+        // profit and every candidate looked profitable by roughly its own size.
+        // Every unit test built a `Refinement` by hand with a small
+        // `expected_output`, so the join the plane actually runs was never
+        // exercised; `the_gross_is_what_the_cycle_returns_above_what_it_took`
+        // runs it.
+        //
+        // Same token on both sides, and the costs are wei, so this is exact only
+        // for a cycle denominated in the native token — which is why the live
+        // frontier prices WETH-start cycles until this module takes a price.
+        let gross = i128::try_from(to_u128(r.expected_output))
+            .unwrap_or(i128::MAX)
+            .saturating_sub(i128::try_from(to_u128(r.input_amount.get())).unwrap_or(i128::MAX));
         let set = self.priors.scenario_set(gross, cost);
         let robust_ev = scenario_ev(&set, EthersU256::zero())
             .map_err(|e| Decline::Uncommittable { detail: format!("scenario set: {e:?}") })?;
