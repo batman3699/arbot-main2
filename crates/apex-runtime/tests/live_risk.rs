@@ -392,3 +392,41 @@ fn the_gate_does_not_record_what_it_sees() {
     assert!(gate.admit(&poor, &good_sim(&poor)).is_err());
     assert_eq!(gate.posture(), RiskPosture::Normal);
 }
+
+/// **§20's ladder is one-directional, and this is what enforces it across two
+/// modules.**
+///
+/// A Tier 0 screen transitions no state, repays no loan and checks no profit
+/// invariant. If it could satisfy the `Simulator` port it would have to invent
+/// `success`, `loan_repaid`, `profit_invariant_held` and `state_after` — and this
+/// gate reads three of those four.
+///
+/// So a Tier 0 answer **cannot authorize a live ticket**, and the clause that
+/// refuses it is `SimulationFidelity` rather than `ExecutionPathHealthy`: fidelity
+/// comes earlier in evaluation order, so the reported reason is "the tier that
+/// answered is too low" rather than a consequence of it. That distinction is what
+/// an operator reads off §33's histogram.
+#[test]
+fn a_tier_zero_answer_cannot_authorize_a_live_ticket() {
+    let gate = healthy_gate();
+    let c = admissible();
+
+    let mut tier0 = good_sim(&c);
+    tier0.tier = SimulationTier::Tier0Analytic;
+    // Even with everything else looking healthy.
+    assert!(tier0.success && tier0.loan_repaid && tier0.profit_invariant_held);
+
+    let err = gate.admit(&c, &tier0).expect_err("Tier 0 may escalate; it may not authorize");
+    let Decline::RiskRefused { rule } = err else { panic!("{err:?}") };
+    assert!(
+        rule.contains(Clause::SimulationFidelity.label()),
+        "the reason is the tier, not a consequence of it: {rule}"
+    );
+    assert!(
+        !rule.contains(Clause::ExecutionPathHealthy.label()),
+        "fidelity is evaluated first, so this is what the histogram records: {rule}"
+    );
+
+    // And the default policy is what draws the line: min_simulation_tier is 1.
+    assert_eq!(gate.policy().min_simulation_tier, 1, "Tier 0 is below the floor by default");
+}

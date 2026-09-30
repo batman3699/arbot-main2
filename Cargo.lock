@@ -307,6 +307,7 @@ dependencies = [
  "apex-obs",
  "apex-risk",
  "apex-search",
+ "apex-sim",
  "apex-state",
  "apex-types",
  "apex-venues",

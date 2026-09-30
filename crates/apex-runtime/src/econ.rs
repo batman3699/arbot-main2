@@ -376,6 +376,35 @@ impl Economics for LiveEconomics {
         let pr_profit = probability_of_profit_ppm(&set)
             .map_err(|e| Decline::Uncommittable { detail: format!("scenario set: {e:?}") })?;
 
+        // **§20's Tier 0 screen, and it belongs here.**
+        //
+        // The first draft put it in the plane, which had to *recover* the gas
+        // price by dividing `l2_execution_fee` by p50 gas — and integer division
+        // of a fee by a gas count gives zero whenever the fee is smaller, which
+        // silently turned the conservative total into its non-gas components. The
+        // screen needs a price, and this is the module that holds one.
+        //
+        // `Tier0Verdict::Escalate` carries its own warning: *"Not a prediction
+        // that it will succeed."* §20: *"A lower tier may only reject. It may
+        // never admit something a higher tier would have caught, because nothing
+        // runs after it to catch anything."* So a pass here means only that a
+        // higher tier is worth its cost — and it is why this cannot satisfy the
+        // `Simulator` port, which would require inventing `success`,
+        // `loan_repaid`, `profit_invariant_held` and `state_after`, three of which
+        // `LiveRiskGate` reads.
+        //
+        // Refusing during `assemble` means a screened-out candidate **never
+        // becomes a ticket**, so INV-01 has nothing to account for.
+        if let apex_sim::tier0::Tier0Verdict::Reject { .. } =
+            apex_sim::tier0::screen(&apex_sim::tier0::Tier0Input {
+                gross_profit_wei: gross,
+                cost: r.costs.clone(),
+                gas_price_wei: to_u128(self.costs.gas_price_wei),
+            })
+        {
+            return Err(Decline::NoProfitableSize);
+        }
+
         Ok(Candidate {
             // Derived from the route hash, so the same route against the same
             // state gets the same id and the miss ledger can join records across

@@ -391,3 +391,88 @@ async fn the_failure_branch_prices_the_l1_fee_it_pays_anyway() {
         "the excess {excess} should be the L1 share {l1_share}"
     );
 }
+
+/// **§20's Tier 0 screen, in the module that holds a gas price.**
+///
+/// The first draft put this in the plane, which had to *recover* the price by
+/// dividing `l2_execution_fee` by p50 gas — and integer division of a fee by a gas
+/// count gives **zero** whenever the fee is smaller, silently reducing the
+/// conservative total to its non-gas components. A test caught it by not firing.
+///
+/// A pass here is not a claim: `Tier0Verdict::Escalate` means only that a higher
+/// tier is worth its cost.
+#[tokio::test]
+async fn a_candidate_that_cannot_pay_for_itself_is_screened_out() {
+    let econ = econ_over(200, L1FeeModel::unvalidated());
+    let p = proposal(2);
+    let costs = econ.refresh_costs(&p).await.expect("costs");
+
+    // A gross of 1 wei against a real Base cost.
+    let thin = Refinement {
+        expected_output: AlloyU256::from(1u64),
+        input_amount: econ.size(&p).await.expect("sizable"),
+        robustness_margin: 0.3,
+        costs: costs.clone(),
+    };
+    assert_eq!(
+        econ.assemble(&p, thin).expect_err("1 wei cannot pay for a Base transaction"),
+        Decline::NoProfitableSize
+    );
+
+    // The complement, so the pair discriminates: a gross well above the
+    // conservative total assembles. Without it, "the screen refuses" is satisfied
+    // by a screen that refuses everything.
+    let fat = Refinement {
+        expected_output: AlloyU256::from(500_000_000_000_000u64),
+        input_amount: econ.size(&p).await.expect("sizable"),
+        robustness_margin: 0.3,
+        costs,
+    };
+    assert!(econ.assemble(&p, fat).is_ok());
+}
+
+/// **The screen prices at p99, not p50.** §23.1 holds a distribution because the
+/// risk gate prices at p99 while the EV uses p50, and `conservative_total` is the
+/// p99 reading. A screen using p50 would pass candidates the gate then refuses,
+/// spending a simulation on each.
+#[tokio::test]
+async fn the_screen_prices_at_the_conservative_total() {
+    let econ = econ_over(200, L1FeeModel::unvalidated());
+    let p = proposal(2);
+    let costs = econ.refresh_costs(&p).await.expect("costs");
+
+    let gas_price = 6_000_000u128;
+    let at_p50 = u128::from(costs.gas_used_distribution.p50.0) * gas_price;
+    let at_p99 = u128::from(costs.gas_used_distribution.p99.0) * gas_price;
+    assert!(at_p99 > at_p50, "the distribution must have a spread to test");
+
+    let non_gas = costs.l1_data_fee
+        + costs.priority_fee
+        + costs.builder_payment
+        + costs.sequencer_payment
+        + costs.flash_fee
+        + costs.dex_fees
+        + costs.expected_failure_cost;
+
+    // A gross that covers p50 but not p99 must be screened out.
+    let between = Refinement {
+        expected_output: AlloyU256::from(at_p50 + non_gas + 1),
+        input_amount: econ.size(&p).await.expect("sizable"),
+        robustness_margin: 0.3,
+        costs: costs.clone(),
+    };
+    assert_eq!(
+        econ.assemble(&p, between).expect_err("covers p50, not p99"),
+        Decline::NoProfitableSize,
+        "a screen using p50 would have passed this and spent a simulation on it"
+    );
+
+    // And one that covers p99 passes.
+    let above = Refinement {
+        expected_output: AlloyU256::from(at_p99 + non_gas + 1),
+        input_amount: econ.size(&p).await.expect("sizable"),
+        robustness_margin: 0.3,
+        costs,
+    };
+    assert!(econ.assemble(&p, above).is_ok());
+}

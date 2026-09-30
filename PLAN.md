@@ -5699,8 +5699,23 @@ So Task 8.5 is not "blocked on wall-clock time". It is blocked on three ports th
 
 - [x] **`RiskGate`** — `crates/apex-runtime/src/risk.rs`, delivered 2026-09-30. See below.
 - [x] **`Economics`** — over `apex-econ`'s sizing, cost model and EV. **Delivered 2026-09-30**, `crates/apex-runtime/src/econ.rs`, 11 tests. See below.
-- [ ] **`Simulator`** — over `apex-sim::tier0`. §20 says a lower tier may only *reject*, which makes Tier 0 the honest shadow-mode simulator: no node, and it cannot admit something a higher tier would have caught.
-- [ ] `Signer`, `LiveReader`, `SettlementFeed` — external inputs.
+- [x] **Tier 0 screen** — wired 2026-09-30 into `LiveEconomics::assemble`. **Not** as a `Simulator`; see below.
+- [ ] **`Simulator`** — **needs a node.** Corrected 2026-09-30: Tier 0 cannot stand in for it.
+- [ ] `Signer`, `LiveReader`, `SettlementFeed`, `Simulator` — external inputs (a key, a node).
+
+#### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
+
+I had this task down as "`Simulator` over `apex-sim::tier0`", on the reasoning that §20 lets a lower tier only *reject* and therefore makes Tier 0 the honest shadow simulator. **The reasoning was right and the conclusion was wrong.**
+
+`Tier0Verdict::Escalate` carries its own warning: *"Not a prediction that it will succeed."* A screen is arithmetic over an already-priced candidate — it transitions no state, repays no loan and checks no profit invariant. `SimulationResult` requires `success`, `loan_repaid`, `profit_invariant_held` and `state_after`, and **`LiveRiskGate::admit` reads three of those four**. Satisfying the port with a screen would mean fabricating exactly the facts the gate depends on, and `execution_path_healthy` would clear on no evidence.
+
+So §20's ladder is expressed as *order* rather than as one port: screen, then simulate. The screen lives in `LiveEconomics::assemble`, and a screened-out candidate therefore **never becomes a ticket** — INV-01 has nothing to account for.
+
+`a_tier_zero_answer_cannot_authorize_a_live_ticket` enforces the ladder across two modules: a Tier 0 result, with everything else looking healthy, is refused — and the reason is `SimulationFidelity` rather than `ExecutionPathHealthy`, because fidelity is evaluated first and that is what §33's histogram records.
+
+**A second correction, found by a test that failed to fire.** The screen was first placed in the plane, which had no gas price and *recovered* one by dividing `l2_execution_fee` by p50 gas. Integer division of a fee by a gas count gives **zero** whenever the fee is smaller, which silently reduced `conservative_total` to its non-gas components — so the screen passed a candidate it should have rejected, and the test caught it by not firing. It now lives in the module that holds a price. `the_screen_prices_at_the_conservative_total` pins the p99 reading: a gross covering p50 but not p99 is screened out, because a screen using p50 would pass candidates the gate then refuses and spend a simulation on each.
+
+**What this means for criterion 1.** A shadow run with only a screen admits no live tickets, because `EligibilityPolicy::min_simulation_tier` is 1 and a Tier 0 answer is below it. `SYSTEM_CAPTURE_ASSURANCE` is then `Undefined`, which — since the 2026-09-29 fix — cannot clear the 0.99 floor. So the 14-day run needs a real Tier 1 or Tier 2 simulator, which needs a node. The three "implementable now" ports are **two**, and that is the honest count.
 - [ ] Then the 14-day run, against a criterion 1 that can now fail.
 
 #### `RiskGate`: three gates in series, and the order is the design
