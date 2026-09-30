@@ -306,6 +306,7 @@ name = "apex-runtime"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "anyhow",
  "apex-capture",
  "apex-chain",
  "apex-config",
@@ -324,6 +325,7 @@ dependencies = [
  "ethers-signers",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

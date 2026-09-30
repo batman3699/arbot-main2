@@ -41,12 +41,16 @@ apex-state = { path = "../apex-state" }
 apex-exec = { path = "../apex-exec" }
 alloy-primitives = { version = "0.8", features = ["serde"] }
 async-trait = "0.1"
+# `apex_venues::cl_ticks::TickDataSource` returns `anyhow::Result`.
+anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 serde_json = "1"
 apex-math = { path = "../apex-math" }

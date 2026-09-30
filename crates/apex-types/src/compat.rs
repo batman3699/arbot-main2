@@ -40,6 +40,18 @@ pub fn u256_to_ethers(value: AlloyU256) -> EthersU256 {
     EthersU256::from_big_endian(&value.to_be_bytes::<32>())
 }
 
+/// alloy → ethers. Twenty bytes both sides, so exact in both directions, like
+/// the integers. Added with the live pool book (Task 8.5), the first code to
+/// hand chain-read addresses to `apex-math`'s ethers-typed pool state.
+pub fn address_to_ethers(value: alloy_primitives::Address) -> ethers_core::types::Address {
+    ethers_core::types::Address::from(value.into_array())
+}
+
+/// ethers → alloy.
+pub fn address_to_alloy(value: ethers_core::types::Address) -> alloy_primitives::Address {
+    alloy_primitives::Address::from(value.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
