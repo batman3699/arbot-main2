@@ -5749,6 +5749,18 @@ INV-17 guards *live dispatch*, and the design keeps it exactly that:
 
 **Found in passing:** `BaseAdapter::optimize_submission_cost` fills `SubmissionDecision::Submit::max_fee_per_gas_wei` from `TotalExecutionCost::l2_execution_fee`, which is a **total**, not a per-gas price. Nothing reads the field, so it is harmless today; it is recorded here so the first reader does not trust it.
 
+#### The signer: `Secret<LocalWallet>`, held to an independent implementation
+
+`apex-runtime::sign` — `LaneKey` (custody) and `LocalSigner` (the `Signer` port). In the wiring crate rather than `apex-capture`, because capture owns lanes and nonces and "the key itself is an operational input"; adding `ethers-signers` to capture's lean core would have been the wrong edge.
+
+- **Byte-for-byte against `cast mktx`.** ECDSA under RFC 6979 is deterministic, so two correct EIP-1559 signers given the same key and fields must agree exactly. `crates/apex-runtime/tests/fixtures/eip1559_signatures.json` was signed **offline** by foundry's alloy implementation with Anvil's published dev key (marked `secret-scan:allow` at the site): a minimal call, an 804-byte `startV2` payload, and a non-zero tip at a seven-digit nonce. All three reproduce exactly.
+- **The port refuses** a lane it holds no key for (the nonce belongs to that lane), a call committed for another chain (`wrong_chain_submission` is hard-zero), and a zero fee cap (no block includes it).
+- **INV-46:** the key is parsed once into a `Secret` and the string is not kept; `Debug` prints the address; a malformed key's error carries no part of the input — a key with one typo is still nearly a key.
+
+**Seven mutations; one survived and was deleted rather than tested.** A pre-check for "exactly 64 hex digits" changed nothing when removed, because the parser already refuses everything it refused. The parser is now the one validator. A second weakness was found before mutation: the end-to-end test's pending nonce was 0, so a signer that ignored the reservation passed; it is 7 now.
+
+**The operator's new key, checked 2026-09-30 by deriving its address through `LaneKey` (the key never left the process's environment):** it signs as `0x69d54e5fc0b9325d7250f0d0a11690327a3dd8a3`. That is **not** the executor owner, so §18.1's separation of trading and admin keys holds. Nonce 0, 0.001506 ETH. It is **not** in the deployed executor's `executors` allowlist — and the deployed executor's `owner()` is the BatchRouter `0x8e04…9954`, not `executor_owner` in `ops/inputs.yaml`. Neither matters to a shadow run, which sends nothing; both matter to a canary, which needs the Phase 5 redeploy (G-SEC-1) and `setExecutor(0x69d5…, true)` on it.
+
 **What a real `CallBuilder` needs, measured against the Phase 5 executor:** the `UNIV3` op calls **one** configured Uniswap `SwapRouter02`, so it cannot reach Aerodrome Slipstream — a different router with a different path format — and Slipstream is where the measured best routes are. The `GENERIC` op calls any allowlisted `(adapterId → target, selector)`, and **Slipstream's router can itself be that target**: register it and allow `exactInputSingle`, no new contract. That registration is deployment configuration, and it has to exist before a Slipstream route can execute.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port

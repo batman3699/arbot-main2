@@ -28,6 +28,9 @@ apex-econ = { path = "../apex-econ" }
 apex-math = { path = "../apex-math" }
 # apex-econ and apex-math speak ethers U256; apex_types::compat is the bridge.
 ethers-core = "2.0.14"
+# `LocalWallet`, which §18.4 names for Phase 6's in-process keys. Already in the
+# lockfile through the legacy crate, so this adds an edge and no new code.
+ethers-signers = "2.0.14"
 apex-risk = { path = "../apex-risk" }
 apex-sim = { path = "../apex-sim" }
 apex-search = { path = "../apex-search" }

@@ -319,6 +319,7 @@ dependencies = [
  "apex-venues",
  "async-trait",
  "ethers-core",
+ "ethers-signers",
  "serde",
  "serde_json",
  "tokio",

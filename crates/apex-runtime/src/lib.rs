@@ -40,6 +40,7 @@ pub mod plane;
 pub mod risk;
 pub mod search;
 pub mod shutdown;
+pub mod sign;
 pub mod supervise;
 pub mod workers;
 
