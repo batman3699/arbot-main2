@@ -16,7 +16,7 @@ use apex_econ::cost::failure::FailureProfile;
 use apex_econ::cost::l1_data::{L1FeeModel, L1FeeParameters};
 use apex_econ::ev::scenario::{PriorSource, ScenarioKind};
 use apex_math::finite_size::SizedRoute;
-use apex_runtime::econ::{ChainCosts, Evaluated, LiveEconomics, RouteCurves, ScenarioPriors};
+use apex_runtime::econ::{ChainCosts, Evaluated, FlashTerms, LiveEconomics, RouteCurves, ScenarioPriors};
 use apex_runtime::plane::{Decline, Economics, Refinement};
 use apex_search::frontier::{ProposalOrigin, RouteProposal};
 use apex_types::cost::{GasLimit, GasUsed};
@@ -507,4 +507,51 @@ async fn the_gross_is_what_the_cycle_returns_above_what_it_took() {
         input
     );
     assert!(c.expected_net_profit < i128::try_from(output - input).unwrap());
+}
+
+/// **A route that borrows says so, on its lender's measured terms.** The first
+/// version put `None` on every candidate while the plan borrowed from Balancer,
+/// so the commitment said "borrows nothing" about a trade that cannot run
+/// without a loan. A lender with no terms cannot be committed; a loan above the
+/// lender's holding is quoted unavailable, which the risk gate refuses.
+#[tokio::test]
+async fn a_borrowing_route_is_quoted_on_its_lenders_terms() {
+    use apex_types::flash::CallbackConstraints;
+    use apex_types::ids::{FlashProviderId, TokenId};
+    let weth = TokenId { chain: BASE, address: Address::repeat_byte(0x01) };
+    let terms = |provider: u16, available: AlloyU256| FlashTerms {
+        provider: FlashProviderId(provider),
+        asset: weth,
+        available,
+        callback: CallbackConstraints { repay_by_transfer: true, reentrancy_permitted: false, max_callback_gas: u64::MAX },
+    };
+    let mut p = proposal(2);
+    p.flash_source = Some(FlashProviderId(1));
+    let base = || econ_over(200, L1FeeModel::unvalidated());
+    let size = base().size(&p).await.expect("sizable");
+    let costs = base().refresh_costs(&p).await.expect("costs");
+    let refinement = || Refinement {
+        expected_output: size.get() + AlloyU256::from(2_000_000_000_000_000u64),
+        input_amount: size,
+        robustness_margin: 0.3,
+        costs: costs.clone(),
+    };
+
+    let refused = |e: Result<apex_types::candidate::Candidate, Decline>| {
+        matches!(e, Err(Decline::Uncommittable { detail }) if detail.contains("flash provider 1"))
+    };
+    assert!(refused(base().assemble(&p, refinement())), "no terms");
+    assert!(refused(base().with_flash(terms(2, AlloyU256::MAX)).assemble(&p, refinement())), "another lender's terms");
+
+    let q = base().with_flash(terms(1, AlloyU256::MAX)).assemble(&p, refinement()).unwrap().flash_source.unwrap();
+    assert_eq!((q.provider, q.asset, q.amount, q.premium), (FlashProviderId(1), weth, size.get(), AlloyU256::ZERO));
+    assert_eq!(q.availability_probability, 1.0);
+
+    let short = base().with_flash(terms(1, size.get() - AlloyU256::from(1u64)));
+    assert_eq!(short.assemble(&p, refinement()).unwrap().flash_source.unwrap().availability_probability, 0.0);
+    let exact = base().with_flash(terms(1, size.get()));
+    assert_eq!(exact.assemble(&p, refinement()).unwrap().flash_source.unwrap().availability_probability, 1.0, "the whole holding is lendable");
+
+    p.flash_source = None;
+    assert!(base().with_flash(terms(1, AlloyU256::MAX)).assemble(&p, refinement()).unwrap().flash_source.is_none());
 }

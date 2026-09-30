@@ -67,10 +67,14 @@ impl LiveCycle {
     }
 }
 
-impl SizedRoute for LiveCycle {
-    fn output(&self, amount_in: U256) -> Option<U256> {
+impl LiveCycle {
+    /// What each hop returns for `amount_in`, in order: the figures a plan's
+    /// steps are built from, by the same arithmetic the cycle is priced by.
+    /// `None` exactly when [`SizedRoute::output`] is.
+    pub fn hop_outputs(&self, amount_in: U256) -> Option<[U256; 2]> {
+        let mut out = [U256::zero(); 2];
         let mut amount = amount_in;
-        for (pool, zero_for_one) in &self.legs {
+        for (i, (pool, zero_for_one)) in self.legs.iter().enumerate() {
             let q =
                 quote_exact_input_multi_tick(&pool.state, &pool.ladder, amount, *zero_for_one, MAX_TICKS)?;
             // A partial fill is not a price for the whole input.
@@ -78,8 +82,15 @@ impl SizedRoute for LiveCycle {
                 return None;
             }
             amount = q.amount_out;
+            out[i] = amount;
         }
-        Some(amount)
+        Some(out)
+    }
+}
+
+impl SizedRoute for LiveCycle {
+    fn output(&self, amount_in: U256) -> Option<U256> {
+        self.hop_outputs(amount_in).map(|[_, last]| last)
     }
 
     fn fixed_cost(&self) -> U256 {

@@ -37,6 +37,15 @@ pub const WETH: Address = address!("4200000000000000000000000000000000000006");
 /// so the first real provider is 1.
 pub const BALANCER_FLASH: FlashProviderId = FlashProviderId(1);
 
+/// Balancer V2's vault on Base, the lender behind [`BALANCER_FLASH`]. The
+/// executor borrows from its own configured vault whatever a plan says; this is
+/// the address the plan names, and so the one its commitment covers.
+pub const BALANCER_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d566BF2C8");
+
+/// The adapter id `script/DeployAndConfigure.s.sol` registers Aerodrome
+/// Slipstream's router under, with `exactInputSingle` allowlisted.
+pub const SLIPSTREAM_ADAPTER: u16 = 1;
+
 /// Domain separator for [`route_hash`].
 pub const ROUTE_HASH_DOMAIN: &[u8] = b"apex.route.v1";
 

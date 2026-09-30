@@ -208,6 +208,25 @@ pub struct ChainCosts {
     pub gas_limit: GasLimit,
 }
 
+/// A lender's terms, read from the chain: what `assemble` quotes a route that
+/// borrows against (Task 8.5 R6).
+///
+/// **Fee-free lenders only**, which is why there is no fee field. A premium
+/// would have to enter the costs, and quoting it at zero would make a losing
+/// route look profitable (§19.1). Balancer V2 on Base charges nothing
+/// (`getFlashLoanFeePercentage()` = 0, read 2026-10-01); whoever builds these
+/// terms reads that again rather than trusting this comment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlashTerms {
+    pub provider: apex_types::ids::FlashProviderId,
+    pub asset: apex_types::ids::TokenId,
+    /// The lender's holding of `asset` when read. A loan above it is quoted
+    /// unavailable, which the risk gate refuses; last-mile check 9 reads it
+    /// again before signing.
+    pub available: AlloyU256,
+    pub callback: apex_types::flash::CallbackConstraints,
+}
+
 /// §46.2's four stages, over `apex-econ`.
 pub struct LiveEconomics {
     curves: std::sync::Arc<dyn RouteCurves>,
@@ -216,6 +235,7 @@ pub struct LiveEconomics {
     continuous: ContinuousBudget,
     refine: RefineBudget,
     strategy: apex_types::ids::StrategyId,
+    flash: Option<FlashTerms>,
 }
 
 impl LiveEconomics {
@@ -232,7 +252,51 @@ impl LiveEconomics {
             continuous: ContinuousBudget::default(),
             refine: RefineBudget::default(),
             strategy,
+            flash: None,
         }
+    }
+
+    /// The lender a borrowing route is quoted against. Without it, a proposal
+    /// that names a lender cannot be committed.
+    #[must_use]
+    pub const fn with_flash(mut self, terms: FlashTerms) -> Self {
+        self.flash = Some(terms);
+        self
+    }
+
+    /// The proposal's lender, quoted at this size.
+    ///
+    /// A route naming a lender these economics hold no terms for is refused:
+    /// the executor takes exactly one loan, and nothing here could say on what
+    /// terms. The first version put `None` on every candidate while the plan
+    /// borrowed from Balancer, so the commitment said "borrows nothing" about a
+    /// trade that could not run without a loan.
+    fn flash_quote(
+        &self,
+        p: &RouteProposal,
+        amount: AlloyU256,
+    ) -> Result<Option<apex_types::flash::FlashSourceQuote>, Decline> {
+        let Some(provider) = p.flash_source else { return Ok(None) };
+        let t = self.flash.filter(|t| t.provider == provider).ok_or_else(|| {
+            Decline::Uncommittable { detail: format!("no terms for flash provider {}", provider.0) }
+        })?;
+        Ok(Some(apex_types::flash::FlashSourceQuote {
+            provider,
+            asset: t.asset,
+            amount,
+            // Fee-free lenders only: see `FlashTerms`.
+            premium: AlloyU256::ZERO,
+            // Inside `ChainCosts::success_gas`, which is the whole settlement's,
+            // loan included — zero here rather than counted twice.
+            gas_overhead: 0,
+            callback_constraints: t.callback,
+            availability_probability: if amount <= t.available { 1.0 } else { 0.0 },
+            state_dependencies: Vec::new(),
+            // Unmeasured: no loan has been taken to measure it by. Nothing on
+            // the live path reads it — the flash router that ranks by it is not
+            // there, and the risk gate reads availability.
+            reliability_score: 1.0,
+        }))
     }
 
     pub const fn priors(&self) -> ScenarioPriors {
@@ -451,7 +515,7 @@ impl Economics for LiveEconomics {
             // ticket priced against state that had moved.
             state_fingerprint: p.state_fingerprint.clone(),
             state_age: apex_types::time::DurationNanos(0),
-            flash_source: None,
+            flash_source: self.flash_quote(p, r.input_amount.get())?,
             input_amount: r.input_amount,
             expected_output: r.expected_output,
             gross_profit: AlloyU256::from(u128::try_from(gross.max(0)).unwrap_or(u128::MAX)),

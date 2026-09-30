@@ -8,6 +8,7 @@
 
 pub mod abi;
 pub mod book;
+pub mod calls;
 pub mod feed;
 pub mod frontier;
 pub mod inventory;

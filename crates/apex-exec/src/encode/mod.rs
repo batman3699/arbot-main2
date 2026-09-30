@@ -5,11 +5,13 @@
 //! The executor decodes a different payload per `Op`, and each needs its own
 //! encoder and its own differential against the contract's decoder. This builds
 //! **UniV3** — the one `util::encode_univ3_path` already existed for, and the one
-//! the measured tradeable set on Base actually uses. Balancer and the generic
-//! adapter path are listed as not delivered rather than stubbed: a stub that
-//! produced plausible bytes would be decoded by the contract into a trade nobody
-//! described, which is precisely the failure the commitment exists to catch and
-//! a worse way to discover it.
+//! the measured tradeable set on Base actually uses — and the **generic adapter
+//! step**, with the one call the live cycles route through it: Aerodrome
+//! Slipstream's `exactInputSingle` (Task 8.5 R6). Balancer swaps are listed as
+//! not delivered rather than stubbed: a stub that produced plausible bytes
+//! would be decoded by the contract into a trade nobody described, which is
+//! precisely the failure the commitment exists to catch and a worse way to
+//! discover it.
 //!
 //! # Min-out is derived here and is never zero
 //!
@@ -44,6 +46,9 @@ pub enum EncodeError {
     /// A basis-point figure above 10,000 is not a slippage bound; it is a sign
     /// the caller meant something else.
     SlippageOutOfRange { bps: u32 },
+    /// Slipstream's `tickSpacing` is an `int24`. Refused rather than truncated:
+    /// a truncated spacing names a different pool.
+    TickSpacingOutOfRange { spacing: i32 },
 }
 
 impl std::fmt::Display for EncodeError {
@@ -53,6 +58,9 @@ impl std::fmt::Display for EncodeError {
             Self::FeeTooLarge { fee } => write!(f, "fee {fee} does not fit in three bytes"),
             Self::ZeroMinOut => f.write_str("min-out of zero accepts any output"),
             Self::SlippageOutOfRange { bps } => write!(f, "{bps} bps is not a slippage bound"),
+            Self::TickSpacingOutOfRange { spacing } => {
+                write!(f, "tick spacing {spacing} does not fit an int24")
+            }
         }
     }
 }
@@ -128,6 +136,80 @@ pub fn apply_slippage(expected_out: U256, slippage_bps: u32) -> Result<U256, Enc
     let kept = U256::from(10_000u64 - u64::from(slippage_bps));
     let min = expected_out.saturating_mul(kept) / U256::from(10_000u64);
     Ok(if min.is_zero() { U256::from(1u64) } else { min })
+}
+
+/// `abi.encode(uint16 adapterId, address token, uint256 approveAmount, bytes
+/// callData)` — the payload `_execAdapter` decodes.
+///
+/// The contract resolves `adapterId` to the address the owner registered and
+/// refuses a selector not allowlisted for it (INV-26), approves `token` to that
+/// adapter for `approveAmount`, then calls it with `callData`. Nothing here can
+/// name a target: that is the point of the registry (B-1).
+///
+/// `bytes` is the one dynamic member, so the head is four words with an offset
+/// of `0x80` — past all four — and the tail is its length and its bytes,
+/// right-padded to a word.
+pub fn generic_step(adapter_id: u16, token: Address, approve_amount: U256, call: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 * WORD + call.len() + padding(call.len()));
+    push_uint(&mut out, u64::from(adapter_id));
+    push_address(&mut out, token);
+    push_u256(&mut out, approve_amount);
+    push_uint(&mut out, (4 * WORD) as u64);
+    push_uint(&mut out, call.len() as u64);
+    out.extend_from_slice(call);
+    out.extend(std::iter::repeat_n(0u8, padding(call.len())));
+    out
+}
+
+/// `exactInputSingle((address,address,int24,address,uint256,uint256,uint256,uint160))`
+/// on Aerodrome Slipstream's `SwapRouter` — `0xa026383e`, which the router's
+/// deployed code contains (checked on Base 2026-09-30) and which the deploy
+/// script allowlists for adapter 1.
+pub const SLIPSTREAM_EXACT_INPUT_SINGLE: [u8; 4] = [0xa0, 0x26, 0x38, 0x3e];
+
+/// One Slipstream swap, exact input. A pool is its two tokens and its **tick
+/// spacing** — Slipstream keys pools by spacing, not fee.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlipstreamSwap {
+    pub token_in: Address,
+    pub token_out: Address,
+    pub tick_spacing: i32,
+    pub recipient: Address,
+    /// Unix seconds; the router refuses a later block.
+    pub deadline: u64,
+    pub amount_in: U256,
+    pub min_out: U256,
+}
+
+/// The router call for one Slipstream swap. Every member of the params tuple is
+/// static, so it is the selector and eight words, in declaration order.
+///
+/// `sqrtPriceLimitX96` is zero — no price limit — because the bound is
+/// `amountOutMinimum`, and a limit would turn an overtaken swap into a partial
+/// fill rather than a refusal. Min-out is refused at zero here as it is for
+/// UniV3, although Slipstream would accept it: a zero minimum accepts any
+/// output.
+pub fn slipstream_exact_input_single(s: &SlipstreamSwap) -> Result<Vec<u8>, EncodeError> {
+    if s.min_out.is_zero() {
+        return Err(EncodeError::ZeroMinOut);
+    }
+    if !(-(1 << 23)..(1 << 23)).contains(&s.tick_spacing) {
+        return Err(EncodeError::TickSpacingOutOfRange { spacing: s.tick_spacing });
+    }
+    let mut out = Vec::with_capacity(4 + 8 * WORD);
+    out.extend_from_slice(&SLIPSTREAM_EXACT_INPUT_SINGLE);
+    push_address(&mut out, s.token_in);
+    push_address(&mut out, s.token_out);
+    // Sign-extended to a word, as every signed ABI integer is.
+    let fill = if s.tick_spacing < 0 { 0xff } else { 0x00 };
+    out.extend_from_slice(&[fill; 28]);
+    out.extend_from_slice(&s.tick_spacing.to_be_bytes());
+    push_address(&mut out, s.recipient);
+    push_uint(&mut out, s.deadline);
+    push_u256(&mut out, s.amount_in);
+    push_u256(&mut out, s.min_out);
+    push_u256(&mut out, U256::ZERO);
+    Ok(out)
 }
 
 /// Assembles the executor's `PlanV2` from encoded steps.
