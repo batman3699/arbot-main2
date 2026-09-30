@@ -5738,6 +5738,19 @@ INV-17 guards *live dispatch*, and the design keeps it exactly that:
 
 **Open, and belongs to the shadow binary:** a shadow ticket that crashes between `Signed` and its close is handed over like any other (`may_be_on_chain`), and boot needs a `ChainOutcomeSource` that can say truthfully that nothing was sent. That is true of a shadow process only if its journal is its own, so the binary must keep the shadow journal separate from any live one.
 
+#### One call per ticket: what is simulated is what is signed
+
+**The ports could not see the transaction.** `Simulator::simulate` took a `Candidate` and `Signer::sign` an `ExecutionCommitment` — the §17.4 *dedup key*, which is not the calldata and not even the commitment the contract recomputes. A real simulator had nothing to simulate and a real signer nothing to sign; the test doubles had been fabricating both.
+
+- **`apex_exec::encode::start_v2_calldata`** ABI-encodes `startV2(PlanV2)` with `p.commitment` set. `PlanV2` is a nested dynamic tuple with two offset origins (the tuple's start, and each dynamic array's element area), which is exactly where a hand-written encoder is one word off — and one word off does not revert, it decodes as a different plan. **Held byte-for-byte to Solidity's own `abi.encodeCall`** through `crates/apex-exec/tests/fixtures/start_v2_calldata.json`: `test/StartV2Calldata.t.sol` asserts the fixture is still the compiler's encoding and decodes it field by field; the Rust test reproduces every byte. Payloads of 0, 2, 3, 32 and 33 bytes, empty arrays and every field at its maximum. Selector `0x6290aa48`, cross-checked with `cast sig`. Five offset mutations, each caught.
+- **`apex_exec::call::ExecutorCall`** can only be built from a `SignedPlan` — a plan whose commitment was recomputed and matched — and encodes its own calldata from it. `SignedPlan` now carries the executor and chain it was checked for, so the call's target is the checked deployment rather than an argument a caller could get wrong. `compile_fail` twins pin both.
+- **`CallBuilder` is a new port**; the plane builds the call once, after `Exacting`, and hands the same value to `Simulator::simulate(c, call, from)` and `Signer::sign(auth, call, gas_limit, fees)`. `from` is the assigned lane's address, because `startV2` is `onlyExecutor`. A route no executor op encodes is refused before any simulation is spent — as `VenueDisabled`, which tells an operator what to do.
+- **`FeeCaps` is per gas, by type.** `fee_caps(readings)` = twice the observed base fee, capped by the policy ceiling, no tip (§4.5: nothing has measured what a tip buys on Base).
+
+**Found in passing:** `BaseAdapter::optimize_submission_cost` fills `SubmissionDecision::Submit::max_fee_per_gas_wei` from `TotalExecutionCost::l2_execution_fee`, which is a **total**, not a per-gas price. Nothing reads the field, so it is harmless today; it is recorded here so the first reader does not trust it.
+
+**What a real `CallBuilder` needs, measured against the Phase 5 executor:** the `UNIV3` op calls **one** configured Uniswap `SwapRouter02`, so it cannot reach Aerodrome Slipstream — a different router with a different path format — and Slipstream is where the measured best routes are. The `GENERIC` op calls any allowlisted `(adapterId → target, selector)`, and **Slipstream's router can itself be that target**: register it and allow `exactInputSingle`, no new contract. That registration is deployment configuration, and it has to exist before a Slipstream route can execute.
+
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
 I had this task down as "`Simulator` over `apex-sim::tier0`", on the reasoning that §20 lets a lower tier only *reject* and therefore makes Tier 0 the honest shadow simulator. **The reasoning was right and the conclusion was wrong.**

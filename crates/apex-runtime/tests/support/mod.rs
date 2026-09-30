@@ -310,7 +310,12 @@ pub struct AlwaysSucceeds;
 
 #[async_trait::async_trait]
 impl Simulator for AlwaysSucceeds {
-    async fn simulate(&self, c: &Candidate) -> Result<SimulationResult, Decline> {
+    async fn simulate(
+        &self,
+        c: &Candidate,
+        _call: &apex_exec::call::ExecutorCall,
+        _from: Address,
+    ) -> Result<SimulationResult, Decline> {
         let mut r = SimulationResult {
             tier: SimulationTier::Tier2FullEvm,
             success: true,
@@ -355,11 +360,16 @@ impl ParkingSimulator {
 
 #[async_trait::async_trait]
 impl Simulator for ParkingSimulator {
-    async fn simulate(&self, c: &Candidate) -> Result<SimulationResult, Decline> {
+    async fn simulate(
+        &self,
+        c: &Candidate,
+        call: &apex_exec::call::ExecutorCall,
+        from: Address,
+    ) -> Result<SimulationResult, Decline> {
         if self.first.swap(false, Ordering::SeqCst) {
             self.release.notified().await;
         }
-        AlwaysSucceeds.simulate(c).await
+        AlwaysSucceeds.simulate(c, call, from).await
     }
 }
 
@@ -376,26 +386,57 @@ impl RiskGate for AlwaysAdmits {
     }
 }
 
-/// Signs by echoing the commitment hash. A real signer is `apex-exec` plus a
-/// key; what matters to the plane is that the bytes it dispatches are the bytes
-/// this produced, for the commitment it was handed (INV-06, INV-10).
+/// "Signs" by echoing the call: the payload is the calldata and its hash is the
+/// calldata's keccak. A real signer is a key; what matters to the plane is that
+/// the bytes it dispatches are the bytes this produced, for the call it was
+/// handed (INV-06, INV-10).
 pub struct EchoSigner;
 
 impl Signer for EchoSigner {
     fn sign(
         &self,
         auth: &apex_capture::revalidate::SigningAuthorization,
-        commitment: &apex_types::commitment::ExecutionCommitment,
+        call: &apex_exec::call::ExecutorCall,
         gas_limit: GasLimit,
+        _fees: apex_runtime::plane::FeeCaps,
     ) -> Result<SignedPayload, Decline> {
-        let hash = commitment.hash();
         Ok(SignedPayload {
-            chain: commitment.chain_id,
-            hash,
+            chain: ChainId(call.chain_id()),
+            hash: alloy_primitives::keccak256(call.data()),
             nonce: auth.nonce().get(),
             gas_limit,
-            raw: hash.to_vec(),
+            raw: call.data().to_vec(),
         })
+    }
+}
+
+/// Builds the call from the locked commitment: a plan with no loans and no
+/// steps, committed to the commitment's own executor and chain. Enough for the
+/// plane's plumbing -- one call, handed to both consumers -- and nothing a real
+/// executor would run, which the real builder's own tests are for.
+pub struct FixtureCalls;
+
+impl apex_runtime::plane::CallBuilder for FixtureCalls {
+    fn build(
+        &self,
+        _c: &Candidate,
+        k: &apex_types::commitment::ExecutionCommitment,
+    ) -> Result<apex_exec::call::ExecutorCall, Decline> {
+        let plan = apex_exec::commitment::PlanV2 {
+            loans: Vec::new(),
+            cycle_slippage_bps: 30,
+            steps: Vec::new(),
+            min_profit: k.min_profit,
+            declared_residue: U256::ZERO,
+            chain_id: k.chain_id.0,
+            deadline: k.deadline,
+        };
+        let declared =
+            apex_exec::commitment::plan_commitment(&plan, k.chain_id.0, k.executor_address);
+        let checked =
+            apex_exec::sign::SignedPlan::check(plan, declared, k.chain_id.0, k.executor_address)
+                .map_err(|e| Decline::Uncommittable { detail: e.to_string() })?;
+        Ok(apex_exec::call::ExecutorCall::from_checked(checked))
     }
 }
 
@@ -790,11 +831,12 @@ impl Signer for StatusWatchingSigner {
     fn sign(
         &self,
         auth: &apex_capture::revalidate::SigningAuthorization,
-        commitment: &apex_types::commitment::ExecutionCommitment,
+        call: &apex_exec::call::ExecutorCall,
         gas_limit: GasLimit,
+        fees: apex_runtime::plane::FeeCaps,
     ) -> Result<SignedPayload, Decline> {
         self.note("sign", auth.ticket());
-        EchoSigner.sign(auth, commitment, gas_limit)
+        EchoSigner.sign(auth, call, gas_limit, fees)
     }
 }
 

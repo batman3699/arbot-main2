@@ -35,12 +35,14 @@
 //! refusing a payload whose recomputed commitment differs from the ticket's, and
 //! the two halves catch different things.
 
+pub mod call;
 pub mod commitment;
 pub mod encode;
 pub mod sign;
 
+pub use call::ExecutorCall;
 pub use commitment::{plan_commitment, Loan, LoanProvider, Op, PlanV2, Step, PLAN_VERSION_V2};
-pub use encode::{EncodeError, PlanEncoder};
+pub use encode::{start_v2_calldata, EncodeError, PlanEncoder, START_V2_SELECTOR};
 pub use sign::{CommitmentMismatch, SignedPlan};
 
 /// Crate version, exposed so workspace wiring is testable.

@@ -273,6 +273,7 @@ async fn the_plane_runs_on_a_real_commitments() {
             30,
             1_800,
         )),
+        calls: Arc::new(FixtureCalls),
         signer: Arc::new(EchoSigner),
         live: Arc::new(FixedReadings(readings())),
         settlement: Arc::new(LandsAndFinalizes),
@@ -308,6 +309,7 @@ async fn an_unverified_venue_stops_the_plane_before_a_ticket_exists() {
         risk: Arc::new(AlwaysAdmits),
         // Nothing admitted.
         commitments: Arc::new(VenueCommitments::new(Vec::new(), 30, 1_800)),
+        calls: Arc::new(FixtureCalls),
         signer: Arc::new(EchoSigner),
         live: Arc::new(FixedReadings(readings())),
         settlement: Arc::new(LandsAndFinalizes),

@@ -85,14 +85,15 @@ impl Signer for CountingSigner {
     fn sign(
         &self,
         auth: &apex_capture::revalidate::SigningAuthorization,
-        commitment: &apex_types::commitment::ExecutionCommitment,
+        call: &apex_exec::call::ExecutorCall,
         gas_limit: GasLimit,
+        fees: apex_runtime::plane::FeeCaps,
     ) -> Result<SignedPayload, Decline> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some((clock, nanos)) = &self.spend {
             clock.advance(*nanos);
         }
-        EchoSigner.sign(auth, commitment, gas_limit)
+        EchoSigner.sign(auth, call, gas_limit, fees)
     }
 }
 
@@ -231,6 +232,7 @@ impl Rig {
             sim: Arc::new(AlwaysSucceeds),
             risk: Arc::clone(&self.risk),
             commitments: Arc::new(FixtureCommitments),
+            calls: Arc::new(FixtureCalls),
             signer: Arc::clone(&self.signer) as Arc<dyn Signer>,
             live: Arc::new(FixedReadings(self.readings.clone())),
             settlement: Arc::clone(&self.settlement) as Arc<dyn SettlementFeed>,

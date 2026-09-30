@@ -49,7 +49,13 @@ impl std::error::Error for CommitmentMismatch {}
 ///
 /// ```compile_fail
 /// use apex_exec::sign::SignedPlan;
-/// let forged = SignedPlan { plan: todo!(), commitment: todo!(), _sealed: () };
+/// let forged = SignedPlan {
+///     plan: todo!(),
+///     commitment: todo!(),
+///     executor: todo!(),
+///     block_chain_id: todo!(),
+///     _sealed: (),
+/// };
 /// ```
 ///
 /// The twin, differing only in going through the check:
@@ -76,6 +82,13 @@ impl std::error::Error for CommitmentMismatch {}
 pub struct SignedPlan {
     plan: PlanV2,
     commitment: B256,
+    /// The deployment the commitment was recomputed for. Carried so a call built
+    /// from this plan is aimed at exactly that executor on exactly that chain:
+    /// the commitment covers `address(this)` and `block.chainid`, so the same
+    /// plan sent anywhere else reverts, and letting a caller supply the target
+    /// separately would be letting it choose where.
+    executor: Address,
+    block_chain_id: u64,
     _sealed: (),
 }
 
@@ -91,7 +104,7 @@ impl SignedPlan {
         if recomputed != declared {
             return Err(CommitmentMismatch { declared, recomputed });
         }
-        Ok(Self { plan, commitment: declared, _sealed: () })
+        Ok(Self { plan, commitment: declared, executor, block_chain_id, _sealed: () })
     }
 
     pub const fn plan(&self) -> &PlanV2 {
@@ -100,5 +113,13 @@ impl SignedPlan {
 
     pub const fn commitment(&self) -> B256 {
         self.commitment
+    }
+
+    pub const fn executor(&self) -> Address {
+        self.executor
+    }
+
+    pub const fn block_chain_id(&self) -> u64 {
+        self.block_chain_id
     }
 }

@@ -80,6 +80,7 @@ use crate::workers::{refine_concurrently, Budgets, ResourceClass};
 use apex_capture::dispatch::{DispatchError, DispatchRequest, Dispatcher, NullDispatcher};
 use apex_capture::scheduler::{CaptureAssurance, Scheduler};
 use apex_econ::eligibility::Clause;
+use apex_exec::call::ExecutorCall;
 use apex_capture::recover::{reconcile, scan, ChainOutcomeSource, DispatchGate, RecoveryError};
 use apex_capture::registry::{TicketGuard, TicketRegistry};
 use apex_capture::revalidate::{
@@ -330,9 +331,37 @@ pub struct Refinement {
     pub costs: TotalExecutionCost,
 }
 
+/// §25's executor call for a candidate: the plan, its commitment, and the
+/// `startV2` calldata, built **once per ticket**.
+///
+/// The simulator and the signer are handed the same [`ExecutorCall`], so what is
+/// simulated is what is signed — there is one set of bytes and both read it.
+/// Before this port neither could see the transaction at all: the simulator took
+/// a `Candidate` and the signer an `ExecutionCommitment`.
+///
+/// A route no executor op can encode is refused here, before any simulation is
+/// spent on it. `apex-exec` owns the encoding; the venue-to-op mapping belongs
+/// to whoever knows the deployment's adapter registrations.
+pub trait CallBuilder: Send + Sync {
+    fn build(
+        &self,
+        c: &Candidate,
+        commitment: &ExecutionCommitment,
+    ) -> Result<ExecutorCall, Decline>;
+}
+
+/// Simulate **the call**, as the lane that will sign it.
+///
+/// `from` matters because `startV2` is `onlyExecutor`: a simulation as anyone
+/// but the assigned lane answers a different question.
 #[async_trait::async_trait]
 pub trait Simulator: Send + Sync {
-    async fn simulate(&self, c: &Candidate) -> Result<SimulationResult, Decline>;
+    async fn simulate(
+        &self,
+        c: &Candidate,
+        call: &ExecutorCall,
+        from: Address,
+    ) -> Result<SimulationResult, Decline>;
 }
 
 /// Risk is a hard execution gate, not advice (§28). Synchronous because a gate
@@ -430,13 +459,51 @@ pub trait Commitments: Send + Sync {
     ) -> Result<ExecutionCommitment, Decline>;
 }
 
+/// Sign **the call** — the bytes that were simulated — at the nonce the
+/// authorization reserved.
+///
+/// Synchronous for the same reason as [`RiskGate`]: signing is arithmetic over a
+/// key already in memory, and an `async` here would be a place to put a network
+/// round trip between the last-mile check and the signature.
 pub trait Signer: Send + Sync {
     fn sign(
         &self,
         auth: &SigningAuthorization,
-        commitment: &ExecutionCommitment,
+        call: &ExecutorCall,
         gas_limit: GasLimit,
+        fees: FeeCaps,
     ) -> Result<SignedPayload, Decline>;
+}
+
+/// What a transaction may pay **per unit of gas**.
+///
+/// Its own type because the unit has already gone wrong once:
+/// `SubmissionDecision::Submit::max_fee_per_gas_wei` is filled from
+/// `TotalExecutionCost::l2_execution_fee`, which is a *total* (recorded in
+/// PLAN.md). Nothing reads that field; the signer reads this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeeCaps {
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
+/// The caps a ticket signs with, from the readings taken for its last-mile
+/// check.
+///
+/// Twice the base fee observed at the head — the conventional EIP-1559 headroom,
+/// so a transaction survives a run of full blocks rather than failing on the
+/// first increase — and never above the policy ceiling, which is the same
+/// ceiling revalidation checks the observed fee against.
+///
+/// **No tip.** §4.5 says a priority fee on Base ranks within the sequencer's
+/// window, and nothing has measured what it buys; `LiveEconomics` prices the
+/// priority fee at zero for the same reason. A fabricated bid is a cost the EV
+/// would then have to clear.
+pub fn fee_caps(r: &LiveReadings) -> FeeCaps {
+    FeeCaps {
+        max_fee_per_gas: r.observed_fee_wei.saturating_mul(2).min(r.fee_ceiling_wei),
+        max_priority_fee_per_gas: 0,
+    }
 }
 
 /// The **live** side of §24.6's eleven comparisons, read once, immediately before
@@ -498,6 +565,7 @@ pub struct Ports {
     pub sim: Arc<dyn Simulator>,
     pub risk: Arc<dyn RiskGate>,
     pub commitments: Arc<dyn Commitments>,
+    pub calls: Arc<dyn CallBuilder>,
     pub signer: Arc<dyn Signer>,
     pub live: Arc<dyn LiveReader>,
     pub settlement: Arc<dyn SettlementFeed>,
@@ -1010,11 +1078,18 @@ impl Plane {
         let repriced = candidate.clone();
         self.advance(guard, TicketStatus::Exacting)?;
 
+        // The one call this ticket makes. Built once, here, and handed to the
+        // simulator and the signer unchanged -- what is simulated is what is
+        // signed. A route no executor op encodes stops here, before a
+        // simulation is spent on it.
+        let call = self.ports.calls.build(&repriced, locked.commitment())?;
+        let from = Address::from(assignment.address());
+
         let sim = {
             let Some(_permit) = self.budgets.reserve(ResourceClass::Simulation) else {
                 return Err(Decline::NoBudget(ResourceClass::Simulation));
             };
-            self.ports.sim.simulate(&repriced).await?
+            self.ports.sim.simulate(&repriced, &call, from).await?
         };
         if !sim.success {
             return Err(Decline::SimulationFailed {
@@ -1063,7 +1138,7 @@ impl Plane {
         self.advance(guard, TicketStatus::Signed)?;
         let authorization = SigningAuthorization::new(ticket.ticket_id, nonce, proof);
         let payload =
-            self.ports.signer.sign(&authorization, locked.commitment(), gas_limit)?;
+            self.ports.signer.sign(&authorization, &call, gas_limit, fee_caps(&readings))?;
 
         // ---- Step 6: dispatch. Again, journalled first.
         self.advance(guard, TicketStatus::Dispatching)?;

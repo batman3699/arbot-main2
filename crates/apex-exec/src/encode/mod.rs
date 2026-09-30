@@ -164,3 +164,117 @@ impl PlanEncoder {
         }
     }
 }
+
+/// `bytes4(keccak256("startV2(((address,uint256,uint8,address)[],uint16,(uint8,bytes)[],uint256,uint256,bytes32,uint64,uint64))"))`.
+///
+/// A constant rather than derived at run time, because the derivation is where a
+/// typo would break silently. `tests/start_v2_calldata.rs` holds it to the
+/// selector the contract itself reports, through the tracked fixture.
+pub const START_V2_SELECTOR: [u8; 4] = [0x62, 0x90, 0xaa, 0x48];
+
+const WORD: usize = 32;
+
+/// The calldata for `MultiVenueArbImplementation.startV2(PlanV2 p)`, with
+/// `p.commitment = commitment`.
+///
+/// # The layout, because the offsets are the whole difficulty
+///
+/// `PlanV2` is a dynamic tuple — it holds two dynamic arrays — so the argument
+/// area is one offset word (`0x20`) followed by the tuple. Inside the tuple:
+///
+/// ```text
+/// head, 8 words:  off(loans) | cycleSlippageBps | off(steps) | minProfit
+///                 | declaredResidue | commitment | chainId | deadline
+/// tail:           loans:  len | 4 static words per Loan
+///                 steps:  len | one offset word per Step | each Step
+/// Step:           op | 0x40 | len(data) | data, right-padded to a word
+/// ```
+///
+/// Offsets in the tuple head count from the **start of the tuple**; offsets in
+/// the steps array count from **just after its length word**. Two origins, and an
+/// encoder that uses one for both produces calldata that decodes — as a
+/// different plan. `tests/start_v2_calldata.rs` holds every byte to the
+/// compiler's own encoding, including payloads of 0, 2, 3, 32 and 33 bytes.
+///
+/// Infallible: every field is fixed-width or length-prefixed, so a `PlanV2` has
+/// exactly one encoding. Whether the executor *accepts* the plan is the
+/// contract's question, and the simulator's.
+pub fn start_v2_calldata(
+    plan: &crate::commitment::PlanV2,
+    commitment: alloy_primitives::B256,
+) -> Vec<u8> {
+    let loans_tail = WORD + plan.loans.len() * 4 * WORD;
+    let head = 8 * WORD;
+
+    let mut out = Vec::with_capacity(4 + WORD + head + loans_tail + steps_len(&plan.steps));
+    out.extend_from_slice(&START_V2_SELECTOR);
+    // The one argument is dynamic, so its slot holds where it starts.
+    push_uint(&mut out, WORD as u64);
+
+    // ---- the tuple's head
+    push_uint(&mut out, head as u64);
+    push_u256(&mut out, U256::from(plan.cycle_slippage_bps));
+    push_uint(&mut out, (head + loans_tail) as u64);
+    push_u256(&mut out, plan.min_profit);
+    push_u256(&mut out, plan.declared_residue);
+    out.extend_from_slice(commitment.as_slice());
+    push_uint(&mut out, plan.chain_id);
+    push_uint(&mut out, plan.deadline);
+
+    // ---- loans: a static-element array, so no offsets
+    push_uint(&mut out, plan.loans.len() as u64);
+    for loan in &plan.loans {
+        push_address(&mut out, loan.token);
+        push_u256(&mut out, loan.amount);
+        push_uint(&mut out, loan.provider as u64);
+        push_address(&mut out, loan.provider_addr);
+    }
+
+    // ---- steps: dynamic elements, so an offset per element first
+    push_uint(&mut out, plan.steps.len() as u64);
+    let mut next = plan.steps.len() * WORD;
+    for step in &plan.steps {
+        push_uint(&mut out, next as u64);
+        next += step_len(step);
+    }
+    for step in &plan.steps {
+        push_uint(&mut out, step.op as u64);
+        // `(uint8 op, bytes data)`: `data` is the tuple's only dynamic member and
+        // starts after its two head words.
+        push_uint(&mut out, (2 * WORD) as u64);
+        push_uint(&mut out, step.data.len() as u64);
+        out.extend_from_slice(&step.data);
+        out.extend(std::iter::repeat_n(0u8, padding(step.data.len())));
+    }
+    out
+}
+
+/// The encoded size of one `Step`: two head words, a length word, and the
+/// payload rounded up to a word.
+fn step_len(step: &crate::commitment::Step) -> usize {
+    3 * WORD + step.data.len() + padding(step.data.len())
+}
+
+fn steps_len(steps: &[crate::commitment::Step]) -> usize {
+    WORD + steps.len() * WORD + steps.iter().map(step_len).sum::<usize>()
+}
+
+/// Zero bytes that round `len` up to a whole word. Zero for an exact multiple —
+/// including zero itself, so an empty payload is its length word and nothing.
+const fn padding(len: usize) -> usize {
+    (WORD - len % WORD) % WORD
+}
+
+fn push_u256(out: &mut Vec<u8>, v: U256) {
+    out.extend_from_slice(&v.to_be_bytes::<32>());
+}
+
+fn push_uint(out: &mut Vec<u8>, v: u64) {
+    push_u256(out, U256::from(v));
+}
+
+/// Left-padded: the twelve zero bytes in front are part of the encoding.
+fn push_address(out: &mut Vec<u8>, a: Address) {
+    out.extend_from_slice(&[0u8; 12]);
+    out.extend_from_slice(a.as_slice());
+}

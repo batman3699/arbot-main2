@@ -33,6 +33,9 @@ apex-sim = { path = "../apex-sim" }
 apex-search = { path = "../apex-search" }
 apex-venues = { path = "../apex-venues" }
 apex-state = { path = "../apex-state" }
+# `ExecutorCall`: the one call a ticket makes, built once and handed to both the
+# simulator and the signer.
+apex-exec = { path = "../apex-exec" }
 alloy-primitives = { version = "0.8", features = ["serde"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

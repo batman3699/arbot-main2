@@ -308,6 +308,7 @@ dependencies = [
  "apex-chain",
  "apex-config",
  "apex-econ",
+ "apex-exec",
  "apex-math",
  "apex-obs",
  "apex-risk",
