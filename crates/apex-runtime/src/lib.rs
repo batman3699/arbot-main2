@@ -36,6 +36,7 @@
 pub mod bus;
 pub mod commit;
 pub mod plane;
+pub mod risk;
 pub mod search;
 pub mod shutdown;
 pub mod supervise;

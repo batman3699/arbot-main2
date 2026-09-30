@@ -302,6 +302,7 @@ dependencies = [
  "apex-capture",
  "apex-chain",
  "apex-config",
+ "apex-econ",
  "apex-math",
  "apex-obs",
  "apex-risk",

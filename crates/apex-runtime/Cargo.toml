@@ -24,6 +24,7 @@ apex-capture = { path = "../apex-capture" }
 apex-chain = { path = "../apex-chain" }
 apex-config = { path = "../apex-config" }
 apex-obs = { path = "../apex-obs" }
+apex-econ = { path = "../apex-econ" }
 apex-risk = { path = "../apex-risk" }
 apex-search = { path = "../apex-search" }
 apex-venues = { path = "../apex-venues" }

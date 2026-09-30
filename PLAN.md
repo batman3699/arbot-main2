@@ -5675,6 +5675,66 @@ So `apex` does the four things that are real: load and validate configuration fa
 
 ### Task 8.5 — Full-system shadow run
 
+#### Status 2026-09-30: five of eight ports had no implementation, not one
+
+**A correction to my own report.** After Task 2b.8 I said "key material is now the only port without an implementation". That was wrong, and a one-line check would have caught it:
+
+```text
+RouteSource     apex-runtime :: FrontierSearch        ✅
+Commitments     apex-runtime :: VenueCommitments      ✅
+Economics       ** NO PRODUCTION IMPL **
+Simulator       ** NO PRODUCTION IMPL **
+RiskGate        ** NO PRODUCTION IMPL **
+Signer          ** NO PRODUCTION IMPL **
+LiveReader      ** NO PRODUCTION IMPL **
+SettlementFeed  ** NO PRODUCTION IMPL **
+```
+
+I had conflated "`Commitments` is wired" with "everything else is wired". The five split into two groups, and the distinction is what makes the task actionable:
+
+- **Implementable now**, from crates that already exist: `Economics` (`apex-econ`), `RiskGate` (`apex-risk` + `apex-econ::eligibility`), `Simulator` (`apex-sim::tier0`).
+- **Needs an external input**: `Signer` (key material, §43/INV-46), `LiveReader` and `SettlementFeed` (a node).
+
+So Task 8.5 is not "blocked on wall-clock time". It is blocked on three ports that can be built and three inputs that cannot.
+
+- [x] **`RiskGate`** — `crates/apex-runtime/src/risk.rs`, delivered 2026-09-30. See below.
+- [ ] **`Economics`** — over `apex-econ`'s sizing, cost model and EV.
+- [ ] **`Simulator`** — over `apex-sim::tier0`. §20 says a lower tier may only *reject*, which makes Tier 0 the honest shadow-mode simulator: no node, and it cannot admit something a higher tier would have caught.
+- [ ] `Signer`, `LiveReader`, `SettlementFeed` — external inputs.
+- [ ] Then the 14-day run, against a criterion 1 that can now fail.
+
+#### `RiskGate`: three gates in series, and the order is the design
+
+§28's sentence is "**risk is a hard execution gate**, not advice", and the plane has one port. Three things must hold, and folding them into one boolean would lose which:
+
+| Gate | Owner | The question |
+|---|---|---|
+| Posture | `apex_risk::PostureLadder` | May this chain and strategy open new live tickets at all? |
+| Breaker | `apex_risk::CircuitBreaker` | Has recent loss or failure exceeded a limit? |
+| Eligibility | `apex_econ::EligibilityGate` | Does *this* candidate clear §2.3's nine clauses and §2.1's robust gate? |
+
+**The order is not the cheapest-first order a latency argument would give.** Posture and breaker are facts about the *system*, so a halted chain rejects every candidate with one cause and an operator sees one reason rather than a histogram of nine clauses. Evaluating eligibility first would file a per-candidate economic reason for what is actually one system-level stop — the largest and least informative bucket, arriving by a different route than Task 8.1 warned about. Two tests pin it: the reason for a halted posture names the posture and **contains no clause label**.
+
+**Five things the context builder reads differently from what the candidate says**, each because the candidate's own value would answer the wrong question:
+
+1. **The tier is the one that answered, not the one requested.** `apex-sim`'s header says `SimulationResult::tier` records "which one was actually asked". A candidate may request Tier 2 and be answered by Tier 0, and reading the request would let an analytic screen satisfy a clause that wanted a node.
+2. **A canary does not outrank a full EVM run.** §20: "never a latency technique, and never a substitute for simulation". Tier 4 ranks at Tier 2's level, not above it.
+3. **`execution_path_healthy` reads three facts**, not one: success, loan repaid, profit invariant held. A simulation that succeeded while leaving the loan unrepaid is not a healthy path, and a test covers each conjunct — the clause sweep alone only perturbs `success`, so two of the three would have gone unexercised.
+4. **Borrowing nothing satisfies the liquidity clause rather than failing it.** §19: a route that borrows nothing needs no loan, and the census priced $300–$1,000 trades against inventory. `None` means "borrows nothing", and a mutation making it mean "unavailable" fails five tests.
+5. **A zero-p50 cost distribution is maximally wide, not maximally confident.** A cost estimate of nothing is an absent estimate, not a certain one, and `u32::MAX` fails the clause at every policy.
+
+**INV-17 is enforced here**: only `CertificateStatus::Proven` sets `route_authorization_valid`. An approximate route may rank and propose; it may not authorize.
+
+**The gate does not record.** `CircuitBreaker::record_failure` and `LossLedger::record` are the write path and belong where a terminal outcome is known. A gate that also recorded would need `&mut self`, and a gate holding a write lock is a gate on the capture path that a reader waits behind (§2.4). One exception is stated rather than hidden: the breaker's `current_status` takes `&mut self` because it evicts expired loss windows as it reads, so there *is* a lock on the read path — acceptable only because the alternative is a breaker reporting stale windows, and a breaker that under-reports loss is worse than a microsecond.
+
+**All nine clauses are asserted reachable.** A clause no candidate can fail is a clause nothing tests — the same argument as Task 8.3's surviving `sums_to` mutation.
+
+**One gap recorded rather than papered over:** `Candidate` carries a `state_age` and no `observed_at`, so the gate cannot tell how long a candidate has been in flight and the freshness clause reads the value the search recorded. Computing a freshness number from a field that does not mean what the clause needs would be worse than using what exists and saying so.
+
+**Eight mutations, each caught:** posture unchecked; breaker unchecked; route authorization always valid; the tier read from the candidate; a canary ranked above Tier 2; an absent cost estimate read as confident; borrowing nothing read as unavailable; `execution_path_healthy` reading only `success`.
+
+#### Originally recorded 2026-09-29 — acceptance criterion 1 could be passed by a system that does nothing
+
 **Blocked 2026-09-29, and not on wall-clock time.** Two findings, and the second is the one that matters.
 
 #### Acceptance criterion 1 could be passed by a system that does nothing
