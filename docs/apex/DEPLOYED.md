@@ -69,3 +69,44 @@ rather than a changelog entry:
 3. `script/Deploy.s.sol` is the path. Task 5.7 gave it a `DeployConfig` seam, so
    a deploy is a function of explicit inputs rather than of whatever the
    environment happened to hold.
+
+## The `master` branch, checked 2026-09-30
+
+**Nothing on `master` belongs on `main`.** Checked rather than assumed, because
+the two branches share no common ancestor and that looks alarming until you see
+why.
+
+`git merge-base origin/main origin/master` exits non-zero: **unrelated
+histories**. Different roots — `master` from `588f78d` (2026-06-02) and `main`
+from `7dab66b` (2026-08-16 10:25). `master`'s tip is `d9499a2`, nineteen minutes
+*before* main's root.
+
+The re-init is what happened, and it lost nothing:
+
+```text
+git diff --name-only origin/master <main's root>   →   0 paths
+```
+
+**Main's root commit contains master's tip tree byte-identically.** So
+`master`'s 41 "unique" commits are unique only in the sense that the history was
+re-rooted; every line of their content is present in main's first commit. The 326
+commits since are the divergence, and all of it is deliberate.
+
+`master` carries 147 tracked paths `main` does not, and each class has a reason:
+
+| On master, not on main | Why |
+|---|---|
+| 48 × `src/*.rs`, 2 × `tests/*.rs` | Relocated. 40 to `crates/arb-exec-legacy/`, 10 to `apex-math` / `apex-venues` — `math.rs`, `quote_common.rs`, `quote_solidly.rs` to the first and the rest of the quoters plus `discovery.rs` to the second, exactly as §34.6 specifies. Every one verified present. |
+| 147 × `contracts/artifacts/**` | **Deliberately untracked** on `main`: `.gitignore:102` carries `/contracts/artifacts/` with the reason beside it — *"Forge artifacts committed by hand. `out/` is the single source of truth."* |
+| `contracts/executor/steps/{Bridge,Generic,Jit,Swap}Executor.sol` | Deleted by Task 5.5 once `_executeSteps` called the handlers directly. The trampolines were a contract-size workaround that had become pure indirection. |
+| `contracts/libraries/BridgeLib.sol`, `contracts/mocks/MockBridge.sol` | §1.4 excludes cross-chain bridging. |
+| `plan.md`, `docs/ARCHITECTURE_PIVOT_HANDOFF.md`, `docs/PRODUCTION_AUDIT_FIX_PLAN.md` | Superseded by `PLAN.md`. |
+| `prometheus.yml`, `docs/grafana/*` | Relocated to `ops/observability/` — all four files present there. |
+
+**What to do with `master`: nothing, and that is a decision rather than neglect.**
+It is a complete, self-consistent snapshot of the pre-v4 system with its own
+history, and deleting it would discard the only record of how that system got
+there — `main`'s root squashed all of it into one commit. It is 326 commits
+behind and must never be merged: an unrelated history would reintroduce the
+workspace split's `src/` tree, the deleted step trampolines and the bridge code
+in one move.
