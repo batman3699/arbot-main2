@@ -14,3 +14,4 @@ pub mod frontier;
 pub mod inventory;
 pub mod pricing;
 pub mod reads;
+pub mod sim;
