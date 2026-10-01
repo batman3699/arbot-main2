@@ -1,6 +1,13 @@
 //! `apex` — the control-plane binary.
 //!
-//! # What this binary does today, stated plainly
+//! # `apex shadow`
+//!
+//! The Task 8.5 shadow run: the whole capture path over Base with the null
+//! dispatcher as its only lane — see [`apex_runtime::shadow`]. Configured by
+//! `--config` (default `ops/shadow.base.yaml`); `scripts/shadow.sh` starts it
+//! with the operator's keys mapped onto the `APEX_SECRET_*` names it reads.
+//!
+//! # What the bare binary does, stated plainly
 //!
 //! It **boots and reports its own readiness**. It does not trade, and it does not
 //! pretend to: three of [`apex_runtime::plane`]'s eight ports are implemented by
@@ -63,6 +70,7 @@ use tracing::{error, info, warn};
 /// Where the journal lives. One file, appended to, replayed once at boot (§17.5).
 const DEFAULT_JOURNAL: &str = "var/apex/tickets.journal";
 const DEFAULT_INPUTS: &str = "ops/inputs.yaml";
+const DEFAULT_SHADOW_CONFIG: &str = "ops/shadow.base.yaml";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -72,6 +80,10 @@ async fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    if std::env::args().nth(1).as_deref() == Some("shadow") {
+        return shadow().await;
+    }
 
     match run().await {
         Ok(report) => {
@@ -93,6 +105,52 @@ async fn main() -> ExitCode {
         }
         Err(e) => {
             error!(error = %e, "apex refused to start");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `apex shadow [--config <path>]`. Runs until SIGINT or SIGTERM.
+async fn shadow() -> ExitCode {
+    let mut config = DEFAULT_SHADOW_CONFIG.to_string();
+    let mut argv = std::env::args().skip(2);
+    while let Some(flag) = argv.next() {
+        match flag.as_str() {
+            "--config" => match argv.next() {
+                Some(path) => config = path,
+                None => {
+                    error!("--config needs a path");
+                    return ExitCode::FAILURE;
+                }
+            },
+            other => {
+                error!("usage: apex shadow [--config {DEFAULT_SHADOW_CONFIG}]; unknown argument `{other}`");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    // `secrets_only`: the endpoints' key and the signer's are the only values
+    // read from the environment, and only under their `APEX_SECRET_*` names.
+    let env = Env::secrets_only();
+    let loaded = match apex_runtime::shadow::config::ShadowConfig::load(&config, &env) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "apex shadow refused to start");
+            return ExitCode::FAILURE;
+        }
+    };
+    match apex_runtime::shadow::run(loaded, &env, wait_for_signal()).await {
+        Ok(report) => {
+            info!(
+                events = report.funnel.events,
+                null_dispatched = report.null_dispatched,
+                capture_assurance = ?report.capture_assurance,
+                "apex shadow stopped"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!(error = %e, "apex shadow refused to start");
             ExitCode::FAILURE
         }
     }

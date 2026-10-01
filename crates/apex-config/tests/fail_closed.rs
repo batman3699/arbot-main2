@@ -168,3 +168,21 @@ fn strip_section(yaml: &str, section: &str) -> String {
     out
 }
 
+
+/// A fixed environment — a test's, never the process's — holds to the same
+/// rule: only `APEX_SECRET_*` names are read, and every key asked for is
+/// recorded, read or not.
+#[test]
+fn a_fixed_environment_reads_only_secrets() {
+    let env = Env::fixed_secrets([
+        ("APEX_SECRET_FIXED_TEST".to_string(), "v".to_string()),
+        ("FIXED_TEST_PLAIN".to_string(), "w".to_string()),
+    ]);
+    assert_eq!(env.get("APEX_SECRET_FIXED_TEST").as_deref(), Some("v"));
+    assert_eq!(env.get("FIXED_TEST_PLAIN"), None, "a non-secret name is not read");
+    assert_eq!(env.get("APEX_SECRET_FIXED_ABSENT"), None);
+    assert_eq!(
+        env.consulted(),
+        vec!["APEX_SECRET_FIXED_ABSENT", "APEX_SECRET_FIXED_TEST", "FIXED_TEST_PLAIN"]
+    );
+}

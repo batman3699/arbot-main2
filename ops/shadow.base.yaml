@@ -1,0 +1,87 @@
+# `apex shadow` on Base (Task 8.5): the capture path over the null dispatcher.
+#
+# No secret is in this file. Placeholders for APEX_SECRET_ variables resolve
+# from the environment at boot, and an unset one refuses to start; the signer's
+# key is named by its variable and read once, never parsed from YAML.
+# `scripts/shadow.sh` maps the operator's .env onto these names.
+#
+# Placeholders are resolved before the YAML is parsed, comments included: a
+# dollar-brace in a comment is a placeholder too.
+#
+# Unknown fields are refused: a misspelt one would otherwise take a default.
+
+chain_id: 8453
+
+rpc:
+  # BlockPI's keyed endpoint: `eth_simulateV1`, `pendingLogs` and
+  # `newFlashblocks` were each probed on it (PLAN.md, Task 8.5 R1, R5, R7).
+  http:
+    - https://base.blockpi.network/v1/rpc/${APEX_SECRET_BLOCKPI_KEY}
+  ws: wss://base.blockpi.network/v1/ws/${APEX_SECRET_BLOCKPI_KEY}
+
+# The census's inventory (outside git). The run loads the pools that can form
+# a WETH cycle: pairs with WETH and at least two pools at <= 500 ppm and
+# >= $100k depth.
+inventory: data/base
+
+# Its own journal: recovery closes everything in it as never sent, which is
+# true of no journal a sending run has written. Must be named as a shadow's.
+journal: var/apex/shadow.journal
+report: var/apex/shadow.report.jsonl
+misses: var/apex/shadow.misses.jsonl
+
+executor:
+  # PRE-PHASE-5. This is the only executor ever deployed (docs/apex/DEPLOYED.md)
+  # and it cannot run a `startV2` plan, so every Tier 2 simulation fails until
+  # the Phase 5 deploy lands. Then replace both fields with the new clone's
+  # address and its runtime code's keccak256, and restart: the fourteen days
+  # start there.
+  address: "0xDbFB219b4F1CE08fA61C5cD3c08C1307760cAec6"
+  code_hash: "0xce7292d7892a8e6d77849cfa93baec0fe2918dfd581c98762fe262260891c3cc"
+  # The plan version the call builder encodes (PLAN_VERSION_V2).
+  plan_version: 2
+
+signer:
+  lane: 1
+  key_env: APEX_SECRET_TRADER_KEY
+  # The trader the Phase 5 deploy authorizes (BASE_EXECUTOR_TRADER). The key
+  # must sign as it, or the run refuses to start.
+  address: "0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3"
+  # Declared, and inert today: the plane asks every lane for a zero reserve and
+  # last-mile check 7 for a zero balance (PLAN.md, R9 findings).
+  gas_reserve_wei: 1000000000000000
+
+policy:
+  # 0.1 gwei: Base's base fee has run ~0.002-0.01 gwei; a ticket signs at
+  # twice the observed fee, capped here, and is refused above it.
+  fee_ceiling_wei: 100000000
+  # Any positive net. The on-chain floor question (expected net against the
+  # executor's gross check) is open before any canary (PLAN.md, R6 finding).
+  min_profit_wei: 1
+  slippage_bps_per_hop: 30
+  # A full reload every 15 minutes refreshes the evidence; an hour's bound
+  # allows three to fail.
+  max_evidence_age_blocks: 1800
+  # Three blocks: a view the head task has stopped refreshing is not a reading.
+  max_view_age_ms: 6000
+  full_reload_every_s: 900
+  report_every_s: 300
+  # The L1 fee oracle moves with L1 blocks; once a minute.
+  l1_every_blocks: 30
+
+# What a settlement costs that the chain does not say. Measured on the R6/R7
+# fork: the two-hop cycle with its flash loan mined in 534,100 gas; the
+# costliest revert (hop 2's minimum) used 411,945. The limit covers p99 (1.3x)
+# with section 21.3's 12% headroom. The failure rate is not measured: it is one
+# of the things this run measures.
+costs:
+  success_gas: 534100
+  gas_limit: 800000
+  gas_on_failure: 411945
+  failure_ppm: 50000
+
+# R5: `newFlashblocks` is ~750 KiB/s, so it is sampled, never held open.
+capacity:
+  boot_sample_s: 60
+  sample_every_s: 900
+  sample_for_s: 20

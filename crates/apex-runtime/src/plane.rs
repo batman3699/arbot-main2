@@ -851,6 +851,13 @@ impl Plane {
         self.locked_misses(|l| l.clone())
     }
 
+    /// The miss ledger, taken: the plane's is left empty. A long run takes it
+    /// periodically and writes it out, so the ledger in memory is one period's
+    /// misses rather than every miss since boot.
+    pub fn drain_misses(&self) -> MissLedger {
+        self.locked_misses(std::mem::take)
+    }
+
     fn locked_misses<R>(&self, f: impl FnOnce(&mut MissLedger) -> R) -> R {
         let mut g = match self.misses.lock() {
             Ok(g) => g,

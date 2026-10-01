@@ -40,6 +40,7 @@ pub mod live;
 pub mod plane;
 pub mod risk;
 pub mod search;
+pub mod shadow;
 pub mod shutdown;
 pub mod sign;
 pub mod supervise;

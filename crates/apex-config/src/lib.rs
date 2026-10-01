@@ -121,7 +121,11 @@ impl ApexConfig {
 /// unset one in place is the failure mode that matters: the literal string
 /// `"${ARB_EXECUTOR_ADDRESS}"` in an address field parses as garbage far away
 /// from the cause, or worse, is silently skipped.
-fn interpolate(yaml: &str, env: &Env) -> Result<String, ConfigError> {
+///
+/// Public so a document with a schema of its own — the shadow run's — resolves
+/// by the same fail-closed rule. The result holds whatever secrets it resolved;
+/// the caller keeps it out of every log line.
+pub fn interpolate(yaml: &str, env: &Env) -> Result<String, ConfigError> {
     let mut out = String::with_capacity(yaml.len());
     let mut rest = yaml;
 

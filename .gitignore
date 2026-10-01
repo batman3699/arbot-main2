@@ -36,6 +36,8 @@ env.example
 /logs/
 /accounting/
 /data/
+# `apex`'s journals and the shadow run's reports.
+/var/
 *.out
 *.jsonl
 
