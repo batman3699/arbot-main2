@@ -3,13 +3,20 @@
 # dispatcher as its only lane. Nothing is sent.
 #
 #   scripts/shadow.sh [config]          # default ops/shadow.base.yaml
-#   nohup scripts/shadow.sh > var/apex/shadow.log 2>&1 &
+#   setsid nohup scripts/shadow.sh > var/apex/shadow.log 2>&1 < /dev/null &
+#   scripts/shadow-status.sh            # what it is doing
 #
-# `apex` reads only `APEX_SECRET_*` variables. This maps the operator's .env
-# onto them -- BLOCKPI_KEY to APEX_SECRET_BLOCKPI_KEY, PRIVATE_KEY to
-# APEX_SECRET_TRADER_KEY -- for the run's process alone. Nothing is echoed:
-# the values pass through variables, never through argv or the terminal, and
-# the rest of .env is not loaded at all.
+# `apex` reads only `APEX_SECRET_*` variables. This maps two of the operator's
+# .env entries onto them for the run's process alone -- BLOCKPI_KEY to
+# APEX_SECRET_BLOCKPI_KEY, and TRADER_PRIVATE_KEY to APEX_SECRET_TRADER_KEY.
+# Nothing is echoed: the values pass through variables, never through argv or
+# the terminal, and the rest of .env is not loaded at all.
+#
+# TRADER_PRIVATE_KEY, and never PRIVATE_KEY: since the Phase 5 deploy
+# (2026-10-03), PRIVATE_KEY signs as the address that owns the executor's
+# router. The owner's key has no business in a long-running trading process,
+# so this script has no path that reads it. The run refuses to start unless
+# the trader key signs as the config's signer.address.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -21,15 +28,19 @@ bin=target/release/apex
 # The last assignment of one variable, unquoted. Values never reach argv.
 value() {
   local v
-  v="$(grep -E "^$1=" .env | tail -n 1 | cut -d= -f2-)"
+  v="$(grep -E "^$1=" .env | tail -n 1 | cut -d= -f2- || true)"
   v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
   printf '%s' "$v"
 }
 
 APEX_SECRET_BLOCKPI_KEY="$(value BLOCKPI_KEY)"
-APEX_SECRET_TRADER_KEY="$(value PRIVATE_KEY)"
+APEX_SECRET_TRADER_KEY="$(value TRADER_PRIVATE_KEY)"
 [[ -n "$APEX_SECRET_BLOCKPI_KEY" ]] || { echo "shadow: BLOCKPI_KEY is empty in .env" >&2; exit 1; }
-[[ -n "$APEX_SECRET_TRADER_KEY" ]] || { echo "shadow: PRIVATE_KEY is empty in .env" >&2; exit 1; }
+[[ -n "$APEX_SECRET_TRADER_KEY" ]] || {
+  echo "shadow: TRADER_PRIVATE_KEY is not set in .env -- the key of the trader the executor" >&2
+  echo "        authorizes (signer.address in $config). Not PRIVATE_KEY, which is the owner's." >&2
+  exit 1
+}
 export APEX_SECRET_BLOCKPI_KEY APEX_SECRET_TRADER_KEY
 
 mkdir -p var/apex

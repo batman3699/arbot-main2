@@ -174,9 +174,13 @@ chains:
   # never fires -- which is what silently produced a census with zero rows.
   - wss://base-rpc.publicnode.com
   gas_model: op_stack
-  executor_address: '0xDbFB219b4F1CE08fA61C5cD3c08C1307760cAec6'
-  executor_owner: '0xD7A4D612E572B5877b0E2fC7cE8683e36360f04c'
-  batch_router_address: '0x8e04a6aeb3aB33349aDf849039Fa2aFC17c79954'
+  # The Phase 5 executor clone and its BatchRouter, deployed 2026-10-03
+  # (docs/apex/DEPLOYED.md). The clone is owned by the router, and the router
+  # by executor_owner, which deployed both; the trading signer is
+  # 0xCB436Ba3acb945b3fc8EE6345857262584356595, authorized by `setExecutor`.
+  executor_address: '0x8940B565D050974b2b589B70De43bCb753b1F93B'
+  executor_owner: '0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3'
+  batch_router_address: '0x9ecde68C269EbbaFD44bbB4DfC9D6716B47952C2'
   permit2_address: '0x000000000022D473030F116dDEE9F6B43aC78BA3'
   venues:
   # UniV2 factory is listed for registry completeness; runtime skips cold

@@ -31,22 +31,24 @@ report: var/apex/shadow.report.jsonl
 misses: var/apex/shadow.misses.jsonl
 
 executor:
-  # PRE-PHASE-5. This is the only executor ever deployed (docs/apex/DEPLOYED.md)
-  # and it cannot run a `startV2` plan, so every Tier 2 simulation fails until
-  # the Phase 5 deploy lands. Then replace both fields with the new clone's
-  # address and its runtime code's keccak256, and restart: the fourteen days
-  # start there.
-  address: "0xDbFB219b4F1CE08fA61C5cD3c08C1307760cAec6"
-  code_hash: "0xce7292d7892a8e6d77849cfa93baec0fe2918dfd581c98762fe262260891c3cc"
+  # The Phase 5 executor, deployed 2026-10-03 by script/DeployAndConfigure.s.sol
+  # (Base blocks 52,105,407-8; docs/apex/DEPLOYED.md): an EIP-1167 clone of the
+  # implementation 0x5C48...5Cee, owned by its BatchRouter 0x9ecd...52C2. The
+  # code hash is keccak256 of the clone's 45-byte runtime code, read back from
+  # the chain; other code there reads as version 0, and last-mile check 2
+  # refuses every ticket.
+  address: "0x8940B565D050974b2b589B70De43bCb753b1F93B"
+  code_hash: "0x68ea95b65ff6d634c1e8e766cf66ecd3996eb0342cdc2f1179485ae03b7fa488"
   # The plan version the call builder encodes (PLAN_VERSION_V2).
   plan_version: 2
 
 signer:
   lane: 1
   key_env: APEX_SECRET_TRADER_KEY
-  # The trader the Phase 5 deploy authorizes (BASE_EXECUTOR_TRADER). The key
-  # must sign as it, or the run refuses to start.
-  address: "0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3"
+  # The trader the deploy authorized (`setExecutor`, read back on chain). The
+  # key must sign as it, or the run refuses to start. Not .env's PRIVATE_KEY:
+  # that signs as the router's owner, and scripts/shadow.sh never reads it.
+  address: "0xCB436Ba3acb945b3fc8EE6345857262584356595"
   # Declared, and inert today: the plane asks every lane for a zero reserve and
   # last-mile check 7 for a zero balance (PLAN.md, R9 findings).
   gas_reserve_wei: 1000000000000000
