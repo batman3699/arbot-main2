@@ -92,6 +92,50 @@ fn each_recorded_revert_is_classified_by_its_cause() {
     }
 }
 
+fn blockpi(case: &str) -> Value {
+    let text = std::fs::read_to_string(format!(
+        "{}/tests/fixtures/simulate_v1_blockpi.json",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("fixture");
+    serde_json::from_str::<Value>(&text).unwrap()[case]["response"].clone()
+}
+
+/// **On BlockPI a revert's data is its error's.** BlockPI's `eth_simulateV1`
+/// leaves `returnData` empty on a revert and returns the bytes as `error.data`
+/// (recorded on Base: a router's unmet minimum). Read from `returnData` alone,
+/// as anvil returns it, every revert the shadow run saw was `Unknown`.
+#[test]
+fn on_blockpi_a_reverts_data_is_its_errors() {
+    let answer = blockpi("router_min_out");
+    let call = &answer[0]["calls"][0];
+    assert_eq!(call["returnData"], json!("0x"), "the recording is BlockPI's shape");
+    let data = hex::decode(call["error"]["data"].as_str().unwrap()).unwrap();
+
+    let r = read_simulation(BASE, Address::repeat_byte(1), &answer, DurationNanos(1)).expect("an answer");
+    assert!(!r.success);
+    assert_eq!(r.revert, Some((RevertClass::MinOutNotMet, data)));
+}
+
+/// **PancakeSwap's minimum fails with nothing to classify.** Its SmartRouter's
+/// check is a bare `require`: no data in either place (recorded). So is an
+/// inner out-of-gas, and so is the executor's own profit floor — an empty
+/// revert says none of them, and is filed `Unknown`.
+#[test]
+fn an_empty_revert_is_unknown_whoever_raised_it() {
+    let r = read_simulation(BASE, Address::repeat_byte(1), &blockpi("pancake_min_out"), DurationNanos(1)).expect("an answer");
+    assert_eq!(r.revert, Some((RevertClass::Unknown, Vec::new())));
+}
+
+/// An error whose data does not decode is a malformed answer, refused whole
+/// rather than classified from half of it.
+#[test]
+fn an_error_whose_data_does_not_decode_is_refused() {
+    let mut answer = blockpi("router_min_out");
+    answer[0]["calls"][0]["error"]["data"] = json!("0xnot-hex");
+    assert!(read_simulation(BASE, Address::repeat_byte(1), &answer, DurationNanos(1)).is_none());
+}
+
 /// **The trap.** Before the Phase 5 executor exists at the committed address, a
 /// call to it is a call to an account with no code — status 1, nothing returned,
 /// recorded. That is not a `startV2` and not a success. Nor is any other return

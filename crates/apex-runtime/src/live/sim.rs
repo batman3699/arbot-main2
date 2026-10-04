@@ -32,7 +32,14 @@
 //! Every class above was either recorded on the fork
 //! (`tests/fixtures/simulate_v1_fork.json`) or is a string or selector checked
 //! against its signature; an empty revert is `Unknown` because on this path it
-//! could be the profit floor or a bare `require` in any token.
+//! could be the profit floor, a bare `require` in any token, PancakeSwap's
+//! minimum check (its `SmartRouter`'s is bare too), or a swap that ran out of
+//! gas inside the executor's call — whose frame then reverts empty, and the
+//! node says "execution reverted", never "out of gas" (all recorded on
+//! BlockPI, `tests/fixtures/simulate_v1_blockpi.json`, R12).
+//!
+//! The bytes are wherever the node puts them: anvil returns them as
+//! `returnData`, BlockPI as `error.data` with `returnData` empty.
 //!
 //! # What the result says, and from what
 //!
@@ -167,13 +174,26 @@ pub fn read_simulation(
     let (hash_now, parent) = (hash(block.get("hash")?)?, hash(block.get("parentHash")?)?);
     let data = hex::decode(call.get("returnData")?.as_str()?).ok()?;
     let status = quantity(call.get("status")?)?;
+    let error = call.get("error");
+    // A revert's bytes: anvil returns them as `returnData`; BlockPI leaves that
+    // empty and returns them as `error.data` (recorded,
+    // `tests/fixtures/simulate_v1_blockpi.json`). Bytes that do not decode are
+    // a malformed answer, refused whole.
+    let error_data = match error.and_then(|e| e.get("data")) {
+        Some(d) => hex::decode(d.as_str()?).ok()?,
+        None => Vec::new(),
+    };
 
     // One word is a `startV2`; an empty success is an account with no code.
     let success = status == 1 && data.len() == 32;
     let revert = (!success).then(|| {
-        let message = call.get("error").and_then(|e| e.get("message")).and_then(Value::as_str);
-        let class = if status == 1 { RevertClass::Unknown } else { classify(&data, message) };
-        (class, data.clone())
+        let message = error.and_then(|e| e.get("message")).and_then(Value::as_str);
+        if status == 1 {
+            // Not a revert, so its bytes are not read as one's.
+            return (RevertClass::Unknown, data.clone());
+        }
+        let bytes = if data.is_empty() { error_data } else { data.clone() };
+        (classify(&bytes, message), bytes)
     });
     let balance_deltas = if success {
         deltas(chain, executor, call.get("logs")?.as_array()?)?

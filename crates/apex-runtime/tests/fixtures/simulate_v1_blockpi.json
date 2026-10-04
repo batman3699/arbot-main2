@@ -1,0 +1,99 @@
+{
+  "about": "BlockPI's eth_simulateV1 on Base, recorded 2026-10-04 (nothing sent): one call a block, a whale's 0.01 WETH swap given its balance and allowance by state override. A reverted call's data comes back in error.data, with returnData empty -- unlike anvil (simulate_v1_fork.json). router_min_out: Uniswap's SwapRouter02 with an unmeetable minimum, 'Too little received' (Slipstream's router answers the same). pancake_min_out: PancakeSwap's SmartRouter with an unmeetable minimum -- a bare require, no data at all.",
+  "router_min_out": {
+    "response": [
+      {
+        "baseFeePerGas": "0x0",
+        "blobGasUsed": "0x39d0",
+        "calls": [
+          {
+            "error": {
+              "code": 3,
+              "data": "0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000013546f6f206c6974746c6520726563656976656400000000000000000000000000",
+              "message": "execution reverted: Too little received"
+            },
+            "gasUsed": "0x2071f",
+            "logs": [],
+            "maxUsedGas": "0x2071f",
+            "returnData": "0x",
+            "status": "0x0"
+          }
+        ],
+        "difficulty": "0x0",
+        "excessBlobGas": "0x0",
+        "extraData": "0x01000000640000000500000000004c4b40",
+        "gasLimit": "0x17d78400",
+        "gasUsed": "0x2071f",
+        "hash": "0x09feff51cff7560f3497036d9c11502b1e3d7e74362da343702e7c099acaf3bb",
+        "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "miner": "0x4200000000000000000000000000000000000011",
+        "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "nonce": "0x0000000000000000",
+        "number": "0x31bd833",
+        "parentBeaconBlockRoot": "0xa60658ea3098322d77f731664ca2eddd47df6c7e311d0824cdea7e89565a5d4f",
+        "parentHash": "0xa8fd0b294743af16c29c873cb51c7b2b807914ee22f7cfdbab28e3aeaf28f41e",
+        "receiptsRoot": "0x011175875fd05c7e17522fd1a539d3da3c6f32b9b7611765956d6243365026c6",
+        "requestsHash": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+        "size": "0x391",
+        "stateRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "timestamp": "0x6ac20d49",
+        "transactions": [
+          "0xc507c2992df3fe1b0f8bed641246b87ad28807b695c91dc9d850ecd3551f2968"
+        ],
+        "transactionsRoot": "0xda8e436ea9722a352e5e2e8e355033b53d824130cb04e5073774a0dfd6609fda",
+        "uncles": [],
+        "withdrawals": [],
+        "withdrawalsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ]
+  },
+  "pancake_min_out": {
+    "response": [
+      {
+        "baseFeePerGas": "0x0",
+        "blobGasUsed": "0x39d0",
+        "calls": [
+          {
+            "error": {
+              "code": 3,
+              "data": "0x",
+              "message": "execution reverted"
+            },
+            "gasUsed": "0x2c211",
+            "logs": [],
+            "maxUsedGas": "0x2c211",
+            "returnData": "0x",
+            "status": "0x0"
+          }
+        ],
+        "difficulty": "0x0",
+        "excessBlobGas": "0x0",
+        "extraData": "0x01000000640000000500000000004c4b40",
+        "gasLimit": "0x17d78400",
+        "gasUsed": "0x2c211",
+        "hash": "0x62c4bc209289c96a76d87e9be7ab15829d99652f0df10942bcadaf3791cc5916",
+        "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "miner": "0x4200000000000000000000000000000000000011",
+        "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "nonce": "0x0000000000000000",
+        "number": "0x31bd833",
+        "parentBeaconBlockRoot": "0xa60658ea3098322d77f731664ca2eddd47df6c7e311d0824cdea7e89565a5d4f",
+        "parentHash": "0xa8fd0b294743af16c29c873cb51c7b2b807914ee22f7cfdbab28e3aeaf28f41e",
+        "receiptsRoot": "0x47065ede6db3dd4138a9df1ddba130a1e9b9ebac8a5a33fe22d844e3703c6239",
+        "requestsHash": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+        "size": "0x391",
+        "stateRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "timestamp": "0x6ac20d49",
+        "transactions": [
+          "0x2732b87ae355b821ce5c56a09131fb967b73194b0073acf8ebcb28a9bc6192a1"
+        ],
+        "transactionsRoot": "0x138c464ae890c369c2c2c57bfbb65ac599db1368f338d4cefbd3621df898d164",
+        "uncles": [],
+        "withdrawals": [],
+        "withdrawalsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ]
+  }
+}
