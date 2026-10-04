@@ -258,18 +258,45 @@ fn deltas_are_the_executors_net_transfers() {
     assert!(r.balance_deltas.is_empty() && r.token_residues.is_empty());
 }
 
-/// Records what it was asked and answers from a script.
+/// Records what it was asked and answers from a script: `header` to the
+/// pending block's header, `answer` to the simulation.
 struct Recording {
+    header: Result<Value, RpcError>,
     answer: Result<Value, RpcError>,
     asked: Mutex<Vec<(String, Value)>>,
+}
+
+impl Recording {
+    fn new(header: Value, answer: Result<Value, RpcError>) -> Self {
+        Self { header: Ok(header), answer, asked: Mutex::new(vec![]) }
+    }
 }
 
 #[async_trait::async_trait]
 impl RpcTransport for Recording {
     async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         self.asked.lock().unwrap().push((method.to_string(), params));
-        self.answer.clone()
+        if method == "eth_getBlockByNumber" {
+            self.header.clone()
+        } else {
+            self.answer.clone()
+        }
     }
+}
+
+/// A pending header naming the block an answer's last block is.
+fn header_for(answer: &Value) -> Value {
+    let last = answer.as_array().unwrap().last().unwrap();
+    json!({ "number": last["number"], "timestamp": last["timestamp"], "baseFeePerGas": "0x4c4b40" })
+}
+
+fn pending_fixture(case: &str) -> Value {
+    let text = std::fs::read_to_string(format!(
+        "{}/tests/fixtures/simulate_v1_pending.json",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("fixture");
+    serde_json::from_str::<Value>(&text).unwrap()[case].clone()
 }
 
 fn call_to(to: Address) -> ExecutorCall {
@@ -286,14 +313,19 @@ fn call_to(to: Address) -> ExecutorCall {
     ExecutorCall::from_checked(SignedPlan::check(plan, declared, 8453, to).unwrap())
 }
 
-/// **One block, one call, as the lane that will sign it**, to the committed
-/// executor, with the gas limit it will be signed with, transfers traced and
-/// validation off — and what comes back is read, not trusted.
+/// **One call, as the lane that will sign it, inside the block being built**,
+/// to the committed executor, with the gas limit it will be signed with,
+/// transfers traced and validation off — and what comes back is read, not
+/// trusted. The pending header is read first: its number, timestamp and base
+/// fee are set explicitly on a simulation based at `pending`, whose state is
+/// the in-progress block's but whose own context lags.
 #[tokio::test]
 async fn the_simulator_asks_one_call_as_the_lane_with_the_gas_limit() {
     let f = fixture();
     let exe = executor(&f);
-    let rpc = Arc::new(Recording { answer: Ok(f["cases"]["success"]["response"].clone()), asked: Mutex::new(vec![]) });
+    let answer = f["cases"]["success"]["response"].clone();
+    let header = header_for(&answer);
+    let rpc = Arc::new(Recording::new(header.clone(), Ok(answer)));
     let sim = LiveSimulator::new(rpc.clone(), BASE);
     let lane = address!("70997970C51812dC3A010C7d01b50e0d17dc79C8");
     let c = support::candidate(1, 100, 1);
@@ -304,14 +336,77 @@ async fn the_simulator_asks_one_call_as_the_lane_with_the_gas_limit() {
     assert!(r.success);
 
     let asked = rpc.asked.lock().unwrap();
-    let [(method, params)] = &asked[..] else { panic!("{asked:?}") };
+    let [(first, header_params), (method, params)] = &asked[..] else { panic!("{asked:?}") };
+    assert_eq!((first.as_str(), header_params), ("eth_getBlockByNumber", &json!(["pending", false])));
     assert_eq!(method, "eth_simulateV1");
+    assert_eq!(
+        params[0]["blockStateCalls"][0]["blockOverrides"],
+        json!({ "number": header["number"], "time": header["timestamp"], "baseFeePerGas": header["baseFeePerGas"] })
+    );
     let one = &params[0]["blockStateCalls"][0]["calls"][0];
     assert_eq!(one["from"].as_str().unwrap().parse::<Address>().unwrap(), lane);
     assert_eq!(one["to"].as_str().unwrap().parse::<Address>().unwrap(), exe);
     assert_eq!(one["data"], json!(format!("0x{}", hex::encode(call.data()))));
     assert_eq!(one["gas"], json!(format!("{:#x}", signed.0)));
-    assert_eq!((params[0]["traceTransfers"].clone(), params[0]["validation"].clone(), params[1].clone()), (json!(true), json!(false), json!("latest")));
+    assert_eq!((params[0]["traceTransfers"].clone(), params[0]["validation"].clone(), params[1].clone()), (json!(true), json!(false), json!("pending")));
+}
+
+/// **The call is in the answer's last block.** BlockPI reaches the requested
+/// number by inserting empty blocks after its lagging context — four before
+/// ours in one recording, none in another — so the answer is read from its
+/// last block, whatever comes before it.
+#[test]
+fn an_answer_is_read_from_its_last_block() {
+    for case in ["gaps", "one_block"] {
+        let f = pending_fixture(case);
+        let answer = &f["response"];
+        let last = answer.as_array().unwrap().last().unwrap();
+        assert_eq!(last["number"], f["pending_header"]["number"], "{case}: the recording ran in the block asked for");
+        let data = hex::decode(last["calls"][0]["error"]["data"].as_str().unwrap()).unwrap();
+        let r = read_simulation(BASE, Address::repeat_byte(1), answer, DurationNanos(1)).expect(case);
+        assert_eq!(r.revert, Some((RevertClass::MinOutNotMet, data)), "{case}");
+        assert_eq!(r.state_after.confirmed_block_number, u64::from_str_radix(&last["number"].as_str().unwrap()[2..], 16).unwrap());
+    }
+    assert_eq!(pending_fixture("gaps")["response"].as_array().unwrap().len(), 5, "the recording has empty blocks to skip");
+}
+
+/// **An answer from another block's context is refused.** The override is what
+/// puts the call in the block being built; an answer whose last block is not
+/// that one ran somewhere else, and is a failure without a class.
+#[tokio::test]
+async fn a_simulation_in_another_blocks_context_is_refused() {
+    let f = fixture();
+    let answer = f["cases"]["success"]["response"].clone();
+    let mut header = header_for(&answer);
+    let n = u64::from_str_radix(&header["number"].as_str().unwrap()[2..], 16).unwrap();
+    header["number"] = json!(format!("{:#x}", n + 1));
+    let c = support::candidate(1, 100, 1);
+    let sim = LiveSimulator::new(Arc::new(Recording::new(header, Ok(answer))), BASE);
+    let err = sim
+        .simulate(&c, &call_to(executor(&f)), Address::repeat_byte(2), c.total_execution_cost.gas_limit)
+        .await
+        .unwrap_err();
+    assert_eq!(err, Decline::SimulationFailed { class: None });
+}
+
+/// **No pending header, no simulation.** Without the block being built there
+/// is no context to set, and a simulation at the lagging one is not asked for.
+#[tokio::test]
+async fn without_the_pending_header_nothing_is_simulated() {
+    let c = support::candidate(1, 100, 1);
+    for header in [
+        Err(RpcError::Exhausted { method: "eth_getBlockByNumber".into(), endpoints: 1, last: "timed out".into() }),
+        Ok(json!({ "number": "0x10" })),
+    ] {
+        let rpc = Arc::new(Recording { header, answer: Ok(json!([])), asked: Mutex::new(vec![]) });
+        let sim = LiveSimulator::new(rpc.clone(), BASE);
+        let err = sim
+            .simulate(&c, &call_to(Address::repeat_byte(1)), Address::repeat_byte(2), c.total_execution_cost.gas_limit)
+            .await
+            .unwrap_err();
+        assert_eq!(err, Decline::SimulationFailed { class: None });
+        assert!(rpc.asked.lock().unwrap().iter().all(|(m, _)| m != "eth_simulateV1"));
+    }
 }
 
 /// A simulation that could not run has no outcome to classify: a failure
@@ -324,7 +419,8 @@ async fn a_simulation_that_cannot_run_fails_without_a_class() {
         Ok(json!({"unexpected": true})),
         Ok(json!([{ "number": "0x1", "hash": format!("0x{}", "11".repeat(32)), "parentHash": format!("0x{}", "22".repeat(32)), "calls": [] }])),
     ] {
-        let sim = LiveSimulator::new(Arc::new(Recording { answer, asked: Mutex::new(vec![]) }), BASE);
+        let header = json!({ "number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x1" });
+        let sim = LiveSimulator::new(Arc::new(Recording::new(header, answer)), BASE);
         let err = sim
             .simulate(&c, &call_to(Address::repeat_byte(1)), Address::repeat_byte(2), c.total_execution_cost.gas_limit)
             .await

@@ -1,5 +1,21 @@
 //! Tier 2 simulation (Task 8.5 R7): **the call**, as the lane that will sign
-//! it, against the chain's latest state, by `eth_simulateV1`.
+//! it, inside the block being built, by `eth_simulateV1`.
+//!
+//! # Inside the block being built (R16)
+//!
+//! The shadow prices against preconfirmed state — the in-progress block through
+//! its latest flashblock — and a trade lands in that block or the next. Until
+//! 2026-10-05 the simulation ran on the last sealed block instead, a different
+//! state: a gap that a swap opened inside the block was not in it, and R11's
+//! first candidate, priced on such a gap, reverted. So the base is `pending`,
+//! whose state BlockPI keeps current — recorded: the sequencer fee vault, which
+//! every transaction pays, reads there exactly as `eth_getBalance` at `pending`
+//! does, ahead of `latest`. Its block context under `pending` is not current:
+//! it lagged by two to four blocks — the blueprint's warning (§15.2). So the
+//! pending header is read first, and its number, timestamp and base fee are set
+//! explicitly. BlockPI reaches the requested number by inserting empty blocks,
+//! so the call is in the answer's last block; an answer whose last block is not
+//! the one asked for ran somewhere else, and is refused.
 //!
 //! # A success that is not a `startV2` is a failure
 //!
@@ -168,7 +184,9 @@ pub fn read_simulation(
     answer: &Value,
     elapsed: DurationNanos,
 ) -> Option<SimulationResult> {
-    let block = answer.get(0)?;
+    // The last block: any before it are the empty ones a node inserts to reach
+    // the block number asked for.
+    let block = answer.as_array()?.last()?;
     let [call] = &block.get("calls")?.as_array()?[..] else { return None };
     let number = quantity(block.get("number")?)?;
     let (hash_now, parent) = (hash(block.get("hash")?)?, hash(block.get("parentHash")?)?);
@@ -234,6 +252,50 @@ pub fn read_simulation(
     Some(r)
 }
 
+/// The block a simulation runs in: the one being built, from its header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockContext {
+    pub number: u64,
+    pub timestamp: u64,
+    pub base_fee: u128,
+}
+
+impl BlockContext {
+    /// From `eth_getBlockByNumber("pending")`'s header; `None` if any of the
+    /// three is missing or does not decode.
+    pub fn from_header(header: &Value) -> Option<Self> {
+        let base_fee = header.get("baseFeePerGas")?.as_str()?.strip_prefix("0x")?;
+        Some(Self {
+            number: quantity(header.get("number")?)?,
+            timestamp: quantity(header.get("timestamp")?)?,
+            base_fee: u128::from_str_radix(base_fee, 16).ok()?,
+        })
+    }
+}
+
+/// The `eth_simulateV1` request: one call, from the signing lane, at the gas
+/// limit it will be signed with, in the block `at` — on `pending`'s state, with
+/// the block's context set explicitly rather than taken from `pending`'s.
+pub fn simulate_request(call: &ExecutorCall, from: Address, gas_limit: GasLimit, at: BlockContext) -> Value {
+    json!([{
+        "blockStateCalls": [{
+            "blockOverrides": {
+                "number": format!("{:#x}", at.number),
+                "time": format!("{:#x}", at.timestamp),
+                "baseFeePerGas": format!("{:#x}", at.base_fee),
+            },
+            "calls": [{
+                "from": from,
+                "to": call.to(),
+                "data": format!("0x{}", hex::encode(call.data())),
+                "gas": format!("{:#x}", gas_limit.0),
+            }],
+        }],
+        "traceTransfers": true,
+        "validation": false,
+    }, "pending"])
+}
+
 /// `eth_simulateV1` over the read-only transport.
 pub struct LiveSimulator {
     rpc: Arc<dyn RpcTransport>,
@@ -248,10 +310,12 @@ impl LiveSimulator {
 
 #[async_trait::async_trait]
 impl Simulator for LiveSimulator {
-    /// One block, one call: from the signing lane, to the committed executor,
-    /// with the gas limit it will be signed with — a call that needs more fails
-    /// here as it would on chain. `validation: false`: nonce and balance are
-    /// last-mile's to check; this answers what the call does.
+    /// One call, inside the block being built: from the signing lane, to the
+    /// committed executor, with the gas limit it will be signed with — a call
+    /// that needs more fails here as it would on chain. `validation: false`:
+    /// nonce and balance are last-mile's to check; this answers what the call
+    /// does. A simulation that did not run, or ran in another block, has no
+    /// outcome and so no class.
     async fn simulate(
         &self,
         _c: &Candidate,
@@ -260,23 +324,16 @@ impl Simulator for LiveSimulator {
         gas_limit: GasLimit,
     ) -> Result<SimulationResult, Decline> {
         let started = std::time::Instant::now();
-        let params = json!([{
-            "blockStateCalls": [{ "calls": [{
-                "from": from,
-                "to": call.to(),
-                "data": format!("0x{}", hex::encode(call.data())),
-                "gas": format!("{:#x}", gas_limit.0),
-            }]}],
-            "traceTransfers": true,
-            "validation": false,
-        }, "latest"]);
-        // No outcome, so no class: the simulation did not run.
-        let answer = self
-            .rpc
-            .call("eth_simulateV1", params)
-            .await
-            .map_err(|_| Decline::SimulationFailed { class: None })?;
+        let unrun = || Decline::SimulationFailed { class: None };
+        let header = self.rpc.call("eth_getBlockByNumber", json!(["pending", false])).await.map_err(|_| unrun())?;
+        let at = BlockContext::from_header(&header).ok_or_else(unrun)?;
+        let answer =
+            self.rpc.call("eth_simulateV1", simulate_request(call, from, gas_limit, at)).await.map_err(|_| unrun())?;
         let elapsed = DurationNanos(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
-        read_simulation(self.chain, call.to(), &answer, elapsed).ok_or(Decline::SimulationFailed { class: None })
+        let r = read_simulation(self.chain, call.to(), &answer, elapsed).ok_or_else(unrun)?;
+        if r.state_after.confirmed_block_number != at.number {
+            return Err(unrun());
+        }
+        Ok(r)
     }
 }
