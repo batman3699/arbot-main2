@@ -183,12 +183,27 @@ pub async fn build_ladder<S: TickDataSource + ?Sized>(
     }
 
     let words = source.tick_words(pool, &word_positions, block).await?;
+    if words.len() != word_positions.len() {
+        return Err(anyhow!(
+            "pool 0x{}: {} bitmap words answered for {} asked",
+            hex::encode(pool),
+            words.len(),
+            word_positions.len()
+        ));
+    }
 
+    // Every word read, or no ladder. The ladder claims coverage over every word
+    // it fetched, so a word that failed to read would be claimed EMPTY — and a
+    // swap through it priced as if it held no initialized tick.
     let mut candidate_ticks: Vec<i32> = Vec::new();
     for (word_pos, word) in word_positions.iter().zip(words.iter()) {
-        if let Some(bitmap) = word {
-            candidate_ticks.extend(ticks_in_word(*word_pos, *bitmap, spacing));
-        }
+        let Some(bitmap) = word else {
+            return Err(anyhow!(
+                "pool 0x{}: bitmap word {word_pos} did not read; a ladder cannot claim a word it has not seen",
+                hex::encode(pool)
+            ));
+        };
+        candidate_ticks.extend(ticks_in_word(*word_pos, *bitmap, spacing));
     }
     candidate_ticks.sort_unstable();
     candidate_ticks.dedup();
@@ -220,12 +235,30 @@ pub async fn build_ladder<S: TickDataSource + ?Sized>(
     }
 
     let nets = source.liquidity_net(pool, &candidate_ticks, block).await?;
-    let ticks: Vec<(i32, i128)> = candidate_ticks
+    if nets.len() != candidate_ticks.len() {
+        return Err(anyhow!(
+            "pool 0x{}: {} ticks answered for {} asked",
+            hex::encode(pool),
+            nets.len(),
+            candidate_ticks.len()
+        ));
+    }
+    // Every initialized tick, with its net — **a zero net included**. v3-core
+    // ends a swap step at every initialized tick, whatever its net, and each
+    // step rounds its fee up on its own; a ladder without the tick quotes one
+    // rounding fewer, and over-states the output by about a unit of the input
+    // token (measured on PancakeSwap's WETH/USDC pool, 2026-10-04, at a tick
+    // with gross 2 and net 0). And a tick whose net did not read cannot be
+    // skipped either: the swap stops there and its liquidity moves.
+    let ticks = candidate_ticks
         .into_iter()
         .zip(nets)
-        .filter_map(|(tick, net)| net.map(|n| (tick, n)))
-        .filter(|(_, net)| *net != 0)
-        .collect();
+        .map(|(tick, net)| {
+            net.map(|n| (tick, n)).ok_or_else(|| {
+                anyhow!("pool 0x{}: ticks({tick}) did not read", hex::encode(pool))
+            })
+        })
+        .collect::<Result<Vec<(i32, i128)>>>()?;
 
     Ok(TickLadder::new(ticks, lower_bound, upper_bound))
 }
@@ -634,6 +667,80 @@ mod tests {
             tick_spacing: 60,
             fee_ppm: 3_000,
             ..Default::default()
+        }
+    }
+
+    /// **A zero-net initialized tick stays in the ladder.** v3-core ends a swap
+    /// step at it, and each step rounds its fee on its own: without it, a quote
+    /// takes one step fewer and over-states its output (`apex-math`'s
+    /// `tests/v3_core_steps.rs` holds that to PancakeSwap's quoter).
+    #[tokio::test]
+    async fn build_ladder_keeps_a_zero_net_initialized_tick() {
+        let pool = Address::zero();
+        let src = StaticTickSource::new(pool, vec![(-120, 500), (60, 0), (120, -500)], 60);
+        let ladder = build_ladder(&src, pool, &state_at_tick_zero(), U64::zero(), 1).await.unwrap();
+        assert_eq!(ladder.ticks(), &[(-120, 500), (60, 0), (120, -500)]);
+    }
+
+    /// A source that answers everything but what it is told to fail.
+    struct Holes {
+        inner: StaticTickSource,
+        word: Option<i16>,
+        tick: Option<i32>,
+        short: bool,
+        short_words: bool,
+    }
+
+    #[async_trait]
+    impl TickDataSource for Holes {
+        async fn tick_words(&self, pool: Address, words: &[i16], block: U64) -> Result<Vec<Option<U256>>> {
+            let mut out = self.inner.tick_words(pool, words, block).await?;
+            for (w, v) in words.iter().zip(out.iter_mut()) {
+                if Some(*w) == self.word {
+                    *v = None;
+                }
+            }
+            if self.short_words {
+                out.pop();
+            }
+            Ok(out)
+        }
+        async fn liquidity_net(&self, pool: Address, ticks: &[i32], block: U64) -> Result<Vec<Option<i128>>> {
+            let mut out = self.inner.liquidity_net(pool, ticks, block).await?;
+            for (t, v) in ticks.iter().zip(out.iter_mut()) {
+                if Some(*t) == self.tick {
+                    *v = None;
+                }
+            }
+            if self.short {
+                out.pop();
+            }
+            Ok(out)
+        }
+    }
+
+    fn holes(word: Option<i16>, tick: Option<i32>, short: bool) -> Holes {
+        let inner = StaticTickSource::new(Address::zero(), vec![(-120, 500), (60, -200), (120, -300)], 60);
+        Holes { inner, word, tick, short, short_words: false }
+    }
+
+    /// **A ladder claims only what it read.** Its coverage spans every word it
+    /// fetched, so an unread word would be claimed empty — a swap through it
+    /// priced as if no tick were initialized there. Refused, as is an
+    /// initialized tick whose net did not read (the swap stops there and its
+    /// liquidity moves) and an answer shorter than the question.
+    #[tokio::test]
+    async fn build_ladder_refuses_what_it_could_not_read() {
+        let state = state_at_tick_zero();
+        assert!(build_ladder(&holes(None, None, false), Address::zero(), &state, U64::zero(), 1).await.is_ok());
+        for (what, src) in [
+            ("an unread word", holes(Some(-1), None, false)),
+            ("an unread tick", holes(None, Some(60), false)),
+            ("a short answer", holes(None, None, true)),
+            ("short words", Holes { short_words: true, ..holes(None, None, false) }),
+        ] {
+            let got = build_ladder(&src, Address::zero(), &state, U64::zero(), 1).await;
+            assert!(got.is_err(), "{what} was built into a ladder: {:?}", got.map(|l| l.ticks().to_vec()));
         }
     }
 

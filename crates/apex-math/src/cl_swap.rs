@@ -185,8 +185,33 @@ fn apply_liquidity_net(liquidity: u128, liquidity_net: i128) -> Option<u128> {
     }
 }
 
+/// v3-core's `nextInitializedTickWithinOneWord` when the word holds nothing
+/// nearer: the edge of the bitmap word in the direction of travel — the lowest
+/// tick of `tick`'s word when the price falls, the highest tick of the word
+/// holding the next position when it rises. A swap step never leaves its word:
+/// with no initialized tick before this edge, the step ends here, uninitialized,
+/// and rounds its fee before the next word is searched. Clamped to the protocol
+/// range, as the swap clamps `tickNext`.
+pub fn word_edge(tick: i32, tick_spacing: i32, zero_for_one: bool) -> i32 {
+    let s = i64::from(tick_spacing.max(1));
+    let compressed = i64::from(tick).div_euclid(s);
+    let edge = if zero_for_one {
+        (compressed - compressed.rem_euclid(256)) * s
+    } else {
+        let next = compressed + 1;
+        (next + (255 - next.rem_euclid(256))) * s
+    };
+    edge.clamp(i64::from(MIN_TICK), i64::from(MAX_TICK)) as i32
+}
+
 /// Exact-input quote that crosses tick boundaries, updating liquidity at each
 /// initialized tick.
+///
+/// **Step for step with v3-core's `swap`**, because each step rounds its fee up
+/// on its own and a quote that took fewer steps would over-state the output by
+/// a unit of the input token per step it skipped: a step ends at the next
+/// initialized tick — a zero net included, which is why the ladder keeps them
+/// — or at the edge of the bitmap word ([`word_edge`]), whichever comes first.
 ///
 /// Returns `None` for structurally invalid input (zero amount, zero liquidity,
 /// unusable state). A quote that runs out of ladder returns `Some` with
@@ -226,9 +251,20 @@ pub fn quote_exact_input_multi_tick(
             break;
         }
 
-        let (next_tick, liquidity_net) = match ladder.next_initialized(tick, zero_for_one) {
-            LadderStep::Initialized { tick, liquidity_net } => (tick, liquidity_net),
-            LadderStep::Exhausted => {
+        let edge = word_edge(tick, state.tick_spacing, zero_for_one);
+        let found = match ladder.next_initialized(tick, zero_for_one) {
+            LadderStep::Initialized { tick: t, liquidity_net }
+                if (zero_for_one && t >= edge) || (!zero_for_one && t <= edge) =>
+            {
+                Some((t, liquidity_net))
+            }
+            _ => None,
+        };
+        let (next_tick, liquidity_net, initialized) = match found {
+            Some((t, net)) => (t, net, true),
+            // Nothing initialized before the word's edge: the step ends there.
+            None if ladder.covers(edge) => (edge, 0, false),
+            None => {
                 exhausted = true;
                 break;
             }
@@ -272,25 +308,28 @@ pub fn quote_exact_input_multi_tick(
             break;
         }
 
-        // Landed exactly on an initialized tick — cross it.
-        if ticks_crossed >= max_ticks {
-            exhausted = true;
-            break;
-        }
-        let signed = if zero_for_one { -liquidity_net } else { liquidity_net };
-        liquidity = match apply_liquidity_net(liquidity, signed) {
-            Some(l) if l > 0 => l,
-            // Liquidity would go to zero or underflow: the ladder disagrees
-            // with reality, so refuse rather than quote through a dead range.
-            _ => {
+        // Landed exactly on an initialized tick — cross it. A word's edge is no
+        // tick at all: nothing to cross, and no crossing to count.
+        if initialized {
+            if ticks_crossed >= max_ticks {
                 exhausted = true;
                 break;
             }
-        };
-        // Downward crossings land on `tick - 1` so the next search makes
-        // progress instead of re-finding the tick just crossed.
+            let signed = if zero_for_one { -liquidity_net } else { liquidity_net };
+            liquidity = match apply_liquidity_net(liquidity, signed) {
+                Some(l) if l > 0 => l,
+                // Liquidity would go to zero or underflow: the ladder disagrees
+                // with reality, so refuse rather than quote through a dead range.
+                _ => {
+                    exhausted = true;
+                    break;
+                }
+            };
+            ticks_crossed += 1;
+        }
+        // Downward steps land on `tick - 1` so the next search makes progress
+        // instead of re-finding the boundary just reached.
         tick = if zero_for_one { next_tick - 1 } else { next_tick };
-        ticks_crossed += 1;
     }
 
     if amount_out.is_zero() {

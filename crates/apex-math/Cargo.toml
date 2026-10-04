@@ -25,3 +25,5 @@ apex-types = { path = "../apex-types" }
 [dev-dependencies]
 # Already in Cargo.lock via the alloy/revm tree, so this adds nothing new.
 proptest = "1"
+# Reads the fixtures recorded from Base. Already in Cargo.lock.
+serde_json = "1"

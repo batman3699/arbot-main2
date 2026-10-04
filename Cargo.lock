@@ -274,6 +274,7 @@ dependencies = [
  "apex-types",
  "ethers-core",
  "proptest",
+ "serde_json",
 ]
 
 [[package]]
