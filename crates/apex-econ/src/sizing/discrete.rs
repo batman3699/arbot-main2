@@ -68,6 +68,15 @@ pub struct Refinement {
     pub evaluations: u32,
 }
 
+/// What one probe of the climb learned.
+enum Probe {
+    Net(U256, Surplus),
+    /// The route cannot be priced at this size, nor at any larger one.
+    Refused,
+    /// The evaluation budget is gone.
+    Spent,
+}
+
 /// Refine a continuous optimum into an executable integer size.
 ///
 /// `None` when the route cannot be priced at the starting point at all.
@@ -84,26 +93,26 @@ pub fn refine_detailed<R: SizedRoute + ?Sized>(
 
     let start = nearest_integer(continuous.value(), lo, hi);
     let mut evaluations = 0u32;
-    let mut evaluate = |x: U256| -> Option<(U256, Surplus)> {
+    let mut evaluate = |x: U256| -> Probe {
         if evaluations >= budget.max_evaluations {
-            return None;
+            return Probe::Spent;
         }
         evaluations += 1;
         // Each size at its own cost: gas grows with the ticks a size crosses.
-        let priced = route.priced(x)?;
+        let Some(priced) = route.priced(x) else { return Probe::Refused };
         let cost = x.saturating_add(priced.cost);
-        Some((
+        Probe::Net(
             priced.output,
             if priced.output >= cost {
                 Surplus::Gain(priced.output - cost)
             } else {
                 Surplus::Loss(cost - priced.output)
             },
-        ))
+        )
     };
 
     // The starting point. Everything after this can only improve on it.
-    let (mut best_out, mut best_net) = evaluate(start)?;
+    let Probe::Net(mut best_out, mut best_net) = evaluate(start) else { return None };
     let mut best_amount = start;
 
     let mut step = budget.max_step.min(hi);
@@ -118,13 +127,19 @@ pub fn refine_detailed<R: SizedRoute + ?Sized>(
             .into_iter()
             .flatten()
             {
-                let Some((out, net)) = evaluate(candidate) else {
-                    // Budget exhausted or the route refused this size. Either
-                    // way the climb stops where it is, which is still at least
-                    // as good as the warm start.
-                    step = U256::zero();
-                    moved = false;
-                    break;
+                let (out, net) = match evaluate(candidate) {
+                    Probe::Net(out, net) => (out, net),
+                    // Past what the route can price: no better, and every
+                    // larger size is refused too, so the climb goes on below
+                    // it. Until 2026-10-05 a refusal ended the climb.
+                    Probe::Refused => continue,
+                    // The budget is gone: the climb stops where it is, which is
+                    // still at least as good as the warm start.
+                    Probe::Spent => {
+                        step = U256::zero();
+                        moved = false;
+                        break;
+                    }
                 };
                 if net > best_net {
                     best_amount = candidate;

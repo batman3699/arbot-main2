@@ -88,22 +88,40 @@ pub fn optimize<R: SizedRoute + ?Sized>(
 
     let (mut lo, mut hi) = (u256_to_f64(lo_u), u256_to_f64(hi_u));
     let mut evaluations = 0u32;
-    let mut net = |x: f64| -> Option<f64> {
-        let amount = f64_to_u256(x)?;
+    // A size the route refuses scores below every size it prices. A
+    // concentrated pool's quote runs off its proven ladder, or past its tick
+    // limit, beyond some size, and every larger size is refused too — so the
+    // section closes on what the route can price rather than stopping at the
+    // first refusal, which for a pool holding far more than it can price is the
+    // first probe.
+    let mut net = |x: f64| -> f64 {
+        let Some(amount) = f64_to_u256(x) else { return f64::NEG_INFINITY };
         if amount < lo_u || amount > hi_u {
-            return None;
+            return f64::NEG_INFINITY;
         }
         evaluations += 1;
         // Each size at its own cost: gas grows with the ticks a size crosses.
-        let priced = route.priced(amount)?;
-        Some(u256_to_f64(priced.output) - x - u256_to_f64(priced.cost))
+        route
+            .priced(amount)
+            .map_or(f64::NEG_INFINITY, |p| u256_to_f64(p.output) - x - u256_to_f64(p.cost))
     };
 
     // 1 / phi.
     const INV_PHI: f64 = 0.618_033_988_749_894_9;
     let mut c = hi - (hi - lo) * INV_PHI;
     let mut d = lo + (hi - lo) * INV_PHI;
-    let (mut fc, mut fd) = (net(c)?, net(d)?);
+    let (mut fc, mut fd) = (net(c), net(d));
+    // Both probes refused: what the route prices lies below the lower one.
+    // Narrow until a probe prices, within the same iteration budget.
+    let mut narrowing = budget.iterations;
+    while fc == f64::NEG_INFINITY && narrowing > 0 && hi - lo > 1.0 {
+        narrowing -= 1;
+        hi = c;
+        c = hi - (hi - lo) * INV_PHI;
+        d = lo + (hi - lo) * INV_PHI;
+        fc = net(c);
+        fd = net(d);
+    }
 
     for _ in 0..budget.iterations {
         if hi - lo <= 1.0 {
@@ -114,22 +132,19 @@ pub fn optimize<R: SizedRoute + ?Sized>(
             d = c;
             fd = fc;
             c = hi - (hi - lo) * INV_PHI;
-            let Some(v) = net(c) else { break };
-            fc = v;
+            fc = net(c);
         } else {
             lo = c;
             c = d;
             fc = fd;
             d = lo + (hi - lo) * INV_PHI;
-            let Some(v) = net(d) else { break };
-            fd = v;
+            fd = net(d);
         }
     }
 
-    Some(ContinuousOptimum {
-        value: if fc > fd { c } else { d },
-        evaluations,
-    })
+    let (value, best) = if fc > fd { (c, fc) } else { (d, fd) };
+    // Nothing priced: no warm start to give.
+    (best > f64::NEG_INFINITY).then_some(ContinuousOptimum { value, evaluations })
 }
 
 /// `U256` -> `f64`, losing precision above 2^53 exactly as described in the

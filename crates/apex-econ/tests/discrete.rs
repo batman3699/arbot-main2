@@ -305,3 +305,65 @@ fn both_stages_charge_each_size_what_it_costs() {
     assert_eq!(found.output, at.output);
     assert_eq!(found.net, Surplus::Gain(at.output - found.amount - at.cost));
 }
+
+/// A route that cannot be priced past `limit`, while its pool holds far more.
+struct Refusing {
+    inner: Route,
+    limit: U256,
+}
+
+impl SizedRoute for Refusing {
+    fn output(&self, amount_in: U256) -> Option<U256> {
+        (amount_in <= self.limit).then(|| self.inner.output(amount_in)).flatten()
+    }
+    fn fixed_cost(&self) -> U256 {
+        self.inner.fixed_cost()
+    }
+    fn max_input(&self) -> U256 {
+        self.inner.max_input()
+    }
+}
+
+/// **A refused size bounds the warm start and the climb; it ends neither.**
+/// Priced to 20 WETH, held a million deep: the golden section's first probes
+/// are refused, and a size past what the route prices is refused too, so both
+/// stages close on what it can price and refine to a profitable size.
+#[test]
+fn a_refused_size_bounds_both_stages() {
+    let limit = U256::from(20_000_000_000_000_000_000u128);
+    let mut deep = route(200, 30, GAS);
+    deep.cap = U256::from(1_000_000_000_000_000_000_000_000u128);
+    let r = Refusing { inner: deep, limit };
+    let start = optimize(&r, ContinuousBudget::default()).expect("a warm start within what it prices");
+    assert!(start.value() <= 20e18, "{}", start.value());
+    let found = refine_detailed(&r, start, RefineBudget::default()).expect("priceable");
+    assert!(found.size.is_some(), "{found:?}");
+    assert!(found.amount <= limit);
+}
+
+/// **A refused step does not end the climb.** From a rough warm start, with
+/// steps as large as 100 WETH, the climb's larger steps land past what the
+/// route can price, just above its best size, while its pool holds twice that.
+/// The climb tries the other way and smaller steps, and reaches the best size;
+/// stopping at the first refusal would leave it at the warm start.
+#[test]
+fn a_refused_step_does_not_end_the_climb() {
+    let free = route(200, 30, GAS);
+    let unbounded = refine_detailed(&free, optimize(&free, ContinuousBudget::default()).unwrap(), RefineBudget::default())
+        .expect("priceable");
+    // Refused just past the best size; held to twice that.
+    let limit = unbounded.amount * U256::from(11u64) / U256::from(10u64);
+    let mut held = route(200, 30, GAS);
+    held.cap = limit * U256::from(2u64);
+    let r = Refusing { inner: held, limit };
+    let rough = optimize(&r, ContinuousBudget { iterations: 1, ..ContinuousBudget::default() }).expect("a warm start");
+    let found = refine_detailed(
+        &r,
+        rough,
+        RefineBudget { max_step: U256::from(100_000_000_000_000_000_000u128), ..RefineBudget::default() },
+    )
+    .expect("priceable");
+    assert!(found.amount <= limit);
+    let (got, best) = (found.net.magnitude(), unbounded.net.magnitude());
+    assert!(found.net.is_gain() && got * U256::from(1_000u64) >= best * U256::from(999u64), "{found:?} against {unbounded:?}");
+}

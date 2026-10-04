@@ -545,3 +545,79 @@ fn a_near_miss_is_never_at_a_size_the_pool_cannot_pay() {
         assert_eq!(route.near_miss_centi_bps().map(i128::from), Some(only));
     }
 }
+
+/// **A pool's depth must not hide a size that pays.** The same 50-tick gap,
+/// the paying pool holding 1,000 WETH or a million: a million puts the search's
+/// first probes far past the pools' ladders, where the route cannot be priced.
+/// A size that pays is still a size that pays.
+#[test]
+fn a_deeper_paying_pool_does_not_hide_a_size_that_pays() {
+    for held in [10u128.pow(21), 10u128.pow(24)] {
+        let deep = |mut p: PoolSnapshot| {
+            p.state.balance0 = Some(U256::from(held));
+            p
+        };
+        let b = book(vec![
+            deep(pool(UNI, Venue::UniswapV3, -197_350, 500, L)),
+            deep(pool(SLIP, Venue::Slipstream, -197_300, 80, L)),
+        ]);
+        let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
+        let pricer = LivePricer::new(b, cycles.clone(), flat(3_000_000_000_000), gas::MEASURED);
+        let wins = cycles.keys().filter_map(|id| pricer.best_size(*id, &fp(), budget()).ok()).count();
+        assert_eq!(wins, 1, "holding {held} wei: {:?}", pricer.near_misses().report());
+    }
+}
+
+/// **And the economics sizes it too.** Engine C's search and the economics'
+/// two stages are separate searches over the same curve: with the paying pool a
+/// million deep, the economics — golden section, then the climb — refines the
+/// same route to a profitable size, through the real pricer.
+#[tokio::test]
+async fn the_economics_sizes_a_route_through_a_deep_pool() {
+    use apex_econ::cost::failure::FailureProfile;
+    use apex_econ::cost::l1_data::{L1FeeModel, L1FeeParameters};
+    use apex_runtime::econ::{ChainCosts, LiveEconomics, ScenarioPriors};
+    use apex_runtime::plane::Economics;
+    use apex_search::frontier::{ProposalOrigin, RouteProposal};
+
+    let deep = |mut p: PoolSnapshot| {
+        p.state.balance0 = Some(U256::from(10u128.pow(24)));
+        p
+    };
+    let b = book(vec![
+        deep(pool(UNI, Venue::UniswapV3, -197_350, 500, L)),
+        deep(pool(SLIP, Venue::Slipstream, -197_300, 80, L)),
+    ]);
+    let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
+    let pricer = Arc::new(LivePricer::new(b, cycles.clone(), flat(3_000_000_000_000), gas::MEASURED));
+    let costs = ChainCosts {
+        gas_price_wei: alloy_primitives::U256::from(5_000_000u64),
+        l1: L1FeeParameters {
+            l1_base_fee: U256::from(82_228_355u64),
+            l1_blob_base_fee: U256::from(4_300_268u64),
+            base_fee_scalar: 2_269,
+            blob_base_fee_scalar: 1_055_762,
+        },
+        l1_model: L1FeeModel::unvalidated(),
+        failure: FailureProfile { gas_on_failure: apex_types::cost::GasUsed(411_945), failure_ppm: 50_000 },
+    };
+    let econ = LiveEconomics::new(pricer.clone(), ScenarioPriors::default(), costs, apex_types::ids::StrategyId(1));
+
+    let (id, _) = cycles
+        .keys()
+        .find_map(|id| pricer.best_size(*id, &fp(), budget()).ok().map(|w| (*id, w)))
+        .expect("Engine C finds the paying direction");
+    let proposal = RouteProposal {
+        chain: BASE,
+        route: pricer.commitment(id).expect("a commitment"),
+        venue_set: Vec::new(),
+        state_fingerprint: fp(),
+        found_at: apex_types::time::UnixNanos(0),
+        origin: ProposalOrigin::FiniteSize,
+        flash_source: None,
+        size_hint: None,
+    };
+    let size = econ.size(&proposal).await.expect("the economics sizes it");
+    assert!(size.get() > alloy_primitives::U256::ZERO);
+    assert!(size.get() <= alloy_primitives::U256::from(10u128.pow(24)));
+}

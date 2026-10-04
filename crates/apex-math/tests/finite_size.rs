@@ -390,3 +390,52 @@ fn best_size_returns_ok_only_for_a_gain() {
     assert!(saw_ok, "no spread in the sweep was profitable");
     assert!(saw_err, "no spread in the sweep was unprofitable");
 }
+
+/// A cycle that cannot be priced past `limit` — as a concentrated pool's runs
+/// off its proven ladder, or past its tick limit — while its pool holds `cap`.
+struct Refusing {
+    inner: TwoVenueCycle,
+    limit: U256,
+}
+
+impl SizedRoute for Refusing {
+    fn output(&self, amount_in: U256) -> Option<U256> {
+        (amount_in <= self.limit).then(|| self.inner.output(amount_in)).flatten()
+    }
+    fn fixed_cost(&self) -> U256 {
+        self.inner.fixed_cost()
+    }
+    fn max_input(&self) -> U256 {
+        self.inner.max_input()
+    }
+}
+
+/// **A size the route refuses bounds the search; it does not end it.** The
+/// route prices to 20 WETH and its pool holds a million: the first probes land
+/// far past what it can price. A larger size is refused too — more input runs
+/// further past the ladder — so the search narrows below the refusal and finds
+/// the same size it finds when the pool holds no more than the route can price.
+#[test]
+fn a_refused_size_bounds_the_search_rather_than_ending_it() {
+    let limit = U256::from(20_000_000_000_000_000_000u128);
+    let mut within = cycle(200, 30, GAS);
+    within.cap = limit;
+    let expected = best_size(&within, SearchBudget::default()).expect("profitable within what it can price");
+
+    let mut deep = cycle(200, 30, GAS);
+    deep.cap = U256::from(1_000_000_000_000_000_000_000_000u128);
+    let found = best_size(&Refusing { inner: deep, limit }, SearchBudget::default()).expect("still profitable");
+    assert!(found.net.is_gain());
+    // The same curve: as good as the bounded search, within a few probes' rounding.
+    assert!(found.net >= Surplus::Gain(expected.net.magnitude() * U256::from(999u64) / U256::from(1_000u64)), "{found:?} vs {expected:?}");
+    assert!(found.amount_in <= limit);
+}
+
+/// A route that refuses every size is unpriceable, however much its pool holds.
+#[test]
+fn a_route_refused_everywhere_is_unpriceable() {
+    let mut deep = cycle(200, 30, GAS);
+    deep.cap = U256::from(1_000_000_000_000_000_000_000_000u128);
+    let r = Refusing { inner: deep, limit: U256::zero() };
+    assert_eq!(best_size(&r, SearchBudget::default()).unwrap_err(), NoSize::Unpriceable);
+}

@@ -208,6 +208,15 @@ impl apex_types::miss::ExplainsMiss for NoSize {
     }
 }
 
+/// What one probe of a size search learned.
+enum Probe {
+    Net(Surplus),
+    /// The route cannot be priced at this size, nor at any larger one.
+    Refused,
+    /// The evaluation budget is gone.
+    Spent,
+}
+
 /// Find the input that maximises net profit, or say why there is none.
 ///
 /// `net(x) = output(x) - x - cost(x)`, with each size's cost from
@@ -221,6 +230,15 @@ impl apex_types::miss::ExplainsMiss for NoSize {
 /// concave between its steps and small steps across them, so the search may
 /// stop near the best size rather than on it. What it reports is still exact:
 /// a size, and the net that size earns at its own cost.
+///
+/// **A size the route refuses bounds the search; it does not end it.** A
+/// concentrated pool's quote runs off its proven ladder, or past its tick
+/// limit, beyond some size — and more input runs further, so every larger size
+/// is refused too. The range ends at what its pool *holds*, which for a deep
+/// pool is thousands of times what it can price, so the first probes are
+/// usually refused. The search narrows below each refusal. Until 2026-10-05 a
+/// refusal ended it, and a route paying 44 bps at a tenth of a WETH reported no
+/// profitable size because its pool held a million.
 pub fn best_size<R: SizedRoute + ?Sized>(
     route: &R,
     budget: SearchBudget,
@@ -233,12 +251,12 @@ pub fn best_size<R: SizedRoute + ?Sized>(
 
     let mut evaluations = 0u32;
     let mut best: Option<SizedOpportunity> = None;
-    let mut evaluate = |x: U256, best: &mut Option<SizedOpportunity>| -> Option<Surplus> {
+    let mut evaluate = |x: U256, best: &mut Option<SizedOpportunity>| -> Probe {
         if evaluations >= budget.max_evaluations {
-            return None;
+            return Probe::Spent;
         }
         evaluations += 1;
-        let priced = route.priced(x)?;
+        let Some(priced) = route.priced(x) else { return Probe::Refused };
         let net = Surplus::of(priced.output, x.saturating_add(priced.cost));
         let candidate = SizedOpportunity {
             amount_in: x,
@@ -248,7 +266,7 @@ pub fn best_size<R: SizedRoute + ?Sized>(
         if best.is_none_or(|b| candidate.net > b.net) {
             *best = Some(candidate);
         }
-        Some(net)
+        Probe::Net(net)
     };
 
     let (mut lo, mut hi) = (lo_bound, hi_bound);
@@ -260,12 +278,22 @@ pub fn best_size<R: SizedRoute + ?Sized>(
         if m1 >= m2 {
             break;
         }
-        let (Some(f1), Some(f2)) = (evaluate(m1, &mut best), evaluate(m2, &mut best)) else {
-            // Either the budget ran out or the route refused a probe. Both mean
-            // the bracket can no longer be trusted; fall through to the scan of
-            // whatever range is left rather than continuing on a broken
-            // comparison.
-            break;
+        // The lower probe first: refused, the higher one would be too.
+        let f1 = match evaluate(m1, &mut best) {
+            Probe::Net(f) => f,
+            Probe::Refused => {
+                hi = m1 - U256::one();
+                continue;
+            }
+            Probe::Spent => break,
+        };
+        let f2 = match evaluate(m2, &mut best) {
+            Probe::Net(f) => f,
+            Probe::Refused => {
+                hi = m2 - U256::one();
+                continue;
+            }
+            Probe::Spent => break,
         };
         if f1 < f2 {
             lo = m1 + U256::one();
@@ -275,10 +303,11 @@ pub fn best_size<R: SizedRoute + ?Sized>(
     }
 
     // Exact scan of the narrowed bracket. Bounded: the loop above reduces the
-    // span geometrically, so this is a handful of points.
+    // span geometrically, so this is a handful of points. A refusal ends it:
+    // every size past it is refused too.
     let mut x = lo;
     while x <= hi {
-        if evaluate(x, &mut best).is_none() {
+        if !matches!(evaluate(x, &mut best), Probe::Net(_)) {
             break;
         }
         x = x.saturating_add(U256::one());
