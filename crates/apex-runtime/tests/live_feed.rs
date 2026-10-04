@@ -10,7 +10,7 @@ use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
-use apex_runtime::live::feed::{self, Effect, FeedHandler, BURN, MINT, SWAP};
+use apex_runtime::live::feed::{self, Effect, FeedHandler, BURN, MINT, PANCAKE_SWAP, SWAP};
 use apex_runtime::live::frontier::WETH;
 use apex_runtime::live::inventory::{PoolSpec, Venue};
 use apex_state::feed::event::EventKind;
@@ -278,4 +278,87 @@ fn a_token_two_pools_from_a_stable_is_priced_in_any_order() {
     let prices = feed::usd_prices(&book);
     let x = prices.get(&X).copied().expect("X is two pools from USDC");
     assert!((1_300.0..1_400.0).contains(&x), "X at {x}, WETH at {}", prices[&WETH]);
+}
+
+// ------------------------------------------------------------------ PancakeSwap
+
+const CAKE_POOL: Address = address!("72ab388e2E2F6FaceF59E3C3FA2C4E29011c2D38");
+
+/// A `Swap` PancakeSwap's 1 bp WETH/USDC pool emitted on Base: block 52,109,364,
+/// log index 393. Seven words — Uniswap's five, then the protocol fees.
+fn cake_log() -> RawLog {
+    let party = B256::left_padding_from(address!("8f10b468b06c6fd214b65f87778827f7d113f996").as_slice());
+    RawLog {
+        pending: false,
+        removed: false,
+        address: CAKE_POOL,
+        topics: vec![PANCAKE_SWAP, party, party],
+        data: alloy_primitives::hex::decode(concat!(
+            "0000000000000000000000000000000000000000000000000068584968155a2f",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffb50e363",
+            "0000000000000000000000000000000000000000000363df4215b46b048caa6e",
+            "000000000000000000000000000000000000000000000000136684f6d608b4b3",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffcfce8",
+            "000000000000000000000000000000000000000000000000000000e1aa578cf8",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ))
+        .unwrap(),
+        block_number: Some(52_109_364),
+        transaction_hash: Some(alloy_primitives::b256!(
+            "87676ded616a1ff7066ea0c4450c12bc2262a85990f30dc3d1f5fe940d7d0e22"
+        )),
+        log_index: Some(393),
+    }
+}
+
+#[test]
+fn pancakeswaps_swap_topic_is_its_signatures_hash() {
+    let sig = "Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)";
+    assert_eq!(PANCAKE_SWAP, keccak256(sig.as_bytes()));
+    assert_eq!(feed::swap_topic(Venue::PancakeV3), PANCAKE_SWAP);
+    assert_eq!(feed::swap_topic(Venue::UniswapV3), SWAP);
+    assert_eq!(feed::swap_topic(Venue::Slipstream), SWAP);
+}
+
+/// **As Base recorded it**, against `cast abi-decode` of the same data: the
+/// post-swap state is the first five words, as for Uniswap.
+#[test]
+fn a_pancakeswap_swap_decodes_as_base_recorded_it() {
+    let s = feed::decode_swap(&cake_log()).unwrap();
+    assert_eq!(s.pool, CAKE_POOL);
+    assert_eq!(s.amount0, 29_370_469_879_994_927);
+    assert_eq!(s.amount1, -78_584_989);
+    assert_eq!(s.sqrt_price_x96, U256::from(4_098_410_126_486_972_375_280_238u128));
+    assert_eq!(s.liquidity, 1_397_950_930_032_833_715);
+    assert_eq!(s.tick, -197_400);
+    assert_eq!((s.block, s.log_index), (52_109_364, 393));
+}
+
+/// Each topic is held to its own length: PancakeSwap's at five or eight words
+/// is not a swap, and neither is Uniswap's at seven.
+#[test]
+fn each_swap_topic_is_held_to_its_own_shape() {
+    let mut five = cake_log();
+    five.data.truncate(160);
+    assert!(feed::decode_swap(&five).is_none());
+    let mut eight = cake_log();
+    eight.data.extend([0u8; 32]);
+    assert!(feed::decode_swap(&eight).is_none());
+    let mut uniswap_seven = cake_log();
+    uniswap_seven.topics[0] = SWAP;
+    assert!(feed::decode_swap(&uniswap_seven).is_none());
+}
+
+/// The handler applies a PancakeSwap swap like any other and publishes it.
+#[test]
+fn a_pancakeswap_swap_moves_the_book_and_becomes_an_event() {
+    let mut snap = (*book().get(POOL).unwrap()).clone();
+    snap.spec.pool = CAKE_POOL;
+    snap.spec.venue = Venue::PancakeV3;
+    snap.factory = Venue::PancakeV3.factory();
+    let book = PoolBook::from_snapshots([snap], ReconstructionStatus::Verified);
+    let effects = FeedHandler::new(BASE).handle(&book, Notification::Log(cake_log()), NOW);
+    let e = event_of(&effects);
+    assert_eq!(book.get(CAKE_POOL).unwrap().state.tick, -197_400, "the book moved");
+    assert_eq!((e.at.block, e.at.log_index), (52_109_364, 393));
 }

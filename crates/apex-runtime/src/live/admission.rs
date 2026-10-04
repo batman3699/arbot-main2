@@ -12,13 +12,13 @@
 //! |---|---|
 //! | bytecode | the code hash the book read, at the read's block |
 //! | factory, tokens, decimals | the book's reads, already held to the inventory and the venue's factory |
-//! | fee | the chain's fee for Uniswap (static); **dynamic** for Slipstream, whose module sets it |
+//! | fee | the chain's fee for Uniswap and PancakeSwap (static); **dynamic** for Slipstream, whose module sets it |
 //! | reconstruction | concentrated-liquidity logs — what the book does |
 //! | depth | the inventory's figure, GeckoTerminal's: **non-authoritative**, it filters and never sizes |
 //! | gas | a share of the R6 fork run's two-hop cycle, **not measured** per hop |
 //! | reverts | none observed yet |
 //! | transfers | `Standard` only for the tokens checked below; **`Unknown`** otherwise, which keeps a pool out of live dispatch while leaving it in the shadow run |
-//! | update mapping | `Swap`, `Mint`, `Burn` |
+//! | update mapping | the venue's `Swap`, `Mint`, `Burn` |
 //!
 //! # Refreshed with the book
 //!
@@ -29,7 +29,7 @@
 
 use crate::commit::VenueCommitments;
 use crate::live::book::{PoolBook, PoolSnapshot};
-use crate::live::feed::{BURN, MINT, SWAP};
+use crate::live::feed::{swap_topic, BURN, MINT};
 use crate::live::frontier::WETH;
 use crate::live::inventory::Venue;
 use crate::plane::{Commitments, Decline};
@@ -86,7 +86,7 @@ pub fn record(p: &PoolSnapshot, chain: ChainId, read_block: u64) -> PoolAdmissio
         tokens: Some((token(p.spec.token0), token(p.spec.token1))),
         decimals: Some(p.decimals),
         fee_behavior: Some(match p.spec.venue {
-            Venue::UniswapV3 => FeeBehavior::Static { ppm: p.state.fee_ppm },
+            Venue::UniswapV3 | Venue::PancakeV3 => FeeBehavior::Static { ppm: p.state.fee_ppm },
             Venue::Slipstream => FeeBehavior::Dynamic,
         }),
         reconstruction: Some(ReconstructionMethod::ConcentratedLiquidityLogs),
@@ -98,7 +98,7 @@ pub fn record(p: &PoolSnapshot, chain: ChainId, read_block: u64) -> PoolAdmissio
         gas_profile: Some(GasProfile { per_hop: GAS_PER_HOP, measured: false }),
         revert_profile: Some(RevertProfile::default()),
         transfer_semantics: Some((semantics(p.spec.token0), semantics(p.spec.token1))),
-        update_mapping: Some(vec![SWAP, MINT, BURN]),
+        update_mapping: Some(vec![swap_topic(p.spec.venue), MINT, BURN]),
     }
 }
 

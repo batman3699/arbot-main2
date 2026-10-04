@@ -65,6 +65,10 @@ pub mod selector {
     pub const BLOB_BASE_FEE_SCALAR: [u8; 4] = [0x68, 0xd5, 0xdc, 0xa6];
     /// `isFjord()`
     pub const IS_FJORD: [u8; 4] = [0x96, 0x0e, 0x3a, 0x23];
+    /// `adapterOf(uint16)` — the executor's adapter registry.
+    pub const ADAPTER_OF: [u8; 4] = [0xb9, 0x69, 0xa5, 0x30];
+    /// `isSelectorAllowed(uint16,bytes4)`
+    pub const IS_SELECTOR_ALLOWED: [u8; 4] = [0x28, 0x4a, 0xea, 0x3f];
 }
 
 const WORD: usize = 32;
@@ -72,6 +76,23 @@ const WORD: usize = 32;
 /// A call with no arguments.
 pub fn call0(sel: [u8; 4]) -> Vec<u8> {
     sel.to_vec()
+}
+
+/// `f(uint16)`.
+pub fn call_u16(sel: [u8; 4], v: u16) -> Vec<u8> {
+    let mut out = sel.to_vec();
+    out.extend_from_slice(&[0u8; 30]);
+    out.extend_from_slice(&v.to_be_bytes());
+    out
+}
+
+/// `f(uint16,bytes4)`: the integer right-aligned in its word, and the bytes
+/// **left**-aligned in theirs — a fixed-size `bytesN` is padded on the right.
+pub fn call_u16_bytes4(sel: [u8; 4], v: u16, b: [u8; 4]) -> Vec<u8> {
+    let mut out = call_u16(sel, v);
+    out.extend_from_slice(&b);
+    out.extend_from_slice(&[0u8; 28]);
+    out
 }
 
 /// `f(address)`.

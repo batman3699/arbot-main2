@@ -46,6 +46,19 @@ pub const BALANCER_VAULT: Address = address!("BA12222222228d8Ba445958a75a0704d56
 /// Slipstream's router under, with `exactInputSingle` allowlisted.
 pub const SLIPSTREAM_ADAPTER: u16 = 1;
 
+/// Aerodrome Slipstream's `SwapRouter` on Base: what adapter 1 must be. Its
+/// `factory()` is Slipstream's, and its code holds `exactInputSingle`.
+pub const SLIPSTREAM_ROUTER: Address = address!("BE6D8f0d05cC4be24d5167a3eF062215bE6D18a5");
+
+/// The adapter id PancakeSwap v3's router is registered under. Not by the
+/// deploy script: by the owner's own `registerAdapter`, after it.
+pub const PANCAKE_ADAPTER: u16 = 2;
+
+/// PancakeSwap's `SmartRouter` on Base: what adapter 2 must be. Its `factory()`
+/// is PancakeSwap's v3 factory and its code holds `IV3SwapRouter`'s
+/// `exactInputSingle` (read 2026-10-03).
+pub const PANCAKE_SMART_ROUTER: Address = address!("678Aa4bF4E210cf2166753e054d5b7c31cc7fa86");
+
 /// Domain separator for [`route_hash`].
 pub const ROUTE_HASH_DOMAIN: &[u8] = b"apex.route.v1";
 

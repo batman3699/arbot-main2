@@ -5,6 +5,12 @@
 #   scripts/shadow.sh [config]          # default ops/shadow.base.yaml
 #   setsid nohup scripts/shadow.sh > var/apex/shadow.log 2>&1 < /dev/null &
 #   scripts/shadow-status.sh            # what it is doing
+#   kill -INT "$(cat var/apex/shadow.pid)"   # drain and stop
+#
+# The pid file is written here, not by the caller: this shell becomes `apex` at
+# `exec`, so `$$` is the run's pid. A caller's `$!` is not -- under an
+# interactive shell `setsid` forks, and `$!` is a parent that has already
+# exited.
 #
 # `apex` reads only `APEX_SECRET_*` variables. This maps two of the operator's
 # .env entries onto them for the run's process alone -- BLOCKPI_KEY to
@@ -44,4 +50,14 @@ APEX_SECRET_TRADER_KEY="$(value TRADER_PRIVATE_KEY)"
 export APEX_SECRET_BLOCKPI_KEY APEX_SECRET_TRADER_KEY
 
 mkdir -p var/apex
+pidfile=var/apex/shadow.pid
+# One run at a time: two would share a journal.
+if [[ -f "$pidfile" ]]; then
+  running="$(cat "$pidfile" 2>/dev/null || true)"
+  if [[ -n "$running" ]] && { tr '\0' ' ' < "/proc/$running/cmdline"; } 2>/dev/null | grep -q 'apex shadow'; then
+    echo "shadow: already running (pid $running)" >&2
+    exit 1
+  fi
+fi
+echo $$ > "$pidfile"
 exec "$bin" shadow --config "$config"

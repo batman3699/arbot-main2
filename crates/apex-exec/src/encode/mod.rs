@@ -212,6 +212,48 @@ pub fn slipstream_exact_input_single(s: &SlipstreamSwap) -> Result<Vec<u8>, Enco
     Ok(out)
 }
 
+/// `exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))`
+/// — `IV3SwapRouter`'s, which has no deadline: PancakeSwap's `SmartRouter` on
+/// Base (`0x04e45aaf`, which its deployed code contains and its `factory()`
+/// names PancakeSwap's v3 factory — checked 2026-10-03). The deadline is the
+/// plan's, which the executor checks before any step runs.
+pub const V3_ROUTER_EXACT_INPUT_SINGLE: [u8; 4] = [0x04, 0xe4, 0x5a, 0xaf];
+
+/// One exact-input swap through an `IV3SwapRouter`. A pool is its two tokens
+/// and its **fee**, as Uniswap keys them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V3RouterSwap {
+    pub token_in: Address,
+    pub token_out: Address,
+    pub fee: u32,
+    pub recipient: Address,
+    pub amount_in: U256,
+    pub min_out: U256,
+}
+
+/// The router call for one such swap: the selector and seven static words, in
+/// declaration order. No price limit, for the reason
+/// [`slipstream_exact_input_single`] gives; min-out of zero refused, and a fee
+/// wider than a `uint24` refused rather than truncated into another pool's.
+pub fn v3_router_exact_input_single(s: &V3RouterSwap) -> Result<Vec<u8>, EncodeError> {
+    if s.min_out.is_zero() {
+        return Err(EncodeError::ZeroMinOut);
+    }
+    if s.fee > 0x00ff_ffff {
+        return Err(EncodeError::FeeTooLarge { fee: s.fee });
+    }
+    let mut out = Vec::with_capacity(4 + 7 * WORD);
+    out.extend_from_slice(&V3_ROUTER_EXACT_INPUT_SINGLE);
+    push_address(&mut out, s.token_in);
+    push_address(&mut out, s.token_out);
+    push_uint(&mut out, u64::from(s.fee));
+    push_address(&mut out, s.recipient);
+    push_u256(&mut out, s.amount_in);
+    push_u256(&mut out, s.min_out);
+    push_u256(&mut out, U256::ZERO);
+    Ok(out)
+}
+
 /// Assembles the executor's `PlanV2` from encoded steps.
 ///
 /// Deliberately thin: it is the place where the pieces meet, and every piece is

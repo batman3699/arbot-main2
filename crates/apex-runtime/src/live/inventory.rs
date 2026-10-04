@@ -8,12 +8,18 @@
 //! cycles. Both thresholds were measured rather than chosen — see
 //! `scripts/data/event_census.py` and `sweep_depth_floor.py`.
 //!
-//! Narrowed to the two venues the Phase 5 executor can reach: Uniswap v3 through
-//! its `UNIV3` op, and Aerodrome Slipstream through `GENERIC` adapter 1. The
-//! census also priced PancakeSwap v3 and a second Slipstream deployment; each
-//! needs its own adapter registration before a route through it could execute,
-//! and pricing routes that cannot execute would fill the funnel with trades
-//! nothing could make.
+//! Three venues: Uniswap v3, reached through the executor's `UNIV3` op;
+//! Aerodrome Slipstream, through `GENERIC` adapter 1; and PancakeSwap v3,
+//! through adapter 2. **PancakeSwap is here on the census's evidence**: every
+//! net-positive sample its four runs recorded was WETH/USDC, and the largest
+//! share of them — 45 of 87 at the $100k floor — paired a PancakeSwap pool with
+//! a Uniswap one. The census also priced a second Slipstream deployment, which
+//! produced none and is not here.
+//!
+//! A venue is only priced once the executor can reach it: pricing routes that
+//! cannot execute would fill the funnel with trades nothing could make. So the
+//! shadow run reads the executor's adapter registrations at boot and leaves out
+//! any venue whose adapter is missing (`live::calls::reachable_venues`).
 //!
 //! # The inventories are not trusted
 //!
@@ -34,15 +40,17 @@ use std::path::Path;
 pub enum Venue {
     UniswapV3,
     Slipstream,
+    PancakeV3,
 }
 
 impl Venue {
-    pub const ALL: [Self; 2] = [Self::UniswapV3, Self::Slipstream];
+    pub const ALL: [Self; 3] = [Self::UniswapV3, Self::Slipstream, Self::PancakeV3];
 
     pub const fn id(self) -> VenueId {
         match self {
             Self::UniswapV3 => venue_ids::UNISWAP_V3,
             Self::Slipstream => venue_ids::AERODROME_SLIPSTREAM,
+            Self::PancakeV3 => venue_ids::PANCAKESWAP_V3,
         }
     }
 
@@ -51,24 +59,28 @@ impl Venue {
         match self {
             Self::UniswapV3 => "uniswap_v3",
             Self::Slipstream => "aerodrome_slipstream",
+            Self::PancakeV3 => "pancakeswap_v3",
         }
     }
 
-    /// The factory every pool of this venue on Base was deployed by. Both read
-    /// from the chain 2026-09-30: SwapRouter02's `factory()` for Uniswap, and
-    /// Slipstream's router's `factory()` for Slipstream.
+    /// The factory every pool of this venue on Base was deployed by, read from
+    /// the chain: SwapRouter02's `factory()` for Uniswap and Slipstream's
+    /// router's for Slipstream (2026-09-30); for PancakeSwap, the `factory()`
+    /// of its WETH/USDC pools and of its `SmartRouter` (2026-10-03).
     pub const fn factory(self) -> Address {
         match self {
             Self::UniswapV3 => address!("33128a8fC17869897dcE68Ed026d694621f6FDfD"),
             Self::Slipstream => address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"),
+            Self::PancakeV3 => address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"),
         }
     }
 
-    /// Uniswap v3 fixes a pool's fee at creation. Slipstream's fee module can
-    /// change it — pools at one tick spacing were measured charging 212 and
-    /// 2,500 ppm — so its fee is read with the rest of the state, every time.
+    /// Uniswap and PancakeSwap fix a pool's fee at creation. Slipstream's fee
+    /// module can change it — pools at one tick spacing were measured charging
+    /// 212 and 2,500 ppm — so its fee is read with the rest of the state, every
+    /// time.
     pub const fn fee_is_static(self) -> bool {
-        matches!(self, Self::UniswapV3)
+        matches!(self, Self::UniswapV3 | Self::PancakeV3)
     }
 }
 
@@ -143,12 +155,12 @@ struct Record {
     hub_usd_liquidity: Option<f64>,
 }
 
-/// Every pool of the two venues that passes `filter`.
+/// Every pool of the venues that passes `filter`.
 ///
 /// A Slipstream record without a measured fee is **skipped, not guessed**: its
 /// `fee` field is the tick spacing, and reading it as a fee would admit a
-/// 200-spacing pool as a 200 ppm one. Uniswap's `fee` is the fee tier, so it may
-/// stand in — the census's own rule.
+/// 200-spacing pool as a 200 ppm one. Uniswap's and PancakeSwap's `fee` is the
+/// fee tier, so it may stand in — the census's own rule.
 pub fn load(data_dir: &Path, filter: UniverseFilter) -> Result<Vec<PoolSpec>, InventoryError> {
     let mut out = Vec::new();
     for venue in Venue::ALL {
@@ -168,7 +180,7 @@ pub fn load(data_dir: &Path, filter: UniverseFilter) -> Result<Vec<PoolSpec>, In
             })?;
             let fee = match (r.fee_ppm_onchain, venue) {
                 (Some(f), _) => f,
-                (None, Venue::UniswapV3) => match r.fee {
+                (None, Venue::UniswapV3 | Venue::PancakeV3) => match r.fee {
                     Some(f) => f,
                     None => continue,
                 },

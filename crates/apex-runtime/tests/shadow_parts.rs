@@ -292,27 +292,42 @@ async fn settlement_is_refused_and_counted() {
 
 // ------------------------------------------------------------------ universe
 
-/// **The pools a WETH cycle can use**, and nothing else the census kept.
+/// **The pools a WETH cycle can use**, on the venues the executor can reach,
+/// and nothing else the census kept. Filtered by venue **before** pairing: with
+/// Uniswap unreachable, PancakeSwap's lone WETH/USDC pool does not make a pair
+/// out of Uniswap's two.
 #[test]
-fn the_universe_is_the_weth_pairs_with_two_pools() {
+fn the_universe_is_the_reachable_weth_pairs_with_two_pools() {
+    use apex_runtime::live::inventory::Venue;
     let dir = tempfile::tempdir().unwrap();
     let weth = "0x4200000000000000000000000000000000000006";
     let usdc = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
     let other = "0x00000000000000000000000000000000000000c3";
     let rec = |pool: &str, t0: &str, t1: &str| {
-        serde_json::json!({ "pool": pool, "token0": t0, "token1": t1, "fee": 500, "hub_usd_liquidity": 1e6 }).to_string()
+        serde_json::json!({ "pool": pool, "token0": t0, "token1": t1, "fee": 500, "fee_ppm_onchain": 500, "hub_usd_liquidity": 1e6 }).to_string()
     };
     let p = |n: u8| format!("0x{:040x}", n);
     for (venue, lines) in [
         ("uniswap_v3", vec![rec(&p(1), weth, usdc), rec(&p(2), weth, usdc), rec(&p(3), usdc, other), rec(&p(4), usdc, other)]),
         ("aerodrome_slipstream", vec![rec(&p(5), weth, other)]),
+        ("pancakeswap_v3", vec![rec(&p(6), weth, other), rec(&p(7), weth, usdc)]),
     ] {
         std::fs::create_dir_all(dir.path().join(venue)).unwrap();
         std::fs::write(dir.path().join(venue).join("pools.jsonl"), lines.join("\n")).unwrap();
     }
-    let mut got: Vec<Address> = apex_runtime::shadow::universe(dir.path()).unwrap().iter().map(|s| s.pool).collect();
-    got.sort();
-    assert_eq!(got, vec![Address::with_last_byte(1), Address::with_last_byte(2)]);
+    let universe = |venues: &[Venue]| {
+        let mut got: Vec<u8> = apex_runtime::shadow::universe(dir.path(), venues)
+            .unwrap()
+            .iter()
+            .map(|s| s.pool.as_slice()[19])
+            .collect();
+        got.sort();
+        got
+    };
+    assert_eq!(universe(&[Venue::UniswapV3, Venue::Slipstream]), vec![1, 2]);
+    assert_eq!(universe(&Venue::ALL), vec![1, 2, 5, 6, 7]);
+    assert_eq!(universe(&[Venue::Slipstream, Venue::PancakeV3]), vec![5, 6]);
+    assert_eq!(universe(&[Venue::UniswapV3]), vec![1, 2]);
 }
 
 // ------------------------------------------------------------------ the plane's misses

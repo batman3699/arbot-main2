@@ -10,14 +10,17 @@ mod support;
 
 use alloy_primitives::{address, Address, B256, U256};
 use apex_exec::commitment::{plan_commitment, LoanProvider, Op};
-use apex_exec::encode::{generic_step, slipstream_exact_input_single, univ3_path, univ3_step, PathHop, SlipstreamSwap};
+use apex_exec::encode::{
+    generic_step, slipstream_exact_input_single, univ3_path, univ3_step, v3_router_exact_input_single, PathHop,
+    SlipstreamSwap, V3RouterSwap,
+};
 use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_math::finite_size::SizedRoute;
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
 use apex_runtime::live::calls::LiveCallBuilder;
-use apex_runtime::live::frontier::{self, Cycle, BALANCER_FLASH, BALANCER_VAULT, SLIPSTREAM_ADAPTER, WETH};
+use apex_runtime::live::frontier::{self, Cycle, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER, SLIPSTREAM_ADAPTER, WETH};
 use apex_runtime::live::inventory::{PoolSpec, Venue};
 use apex_runtime::live::pricing::LiveCycle;
 use apex_runtime::plane::{CallBuilder, Decline};
@@ -61,6 +64,8 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, spacing: i32) -> P
         seq: 0,
     }
 }
+
+const PANCAKE: Address = address!("72ab388e2E2F6FaceF59E3C3FA2C4E29011c2D38");
 
 /// WETH is cheaper on Uniswap than on Slipstream when `uni_tick` is below `slip_tick`.
 ///
@@ -133,6 +138,18 @@ fn expected_step(b: &PoolBook, pool: Address, token_in: Address, token_out: Addr
             .unwrap();
             (Op::Generic, generic_step(SLIPSTREAM_ADAPTER, token_in, amount_in, &call))
         }
+        Venue::PancakeV3 => {
+            let call = v3_router_exact_input_single(&V3RouterSwap {
+                token_in,
+                token_out,
+                fee: p.state.fee_ppm,
+                recipient: EXECUTOR,
+                amount_in,
+                min_out,
+            })
+            .unwrap();
+            (Op::Generic, generic_step(PANCAKE_ADAPTER, token_in, amount_in, &call))
+        }
     }
 }
 
@@ -186,6 +203,38 @@ fn a_priced_cycle_becomes_one_checked_plan_in_either_venue_order() {
         let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &k).expect("builds");
         let want = expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, owed);
         assert_eq!((call.plan().steps[1].op, call.plan().steps[1].data.clone()), want);
+    }
+}
+
+/// **PancakeSwap's hop is adapter 2's call**: the `SmartRouter`'s
+/// `exactInputSingle` with the chain's fee — here 100 ppm where the inventory
+/// says 500 — paying the executor, in either order with Uniswap.
+#[test]
+fn a_pancakeswap_hop_is_adapter_twos_router_call() {
+    for (uni, cake) in [(-197_350, -197_300), (-197_300, -197_350)] {
+        let mut p = pool(PANCAKE, Venue::PancakeV3, cake, 100, 1);
+        p.spec.fee_ppm = 500;
+        let b = Arc::new(PoolBook::from_snapshots(
+            [pool(UNI, Venue::UniswapV3, uni, 500, 10), p],
+            ReconstructionStatus::Verified,
+        ));
+        let (cycle, c) = priced(&b);
+        let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &commitment(&c, 1)).expect("builds");
+        let input = c.input_amount.get();
+        let mid = u256_to_alloy(
+            LiveCycle::new(&cycle, &b.snapshot(), 0).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
+        );
+        let floor = (input + U256::from(1u64)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
+        let [l0, l1] = &cycle.legs;
+        let want = [
+            expected_step(&b, l0.pool, l0.token_in, l0.token_out, input, mid),
+            expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, floor),
+        ];
+        for (got, (op, data)) in call.plan().steps.iter().zip(want) {
+            assert_eq!((got.op, &got.data), (op, &data));
+        }
+        let cake_step = cycle.legs.iter().position(|l| l.pool == PANCAKE).unwrap();
+        assert_eq!(call.plan().steps[cake_step].op, Op::Generic);
     }
 }
 
@@ -259,4 +308,154 @@ fn a_commitment_that_does_not_describe_this_cycle_is_refused() {
     // A route the builder holds no cycle for.
     let err = LiveCallBuilder::new(b, []).build(&c, &k).unwrap_err();
     assert!(matches!(&err, Decline::Uncommittable { detail } if detail.contains("no live cycle")), "{err:?}");
+}
+
+// ------------------------------------------------------------------ reachability
+
+use apex_chain::rpc::{RpcError, RpcTransport};
+use apex_runtime::live::abi::{self, selector, MULTICALL3};
+use apex_runtime::live::calls::{binding, reachable_venues};
+use apex_runtime::live::frontier::{PANCAKE_SMART_ROUTER, SLIPSTREAM_ROUTER};
+use apex_runtime::live::reads::ChainReads;
+use serde_json::{json, Value};
+use std::sync::Mutex;
+
+fn word(v: U256) -> Vec<u8> {
+    v.to_be_bytes::<32>().to_vec()
+}
+
+fn address_word(a: Address) -> Vec<u8> {
+    [vec![0u8; 12], a.to_vec()].concat()
+}
+
+/// `aggregate3`'s answer: `(bool success, bytes returnData)[]`.
+fn encode_results(results: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let w = |v: usize| word(U256::from(v));
+    let padded = |n: usize| n.div_ceil(32) * 32;
+    let mut out = [w(32), w(results.len())].concat();
+    let mut next = results.len() * 32;
+    for r in results {
+        out.extend(w(next));
+        next += 96 + padded(r.as_ref().map_or(0, Vec::len));
+    }
+    for r in results {
+        let d = r.clone().unwrap_or_default();
+        out.extend([w(usize::from(r.is_some())), w(64), w(d.len())].concat());
+        out.extend(&d);
+        out.extend(std::iter::repeat_n(0u8, padded(d.len()) - d.len()));
+    }
+    out
+}
+
+/// The sub-calls of one `aggregate3` request, in order.
+fn decode_request(data: &[u8]) -> Vec<(Address, Vec<u8>)> {
+    let body = &data[4..];
+    let at = |i: usize| U256::from_be_slice(&body[i..i + 32]).to::<usize>();
+    (0..at(32))
+        .map(|i| {
+            let t = 64 + at(64 + i * 32);
+            let len = at(t + 96);
+            (Address::from_slice(&body[t + 12..t + 32]), body[t + 128..t + 128 + len].to_vec())
+        })
+        .collect()
+}
+
+/// `(target, calldata) -> return data`.
+type Table = BTreeMap<(Address, Vec<u8>), Vec<u8>>;
+
+/// An executor's registry: answers what it was told, fails anything else.
+#[derive(Default)]
+struct Registry(Mutex<Table>);
+
+impl Registry {
+    fn holds(&self, id: u16, router: Address, sel: [u8; 4], allowed: bool) {
+        let mut m = self.0.lock().unwrap();
+        m.insert((EXECUTOR, abi::call_u16(selector::ADAPTER_OF, id)), address_word(router));
+        m.insert(
+            (EXECUTOR, abi::call_u16_bytes4(selector::IS_SELECTOR_ALLOWED, id, sel)),
+            word(U256::from(u8::from(allowed))),
+        );
+    }
+}
+
+#[async_trait::async_trait]
+impl RpcTransport for Registry {
+    async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        assert_eq!(method, "eth_call");
+        assert_eq!(params[0]["to"].as_str().unwrap().parse::<Address>().unwrap(), MULTICALL3);
+        let data = alloy_primitives::hex::decode(params[0]["data"].as_str().unwrap()).unwrap();
+        let m = self.0.lock().unwrap();
+        let answers: Vec<Option<Vec<u8>>> = decode_request(&data).into_iter().map(|k| m.get(&k).cloned()).collect();
+        Ok(json!(format!("0x{}", alloy_primitives::hex::encode(encode_results(&answers)))))
+    }
+}
+
+/// Slipstream as deployed, and PancakeSwap as the owner would register it.
+fn deployed(pancake: bool) -> Arc<Registry> {
+    let r = Arc::new(Registry::default());
+    let slip = binding(Venue::Slipstream).unwrap();
+    r.holds(slip.id, SLIPSTREAM_ROUTER, slip.selector, true);
+    if pancake {
+        let cake = binding(Venue::PancakeV3).unwrap();
+        r.holds(cake.id, PANCAKE_SMART_ROUTER, cake.selector, true);
+    }
+    r
+}
+
+async fn reach(r: Arc<Registry>) -> Vec<Venue> {
+    reachable_venues(&ChainReads::new(r), EXECUTOR, 100).await.unwrap()
+}
+
+/// **A venue is priced only once the executor can reach it.** Uniswap always —
+/// its op is built in; PancakeSwap once adapter 2 holds its `SmartRouter`.
+#[tokio::test]
+async fn a_venue_is_reachable_only_once_its_adapter_is_registered() {
+    assert_eq!(reach(deployed(false)).await, vec![Venue::UniswapV3, Venue::Slipstream]);
+    assert_eq!(reach(deployed(true)).await, vec![Venue::UniswapV3, Venue::Slipstream, Venue::PancakeV3]);
+}
+
+/// Registered is not enough: the adapter must be **this** router, with **this**
+/// selector allowed. Anything else would revert the hop.
+#[tokio::test]
+async fn an_adapter_that_is_not_this_router_or_this_selector_is_unreachable() {
+    let cake = binding(Venue::PancakeV3).unwrap();
+    let elsewhere = deployed(false);
+    elsewhere.holds(cake.id, Address::repeat_byte(0xee), cake.selector, true);
+    let disallowed = deployed(false);
+    disallowed.holds(cake.id, PANCAKE_SMART_ROUTER, cake.selector, false);
+    let other_selector = deployed(false);
+    other_selector.holds(cake.id, PANCAKE_SMART_ROUTER, [0x41, 0x4b, 0xf3, 0x89], true);
+    for r in [elsewhere, disallowed, other_selector] {
+        assert_eq!(reach(r).await, vec![Venue::UniswapV3, Venue::Slipstream]);
+    }
+}
+
+/// An executor that answers nothing about its registry — no code, or no
+/// registry — reaches Uniswap alone; a read that fails whole is an error, not
+/// an empty universe.
+#[tokio::test]
+async fn an_unanswered_registry_reaches_uniswap_alone() {
+    assert_eq!(reach(Arc::new(Registry::default())).await, vec![Venue::UniswapV3]);
+
+    struct Down;
+    #[async_trait::async_trait]
+    impl RpcTransport for Down {
+        async fn call(&self, method: &str, _: Value) -> Result<Value, RpcError> {
+            Err(RpcError::Exhausted { method: method.into(), endpoints: 1, last: "timed out".into() })
+        }
+    }
+    assert!(reachable_venues(&ChainReads::new(Arc::new(Down)), EXECUTOR, 100).await.is_err());
+}
+
+/// The registry calls as `cast calldata` writes them.
+#[test]
+fn the_registry_calls_encode_as_cast_does() {
+    assert_eq!(
+        alloy_primitives::hex::encode(abi::call_u16(selector::ADAPTER_OF, 2)),
+        "b969a5300000000000000000000000000000000000000000000000000000000000000002"
+    );
+    assert_eq!(
+        alloy_primitives::hex::encode(abi::call_u16_bytes4(selector::IS_SELECTOR_ALLOWED, 2, [0x04, 0xe4, 0x5a, 0xaf])),
+        "284aea3f000000000000000000000000000000000000000000000000000000000000000204e45aaf00000000000000000000000000000000000000000000000000000000"
+    );
 }

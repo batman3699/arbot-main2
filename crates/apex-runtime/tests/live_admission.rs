@@ -15,7 +15,7 @@ use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::live::admission::{self, LiveCommitments, GAS_PER_HOP};
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
-use apex_runtime::live::feed::{BURN, MINT, SWAP};
+use apex_runtime::live::feed::{BURN, MINT, PANCAKE_SWAP, SWAP};
 use apex_runtime::live::frontier::WETH;
 use apex_runtime::live::inventory::{PoolSpec, Venue};
 use apex_runtime::plane::{Commitments, Decline};
@@ -211,4 +211,18 @@ fn a_pool_the_last_reload_refused_is_unverified() {
     let got = commitments.commit(&through(&[UNI, SLIP], READ_AT + 1), &auth(), U256::from(1));
     assert!(matches!(&got, Err(Decline::VenueUnverified { .. })), "{got:?}");
     assert!(commitments.commit(&through(&[BSD, UNI], READ_AT + 1), &auth(), U256::from(1)).is_ok());
+}
+
+/// **A PancakeSwap pool is admitted on its own factory**, with its static fee
+/// and its own `Swap` topic in the update mapping — Uniswap's would name an
+/// event the pool never emits.
+#[test]
+fn a_pancakeswap_pool_is_admitted_with_its_own_swap_topic() {
+    let cake = address!("72ab388e2E2F6FaceF59E3C3FA2C4E29011c2D38");
+    let a = admitted([pool(cake, Venue::PancakeV3, USDC, 2.2e6)], READ_AT);
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].venue, Venue::PancakeV3.id());
+    assert_eq!(a[0].deployed_by, Venue::PancakeV3.factory());
+    assert_eq!(a[0].fee_behavior, FeeBehavior::Static { ppm: 500 });
+    assert_eq!(a[0].update_mapping, vec![PANCAKE_SWAP, MINT, BURN]);
 }

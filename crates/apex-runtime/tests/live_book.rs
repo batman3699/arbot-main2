@@ -59,6 +59,8 @@ fn every_selector_is_its_signatures_hash() {
         (selector::BASE_FEE_SCALAR, "baseFeeScalar()"),
         (selector::BLOB_BASE_FEE_SCALAR, "blobBaseFeeScalar()"),
         (selector::IS_FJORD, "isFjord()"),
+        (selector::ADAPTER_OF, "adapterOf(uint16)"),
+        (selector::IS_SELECTOR_ALLOWED, "isSelectorAllowed(uint16,bytes4)"),
     ] {
         assert_eq!(sel, keccak256(sig.as_bytes())[..4], "{sig}");
     }
@@ -136,6 +138,7 @@ fn write_inventory(dir: &std::path::Path, venue: &str, lines: &[Value]) {
 
 /// The census's thresholds, and its rule for Slipstream: a record without a
 /// measured fee is skipped, because its `fee` field is the tick spacing.
+/// PancakeSwap's `fee` is its fee tier, as Uniswap's is, so it stands in.
 #[test]
 fn the_inventory_applies_the_census_filters() {
     let dir = tempfile::tempdir().unwrap();
@@ -150,13 +153,28 @@ fn the_inventory_applies_the_census_filters() {
         json!({"pool":"0x0000000000000000000000000000000000000004","token0":a,"token1":b,"fee":1,"fee_ppm_onchain":80,"hub_usd_liquidity":3e5}),
         json!({"pool":"0x0000000000000000000000000000000000000005","token0":a,"token1":b,"fee":100,"hub_usd_liquidity":3e5}),
     ]);
+    write_inventory(dir.path(), "pancakeswap_v3", &[
+        json!({"pool":"0x0000000000000000000000000000000000000006","token0":a,"token1":b,"fee":100,"hub_usd_liquidity":2e6}),
+        json!({"pool":"0x0000000000000000000000000000000000000007","token0":a,"token1":b,"fee":2500,"hub_usd_liquidity":2e6}),
+    ]);
     let specs = inventory::load(dir.path(), UniverseFilter::default()).unwrap();
     let pools: Vec<u8> = specs.iter().map(|s| s.pool.as_slice()[19]).collect();
-    assert_eq!(pools, vec![1, 4], "500ppm uni and the measured slipstream only");
+    assert_eq!(pools, vec![1, 4, 6], "500ppm uni, the measured slipstream and the 100ppm pancake only");
     assert_eq!(specs[1].fee_ppm, 80, "the measured fee, not the tick spacing");
+    assert_eq!((specs[2].venue, specs[2].fee_ppm), (Venue::PancakeV3, 100), "the fee tier stands in");
 
     let pairs = inventory::pairs(&specs);
-    assert_eq!(pairs.len(), 1, "one pair, two pools");
+    assert_eq!(pairs.len(), 1, "one pair, three pools");
+}
+
+/// A venue's inventory that is missing is an error, not an empty venue: a
+/// universe quietly a venue short looks just like a quiet market.
+#[test]
+fn a_missing_inventory_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    write_inventory(dir.path(), "uniswap_v3", &[]);
+    write_inventory(dir.path(), "aerodrome_slipstream", &[]);
+    assert!(matches!(inventory::load(dir.path(), UniverseFilter::default()), Err(inventory::InventoryError::Io { .. })));
 }
 
 // ------------------------------------------------------------------ the book
@@ -737,4 +755,34 @@ async fn a_reload_states_the_fee_from_the_fresh_regime() {
     node.set(SLIP, abi::call_observe(600), twap_answer(TICK + 5));
     book.reload(&reads, &[SLIP], 120).await.unwrap();
     assert_eq!(book.get(SLIP).unwrap().state.fee_ppm, 535 + 5 * 149 / 10, "not the 500 `fee()` answered");
+}
+
+// ------------------------------------------------------------------ PancakeSwap
+
+const CAKE: Address = address!("72ab388e2E2F6FaceF59E3C3FA2C4E29011c2D38");
+
+/// **A PancakeSwap pool loads as a Uniswap one does**: held to its own factory,
+/// its fee from `fee()`, and no fee module asked about — the node answers
+/// nothing about one, so a read of it would refuse the pool.
+#[tokio::test]
+async fn a_pancakeswap_pool_loads_with_its_static_fee() {
+    let node = Arc::new(Scripted::default());
+    healthy_at(&node, CAKE, Venue::PancakeV3.factory());
+    let cake = PoolSpec { pool: CAKE, venue: Venue::PancakeV3, ..spec() };
+    let (book, refused) = PoolBook::load(&ChainReads::new(node), &[cake], 100).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    let p = book.get(CAKE).unwrap();
+    assert_eq!((p.state.fee_ppm, p.factory), (500, Venue::PancakeV3.factory()));
+    assert!(p.dynamic_fee.is_none());
+}
+
+/// Filed under PancakeSwap, deployed by Uniswap's factory: refused.
+#[tokio::test]
+async fn a_pool_filed_under_pancakeswap_from_another_factory_is_refused() {
+    let node = Arc::new(Scripted::default());
+    healthy_at(&node, CAKE, Venue::UniswapV3.factory());
+    let cake = PoolSpec { pool: CAKE, venue: Venue::PancakeV3, ..spec() };
+    let (book, refused) = PoolBook::load(&ChainReads::new(node), &[cake], 100).await.unwrap();
+    assert!(book.is_empty());
+    assert!(matches!(refused[0].why, Unloadable::WrongFactory { .. }), "{refused:?}");
 }

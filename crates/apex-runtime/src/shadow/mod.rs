@@ -44,11 +44,11 @@ use crate::live::abi::{self, selector};
 use crate::live::adapter::LiveAdapter;
 use crate::live::admission::{self, LiveCommitments};
 use crate::live::book::PoolBook;
-use crate::live::calls::LiveCallBuilder;
+use crate::live::calls::{self, LiveCallBuilder};
 use crate::live::costs::{self, Costs};
-use crate::live::feed::{Effect, FeedHandler, BURN, MINT, SWAP};
+use crate::live::feed::{Effect, FeedHandler, BURN, MINT, PANCAKE_SWAP, SWAP};
 use crate::live::frontier::{self, BALANCER_FLASH, BALANCER_VAULT, WETH};
-use crate::live::inventory::{self, PoolSpec, UniverseFilter};
+use crate::live::inventory::{self, PoolSpec, UniverseFilter, Venue};
 use crate::live::pricing::LivePricer;
 use crate::live::reader::{ChainReader, ReaderConfig};
 use crate::live::reads::ChainReads;
@@ -182,6 +182,8 @@ struct Shadow {
     config: ShadowConfig,
     reads: ChainReads,
     universe: Vec<Address>,
+    /// The venues the executor could reach at boot.
+    venues: Vec<Venue>,
     book: Arc<PoolBook>,
     plane: Arc<Plane>,
     search: Arc<FrontierSearch>,
@@ -202,9 +204,14 @@ struct Shadow {
 }
 
 /// The census's pools that can form a cycle the live frontier prices: pairs
-/// with WETH on one side and at least two pools.
-pub fn universe(dir: &Path) -> Result<Vec<PoolSpec>, inventory::InventoryError> {
-    let specs = inventory::load(dir, UniverseFilter::default())?;
+/// with WETH on one side and at least two pools, **counting only `venues`** —
+/// the ones the executor can reach. Filtered before pairing, so a pool on an
+/// unreachable venue cannot make up a pair's two.
+pub fn universe(dir: &Path, venues: &[Venue]) -> Result<Vec<PoolSpec>, inventory::InventoryError> {
+    let specs: Vec<PoolSpec> = inventory::load(dir, UniverseFilter::default())?
+        .into_iter()
+        .filter(|s| venues.contains(&s.venue))
+        .collect();
     Ok(inventory::pairs(&specs)
         .into_iter()
         .filter(|((a, b), _)| *a == WETH || *b == WETH)
@@ -326,7 +333,16 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     let reads = ChainReads::new(Arc::clone(&rpc));
     let head = reads.head().await.map_err(|e| boot_err("the head", e))?;
 
-    let specs = universe(&config.inventory).map_err(|e| boot_err("the inventory", e))?;
+    // Only what the executor can reach: an adapter venue's routes would revert
+    // without its registration, and pricing them would fill the funnel with
+    // trades nothing could make.
+    let venues = calls::reachable_venues(&reads, config.executor.address, head)
+        .await
+        .map_err(|e| boot_err("the executor's adapters", e))?;
+    for v in Venue::ALL.iter().filter(|v| !venues.contains(v)) {
+        warn!(venue = ?v, "the executor has no adapter for it: its pools are left out of the universe");
+    }
+    let specs = universe(&config.inventory, &venues).map_err(|e| boot_err("the inventory", e))?;
     let (book, unloaded) = PoolBook::load(&reads, &specs, head).await.map_err(|e| boot_err("the pool book", e))?;
     for u in &unloaded {
         warn!(pool = %u.pool, why = ?u.why, "not loaded at boot; the first full reload reads it again");
@@ -459,6 +475,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     info!(
         config = %config.version,
         head,
+        ?venues,
         pools = book.len(),
         universe = specs.len(),
         cycles = search.resident(),
@@ -471,6 +488,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     let (heads, _) = watch::channel(None);
     Ok(Shadow {
         universe: specs.iter().map(|p| p.pool).collect(),
+        venues,
         reads,
         book,
         plane,
@@ -496,7 +514,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
 impl Shadow {
     /// The capture feed: notifications → the book → effects.
     async fn feed(&self, bus: &EventBus, stopped: watch::Receiver<bool>) {
-        let filter = LogFilter { addresses: self.universe.clone(), topics0: vec![SWAP, MINT, BURN] };
+        let filter = LogFilter { addresses: self.universe.clone(), topics0: vec![SWAP, PANCAKE_SWAP, MINT, BURN] };
         let subs = vec![Subscription::NewHeads, Subscription::PendingLogs(filter.clone()), Subscription::Logs(filter)];
         let feed = match WsFeed::new(self.config.rpc_ws.expose(), subs, WsSettings::default()) {
             Ok(f) => f,
@@ -715,6 +733,7 @@ impl Shadow {
             null_dispatched: self.null.count(),
             settlement_asked: self.nothing_sent.asked(),
             book: BookReport {
+                venues: self.venues.iter().map(|v| format!("{v:?}")).collect(),
                 held: self.book.len(),
                 universe: self.universe.len(),
                 status: format!("{:?}", self.book.status()),
@@ -820,6 +839,8 @@ pub struct SearchReport {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct BookReport {
+    /// The venues the executor could reach at boot, and so the ones priced.
+    pub venues: Vec<String>,
     pub held: usize,
     pub universe: usize,
     pub status: String,

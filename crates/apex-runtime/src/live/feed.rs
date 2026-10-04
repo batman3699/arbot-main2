@@ -22,6 +22,7 @@
 
 use crate::live::book::{PoolBook, SwapApplied};
 use crate::live::abi;
+use crate::live::inventory::Venue;
 use alloy_primitives::{b256, keccak256, Address, B256, U256};
 use apex_chain::rpc::ws::{Head, Notification, RawLog};
 use apex_state::feed::event::{EventKind, StateEvent};
@@ -34,6 +35,11 @@ use std::collections::BTreeMap;
 /// `Swap(address,address,int256,int256,uint160,uint128,int24)` — Uniswap v3 and
 /// Slipstream share it.
 pub const SWAP: B256 = b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+/// PancakeSwap v3's `Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)`:
+/// Uniswap's five words, then the protocol fee the swap paid in each token. A
+/// topic of its own, so a feed listening for Uniswap's alone would never see a
+/// PancakeSwap pool move.
+pub const PANCAKE_SWAP: B256 = b256!("19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83");
 /// `Mint(address,address,int24,int24,uint128,uint256,uint256)`
 pub const MINT: B256 = b256!("7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde");
 /// `Burn(address,int24,int24,uint128,uint256,uint256)`
@@ -65,11 +71,25 @@ pub struct SwapLog {
     pub pending: bool,
 }
 
+/// The `Swap` topic a venue's pools emit.
+pub const fn swap_topic(venue: Venue) -> B256 {
+    match venue {
+        Venue::UniswapV3 | Venue::Slipstream => SWAP,
+        Venue::PancakeV3 => PANCAKE_SWAP,
+    }
+}
+
 /// `None` for anything that is not a well-formed `Swap` with a position: a log
 /// that cannot be ordered cannot be applied, because ordering is what stops an
-/// old log rolling a pool back.
+/// old log rolling a pool back. Uniswap's has five words of data and
+/// PancakeSwap's seven, the first five the same.
 pub fn decode_swap(l: &RawLog) -> Option<SwapLog> {
-    if l.topics.first() != Some(&SWAP) || l.data.len() != 160 {
+    let words = match l.topics.first() {
+        Some(t) if *t == SWAP => 5,
+        Some(t) if *t == PANCAKE_SWAP => 7,
+        _ => return None,
+    };
+    if l.data.len() != words * 32 {
         return None;
     }
     Some(SwapLog {
@@ -194,7 +214,7 @@ impl FeedHandler {
             Notification::Log(l) if l.removed => vec![Effect::Reload(vec![l.address])],
             Notification::Log(l) => match l.topics.first() {
                 Some(t) if *t == MINT || *t == BURN => vec![Effect::Reload(vec![l.address])],
-                Some(t) if *t == SWAP => self.swap(book, &l, now),
+                Some(t) if *t == SWAP || *t == PANCAKE_SWAP => self.swap(book, &l, now),
                 _ => Vec::new(),
             },
         }
