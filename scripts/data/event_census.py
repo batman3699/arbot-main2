@@ -23,6 +23,26 @@ therefore has a control -- the same cycles, same sizes, priced at a block with
 no qualifying swap. `trigger` is "swap" or "control" on every row, so the
 comparison is a filter, not a re-run.
 
+ATOMIC: ONE PINNED BLOCK, AND A MIRROR
+--------------------------------------
+Until 2026-10-05 both hops were quoted at "latest", in separate calls (hop 2's
+input is hop 1's output), each sent to the NEXT of several public providers.
+So the two hops routinely read different blocks, and a price that moved between
+them faked an edge: every loop buying the moving token first looked profitable,
+every loop selling it first looked unprofitable. All 214 "net-positive" samples
+of the 2026-09-12 runs were that drift -- for 159 of them the reverse loop with
+the same start token was positive in the same event, which no single price
+state allows, and averaged with its mirror (the same gap traded from the other
+start token) every one was negative, the best -0.37 bps.
+
+So every quote of an instance is pinned to one block: the swap's own (the state
+right after it -- what a bot acting in the next block faces), or the quiet block
+for a control. Any provider answers a pinned block identically. And a positive
+is CONFIRMED only when its mirror is positive too: a real gap pays from both
+start tokens, while drift favours one. Two loops with the same start token in
+opposite directions both positive is a VIOLATION -- impossible at one state --
+and counts against the measurement itself; it should stay at zero.
+
 WHAT IT IS NOT
 --------------
 Not an execution path and not wired to the bot. It quotes through the same
@@ -238,6 +258,8 @@ def load_universe():
 
 
 MAX_POOLS_PER_PAIR = int(os.environ.get("EV_MAX_POOLS_PER_PAIR", "4"))
+# Blocks behind the head the log scan stays: see main().
+LAG = 2
 
 
 def cycles_for_pair(members):
@@ -265,7 +287,9 @@ INSTANCE = [0]
 
 
 def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
-    """Quote every cycle on this pair across the ladder; append rows."""
+    """Quote every cycle on this pair across the ladder, every quote at the one
+    pinned block `block_tag`; append rows, each carrying its mirror's and its
+    reverse's net. Returns (rows, summary)."""
     hub = next((t for t in pair if t in HUBS), None)
     if hub is None:
         return 0, None
@@ -306,8 +330,7 @@ def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
     if len(leg2) != len(live):
         return 0, None
 
-    n = 0
-    best_bps = None
+    priced = []
     for j, (ok, ret) in zip(live, leg2):
         if not (ok and len(ret) >= 32):
             continue
@@ -316,15 +339,42 @@ def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
             continue
         s = j["start"].lower()
         _sy, sdec, spx = HUBS[s]
-        gross = out_amt - j["amt"]
-        bps = gross / j["amt"] * 1e4
-        best_bps = bps if best_bps is None else max(best_bps, bps)
-        gas_tokens = int(GAS_USD / spx * (10 ** sdec))
+        j["out_amt"] = out_amt
+        j["gross"] = out_amt - j["amt"]
+        j["gas_tokens"] = int(GAS_USD / spx * (10 ** sdec))
+        j["net"] = j["gross"] - j["gas_tokens"]
+        j["net_bps"] = round(j["net"] / j["amt"] * 1e4, 4)
+        priced.append(j)
+
+    # The mirror: the same gap traded from the other start token, through the
+    # same two pools in reverse order. The reverse: the same start token, the
+    # pools reversed -- the opposite gap.
+    def key(start, a, b, usd):
+        return (start.lower(), a["pool"].lower(), b["pool"].lower(), usd)
+    by_key = {key(j["start"], j["a"], j["b"], j["usd"]): j for j in priced}
+    summary = {"best_bps": None, "confirmed": 0, "one_sided": 0, "violations": 0, "best_confirmed_bps": None}
+    n = 0
+    for j in priced:
+        mirror = by_key.get(key(j["mid"], j["b"], j["a"], j["usd"]))
+        reverse = by_key.get(key(j["start"], j["b"], j["a"], j["usd"]))
+        bps = j["net_bps"]
+        summary["best_bps"] = bps if summary["best_bps"] is None else max(summary["best_bps"], bps)
+        if j["net"] > 0:
+            if mirror is not None and mirror["net"] > 0:
+                summary["confirmed"] += 1
+                best = summary["best_confirmed_bps"]
+                summary["best_confirmed_bps"] = bps if best is None else max(best, bps)
+            else:
+                summary["one_sided"] += 1
+            if reverse is not None and reverse["net"] > 0:
+                summary["violations"] += 1
         writer.write(json.dumps({
             "trigger": trigger,
             "instance": inst_id,
             "swap_usd": swap_usd,
-            "block": block_tag,
+            "block": int(block_tag, 16),
+            "mirror_net_bps": mirror["net_bps"] if mirror is not None else None,
+            "reverse_net_bps": reverse["net_bps"] if reverse is not None else None,
             # depth_usd and fee_ppm ride along so a depth-floor sweep is a
             # FILTER over one run rather than one run per floor. Sequential runs
             # face different market conditions, and that confound is what made
@@ -342,17 +392,17 @@ def price_cycles(pair, members, trigger, swap_usd, block_tag, writer):
             "hops": 2,
             "start": j["start"],
             "amount_in": str(j["amt"]),
-            "amount_out": str(out_amt),
-            "gross": gross,
+            "amount_out": str(j["out_amt"]),
+            "gross": j["gross"],
             "flash_fee": "0",
-            "gas_cost": str(gas_tokens),
-            "net": gross - gas_tokens,
-            "net_bps": round((gross - gas_tokens) / j["amt"] * 1e4, 4),
+            "gas_cost": str(j["gas_tokens"]),
+            "net": j["net"],
+            "net_bps": bps,
             "notional_usd": j["usd"],
         }) + "\n")
         n += 1
     writer.flush()
-    return n, best_bps
+    return n, summary
 
 
 def swap_usd_of(log, pool_by_addr):
@@ -399,11 +449,14 @@ def main():
 
     deadline = time.time() + MINUTES * 60
     events = controls = rows = hits = control_hits = 0
+    one_sided = violations = 0
     quiet_blocks = 0
-    seen = head
+    seen = head - LAG
     with open(OUT, "w") as writer:
         while time.time() < deadline:
-            nxt = int(rpc("eth_blockNumber", []) or "0x0", 16)
+            # A couple of blocks behind the head: the providers rotate, and one
+            # that has not seen a block yet answers its logs with an empty list.
+            nxt = int(rpc("eth_blockNumber", []) or "0x0", 16) - LAG
             if nxt <= seen:
                 time.sleep(1.0)
                 continue
@@ -422,31 +475,36 @@ def main():
                     for addr, usd in big[:2]:
                         rec = pool_by_addr[addr]
                         pair = tuple(sorted((rec["token0"].lower(), rec["token1"].lower())))
-                        # "latest", not the swap's block: the question is whether
-                        # the dislocation is still there when we could act.
-                        n, best = price_cycles(pair, universe[pair], "swap",
-                                               round(usd, 2), "latest", writer)
+                        # The swap's own block, pinned for every quote: the state
+                        # right after it, which is what a bot acting in the next
+                        # block faces -- and the same state for both hops.
+                        n, s = price_cycles(pair, universe[pair], "swap",
+                                            round(usd, 2), hex(blk), writer)
                         rows += n
                         if n:
                             events += 1
-                            if best is not None and best > 0:
-                                hits += 1
+                            hits += s["confirmed"] > 0
+                            one_sided += s["one_sided"]
+                            violations += s["violations"]
                         rate = (100.0 * hits / events) if events else 0.0
+                        best = s["best_bps"] if n else None
                         print(f"  [{blk}] swap ${usd:>11,.0f} -> {n:>4} quotes  "
                               f"best {('%+.2f' % best) if best is not None else '   n/a':>8} bps  "
+                              f"confirmed {s['confirmed'] if n else 0} one-sided {s['one_sided'] if n else 0}  "
                               f"HIT-RATE {hits}/{events} = {rate:.1f}%", flush=True)
                 else:
                     quiet_blocks += 1
                     if quiet_blocks >= CONTROL_EVERY:
                         quiet_blocks = 0
                         pair = random.choice(list(universe))
-                        n, best = price_cycles(pair, universe[pair], "control", 0.0,
-                                               "latest", writer)
+                        n, s = price_cycles(pair, universe[pair], "control", 0.0,
+                                            hex(blk), writer)
                         rows += n
                         if n:
                             controls += 1
-                            if best is not None and best > 0:
-                                control_hits += 1
+                            control_hits += s["confirmed"] > 0
+                            one_sided += s["one_sided"]
+                            violations += s["violations"]
             seen = min(nxt, seen + 6)
     # The RATE is the measurement that converges. Realised dollars are
     # fat-tailed -- one window's total was 87% two events -- so a 45-minute run
@@ -454,8 +512,10 @@ def main():
     # instances can.
     er = (100.0 * hits / events) if events else 0.0
     cr = (100.0 * control_hits / controls) if controls else 0.0
-    print(f"\nswap    instances {events:>4}  hits {hits:>4}  HIT RATE {er:5.1f}%")
-    print(f"control instances {controls:>4}  hits {control_hits:>4}  HIT RATE {cr:5.1f}%")
+    print(f"\nswap    instances {events:>4}  confirmed hits {hits:>4}  HIT RATE {er:5.1f}%")
+    print(f"control instances {controls:>4}  confirmed hits {control_hits:>4}  HIT RATE {cr:5.1f}%")
+    print(f"one-sided positives {one_sided} (a mirror that does not pay); "
+          f"violations {violations} (must be 0 at one pinned state)")
     print(f"rows {rows} -> {OUT}")
     return 0
 
