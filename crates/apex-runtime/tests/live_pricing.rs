@@ -14,6 +14,7 @@ use apex_runtime::live::book::{PoolBook, PoolSnapshot};
 use apex_runtime::live::frontier::{self, WETH};
 use apex_runtime::live::inventory::{PoolSpec, Venue};
 use apex_runtime::live::gas::{self, HopSteps};
+use apex_runtime::live::near_miss::{NearMisses, LADDER_WEI};
 use apex_runtime::live::pricing::{CostedCycle, LiveCycle, LivePricer, MAX_TICKS};
 use apex_search::engine_c::TemplatePricer;
 use apex_types::ids::ChainId;
@@ -424,4 +425,123 @@ fn the_pricer_charges_each_size_its_own_gas() {
         Surplus::Gain(win.output - win.amount_in - U256::from(costs.with_gas(gas.expected))),
         "the reported net is not the size's own"
     );
+}
+
+// ------------------------------------------------------------------ near misses (R14)
+
+/// **Near misses are counted by how far they were from paying**, in disjoint
+/// bands of basis points, with the closest kept.
+#[test]
+fn near_misses_are_counted_by_how_far_they_were_from_paying() {
+    let m = NearMisses::default();
+    assert_eq!(m.report().best_bps, None, "nothing measured, nothing closest");
+    // Hundredths of a basis point, on and inside each band's edges — and a
+    // different count in each band, so no two bands can trade places unseen.
+    for c in [
+        0, -1, -49, -50, -75, -99, -100, -120, -150, -199, -200, -250, -300, -400, -499, -500, -600, -700, -800,
+        -900, -999, -1_000, -1_001, -2_000, -3_000, -4_000, -5_000, -10_000,
+    ] {
+        m.record(c);
+    }
+    let r = m.report();
+    assert_eq!(r.measured, 28);
+    assert_eq!(
+        (r.pays, r.within_0_5, r.within_1, r.within_2, r.within_5, r.within_10, r.beyond_10),
+        (1, 2, 3, 4, 5, 6, 7)
+    );
+    assert_eq!(r.best_bps, Some(0.0));
+    m.record(120);
+    let r = m.report();
+    assert_eq!(r.best_bps, Some(1.2));
+
+    // The names `scripts/shadow-status.sh` reads from the report.
+    let json = serde_json::to_value(&r).unwrap();
+    let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["best_bps", "beyond_10", "measured", "pays", "within_0_5", "within_1", "within_10", "within_2", "within_5"]
+    );
+}
+
+/// **A route's near miss is its best net over the ladder**: each size at its
+/// own cost, as a share of the size — the census's measure. A 50-tick gap
+/// (50.1 bps) against 5.8 bps of fees nets about 44 bps the paying way, and
+/// about -56 the other.
+#[test]
+fn a_routes_near_miss_is_its_best_net_over_the_ladder() {
+    let b = book(vec![
+        pool(UNI, Venue::UniswapV3, -197_350, 500, L),
+        pool(SLIP, Venue::Slipstream, -197_300, 80, L),
+    ]);
+    let snap = b.snapshot();
+    let costs = RouteCosts { other_wei: 100_000_000_000, wei_per_gas: 5_000_000 };
+    let mut seen = Vec::new();
+    for cycle in frontier::cycles(BASE, WETH, &snap) {
+        let route = CostedCycle::new(LiveCycle::new(&cycle, &snap).unwrap(), costs, gas::MEASURED);
+        let at = |x: u128| {
+            let p = route.priced(U256::from(x)).unwrap();
+            (p.output.as_u128() as i128 - x as i128 - p.cost.as_u128() as i128) * 1_000_000 / x as i128
+        };
+        let want = LADDER_WEI.iter().map(|x| at(*x)).max().unwrap();
+        let got = route.near_miss_centi_bps().expect("every ladder size prices");
+        assert_eq!(i128::from(got), want);
+        seen.push(got);
+    }
+    seen.sort_unstable();
+    assert!((-5_700..-5_500).contains(&seen[0]), "the losing way: {seen:?}");
+    assert!((4_300..4_500).contains(&seen[1]), "the paying way: {seen:?}");
+}
+
+/// **The pricer records a near miss for every route it prices**, and none for
+/// one it cannot: a pool off its ladder prices nothing, so there is nothing to
+/// be near.
+#[test]
+fn the_pricer_records_a_near_miss_for_every_route_it_prices() {
+    let b = book(vec![
+        pool(UNI, Venue::UniswapV3, -197_350, 500, L),
+        pool(SLIP, Venue::Slipstream, -197_300, 80, L),
+    ]);
+    let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
+    let pricer = LivePricer::new(b, cycles.clone(), flat(3_000_000_000_000), gas::MEASURED);
+    for id in cycles.keys() {
+        let _ = pricer.best_size(*id, &fp(), budget());
+    }
+    let r = pricer.near_misses().report();
+    assert_eq!((r.measured, r.pays, r.beyond_10), (2, 1, 1), "{r:?}");
+
+    let mut off = pool(SLIP, Venue::Slipstream, -197_300, 80, L);
+    off.state.tick = -150_000;
+    let b = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L), off]);
+    let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
+    let pricer = LivePricer::new(b, cycles.clone(), flat(0), gas::MEASURED);
+    for id in cycles.keys() {
+        assert_eq!(pricer.best_size(*id, &fp(), budget()).unwrap_err(), NoSize::Unpriceable);
+    }
+    assert_eq!(pricer.near_misses().report().measured, 0);
+}
+
+/// **A near miss is never at a size the paying pool cannot pay out.** Each
+/// pool here holds 0.02 WETH, so of the ladder only 0.01 WETH can execute, and
+/// the near miss is that size's net — not a larger size's, which would describe
+/// a trade nothing could make.
+#[test]
+fn a_near_miss_is_never_at_a_size_the_pool_cannot_pay() {
+    let thin = |mut p: PoolSnapshot| {
+        p.state.balance0 = Some(U256::from(20_000_000_000_000_000u128));
+        p
+    };
+    let b = book(vec![
+        thin(pool(UNI, Venue::UniswapV3, -197_350, 500, L)),
+        thin(pool(SLIP, Venue::Slipstream, -197_300, 80, L)),
+    ]);
+    let snap = b.snapshot();
+    let costs = RouteCosts { other_wei: 100_000_000_000, wei_per_gas: 5_000_000 };
+    for cycle in frontier::cycles(BASE, WETH, &snap) {
+        let route = CostedCycle::new(LiveCycle::new(&cycle, &snap).unwrap(), costs, gas::MEASURED);
+        let x = 10_000_000_000_000_000u128;
+        let p = route.priced(U256::from(x)).unwrap();
+        let only = (p.output.as_u128() as i128 - x as i128 - p.cost.as_u128() as i128) * 1_000_000 / x as i128;
+        assert_eq!(route.near_miss_centi_bps().map(i128::from), Some(only));
+    }
 }

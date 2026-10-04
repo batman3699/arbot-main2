@@ -49,6 +49,7 @@ use crate::live::costs::{self, Costs};
 use crate::live::feed::{Effect, FeedHandler, BURN, MINT, PANCAKE_SWAP, SWAP};
 use crate::live::frontier::{self, BALANCER_FLASH, BALANCER_VAULT, WETH};
 use crate::live::gas;
+use crate::live::near_miss::{NearMissReport, NearMisses};
 use crate::live::inventory::{self, PoolSpec, UniverseFilter, Venue};
 use crate::live::pricing::LivePricer;
 use crate::live::reader::{ChainReader, ReaderConfig};
@@ -192,6 +193,8 @@ struct Shadow {
     adapter: Arc<LiveAdapter>,
     commitments: Arc<LiveCommitments>,
     costs: Costs,
+    /// How close the priced routes came to paying (R14).
+    near_misses: Arc<NearMisses>,
     null: Arc<NullDispatcher>,
     nothing_sent: Arc<NothingSent>,
     funnel: Funnel,
@@ -397,6 +400,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     // clears; `Costs::new` aligns it with the economics' before anything prices.
     let unpriced = RouteCosts { other_wei: u128::MAX, wei_per_gas: u128::MAX };
     let pricer = Arc::new(LivePricer::new(Arc::clone(&book), cycles.clone(), unpriced, gas::MEASURED));
+    let pricer_near_misses = pricer.near_misses();
     let econ = Arc::new(
         LiveEconomics::new(pricer.clone(), ScenarioPriors::default(), chain_costs, StrategyId(1)).with_flash(terms),
     );
@@ -499,6 +503,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         adapter,
         commitments,
         costs,
+        near_misses: pricer_near_misses,
         null,
         nothing_sent,
         funnel: Funnel::default(),
@@ -769,6 +774,7 @@ impl Shadow {
                 fast_lane_lossless: bus.fast_lane_is_lossless(),
             },
             misses_written: get(&self.stats.misses_written),
+            near_miss: self.near_misses.report(),
         };
         info!(
             head = ?r.head,
@@ -781,6 +787,7 @@ impl Shadow {
             book = %r.book.status,
             pools = r.book.held,
             largest_window = r.capacity.largest_window,
+            closest_bps = ?r.near_miss.best_bps,
             "shadow report"
         );
         match serde_json::to_string(&r) {
@@ -828,6 +835,9 @@ pub struct Report {
     pub capacity: CapacityReport,
     pub feed: FeedReport,
     pub misses_written: u64,
+    /// How close the priced routes came to paying: the best net over a ladder
+    /// of sizes, as basis points of the size (R14).
+    pub near_miss: NearMissReport,
 }
 
 #[derive(Clone, Debug, Serialize)]

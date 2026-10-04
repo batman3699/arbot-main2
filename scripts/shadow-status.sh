@@ -55,6 +55,11 @@ else:
     print(f"  skipped, book rebuilding    {f['skipped_unverified']:>10}")
     print(f"  skipped by Engine D         {s['skipped']:>10}   (below the $5k floor, or no template)")
     print(f"  priced, no profitable size  {s['declined']:>10}   (Engine C)")
+    nm = r.get("near_miss")
+    if nm and nm["measured"]:
+        print(f"  closest to paying           {nm['best_bps']:>+10.2f}   bps, best net over 0.01-10 WETH, of {nm['measured']} priced routes")
+        print(f"    pays {nm['pays']}, within 0.5 bp {nm['within_0_5']}, 1 bp {nm['within_1']}, 2 bp {nm['within_2']}, "
+              f"5 bp {nm['within_5']}, 10 bp {nm['within_10']}, further {nm['beyond_10']}")
     print(f"  reached the plane           {reached:>10}")
     print(f"  null-dispatched (signed)    {r['null_dispatched']:>10}")
     if f["declined"]:

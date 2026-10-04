@@ -36,6 +36,7 @@ use crate::econ::{Evaluated, GasEstimate, RouteCosts, RouteCurves, SettledRoute}
 use crate::live::book::{PoolBook, PoolSnapshot};
 use crate::live::frontier::Cycle;
 use crate::live::gas::{HopSteps, SettlementGas};
+use crate::live::near_miss::{NearMisses, LADDER_WEI};
 use crate::plane::Decline;
 use apex_math::cl_swap::quote_exact_input_multi_tick;
 use apex_math::finite_size::{best_size, NoSize, Priced, SearchBudget, SizedOpportunity, SizedRoute};
@@ -143,6 +144,34 @@ impl CostedCycle {
     fn cost_of(&self, gas: GasEstimate) -> U256 {
         U256::from(self.costs.with_gas(gas.expected))
     }
+
+    /// The route's best net over [`LADDER_WEI`], each size at its own cost, in
+    /// hundredths of a basis point of the size (R14). Sizes past what the paying
+    /// pool holds are left out; `None` if no size prices.
+    pub fn near_miss_centi_bps(&self) -> Option<i64> {
+        let cap = self.max_input();
+        LADDER_WEI
+            .iter()
+            .map(|x| U256::from(*x))
+            .filter(|x| *x <= cap)
+            .filter_map(|x| {
+                let p = self.priced(x)?;
+                let net = wei(p.output).saturating_sub(wei(x)).saturating_sub(wei(p.cost));
+                // Clamped clear of `i64::MIN`, which `NearMisses` reads as "none yet".
+                let centi = net.saturating_mul(1_000_000) / wei(x);
+                Some(centi.clamp(i128::from(i64::MIN + 1), i128::from(i64::MAX)) as i64)
+            })
+            .max()
+    }
+}
+
+/// A wei amount as a signed figure, saturating rather than wrapping.
+fn wei(v: U256) -> i128 {
+    if v > U256::from(i128::MAX as u128) {
+        i128::MAX
+    } else {
+        v.as_u128() as i128
+    }
 }
 
 impl SizedRoute for CostedCycle {
@@ -189,13 +218,20 @@ pub struct LivePricer {
     /// `LiveEconomics::route_costs`, replaced when the economics' costs are.
     costs: apex_state::Versioned<RouteCosts>,
     gas: SettlementGas,
+    /// How close each route Engine C prices comes to paying (R14).
+    near_misses: Arc<NearMisses>,
 }
 
 impl LivePricer {
     pub fn new(book: Arc<PoolBook>, cycles: BTreeMap<RouteId, Cycle>, costs: RouteCosts, gas: SettlementGas) -> Self {
         let by_hash = cycles.iter().map(|(id, c)| (c.commitment.route_hash, *id)).collect();
         let costs = apex_state::Versioned::new(costs, apex_types::state::ReconstructionStatus::Verified);
-        Self { book, cycles, by_hash, costs, gas }
+        Self { book, cycles, by_hash, costs, gas, near_misses: Arc::default() }
+    }
+
+    /// How close the routes Engine C has priced came to paying.
+    pub fn near_misses(&self) -> Arc<NearMisses> {
+        Arc::clone(&self.near_misses)
     }
 
     /// Size every later route at these costs — the economics' new
@@ -232,6 +268,9 @@ impl TemplatePricer for LivePricer {
         // A pool that has left its ladder cannot be priced; that is the pool's
         // state, not the route's economics, and `Unpriceable` says so.
         let Some(route) = self.live(id) else { return Err(NoSize::Unpriceable) };
+        if let Some(near) = route.near_miss_centi_bps() {
+            self.near_misses.record(near);
+        }
         best_size(&route, budget)
     }
 
