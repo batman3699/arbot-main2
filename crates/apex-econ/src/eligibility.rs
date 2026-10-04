@@ -116,8 +116,11 @@ pub struct EligibilityContext {
     pub execution_path_healthy: bool,
     pub flash_liquidity_available: bool,
     pub route_authorization_valid: bool,
-    /// Width of the cost estimate as a fraction of the estimate, in bps. A
-    /// wide interval is not a small cost.
+    /// Width of the cost estimate — its p50-to-p99 spread, in wei — as a share
+    /// of the expected net profit, in bps: how much of what the trade expects
+    /// to make the cost's uncertainty could take. A wide interval is not a
+    /// small cost when it is a large share of a small profit; against a large
+    /// one it is noise.
     pub cost_confidence_bps: u32,
     /// `Pr(Π > 0)` in ppm, from `ev::scenario::probability_of_profit_ppm`.
     pub probability_of_profit_ppm: u32,
@@ -130,7 +133,8 @@ pub struct EligibilityPolicy {
     pub min_robustness_margin_bps: u32,
     pub max_state_age: DurationNanos,
     pub min_simulation_tier: u8,
-    /// The widest cost interval still considered a usable estimate.
+    /// The largest share of the expected profit a cost estimate's width may
+    /// span and still be a usable estimate.
     pub max_cost_confidence_bps: u32,
     /// §2.1's `p_min`.
     pub min_probability_of_profit_ppm: u32,
@@ -145,6 +149,9 @@ impl Default for EligibilityPolicy {
             // measurement that does not exist yet.
             max_state_age: DurationNanos(2_000_000_000),
             min_simulation_tier: 1,
+            // A tenth of the expected profit. Every candidate the economics
+            // assembles already clears Tier 0 at p99, so its profit covers the
+            // whole width; this asks for a margin on top of that.
             max_cost_confidence_bps: 1_000,
             min_probability_of_profit_ppm: 500_000,
         }

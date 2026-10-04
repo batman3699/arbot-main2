@@ -46,7 +46,7 @@ use apex_types::ids::SignerLaneId;
 use apex_types::route::CertificateStatus;
 use apex_types::sim::SimulationResult;
 use apex_types::ticket::{TerminalFailure, TicketOutcome, TicketStatus};
-use apex_types::time::{DurationNanos, UnixNanos};
+use apex_types::time::UnixNanos;
 use alloy_primitives::{B256, U256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -151,17 +151,15 @@ impl RiskGate for RogueGate {
 
 // ------------------------------------------------------------------ fixtures
 
+/// The policy the shadow run holds: the default. It once needed a permissive
+/// cost-confidence cap here, while the clause read the gas estimate's width
+/// against itself and refused every candidate; read in money, against the
+/// profit, the default admits what the economics produces.
 fn real_gate() -> Arc<LiveRiskGate> {
     Arc::new(LiveRiskGate::new(
         PostureLadder::new(),
         CircuitBreaker::new(U256::from(u128::MAX), U256::from(u128::MAX), 100),
-        EligibilityPolicy {
-            min_robustness_margin_bps: 50,
-            max_state_age: DurationNanos(2_000_000_000),
-            min_simulation_tier: 1,
-            max_cost_confidence_bps: 10_000,
-            min_probability_of_profit_ppm: 500_000,
-        },
+        EligibilityPolicy::default(),
         Box::new(ManualClock::at(BOOT.0)),
     ))
 }

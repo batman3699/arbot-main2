@@ -355,6 +355,72 @@ fn an_absent_cost_estimate_is_not_a_confident_one() {
     assert!(healthy_gate().admit(&c, &good_sim(&c), LaneKind::Live).is_err());
 }
 
+/// The default policy's gate: what the shadow run holds.
+fn default_gate() -> LiveRiskGate {
+    LiveRiskGate::new(
+        PostureLadder::new(),
+        CircuitBreaker::new(U256::from(u128::MAX), U256::from(u128::MAX), 100),
+        EligibilityPolicy::default(),
+        Box::new(apex_capture::ManualClock::at(NOW.0)),
+    )
+}
+
+/// `c` settling with `p50` gas expected and `p99` at most, at `wei_per_gas`,
+/// and expecting `net` wei.
+fn priced(mut c: Candidate, p50: u64, p99: u64, wei_per_gas: u128, net: i128) -> Candidate {
+    let d = &mut c.total_execution_cost.gas_used_distribution;
+    d.p50 = apex_types::cost::GasUsed(p50);
+    d.p90 = apex_types::cost::GasUsed((p50 + p99) / 2);
+    d.p99 = apex_types::cost::GasUsed(p99);
+    c.total_execution_cost.l2_execution_fee = u128::from(p50) * wei_per_gas;
+    c.expected_net_profit = net;
+    c
+}
+
+/// **The cost estimate's width is judged in money, against the profit.**
+/// Operator decision, 2026-10-05: what the clause asks is whether the gas
+/// estimate's uncertainty could take a meaningful share of what the trade
+/// expects to make — the width between p50 and p99, in wei at the fee's own
+/// price, as a share of the expected net profit. The same gas spread passes
+/// against a large profit and fails against a small one.
+#[test]
+fn the_cost_estimates_width_is_judged_in_money_against_the_profit() {
+    // p99 twice p50: 10,000 bps of the gas, the width 2.5e12 wei at 5e6 a gas.
+    let wide = |net: i128| priced(admissible(), 500_000, 1_000_000, 5_000_000, net);
+
+    let rich = wide(100_000_000_000_000);
+    assert_eq!(context_for(&rich, &good_sim(&rich), NOW).cost_confidence_bps, 250, "a fortieth of the profit");
+    assert!(default_gate().admit(&rich, &good_sim(&rich), LaneKind::Live).is_ok());
+
+    let thin = wide(10_000_000_000_000);
+    assert_eq!(context_for(&thin, &good_sim(&thin), NOW).cost_confidence_bps, 2_500, "a quarter of it");
+    let err = default_gate().admit(&thin, &good_sim(&thin), LaneKind::Live).expect_err("too wide for its profit");
+    let Decline::RiskRefused { rule } = err else { panic!("{err:?}") };
+    assert!(rule.contains(Clause::CostEstimateConfidence.label()), "{rule}");
+}
+
+/// **The first candidate the shadow run ever simulated clears the clause.**
+/// PancakeSwap to PancakeSwap, crossing nothing, expecting 11,932,774,580,074
+/// wei: 472,000 gas expected, 532,000 at most, at Base's 0.005 gwei. Its width
+/// is 3e11 wei, 2.5% of the profit. Read as a share of the gas instead —
+/// 1,271 bps — the default policy refused it, as it refused every candidate.
+#[test]
+fn the_first_candidate_the_shadow_saw_clears_the_clause() {
+    let first = priced(admissible(), 472_000, 532_000, 5_000_000, 11_932_774_580_074);
+    assert_eq!(context_for(&first, &good_sim(&first), NOW).cost_confidence_bps, 251);
+    assert!(default_gate().admit(&first, &good_sim(&first), LaneKind::Live).is_ok());
+}
+
+/// A candidate that expects no profit has no share for a width to take: its
+/// cost confidence is maximally wide, and the clause fails at every policy.
+#[test]
+fn a_candidate_expecting_nothing_has_no_confident_cost() {
+    for net in [0, -1_000_000] {
+        let c = priced(admissible(), 500_000, 600_000, 5_000_000, net);
+        assert_eq!(context_for(&c, &good_sim(&c), NOW).cost_confidence_bps, u32::MAX, "{net}");
+    }
+}
+
 /// **`Pr(Π > 0)` is not `P(lands)`, and the gate reads the right one.**
 ///
 /// The first draft read `capture_probability` for §2.1's robust-gate clause,

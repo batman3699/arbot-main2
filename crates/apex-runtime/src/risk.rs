@@ -248,21 +248,38 @@ const fn tier_ordinal(tier: apex_types::sim::SimulationTier) -> u8 {
     }
 }
 
-/// How wide the cost estimate is, in bps of itself.
+/// How much of the expected profit the cost estimate's width could take, in
+/// bps of the profit.
 ///
 /// §23.1 requires a distribution rather than a scalar, and `TotalExecutionCost`
-/// carries one: the p99/p50 spread of gas used is the width the clause is about.
+/// carries one: the gas between p50 and p99 is the width the clause is about.
+/// **It is judged in money, against the profit** (operator decision,
+/// 2026-10-05): the width in wei, at the price the L2 fee was computed at, as a
+/// share of the expected net profit. Measured against the gas estimate itself it
+/// refused every candidate — a measured settlement's ceiling sits 13% or more
+/// above its mean, while the whole spread was worth about a cent against the
+/// trade it could move.
+///
 /// **Zero p50 is refused as maximally wide rather than treated as certain** — a
-/// cost estimate of nothing is not a confident estimate, it is an absent one, and
-/// `u32::MAX` here fails the clause at every policy.
+/// cost estimate of nothing is not a confident estimate, it is an absent one —
+/// and so is a candidate expecting no profit, which has no share to take:
+/// `u32::MAX` fails the clause at every policy.
 fn cost_confidence_bps(c: &Candidate) -> u32 {
-    let d = &c.total_execution_cost.gas_used_distribution;
+    let cost = &c.total_execution_cost;
+    let d = &cost.gas_used_distribution;
     let (p50, p99) = (d.p50.0, d.p99.0);
     if p50 == 0 {
         return u32::MAX;
     }
-    let spread = p99.saturating_sub(p50);
-    u32::try_from(spread.saturating_mul(10_000) / p50).unwrap_or(u32::MAX)
+    let profit = match u128::try_from(c.expected_net_profit) {
+        Ok(p) if p > 0 => p,
+        _ => return u32::MAX,
+    };
+    // The L2 fee is p50 at the gas price, so the width is the fee scaled by the
+    // gas between p50 and p99: multiplied before dividing, so no price is
+    // recovered by an integer division that could round it to nothing.
+    let width_wei = cost.l2_execution_fee.saturating_mul(u128::from(p99.saturating_sub(p50))) / u128::from(p50);
+    u32::try_from(width_wei.saturating_mul(10_000) / profit).unwrap_or(u32::MAX)
 }
 
 /// The clauses, exposed so a caller can report which one stopped a candidate
