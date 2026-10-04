@@ -121,7 +121,7 @@ impl CallBuilder for LiveCallBuilder {
         };
 
         let snapshot = self.book.snapshot();
-        let live = LiveCycle::new(cycle, &snapshot, 0).ok_or_else(stale)?;
+        let live = LiveCycle::new(cycle, &snapshot).ok_or_else(stale)?;
         let [mid, out] = live.hop_outputs(u256_to_ethers(input)).ok_or_else(stale)?;
         let (mid, out) = (u256_to_alloy(mid), u256_to_alloy(out));
         if out != c.expected_output {

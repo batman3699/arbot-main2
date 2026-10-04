@@ -116,7 +116,14 @@ pub struct MultiTickQuote {
     /// when `exhausted` is set.
     pub amount_in_consumed: U256,
     pub sqrt_price_after: U256,
+    /// Initialized ticks crossed, a zero net included: each is a tick v3-core
+    /// writes as it crosses, and so most of the gas a crossing-heavy swap uses.
     pub ticks_crossed: u32,
+    /// Steps that ended at a bitmap word's edge with nothing initialized there
+    /// and went on into the next word: a loop of v3-core's swap that crosses no
+    /// tick and reads one more word. Counted apart from `ticks_crossed` because
+    /// it costs a fraction of a crossing's gas.
+    pub word_steps: u32,
     /// The swap wanted to continue past the ladder's proven coverage or past
     /// `max_ticks`. The quote is a LOWER bound on a partial fill, not a
     /// complete answer — callers must fall back rather than use it as a real
@@ -240,6 +247,7 @@ pub fn quote_exact_input_multi_tick(
     let mut liquidity = state.liquidity;
     let mut tick = state.tick;
     let mut ticks_crossed: u32 = 0;
+    let mut word_steps: u32 = 0;
     let mut exhausted = false;
     let mut ended_on_tick_boundary = false;
 
@@ -326,6 +334,8 @@ pub fn quote_exact_input_multi_tick(
                 }
             };
             ticks_crossed += 1;
+        } else {
+            word_steps += 1;
         }
         // Downward steps land on `tick - 1` so the next search makes progress
         // instead of re-finding the boundary just reached.
@@ -341,6 +351,7 @@ pub fn quote_exact_input_multi_tick(
         amount_in_consumed: amount_in.checked_sub(remaining).unwrap_or(amount_in),
         sqrt_price_after: sqrt_price,
         ticks_crossed,
+        word_steps,
         exhausted,
         liquidity_after: liquidity,
         ended_on_tick_boundary,

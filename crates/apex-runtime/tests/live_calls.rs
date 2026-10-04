@@ -17,7 +17,6 @@ use apex_exec::encode::{
 use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
-use apex_math::finite_size::SizedRoute;
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
 use apex_runtime::live::calls::LiveCallBuilder;
 use apex_runtime::live::frontier::{self, Cycle, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER, SLIPSTREAM_ADAPTER, WETH};
@@ -88,7 +87,7 @@ fn priced(b: &Arc<PoolBook>) -> (Cycle, Candidate) {
     let (cycle, out) = cycles
         .into_iter()
         .map(|c| {
-            let out = LiveCycle::new(&c, &b.snapshot(), 0).unwrap().output(u256_to_ethers(input)).unwrap();
+            let out = LiveCycle::new(&c, &b.snapshot()).unwrap().output(u256_to_ethers(input)).unwrap();
             (c, u256_to_alloy(out))
         })
         .find(|(_, out)| *out > input)
@@ -180,7 +179,7 @@ fn a_priced_cycle_becomes_one_checked_plan_in_either_venue_order() {
         assert_eq!((loan.token, loan.amount, loan.provider, loan.provider_addr), (WETH, input, LoanProvider::Balancer, BALANCER_VAULT));
 
         let mid = u256_to_alloy(
-            LiveCycle::new(&cycle, &b.snapshot(), 0).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
+            LiveCycle::new(&cycle, &b.snapshot()).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
         );
         let floor = (input + U256::from(1u64)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
         let [l0, l1] = &cycle.legs;
@@ -222,7 +221,7 @@ fn a_pancakeswap_hop_is_adapter_twos_router_call() {
         let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &commitment(&c, 1)).expect("builds");
         let input = c.input_amount.get();
         let mid = u256_to_alloy(
-            LiveCycle::new(&cycle, &b.snapshot(), 0).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
+            LiveCycle::new(&cycle, &b.snapshot()).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
         );
         let floor = (input + U256::from(1u64)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
         let [l0, l1] = &cycle.legs;

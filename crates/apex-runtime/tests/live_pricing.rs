@@ -7,12 +7,14 @@
 use alloy_primitives::{address, Address};
 use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
-use apex_math::cl_swap::TickLadder;
-use apex_math::finite_size::{NoSize, SearchBudget, SizedRoute};
+use apex_math::cl_swap::{quote_exact_input_multi_tick, TickLadder};
+use apex_math::finite_size::{NoSize, SearchBudget, SizedRoute, Surplus};
+use apex_runtime::econ::{RouteCosts, SettledRoute};
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
 use apex_runtime::live::frontier::{self, WETH};
 use apex_runtime::live::inventory::{PoolSpec, Venue};
-use apex_runtime::live::pricing::{LiveCycle, LivePricer};
+use apex_runtime::live::gas::{self, HopSteps};
+use apex_runtime::live::pricing::{CostedCycle, LiveCycle, LivePricer, MAX_TICKS};
 use apex_search::engine_c::TemplatePricer;
 use apex_types::ids::ChainId;
 use apex_types::state::{ReconstructionStatus, StateFingerprint};
@@ -137,6 +139,11 @@ fn budget() -> SearchBudget {
     SearchBudget { max_evaluations: 128, min_input: U256::from(10u64.pow(12)) }
 }
 
+/// A cost every size shares, with gas free: what pricing was before R12.
+fn flat(wei: u128) -> RouteCosts {
+    RouteCosts { other_wei: wei, wei_per_gas: 0 }
+}
+
 /// **A gap wider than both fees pays; the pricer finds it.** Fifty ticks is
 /// ≈ 50 bps between the pools against 5 + 0.8 bps of fees.
 #[test]
@@ -146,7 +153,7 @@ fn a_gap_wider_than_the_fees_has_a_profitable_size() {
         pool(SLIP, Venue::Slipstream, -197_300, 80, L),
     ]);
     let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
-    let pricer = LivePricer::new(b, cycles.clone(), 3_000_000_000_000);
+    let pricer = LivePricer::new(b, cycles.clone(), flat(3_000_000_000_000), gas::MEASURED);
     let wins: Vec<_> = cycles
         .keys()
         .filter_map(|id| pricer.best_size(*id, &fp(), budget()).ok())
@@ -164,14 +171,14 @@ fn the_pricer_sizes_against_the_cost_it_was_last_given() {
         pool(SLIP, Venue::Slipstream, -197_300, 80, L),
     ]);
     let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
-    let pricer = LivePricer::new(b, cycles.clone(), 0);
+    let pricer = LivePricer::new(b, cycles.clone(), flat(0), gas::MEASURED);
     let (id, win) = cycles
         .keys()
         .find_map(|id| pricer.best_size(*id, &fp(), budget()).ok().map(|w| (*id, w)))
         .expect("the gap pays");
 
-    pricer.set_fixed_cost_wei((win.output - win.amount_in).as_u128() * 1_000);
-    assert_eq!(pricer.fixed_cost_wei(), (win.output - win.amount_in).as_u128() * 1_000);
+    pricer.set_costs(flat((win.output - win.amount_in).as_u128() * 1_000));
+    assert_eq!(pricer.costs(), flat((win.output - win.amount_in).as_u128() * 1_000));
     let got = pricer.best_size(id, &fp(), budget());
     assert!(matches!(got, Err(NoSize::NoProfitableSize { .. })), "{got:?}");
 }
@@ -185,7 +192,7 @@ fn equal_prices_have_no_profitable_size() {
         pool(SLIP, Venue::Slipstream, -197_350, 80, L),
     ]);
     let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
-    let pricer = LivePricer::new(b, cycles.clone(), 3_000_000_000_000);
+    let pricer = LivePricer::new(b, cycles.clone(), flat(3_000_000_000_000), gas::MEASURED);
     for id in cycles.keys() {
         match pricer.best_size(*id, &fp(), budget()) {
             Err(NoSize::NoProfitableSize { .. }) | Err(NoSize::RangeEmpty) => {}
@@ -203,7 +210,7 @@ fn a_pool_off_its_ladder_is_unpriceable() {
     off.state.tick = -150_000; // far outside the proven range
     let b = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L), off]);
     let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
-    let pricer = LivePricer::new(b, cycles.clone(), 0);
+    let pricer = LivePricer::new(b, cycles.clone(), flat(0), gas::MEASURED);
     for id in cycles.keys() {
         assert_eq!(pricer.best_size(*id, &fp(), budget()).unwrap_err(), NoSize::Unpriceable);
     }
@@ -219,7 +226,7 @@ fn a_size_past_the_ladder_is_refused_not_completed() {
     ]);
     let snap = b.snapshot();
     let cycle = &frontier::cycles(BASE, WETH, &snap)[0];
-    let live = LiveCycle::new(cycle, &snap, 0).expect("both pools on their ladders");
+    let live = LiveCycle::new(cycle, &snap).expect("both pools on their ladders");
     assert!(live.output(U256::from(10u64.pow(16))).is_some(), "0.01 WETH fills");
     assert!(live.output(U256::exp10(26)).is_none(), "100M WETH runs off every ladder");
 }
@@ -235,12 +242,12 @@ fn max_input_is_the_real_holding_and_fails_closed() {
         .into_iter()
         .find(|c| c.legs[1].pool == SLIP)
         .unwrap();
-    assert_eq!(LiveCycle::new(&c, &snap, 0).unwrap().max_input(), U256::from(10u128.pow(21)));
+    assert_eq!(LiveCycle::new(&c, &snap).unwrap().max_input(), U256::from(10u128.pow(21)));
 
     slip.state.balance0 = None;
     let b = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L), slip]);
     let snap = b.snapshot();
-    assert_eq!(LiveCycle::new(&c, &snap, 0).unwrap().max_input(), U256::zero());
+    assert_eq!(LiveCycle::new(&c, &snap).unwrap().max_input(), U256::zero());
 }
 
 /// A proposal's venue versions are its **route's** pools, read from the book: a
@@ -256,7 +263,7 @@ fn route_versions_move_only_with_the_routes_own_pools() {
         far,
     ]);
     let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
-    let pricer = LivePricer::new(b.clone(), cycles.clone(), 0);
+    let pricer = LivePricer::new(b.clone(), cycles.clone(), flat(0), gas::MEASURED);
     let id = *cycles.keys().next().unwrap();
     let versions = || pricer.route_fingerprint(id, &fp()).venue_state_version;
     let before = versions();
@@ -315,4 +322,106 @@ fn a_pool_the_book_does_not_carry_empties_the_reading() {
     let b = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L)]);
     assert_eq!(b.versions_for(&[UNI]).len(), 1);
     assert!(b.versions_for(&[UNI, ELSEWHERE]).is_empty());
+}
+
+// ------------------------------------------------------------------ gas (R12)
+
+/// The pool with a zero-net initialized tick every `every` ticks across its
+/// band: each is a step v3-core takes and a tick it writes, so a larger trade
+/// crosses more of them.
+fn ticked(mut p: PoolSnapshot, every: i32) -> PoolSnapshot {
+    let ticks = p.ladder.ticks().to_vec();
+    let (lower, upper) = (ticks[0].0, ticks[ticks.len() - 1].0);
+    let mut all = ticks.clone();
+    let mut t = lower + every;
+    while t < upper {
+        all.push((t, 0));
+        t += every;
+    }
+    p.ladder = TickLadder::new(all, p.ladder.lower_bound(), p.ladder.upper_bound());
+    p
+}
+
+/// **A larger trade crosses more ticks, and is charged their gas.** The quote
+/// that prices a size counts the ticks each hop crosses, and the cost a size is
+/// sized against is the route's other costs plus that size's expected gas at the
+/// gas price — never one figure every size shares.
+#[test]
+fn a_size_that_crosses_more_ticks_is_charged_its_gas() {
+    let b = book(vec![
+        ticked(pool(UNI, Venue::UniswapV3, -197_350, 500, L), 10),
+        ticked(pool(SLIP, Venue::Slipstream, -197_300, 80, L), 10),
+    ]);
+    let snap = b.snapshot();
+    let cycle = &frontier::cycles(BASE, WETH, &snap)[0];
+    let costs = RouteCosts { other_wei: 7_000_000_000, wei_per_gas: 5_000_000 };
+    let route = CostedCycle::new(LiveCycle::new(cycle, &snap).unwrap(), costs, gas::MEASURED);
+    let quote = |x: U256| LiveCycle::new(cycle, &snap).unwrap().quote(x).unwrap();
+    let crossed = |hops: [HopSteps; 2]| hops[0].crossed + hops[1].crossed;
+
+    // 0.001 WETH crosses at most the tick hop 1's price sits on; 100 WETH
+    // crosses several more.
+    let (small, large) = (U256::exp10(15), U256::exp10(20));
+    assert!(crossed(quote(small).hops) <= 1, "{:?}", quote(small).hops);
+    assert!(crossed(quote(large).hops) >= crossed(quote(small).hops) + 4, "{:?}", quote(large).hops);
+
+    // Each hop's steps are its own pool's, in its own direction: hop 1 sells
+    // WETH down its pool, hop 2 buys it back up the other.
+    let mut amount = large;
+    for (i, leg) in cycle.legs.iter().enumerate() {
+        let p = snap.get(&leg.pool).unwrap();
+        let direct = quote_exact_input_multi_tick(&p.state, &p.ladder, amount, leg.zero_for_one, MAX_TICKS).unwrap();
+        let want = HopSteps {
+            venue: leg.venue,
+            zero_for_one: leg.zero_for_one,
+            crossed: direct.ticks_crossed,
+            word_steps: direct.word_steps,
+        };
+        assert_eq!(quote(large).hops[i], want, "hop {i}");
+        amount = direct.amount_out;
+    }
+    assert_ne!(cycle.legs[0].zero_for_one, cycle.legs[1].zero_for_one);
+
+    let (at_small, at_large) = (route.gas_at(small).unwrap(), route.gas_at(large).unwrap());
+    assert_eq!(at_small, gas::MEASURED.estimate(&quote(small).hops));
+    assert_eq!(at_large, gas::MEASURED.estimate(&quote(large).hops));
+    assert!(at_large.expected > at_small.expected && at_large.ceiling > at_small.ceiling);
+    for x in [small, large] {
+        let priced = route.priced(x).unwrap();
+        assert_eq!(priced.output, quote(x).outputs[1]);
+        assert_eq!(priced.cost, U256::from(costs.with_gas(route.gas_at(x).unwrap().expected)));
+    }
+    // The least any size costs: a settlement that crosses nothing.
+    let nothing = quote(small).hops.map(|h| HopSteps { crossed: 0, word_steps: 0, ..h });
+    assert_eq!(route.fixed_cost(), U256::from(costs.with_gas(gas::MEASURED.estimate(&nothing).expected)));
+    assert!(route.fixed_cost() < route.priced(large).unwrap().cost);
+}
+
+/// **Engine C sizes against each size's own cost.** The net the pricer reports
+/// is the size's output, less what it took, the other costs, and the gas that
+/// size's crossings use — the figure the economics will charge.
+#[test]
+fn the_pricer_charges_each_size_its_own_gas() {
+    let b = book(vec![
+        ticked(pool(UNI, Venue::UniswapV3, -197_350, 500, L), 10),
+        ticked(pool(SLIP, Venue::Slipstream, -197_300, 80, L), 10),
+    ]);
+    let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
+    let costs = RouteCosts { other_wei: 1_000_000_000_000, wei_per_gas: 5_000_000 };
+    let pricer = LivePricer::new(b.clone(), cycles.clone(), costs, gas::MEASURED);
+    let (id, win) = cycles
+        .keys()
+        .find_map(|id| pricer.best_size(*id, &fp(), budget()).ok().map(|w| (*id, w)))
+        .expect("the gap pays");
+
+    let cycle = LiveCycle::new(pricer.cycle(id).unwrap(), &b.snapshot()).unwrap();
+    let hops = cycle.quote(win.amount_in).unwrap().hops;
+    assert!(hops[0].crossed + hops[1].crossed > 0, "the size found crosses nothing: the test proves nothing");
+    let route = CostedCycle::new(cycle, costs, gas::MEASURED);
+    let gas = route.gas_at(win.amount_in).unwrap();
+    assert_eq!(
+        win.net,
+        Surplus::Gain(win.output - win.amount_in - U256::from(costs.with_gas(gas.expected))),
+        "the reported net is not the size's own"
+    );
 }

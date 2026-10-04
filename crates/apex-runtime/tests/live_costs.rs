@@ -9,13 +9,14 @@ use alloy_primitives::{hex, Address, U256};
 use apex_chain::rpc::{RpcError, RpcTransport};
 use apex_econ::cost::failure::FailureProfile;
 use apex_econ::cost::l1_data::{L1FeeModel, L1FeeParameters};
-use apex_runtime::econ::{ChainCosts, LiveEconomics, ScenarioPriors};
+use apex_runtime::econ::{ChainCosts, LiveEconomics, RouteCosts, ScenarioPriors};
 use apex_runtime::live::abi::{selector, MULTICALL3};
 use apex_runtime::live::book::PoolBook;
 use apex_runtime::live::costs::{self, Costs, GAS_PRICE_ORACLE};
+use apex_runtime::live::gas;
 use apex_runtime::live::pricing::LivePricer;
 use apex_runtime::live::reads::{ChainReads, ReadError};
-use apex_types::cost::{GasLimit, GasUsed};
+use apex_types::cost::GasUsed;
 use apex_types::ids::StrategyId;
 use apex_types::state::ReconstructionStatus;
 use ethers_core::types::U256 as EthersU256;
@@ -128,30 +129,37 @@ fn chain_costs() -> ChainCosts {
         },
         l1_model: L1FeeModel::unvalidated(),
         failure: FailureProfile { gas_on_failure: GasUsed(411_945), failure_ppm: 50_000 },
-        success_gas: GasUsed(534_100),
-        gas_limit: GasLimit(800_000),
     }
 }
 
 /// **One figure for both.** The pricer is aligned with the economics on
-/// construction, and a refresh moves both; what the chain does not say is kept.
+/// construction, and a refresh moves both; what the chain does not say — how a
+/// settlement fails — is kept.
 #[test]
 fn a_refresh_moves_the_economics_and_the_pricer_together() {
     let book = Arc::new(PoolBook::from_snapshots([], ReconstructionStatus::Verified));
-    let pricer = Arc::new(LivePricer::new(book, BTreeMap::new(), 7));
+    let pricer = Arc::new(LivePricer::new(
+        book,
+        BTreeMap::new(),
+        RouteCosts { other_wei: 7, wei_per_gas: 7 },
+        gas::MEASURED,
+    ));
     let econ = Arc::new(LiveEconomics::new(pricer.clone(), ScenarioPriors::default(), chain_costs(), StrategyId(1)));
     let c = Costs::new(Arc::clone(&econ), Arc::clone(&pricer));
-    let booted = c.route_cost_wei();
-    assert_eq!(pricer.fixed_cost_wei(), booted);
-    assert_eq!(booted, econ.route_cost_wei(2));
+    let booted = c.route_costs();
+    assert_eq!(pricer.costs(), booted);
+    assert_eq!(booted, econ.route_costs(2));
+    assert_eq!(booted.wei_per_gas, 6_000_000);
 
     let mut l1 = chain_costs().l1;
     l1.l1_base_fee *= 3;
     let set = c.set(60_000_000, l1);
     assert_eq!(set.gas_price_wei, U256::from(60_000_000u64));
     assert_eq!(set.l1, l1);
-    assert_eq!((set.success_gas, set.gas_limit, set.failure), (GasUsed(534_100), GasLimit(800_000), chain_costs().failure));
+    assert_eq!(set.failure, chain_costs().failure);
     assert_eq!(econ.costs().gas_price_wei, set.gas_price_wei);
-    assert!(c.route_cost_wei() > booted);
-    assert_eq!(pricer.fixed_cost_wei(), c.route_cost_wei());
+    let now = c.route_costs();
+    assert_eq!(now.wei_per_gas, 60_000_000);
+    assert!(now.other_wei > booted.other_wei, "the L1 fee tripled");
+    assert_eq!(pricer.costs(), now);
 }

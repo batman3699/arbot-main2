@@ -181,6 +181,25 @@ fn a_word_edge_ends_a_step() {
     assert!(differs, "no size distinguishes one step from two: the test proves nothing");
 }
 
+/// **The quote counts the steps that cost gas.** A settlement's gas follows
+/// v3-core's loop: each initialized tick it crosses writes that tick, and each
+/// word's edge it passes reads the next word of the bitmap. The two are counted
+/// apart, because they cost different amounts: an edge is a step that crosses
+/// nothing.
+#[test]
+fn the_quote_counts_crossings_and_word_edges_apart() {
+    // Spacing 1, tick 250, a zero-net tick at 300: up from 250 the steps end at
+    // 255 (word 0's edge), 300 (initialized), 511 (word 1's edge), then short
+    // of 600. Tick 255 is ~2.5e14 of input away, 300 ~2.8e15, 511 ~1.4e16.
+    let (state, ladder) = wide(1, &[(300, 0)]);
+    for (amount, edges, crossed) in [(3u64, 0, 0), (50, 1, 0), (500, 1, 1), (1_500, 2, 1)] {
+        let amount = U256::from(amount) * U256::exp10(13);
+        let q = quote_exact_input_multi_tick(&state, &ladder, amount, false, 64).unwrap();
+        assert!(!q.exhausted, "{amount}");
+        assert_eq!((q.word_steps, q.ticks_crossed), (edges, crossed), "{amount}");
+    }
+}
+
 /// **A zero-net tick ends a step** too, and changes nothing else: at spacing
 /// 10 no word edge is near, so the only extra stop is the tick at 300.
 #[test]

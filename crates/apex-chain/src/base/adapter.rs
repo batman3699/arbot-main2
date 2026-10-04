@@ -63,6 +63,16 @@ pub trait BaseRpc: Send + Sync {
 /// measurement, and it is stated here rather than spread through the code.
 pub const GAS_HEADROOM_BPS: u64 = 1_200;
 
+/// §21.3's `G_safe` over a p99: the figure plus [`GAS_HEADROOM_BPS`].
+///
+/// One formula for the two places that need it: the economics, pricing the
+/// limit a candidate's simulation runs at, and the adapter, choosing the limit
+/// it is signed with. Two copies would let the simulation pass at a limit the
+/// signed transaction then runs out of.
+pub const fn gas_limit_over(p99: apex_types::cost::GasUsed) -> GasLimit {
+    GasLimit(p99.0.saturating_add(p99.0.saturating_mul(GAS_HEADROOM_BPS) / 10_000))
+}
+
 pub struct BaseAdapter<R: BaseRpc> {
     rpc: R,
     regime: RegimeDiscovery,
@@ -102,8 +112,7 @@ impl<R: BaseRpc> BaseAdapter<R> {
     /// p99, not p50: the limit must cover the tail, because a transaction that
     /// runs out of gas has paid for the whole thing and bought nothing.
     pub const fn safe_gas_limit(c: &Candidate) -> GasLimit {
-        let p99 = c.total_execution_cost.gas_used_distribution.p99.0;
-        GasLimit(p99 + (p99 * GAS_HEADROOM_BPS) / 10_000)
+        gas_limit_over(c.total_execution_cost.gas_used_distribution.p99)
     }
 
     /// The flashblock index the candidate could land in, given where the block

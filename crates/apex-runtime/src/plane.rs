@@ -356,11 +356,15 @@ pub trait CallBuilder: Send + Sync {
 /// but the assigned lane answers a different question.
 #[async_trait::async_trait]
 pub trait Simulator: Send + Sync {
+    /// `gas_limit` is the one the transaction will be signed with: what is
+    /// simulated is what is signed, and a call that needs more gas than its
+    /// limit fails here as it would on chain.
     async fn simulate(
         &self,
         c: &Candidate,
         call: &ExecutorCall,
         from: Address,
+        gas_limit: GasLimit,
     ) -> Result<SimulationResult, Decline>;
 }
 
@@ -1096,7 +1100,7 @@ impl Plane {
             let Some(_permit) = self.budgets.reserve(ResourceClass::Simulation) else {
                 return Err(Decline::NoBudget(ResourceClass::Simulation));
             };
-            self.ports.sim.simulate(&repriced, &call, from).await?
+            self.ports.sim.simulate(&repriced, &call, from, gas_limit).await?
         };
         if !sim.success {
             return Err(Decline::SimulationFailed {

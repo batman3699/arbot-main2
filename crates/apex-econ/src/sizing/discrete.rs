@@ -89,14 +89,15 @@ pub fn refine_detailed<R: SizedRoute + ?Sized>(
             return None;
         }
         evaluations += 1;
-        let out = route.output(x)?;
-        let cost = x.saturating_add(route.fixed_cost());
+        // Each size at its own cost: gas grows with the ticks a size crosses.
+        let priced = route.priced(x)?;
+        let cost = x.saturating_add(priced.cost);
         Some((
-            out,
-            if out >= cost {
-                Surplus::Gain(out - cost)
+            priced.output,
+            if priced.output >= cost {
+                Surplus::Gain(priced.output - cost)
             } else {
-                Surplus::Loss(cost - out)
+                Surplus::Loss(cost - priced.output)
             },
         ))
     };

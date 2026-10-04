@@ -3,7 +3,7 @@
 use apex_econ::sizing::continuous::{optimize, ContinuousBudget, ContinuousOptimum};
 use apex_econ::sizing::discrete::{refine, refine_detailed, RefineBudget};
 use apex_math::engine::{CpmmEngine, CpmmState, ExactPricingEngine, Order};
-use apex_math::finite_size::{SizedRoute, Surplus};
+use apex_math::finite_size::{Priced, SizedRoute, Surplus};
 use ethers_core::types::{Address, U256};
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
@@ -256,4 +256,52 @@ fn a_continuous_optimum_is_not_a_size() {
          than an exactly evaluated one -- fixture is too easy, pick a route where \
          the climb actually moves"
     );
+}
+
+/// A route whose cost steps up with its size, as gas does with each initialized
+/// tick a concentrated-liquidity hop crosses.
+struct Stepped {
+    inner: Route,
+    step: U256,
+    per_step: U256,
+}
+
+impl SizedRoute for Stepped {
+    fn output(&self, amount_in: U256) -> Option<U256> {
+        self.inner.output(amount_in)
+    }
+    fn fixed_cost(&self) -> U256 {
+        self.inner.fixed_cost()
+    }
+    fn max_input(&self) -> U256 {
+        self.inner.max_input()
+    }
+    fn priced(&self, amount_in: U256) -> Option<Priced> {
+        Some(Priced {
+            output: self.output(amount_in)?,
+            cost: self.fixed_cost() + amount_in / self.step * self.per_step,
+        })
+    }
+}
+
+/// **Both stages charge each size what it costs.** The warm start and the
+/// climb price every size they try at that size's own cost: a stage that
+/// charged the fixed part alone would size past the point where the next unit
+/// of input pays for the gas it adds, and report a net the trade does not earn.
+#[test]
+fn both_stages_charge_each_size_what_it_costs() {
+    let stepped = Stepped {
+        inner: route(200, 30, GAS),
+        step: U256::from(100_000_000_000_000_000u128),
+        per_step: U256::from(100_000_000_000_000u128),
+    };
+    let flat = optimize(&route(200, 30, GAS), ContinuousBudget::default()).expect("warm start");
+    let start = optimize(&stepped, ContinuousBudget::default()).expect("warm start");
+    assert!(start.value() < flat.value(), "warm start {} against a growing cost, {} against a fixed one", start.value(), flat.value());
+
+    let found = refine_detailed(&stepped, start, RefineBudget::default()).expect("priceable");
+    assert!(found.size.is_some(), "still profitable");
+    let at = stepped.priced(found.amount).unwrap();
+    assert_eq!(found.output, at.output);
+    assert_eq!(found.net, Surplus::Gain(at.output - found.amount - at.cost));
 }

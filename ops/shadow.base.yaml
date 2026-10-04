@@ -71,14 +71,13 @@ policy:
   # The L1 fee oracle moves with L1 blocks; once a minute.
   l1_every_blocks: 30
 
-# What a settlement costs that the chain does not say. Measured on the R6/R7
-# fork: the two-hop cycle with its flash loan mined in 534,100 gas; the
-# costliest revert (hop 2's minimum) used 411,945. The limit covers p99 (1.3x)
-# with section 21.3's 12% headroom. The failure rate is not measured: it is one
-# of the things this run measures.
+# How a settlement fails, and what failing costs: what the chain does not say.
+# The costliest revert on the R6/R7 fork (hop 2's minimum) used 411,945 gas.
+# The failure rate is not measured: it is one of the things this run measures.
+# What a success uses is not here: it is each route's own, at its size, from
+# the ticks it crosses (live::gas::MEASURED, R12), and every ticket's gas limit
+# is built from that.
 costs:
-  success_gas: 534100
-  gas_limit: 800000
   gas_on_failure: 411945
   failure_ppm: 50000
 

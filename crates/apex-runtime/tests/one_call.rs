@@ -31,11 +31,13 @@ use support::*;
 
 const BOOT: UnixNanos = UnixNanos(1_000_000_000);
 const LANE_ADDRESS: [u8; 20] = [0x22; 20];
+/// The gas limit the chain schedules with, unlike any candidate's.
+const CHOSEN: GasLimit = GasLimit(987_654);
 
-/// Records what it was asked to simulate, and as whom.
+/// Records what it was asked to simulate, as whom, and at what gas limit.
 #[derive(Default)]
 struct SpySimulator {
-    seen: Mutex<Vec<(Vec<u8>, Address)>>,
+    seen: Mutex<Vec<(Vec<u8>, Address, GasLimit)>>,
 }
 
 #[async_trait::async_trait]
@@ -45,16 +47,17 @@ impl Simulator for SpySimulator {
         c: &Candidate,
         call: &ExecutorCall,
         from: Address,
+        gas_limit: GasLimit,
     ) -> Result<SimulationResult, Decline> {
-        self.seen.lock().unwrap().push((call.data().to_vec(), from));
-        AlwaysSucceeds.simulate(c, call, from).await
+        self.seen.lock().unwrap().push((call.data().to_vec(), from, gas_limit));
+        AlwaysSucceeds.simulate(c, call, from, gas_limit).await
     }
 }
 
-/// Records what it was asked to sign, and at what fees.
+/// Records what it was asked to sign, at what fees and what gas limit.
 #[derive(Default)]
 struct SpySigner {
-    seen: Mutex<Vec<(Vec<u8>, FeeCaps)>>,
+    seen: Mutex<Vec<(Vec<u8>, FeeCaps, GasLimit)>>,
 }
 
 impl Signer for SpySigner {
@@ -65,7 +68,7 @@ impl Signer for SpySigner {
         gas_limit: GasLimit,
         fees: FeeCaps,
     ) -> Result<SignedPayload, Decline> {
-        self.seen.lock().unwrap().push((call.data().to_vec(), fees));
+        self.seen.lock().unwrap().push((call.data().to_vec(), fees, gas_limit));
         EchoSigner.sign(auth, call, gas_limit, fees)
     }
 }
@@ -106,7 +109,9 @@ fn plane(
         pool: Arc::new(pool()),
         gate: Arc::new(DispatchGate::shut()),
         dispatch: DispatchLane::Shadow(Arc::new(NullDispatcher::new())),
-        chain: Arc::new(FakeChain::landing()),
+        // Not the candidate's limit: what the plane simulates and signs at must
+        // be the chain's choice.
+        chain: Arc::new(FakeChain::landing().choosing(CHOSEN)),
         search: Arc::new(FixedSearch::new(vec![candidate(1, 47_079_437, 320_000_000_000)])),
         econ: Arc::new(PassThroughEconomics::default()),
         sim,
@@ -142,6 +147,21 @@ async fn the_simulator_and_the_signer_see_the_same_call() {
     assert_eq!(signed.len(), 1);
     assert_eq!(simulated[0].0, signed[0].0, "what was signed is not what was simulated");
     assert!(!signed[0].0.is_empty());
+}
+
+/// **And at the same gas limit.** The limit a call is signed with is the one
+/// it ran at in simulation: a simulation given more gas than the transaction
+/// passes a call that then runs out on chain.
+#[tokio::test]
+async fn the_simulation_runs_at_the_gas_limit_it_is_signed_with() {
+    let sim = Arc::new(SpySimulator::default());
+    let signer = Arc::new(SpySigner::default());
+    let plane = plane(Arc::new(FixtureCalls), sim.clone(), signer.clone(), readings());
+    run_one(&plane).await;
+
+    let simulated = sim.seen.lock().unwrap()[0].2;
+    let signed = signer.seen.lock().unwrap()[0].2;
+    assert_eq!((simulated, signed), (CHOSEN, CHOSEN));
 }
 
 /// `onlyExecutor` gates `startV2`, so a simulation as anyone but the lane that

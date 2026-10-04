@@ -315,6 +315,7 @@ impl Simulator for AlwaysSucceeds {
         c: &Candidate,
         _call: &apex_exec::call::ExecutorCall,
         _from: Address,
+        _gas_limit: GasLimit,
     ) -> Result<SimulationResult, Decline> {
         let mut r = SimulationResult {
             tier: SimulationTier::Tier2FullEvm,
@@ -365,11 +366,12 @@ impl Simulator for ParkingSimulator {
         c: &Candidate,
         call: &apex_exec::call::ExecutorCall,
         from: Address,
+        gas_limit: GasLimit,
     ) -> Result<SimulationResult, Decline> {
         if self.first.swap(false, Ordering::SeqCst) {
             self.release.notified().await;
         }
-        AlwaysSucceeds.simulate(c, call, from).await
+        AlwaysSucceeds.simulate(c, call, from, gas_limit).await
     }
 }
 
@@ -475,11 +477,20 @@ pub struct FakeChain {
     pub landed: bool,
     pub observed: AtomicU64,
     pub reconciled: AtomicU64,
+    /// The gas limit it schedules with, when not the candidate's own.
+    pub chooses: Option<GasLimit>,
 }
 
 impl FakeChain {
     pub fn landing() -> Self {
-        Self { landed: true, observed: AtomicU64::new(0), reconciled: AtomicU64::new(0) }
+        Self { landed: true, observed: AtomicU64::new(0), reconciled: AtomicU64::new(0), chooses: None }
+    }
+
+    /// Schedules every candidate at `limit`, so a test can tell the limit the
+    /// chain chose from the one the candidate carries.
+    pub fn choosing(mut self, limit: GasLimit) -> Self {
+        self.chooses = Some(limit);
+        self
     }
 }
 
@@ -515,7 +526,7 @@ impl ChainExecutionAdapter for FakeChain {
     fn optimize_submission_cost(&self, c: &Candidate, _now: UnixNanos) -> SubmissionDecision {
         SubmissionDecision::Submit {
             lane: SubmissionLaneId(1),
-            gas_limit: c.total_execution_cost.gas_limit,
+            gas_limit: self.chooses.unwrap_or(c.total_execution_cost.gas_limit),
             earliest_eligible_flashblock: Some(0),
             max_fee_per_gas_wei: 2_000_000,
             max_priority_fee_per_gas_wei: 100_000,

@@ -14,6 +14,7 @@ pub mod calls;
 pub mod costs;
 pub mod feed;
 pub mod frontier;
+pub mod gas;
 pub mod inventory;
 pub mod pricing;
 pub mod reader;

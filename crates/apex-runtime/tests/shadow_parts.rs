@@ -60,8 +60,6 @@ policy:
   report_every_s: 300
   l1_every_blocks: 30
 costs:
-  success_gas: 534100
-  gas_limit: 800000
   gas_on_failure: 411945
   failure_ppm: 50000
 capacity:

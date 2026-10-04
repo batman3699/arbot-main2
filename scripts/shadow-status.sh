@@ -75,7 +75,10 @@ else:
     print(f"  reads       view {rf['view']}, twap {rf['twap']}, l1 {rf['l1']} failures")
     print(f"  feed        {fd['sessions']} sessions ({max(fd['sessions'] - 1, 0)} reconnects), {fd['dropped']} dropped, lossless {fd['fast_lane_lossless']}")
     print(f"  capacity    {cap['samples']} samples, {cap['blocks_held']} blocks held, largest window {cap['largest_window']:,} gas")
-    print(f"  costs       base fee {c['base_fee_wei'] / 1e9:.4f} gwei, two-hop route {c['route_cost_wei'] / 1e18:.8f} ETH")
+    if "route_other_wei" in c:
+        print(f"  costs       base fee {c['base_fee_wei'] / 1e9:.4f} gwei; per route {c['route_other_wei'] / 1e18:.8f} ETH (L1 fee, failure) + its own gas")
+    else:  # a report from before R12, when every route was one figure
+        print(f"  costs       base fee {c['base_fee_wei'] / 1e9:.4f} gwei, two-hop route {c['route_cost_wei'] / 1e18:.8f} ETH")
     print(f"  settlement  asked {r['settlement_asked']} (should stay 0); misses written {r['misses_written']}")
 
 try:

@@ -17,6 +17,7 @@ use apex_exec::commitment::{plan_commitment, PlanV2};
 use apex_exec::sign::SignedPlan;
 use apex_runtime::live::sim::{classify, read_simulation, revert, LiveSimulator};
 use apex_runtime::plane::{Decline, Simulator};
+use apex_types::cost::GasLimit;
 use apex_types::ids::ChainId;
 use apex_types::sim::{RevertClass, SimulationTier};
 use apex_types::time::DurationNanos;
@@ -242,8 +243,8 @@ fn call_to(to: Address) -> ExecutorCall {
 }
 
 /// **One block, one call, as the lane that will sign it**, to the committed
-/// executor, with the candidate's gas limit, transfers traced and validation
-/// off — and what comes back is read, not trusted.
+/// executor, with the gas limit it will be signed with, transfers traced and
+/// validation off — and what comes back is read, not trusted.
 #[tokio::test]
 async fn the_simulator_asks_one_call_as_the_lane_with_the_gas_limit() {
     let f = fixture();
@@ -253,7 +254,9 @@ async fn the_simulator_asks_one_call_as_the_lane_with_the_gas_limit() {
     let lane = address!("70997970C51812dC3A010C7d01b50e0d17dc79C8");
     let c = support::candidate(1, 100, 1);
     let call = call_to(exe);
-    let r = sim.simulate(&c, &call, lane).await.expect("simulated");
+    // Not the candidate's: the limit the plane chose, which the signer gets.
+    let signed = GasLimit(c.total_execution_cost.gas_limit.0 + 123_457);
+    let r = sim.simulate(&c, &call, lane, signed).await.expect("simulated");
     assert!(r.success);
 
     let asked = rpc.asked.lock().unwrap();
@@ -263,7 +266,7 @@ async fn the_simulator_asks_one_call_as_the_lane_with_the_gas_limit() {
     assert_eq!(one["from"].as_str().unwrap().parse::<Address>().unwrap(), lane);
     assert_eq!(one["to"].as_str().unwrap().parse::<Address>().unwrap(), exe);
     assert_eq!(one["data"], json!(format!("0x{}", hex::encode(call.data()))));
-    assert_eq!(one["gas"], json!(format!("{:#x}", c.total_execution_cost.gas_limit.0)));
+    assert_eq!(one["gas"], json!(format!("{:#x}", signed.0)));
     assert_eq!((params[0]["traceTransfers"].clone(), params[0]["validation"].clone(), params[1].clone()), (json!(true), json!(false), json!("latest")));
 }
 
@@ -278,7 +281,10 @@ async fn a_simulation_that_cannot_run_fails_without_a_class() {
         Ok(json!([{ "number": "0x1", "hash": format!("0x{}", "11".repeat(32)), "parentHash": format!("0x{}", "22".repeat(32)), "calls": [] }])),
     ] {
         let sim = LiveSimulator::new(Arc::new(Recording { answer, asked: Mutex::new(vec![]) }), BASE);
-        let err = sim.simulate(&c, &call_to(Address::repeat_byte(1)), Address::repeat_byte(2)).await.unwrap_err();
+        let err = sim
+            .simulate(&c, &call_to(Address::repeat_byte(1)), Address::repeat_byte(2), c.total_execution_cost.gas_limit)
+            .await
+            .unwrap_err();
         assert_eq!(err, Decline::SimulationFailed { class: None });
     }
 }

@@ -95,6 +95,14 @@ impl Ord for Surplus {
     }
 }
 
+/// What one pricing of a route says at one size: what it returns, and what
+/// executing it at that size costs — both in input-token units.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Priced {
+    pub output: U256,
+    pub cost: U256,
+}
+
 /// A closed route, priced at whatever size it is asked about.
 pub trait SizedRoute {
     /// What the route returns for `amount_in`, in the SAME token. `None` when
@@ -112,6 +120,19 @@ pub trait SizedRoute {
     /// The largest input the route can absorb, from the thinnest hop's real
     /// holdings.
     fn max_input(&self) -> U256;
+
+    /// What the route returns for `amount_in` and what executing it at that
+    /// size costs: one pricing, both answers. **Every search sizes against
+    /// this**, never against `fixed_cost` alone.
+    ///
+    /// The default charges `fixed_cost` at every size. A route whose cost grows
+    /// with its size overrides it — a concentrated-liquidity hop pays gas for
+    /// every initialized tick it crosses, so a larger trade costs more to
+    /// settle — and a search that charged the fixed part alone would size past
+    /// the point where the next unit of input pays for the gas it adds.
+    fn priced(&self, amount_in: U256) -> Option<Priced> {
+        Some(Priced { output: self.output(amount_in)?, cost: self.fixed_cost() })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,11 +210,17 @@ impl apex_types::miss::ExplainsMiss for NoSize {
 
 /// Find the input that maximises net profit, or say why there is none.
 ///
-/// `net(x) = output(x) - x - fixed_cost` is concave — a concave function minus
-/// a linear one — so it is unimodal and a ternary search finds the maximum
-/// without evaluating every size. The search is over integers and narrows to a
-/// handful of candidates, which are then scanned exactly; ternary search alone
-/// can be off by one on a lattice.
+/// `net(x) = output(x) - x - cost(x)`, with each size's cost from
+/// [`SizedRoute::priced`]. Under a fixed cost it is concave — a concave
+/// function minus a linear one — so it is unimodal and a ternary search finds
+/// the maximum without evaluating every size. The search is over integers and
+/// narrows to a handful of candidates, which are then scanned exactly; ternary
+/// search alone can be off by one on a lattice.
+///
+/// A cost that steps up with the size (gas, per tick crossed) leaves `net`
+/// concave between its steps and small steps across them, so the search may
+/// stop near the best size rather than on it. What it reports is still exact:
+/// a size, and the net that size earns at its own cost.
 pub fn best_size<R: SizedRoute + ?Sized>(
     route: &R,
     budget: SearchBudget,
@@ -211,11 +238,11 @@ pub fn best_size<R: SizedRoute + ?Sized>(
             return None;
         }
         evaluations += 1;
-        let out = route.output(x)?;
-        let net = Surplus::of(out, x.saturating_add(route.fixed_cost()));
+        let priced = route.priced(x)?;
+        let net = Surplus::of(priced.output, x.saturating_add(priced.cost));
         let candidate = SizedOpportunity {
             amount_in: x,
-            output: out,
+            output: priced.output,
             net,
         };
         if best.is_none_or(|b| candidate.net > b.net) {

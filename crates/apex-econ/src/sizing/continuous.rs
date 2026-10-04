@@ -66,9 +66,10 @@ impl Default for ContinuousBudget {
 
 /// Golden-section search for the net-profit maximiser.
 ///
-/// Net profit is concave — a concave output minus a linear cost — so it is
-/// unimodal and golden-section converges without needing a derivative, which
-/// matters because the objective is an AMM quote rather than a formula.
+/// Net profit is concave under a fixed cost — a concave output minus a linear
+/// cost — so it is unimodal and golden-section converges without needing a
+/// derivative, which matters because the objective is an AMM quote rather than
+/// a formula.
 ///
 /// `None` when the route cannot be priced anywhere in range. Note that this
 /// says nothing about profitability: an unprofitable route still has a
@@ -93,8 +94,9 @@ pub fn optimize<R: SizedRoute + ?Sized>(
             return None;
         }
         evaluations += 1;
-        let out = route.output(amount)?;
-        Some(u256_to_f64(out) - x - u256_to_f64(route.fixed_cost()))
+        // Each size at its own cost: gas grows with the ticks a size crosses.
+        let priced = route.priced(amount)?;
+        Some(u256_to_f64(priced.output) - x - u256_to_f64(priced.cost))
     };
 
     // 1 / phi.

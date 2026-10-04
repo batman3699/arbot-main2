@@ -39,7 +39,7 @@ pub mod nothing_sent;
 pub mod reload;
 
 use crate::bus::{EventBus, Lane, Subscription as BusSubscription};
-use crate::econ::{ChainCosts, FlashTerms, LiveEconomics, ScenarioPriors};
+use crate::econ::{ChainCosts, FlashTerms, LiveEconomics, RouteCosts, ScenarioPriors};
 use crate::live::abi::{self, selector};
 use crate::live::adapter::LiveAdapter;
 use crate::live::admission::{self, LiveCommitments};
@@ -48,6 +48,7 @@ use crate::live::calls::{self, LiveCallBuilder};
 use crate::live::costs::{self, Costs};
 use crate::live::feed::{Effect, FeedHandler, BURN, MINT, PANCAKE_SWAP, SWAP};
 use crate::live::frontier::{self, BALANCER_FLASH, BALANCER_VAULT, WETH};
+use crate::live::gas;
 use crate::live::inventory::{self, PoolSpec, UniverseFilter, Venue};
 use crate::live::pricing::LivePricer;
 use crate::live::reader::{ChainReader, ReaderConfig};
@@ -81,7 +82,7 @@ use apex_risk::posture::PostureLadder;
 use apex_search::engine_c::FiniteSizeEngine;
 use apex_search::engine_d::EventEngine;
 use apex_state::Versioned;
-use apex_types::cost::{GasLimit, GasUsed};
+use apex_types::cost::GasUsed;
 use apex_types::flash::CallbackConstraints;
 use apex_types::ids::{ChainId, SignerLaneId, StrategyId, SubmissionLaneId, TokenId};
 use apex_types::state::ReconstructionStatus;
@@ -371,8 +372,6 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         l1: costs::read_l1(&reads, head).await.map_err(|e| boot_err("the L1 fee oracle", e))?,
         l1_model: L1FeeModel::unvalidated(),
         failure: FailureProfile { gas_on_failure: GasUsed(c.gas_on_failure), failure_ppm: c.failure_ppm },
-        success_gas: GasUsed(c.success_gas),
-        gas_limit: GasLimit(c.gas_limit),
     };
 
     // The lender: Balancer's vault, fee-free on Base, repaid by transfer and
@@ -394,7 +393,10 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         callback: CallbackConstraints { repay_by_transfer: true, reentrancy_permitted: false, max_callback_gas: u64::MAX },
     };
 
-    let pricer = Arc::new(LivePricer::new(Arc::clone(&book), cycles.clone(), 0));
+    // Built before the economics it serves, so it starts at costs no route
+    // clears; `Costs::new` aligns it with the economics' before anything prices.
+    let unpriced = RouteCosts { other_wei: u128::MAX, wei_per_gas: u128::MAX };
+    let pricer = Arc::new(LivePricer::new(Arc::clone(&book), cycles.clone(), unpriced, gas::MEASURED));
     let econ = Arc::new(
         LiveEconomics::new(pricer.clone(), ScenarioPriors::default(), chain_costs, StrategyId(1)).with_flash(terms),
     );
@@ -481,7 +483,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         cycles = search.resident(),
         admitted = commitments.admitted(),
         reconciled,
-        route_cost_wei = costs.route_cost_wei(),
+        route_other_wei = costs.route_costs().other_wei,
         lender_weth = holding,
         "shadow booted"
     );
@@ -751,7 +753,7 @@ impl Shadow {
                 twap: get(&self.stats.twap_failures),
                 l1: get(&self.stats.l1_failures),
             },
-            costs: CostReport { base_fee_wei: get(&self.stats.base_fee_wei), route_cost_wei: self.costs.route_cost_wei() },
+            costs: CostReport { base_fee_wei: get(&self.stats.base_fee_wei), route_other_wei: self.costs.route_costs().other_wei },
             capacity: CapacityReport {
                 samples: get(&self.stats.capacity_samples),
                 flashblocks_seen: get(&self.stats.flashblocks_seen),
@@ -868,7 +870,9 @@ pub struct ReadFailures {
 #[derive(Clone, Debug, Serialize)]
 pub struct CostReport {
     pub base_fee_wei: u64,
-    pub route_cost_wei: u128,
+    /// What a two-hop route costs besides its gas: the L1 data fee and the
+    /// failure branch. Its gas is its own, at its size.
+    pub route_other_wei: u128,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -16,10 +16,12 @@ use apex_econ::cost::failure::FailureProfile;
 use apex_econ::cost::l1_data::{L1FeeModel, L1FeeParameters};
 use apex_econ::ev::scenario::{PriorSource, ScenarioKind};
 use apex_math::finite_size::SizedRoute;
-use apex_runtime::econ::{ChainCosts, Evaluated, FlashTerms, LiveEconomics, RouteCurves, ScenarioPriors};
+use apex_runtime::econ::{
+    ChainCosts, Evaluated, FlashTerms, GasEstimate, LiveEconomics, RouteCurves, ScenarioPriors, SettledRoute,
+};
 use apex_runtime::plane::{Decline, Economics, Refinement};
 use apex_search::frontier::{ProposalOrigin, RouteProposal};
-use apex_types::cost::{GasLimit, GasUsed};
+use apex_types::cost::GasUsed;
 use apex_types::ids::StrategyId;
 use apex_types::route::{CertificateStatus, ComplexityCost, RouteCommitment, RouteHop};
 use apex_types::sim::SimulationTier;
@@ -35,6 +37,8 @@ struct RoundTrip {
     spread_bps: u64,
     fee_bps: u64,
     fixed_cost: u64,
+    /// Gas its settlement adds for each whole WETH of size, as crossings do.
+    gas_per_weth: u64,
 }
 
 impl RoundTrip {
@@ -61,6 +65,15 @@ impl SizedRoute for RoundTrip {
     }
 }
 
+/// 240,000 gas, plus `gas_per_weth` for each whole WETH; at most 1.3 times that.
+impl SettledRoute for RoundTrip {
+    fn gas_at(&self, amount_in: EthersU256) -> Option<GasEstimate> {
+        let weth = (amount_in / EthersU256::exp10(18)).as_u64();
+        let expected = 240_000 + self.gas_per_weth * weth;
+        Some(GasEstimate { expected: GasUsed(expected), ceiling: GasUsed(expected * 13 / 10) })
+    }
+}
+
 struct Curves {
     route: Option<RoundTrip>,
 }
@@ -69,7 +82,7 @@ impl RouteCurves for Curves {
     fn evaluate(
         &self,
         _p: &RouteProposal,
-        f: &mut dyn FnMut(&dyn SizedRoute) -> Result<Evaluated, Decline>,
+        f: &mut dyn FnMut(&dyn SettledRoute) -> Result<Evaluated, Decline>,
     ) -> Result<Evaluated, Decline> {
         match &self.route {
             Some(r) => f(r),
@@ -93,12 +106,14 @@ fn chain_costs(model: L1FeeModel) -> ChainCosts {
         },
         l1_model: model,
         failure: FailureProfile { gas_on_failure: GasUsed(90_000), failure_ppm: 50_000 },
-        success_gas: GasUsed(240_000),
-        gas_limit: GasLimit(400_000),
     }
 }
 
 fn econ_over(spread_bps: u64, model: L1FeeModel) -> LiveEconomics {
+    econ_with_gas(spread_bps, model, 0)
+}
+
+fn econ_with_gas(spread_bps: u64, model: L1FeeModel, gas_per_weth: u64) -> LiveEconomics {
     LiveEconomics::new(
         Arc::new(Curves {
             route: Some(RoundTrip {
@@ -106,6 +121,7 @@ fn econ_over(spread_bps: u64, model: L1FeeModel) -> LiveEconomics {
                 spread_bps,
                 fee_bps: 30,
                 fixed_cost: GAS,
+                gas_per_weth,
             }),
         }),
         ScenarioPriors::default(),
@@ -336,14 +352,14 @@ fn an_estimated_l1_fee_is_not_authoritative() {
 /// indifferent to route length would make a 4-hop route look as cheap as a
 /// 2-hop one — and the census found deeper routes strictly worse.
 /// **A cost refresh prices the next route.** A higher base fee costs more gas
-/// and a new oracle reading a different L1 fee; what the chain does not say —
-/// the settlement's gas, its limit — is kept.
+/// and a new oracle reading a different L1 fee; the settlement's gas is the
+/// route's, so its distribution and its limit are unchanged.
 #[tokio::test]
 async fn a_cost_refresh_prices_the_next_route() {
     let econ = econ_over(200, L1FeeModel::unvalidated());
     let p = proposal(2);
     let before = econ.refresh_costs(&p).await.expect("costs");
-    let route_before = econ.route_cost_wei(2);
+    let route_before = econ.route_costs(2);
 
     let mut costs = econ.costs();
     costs.gas_price_wei *= AlloyU256::from(10u64);
@@ -355,7 +371,68 @@ async fn a_cost_refresh_prices_the_next_route() {
     assert!(after.l1_data_fee > before.l1_data_fee, "{} vs {}", after.l1_data_fee, before.l1_data_fee);
     assert_eq!(after.gas_used_distribution, before.gas_used_distribution);
     assert_eq!(after.gas_limit, before.gas_limit);
-    assert!(econ.route_cost_wei(2) > route_before);
+    let route_after = econ.route_costs(2);
+    assert!(route_after.other_wei > route_before.other_wei, "the L1 fee doubled");
+    assert_eq!(route_after.wei_per_gas, route_before.wei_per_gas * 10);
+}
+
+/// **A candidate's gas is its route's, at the size it trades.** p50 is the
+/// expected figure the EV prices, p99 the ceiling, and the limit — the one the
+/// simulation runs at and the transaction is signed with — the ceiling plus
+/// §21.3's headroom, by the adapter's own formula. A larger trade crosses more
+/// ticks, so a route whose gas grows with size gets a larger limit.
+#[tokio::test]
+async fn a_candidates_gas_is_its_routes_at_the_size_it_trades() {
+    let econ = econ_with_gas(200, L1FeeModel::unvalidated(), 30_000);
+    let p = proposal(2);
+    let size = econ.size(&p).await.expect("sizable");
+    let costs = econ.refresh_costs(&p).await.expect("costs");
+
+    let weth = (size.get() / AlloyU256::from(10u64).pow(AlloyU256::from(18u64))).to::<u64>();
+    assert!(weth >= 1, "the size is under a WETH: the test proves nothing");
+    let expected = 240_000 + 30_000 * weth;
+    let d = &costs.gas_used_distribution;
+    assert_eq!((d.p50.0, d.p99.0), (expected, expected * 13 / 10));
+    assert_eq!(costs.gas_limit, apex_chain::base::adapter::gas_limit_over(d.p99));
+    assert_eq!(d.max_observed.0, costs.gas_limit.0);
+    assert_eq!(costs.l2_execution_fee, u128::from(expected) * 6_000_000);
+
+    // The same route, its gas fixed: a smaller limit for the same size.
+    let flat = econ_over(200, L1FeeModel::unvalidated()).refresh_costs(&p).await.expect("costs");
+    assert!(flat.gas_limit.0 < costs.gas_limit.0);
+}
+
+/// **The robustness margin is priced at the route's own gas.** `scenarios`
+/// adds the cost back to the net the sizing found and spreads it over the
+/// scenario set; a margin priced at any other gas than the candidate carries
+/// would describe a different trade. Here the same curve, settling with more
+/// gas, has a different margin.
+#[tokio::test]
+async fn the_margin_is_priced_at_the_routes_own_gas() {
+    let p = proposal(2);
+    let light = econ_with_gas(200, L1FeeModel::unvalidated(), 0).scenarios(&p).await.expect("scenarios");
+    let heavy = econ_with_gas(200, L1FeeModel::unvalidated(), 30_000).scenarios(&p).await.expect("scenarios");
+    assert_ne!(light, heavy);
+}
+
+/// **The pricer and the economics charge one cost.** What `route_costs` hands a
+/// pricer, charged a settlement's expected gas, is the total the economics
+/// subtracts from the gross: a search that sized against anything else would
+/// propose routes the economics refuses.
+#[tokio::test]
+async fn the_pricer_and_the_economics_charge_one_cost() {
+    let econ = econ_with_gas(200, L1FeeModel::unvalidated(), 30_000);
+    let p = proposal(2);
+    let costs = econ.refresh_costs(&p).await.expect("costs");
+    let total = costs.l2_execution_fee
+        + costs.l1_data_fee
+        + costs.priority_fee
+        + costs.builder_payment
+        + costs.sequencer_payment
+        + costs.flash_fee
+        + costs.dex_fees
+        + costs.expected_failure_cost;
+    assert_eq!(econ.route_costs(2).with_gas(costs.gas_used_distribution.p50), total);
 }
 
 #[tokio::test]

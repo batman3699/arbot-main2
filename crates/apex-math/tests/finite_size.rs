@@ -2,7 +2,7 @@
 
 use apex_math::engine::{CpmmEngine, CpmmState, ExactPricingEngine, Order};
 use apex_math::finite_size::{
-    best_size, is_profitable_at, marginal_gross_bps, NoSize, SearchBudget, SizedRoute, Surplus,
+    best_size, is_profitable_at, marginal_gross_bps, NoSize, Priced, SearchBudget, SizedRoute, Surplus,
 };
 use ethers_core::types::{Address, U256};
 use proptest::prelude::*;
@@ -205,6 +205,72 @@ fn engine_c_reports_a_size_not_just_a_verdict() {
                 found.amount_in
             );
         }
+    }
+}
+
+/// A cycle whose execution cost steps up with its size, as gas does with each
+/// initialized tick a concentrated-liquidity hop crosses: `per_step` more for
+/// every `step` of input.
+struct SteppedCost {
+    inner: TwoVenueCycle,
+    step: U256,
+    per_step: U256,
+}
+
+impl SizedRoute for SteppedCost {
+    fn output(&self, amount_in: U256) -> Option<U256> {
+        self.inner.output(amount_in)
+    }
+    fn fixed_cost(&self) -> U256 {
+        self.inner.fixed_cost()
+    }
+    fn max_input(&self) -> U256 {
+        self.inner.max_input()
+    }
+    fn priced(&self, amount_in: U256) -> Option<Priced> {
+        Some(Priced {
+            output: self.output(amount_in)?,
+            cost: self.fixed_cost() + amount_in / self.step * self.per_step,
+        })
+    }
+}
+
+/// **The search charges each size what that size costs.** A larger trade
+/// crosses more ticks and pays more gas, so a search that charged the fixed
+/// part alone would size past the point where the next unit of input pays for
+/// the gas it adds — and report a net the trade does not earn.
+#[test]
+fn the_search_charges_each_size_what_it_costs() {
+    let unstepped = best_size(&cycle(200, 30, GAS), SearchBudget::default()).expect("profitable");
+    let route = SteppedCost {
+        inner: cycle(200, 30, GAS),
+        // A tenth of a basis point of the input per 0.1 WETH: small beside the
+        // 140 bps the spread leaves, large enough to move the optimum.
+        step: U256::from(100_000_000_000_000_000u128),
+        per_step: U256::from(100_000_000_000_000u128),
+    };
+    let found = best_size(&route, SearchBudget::default()).expect("still profitable");
+
+    // The net reported is the one the size earns at its own cost.
+    let at = route.priced(found.amount_in).unwrap();
+    assert_eq!(found.output, at.output);
+    assert_eq!(found.net, Surplus::Gain(at.output - found.amount_in - at.cost));
+    // And the search stopped sooner, because each step of size cost more.
+    assert!(
+        found.amount_in < unstepped.amount_in,
+        "sized {} against a growing cost, {} against a fixed one",
+        found.amount_in,
+        unstepped.amount_in
+    );
+}
+
+/// Without an override a route costs its fixed cost at every size — the
+/// behaviour every route had before costs could grow.
+#[test]
+fn a_route_without_an_override_costs_its_fixed_cost_at_every_size() {
+    let c = cycle(200, 30, GAS);
+    for x in [PROBE(), U256::from(5_000_000_000_000_000_000u128)] {
+        assert_eq!(c.priced(x), Some(Priced { output: c.output(x).unwrap(), cost: U256::from(GAS) }));
     }
 }
 

@@ -5,7 +5,7 @@ use apex_chain::adapter::{
     Ack, AdapterError, AdapterResult, ChainExecutionAdapter, PendingState, RejectReason,
     ReplacementPolicy, SignedPayload, StateFeedHandle, SubmissionDecision,
 };
-use apex_chain::base::adapter::{BaseAdapter, BaseRpc, FLASHBLOCK};
+use apex_chain::base::adapter::{gas_limit_over, BaseAdapter, BaseRpc, FLASHBLOCK};
 use apex_chain::base::flashblock::{FlashblockObservation, MeasuredCapacityModel};
 use apex_chain::regime::{
     FeeModel, NotDiscovered, OrderingMode, PriorityFeeSemantics, RegimeDiscovery, ReplacementRules,
@@ -273,6 +273,8 @@ fn the_safe_gas_limit_covers_the_tail() {
     assert!(safe.0 > c.total_execution_cost.gas_used_distribution.p99.0);
     assert!(safe.0 > c.total_execution_cost.gas_used_distribution.p50.0 * 2 / 2);
     assert_eq!(safe.0, 300_000 + 36_000, "12% headroom over p99");
+    // One formula: the economics prices a candidate's limit with the same one.
+    assert_eq!(safe, gas_limit_over(GasUsed(300_000)));
 }
 
 /// A smaller gas limit can mean an earlier flashblock (INV-37). That is the

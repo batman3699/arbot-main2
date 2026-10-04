@@ -50,11 +50,31 @@ use apex_math::finite_size::{SizedRoute, Surplus};
 use apex_search::frontier::RouteProposal;
 use apex_types::candidate::{Candidate, DiscreteSize};
 use apex_types::compat::{u256_to_alloy, u256_to_ethers};
-use apex_types::cost::{GasDistribution, GasLimit, GasUsed, TotalExecutionCost};
+use apex_types::cost::{GasDistribution, GasUsed, TotalExecutionCost};
 use apex_types::ids::CandidateId;
 use apex_types::route::CertificateStatus;
 use apex_types::sim::SimulationTier;
 use ethers_core::types::U256 as EthersU256;
+
+/// What settling a route at one size uses in gas: the **expected** figure,
+/// which the EV prices (§23.1's p50), and the **ceiling**, the most it can
+/// use, which the gas limit is built from (the p99 §21.3's headroom goes on).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GasEstimate {
+    pub expected: GasUsed,
+    pub ceiling: GasUsed,
+}
+
+/// A route's curve, and the gas settling it at a size uses.
+///
+/// Separate from `SizedRoute` because gas is the settlement's, not the curve's:
+/// `apex-math` sizes a curve against a cost in the input token, and only the
+/// executor's gas — which grows with every initialized tick a hop crosses —
+/// says what limit the transaction needs.
+pub trait SettledRoute: SizedRoute {
+    /// `None` where the route cannot be priced at this size.
+    fn gas_at(&self, amount_in: EthersU256) -> Option<GasEstimate>;
+}
 
 /// Prices a proposal's route as a finite-size curve, against live venue state.
 ///
@@ -71,7 +91,7 @@ pub trait RouteCurves: Send + Sync {
     fn evaluate(
         &self,
         p: &RouteProposal,
-        f: &mut dyn FnMut(&dyn SizedRoute) -> Result<Evaluated, Decline>,
+        f: &mut dyn FnMut(&dyn SettledRoute) -> Result<Evaluated, Decline>,
     ) -> Result<Evaluated, Decline>;
 }
 
@@ -83,6 +103,27 @@ pub struct Evaluated {
     pub output: EthersU256,
     pub net: Surplus,
     pub evaluations: u32,
+    /// The settlement's gas at `amount`: what the candidate's cost and limit
+    /// are built from.
+    pub gas: GasEstimate,
+}
+
+/// What a route costs besides its gas, and what each unit of gas costs: the
+/// two figures a pricer charges each size with (`SizedRoute::priced`), in wei.
+/// From [`LiveEconomics::route_costs`], so a search sizes against exactly what
+/// the economics will charge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RouteCosts {
+    /// Everything but the gas: the L1 data fee and the failure branch.
+    pub other_wei: u128,
+    pub wei_per_gas: u128,
+}
+
+impl RouteCosts {
+    /// What a settlement using `gas` costs.
+    pub fn with_gas(self, gas: GasUsed) -> u128 {
+        self.other_wei.saturating_add(self.wei_per_gas.saturating_mul(u128::from(gas.0)))
+    }
 }
 
 /// §14.1's pessimistic fixed priors, and the gross-to-scenario mapping.
@@ -201,11 +242,9 @@ pub struct ChainCosts {
     /// because of that, and `an_estimated_l1_fee_is_not_authoritative` is the
     /// test.
     pub l1_model: L1FeeModel,
+    /// How a settlement fails, and what failing costs. The gas a success
+    /// uses is not here: it is the route's, at its size (`SettledRoute`).
     pub failure: FailureProfile,
-    /// The gas a successful settlement of this shape uses. §12.1's `GasClass` is
-    /// a bucket for ranking; this is the number the cost model prices against.
-    pub success_gas: GasUsed,
-    pub gas_limit: GasLimit,
 }
 
 /// A lender's terms, read from the chain: what `assemble` quotes a route that
@@ -301,7 +340,7 @@ impl LiveEconomics {
             amount,
             // Fee-free lenders only: see `FlashTerms`.
             premium: AlloyU256::ZERO,
-            // Inside `ChainCosts::success_gas`, which is the whole settlement's,
+            // Inside the settlement's gas, which is the whole transaction's,
             // loan included — zero here rather than counted twice.
             gas_overhead: 0,
             callback_constraints: t.callback,
@@ -342,6 +381,8 @@ impl LiveEconomics {
                     output: found.output,
                     net: found.net,
                     evaluations: found.evaluations + start.evaluations(),
+                    // At the size found: a larger trade crosses more ticks.
+                    gas: route.gas_at(found.amount).ok_or(Decline::SimulationFailed { class: None })?,
                 }),
                 // Priced at every size and profitable at none. **The 96% bucket**,
                 // and `LowEv` is what it is — the route priced fine and does not
@@ -352,8 +393,8 @@ impl LiveEconomics {
         })
     }
 
-    /// §23's total, for a route of this shape.
-    fn total_cost(&self, calldata_bytes: u32) -> TotalExecutionCost {
+    /// §23's total, for a route of this shape settling with `gas`.
+    fn total_cost(&self, calldata_bytes: u32, gas: GasEstimate) -> TotalExecutionCost {
         // Read once: every figure below is at the same prices.
         let costs = self.costs();
         let fee = l1_fee_at(&costs, calldata_bytes);
@@ -363,8 +404,10 @@ impl LiveEconomics {
             u256_to_ethers(costs.gas_price_wei),
             fee.wei,
         );
-        let l2 = AlloyU256::from(costs.success_gas.0)
-            .saturating_mul(costs.gas_price_wei);
+        let l2 = AlloyU256::from(gas.expected.0).saturating_mul(costs.gas_price_wei);
+        // The limit the simulation runs at and the transaction is signed with:
+        // the ceiling and §21.3's headroom, by the adapter's own formula.
+        let limit = apex_chain::base::adapter::gas_limit_over(gas.ceiling);
 
         TotalExecutionCost {
             l2_execution_fee: to_u128(l2),
@@ -380,30 +423,34 @@ impl LiveEconomics {
             expected_failure_cost: to_u128(u256_to_alloy(failure)),
             calldata_bytes,
             compressed_data_estimate: calldata_bytes,
-            gas_limit: costs.gas_limit,
+            gas_limit: limit,
             // §23.1 requires a distribution: the risk gate prices at p99 while
-            // the EV uses p50, and a single number cannot serve both. The spread
-            // is a shape rather than a measurement, which is why the venue's
-            // `GasProfile::measured` is false and why the candidate is
-            // `Heuristic`.
+            // the EV uses p50, and a single number cannot serve both. p50 is the
+            // measured mean and p99 the ceiling, which no measured settlement
+            // exceeded (`live::gas`); p90 between them is a shape, not a
+            // measurement.
             gas_used_distribution: GasDistribution {
-                p50: costs.success_gas,
-                p90: GasUsed(costs.success_gas.0.saturating_mul(11) / 10),
-                p99: GasUsed(costs.success_gas.0.saturating_mul(13) / 10),
-                max_observed: GasUsed(costs.gas_limit.0),
+                p50: gas.expected,
+                p90: GasUsed(gas.expected.0.saturating_add(gas.ceiling.0.saturating_sub(gas.expected.0) / 2)),
+                p99: gas.ceiling,
+                max_observed: GasUsed(limit.0),
             },
         }
     }
 
-    /// Everything a route of `hops` hops costs, in wei: the figure `assemble`
-    /// subtracts from the gross.
+    /// What a route of `hops` hops costs besides its gas, and the price of gas:
+    /// the figures `assemble` charges, apart from the route's own gas.
     ///
-    /// Exposed so a pricer's `SizedRoute::fixed_cost` is **the same number**. A
-    /// search that sized routes against one cost while the economics charged
-    /// another would propose routes the economics then refuses, and miss ones it
-    /// would have taken.
-    pub fn route_cost_wei(&self, hops: usize) -> u128 {
-        u128::try_from(cost_i128(&self.total_cost(calldata_for_hops(hops)))).unwrap_or(u128::MAX)
+    /// Exposed so a pricer charges each size **the same number** the economics
+    /// will. A search that sized routes against one cost while the economics
+    /// charged another would propose routes the economics then refuses, and
+    /// miss ones it would have taken.
+    pub fn route_costs(&self, hops: usize) -> RouteCosts {
+        let none = GasEstimate { expected: GasUsed(0), ceiling: GasUsed(0) };
+        RouteCosts {
+            other_wei: u128::try_from(cost_i128(&self.total_cost(calldata_for_hops(hops), none))).unwrap_or(u128::MAX),
+            wei_per_gas: to_u128(self.costs().gas_price_wei),
+        }
     }
 
     /// The Fjord fee, with its provenance attached.
@@ -444,10 +491,9 @@ impl Economics for LiveEconomics {
     /// profit is.
     async fn scenarios(&self, p: &RouteProposal) -> Result<f64, Decline> {
         let e = self.evaluate(p)?;
-        let gross = surplus_to_i128(e.net).saturating_add(cost_i128(&self.total_cost(
-            calldata_estimate(p),
-        )));
-        let set = self.priors.scenario_set(gross, cost_i128(&self.total_cost(calldata_estimate(p))));
+        let cost = cost_i128(&self.total_cost(calldata_estimate(p), e.gas));
+        let gross = surplus_to_i128(e.net).saturating_add(cost);
+        let set = self.priors.scenario_set(gross, cost);
         let ev = scenario_ev(&set, EthersU256::zero())
             .map_err(|e| Decline::Uncommittable { detail: format!("scenario set: {e:?}") })?;
         if gross <= 0 {
@@ -457,8 +503,11 @@ impl Economics for LiveEconomics {
         Ok((ev as f64 / gross as f64).clamp(0.0, 1.0))
     }
 
+    /// The costs at the size this route trades: its gas grows with the ticks
+    /// that size crosses, so pricing them means sizing it.
     async fn refresh_costs(&self, p: &RouteProposal) -> Result<TotalExecutionCost, Decline> {
-        Ok(self.total_cost(calldata_estimate(p)))
+        let e = self.evaluate(p)?;
+        Ok(self.total_cost(calldata_estimate(p), e.gas))
     }
 
     fn assemble(&self, p: &RouteProposal, r: Refinement) -> Result<Candidate, Decline> {

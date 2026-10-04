@@ -118,12 +118,12 @@ pub struct Policy {
     pub l1_every_blocks: u64,
 }
 
-/// What a settlement costs that the chain does not say.
+/// How a settlement fails, and what failing costs: what the chain does not
+/// say. What a success uses is each route's own gas at its size, measured per
+/// venue (`live::gas::MEASURED`), and its limit is built from that.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CostConfig {
-    pub success_gas: u64,
-    pub gas_limit: u64,
     pub gas_on_failure: u64,
     pub failure_ppm: u32,
 }

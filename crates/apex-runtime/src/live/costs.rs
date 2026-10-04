@@ -15,8 +15,10 @@
 //! (`plane::fee_caps`), so the base fee is what a transaction pays per gas. The
 //! L1 parameters come from `GasPriceOracle`, the predeploy the chain computes
 //! the fee with — and only while it says Fjord, the formula `apex-econ` holds.
+//! How much gas a settlement uses is not read here: it is each route's, at its
+//! size (`live::gas`).
 
-use crate::econ::{ChainCosts, LiveEconomics};
+use crate::econ::{ChainCosts, LiveEconomics, RouteCosts};
 use crate::live::abi::{self, selector};
 use crate::live::pricing::LivePricer;
 use crate::live::reads::{ChainReads, ReadError};
@@ -72,23 +74,23 @@ pub struct Costs {
 
 impl Costs {
     /// Aligns the pricer with the economics at once: whatever it was built
-    /// with, it sizes against the economics' cost from here on.
+    /// with, it sizes against the economics' costs from here on.
     pub fn new(econ: Arc<LiveEconomics>, pricer: Arc<LivePricer>) -> Self {
-        pricer.set_fixed_cost_wei(econ.route_cost_wei(HOPS));
+        pricer.set_costs(econ.route_costs(HOPS));
         Self { econ, pricer }
     }
 
     /// Price every later route at `base_fee_wei` and `l1`. What the chain does
-    /// not say — the settlement's gas, its limit, how it fails — is kept.
+    /// not say — how a settlement fails — is kept.
     pub fn set(&self, base_fee_wei: u128, l1: L1FeeParameters) -> ChainCosts {
         let costs = ChainCosts { gas_price_wei: U256::from(base_fee_wei), l1, ..self.econ.costs() };
         self.econ.set_costs(costs);
-        self.pricer.set_fixed_cost_wei(self.econ.route_cost_wei(HOPS));
+        self.pricer.set_costs(self.econ.route_costs(HOPS));
         costs
     }
 
-    /// What a two-hop route costs now, in wei.
-    pub fn route_cost_wei(&self) -> u128 {
-        self.econ.route_cost_wei(HOPS)
+    /// What a two-hop route costs now besides its gas, and the price of gas.
+    pub fn route_costs(&self) -> RouteCosts {
+        self.econ.route_costs(HOPS)
     }
 }

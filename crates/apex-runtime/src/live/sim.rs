@@ -46,6 +46,7 @@ use alloy_primitives::{b256, hex, keccak256, Address, B256};
 use apex_chain::rpc::RpcTransport;
 use apex_exec::call::ExecutorCall;
 use apex_types::candidate::Candidate;
+use apex_types::cost::GasLimit;
 use apex_types::ids::{ChainId, TokenId};
 use apex_types::sim::{RevertClass, SimulationResult, SimulationTier};
 use apex_types::state::StateFingerprint;
@@ -228,14 +229,15 @@ impl LiveSimulator {
 #[async_trait::async_trait]
 impl Simulator for LiveSimulator {
     /// One block, one call: from the signing lane, to the committed executor,
-    /// with the candidate's gas limit — a call that needs more fails here as it
-    /// would on chain. `validation: false`: nonce and balance are last-mile's to
-    /// check; this answers what the call does.
+    /// with the gas limit it will be signed with — a call that needs more fails
+    /// here as it would on chain. `validation: false`: nonce and balance are
+    /// last-mile's to check; this answers what the call does.
     async fn simulate(
         &self,
-        c: &Candidate,
+        _c: &Candidate,
         call: &ExecutorCall,
         from: Address,
+        gas_limit: GasLimit,
     ) -> Result<SimulationResult, Decline> {
         let started = std::time::Instant::now();
         let params = json!([{
@@ -243,7 +245,7 @@ impl Simulator for LiveSimulator {
                 "from": from,
                 "to": call.to(),
                 "data": format!("0x{}", hex::encode(call.data())),
-                "gas": format!("{:#x}", c.total_execution_cost.gas_limit.0),
+                "gas": format!("{:#x}", gas_limit.0),
             }]}],
             "traceTransfers": true,
             "validation": false,
