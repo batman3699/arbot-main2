@@ -539,19 +539,43 @@ impl Shadow {
 
         let (task, mut rx) = feed.spawn(stopped);
         let mut handler = FeedHandler::new(ChainId::BASE);
-        while let Some(n) = rx.recv().await {
+        loop {
+            // A burst of swaps is held until the feed has been quiet for
+            // `BURST_QUIET`, then applied and published as one state (R17).
+            // `timeout` polls the receiver before its timer, so a notification
+            // already waiting joins the burst rather than being split from it.
+            let next = match handler.quiet_deadline() {
+                Some(deadline) => {
+                    let wait = Duration::from_nanos(deadline.0.saturating_sub(SystemClock.now().0));
+                    match tokio::time::timeout(wait, rx.recv()).await {
+                        Ok(n) => n,
+                        Err(_) => {
+                            self.apply(bus, handler.flush(&self.book));
+                            continue;
+                        }
+                    }
+                }
+                None => rx.recv().await,
+            };
+            let Some(n) = next else { break };
             if let Notification::Head(h) = &n {
                 self.heads.send_replace(Some(h.clone()));
             }
-            for effect in handler.handle(&self.book, n, SystemClock.now()) {
-                match effect {
-                    Effect::Event(e) => bus.publish(*e),
-                    Effect::Reload(pools) => self.reloads.request(pools),
-                    Effect::FullReload => self.reloads.request_full(),
-                }
+            self.apply(bus, handler.handle(&self.book, n, SystemClock.now()));
+        }
+        // The feed is gone; what it held still happened.
+        self.apply(bus, handler.flush(&self.book));
+        let _ = task.await;
+    }
+
+    fn apply(&self, bus: &EventBus, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::Event(e) => bus.publish(*e),
+                Effect::Reload(pools) => self.reloads.request(pools),
+                Effect::FullReload => self.reloads.request_full(),
             }
         }
-        let _ = task.await;
     }
 
     /// Events into the plane, while the book can be priced from.

@@ -51,7 +51,7 @@ else:
     print(f"capture assurance: {'%.4f' % ca if ca is not None else 'undefined -- no ticket authorized yet'}")
     print()
     print("funnel")
-    print(f"  events                      {f['events']:>10}")
+    print(f"  events                      {f['events']:>10}   (one per flashblock's swaps, applied at once)")
     print(f"  skipped, book rebuilding    {f['skipped_unverified']:>10}")
     print(f"  skipped by Engine D         {s['skipped']:>10}   (below the $5k floor, or no template)")
     print(f"  priced, no profitable size  {s['declined']:>10}   (Engine C)")

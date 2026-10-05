@@ -194,6 +194,16 @@ pub enum SwapApplied {
     Unknown,
 }
 
+/// One `Swap` log's post-swap state, as [`PoolBook::apply_swaps`] writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwapWrite {
+    pub pool: Address,
+    pub sqrt_price_x96: U256,
+    pub liquidity: u128,
+    pub tick: i32,
+    pub at: LogPosition,
+}
+
 pub struct PoolBook {
     pools: Versioned<BTreeMap<Address, Arc<PoolSnapshot>>>,
     writer: Mutex<WriterState>,
@@ -718,28 +728,45 @@ impl PoolBook {
         tick: i32,
         at: LogPosition,
     ) -> SwapApplied {
+        self.apply_swaps(&[SwapWrite { pool, sqrt_price_x96, liquidity, tick, at }])[0]
+    }
+
+    /// Apply several `Swap` logs, in order, as **one** write: a reader sees the
+    /// book before all of them or after all of them, never between two.
+    ///
+    /// A flashblock is published whole, so the state between two of its
+    /// transactions is one no trade can ever land in — and a pricer that read
+    /// it there would price a gap that never existed (R17: the first two
+    /// routes ever to pay were exactly that). Each swap is judged newer or not
+    /// against the pools as the swaps before it in `swaps` left them.
+    pub fn apply_swaps(&self, swaps: &[SwapWrite]) -> Vec<SwapApplied> {
         self.write(|map, w, status| {
-            let Some(old) = map.get(&pool) else { return (SwapApplied::Unknown, status) };
-            let newer = match old.last_log {
-                Some(last) => at > last,
-                None => at.0 > old.block,
-            };
-            if !newer {
-                return (SwapApplied::Stale, status);
-            }
-            let mut next = (**old).clone();
-            next.state.sqrt_price_x96 = u256_to_ethers(sqrt_price_x96);
-            next.state.liquidity = liquidity;
-            next.state.tick = tick;
-            next.block = at.0;
-            next.last_log = Some(at);
-            // The swap moved the tick, and on Slipstream the fee with it.
-            next.fee_from_tick();
-            next.seq = w.seq;
-            let covered = next.ladder_covers_price();
-            map.insert(pool, Arc::new(next));
-            (if covered { SwapApplied::Updated } else { SwapApplied::NeedsReload }, status)
+            let applied = swaps.iter().map(|s| Self::swap_into(map, w.seq, s)).collect();
+            (applied, status)
         })
+    }
+
+    fn swap_into(map: &mut BTreeMap<Address, Arc<PoolSnapshot>>, seq: u64, s: &SwapWrite) -> SwapApplied {
+        let Some(old) = map.get(&s.pool) else { return SwapApplied::Unknown };
+        let newer = match old.last_log {
+            Some(last) => s.at > last,
+            None => s.at.0 > old.block,
+        };
+        if !newer {
+            return SwapApplied::Stale;
+        }
+        let mut next = (**old).clone();
+        next.state.sqrt_price_x96 = u256_to_ethers(s.sqrt_price_x96);
+        next.state.liquidity = s.liquidity;
+        next.state.tick = s.tick;
+        next.block = s.at.0;
+        next.last_log = Some(s.at);
+        // The swap moved the tick, and on Slipstream the fee with it.
+        next.fee_from_tick();
+        next.seq = seq;
+        let covered = next.ladder_covers_price();
+        map.insert(s.pool, Arc::new(next));
+        if covered { SwapApplied::Updated } else { SwapApplied::NeedsReload }
     }
 
     /// A feed gap: everything may have missed updates. `Rebuilding` until a

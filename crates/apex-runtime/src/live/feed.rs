@@ -4,13 +4,36 @@
 //!
 //! | Notification | Book | Plane |
 //! |---|---|---|
-//! | `Swap`, newer than the pool's last log | post-swap state applied exactly | a `PendingSwap` event on the fast lane |
+//! | `Swap` | held until its burst is over (below) | nothing yet |
+//! | a burst's swaps, each newer than its pool's last log | post-swap states applied exactly, **in one write** | one `PendingSwap` on the fast lane, naming every pool they moved |
 //! | `Swap`, not newer | nothing — it is the confirmed copy of a preconfirmed swap already applied | nothing |
-//! | `Swap` that leaves the ladder | applied, pool reloaded | nothing until reloaded: it cannot be priced |
+//! | `Swap` that leaves the ladder | applied, pool reloaded | that pool left out until reloaded: it cannot be priced |
 //! | `Mint` / `Burn` | pool reloaded — a range's liquidity changed | nothing |
 //! | a removed log (reorg) | pool reloaded — what was applied may not have happened | nothing |
-//! | `Reconnected` / `Gap` | whole book `Rebuilding`, then reloaded | nothing — state is unknown until rebuilt |
+//! | `Reconnected` / `Gap` | what is held applied, whole book `Rebuilding`, then reloaded | nothing — state is unknown until rebuilt |
 //! | `Head` | the latest sealed block, for the next fingerprint | nothing |
+//!
+//! # A flashblock is one state (R17)
+//!
+//! Base publishes a flashblock whole: every transaction in it is sequenced
+//! before anyone outside the builder sees any of it. BlockPI's `pendingLogs`
+//! then sends its logs **one notification at a time**. Applying and publishing
+//! each as it came let a pricer read the book between two transactions of one
+//! flashblock — a state no trade can ever land in. The first two routes ever to
+//! pay were exactly that (2026-10-05, block 52,184,616: a swap into one pool
+//! priced before the same flashblock's swap into the other, +0.35 bps between
+//! them, −3 bps either side), and about half of all preconfirmed swaps are
+//! followed by another of the same flashblock within 12 ms.
+//!
+//! So swaps are held until the feed has been quiet for [`BURST_QUIET`], then
+//! applied in one write and published as one event: a pricer sees the book
+//! before the flashblock or after it. A swap from a later block than a held
+//! preconfirmed one ends the burst at once — that block began after the
+//! burst's flashblock was published. A confirmed copy, which trails by
+//! 0.5–2 s and lands in the middle of later bursts, is held with them: it is
+//! from an older block, almost always already applied, and never dates a
+//! burst. Merging two flashblocks costs one real state priced; splitting one
+//! prices a state that never existed, so every tie goes to holding.
 //!
 //! # A preconfirmed swap and its confirmed copy are one swap
 //!
@@ -20,7 +43,7 @@
 //! both feeds: the book refuses the second copy as not newer, and the event both
 //! would produce has one `Ordinal`, which the plane's redelivery check catches.
 
-use crate::live::book::{PoolBook, SwapApplied};
+use crate::live::book::{PoolBook, SwapApplied, SwapWrite};
 use crate::live::abi;
 use crate::live::inventory::Venue;
 use alloy_primitives::{b256, keccak256, Address, B256, U256};
@@ -31,6 +54,17 @@ use apex_types::ids::{ChainId, PoolId};
 use apex_types::state::StateFingerprint;
 use apex_types::time::UnixNanos;
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+/// How long the feed must be quiet before the swaps it is holding are one
+/// state.
+///
+/// Measured against BlockPI 2026-10-05 (90 s, 306 preconfirmed swaps on 49 WETH
+/// pools): consecutive logs of one flashblock arrived 0.08 ms apart at the
+/// median and 11.1 ms apart at most; the next flashblock ~206 ms later. Twenty
+/// milliseconds is about twice the widest gap inside a flashblock and a tenth
+/// of the gap between two.
+pub const BURST_QUIET: Duration = Duration::from_millis(20);
 
 /// `Swap(address,address,int256,int256,uint160,uint128,int24)` — Uniswap v3 and
 /// Slipstream share it.
@@ -182,16 +216,19 @@ pub enum Effect {
 }
 
 /// The pure half of the feed task: notifications in, book writes and effects
-/// out. The async half — receiving, publishing, reloading — is the caller's, so
+/// out. The async half — receiving, publishing, reloading, and calling
+/// [`Self::flush`] once [`Self::quiet_deadline`] passes — is the caller's, so
 /// this can be driven exactly by a test.
 pub struct FeedHandler {
     chain: ChainId,
     last_head: Option<Head>,
+    /// The burst still arriving, in arrival order, each swap with when it came.
+    held: Vec<(SwapLog, UnixNanos)>,
 }
 
 impl FeedHandler {
     pub const fn new(chain: ChainId) -> Self {
-        Self { chain, last_head: None }
+        Self { chain, last_head: None, held: Vec::new() }
     }
 
     pub const fn last_head(&self) -> Option<&Head> {
@@ -205,6 +242,11 @@ impl FeedHandler {
                 Vec::new()
             }
             Notification::Reconnected { .. } | Notification::Gap { .. } => {
+                // What is held happened, so the book takes it; nothing is
+                // published, because no state across a gap is priced until the
+                // book has been read again.
+                let held = std::mem::take(&mut self.held);
+                Self::apply(book, &held);
                 book.mark_rebuilding();
                 vec![Effect::FullReload]
             }
@@ -214,57 +256,144 @@ impl FeedHandler {
             Notification::Log(l) if l.removed => vec![Effect::Reload(vec![l.address])],
             Notification::Log(l) => match l.topics.first() {
                 Some(t) if *t == MINT || *t == BURN => vec![Effect::Reload(vec![l.address])],
-                Some(t) if *t == SWAP || *t == PANCAKE_SWAP => self.swap(book, &l, now),
+                Some(t) if *t == SWAP || *t == PANCAKE_SWAP => self.hold(book, &l, now),
                 _ => Vec::new(),
             },
         }
     }
 
-    fn swap(&self, book: &PoolBook, l: &RawLog, now: UnixNanos) -> Vec<Effect> {
-        let Some(s) = decode_swap(l) else { return Vec::new() };
-        match book.apply_swap(s.pool, s.sqrt_price_x96, s.liquidity, s.tick, (s.block, s.log_index)) {
-            SwapApplied::Updated => {}
-            SwapApplied::NeedsReload => return vec![Effect::Reload(vec![s.pool])],
-            SwapApplied::Stale | SwapApplied::Unknown => return Vec::new(),
-        }
-        let Some(pool) = book.get(s.pool) else { return Vec::new() };
-        let notional =
-            notional_usd(&s, (pool.spec.token0, pool.spec.token1), pool.decimals, &usd_prices(book));
+    /// Whether swaps are held, waiting for their burst to end.
+    pub fn holding(&self) -> bool {
+        !self.held.is_empty()
+    }
 
-        // Identify the change itself, so two different swaps can never share a
-        // fingerprint however their other fields line up.
-        let mut delta = Vec::with_capacity(32 + 8 + 20);
-        delta.extend_from_slice(s.tx.as_slice());
-        delta.extend_from_slice(&s.log_index.to_be_bytes());
-        delta.extend_from_slice(s.pool.as_slice());
+    /// When the burst being held is over unless another swap arrives:
+    /// [`BURST_QUIET`] after the latest one.
+    pub fn quiet_deadline(&self) -> Option<UnixNanos> {
+        let quiet = u64::try_from(BURST_QUIET.as_nanos()).unwrap_or(u64::MAX);
+        self.held.last().map(|(_, at)| UnixNanos(at.0.saturating_add(quiet)))
+    }
+
+    fn hold(&mut self, book: &PoolBook, l: &RawLog, now: UnixNanos) -> Vec<Effect> {
+        let Some(s) = decode_swap(l) else { return Vec::new() };
+        // A swap from a later block than a held preconfirmed one: that block
+        // began after the held flashblock was published, so the burst is over.
+        // Only a preconfirmed swap dates the burst — a held confirmed copy is
+        // from an older block, and would end it at the next swap of its own.
+        let later = self.held.iter().any(|(h, _)| h.pending && h.block < s.block);
+        let effects = if later { self.flush(book) } else { Vec::new() };
+        self.held.push((s, now));
+        effects
+    }
+
+    /// The burst is over: apply every held swap in one write, and publish one
+    /// event for the state they leave.
+    ///
+    /// The event names each pool the burst moved and can be priced — a pool
+    /// whose last swap left its ladder is reloaded instead, and one a later swap
+    /// brought back is priceable. It covers every swap applied to those pools,
+    /// carries the last one's ordinal, the state it describes being the one
+    /// after that swap, and the largest one's notional: a burst is as large as
+    /// its largest swap, and one that cannot be sized makes the burst
+    /// unmeasured, which Engine D admits.
+    pub fn flush(&mut self, book: &PoolBook) -> Vec<Effect> {
+        let held = std::mem::take(&mut self.held);
+        let Some(&(_, observed_at)) = held.last() else { return Vec::new() };
+        let results = Self::apply(book, &held);
+
+        // Each pool's last word, and every pool that left its ladder on the way.
+        let mut last: BTreeMap<Address, SwapApplied> = BTreeMap::new();
+        let mut reload: Vec<Address> = Vec::new();
+        for ((s, _), r) in held.iter().zip(&results) {
+            if matches!(r, SwapApplied::Updated | SwapApplied::NeedsReload) {
+                last.insert(s.pool, *r);
+            }
+            if *r == SwapApplied::NeedsReload {
+                reload.push(s.pool);
+            }
+        }
+        let moved: Vec<&SwapLog> = held
+            .iter()
+            .zip(&results)
+            .filter(|((s, _), r)| {
+                matches!(r, SwapApplied::Updated | SwapApplied::NeedsReload)
+                    && last.get(&s.pool) == Some(&SwapApplied::Updated)
+            })
+            .map(|((s, _), _)| s)
+            .collect();
+
+        let mut effects = Vec::new();
+        if !reload.is_empty() {
+            effects.push(Effect::Reload(reload));
+        }
+        if let Some(e) = self.event(book, &moved, observed_at) {
+            effects.push(Effect::Event(Box::new(e)));
+        }
+        effects
+    }
+
+    fn apply(book: &PoolBook, held: &[(SwapLog, UnixNanos)]) -> Vec<SwapApplied> {
+        let writes: Vec<SwapWrite> = held
+            .iter()
+            .map(|(s, _)| SwapWrite {
+                pool: s.pool,
+                sqrt_price_x96: s.sqrt_price_x96,
+                liquidity: s.liquidity,
+                tick: s.tick,
+                at: (s.block, s.log_index),
+            })
+            .collect();
+        book.apply_swaps(&writes)
+    }
+
+    fn event(&self, book: &PoolBook, moved: &[&SwapLog], observed_at: UnixNanos) -> Option<StateEvent> {
+        let last = *moved.last()?;
+        let prices = usd_prices(book);
+        let mut pools: Vec<Address> = Vec::new();
+        let mut notional = Some(0.0f64);
+        // Identify the change itself, so two different bursts can never share
+        // a fingerprint however their other fields line up.
+        let mut delta = Vec::with_capacity(moved.len() * (32 + 8 + 20));
+        for s in moved {
+            if !pools.contains(&s.pool) {
+                pools.push(s.pool);
+            }
+            let size = book
+                .get(s.pool)
+                .and_then(|p| notional_usd(s, (p.spec.token0, p.spec.token1), p.decimals, &prices));
+            notional = notional.zip(size).map(|(a, b)| a.max(b));
+            delta.extend_from_slice(s.tx.as_slice());
+            delta.extend_from_slice(&s.log_index.to_be_bytes());
+            delta.extend_from_slice(s.pool.as_slice());
+        }
 
         let head = self.last_head.as_ref();
         let fingerprint = StateFingerprint {
             chain_id: self.chain,
             parent_block_hash: head.map_or(B256::ZERO, |h| h.hash),
-            confirmed_block_number: head.map_or(s.block.saturating_sub(1), |h| h.number),
-            preconf_sequence: s.pending.then_some(s.block),
+            confirmed_block_number: head.map_or(last.block.saturating_sub(1), |h| h.number),
+            preconf_sequence: last.pending.then_some(last.block),
             flashblock_index: None,
             state_root_or_equivalent: None,
             block_hash_if_available: None,
             state_delta_hash: keccak256(&delta),
-            venue_state_version: book.versions_for(&[s.pool]),
+            venue_state_version: book.versions_for(&pools),
             external_dependency_fingerprint: None,
         };
-        vec![Effect::Event(Box::new(StateEvent {
+        Some(StateEvent {
             chain: self.chain,
             // Both copies of one swap get this ordinal, so the plane sees the
             // second as a redelivery. `flashblock_index` is 0 because the provider
             // does not say which flashblock carried it — the ordering within a
             // block is the log index, which it does say.
-            at: Ordinal { block: s.block, flashblock_index: 0, tx_index: 0, log_index: s.log_index, payload_id: 0 },
-            observed_at: now,
+            at: Ordinal { block: last.block, flashblock_index: 0, tx_index: 0, log_index: last.log_index, payload_id: 0 },
+            observed_at,
             fingerprint,
             kind: EventKind::PendingSwap {
-                target: s.tx,
-                pools: vec![PoolId { chain: self.chain, address: s.pool }],
+                target: last.tx,
+                pools: pools.iter().map(|a| PoolId { chain: self.chain, address: *a }).collect(),
                 notional_usd: notional,
             },
-        }))]
+        })
     }
 }

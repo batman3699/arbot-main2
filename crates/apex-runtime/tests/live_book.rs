@@ -9,7 +9,7 @@
 use alloy_primitives::{address, hex, keccak256, Address, U256};
 use apex_chain::rpc::{RpcError, RpcTransport};
 use apex_runtime::live::abi::{self, selector, MULTICALL3};
-use apex_runtime::live::book::{DynamicFee, PoolBook, ReloadError, SwapApplied, Unloadable};
+use apex_runtime::live::book::{DynamicFee, PoolBook, ReloadError, SwapApplied, SwapWrite, Unloadable};
 use apex_runtime::live::inventory::{self, PoolSpec, UniverseFilter, Venue};
 use apex_runtime::live::reads::ChainReads;
 use apex_types::state::ReconstructionStatus;
@@ -415,6 +415,39 @@ async fn a_snapshot_is_stable_while_swaps_land() {
     book.apply_swap(WETH_USDC, U256::from(1u64) << 96, 42, -197_346, (101, 0));
     assert_eq!(before[&WETH_USDC].state.tick, TICK as i32, "the held snapshot moved");
     assert_eq!(book.get(WETH_USDC).unwrap().state.tick, -197_346);
+}
+
+/// **R17: a burst of swaps is one write.** A reader sees the book before all of
+/// them or after all of them, and each is judged newer or not against the
+/// swaps before it in the burst.
+#[tokio::test]
+async fn a_burst_of_swaps_is_one_write() {
+    const OTHER: Address = address!("b4cB800910B228ED3d0834cF79D697127BBB00e5");
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    healthy_at(&node, OTHER, Venue::UniswapV3.factory());
+    let other = PoolSpec { pool: OTHER, ..spec() };
+    let (book, refused) = PoolBook::load(&ChainReads::new(node), &[spec(), other], 100).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    let before = book.snapshot();
+    let price = U256::from(4_100_000_000_000_000_000_000_000u128);
+    let swap = |pool, tick, at| SwapWrite { pool, sqrt_price_x96: price, liquidity: 7, tick, at };
+
+    let applied = book.apply_swaps(&[
+        swap(WETH_USDC, -197_348, (101, 5)),
+        swap(OTHER, -197_349, (101, 6)),
+        swap(WETH_USDC, -197_352, (101, 8)),
+        // Older than the burst's own swap before it.
+        swap(WETH_USDC, -197_300, (101, 7)),
+    ]);
+    use SwapApplied::{Stale, Updated};
+    assert_eq!(applied, vec![Updated, Updated, Updated, Stale]);
+    let (a, b) = (book.get(WETH_USDC).unwrap(), book.get(OTHER).unwrap());
+    assert_eq!((a.state.tick, b.state.tick), (-197_352, -197_349));
+    assert_eq!(a.seq, b.seq, "one write");
+    assert!(a.seq > before[&WETH_USDC].seq);
+    assert_eq!(before[&WETH_USDC].state.tick, TICK as i32, "a held snapshot saw none of it");
+    assert_eq!(before[&OTHER].state.tick, TICK as i32);
 }
 
 /// A feed gap makes the book `Rebuilding`; only a full reload makes it

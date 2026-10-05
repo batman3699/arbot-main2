@@ -18,6 +18,7 @@ use apex_types::ids::ChainId;
 use apex_types::state::ReconstructionStatus;
 use apex_types::time::UnixNanos;
 use ethers_core::types::U256 as EU256;
+use std::time::Duration;
 
 const BASE: ChainId = ChainId(8453);
 const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
@@ -93,6 +94,13 @@ fn event_of(effects: &[Effect]) -> &apex_state::feed::event::StateEvent {
     }
 }
 
+/// One notification, and then the quiet that ends its burst.
+fn settle(h: &mut FeedHandler, book: &PoolBook, n: Notification) -> Vec<Effect> {
+    let mut effects = h.handle(book, n, NOW);
+    effects.extend(h.flush(book));
+    effects
+}
+
 #[test]
 fn a_swap_decodes_its_post_swap_state() {
     let s = feed::decode_swap(&swap(-197_360, 101, 7, true, 5 * 10i128.pow(18), 13_450_000_000)).unwrap();
@@ -109,14 +117,17 @@ fn a_swap_decodes_its_post_swap_state() {
     assert!(feed::decode_swap(&unordered).is_none());
 }
 
-/// **The capture path's event.** A preconfirmed swap is applied to the book and
-/// becomes one `PendingSwap` on the pool it moved, sized in USD from the USDC
-/// side, at the swap's own ordinal.
+/// **The capture path's event.** A preconfirmed swap is held until its burst
+/// is over, then applied to the book and published as one `PendingSwap` on the
+/// pool it moved, sized in USD from the USDC side, at the swap's own ordinal.
 #[test]
 fn a_new_swap_moves_the_book_and_becomes_an_event() {
     let book = book();
     let mut h = FeedHandler::new(BASE);
-    let effects = h.handle(&book, Notification::Log(swap(-197_360, 101, 7, true, 5 * 10i128.pow(18), 13_450_000_000)), NOW);
+    let held = h.handle(&book, Notification::Log(swap(-197_360, 101, 7, true, 5 * 10i128.pow(18), 13_450_000_000)), NOW);
+    assert!(held.is_empty(), "{held:?}");
+    assert_eq!(book.get(POOL).unwrap().state.tick, TICK, "held, not applied");
+    let effects = h.flush(&book);
     let e = event_of(&effects);
 
     assert_eq!(book.get(POOL).unwrap().state.tick, -197_360, "the book moved");
@@ -139,14 +150,14 @@ fn a_new_swap_moves_the_book_and_becomes_an_event() {
 fn the_confirmed_copy_of_an_applied_swap_is_not_a_second_event() {
     let book = book();
     let mut h = FeedHandler::new(BASE);
-    let pending = h.handle(&book, Notification::Log(swap(-197_360, 101, 7, true, 10i128.pow(18), 2_690_000_000)), NOW);
+    let pending = settle(&mut h, &book, Notification::Log(swap(-197_360, 101, 7, true, 10i128.pow(18), 2_690_000_000)));
     let first = event_of(&pending).at;
-    let confirmed = h.handle(&book, Notification::Log(swap(-197_360, 101, 7, false, 10i128.pow(18), 2_690_000_000)), NOW);
+    let confirmed = settle(&mut h, &book, Notification::Log(swap(-197_360, 101, 7, false, 10i128.pow(18), 2_690_000_000)));
     assert!(confirmed.is_empty(), "{confirmed:?}");
 
     // An older swap arriving late is refused the same way: it would roll the
     // pool back.
-    assert!(h.handle(&book, Notification::Log(swap(-197_000, 101, 3, false, 1, 1)), NOW).is_empty());
+    assert!(settle(&mut h, &book, Notification::Log(swap(-197_000, 101, 3, false, 1, 1))).is_empty());
     assert_eq!(book.get(POOL).unwrap().state.tick, -197_360);
     assert_eq!(first.block, 101);
 }
@@ -157,7 +168,7 @@ fn the_confirmed_copy_of_an_applied_swap_is_not_a_second_event() {
 fn a_swap_off_the_ladder_reloads_and_publishes_nothing() {
     let book = book();
     let mut h = FeedHandler::new(BASE);
-    let effects = h.handle(&book, Notification::Log(swap(-150_000, 102, 0, true, 1, 1)), NOW);
+    let effects = settle(&mut h, &book, Notification::Log(swap(-150_000, 102, 0, true, 1, 1)));
     assert_eq!(effects, vec![Effect::Reload(vec![POOL])]);
 }
 
@@ -210,7 +221,7 @@ fn a_head_is_remembered_not_published() {
         gas_limit: 2,
     };
     assert!(h.handle(&book, Notification::Head(head.clone()), NOW).is_empty());
-    let effects = h.handle(&book, Notification::Log(swap(-197_360, 106, 0, true, 1, 1)), NOW);
+    let effects = settle(&mut h, &book, Notification::Log(swap(-197_360, 106, 0, true, 1, 1)));
     let e = event_of(&effects);
     assert_eq!(e.fingerprint.parent_block_hash, head.hash);
     assert_eq!(e.fingerprint.confirmed_block_number, 105);
@@ -226,14 +237,14 @@ fn prices_come_from_the_book() {
     assert!((2_600.0..2_800.0).contains(&weth), "WETH at {weth}");
 }
 
-/// Two different swaps never share a fingerprint, however their other fields
+/// Two different bursts never share a fingerprint, however their other fields
 /// line up — the delta hash identifies the change itself.
 #[test]
 fn different_swaps_have_different_fingerprints() {
     let book = book();
     let mut h = FeedHandler::new(BASE);
-    let a = h.handle(&book, Notification::Log(swap(-197_360, 110, 0, true, 1, 1)), NOW);
-    let b = h.handle(&book, Notification::Log(swap(-197_370, 110, 1, true, 1, 1)), NOW);
+    let a = settle(&mut h, &book, Notification::Log(swap(-197_360, 110, 0, true, 1, 1)));
+    let b = settle(&mut h, &book, Notification::Log(swap(-197_370, 110, 1, true, 1, 1)));
     assert_ne!(event_of(&a).fingerprint.hash(), event_of(&b).fingerprint.hash());
     let _ = U256::ZERO;
 }
@@ -256,7 +267,7 @@ fn a_log_of_the_wrong_shape_is_not_a_swap() {
 fn a_swap_first_seen_confirmed_is_not_marked_preconfirmed() {
     let book = book();
     let mut h = FeedHandler::new(BASE);
-    let effects = h.handle(&book, Notification::Log(swap(-197_360, 101, 7, false, 1, 1)), NOW);
+    let effects = settle(&mut h, &book, Notification::Log(swap(-197_360, 101, 7, false, 1, 1)));
     assert_eq!(event_of(&effects).fingerprint.preconf_sequence, None);
 }
 
@@ -357,8 +368,220 @@ fn a_pancakeswap_swap_moves_the_book_and_becomes_an_event() {
     snap.spec.venue = Venue::PancakeV3;
     snap.factory = Venue::PancakeV3.factory();
     let book = PoolBook::from_snapshots([snap], ReconstructionStatus::Verified);
-    let effects = FeedHandler::new(BASE).handle(&book, Notification::Log(cake_log()), NOW);
+    let effects = settle(&mut FeedHandler::new(BASE), &book, Notification::Log(cake_log()));
     let e = event_of(&effects);
     assert_eq!(book.get(CAKE_POOL).unwrap().state.tick, -197_400, "the book moved");
     assert_eq!((e.at.block, e.at.log_index), (52_109_364, 393));
+}
+
+// ------------------------------------------------- R17: a flashblock is one state
+
+const POOL2: Address = address!("b4cB800910B228ED3d0834cF79D697127BBB00e5");
+
+/// `POOL` and a second WETH/USDC pool, both at `TICK`.
+fn two_pools() -> PoolBook {
+    let one = (*book().get(POOL).unwrap()).clone();
+    let mut two = one.clone();
+    two.spec.pool = POOL2;
+    PoolBook::from_snapshots([one, two], ReconstructionStatus::Verified)
+}
+
+/// `l` as emitted by `pool`, in its own transaction.
+fn by(l: RawLog, pool: Address, tx: u8) -> RawLog {
+    RawLog { address: pool, transaction_hash: Some(B256::repeat_byte(tx)), ..l }
+}
+
+fn pools_of(e: &apex_state::feed::event::StateEvent) -> Vec<Address> {
+    match &e.kind {
+        EventKind::PendingSwap { pools, .. } => pools.iter().map(|p| p.address).collect(),
+        other => panic!("expected a PendingSwap, got {other:?}"),
+    }
+}
+
+fn notional_of(e: &apex_state::feed::event::StateEvent) -> Option<f64> {
+    match &e.kind {
+        EventKind::PendingSwap { notional_usd, .. } => *notional_usd,
+        other => panic!("expected a PendingSwap, got {other:?}"),
+    }
+}
+
+/// **A flashblock is one state.** Two swaps of one flashblock — the shape of
+/// block 52,184,616's, where a sale into one pool was priced before the same
+/// flashblock's sale into the other and a route paid between them that paid
+/// nowhere else — are held, so a pricer reading the book between them sees
+/// neither. The burst is then applied in one write and published as one event
+/// naming both pools, at the last swap's ordinal, as large as its largest swap.
+#[test]
+fn a_flashblock_is_one_state() {
+    let book = two_pools();
+    let mut h = FeedHandler::new(BASE);
+    let first = by(swap(-197_360, 101, 7, true, 5 * 10i128.pow(18), 13_450_000_000), POOL, 1);
+    let second = by(swap(-197_355, 101, 9, true, 10i128.pow(18), 2_690_000_000), POOL2, 2);
+
+    assert!(h.handle(&book, Notification::Log(first), NOW).is_empty());
+    assert_eq!(book.get(POOL).unwrap().state.tick, TICK, "a pricer between the two sees neither");
+    assert!(h.handle(&book, Notification::Log(second), NOW).is_empty());
+    assert_eq!(book.get(POOL2).unwrap().state.tick, TICK);
+    assert!(h.holding());
+
+    let effects = h.flush(&book);
+    let e = event_of(&effects);
+    let (a, b) = (book.get(POOL).unwrap(), book.get(POOL2).unwrap());
+    assert_eq!((a.state.tick, b.state.tick), (-197_360, -197_355));
+    assert_eq!(a.seq, b.seq, "applied in one write");
+    assert_eq!((e.at.block, e.at.log_index), (101, 9), "the state after the last swap");
+    assert_eq!(pools_of(e), vec![POOL, POOL2]);
+    match &e.kind {
+        EventKind::PendingSwap { target, .. } => assert_eq!(*target, B256::repeat_byte(2)),
+        other => panic!("expected a PendingSwap, got {other:?}"),
+    }
+    let n = notional_of(e).expect("both sides priced");
+    assert!((13_000.0..14_000.0).contains(&n), "the largest swap's notional, {n}");
+
+    assert!(!h.holding());
+    assert!(h.flush(&book).is_empty(), "a burst is published once");
+}
+
+/// A swap from a later block than a held preconfirmed one ends the burst at
+/// once: that block began after the burst's flashblock was published — and a
+/// confirmed one too, when the preconfirmed feed missed its copy.
+#[test]
+fn a_swap_from_a_later_block_ends_the_burst() {
+    for pending in [true, false] {
+        let book = two_pools();
+        let mut h = FeedHandler::new(BASE);
+        assert!(h.handle(&book, Notification::Log(swap(-197_360, 101, 7, true, 1, 1)), NOW).is_empty());
+        let effects = h.handle(&book, Notification::Log(by(swap(-197_355, 102, 0, pending, 1, 1), POOL2, 3)), NOW);
+        let e = event_of(&effects);
+        assert_eq!((e.at.block, e.at.log_index), (101, 7), "block 101's burst, published");
+        assert_eq!(book.get(POOL2).unwrap().state.tick, TICK, "block 102's swap held");
+        assert!(h.holding());
+    }
+}
+
+/// A confirmed copy never ends a burst: it trails by 0.5–2 s and lands in the
+/// middle of later bursts. Held with one, it is refused as not newer and is no
+/// part of the burst's event — not its size, and not its ordinal, which would
+/// be the copy's own earlier event's and be dropped as a redelivery.
+#[test]
+fn a_confirmed_log_does_not_end_a_burst() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    assert!(h.handle(&book, Notification::Log(swap(-197_360, 102, 3, true, 1, 1)), NOW).is_empty());
+    let late_copy = swap(-197_000, 101, 7, false, 5 * 10i128.pow(18), 13_450_000_000);
+    assert!(h.handle(&book, Notification::Log(late_copy), NOW).is_empty());
+    let effects = h.flush(&book);
+    let e = event_of(&effects);
+    assert_eq!((e.at.block, e.at.log_index), (102, 3));
+    assert!(notional_of(e).expect("priced") < 1.0, "the copy is not part of the burst");
+    assert_eq!(book.get(POOL).unwrap().state.tick, -197_360, "the older copy did not roll it back");
+
+    // Nor does it date the burst: the next swap of the same flashblock joins.
+    assert!(h.handle(&book, Notification::Log(swap(-197_361, 103, 1, true, 1, 1)), NOW).is_empty());
+    assert!(h.handle(&book, Notification::Log(swap(-197_360, 102, 3, false, 1, 1)), NOW).is_empty());
+    assert!(h.handle(&book, Notification::Log(swap(-197_362, 103, 2, true, 1, 1)), NOW).is_empty());
+    let effects = h.flush(&book);
+    assert_eq!((event_of(&effects).at.block, event_of(&effects).at.log_index), (103, 2));
+    assert_eq!(book.get(POOL).unwrap().state.tick, -197_362);
+}
+
+/// Neither a head nor a liquidity event ends a burst: neither moves a price
+/// the burst's event carries.
+#[test]
+fn heads_and_liquidity_events_do_not_end_a_burst() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    assert!(h.handle(&book, Notification::Log(swap(-197_360, 101, 7, true, 1, 1)), NOW).is_empty());
+    let head = Head { number: 100, hash: B256::repeat_byte(9), timestamp: 1, base_fee_per_gas: None, gas_used: 1, gas_limit: 2 };
+    assert!(h.handle(&book, Notification::Head(head), NOW).is_empty());
+    let mint = RawLog { topics: vec![MINT], ..swap(TICK, 101, 8, true, 1, 1) };
+    assert_eq!(h.handle(&book, Notification::Log(mint), NOW), vec![Effect::Reload(vec![POOL])]);
+    assert!(h.holding());
+    assert_eq!(event_of(&h.flush(&book)).at.log_index, 7);
+}
+
+/// A gap ends a burst without publishing it: what was held happened, so the
+/// book takes it, and nothing is priced until the book is read again.
+#[test]
+fn a_gap_applies_what_was_held_and_publishes_nothing() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    assert!(h.handle(&book, Notification::Log(swap(-197_360, 101, 7, true, 1, 1)), NOW).is_empty());
+    assert_eq!(h.handle(&book, Notification::Gap { dropped: 3 }, NOW), vec![Effect::FullReload]);
+    assert_eq!(book.get(POOL).unwrap().state.tick, -197_360);
+    assert_eq!(book.status(), ReconstructionStatus::Rebuilding);
+    assert!(!h.holding());
+    assert!(h.flush(&book).is_empty());
+}
+
+/// The burst is over `BURST_QUIET` after its latest swap — not its first, and
+/// not moved by anything that is not a swap.
+#[test]
+fn the_quiet_deadline_follows_the_latest_swap() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    let ms = |n: u64| UnixNanos(NOW.0 + n * 1_000_000);
+    assert_eq!(feed::BURST_QUIET, Duration::from_millis(20));
+    assert_eq!(h.quiet_deadline(), None);
+    h.handle(&book, Notification::Log(swap(-197_360, 101, 7, true, 1, 1)), ms(0));
+    assert_eq!(h.quiet_deadline(), Some(ms(20)));
+    let head = Head { number: 100, hash: B256::repeat_byte(9), timestamp: 1, base_fee_per_gas: None, gas_used: 1, gas_limit: 2 };
+    h.handle(&book, Notification::Head(head), ms(5));
+    assert_eq!(h.quiet_deadline(), Some(ms(20)));
+    h.handle(&book, Notification::Log(swap(-197_361, 101, 9, true, 1, 1)), ms(8));
+    assert_eq!(h.quiet_deadline(), Some(ms(28)));
+    let effects = h.flush(&book);
+    assert_eq!(event_of(&effects).observed_at, ms(8), "observed when its last swap arrived");
+    assert_eq!(h.quiet_deadline(), None);
+}
+
+/// A pool whose last swap in the burst left its ladder is reloaded and left out
+/// of the event; one a later swap brought back is in it, every swap applied to
+/// it covered.
+#[test]
+fn a_pool_off_its_ladder_is_reloaded_not_published() {
+    let book = two_pools();
+    let mut h = FeedHandler::new(BASE);
+    h.handle(&book, Notification::Log(swap(-150_000, 101, 1, true, 1, 1)), NOW);
+    h.handle(&book, Notification::Log(by(swap(-197_355, 101, 2, true, 1, 1), POOL2, 2)), NOW);
+    let effects = h.flush(&book);
+    assert_eq!(effects[0], Effect::Reload(vec![POOL]));
+    assert_eq!(pools_of(event_of(&effects[1..])), vec![POOL2]);
+
+    // Off, then back on: priceable again, and still re-read.
+    h.handle(&book, Notification::Log(swap(-150_000, 102, 1, true, 10i128.pow(18), 2_690_000_000)), NOW);
+    h.handle(&book, Notification::Log(swap(-197_365, 102, 2, true, 1, 1)), NOW);
+    let effects = h.flush(&book);
+    assert_eq!(effects[0], Effect::Reload(vec![POOL]));
+    let e = event_of(&effects[1..]);
+    assert_eq!(pools_of(e), vec![POOL]);
+    assert_eq!((e.at.block, e.at.log_index), (102, 2));
+    let n = notional_of(e).expect("priced");
+    assert!(n > 2_000.0, "the swap that left the ladder is part of the burst: {n}");
+
+    // On, then off: its last word is off the ladder, so nothing to price.
+    h.handle(&book, Notification::Log(swap(-197_366, 103, 0, true, 1, 1)), NOW);
+    h.handle(&book, Notification::Log(swap(-150_000, 103, 1, true, 1, 1)), NOW);
+    assert_eq!(h.flush(&book), vec![Effect::Reload(vec![POOL])]);
+}
+
+/// One swap that cannot be sized makes its burst unmeasured — which Engine D
+/// admits rather than skips.
+#[test]
+fn a_swap_that_cannot_be_sized_makes_the_burst_unmeasured() {
+    const X: Address = address!("1000000000000000000000000000000000000001");
+    const Y: Address = address!("1000000000000000000000000000000000000002");
+    const XY: Address = address!("3000000000000000000000000000000000000003");
+    let weth_usdc = (*book().get(POOL).unwrap()).clone();
+    let mut xy = weth_usdc.clone();
+    xy.spec.pool = XY;
+    (xy.spec.token0, xy.spec.token1) = (X, Y);
+    let book = PoolBook::from_snapshots([weth_usdc, xy], ReconstructionStatus::Verified);
+
+    let mut h = FeedHandler::new(BASE);
+    h.handle(&book, Notification::Log(swap(-197_360, 101, 1, true, 10i128.pow(18), 2_690_000_000)), NOW);
+    h.handle(&book, Notification::Log(by(swap(-197_355, 101, 2, true, 1, 1), XY, 2)), NOW);
+    let effects = h.flush(&book);
+    assert_eq!(pools_of(event_of(&effects)), vec![POOL, XY]);
+    assert_eq!(notional_of(event_of(&effects)), None);
 }
