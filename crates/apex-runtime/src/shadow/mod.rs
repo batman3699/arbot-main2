@@ -12,7 +12,7 @@
 //!
 //! | Task | Does | Why |
 //! |---|---|---|
-//! | feed | `newHeads`, `pendingLogs` and `logs` over the universe's pools → the book → `PendingSwap` events on the fast lane | R1, R3 |
+//! | feed | `newHeads`, `pendingLogs` and `logs` over the universe's pools → the book, a flashblock's swaps at once → one `PendingSwap` per flashblock on the fast lane | R1, R3, R17 |
 //! | capture | each event → `Plane::on_event`, **only while the book is `Verified`** (INV-08) | the run itself |
 //! | reload | one reload at a time, at the newest head, requests coalesced; a pool still off its ladder is asked for again next block; a full reload re-admits the universe and refreshes the admissions | R3, R9 |
 //! | heads | each head: the live reader's view, Slipstream's TWAPs, and the costs — the base fee each block, the L1 oracle every `l1_every_blocks` | R6, R8, R9 |
@@ -80,7 +80,6 @@ use apex_econ::cost::l1_data::{L1FeeModel, L1FeeParameters};
 use apex_econ::eligibility::EligibilityPolicy;
 use apex_risk::breaker::CircuitBreaker;
 use apex_risk::posture::PostureLadder;
-use apex_search::engine_c::FiniteSizeEngine;
 use apex_search::engine_d::EventEngine;
 use apex_state::Versioned;
 use apex_types::cost::GasUsed;
@@ -412,7 +411,8 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         ReconstructionStatus::Verified,
         pricer.clone(),
         EventEngine::measured(),
-        FiniteSizeEngine::measured(),
+        // Every template a flashblock touches: see `flashblock_engine`.
+        crate::search::flashblock_engine(cycles.len()),
     ));
 
     let (admitted, refused) = admission::admit_book(&book, base, head);

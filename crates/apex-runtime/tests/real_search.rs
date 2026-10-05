@@ -20,7 +20,7 @@ use apex_capture::signer::{ExecutorAuth, LaneConfig, SignerPool};
 use apex_capture::{InMemoryJournal, ManualClock, NullDispatcher};
 use apex_math::finite_size::{best_size, NoSize, SearchBudget, SizedOpportunity, SizedRoute};
 use apex_runtime::plane::{DispatchLane, Handled, Plane, Ports};
-use apex_runtime::search::FrontierSearch;
+use apex_runtime::search::{flashblock_engine, FrontierSearch};
 use apex_search::engine_c::{FiniteSizeEngine, TemplatePricer};
 use apex_search::engine_d::EventEngine;
 use apex_search::frontier::{
@@ -371,3 +371,40 @@ async fn a_saturated_pricing_budget_declines_rather_than_queues() {
     );
 }
 
+
+/// **R17: an event is a flashblock, and one can move several pools.** Engine C
+/// prices every template it touches. `measured()`'s eight per event was sized
+/// for an event naming one pool, and leaves the most expensive unpriced.
+#[tokio::test]
+async fn a_flashblock_that_moves_several_pools_prices_every_template_it_touches() {
+    // Four pools of one pair: twelve two-hop templates, each pool in six.
+    let pools = [0x31u8, 0x32, 0x33, 0x34];
+    let mut frontier = Frontier::new();
+    let mut id = 0;
+    for a in pools {
+        for b in pools.into_iter().filter(|b| *b != a) {
+            id += 1;
+            let mut t = template(id);
+            t.fee_variants[0].pool = p(a);
+            t.fee_variants[1].pool = p(b);
+            frontier.insert(t).expect("a consistent template");
+        }
+    }
+    // No route prices, so every template looked at is refused.
+    let pricer = Arc::new(Pricer { routes: BTreeMap::new() });
+
+    for (engine, unpriced) in [(flashblock_engine(12), 0), (FiniteSizeEngine::measured(), 4)] {
+        let search = Arc::new(FrontierSearch::new(
+            frontier.clone(),
+            ReconstructionStatus::Unsafe,
+            pricer.clone(),
+            EventEngine::measured(),
+            engine,
+        ));
+        let plane = plane_over(Arc::clone(&search));
+        plane.boot(&NoChain, BOOT).expect("boot");
+        plane.on_event(&swap_on(&[0x31, 0x32, 0x33], 47_079_437)).await;
+        let (_, left, declined, _) = search.counters().snapshot();
+        assert_eq!((left, declined), (unpriced, 12 - unpriced), "max_templates {}", engine.max_templates());
+    }
+}

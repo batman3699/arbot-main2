@@ -38,6 +38,7 @@
 //! lane, and this repository measured that 4× the cycles changed nothing.
 
 use crate::plane::RouteSource;
+use apex_math::finite_size::SearchBudget;
 use apex_search::engine_c::{FiniteSizeEngine, TemplatePricer};
 use apex_search::engine_d::{EventEngine, StaleAttribute};
 use apex_search::frontier::{Frontier, RouteId, RouteProposal, RouteTemplate};
@@ -73,6 +74,20 @@ impl SearchCounters {
             self.invalidated.load(Ordering::Relaxed),
         )
     }
+}
+
+/// Engine C for a frontier whose events are whole flashblocks: every template
+/// an event touches, up to the `resident` set.
+///
+/// [`FiniteSizeEngine::measured`] prices eight per event, sized when an event
+/// named the one pool a swap moved — about six templates on the live universe.
+/// Since R17 an event is a flashblock, and one can move several pools: two
+/// WETH/USDC pools touch ten templates, and eight left the most expensive
+/// unpriced, 114 in the first five minutes. The resident set bounds the work
+/// instead, and pricing a flashblock's templates once costs no more than
+/// pricing each of its swaps' did.
+pub fn flashblock_engine(resident: usize) -> FiniteSizeEngine {
+    FiniteSizeEngine::new(resident, SearchBudget::default())
 }
 
 /// The fast path's candidate generation.
