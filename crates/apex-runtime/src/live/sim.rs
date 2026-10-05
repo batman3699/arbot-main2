@@ -12,10 +12,27 @@
 //! every transaction pays, reads there exactly as `eth_getBalance` at `pending`
 //! does, ahead of `latest`. Its block context under `pending` is not current:
 //! it lagged by two to four blocks — the blueprint's warning (§15.2). So the
-//! pending header is read first, and its number, timestamp and base fee are set
-//! explicitly. BlockPI reaches the requested number by inserting empty blocks,
-//! so the call is in the answer's last block; an answer whose last block is not
-//! the one asked for ran somewhere else, and is refused.
+//! block being built is named explicitly — its number, timestamp and base fee.
+//! BlockPI reaches the requested number by inserting empty blocks, so the call
+//! is in the answer's last block; an answer whose last block is not the one
+//! asked for ran somewhere else, and is refused.
+//!
+//! # The block being built comes from the feed (R18)
+//!
+//! It was read with `eth_getBlockByNumber("pending")` before every simulation:
+//! 207–311 ms on BlockPI, as long as the simulation's own round trip (215–400
+//! ms, measured 2026-10-06), and the first real gap the shadow priced lasted
+//! one flashblock, 200 ms. The capture feed already knows it — the newest
+//! sealed head, and the newest block a preconfirmed log came from
+//! ([`BlockContext::being_built`]) — so the shadow publishes it as the feed
+//! learns it, and a simulation reads it and carries it on to the block being
+//! built when it runs ([`BlockContext::at`]): a block is sealed when its time
+//! comes, whether or not the feed has heard. Against BlockPI's own pending
+//! header read at the same moment, that named the same block 84 times in 94
+//! and the next one 10 times (BlockPI moves on 0.2–0.4 s after the boundary),
+//! never the one before; the simulation took 167–614 ms, 234 at the median.
+//! Before the feed has seen a head there is nothing to read, and nothing is
+//! simulated.
 //!
 //! # A success that is not a `startV2` is a failure
 //!
@@ -65,7 +82,9 @@
 //! success is both, and a failure neither.
 
 use crate::plane::{Decline, Simulator};
+use apex_capture::clock::Clock;
 use alloy_primitives::{b256, hex, keccak256, Address, B256};
+use apex_chain::rpc::ws::Head;
 use apex_chain::rpc::RpcTransport;
 use apex_exec::call::ExecutorCall;
 use apex_types::candidate::Candidate;
@@ -73,7 +92,7 @@ use apex_types::cost::GasLimit;
 use apex_types::ids::{ChainId, TokenId};
 use apex_types::sim::{RevertClass, SimulationResult, SimulationTier};
 use apex_types::state::StateFingerprint;
-use apex_types::time::DurationNanos;
+use apex_types::time::{DurationNanos, UnixNanos};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -252,7 +271,7 @@ pub fn read_simulation(
     Some(r)
 }
 
-/// The block a simulation runs in: the one being built, from its header.
+/// The block a simulation runs in: the one being built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockContext {
     pub number: u64,
@@ -260,17 +279,49 @@ pub struct BlockContext {
     pub base_fee: u128,
 }
 
+/// Base seals a block every two seconds: the pending header's timestamp was the
+/// latest's plus two per block in every sample (2026-10-06).
+pub const BLOCK_TIME_S: u64 = 2;
+
 impl BlockContext {
-    /// From `eth_getBlockByNumber("pending")`'s header; `None` if any of the
-    /// three is missing or does not decode.
-    pub fn from_header(header: &Value) -> Option<Self> {
-        let base_fee = header.get("baseFeePerGas")?.as_str()?.strip_prefix("0x")?;
+    /// The block being built, from what the capture feed has seen: one past
+    /// the newest sealed `head`, or the newest block a preconfirmed log came
+    /// from when the head lags behind the flashblocks. Its timestamp is the
+    /// head's plus two seconds a block.
+    ///
+    /// The base fee is the head's. The next block's is at most a hundredth
+    /// away — Base's EIP-1559 denominator is 100, and at its 0.005 gwei floor
+    /// the two are equal — and nothing the simulated call runs reads it: the
+    /// executor, the routers and the pools never use `BASEFEE`, and
+    /// `validation: false` charges no gas. `None` for a head without one.
+    /// The block being built at `now`. A block is built in the two seconds
+    /// before its timestamp, so once `now` reaches it the block is sealed and
+    /// the one being built is the next — or later, two seconds a block.
+    /// BlockPI's pending block moved on 0.2–0.4 s after each boundary and the
+    /// feed's head later still: without this, one simulation in five named the
+    /// block before, and two of 94 were refused (2026-10-06).
+    pub fn at(self, now: UnixNanos) -> Self {
+        let sealed_at = self.timestamp.saturating_mul(1_000_000_000);
+        if now.0 < sealed_at {
+            return self;
+        }
+        let blocks = 1 + (now.0 - sealed_at) / BLOCK_TIME_S.saturating_mul(1_000_000_000);
+        Self {
+            number: self.number.saturating_add(blocks),
+            timestamp: self.timestamp.saturating_add(BLOCK_TIME_S.saturating_mul(blocks)),
+            ..self
+        }
+    }
+
+    pub fn being_built(head: &Head, newest_preconfirmed: Option<u64>) -> Option<Self> {
+        let number = head.number.saturating_add(1).max(newest_preconfirmed.unwrap_or(0));
         Some(Self {
-            number: quantity(header.get("number")?)?,
-            timestamp: quantity(header.get("timestamp")?)?,
-            base_fee: u128::from_str_radix(base_fee, 16).ok()?,
+            number,
+            timestamp: head.timestamp.saturating_add(BLOCK_TIME_S.saturating_mul(number - head.number)),
+            base_fee: head.base_fee_per_gas?,
         })
     }
+
 }
 
 /// The `eth_simulateV1` request: one call, from the signing lane, at the gas
@@ -300,11 +351,20 @@ pub fn simulate_request(call: &ExecutorCall, from: Address, gas_limit: GasLimit,
 pub struct LiveSimulator {
     rpc: Arc<dyn RpcTransport>,
     chain: ChainId,
+    /// The block being built, as the capture feed has seen it (R18).
+    building: tokio::sync::watch::Receiver<Option<BlockContext>>,
+    /// To carry it on to the block being built when the simulation runs.
+    clock: Arc<dyn Clock>,
 }
 
 impl LiveSimulator {
-    pub fn new(rpc: Arc<dyn RpcTransport>, chain: ChainId) -> Self {
-        Self { rpc, chain }
+    pub fn new(
+        rpc: Arc<dyn RpcTransport>,
+        chain: ChainId,
+        building: tokio::sync::watch::Receiver<Option<BlockContext>>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self { rpc, chain, building, clock }
     }
 }
 
@@ -325,8 +385,7 @@ impl Simulator for LiveSimulator {
     ) -> Result<SimulationResult, Decline> {
         let started = std::time::Instant::now();
         let unrun = || Decline::SimulationFailed { class: None };
-        let header = self.rpc.call("eth_getBlockByNumber", json!(["pending", false])).await.map_err(|_| unrun())?;
-        let at = BlockContext::from_header(&header).ok_or_else(unrun)?;
+        let at = (*self.building.borrow()).ok_or_else(unrun)?.at(self.clock.now());
         let answer =
             self.rpc.call("eth_simulateV1", simulate_request(call, from, gas_limit, at)).await.map_err(|_| unrun())?;
         let elapsed = DurationNanos(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));

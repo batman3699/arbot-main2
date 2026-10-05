@@ -11,6 +11,7 @@ use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
 use apex_runtime::live::feed::{self, Effect, FeedHandler, BURN, MINT, PANCAKE_SWAP, SWAP};
+use apex_runtime::live::sim::BlockContext;
 use apex_runtime::live::frontier::WETH;
 use apex_runtime::live::inventory::{PoolSpec, Venue};
 use apex_state::feed::event::EventKind;
@@ -584,4 +585,50 @@ fn a_swap_that_cannot_be_sized_makes_the_burst_unmeasured() {
     let effects = h.flush(&book);
     assert_eq!(pools_of(event_of(&effects)), vec![POOL, XY]);
     assert_eq!(notional_of(event_of(&effects)), None);
+}
+
+// ------------------------------------------- R18: the block being built, from the feed
+
+fn head_at(number: u64, timestamp: u64) -> Head {
+    Head { number, hash: B256::repeat_byte(9), timestamp, base_fee_per_gas: Some(5_000_000), gas_used: 1, gas_limit: 2 }
+}
+
+/// **The block being built comes from the feed.** Tier 2 sets the context of
+/// the block a trade would land in, and read it from BlockPI before every
+/// simulation — a round trip as long as the simulation's own. The feed already
+/// has it: the newest sealed head, one block on, two seconds later — or the
+/// newest block a preconfirmed log came from, when the head lags behind the
+/// flashblocks, as BlockPI's did one time in five (measured 2026-10-06).
+#[test]
+fn the_block_being_built_follows_the_feed() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    let at = |number, timestamp| Some(BlockContext { number, timestamp, base_fee: 5_000_000 });
+    assert_eq!(h.block_being_built(), None, "no head, no block");
+
+    h.handle(&book, Notification::Head(head_at(100, 1_000)), NOW);
+    assert_eq!(h.block_being_built(), at(101, 1_002));
+
+    // A preconfirmed log from the block after: the head lags.
+    h.handle(&book, Notification::Log(swap(-197_360, 102, 0, true, 1, 1)), NOW);
+    assert_eq!(h.block_being_built(), at(102, 1_004));
+
+    // A confirmed log never dates it, and an older preconfirmed one never
+    // moves it back.
+    h.handle(&book, Notification::Log(swap(-197_360, 105, 0, false, 1, 1)), NOW);
+    h.handle(&book, Notification::Log(swap(-197_360, 101, 3, true, 1, 1)), NOW);
+    assert_eq!(h.block_being_built(), at(102, 1_004));
+
+    // Any preconfirmed log dates it, a mint's as well as a swap's.
+    let mint = RawLog { topics: vec![MINT], ..swap(TICK, 103, 0, true, 1, 1) };
+    h.handle(&book, Notification::Log(mint), NOW);
+    assert_eq!(h.block_being_built(), at(103, 1_006));
+
+    // A newer head.
+    h.handle(&book, Notification::Head(head_at(103, 1_006)), NOW);
+    assert_eq!(h.block_being_built(), at(104, 1_008));
+
+    // A head without a base fee is no context to simulate in.
+    h.handle(&book, Notification::Head(Head { base_fee_per_gas: None, ..head_at(104, 1_008) }), NOW);
+    assert_eq!(h.block_being_built(), None);
 }

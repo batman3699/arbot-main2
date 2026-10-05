@@ -46,6 +46,7 @@
 use crate::live::book::{PoolBook, SwapApplied, SwapWrite};
 use crate::live::abi;
 use crate::live::inventory::Venue;
+use crate::live::sim::BlockContext;
 use alloy_primitives::{b256, keccak256, Address, B256, U256};
 use apex_chain::rpc::ws::{Head, Notification, RawLog};
 use apex_state::feed::event::{EventKind, StateEvent};
@@ -222,13 +223,15 @@ pub enum Effect {
 pub struct FeedHandler {
     chain: ChainId,
     last_head: Option<Head>,
+    /// The newest block a preconfirmed log came from.
+    newest_preconfirmed: Option<u64>,
     /// The burst still arriving, in arrival order, each swap with when it came.
     held: Vec<(SwapLog, UnixNanos)>,
 }
 
 impl FeedHandler {
     pub const fn new(chain: ChainId) -> Self {
-        Self { chain, last_head: None, held: Vec::new() }
+        Self { chain, last_head: None, newest_preconfirmed: None, held: Vec::new() }
     }
 
     pub const fn last_head(&self) -> Option<&Head> {
@@ -236,6 +239,11 @@ impl FeedHandler {
     }
 
     pub fn handle(&mut self, book: &PoolBook, n: Notification, now: UnixNanos) -> Vec<Effect> {
+        if let Notification::Log(l) = &n {
+            if l.pending {
+                self.newest_preconfirmed = self.newest_preconfirmed.max(l.block_number);
+            }
+        }
         match n {
             Notification::Head(h) => {
                 self.last_head = Some(h);
@@ -260,6 +268,12 @@ impl FeedHandler {
                 _ => Vec::new(),
             },
         }
+    }
+
+    /// The block a trade sent now would land in, from what this feed has
+    /// seen — see [`BlockContext::being_built`]. Tier 2 simulates in it.
+    pub fn block_being_built(&self) -> Option<BlockContext> {
+        BlockContext::being_built(self.last_head.as_ref()?, self.newest_preconfirmed)
     }
 
     /// Whether swaps are held, waiting for their burst to end.

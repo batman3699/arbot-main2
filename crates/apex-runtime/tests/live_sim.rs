@@ -11,18 +11,20 @@
 mod support;
 
 use alloy_primitives::{address, hex, keccak256, Address, U256};
+use apex_capture::clock::ManualClock;
 use apex_chain::rpc::{RpcError, RpcTransport};
 use apex_exec::call::ExecutorCall;
 use apex_exec::commitment::{plan_commitment, PlanV2};
 use apex_exec::sign::SignedPlan;
-use apex_runtime::live::sim::{classify, read_simulation, revert, LiveSimulator};
+use apex_runtime::live::sim::{classify, read_simulation, revert, BlockContext, LiveSimulator};
 use apex_runtime::plane::{Decline, Simulator};
 use apex_types::cost::GasLimit;
 use apex_types::ids::ChainId;
 use apex_types::sim::{RevertClass, SimulationTier};
-use apex_types::time::DurationNanos;
+use apex_types::time::{DurationNanos, UnixNanos};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 
 const BASE: ChainId = ChainId(8453);
 
@@ -258,17 +260,15 @@ fn deltas_are_the_executors_net_transfers() {
     assert!(r.balance_deltas.is_empty() && r.token_residues.is_empty());
 }
 
-/// Records what it was asked and answers from a script: `header` to the
-/// pending block's header, `answer` to the simulation.
+/// Records what it was asked and answers everything with `answer`.
 struct Recording {
-    header: Result<Value, RpcError>,
     answer: Result<Value, RpcError>,
     asked: Mutex<Vec<(String, Value)>>,
 }
 
 impl Recording {
-    fn new(header: Value, answer: Result<Value, RpcError>) -> Self {
-        Self { header: Ok(header), answer, asked: Mutex::new(vec![]) }
+    fn new(answer: Result<Value, RpcError>) -> Self {
+        Self { answer, asked: Mutex::new(vec![]) }
     }
 }
 
@@ -276,18 +276,28 @@ impl Recording {
 impl RpcTransport for Recording {
     async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         self.asked.lock().unwrap().push((method.to_string(), params));
-        if method == "eth_getBlockByNumber" {
-            self.header.clone()
-        } else {
-            self.answer.clone()
-        }
+        self.answer.clone()
     }
 }
 
-/// A pending header naming the block an answer's last block is.
-fn header_for(answer: &Value) -> Value {
+fn hex_u64(v: &Value) -> u64 {
+    u64::from_str_radix(&v.as_str().unwrap()[2..], 16).unwrap()
+}
+
+/// The block being built, as the feed would publish it: the one an answer's
+/// last block is.
+fn building_for(answer: &Value) -> BlockContext {
     let last = answer.as_array().unwrap().last().unwrap();
-    json!({ "number": last["number"], "timestamp": last["timestamp"], "baseFeePerGas": "0x4c4b40" })
+    BlockContext { number: hex_u64(&last["number"]), timestamp: hex_u64(&last["timestamp"]), base_fee: 5_000_000 }
+}
+
+fn building(at: Option<BlockContext>) -> watch::Receiver<Option<BlockContext>> {
+    watch::channel(at).1
+}
+
+/// A clock before any block: the feed's block is still being built.
+fn before_any_block() -> Arc<ManualClock> {
+    Arc::new(ManualClock::at(0))
 }
 
 fn pending_fixture(case: &str) -> Value {
@@ -316,17 +326,19 @@ fn call_to(to: Address) -> ExecutorCall {
 /// **One call, as the lane that will sign it, inside the block being built**,
 /// to the committed executor, with the gas limit it will be signed with,
 /// transfers traced and validation off — and what comes back is read, not
-/// trusted. The pending header is read first: its number, timestamp and base
-/// fee are set explicitly on a simulation based at `pending`, whose state is
-/// the in-progress block's but whose own context lags.
+/// trusted. The block being built is the feed's: its number, timestamp and
+/// base fee are set explicitly on a simulation based at `pending`, whose state
+/// is the in-progress block's but whose own context lags — and **nothing else
+/// is asked**. Reading the pending header first cost a round trip as long as
+/// the simulation's own (R18).
 #[tokio::test]
 async fn the_simulator_asks_one_call_as_the_lane_with_the_gas_limit() {
     let f = fixture();
     let exe = executor(&f);
     let answer = f["cases"]["success"]["response"].clone();
-    let header = header_for(&answer);
-    let rpc = Arc::new(Recording::new(header.clone(), Ok(answer)));
-    let sim = LiveSimulator::new(rpc.clone(), BASE);
+    let at = building_for(&answer);
+    let rpc = Arc::new(Recording::new(Ok(answer)));
+    let sim = LiveSimulator::new(rpc.clone(), BASE, building(Some(at)), before_any_block());
     let lane = address!("70997970C51812dC3A010C7d01b50e0d17dc79C8");
     let c = support::candidate(1, 100, 1);
     let call = call_to(exe);
@@ -336,12 +348,11 @@ async fn the_simulator_asks_one_call_as_the_lane_with_the_gas_limit() {
     assert!(r.success);
 
     let asked = rpc.asked.lock().unwrap();
-    let [(first, header_params), (method, params)] = &asked[..] else { panic!("{asked:?}") };
-    assert_eq!((first.as_str(), header_params), ("eth_getBlockByNumber", &json!(["pending", false])));
+    let [(method, params)] = &asked[..] else { panic!("{asked:?}") };
     assert_eq!(method, "eth_simulateV1");
     assert_eq!(
         params[0]["blockStateCalls"][0]["blockOverrides"],
-        json!({ "number": header["number"], "time": header["timestamp"], "baseFeePerGas": header["baseFeePerGas"] })
+        json!({ "number": format!("{:#x}", at.number), "time": format!("{:#x}", at.timestamp), "baseFeePerGas": "0x4c4b40" })
     );
     let one = &params[0]["blockStateCalls"][0]["calls"][0];
     assert_eq!(one["from"].as_str().unwrap().parse::<Address>().unwrap(), lane);
@@ -377,11 +388,10 @@ fn an_answer_is_read_from_its_last_block() {
 async fn a_simulation_in_another_blocks_context_is_refused() {
     let f = fixture();
     let answer = f["cases"]["success"]["response"].clone();
-    let mut header = header_for(&answer);
-    let n = u64::from_str_radix(&header["number"].as_str().unwrap()[2..], 16).unwrap();
-    header["number"] = json!(format!("{:#x}", n + 1));
+    let mut at = building_for(&answer);
+    at.number += 1;
     let c = support::candidate(1, 100, 1);
-    let sim = LiveSimulator::new(Arc::new(Recording::new(header, Ok(answer))), BASE);
+    let sim = LiveSimulator::new(Arc::new(Recording::new(Ok(answer))), BASE, building(Some(at)), before_any_block());
     let err = sim
         .simulate(&c, &call_to(executor(&f)), Address::repeat_byte(2), c.total_execution_cost.gas_limit)
         .await
@@ -389,24 +399,20 @@ async fn a_simulation_in_another_blocks_context_is_refused() {
     assert_eq!(err, Decline::SimulationFailed { class: None });
 }
 
-/// **No pending header, no simulation.** Without the block being built there
-/// is no context to set, and a simulation at the lagging one is not asked for.
+/// **No block being built, no simulation.** Before the feed has seen a head
+/// there is no context to set, and a simulation at `pending`'s lagging one is
+/// not asked for — nothing is asked at all.
 #[tokio::test]
-async fn without_the_pending_header_nothing_is_simulated() {
+async fn without_a_block_being_built_nothing_is_simulated() {
     let c = support::candidate(1, 100, 1);
-    for header in [
-        Err(RpcError::Exhausted { method: "eth_getBlockByNumber".into(), endpoints: 1, last: "timed out".into() }),
-        Ok(json!({ "number": "0x10" })),
-    ] {
-        let rpc = Arc::new(Recording { header, answer: Ok(json!([])), asked: Mutex::new(vec![]) });
-        let sim = LiveSimulator::new(rpc.clone(), BASE);
-        let err = sim
-            .simulate(&c, &call_to(Address::repeat_byte(1)), Address::repeat_byte(2), c.total_execution_cost.gas_limit)
-            .await
-            .unwrap_err();
-        assert_eq!(err, Decline::SimulationFailed { class: None });
-        assert!(rpc.asked.lock().unwrap().iter().all(|(m, _)| m != "eth_simulateV1"));
-    }
+    let rpc = Arc::new(Recording::new(Ok(json!([]))));
+    let sim = LiveSimulator::new(rpc.clone(), BASE, building(None), before_any_block());
+    let err = sim
+        .simulate(&c, &call_to(Address::repeat_byte(1)), Address::repeat_byte(2), c.total_execution_cost.gas_limit)
+        .await
+        .unwrap_err();
+    assert_eq!(err, Decline::SimulationFailed { class: None });
+    assert!(rpc.asked.lock().unwrap().is_empty());
 }
 
 /// A simulation that could not run has no outcome to classify: a failure
@@ -419,12 +425,46 @@ async fn a_simulation_that_cannot_run_fails_without_a_class() {
         Ok(json!({"unexpected": true})),
         Ok(json!([{ "number": "0x1", "hash": format!("0x{}", "11".repeat(32)), "parentHash": format!("0x{}", "22".repeat(32)), "calls": [] }])),
     ] {
-        let header = json!({ "number": "0x1", "timestamp": "0x1", "baseFeePerGas": "0x1" });
-        let sim = LiveSimulator::new(Arc::new(Recording::new(header, answer)), BASE);
+        let at = BlockContext { number: 1, timestamp: 1, base_fee: 1 };
+        let sim = LiveSimulator::new(Arc::new(Recording::new(answer)), BASE, building(Some(at)), before_any_block());
         let err = sim
             .simulate(&c, &call_to(Address::repeat_byte(1)), Address::repeat_byte(2), c.total_execution_cost.gas_limit)
             .await
             .unwrap_err();
         assert_eq!(err, Decline::SimulationFailed { class: None });
     }
+}
+
+/// **The block being built goes on without the feed.** Base seals a block every
+/// two seconds whether or not the feed has said so: BlockPI's pending block
+/// moved on 0.2–0.4 s after each boundary, the feed's head later still, and one
+/// simulation in five named the block before it — two of them refused
+/// (2026-10-06). So a block whose time has come is sealed, and the one being
+/// built is the next.
+#[test]
+fn a_block_whose_time_has_passed_is_the_next_one() {
+    let b = BlockContext { number: 100, timestamp: 1_000, base_fee: 7 };
+    let at = |ms: u64| b.at(UnixNanos(ms * 1_000_000));
+    assert_eq!(at(999_999), b, "still being built");
+    assert_eq!(at(1_000_000), BlockContext { number: 101, timestamp: 1_002, base_fee: 7 });
+    assert_eq!(at(1_002_300), BlockContext { number: 102, timestamp: 1_004, base_fee: 7 });
+}
+
+/// The simulator asks for the block being built when it simulates, not when
+/// the feed last moved: the feed's block has passed, so the call is simulated
+/// in the next.
+#[tokio::test]
+async fn the_simulator_simulates_in_the_block_being_built_now() {
+    let f = fixture();
+    let answer = f["cases"]["success"]["response"].clone();
+    let now_built = building_for(&answer);
+    let feed_said = BlockContext { number: now_built.number - 1, timestamp: now_built.timestamp - 2, ..now_built };
+    let clock = Arc::new(ManualClock::at(feed_said.timestamp * 1_000_000_000 + 300_000_000));
+    let rpc = Arc::new(Recording::new(Ok(answer)));
+    let sim = LiveSimulator::new(rpc.clone(), BASE, building(Some(feed_said)), clock);
+    let c = support::candidate(1, 100, 1);
+    let r = sim.simulate(&c, &call_to(executor(&f)), Address::repeat_byte(2), c.total_execution_cost.gas_limit).await;
+    assert!(r.expect("simulated in the block being built").success);
+    let asked = rpc.asked.lock().unwrap();
+    assert_eq!(asked[0].1[0]["blockStateCalls"][0]["blockOverrides"]["number"], json!(format!("{:#x}", now_built.number)));
 }

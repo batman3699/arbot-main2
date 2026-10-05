@@ -54,7 +54,7 @@ use crate::live::inventory::{self, PoolSpec, UniverseFilter, Venue};
 use crate::live::pricing::LivePricer;
 use crate::live::reader::{ChainReader, ReaderConfig};
 use crate::live::reads::ChainReads;
-use crate::live::sim::LiveSimulator;
+use crate::live::sim::{BlockContext, LiveSimulator};
 use crate::plane::{DispatchLane, Plane, Ports};
 use crate::risk::LiveRiskGate;
 use crate::search::FrontierSearch;
@@ -199,6 +199,8 @@ struct Shadow {
     funnel: Funnel,
     reloads: ReloadQueue,
     heads: watch::Sender<Option<Head>>,
+    /// The block being built, from the feed: what Tier 2 simulates in (R18).
+    building: watch::Sender<Option<BlockContext>>,
     largest_window: AtomicU64,
     recorder: tokio::sync::Mutex<FlashblockRecorder>,
     feed_stats: Versioned<Option<Arc<WsStats>>>,
@@ -453,6 +455,8 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     ));
     let null = Arc::new(NullDispatcher::new());
     let nothing_sent = Arc::new(NothingSent::default());
+    // The block being built, as the feed has seen it: Tier 2 simulates in it.
+    let (building, building_now) = watch::channel(None);
     let plane = Arc::new(Plane::new(Ports {
         registry: Arc::new(TicketRegistry::new(Box::new(journal), Box::new(SystemClock))),
         pool,
@@ -461,7 +465,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         chain: adapter.clone(),
         search: search.clone(),
         econ,
-        sim: Arc::new(LiveSimulator::new(Arc::clone(&rpc), base)),
+        sim: Arc::new(LiveSimulator::new(Arc::clone(&rpc), base, building_now, Arc::new(SystemClock))),
         // Nothing records a loss on a lane that sends nothing, so the breaker
         // never trips here; its limits are the live run's to set.
         risk: Arc::new(LiveRiskGate::new(
@@ -509,6 +513,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         funnel: Funnel::default(),
         reloads: ReloadQueue::default(),
         heads,
+        building,
         largest_window: AtomicU64::new(0),
         recorder: tokio::sync::Mutex::new(FlashblockRecorder::new(FlashblockRecorder::DEFAULT_WINDOW)),
         feed_stats: Versioned::new(None, ReconstructionStatus::Rebuilding),
@@ -562,6 +567,14 @@ impl Shadow {
                 self.heads.send_replace(Some(h.clone()));
             }
             self.apply(bus, handler.handle(&self.book, n, SystemClock.now()));
+            // Tier 2 simulates in the block being built: published as the feed
+            // learns it, so a simulation reads it rather than asking (R18).
+            let building = handler.block_being_built();
+            self.building.send_if_modified(|now| {
+                let moved = *now != building;
+                *now = building;
+                moved
+            });
         }
         // The feed is gone; what it held still happened.
         self.apply(bus, handler.flush(&self.book));
@@ -755,6 +768,7 @@ impl Shadow {
             uptime_s: self.started.elapsed().as_secs(),
             config: self.config.version.to_string(),
             head: self.heads.borrow().as_ref().map(|h| h.number),
+            building: (*self.building.borrow()).map(|b| b.at(SystemClock.now()).number),
             capture_assurance: match self.plane.capture_assurance() {
                 CaptureAssurance::Measured(v) => Some(v),
                 CaptureAssurance::Undefined => None,
@@ -845,6 +859,9 @@ pub struct Report {
     pub uptime_s: u64,
     pub config: String,
     pub head: Option<u64>,
+    /// The block Tier 2 would simulate in now, from the feed (R18). `None`
+    /// until the feed has seen a head — and every simulation refused until then.
+    pub building: Option<u64>,
     /// `None` while no ticket has been authorized: nothing to be a share of.
     pub capture_assurance: Option<f64>,
     pub funnel: Counts,

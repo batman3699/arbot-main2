@@ -47,7 +47,8 @@ else:
     f, s, b = r["funnel"], r["search"], r["book"]
     reached = sum(f["declined"].values()) + sum(f["closed"].values()) + f["suppressed"]
     ca = r["capture_assurance"]
-    print(f"report: head {r['head']}, uptime {r['uptime_s'] // 3600}h{(r['uptime_s'] % 3600) // 60:02d}m, config {r['config'][:10]}")
+    building = f", Tier 2 simulates in {r['building']}" if r.get("building") else (", Tier 2 has no block yet" if "building" in r else "")
+    print(f"report: head {r['head']}{building}, uptime {r['uptime_s'] // 3600}h{(r['uptime_s'] % 3600) // 60:02d}m, config {r['config'][:10]}")
     print(f"capture assurance: {'%.4f' % ca if ca is not None else 'undefined -- no ticket authorized yet'}")
     print()
     print("funnel")
