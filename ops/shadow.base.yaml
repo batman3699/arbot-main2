@@ -94,3 +94,12 @@ capacity:
   boot_sample_s: 60
   sample_every_s: 900
   sample_for_s: 20
+
+# Which pools the run may price (R20, operator decision 2026-10-06). The
+# census's 500 ppm left out Base's deepest WETH/USDC and WETH/cbBTC pools,
+# Uniswap's 0.3% ($60M, $6.3M) and Slipstream's spacing-100 ($8.8M at ~570
+# ppm, $17M at 2,500), where the large swaps behind every real gap land.
+# Pricing is exact at any fee; a 30 bps pool simply pays less often.
+universe:
+  max_fee_ppm: 3000
+  min_depth_usd: 100000

@@ -15,7 +15,8 @@ use apex_chain::adapter::RejectReason;
 use apex_config::Env;
 use apex_econ::eligibility::{Clause, Decision, EligibilityContext, EligibilityGate, EligibilityPolicy};
 use apex_runtime::plane::{Decline, DispatchLane, Handled, Plane, Ports, SettlementFeed, Suppressed};
-use apex_runtime::shadow::config::{ShadowConfig, ShadowConfigError};
+use apex_runtime::live::inventory::UniverseFilter;
+use apex_runtime::shadow::config::{ShadowConfig, ShadowConfigError, UniverseConfig};
 use apex_runtime::shadow::funnel::{decline_label, outcome_label, Funnel};
 use apex_runtime::shadow::nothing_sent::{NothingSent, NEVER_SENT};
 use apex_runtime::shadow::reload::{ReloadQueue, Work};
@@ -68,6 +69,9 @@ capacity:
   boot_sample_s: 60
   sample_every_s: 900
   sample_for_s: 20
+universe:
+  max_fee_ppm: 3000
+  min_depth_usd: 100000
 "#
     )
 }
@@ -159,6 +163,21 @@ fn the_shipped_config_parses() {
     // Operator decision, 2026-10-06: the shadow refuses only a trade its
     // worst-case gas would leave unprofitable.
     assert_eq!(c.policy.max_cost_confidence_bps, 10_000);
+    // R20: the shadow prices the deep pools the census's 500 ppm left out.
+    assert_eq!(c.universe, UniverseConfig { max_fee_ppm: 3_000, min_depth_usd: 100_000 });
+}
+
+/// **The run sets its own universe filter (R20).** The shadow's config names
+/// the fee ceiling and depth floor; the census's 500 ppm stays the default.
+#[test]
+fn the_universe_filter_is_the_runs_to_set() {
+    let var = "APEX_SECRET_SHADOW_TEST_UNI";
+    let c = ShadowConfig::from_yaml_str(&yaml(var, "var/apex/shadow.journal"), &env(var, SECRET)).unwrap();
+    assert_eq!(c.universe.filter(), UniverseFilter { max_fee_ppm: 3_000, min_depth_usd: 100_000.0 });
+
+    // A ceiling of zero admits no pool: refused, not run empty.
+    let text = yaml(var, "var/apex/shadow.journal").replace("max_fee_ppm: 3000", "max_fee_ppm: 0");
+    assert!(matches!(ShadowConfig::from_yaml_str(&text, &env(var, SECRET)), Err(ShadowConfigError::Invalid(_))));
 }
 
 /// **The shadow sets its own cost-confidence cap; everything else is the
@@ -350,7 +369,7 @@ fn the_universe_is_the_reachable_weth_pairs_with_two_pools() {
         std::fs::write(dir.path().join(venue).join("pools.jsonl"), lines.join("\n")).unwrap();
     }
     let universe = |venues: &[Venue]| {
-        let mut got: Vec<u8> = apex_runtime::shadow::universe(dir.path(), venues)
+        let mut got: Vec<u8> = apex_runtime::shadow::universe(dir.path(), venues, UniverseFilter::default())
             .unwrap()
             .iter()
             .map(|s| s.pool.as_slice()[19])
@@ -362,6 +381,39 @@ fn the_universe_is_the_reachable_weth_pairs_with_two_pools() {
     assert_eq!(universe(&Venue::ALL), vec![1, 2, 5, 6, 7]);
     assert_eq!(universe(&[Venue::Slipstream, Venue::PancakeV3]), vec![5, 6]);
     assert_eq!(universe(&[Venue::UniswapV3]), vec![1, 2]);
+}
+
+/// **The fee ceiling decides which pools pair.** At the census's 500 ppm a
+/// 3,000 ppm pool is out and its pair keeps two pools; at 3,000 it is in. A
+/// pool under the depth floor is out at any ceiling.
+#[test]
+fn the_universe_follows_its_filter() {
+    use apex_runtime::live::inventory::Venue;
+    let dir = tempfile::tempdir().unwrap();
+    let weth = "0x4200000000000000000000000000000000000006";
+    let usdc = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+    let rec = |pool: u8, fee: u32, depth: f64| {
+        serde_json::json!({ "pool": format!("0x{:040x}", pool), "token0": weth, "token1": usdc,
+                            "fee": fee, "fee_ppm_onchain": fee, "hub_usd_liquidity": depth }).to_string()
+    };
+    std::fs::create_dir_all(dir.path().join("uniswap_v3")).unwrap();
+    let lines = [rec(1, 500, 5e6), rec(2, 3_000, 60e6), rec(3, 100, 1e5), rec(4, 3_000, 5e4)];
+    std::fs::write(dir.path().join("uniswap_v3").join("pools.jsonl"), lines.join("\n")).unwrap();
+    for v in ["aerodrome_slipstream", "pancakeswap_v3"] {
+        std::fs::create_dir_all(dir.path().join(v)).unwrap();
+        std::fs::write(dir.path().join(v).join("pools.jsonl"), "").unwrap();
+    }
+    let at = |filter| {
+        let mut got: Vec<u8> = apex_runtime::shadow::universe(dir.path(), &[Venue::UniswapV3], filter)
+            .unwrap()
+            .iter()
+            .map(|s| s.pool.as_slice()[19])
+            .collect();
+        got.sort();
+        got
+    };
+    assert_eq!(at(UniverseFilter::default()), vec![1, 3]);
+    assert_eq!(at(UniverseFilter { max_fee_ppm: 3_000, min_depth_usd: 100_000.0 }), vec![1, 2, 3]);
 }
 
 // ------------------------------------------------------------------ the plane's misses

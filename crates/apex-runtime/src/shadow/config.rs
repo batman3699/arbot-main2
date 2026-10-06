@@ -25,6 +25,7 @@
 use alloy_primitives::{keccak256, Address, B256};
 use apex_config::{ConfigError, Env, Secret};
 use apex_econ::eligibility::EligibilityPolicy;
+use crate::live::inventory::UniverseFilter;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -70,6 +71,7 @@ struct Raw {
     policy: Policy,
     costs: CostConfig,
     capacity: CapacityConfig,
+    universe: UniverseConfig,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +104,24 @@ pub struct SignerConfig {
     /// The address the executor authorizes. The key must sign as it.
     pub address: Address,
     pub gas_reserve_wei: u128,
+}
+
+/// Which pools the run may price, by the inventory's measured fee and depth
+/// (R20). The census's 500 ppm left out Base's deepest WETH/USDC and
+/// WETH/cbBTC pools, where the large swaps behind every real gap land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UniverseConfig {
+    /// The highest fee a pool may charge, in ppm.
+    pub max_fee_ppm: u32,
+    /// The least a pool must hold, in whole US dollars.
+    pub min_depth_usd: u64,
+}
+
+impl UniverseConfig {
+    pub fn filter(&self) -> UniverseFilter {
+        UniverseFilter { max_fee_ppm: self.max_fee_ppm, min_depth_usd: self.min_depth_usd as f64 }
+    }
 }
 
 /// What the run decides, stated once.
@@ -170,6 +190,8 @@ pub struct ShadowConfig {
     pub policy: Policy,
     pub costs: CostConfig,
     pub capacity: CapacityConfig,
+    /// Which pools the run prices.
+    pub universe: UniverseConfig,
 }
 
 fn scrub(mut message: String, secrets: &[String]) -> String {
@@ -224,6 +246,9 @@ impl ShadowConfig {
         if raw.capacity.sample_every_s == 0 || raw.capacity.boot_sample_s == 0 || raw.capacity.sample_for_s == 0 {
             return Err(invalid("a capacity sample of zero"));
         }
+        if raw.universe.max_fee_ppm == 0 {
+            return Err(invalid("a universe fee ceiling of zero admits no pool"));
+        }
         Ok(Self {
             version,
             chain_id: raw.chain_id,
@@ -238,6 +263,7 @@ impl ShadowConfig {
             policy: raw.policy,
             costs: raw.costs,
             capacity: raw.capacity,
+            universe: raw.universe,
         })
     }
 }

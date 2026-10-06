@@ -211,8 +211,8 @@ struct Shadow {
 /// with WETH on one side and at least two pools, **counting only `venues`** —
 /// the ones the executor can reach. Filtered before pairing, so a pool on an
 /// unreachable venue cannot make up a pair's two.
-pub fn universe(dir: &Path, venues: &[Venue]) -> Result<Vec<PoolSpec>, inventory::InventoryError> {
-    let specs: Vec<PoolSpec> = inventory::load(dir, UniverseFilter::default())?
+pub fn universe(dir: &Path, venues: &[Venue], filter: UniverseFilter) -> Result<Vec<PoolSpec>, inventory::InventoryError> {
+    let specs: Vec<PoolSpec> = inventory::load(dir, filter)?
         .into_iter()
         .filter(|s| venues.contains(&s.venue))
         .collect();
@@ -346,7 +346,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     for v in Venue::ALL.iter().filter(|v| !venues.contains(v)) {
         warn!(venue = ?v, "the executor has no adapter for it: its pools are left out of the universe");
     }
-    let specs = universe(&config.inventory, &venues).map_err(|e| boot_err("the inventory", e))?;
+    let specs = universe(&config.inventory, &venues, config.universe.filter()).map_err(|e| boot_err("the inventory", e))?;
     let (book, unloaded) = PoolBook::load(&reads, &specs, head).await.map_err(|e| boot_err("the pool book", e))?;
     for u in &unloaded {
         warn!(pool = %u.pool, why = ?u.why, "not loaded at boot; the first full reload reads it again");
