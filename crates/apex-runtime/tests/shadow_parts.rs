@@ -13,6 +13,7 @@ use apex_capture::signer::{ExecutorAuth, LaneConfig, SignerPool};
 use apex_capture::{InMemoryJournal, ManualClock};
 use apex_chain::adapter::RejectReason;
 use apex_config::Env;
+use apex_econ::eligibility::{Clause, Decision, EligibilityContext, EligibilityGate, EligibilityPolicy};
 use apex_runtime::plane::{Decline, DispatchLane, Handled, Plane, Ports, SettlementFeed, Suppressed};
 use apex_runtime::shadow::config::{ShadowConfig, ShadowConfigError};
 use apex_runtime::shadow::funnel::{decline_label, outcome_label, Funnel};
@@ -22,7 +23,7 @@ use apex_types::cost::GasLimit;
 use apex_types::ids::{ChainId, SignerLaneId};
 use apex_types::sim::RevertClass;
 use apex_types::ticket::{TerminalFailure, TicketOutcome, TicketStatus};
-use apex_types::time::UnixNanos;
+use apex_types::time::{DurationNanos, UnixNanos};
 use std::sync::Arc;
 use std::time::Duration;
 use support::*;
@@ -59,6 +60,7 @@ policy:
   full_reload_every_s: 900
   report_every_s: 300
   l1_every_blocks: 30
+  max_cost_confidence_bps: 10000
 costs:
   gas_on_failure: 411945
   failure_ppm: 50000
@@ -154,6 +156,40 @@ fn the_shipped_config_parses() {
     assert_eq!(c.signer.key_env, "APEX_SECRET_TRADER_KEY");
     assert!(c.journal.to_str().unwrap().contains("shadow"));
     assert_eq!(c.executor.plan_version, 2);
+    // Operator decision, 2026-10-06: the shadow refuses only a trade its
+    // worst-case gas would leave unprofitable.
+    assert_eq!(c.policy.max_cost_confidence_bps, 10_000);
+}
+
+/// **The shadow sets its own cost-confidence cap; everything else is the
+/// default.** The first trade ever to pass Tier 2 in the block being built —
+/// ticket 46, 2026-10-06, half a cent expected, still profitable at p99 gas —
+/// was refused at the default's 1,000 bps with a width of 1,629. The operator
+/// relaxed the cap for the shadow only, to 10,000 bps: a width as large as the
+/// whole profit. A live run keeps the default.
+#[test]
+fn the_shadow_sets_its_own_cost_confidence_cap() {
+    let var = "APEX_SECRET_SHADOW_TEST_CAP";
+    let c = ShadowConfig::from_yaml_str(&yaml(var, "var/apex/shadow.journal"), &env(var, SECRET)).unwrap();
+    let shadow = c.policy.eligibility();
+    assert_eq!(shadow, EligibilityPolicy { max_cost_confidence_bps: 10_000, ..EligibilityPolicy::default() });
+
+    let ticket_46 = EligibilityContext {
+        expected_net_ev_wei: 1_841_315_099_078,
+        robustness_margin_bps: 5_000,
+        state_age: DurationNanos(100_000_000),
+        simulation_tier: 2,
+        execution_path_healthy: true,
+        flash_liquidity_available: true,
+        route_authorization_valid: true,
+        cost_confidence_bps: 1_629,
+        probability_of_profit_ppm: 900_000,
+    };
+    assert_eq!(
+        EligibilityGate::evaluate(&ticket_46, &EligibilityPolicy::default()),
+        Decision::Reject { clause: Clause::CostEstimateConfidence }
+    );
+    assert_eq!(EligibilityGate::evaluate(&ticket_46, &shadow), Decision::Admit);
 }
 
 // ------------------------------------------------------------------ funnel

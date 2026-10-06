@@ -77,7 +77,6 @@ use apex_chain::rpc::RpcTransport;
 use apex_config::{Env, Secret};
 use apex_econ::cost::failure::FailureProfile;
 use apex_econ::cost::l1_data::{L1FeeModel, L1FeeParameters};
-use apex_econ::eligibility::EligibilityPolicy;
 use apex_risk::breaker::CircuitBreaker;
 use apex_risk::posture::PostureLadder;
 use apex_search::engine_d::EventEngine;
@@ -471,7 +470,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         risk: Arc::new(LiveRiskGate::new(
             PostureLadder::new(),
             CircuitBreaker::new(U256::MAX, U256::MAX, u32::MAX),
-            EligibilityPolicy::default(),
+            config.policy.eligibility(),
             Box::new(SystemClock),
         )),
         commitments: commitments.clone(),

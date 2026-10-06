@@ -24,6 +24,7 @@
 
 use alloy_primitives::{keccak256, Address, B256};
 use apex_config::{ConfigError, Env, Secret};
+use apex_econ::eligibility::EligibilityPolicy;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -116,6 +117,20 @@ pub struct Policy {
     pub report_every_s: u64,
     /// How often, in blocks, the L1 fee oracle is read again.
     pub l1_every_blocks: u64,
+    /// The risk gate's cost-confidence cap for this run: how large a share of
+    /// the expected profit the gas estimate's p50-to-p99 width may be, in bps.
+    pub max_cost_confidence_bps: u32,
+}
+
+impl Policy {
+    /// The risk gate's thresholds: the default's, with this run's
+    /// cost-confidence cap. The default's 1,000 bps refused the first trade
+    /// ever to pass Tier 2 inside the block being built (ticket 46,
+    /// 2026-10-06): half a cent expected, a 1,629 bps width, still profitable
+    /// at p99 gas. Operator decision: relax it for the shadow only.
+    pub fn eligibility(&self) -> EligibilityPolicy {
+        EligibilityPolicy { max_cost_confidence_bps: self.max_cost_confidence_bps, ..EligibilityPolicy::default() }
+    }
 }
 
 /// How a settlement fails, and what failing costs: what the chain does not

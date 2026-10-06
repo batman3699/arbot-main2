@@ -70,6 +70,14 @@ policy:
   report_every_s: 300
   # The L1 fee oracle moves with L1 blocks; once a minute.
   l1_every_blocks: 30
+  # The risk gate's cost-confidence cap: the gas estimate's p50-to-p99 width
+  # in wei, as a share of the expected profit. The default (1,000 bps, a tenth)
+  # refused the first trade ever to pass Tier 2 in the block being built
+  # (ticket 46, 2026-10-06: half a cent expected, a 1,629 bps width, still
+  # profitable at p99 gas). Operator decision: 10,000 bps for the shadow only,
+  # refusing just a trade its worst-case gas would leave without profit. A live
+  # run keeps the default.
+  max_cost_confidence_bps: 10000
 
 # How a settlement fails, and what failing costs: what the chain does not say.
 # The costliest revert on the R6/R7 fork (hop 2's minimum) used 411,945 gas.
