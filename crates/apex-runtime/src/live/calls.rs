@@ -55,7 +55,7 @@ use crate::live::abi::{self, selector};
 use crate::live::book::PoolBook;
 use crate::live::frontier::{
     Cycle, Leg, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER, PANCAKE_SMART_ROUTER, SLIPSTREAM_ADAPTER,
-    SLIPSTREAM_ROUTER,
+    SLIPSTREAM_ROUTER, SLIPSTREAM_V3_ADAPTER, SLIPSTREAM_V3_ROUTER,
 };
 use crate::live::inventory::Venue;
 use crate::live::pricing::LiveCycle;
@@ -169,7 +169,7 @@ impl LiveCallBuilder {
                 let data = univ3_step(&path, amount_in, min_out).map_err(|e| refuse(e.to_string()))?;
                 Ok(Step { op: Op::UniV3, data })
             }
-            Venue::Slipstream => {
+            Venue::Slipstream | Venue::SlipstreamV3 => {
                 let call = slipstream_exact_input_single(&SlipstreamSwap {
                     token_in: leg.token_in,
                     token_out: leg.token_out,
@@ -180,10 +180,9 @@ impl LiveCallBuilder {
                     min_out,
                 })
                 .map_err(|e| refuse(e.to_string()))?;
-                Ok(Step {
-                    op: Op::Generic,
-                    data: generic_step(SLIPSTREAM_ADAPTER, leg.token_in, amount_in, &call),
-                })
+                // Each factory's pools run through its own router's adapter.
+                let adapter = binding(leg.venue).ok_or_else(|| refuse("no adapter for a Slipstream hop"))?.id;
+                Ok(Step { op: Op::Generic, data: generic_step(adapter, leg.token_in, amount_in, &call) })
             }
             Venue::PancakeV3 => {
                 let call = v3_router_exact_input_single(&V3RouterSwap {
@@ -228,6 +227,11 @@ pub const fn binding(venue: Venue) -> Option<AdapterBinding> {
             id: PANCAKE_ADAPTER,
             router: PANCAKE_SMART_ROUTER,
             selector: V3_ROUTER_EXACT_INPUT_SINGLE,
+        }),
+        Venue::SlipstreamV3 => Some(AdapterBinding {
+            id: SLIPSTREAM_V3_ADAPTER,
+            router: SLIPSTREAM_V3_ROUTER,
+            selector: SLIPSTREAM_EXACT_INPUT_SINGLE,
         }),
     }
 }

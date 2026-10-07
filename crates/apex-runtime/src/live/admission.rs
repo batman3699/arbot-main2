@@ -85,9 +85,10 @@ pub fn record(p: &PoolSnapshot, chain: ChainId, read_block: u64) -> PoolAdmissio
         deployed_by: Some(p.factory),
         tokens: Some((token(p.spec.token0), token(p.spec.token1))),
         decimals: Some(p.decimals),
-        fee_behavior: Some(match p.spec.venue {
-            Venue::UniswapV3 | Venue::PancakeV3 => FeeBehavior::Static { ppm: p.state.fee_ppm },
-            Venue::Slipstream => FeeBehavior::Dynamic,
+        fee_behavior: Some(if p.spec.venue.fee_is_static() {
+            FeeBehavior::Static { ppm: p.state.fee_ppm }
+        } else {
+            FeeBehavior::Dynamic
         }),
         reconstruction: Some(ReconstructionMethod::ConcentratedLiquidityLogs),
         depth: Some(DepthEstimate::ExternalNonAuthoritative {

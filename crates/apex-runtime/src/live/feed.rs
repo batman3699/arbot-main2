@@ -109,7 +109,7 @@ pub struct SwapLog {
 /// The `Swap` topic a venue's pools emit.
 pub const fn swap_topic(venue: Venue) -> B256 {
     match venue {
-        Venue::UniswapV3 | Venue::Slipstream => SWAP,
+        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => SWAP,
         Venue::PancakeV3 => PANCAKE_SWAP,
     }
 }

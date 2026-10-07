@@ -364,6 +364,7 @@ fn the_universe_is_the_reachable_weth_pairs_with_two_pools() {
         ("uniswap_v3", vec![rec(&p(1), weth, usdc), rec(&p(2), weth, usdc), rec(&p(3), usdc, other), rec(&p(4), usdc, other)]),
         ("aerodrome_slipstream", vec![rec(&p(5), weth, other)]),
         ("pancakeswap_v3", vec![rec(&p(6), weth, other), rec(&p(7), weth, usdc)]),
+        ("aerodrome_slipstream_v3", vec![rec(&p(8), weth, other)]),
     ] {
         std::fs::create_dir_all(dir.path().join(venue)).unwrap();
         std::fs::write(dir.path().join(venue).join("pools.jsonl"), lines.join("\n")).unwrap();
@@ -378,9 +379,11 @@ fn the_universe_is_the_reachable_weth_pairs_with_two_pools() {
         got
     };
     assert_eq!(universe(&[Venue::UniswapV3, Venue::Slipstream]), vec![1, 2]);
-    assert_eq!(universe(&Venue::ALL), vec![1, 2, 5, 6, 7]);
+    assert_eq!(universe(&Venue::ALL), vec![1, 2, 5, 6, 7, 8]);
     assert_eq!(universe(&[Venue::Slipstream, Venue::PancakeV3]), vec![5, 6]);
     assert_eq!(universe(&[Venue::UniswapV3]), vec![1, 2]);
+    // R22: Aerodrome's two Slipstream factories pair with each other.
+    assert_eq!(universe(&[Venue::Slipstream, Venue::SlipstreamV3]), vec![5, 8]);
 }
 
 /// **The fee ceiling decides which pools pair.** At the census's 500 ppm a
@@ -399,7 +402,7 @@ fn the_universe_follows_its_filter() {
     std::fs::create_dir_all(dir.path().join("uniswap_v3")).unwrap();
     let lines = [rec(1, 500, 5e6), rec(2, 3_000, 60e6), rec(3, 100, 1e5), rec(4, 3_000, 5e4)];
     std::fs::write(dir.path().join("uniswap_v3").join("pools.jsonl"), lines.join("\n")).unwrap();
-    for v in ["aerodrome_slipstream", "pancakeswap_v3"] {
+    for v in ["aerodrome_slipstream", "pancakeswap_v3", "aerodrome_slipstream_v3"] {
         std::fs::create_dir_all(dir.path().join(v)).unwrap();
         std::fs::write(dir.path().join(v).join("pools.jsonl"), "").unwrap();
     }

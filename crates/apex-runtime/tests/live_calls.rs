@@ -19,7 +19,9 @@ use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
 use apex_runtime::live::calls::LiveCallBuilder;
-use apex_runtime::live::frontier::{self, Cycle, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER, SLIPSTREAM_ADAPTER, WETH};
+use apex_runtime::live::frontier::{
+    self, Cycle, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER, SLIPSTREAM_ADAPTER, SLIPSTREAM_V3_ADAPTER, WETH,
+};
 use apex_runtime::live::inventory::{PoolSpec, Venue};
 use apex_runtime::live::pricing::LiveCycle;
 use apex_runtime::plane::{CallBuilder, Decline};
@@ -136,6 +138,19 @@ fn expected_step(b: &PoolBook, pool: Address, token_in: Address, token_out: Addr
             })
             .unwrap();
             (Op::Generic, generic_step(SLIPSTREAM_ADAPTER, token_in, amount_in, &call))
+        }
+        Venue::SlipstreamV3 => {
+            let call = slipstream_exact_input_single(&SlipstreamSwap {
+                token_in,
+                token_out,
+                tick_spacing: p.state.tick_spacing,
+                recipient: EXECUTOR,
+                deadline: DEADLINE,
+                amount_in,
+                min_out,
+            })
+            .unwrap();
+            (Op::Generic, generic_step(SLIPSTREAM_V3_ADAPTER, token_in, amount_in, &call))
         }
         Venue::PancakeV3 => {
             let call = v3_router_exact_input_single(&V3RouterSwap {
@@ -314,7 +329,7 @@ fn a_commitment_that_does_not_describe_this_cycle_is_refused() {
 use apex_chain::rpc::{RpcError, RpcTransport};
 use apex_runtime::live::abi::{self, selector, MULTICALL3};
 use apex_runtime::live::calls::{binding, reachable_venues};
-use apex_runtime::live::frontier::{PANCAKE_SMART_ROUTER, SLIPSTREAM_ROUTER};
+use apex_runtime::live::frontier::{PANCAKE_SMART_ROUTER, SLIPSTREAM_ROUTER, SLIPSTREAM_V3_ROUTER};
 use apex_runtime::live::reads::ChainReads;
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -457,4 +472,52 @@ fn the_registry_calls_encode_as_cast_does() {
         alloy_primitives::hex::encode(abi::call_u16_bytes4(selector::IS_SELECTOR_ALLOWED, 2, [0x04, 0xe4, 0x5a, 0xaf])),
         "284aea3f000000000000000000000000000000000000000000000000000000000000000204e45aaf00000000000000000000000000000000000000000000000000000000"
     );
+}
+
+/// The second factory's $3.8M WETH/USDC pool (tick spacing 50), from
+/// `data/base/aerodrome_slipstream_v3/pools.jsonl`.
+const SLIP3: Address = address!("3FE04A59Ebd38cF06080a6F60a98D124eb59392A");
+
+/// R22: a hop in the second Slipstream factory's pool is adapter 3's router
+/// call, the same `exactInputSingle` as the first factory's.
+#[test]
+fn a_second_slipstream_hop_is_adapter_threes_router_call() {
+    for (uni, slip) in [(-197_350, -197_300), (-197_300, -197_350)] {
+        let b = Arc::new(PoolBook::from_snapshots(
+            [pool(UNI, Venue::UniswapV3, uni, 500, 10), pool(SLIP3, Venue::SlipstreamV3, slip, 400, 100)],
+            ReconstructionStatus::Verified,
+        ));
+        let (cycle, c) = priced(&b);
+        let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &commitment(&c, 1)).expect("builds");
+        let input = c.input_amount.get();
+        let mid = u256_to_alloy(
+            LiveCycle::new(&cycle, &b.snapshot()).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
+        );
+        let floor = (input + U256::from(1u64)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
+        let [l0, l1] = &cycle.legs;
+        let want = [
+            expected_step(&b, l0.pool, l0.token_in, l0.token_out, input, mid),
+            expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, floor),
+        ];
+        for (got, (op, data)) in call.plan().steps.iter().zip(want) {
+            assert_eq!((got.op, &got.data), (op, &data));
+        }
+    }
+}
+
+#[test]
+fn the_second_slipstream_factory_binds_adapter_three() {
+    let b = binding(Venue::SlipstreamV3).expect("an adapter venue");
+    assert_eq!((b.id, b.router), (SLIPSTREAM_V3_ADAPTER, SLIPSTREAM_V3_ROUTER));
+    assert_eq!(b.id, 3);
+    assert_eq!(b.selector, binding(Venue::Slipstream).unwrap().selector, "the same exactInputSingle");
+}
+
+#[tokio::test]
+async fn the_second_slipstream_factory_is_reachable_once_adapter_three_is_registered() {
+    assert!(!reach(deployed(true)).await.contains(&Venue::SlipstreamV3), "not before the owner registers it");
+    let r = deployed(true);
+    let v3 = binding(Venue::SlipstreamV3).unwrap();
+    r.holds(v3.id, SLIPSTREAM_V3_ROUTER, v3.selector, true);
+    assert_eq!(reach(r).await, vec![Venue::UniswapV3, Venue::Slipstream, Venue::PancakeV3, Venue::SlipstreamV3]);
 }

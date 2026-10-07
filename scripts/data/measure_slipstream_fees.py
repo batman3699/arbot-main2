@@ -13,11 +13,14 @@ A Slipstream fee is dynamic: the reading is one moment's, and decides only
 whether the pool is admitted. The book prices every swap at the fee the
 module charges then.
 
+Aerodrome's second Slipstream factory (0xf8f2...) has its own inventory
+directory and the same rule (R22): pass `--dir aerodrome_slipstream_v3`.
+
 The RPC endpoint comes from BASE_RPC_URL (or PROBE_RPC) and is never printed.
 The inventory is backed up before it is rewritten. Re-running measures
 nothing new.
 
-Usage: BASE_RPC_URL=... scripts/data/measure_slipstream_fees.py [--dry-run]
+Usage: BASE_RPC_URL=... scripts/data/measure_slipstream_fees.py [--dry-run] [--dir aerodrome_slipstream_v3]
 """
 import argparse
 import json
@@ -29,7 +32,7 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-INVENTORY = REPO / "data" / "base" / "aerodrome_slipstream" / "pools.jsonl"
+BASE_DATA = REPO / "data" / "base"
 FEE = "0xddca3f43"  # fee()
 
 
@@ -57,9 +60,12 @@ def call(url: str, method: str, params: list):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="report the fees, write nothing")
+    ap.add_argument("--dir", default="aerodrome_slipstream",
+                    help="inventory directory under data/base/ (default: aerodrome_slipstream)")
     args = ap.parse_args()
+    inventory = BASE_DATA / args.dir / "pools.jsonl"
     url = rpc_url()
-    records = [json.loads(l) for l in INVENTORY.read_text().splitlines() if l.strip()]
+    records = [json.loads(l) for l in inventory.read_text().splitlines() if l.strip()]
     block = int(call(url, "eth_blockNumber", []), 16)
     measured, unreadable = 0, []
     for r in records:
@@ -78,9 +84,9 @@ def main() -> int:
         print(f"  unreadable {pool}: {why}")
     if args.dry_run or measured == 0:
         return 0
-    backup = INVENTORY.with_name(f"pools.jsonl.bak.fees-{int(time.time())}")
-    shutil.copy2(INVENTORY, backup)
-    INVENTORY.write_text("".join(json.dumps(r) + "\n" for r in records))
+    backup = inventory.with_name(f"pools.jsonl.bak.fees-{int(time.time())}")
+    shutil.copy2(inventory, backup)
+    inventory.write_text("".join(json.dumps(r) + "\n" for r in records))
     print(f"written; the previous inventory is {backup.name}")
     return 0
 

@@ -44,6 +44,8 @@ pub mod venue_ids {
     pub const CURVE: VenueId = VenueId(6);
     pub const BALANCER: VenueId = VenueId(7);
     pub const UNISWAP_V4: VenueId = VenueId(8);
+    /// Aerodrome's second Slipstream factory, `0xf8f2…` (R22).
+    pub const AERODROME_SLIPSTREAM_V3: VenueId = VenueId(9);
 }
 
 /// Pool state, in whichever shape its venue family needs.

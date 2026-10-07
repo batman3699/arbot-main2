@@ -49,7 +49,9 @@ impl PerVenue {
     pub const fn of(&self, venue: Venue) -> u64 {
         match venue {
             Venue::UniswapV3 => self.uniswap_v3,
-            Venue::Slipstream => self.slipstream,
+            // The second factory's pools and router are the first's code, so
+            // its crossings cost the same (R22's router simulation).
+            Venue::Slipstream | Venue::SlipstreamV3 => self.slipstream,
             Venue::PancakeV3 => self.pancake_v3,
         }
     }

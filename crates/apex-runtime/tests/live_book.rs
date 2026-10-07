@@ -137,8 +137,9 @@ fn write_inventory(dir: &std::path::Path, venue: &str, lines: &[Value]) {
 }
 
 /// The census's thresholds, and its rule for Slipstream: a record without a
-/// measured fee is skipped, because its `fee` field is the tick spacing.
-/// PancakeSwap's `fee` is its fee tier, as Uniswap's is, so it stands in.
+/// measured fee is skipped, because its `fee` field is the tick spacing. The
+/// second Slipstream factory's records follow the same rule (R22). PancakeSwap's
+/// `fee` is its fee tier, as Uniswap's is, so it stands in.
 #[test]
 fn the_inventory_applies_the_census_filters() {
     let dir = tempfile::tempdir().unwrap();
@@ -157,14 +158,23 @@ fn the_inventory_applies_the_census_filters() {
         json!({"pool":"0x0000000000000000000000000000000000000006","token0":a,"token1":b,"fee":100,"hub_usd_liquidity":2e6}),
         json!({"pool":"0x0000000000000000000000000000000000000007","token0":a,"token1":b,"fee":2500,"hub_usd_liquidity":2e6}),
     ]);
+    write_inventory(dir.path(), "aerodrome_slipstream_v3", &[
+        json!({"pool":"0x0000000000000000000000000000000000000008","token0":a,"token1":b,"fee":50,"fee_ppm_onchain":425,"hub_usd_liquidity":3e6}),
+        json!({"pool":"0x0000000000000000000000000000000000000009","token0":a,"token1":b,"fee":200,"hub_usd_liquidity":3e6}),
+    ]);
     let specs = inventory::load(dir.path(), UniverseFilter::default()).unwrap();
     let pools: Vec<u8> = specs.iter().map(|s| s.pool.as_slice()[19]).collect();
-    assert_eq!(pools, vec![1, 4, 6], "500ppm uni, the measured slipstream and the 100ppm pancake only");
+    assert_eq!(
+        pools,
+        vec![1, 4, 6, 8],
+        "500ppm uni, the measured slipstreams of both factories and the 100ppm pancake only"
+    );
     assert_eq!(specs[1].fee_ppm, 80, "the measured fee, not the tick spacing");
     assert_eq!((specs[2].venue, specs[2].fee_ppm), (Venue::PancakeV3, 100), "the fee tier stands in");
+    assert_eq!((specs[3].venue, specs[3].fee_ppm), (Venue::SlipstreamV3, 425), "measured, as the first factory's");
 
     let pairs = inventory::pairs(&specs);
-    assert_eq!(pairs.len(), 1, "one pair, three pools");
+    assert_eq!(pairs.len(), 1, "one pair, four pools");
 }
 
 /// A venue's inventory that is missing is an error, not an empty venue: a

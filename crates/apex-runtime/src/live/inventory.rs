@@ -41,16 +41,21 @@ pub enum Venue {
     UniswapV3,
     Slipstream,
     PancakeV3,
+    /// Aerodrome's second Slipstream deployment, factory `0xf8f2…`: the same
+    /// pool and router code as the first, with its own pools, router and fee
+    /// module (R22). Named after its inventory directory.
+    SlipstreamV3,
 }
 
 impl Venue {
-    pub const ALL: [Self; 3] = [Self::UniswapV3, Self::Slipstream, Self::PancakeV3];
+    pub const ALL: [Self; 4] = [Self::UniswapV3, Self::Slipstream, Self::PancakeV3, Self::SlipstreamV3];
 
     pub const fn id(self) -> VenueId {
         match self {
             Self::UniswapV3 => venue_ids::UNISWAP_V3,
             Self::Slipstream => venue_ids::AERODROME_SLIPSTREAM,
             Self::PancakeV3 => venue_ids::PANCAKESWAP_V3,
+            Self::SlipstreamV3 => venue_ids::AERODROME_SLIPSTREAM_V3,
         }
     }
 
@@ -60,18 +65,21 @@ impl Venue {
             Self::UniswapV3 => "uniswap_v3",
             Self::Slipstream => "aerodrome_slipstream",
             Self::PancakeV3 => "pancakeswap_v3",
+            Self::SlipstreamV3 => "aerodrome_slipstream_v3",
         }
     }
 
     /// The factory every pool of this venue on Base was deployed by, read from
     /// the chain: SwapRouter02's `factory()` for Uniswap and Slipstream's
     /// router's for Slipstream (2026-09-30); for PancakeSwap, the `factory()`
-    /// of its WETH/USDC pools and of its `SmartRouter` (2026-10-03).
+    /// of its WETH/USDC pools and of its `SmartRouter` (2026-10-03); for
+    /// Slipstream's second deployment, its router's (2026-10-08).
     pub const fn factory(self) -> Address {
         match self {
             Self::UniswapV3 => address!("33128a8fC17869897dcE68Ed026d694621f6FDfD"),
             Self::Slipstream => address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"),
             Self::PancakeV3 => address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"),
+            Self::SlipstreamV3 => address!("f8f2eB4940CFE7d13603DDDD87f123820Fc061Ef"),
         }
     }
 
@@ -180,11 +188,13 @@ pub fn load(data_dir: &Path, filter: UniverseFilter) -> Result<Vec<PoolSpec>, In
             })?;
             let fee = match (r.fee_ppm_onchain, venue) {
                 (Some(f), _) => f,
-                (None, Venue::UniswapV3 | Venue::PancakeV3) => match r.fee {
+                // A dynamic-fee record's `fee` is its tick spacing: skipped,
+                // never guessed.
+                (None, v) if !v.fee_is_static() => continue,
+                (None, _) => match r.fee {
                     Some(f) => f,
                     None => continue,
                 },
-                (None, Venue::Slipstream) => continue,
             };
             let Ok(fee) = u32::try_from(fee) else { continue };
             let depth = r.hub_usd_liquidity.unwrap_or(0.0);

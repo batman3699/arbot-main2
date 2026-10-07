@@ -59,6 +59,15 @@ pub const PANCAKE_ADAPTER: u16 = 2;
 /// `exactInputSingle` (read 2026-10-03).
 pub const PANCAKE_SMART_ROUTER: Address = address!("678Aa4bF4E210cf2166753e054d5b7c31cc7fa86");
 
+/// The adapter id Aerodrome's second Slipstream factory's router is registered
+/// under: by the owner's `registerAdapter`, after the deploy (R22).
+pub const SLIPSTREAM_V3_ADAPTER: u16 = 3;
+
+/// The second Slipstream factory's `SwapRouter`: what adapter 3 must be. Its
+/// `factory()` is `0xf8f2…`, and its code (9,908 bytes, as the first router's)
+/// holds `exactInputSingle` `0xa026383e` (read 2026-10-08).
+pub const SLIPSTREAM_V3_ROUTER: Address = address!("698Cb2b6dd822994581fEa6eA4Fc755d1363A92F");
+
 /// Domain separator for [`route_hash`].
 pub const ROUTE_HASH_DOMAIN: &[u8] = b"apex.route.v1";
 

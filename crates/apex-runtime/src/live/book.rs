@@ -536,7 +536,8 @@ impl PoolBook {
         let slip: Vec<(Address, Address, i32, u64)> = specs
             .iter()
             .zip(answers.chunks(STATE_READS))
-            .filter(|(s, _)| s.venue == crate::live::inventory::Venue::Slipstream)
+            // Every dynamic-fee venue follows its TWAP.
+            .filter(|(s, _)| !s.venue.fee_is_static())
             .filter_map(|(s, a)| {
                 let p = pools.get(&s.pool)?;
                 let cardinality = a[5].as_deref().and_then(|d| abi::word_uint(d, 3, 16)).unwrap_or(0);
