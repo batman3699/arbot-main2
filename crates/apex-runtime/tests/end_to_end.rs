@@ -23,11 +23,12 @@ use apex_capture::registry::TicketRegistry;
 use apex_capture::signer::{ExecutorAuth, LaneConfig, SignerPool};
 use apex_capture::{InMemoryJournal, ManualClock, NullDispatcher};
 use apex_runtime::plane::{
-    DispatchLane, Economics, Handled, LockFailure, Locked, Plane, Ports, SettlementFeed,
+    Decline, DispatchLane, Economics, Handled, LockFailure, Locked, Plane, Ports, SettlementFeed,
 };
 use apex_types::ids::SignerLaneId;
 use apex_types::ticket::TicketStatus;
-use apex_types::time::UnixNanos;
+use apex_types::miss::MissReason;
+use apex_types::time::{DurationNanos, UnixNanos};
 use std::sync::Arc;
 use std::time::Duration;
 use support::*;
@@ -587,4 +588,38 @@ async fn the_redelivery_window_is_bounded() {
         !matches!(plane.on_event(&ancient).await.first(), Some(Handled::Redelivered { .. })),
         "an observation older than the window is outside it, by definition"
     );
+}
+
+/// R21: proposing and handling are separable, and together they are `on_event`.
+#[tokio::test]
+async fn proposing_then_handling_is_what_on_event_does() {
+    let plane = landing_plane();
+    plane.boot(&NoChain, BOOT).expect("boot");
+    let stream = recorded_stream();
+    let event = stream.first().expect("an event");
+
+    let proposals = plane.propose(event).await.expect("a fresh observation proposes");
+    assert_eq!(proposals.len(), 1);
+    let handled = plane.handle_proposal(event, &proposals[0]).await;
+    assert!(matches!(handled, Handled::Closed { .. }), "{handled:?}");
+
+    match plane.propose(event).await {
+        Err(Handled::Redelivered { .. }) => {}
+        other => panic!("the same observation again is a redelivery: {other:?}"),
+    }
+}
+
+/// R21: a proposal too old to simulate is filed as a stale-state miss.
+#[tokio::test]
+async fn a_stale_proposal_is_filed_as_a_miss() {
+    let plane = landing_plane();
+    plane.boot(&NoChain, BOOT).expect("boot");
+    let event = recorded_stream().remove(0);
+    let proposals = plane.propose(&event).await.expect("proposes");
+
+    let handled = plane.decline_stale(&proposals[0], DurationNanos(1_500_000_000));
+    assert!(matches!(handled, Handled::Declined(Decline::StaleState { .. })), "{handled:?}");
+    let misses = plane.drain_misses();
+    assert_eq!(misses.len(), 1);
+    assert_eq!(misses.misses()[0].record.reason, MissReason::StaleState);
 }

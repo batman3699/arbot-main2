@@ -80,6 +80,9 @@ else:
     print(f"  reloads     {rl['full']} full, {rl['partial']} partial, {rl['failed']} failed; pools refused {rl['pools_refused']}, removed {rl['pools_removed']}")
     print(f"  reads       view {rf['view']}, twap {rf['twap']}, l1 {rf['l1']} failures")
     print(f"  feed        {fd['sessions']} sessions ({max(fd['sessions'] - 1, 0)} reconnects), {fd['dropped']} dropped, lossless {fd['fast_lane_lossless']}")
+    q = r.get("queue")
+    if q:  # R21: absent from a report before the queue
+        print(f"  queue       {q['stale']} dropped as stale, {q['conflicts']} as conflicts, deepest {q['max_depth']}")
     print(f"  capacity    {cap['samples']} samples, {cap['blocks_held']} blocks held, largest window {cap['largest_window']:,} gas")
     if "route_other_wei" in c:
         print(f"  costs       base fee {c['base_fee_wei'] / 1e9:.4f} gwei; per route {c['route_other_wei'] / 1e18:.8f} ETH (L1 fee, failure) + its own gas")

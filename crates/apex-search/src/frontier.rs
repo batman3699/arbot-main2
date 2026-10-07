@@ -430,6 +430,12 @@ pub struct RouteProposal {
     /// input to that search, never a substitute for it, and the type is what says
     /// so rather than a comment asking nicely.
     pub size_hint: Option<U256>,
+    /// Engine C's net at `size_hint`, in the start token's wei: what the shadow's
+    /// capture loop orders a spike's proposals by (R21). An ordering input only,
+    /// exactly as `size_hint` is: the economics re-evaluates every proposal
+    /// against the book as it then stands. `None` from an engine that does not
+    /// size.
+    pub net_hint: Option<U256>,
 }
 
 /// Which engine proposed a route, and from where.

@@ -435,5 +435,6 @@ pub fn to_proposal(
         origin: ProposalOrigin::NegativeCycle,
         flash_source: None,
         size_hint: None,
+        net_hint: None,
     }
 }

@@ -195,6 +195,7 @@ impl RouteSource for FixedSearch {
                 origin: ProposalOrigin::FiniteSize,
                 flash_source: c.flash_source.as_ref().map(|f| f.provider),
                 size_hint: Some(c.input_amount.get()),
+                net_hint: None,
             })
             .collect()
     }
@@ -228,6 +229,7 @@ pub fn proposal_for(c: &Candidate) -> RouteProposal {
         origin: ProposalOrigin::FiniteSize,
         flash_source: c.flash_source.as_ref().map(|f| f.provider),
         size_hint: Some(c.input_amount.get()),
+        net_hint: None,
     }
 }
 

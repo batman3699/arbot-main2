@@ -9,13 +9,14 @@
 //! because `graph.rs`'s edge weights are rate-only and carry no gas term.
 
 use alloy_primitives::{Address, B256};
-use apex_math::finite_size::{best_size, NoSize, SearchBudget, SizedOpportunity, SizedRoute};
+use apex_math::finite_size::{best_size, NoSize, SearchBudget, SizedOpportunity, SizedRoute, Surplus};
 use apex_search::engine_c::{FiniteSizeEngine, TemplatePricer};
 use apex_search::frontier::{
     FeeVariant, Frontier, GasClass, ProposalOrigin, RouteId, RouteTemplate,
 };
 use apex_state::feed::event::{EventKind, StateEvent};
 use apex_state::Ordinal;
+use apex_types::compat::u256_to_alloy;
 use apex_types::ids::{ChainId, FlashProviderId, PoolId, TokenId, VenueId};
 use apex_types::route::{ComplexityCost, RouteCommitment};
 use apex_types::state::StateFingerprint;
@@ -393,4 +394,20 @@ fn the_proposal_commits_to_versions_read_before_pricing() {
     let plain = Fixture { routes: routes() };
     let out = FiniteSizeEngine::measured().propose(&hits, &permit, &event, &frontier, &plain);
     assert_eq!(out.proposals[0].state_fingerprint, event.fingerprint);
+}
+
+/// R21: a proposal carries the net its size was found at, so the capture loop
+/// can take a spike's most valuable proposal first.
+#[test]
+fn a_proposal_carries_the_net_its_size_was_found_at() {
+    let route = route_at(200, GAS);
+    let Surplus::Gain(expected) = best_size(&route, SearchBudget::default()).expect("pays").net else {
+        panic!("a proposal is a gain");
+    };
+    let mut frontier = Frontier::new();
+    frontier.insert(template(1, 3_000)).expect("consistent");
+    let (hits, permit) = frontier.revalue(&swap());
+    let pricer = Fixture { routes: BTreeMap::from([(RouteId(1), route)]) };
+    let out = FiniteSizeEngine::measured().propose(&hits, &permit, &swap(), &frontier, &pricer);
+    assert_eq!(out.proposals[0].net_hint, Some(u256_to_alloy(expected)));
 }

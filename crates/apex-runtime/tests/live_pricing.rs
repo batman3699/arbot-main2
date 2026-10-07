@@ -616,8 +616,38 @@ async fn the_economics_sizes_a_route_through_a_deep_pool() {
         origin: ProposalOrigin::FiniteSize,
         flash_source: None,
         size_hint: None,
+        net_hint: None,
     };
     let size = econ.size(&proposal).await.expect("the economics sizes it");
     assert!(size.get() > alloy_primitives::U256::ZERO);
     assert!(size.get() <= alloy_primitives::U256::from(10u128.pow(24)));
+}
+
+/// R21: a route sizes within what the lender holds. The gap of
+/// `a_gap_wider_than_the_fees_has_a_profitable_size`, capped at half the size
+/// it finds unbounded.
+#[test]
+fn a_route_sizes_within_the_lenders_holding() {
+    let b = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L), pool(SLIP, Venue::Slipstream, -197_300, 80, L)]);
+    let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
+    let free = LivePricer::new(b.clone(), cycles.clone(), flat(3_000_000_000_000), gas::MEASURED);
+    let (id, unbounded) = cycles
+        .keys()
+        .find_map(|id| free.best_size(*id, &fp(), budget()).ok().map(|s| (*id, s.amount_in)))
+        .expect("one direction pays");
+    let cap = unbounded / 2;
+    let (_tx, rx) = tokio::sync::watch::channel(Some(cap));
+    let capped = LivePricer::new(b, cycles, flat(3_000_000_000_000), gas::MEASURED).with_lender(rx);
+    let sized = capped.best_size(id, &fp(), budget()).expect("still pays at half the size");
+    assert!(sized.amount_in <= cap, "{} > {}", sized.amount_in, cap);
+}
+
+/// R21: an unread lender holding sizes nothing, as an unread pool balance does.
+#[test]
+fn an_unread_lender_sizes_nothing() {
+    let b = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L), pool(SLIP, Venue::Slipstream, -197_300, 80, L)]);
+    let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let pricer = LivePricer::new(b, cycles.clone(), flat(3_000_000_000_000), gas::MEASURED).with_lender(rx);
+    assert!(cycles.keys().all(|id| pricer.best_size(*id, &fp(), budget()).is_err()));
 }

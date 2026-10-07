@@ -36,6 +36,7 @@
 pub mod config;
 pub mod funnel;
 pub mod nothing_sent;
+pub mod queue;
 pub mod reload;
 
 use crate::bus::{EventBus, Lane, Subscription as BusSubscription};
@@ -55,7 +56,7 @@ use crate::live::pricing::LivePricer;
 use crate::live::reader::{ChainReader, ReaderConfig};
 use crate::live::reads::ChainReads;
 use crate::live::sim::{BlockContext, LiveSimulator};
-use crate::plane::{DispatchLane, Plane, Ports};
+use crate::plane::{DispatchLane, Handled, Plane, Ports};
 use crate::risk::LiveRiskGate;
 use crate::search::FrontierSearch;
 use crate::shutdown::Shutdown;
@@ -80,14 +81,17 @@ use apex_econ::cost::l1_data::{L1FeeModel, L1FeeParameters};
 use apex_risk::breaker::CircuitBreaker;
 use apex_risk::posture::PostureLadder;
 use apex_search::engine_d::EventEngine;
+use apex_state::feed::event::StateEvent;
 use apex_state::Versioned;
 use apex_types::cost::GasUsed;
 use apex_types::flash::CallbackConstraints;
 use apex_types::ids::{ChainId, SignerLaneId, StrategyId, SubmissionLaneId, TokenId};
 use apex_types::state::ReconstructionStatus;
+use apex_types::ticket::TicketOutcome;
 use config::ShadowConfig;
 use funnel::{Counts, Funnel};
 use nothing_sent::NothingSent;
+use queue::{pools_of, PendingQueue};
 use reload::{ReloadQueue, Work};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -141,6 +145,11 @@ struct Stats {
     capacity_refused: AtomicU64,
     misses_written: AtomicU64,
     base_fee_wei: AtomicU64,
+    /// R21's queue: proposals dropped as too old, or as sharing a pool with a
+    /// ticket just dispatched, and the deepest it got.
+    queue_stale: AtomicU64,
+    queue_conflicts: AtomicU64,
+    queue_max_depth: AtomicU64,
 }
 
 fn bump(c: &AtomicU64) {
@@ -200,6 +209,8 @@ struct Shadow {
     heads: watch::Sender<Option<Head>>,
     /// The block being built, from the feed: what Tier 2 simulates in (R18).
     building: watch::Sender<Option<BlockContext>>,
+    /// What the lender holds, for sizing (R21); read with the reader's view.
+    lender: watch::Sender<Option<ethers_core::types::U256>>,
     largest_window: AtomicU64,
     recorder: tokio::sync::Mutex<FlashblockRecorder>,
     feed_stats: Versioned<Option<Arc<WsStats>>>,
@@ -399,7 +410,11 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     // Built before the economics it serves, so it starts at costs no route
     // clears; `Costs::new` aligns it with the economics' before anything prices.
     let unpriced = RouteCosts { other_wei: u128::MAX, wei_per_gas: u128::MAX };
-    let pricer = Arc::new(LivePricer::new(Arc::clone(&book), cycles.clone(), unpriced, gas::MEASURED));
+    // R21: what the lender holds, for sizing. Seeded with the boot read; the
+    // head loop replaces it after every view the reader takes.
+    let (lender, lender_now) = watch::channel(Some(ethers_core::types::U256::from(holding)));
+    let pricer =
+        Arc::new(LivePricer::new(Arc::clone(&book), cycles.clone(), unpriced, gas::MEASURED).with_lender(lender_now));
     let pricer_near_misses = pricer.near_misses();
     let econ = Arc::new(
         LiveEconomics::new(pricer.clone(), ScenarioPriors::default(), chain_costs, StrategyId(1)).with_flash(terms),
@@ -513,6 +528,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         reloads: ReloadQueue::default(),
         heads,
         building,
+        lender,
         largest_window: AtomicU64::new(0),
         recorder: tokio::sync::Mutex::new(FlashblockRecorder::new(FlashblockRecorder::DEFAULT_WINDOW)),
         feed_stats: Versioned::new(None, ReconstructionStatus::Rebuilding),
@@ -590,16 +606,52 @@ impl Shadow {
         }
     }
 
-    /// Events into the plane, while the book can be priced from.
+    /// Events into the plane, while the book can be priced from — through one
+    /// queue, best first (R21; see `queue`).
     async fn capture(&self, sub: &mut BusSubscription) {
-        while let Some(ev) = sub.recv().await {
-            self.funnel.event();
+        let mut queue = PendingQueue::default();
+        loop {
+            // Wait only when there is nothing to do.
+            if queue.is_empty() {
+                let Some(ev) = sub.recv().await else { return };
+                self.take(&mut queue, ev).await;
+            }
+            // Everything already waiting, before choosing.
+            while let Some(ev) = sub.try_recv() {
+                self.take(&mut queue, ev).await;
+            }
+            // Priced against a book being rebuilt: dropped, not handled. A route
+            // that still pays is proposed again once the book is verified.
             if self.book.status() != ReconstructionStatus::Verified {
-                self.funnel.skipped_unverified();
+                queue.clear();
                 continue;
             }
-            let handled = self.plane.on_event(&ev).await;
-            self.funnel.record(&handled);
+            let popped = queue.pop_best(SystemClock.now());
+            let stale: Vec<Handled> =
+                popped.stale.iter().map(|(p, age)| self.plane.decline_stale(&p.proposal, *age)).collect();
+            self.stats.queue_stale.fetch_add(stale.len() as u64, Ordering::Relaxed);
+            self.funnel.record(&stale);
+            self.stats.queue_max_depth.fetch_max(queue.max_depth() as u64, Ordering::Relaxed);
+            let Some(best) = popped.best else { continue };
+            let handled = self.plane.handle_proposal(&best.event, &best.proposal).await;
+            if dispatched(&handled) {
+                let n = queue.drop_conflicting(&pools_of(&best.proposal));
+                self.stats.queue_conflicts.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            self.funnel.record(std::slice::from_ref(&handled));
+        }
+    }
+
+    /// One event: counted, then proposed and queued while the book is verified.
+    async fn take(&self, queue: &mut PendingQueue, ev: Arc<StateEvent>) {
+        self.funnel.event();
+        if self.book.status() != ReconstructionStatus::Verified {
+            self.funnel.skipped_unverified();
+            return;
+        }
+        match self.plane.propose(&ev).await {
+            Ok(proposals) => queue.merge(&ev, proposals),
+            Err(handled) => self.funnel.record(std::slice::from_ref(&handled)),
         }
     }
 
@@ -697,6 +749,14 @@ impl Shadow {
             let Some(h) = heads.borrow_and_update().clone() else { continue };
             let window = self.largest_window.load(Ordering::Relaxed);
             view.note("the live reader's view", self.reader.refresh(&h, window).await, &self.stats.view_failures);
+            if let Some(v) = self.reader.view() {
+                let held = Some(ethers_core::types::U256::from(v.lender_holding));
+                self.lender.send_if_modified(|now| {
+                    let moved = *now != held;
+                    *now = held;
+                    moved
+                });
+            }
             twap.note("Slipstream's TWAPs", self.book.refresh_twaps(&self.reads, h.number).await.map(|_| ()), &self.stats.twap_failures);
             if l1.is_none_or(|(at, _)| h.number >= at.saturating_add(every)) {
                 let read = costs::read_l1(&self.reads, h.number).await;
@@ -812,6 +872,11 @@ impl Shadow {
             },
             misses_written: get(&self.stats.misses_written),
             near_miss: self.near_misses.report(),
+            queue: QueueReport {
+                stale: get(&self.stats.queue_stale),
+                conflicts: get(&self.stats.queue_conflicts),
+                max_depth: get(&self.stats.queue_max_depth),
+            },
         };
         info!(
             head = ?r.head,
@@ -878,6 +943,24 @@ pub struct Report {
     /// How close the priced routes came to paying: the best net over a ladder
     /// of sizes, as basis points of the size (R14).
     pub near_miss: NearMissReport,
+    /// R21's queue: what it dropped, and how deep it got.
+    pub queue: QueueReport,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QueueReport {
+    /// Proposals older than `queue::MAX_PROPOSAL_AGE` when picked, filed as
+    /// stale-state misses.
+    pub stale: u64,
+    /// Proposals sharing a pool with a ticket just dispatched.
+    pub conflicts: u64,
+    pub max_depth: u64,
+}
+
+/// A ticket that went to a dispatcher: its pools are about to move.
+fn dispatched(h: &Handled) -> bool {
+    matches!(h, Handled::Closed { outcome, .. }
+        if matches!(**outcome, TicketOutcome::Success { .. } | TicketOutcome::ShadowDispatched { .. }))
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -129,16 +129,30 @@ impl LiveCycle {
     }
 }
 
+/// What the lender holds of the start token, as last read: the most any cycle
+/// may borrow (R21). `None` until read, which sizes nothing.
+pub type LenderHolding = tokio::sync::watch::Receiver<Option<U256>>;
+
 /// A cycle and what settling it costs: what Engine C and the economics size.
 pub struct CostedCycle {
     cycle: LiveCycle,
     costs: RouteCosts,
     gas: SettlementGas,
+    /// A bound on the input beside the paying pool's holding: the lender's.
+    cap: Option<U256>,
 }
 
 impl CostedCycle {
     pub const fn new(cycle: LiveCycle, costs: RouteCosts, gas: SettlementGas) -> Self {
-        Self { cycle, costs, gas }
+        Self { cycle, costs, gas, cap: None }
+    }
+
+    /// Bound every size at `cap` as well as at the paying pool's holding: the
+    /// lender's holding, for a cycle that borrows (R21).
+    #[must_use]
+    pub const fn capped(mut self, cap: Option<U256>) -> Self {
+        self.cap = cap;
+        self
     }
 
     fn cost_of(&self, gas: GasEstimate) -> U256 {
@@ -191,7 +205,8 @@ impl SizedRoute for CostedCycle {
     }
 
     fn max_input(&self) -> U256 {
-        self.cycle.max_input()
+        let held = self.cycle.max_input();
+        self.cap.map_or(held, |c| held.min(c))
     }
 
     /// The output and its cost from one quote: the crossings that price the size
@@ -220,13 +235,26 @@ pub struct LivePricer {
     gas: SettlementGas,
     /// How close each route Engine C prices comes to paying (R14).
     near_misses: Arc<NearMisses>,
+    /// The lender's holding, when sizing is bounded by it (R21).
+    lender: Option<LenderHolding>,
 }
 
 impl LivePricer {
     pub fn new(book: Arc<PoolBook>, cycles: BTreeMap<RouteId, Cycle>, costs: RouteCosts, gas: SettlementGas) -> Self {
         let by_hash = cycles.iter().map(|(id, c)| (c.commitment.route_hash, *id)).collect();
         let costs = apex_state::Versioned::new(costs, apex_types::state::ReconstructionStatus::Verified);
-        Self { book, cycles, by_hash, costs, gas, near_misses: Arc::default() }
+        Self { book, cycles, by_hash, costs, gas, near_misses: Arc::default(), lender: None }
+    }
+
+    /// Size every cycle within the lender's holding as `lender` reports it.
+    /// Every live cycle borrows from Balancer (`frontier::BALANCER_FLASH`), so
+    /// the cap applies to all of them. Without it, sizing is bounded only by the
+    /// paying pool, and an optimum above the lender's holding is refused whole
+    /// by the risk gate rather than traded smaller.
+    #[must_use]
+    pub fn with_lender(mut self, lender: LenderHolding) -> Self {
+        self.lender = Some(lender);
+        self
     }
 
     /// How close the routes Engine C has priced came to paying.
@@ -254,7 +282,8 @@ impl LivePricer {
 
     fn live(&self, id: RouteId) -> Option<CostedCycle> {
         let cycle = LiveCycle::new(self.cycles.get(&id)?, &self.book.snapshot())?;
-        Some(CostedCycle::new(cycle, self.costs(), self.gas))
+        let cap = self.lender.as_ref().map(|l| (*l.borrow()).unwrap_or_default());
+        Some(CostedCycle::new(cycle, self.costs(), self.gas).capped(cap))
     }
 }
 

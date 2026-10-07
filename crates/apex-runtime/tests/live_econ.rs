@@ -166,6 +166,7 @@ fn proposal(hops: usize) -> RouteProposal {
         origin: ProposalOrigin::FiniteSize,
         flash_source: None,
         size_hint: Some(AlloyU256::from(1u64)),
+        net_hint: None,
     }
 }
 

@@ -42,7 +42,7 @@
 //! of is a budget nobody can set.
 
 use crate::frontier::{Frontier, ProposalOrigin, Revalued, RouteId, RouteProposal};
-use apex_math::finite_size::{NoSize, SearchBudget, SizedOpportunity};
+use apex_math::finite_size::{NoSize, SearchBudget, SizedOpportunity, Surplus};
 use apex_state::feed::event::StateEvent;
 use apex_types::compat::u256_to_alloy;
 use apex_types::ids::{ChainId, FlashProviderId, VenueId};
@@ -196,6 +196,12 @@ impl FiniteSizeEngine {
                         // so this is an input to that refinement and the type is
                         // what says so.
                         size_hint: Some(u256_to_alloy(best.amount_in)),
+                        // `Ok` is a gain (see above), so the loss arm cannot
+                        // happen; `None` keeps the type honest if it ever did.
+                        net_hint: match best.net {
+                            Surplus::Gain(g) => Some(u256_to_alloy(g)),
+                            Surplus::Loss(_) => None,
+                        },
                     });
                 }
                 Err(why) => declined.push(Declined { route: *id, why }),

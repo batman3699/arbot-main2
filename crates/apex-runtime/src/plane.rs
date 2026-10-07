@@ -914,10 +914,26 @@ impl Plane {
 
     /// One event, end to end, for every proposal it produces.
     pub async fn on_event(&self, event: &StateEvent) -> Vec<Handled> {
+        let proposals = match self.propose(event).await {
+            Ok(p) => p,
+            Err(handled) => return vec![handled],
+        };
+        let mut out = Vec::with_capacity(proposals.len());
+        for proposal in &proposals {
+            out.push(self.handle_proposal(event, proposal).await);
+        }
+        out
+    }
+
+    /// What `event` proposes, or why it proposes nothing: a redelivery, or a
+    /// candidate-generation budget that is spent. The shadow's capture loop
+    /// queues these and handles the best first (R21); `on_event` handles them
+    /// in order.
+    pub async fn propose(&self, event: &StateEvent) -> Result<Vec<RouteProposal>, Handled> {
         // The cheapest check first, and before any budget is spent: has this
         // exact observation already been handled? See `SeenEvents`.
         if !self.seen.take(event.chain, event.at) {
-            return vec![Handled::Redelivered { chain: event.chain, at: event.at }];
+            return Err(Handled::Redelivered { chain: event.chain, at: event.at });
         }
 
         // §29.3: candidate generation is a bounded class. Reserved before the
@@ -925,18 +941,21 @@ impl Plane {
         // queuing it.
         let Some(_permit) = self.budgets.reserve(ResourceClass::CandidateGeneration) else {
             let d = Decline::NoBudget(ResourceClass::CandidateGeneration);
-            return vec![Handled::Declined(self.file(None, &d))];
+            return Err(Handled::Declined(self.file(None, &d)));
         };
 
-        let proposals = self.ports.search.propose(event).await;
-        let mut out = Vec::with_capacity(proposals.len());
-        for proposal in proposals {
-            out.push(self.handle(event, &proposal).await);
-        }
-        out
+        Ok(self.ports.search.propose(event).await)
     }
 
-    async fn handle(&self, event: &StateEvent, proposal: &RouteProposal) -> Handled {
+    /// A proposal too old to be worth a simulation, filed as the stale-state
+    /// miss it is (R21): it would reach Tier 2 past its deadline.
+    pub fn decline_stale(&self, proposal: &RouteProposal, age: DurationNanos) -> Handled {
+        Handled::Declined(self.file_proposal(proposal, &Decline::StaleState { age }))
+    }
+
+    /// One proposal, end to end: refined into a candidate, then the ticket's
+    /// protocol.
+    pub async fn handle_proposal(&self, event: &StateEvent, proposal: &RouteProposal) -> Handled {
         // §46.2's four stages, concurrently, and their join is what makes a
         // candidate exist at all. Before this point there is a route; after it
         // there is a trade with a size.
