@@ -100,8 +100,10 @@ The report (`data/census/report-<from>-<to>.md` and `.json`) has:
 2. **The market-maker venues:** trades that profit against each, their banked
    value, and the share taken by the top three accounts.
 3. **Pairs:** the same, by unordered token pair, long-tail tokens included,
-   each marked against the report's promotion gates (two or more venues,
-   $100k of depth, a venue whose state we can reconstruct).
+   each marked against the report's promotion gates the census can judge
+   (two or more venues, a venue whose state we can reconstruct). The $100k
+   depth gate is checked at promotion, from the pools' own balances: the
+   census does not read them.
 4. **Coverage:** what each venue's decoder verified, and what was not covered.
 
 ## Shape
