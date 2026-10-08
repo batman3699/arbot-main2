@@ -10,13 +10,20 @@ from pathlib import Path
 from arb_census.venues import MARKET_MAKERS, OURS
 
 BLOCKS_PER_HOUR = 1800
+# Venue sets are combined from this many venues outside ours: those with the
+# most arbitrage value needing them.
+UNLOCK_CANDIDATES = 12
 DATA = Path(__file__).resolve().parents[3] / "data" / "census"
 
 
 def value(a):
+    """What the bot kept after costs, never more than its legs took from the
+    pools (`est_usd`): more than that is someone else's flow counted as the
+    bot's, since ETH moves without logs."""
+    est = float(a.get("est_usd") or 0.0)
     if a.get("valued_by") == "banked":
-        return float(a.get("banked_usd") or 0.0)
-    return float(a.get("est_usd") or 0.0)
+        return min(float(a.get("banked_usd") or 0.0), est)
+    return est
 
 
 def _hour(a, lo):
@@ -46,7 +53,7 @@ def _row(arbs, spikes, lo):
     return {"arbs": len(arbs), "gross": round(sum(vals), 2), "net": round(sum(vals) - gas, 2),
             "spike": round(spike, 2), "calm": round(sum(vals) - spike, 2),
             "p50": round(_q(vals, 0.5), 4), "p90": round(_q(vals, 0.9), 2),
-            "bots": len({a.get("sender") for a in arbs if a.get("sender")})}
+            "senders": len({a.get("sender") for a in arbs if a.get("sender")})}
 
 
 def venue_table(arbs, spikes, lo=0):
@@ -59,13 +66,18 @@ def venue_table(arbs, spikes, lo=0):
 
 def unlock_table(arbs, spikes, hours, lo=0):
     """What adding venues to ours would make reachable: arbitrage needing
-    exactly those venues beyond ours, alone and in combinations of up to 3."""
+    exactly those venues beyond ours, alone and in combinations of up to 3,
+    among the `UNLOCK_CANDIDATES` venues with the most value needing them."""
     need = {}
     for a in arbs:
         n = frozenset(a["venues"]) - OURS
         if n:
             need.setdefault(n, []).append(a)
-    cands = sorted({v for n in need for v in n})
+    weight = {}
+    for n, xs in need.items():
+        for v in n:
+            weight[v] = weight.get(v, 0.0) + sum(value(a) for a in xs)
+    cands = sorted(sorted(weight, key=lambda v: -weight[v])[:UNLOCK_CANDIDATES])
     rows = []
     for k in (1, 2, 3):
         for combo in itertools.combinations(cands, k):
@@ -139,11 +151,11 @@ def main():
     stem.with_suffix(".json").write_text(json.dumps(out, indent=1))
     md = [f"# Base arbitrage census, blocks {lo}–{hi}\n",
           f"{len(arbs):,} arbitrages, ${out['gross']:,.0f} gross over {hours} hours; spike hours: {len(spikes)}.\n",
-          "\n## Venues\n", _md_table(out["venues"], ["venue", "arbs", "gross", "net", "calm", "spike", "p50", "p90", "bots"]),
+          "\n## Venues\n", _md_table(out["venues"], ["venue", "arbs", "gross", "net", "calm", "spike", "p50", "p90", "senders"]),
           "\n## What adding venues would make reachable (beyond ours)\n",
           _md_table(out["unlock"], ["add", "arbs", "gross", "spike", "calm_per_day", "p50", "p90"]),
           "\n## Against the market-maker venues\n", _md_table(out["market_makers"], ["venue", "arbs", "gross", "top3_share"]),
-          "\n## Pairs\n", _md_table(out["pairs"], ["pair", "arbs", "gross", "calm", "spike", "p50", "p90", "bots", "venues_seen", "two_venues", "reconstructable_venue"]),
+          "\n## Pairs\n", _md_table(out["pairs"], ["pair", "arbs", "gross", "calm", "spike", "p50", "p90", "senders", "venues_seen", "two_venues", "reconstructable_venue"]),
           "\n## Coverage\n", _md_table([{"venue": k, **v} for k, v in coverage.items()], ["venue", "checked", "passed", "counts"])]
     stem.with_suffix(".md").write_text("".join(md))
     print(stem.with_suffix(".md"))

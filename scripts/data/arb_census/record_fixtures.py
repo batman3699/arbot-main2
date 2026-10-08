@@ -22,6 +22,14 @@ FIXTURES = {
     "native_out_by_executor": "0x9175d5ac765351261c45570a8c5e70b28e0afb29446c39060e588f462f0af41a",
     # The executor keeps the profit and unwraps it; the target pays a fee.
     "profit_at_executor": "0x8a90e4098bd6520fb56132febee824d2ca9fca558e95de9ed6687fc76c46b7bc",
+    # The v4 PoolManager wraps the ETH a v4 pool paid out; the bot gets none.
+    "venue_wraps": "0x66b8c93685bf21ed7a3d0ec976861cd8f79fa10533faed119d7ce03c3a614f42",
+    # The bot pays WETH to an address that unwraps it: a payee, not the bot.
+    "payee_unwraps": "0x4dd1d19bc2b5dbd634eda032701764d95ecfc9db0759e836c16d80f0da032801",
+    # An address outside the bot unwraps the ETH a v4 pool takes.
+    "other_unwraps": "0xd138e73e60fa35b8eb60f33868d61fa44d754386a40646572083cab875f505c8",
+    # A pool drained through its own pricing, 12 swaps in one pool.
+    "single_pool_drain": "0x489f40fa0f12740991d5b7e6844c51db41fae2eccff122fbc24f40195ba751de",
 }
 OUT = Path(__file__).resolve().parent / "fixtures"
 

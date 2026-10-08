@@ -94,6 +94,36 @@ class FixtureTest(unittest.TestCase):
         legs = detect.legs_of(f["receipt"], f["meta"])
         self.assertEqual(detect.banked(f["receipt"], legs).get(WETH), 8297473281402047 - 2077151399059272)
 
+    def test_eth_a_venue_wraps_is_not_the_bots(self):
+        # The v4 PoolManager wrapped the 0.748 ETH a v4 pool paid out and sent
+        # it on as WETH; the 3.63 USDC profit went to a third address.
+        f = fixture("venue_wraps")
+        legs = detect.legs_of(f["receipt"], f["meta"])
+        self.assertEqual(detect.banked(f["receipt"], legs), {})
+
+    def test_eth_an_adapter_unwraps_for_a_venue_is_not_charged_twice(self):
+        # 0xa537... unwrapped the bot's 0.1004 WETH to pay a v4 pool and
+        # wrapped the 0.1019 ETH another paid back; it trades with no venue by
+        # Transfer. The bot kept the 0.0015 WETH difference.
+        f = fixture("other_unwraps")
+        legs = detect.legs_of(f["receipt"], f["meta"])
+        self.assertEqual(detect.banked(f["receipt"], legs), {WETH: 101940629516092826 - 100413320800297764})
+
+    def test_an_address_that_unwraps_what_the_bot_paid_it_is_a_payee(self):
+        # The bot wrapped 0.239 ETH and paid it to 0xf4b1..., which unwrapped
+        # it; later it bought the WETH back. It kept nothing.
+        f = fixture("payee_unwraps")
+        legs = detect.legs_of(f["receipt"], f["meta"])
+        self.assertEqual(detect.banked(f["receipt"], legs), {})
+
+    def test_a_pool_drained_through_its_own_pricing_is_not_an_arbitrage(self):
+        # 12 swaps in one Curve pool took 15.1 WETH and 13.0 wstETH out of it:
+        # an exploit, with no second price to arbitrage against.
+        f = fixture("single_pool_drain")
+        legs = detect.legs_of(f["receipt"], f["meta"])
+        self.assertEqual(len(legs), 12)
+        self.assertFalse(detect.is_arbitrage(legs))
+
     def test_gas_includes_the_l1_fee(self):
         f = fixture("spike_855")
         r = f["receipt"]
