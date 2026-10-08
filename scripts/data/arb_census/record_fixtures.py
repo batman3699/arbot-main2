@@ -15,6 +15,13 @@ FIXTURES = {
     "user_route": "0x0a801f75b94e7501133eb742233ae374d21e02fc6083dca50224ec1050ca6c13",
     # Pays native ETH into a Uniswap v4 pool: no Transfer log carries it.
     "native_v4": "0x3e548fc63a4eceb533021056ddc3331d696881e07f18621f15e35384b3480aeb",
+    # An executor that is neither sender nor target unwraps WETH and pays the
+    # ETH into a v4 pool; the profit goes to a third address.
+    "native_in_by_executor": "0x38803fccf4344f9a919562c3dd21c2a5e98b410f0864d57ef8fe1e58bdc983b0",
+    # The mirror: a v4 pool pays ETH that a third-party executor wraps.
+    "native_out_by_executor": "0x9175d5ac765351261c45570a8c5e70b28e0afb29446c39060e588f462f0af41a",
+    # The executor keeps the profit and unwraps it; the target pays a fee.
+    "profit_at_executor": "0x8a90e4098bd6520fb56132febee824d2ca9fca558e95de9ed6687fc76c46b7bc",
 }
 OUT = Path(__file__).resolve().parent / "fixtures"
 

@@ -71,6 +71,29 @@ class FixtureTest(unittest.TestCase):
         kept = detect.banked(f["receipt"], legs).get(WETH, 0)
         self.assertTrue(0 < kept < 10**14, kept)
 
+    def test_eth_an_executor_unwrapped_and_paid_in_is_not_charged_to_the_sender(self):
+        # Executor 0x1c96... (neither sender nor target) unwrapped 0.335 WETH
+        # and paid it into a v4 pool; the 0.0059 WETH profit went to a third
+        # address. The sender and target kept nothing, and lost nothing.
+        f = fixture("native_in_by_executor")
+        legs = detect.legs_of(f["receipt"], f["meta"])
+        self.assertTrue(detect.is_arbitrage(legs))
+        self.assertEqual(detect.banked(f["receipt"], legs), {})
+
+    def test_eth_a_v4_pool_paid_to_an_executor_that_wrapped_it_is_not_credited_to_the_sender(self):
+        # A v4 pool paid 0.11413 ETH to executor 0x8f10..., which wrapped
+        # 0.11411 of it; only the 0.0000197 left over is the bot's gain.
+        f = fixture("native_out_by_executor")
+        legs = detect.legs_of(f["receipt"], f["meta"])
+        self.assertEqual(detect.banked(f["receipt"], legs).get(WETH), 19691080887285)
+
+    def test_profit_an_executor_keeps_and_unwraps_is_the_bots(self):
+        # Executor 0x20cc... took the 0.0083 WETH gain and unwrapped it; the
+        # target paid a 0.0021 WETH fee. The bot kept the difference.
+        f = fixture("profit_at_executor")
+        legs = detect.legs_of(f["receipt"], f["meta"])
+        self.assertEqual(detect.banked(f["receipt"], legs).get(WETH), 8297473281402047 - 2077151399059272)
+
     def test_gas_includes_the_l1_fee(self):
         f = fixture("spike_855")
         r = f["receipt"]

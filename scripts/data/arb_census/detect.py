@@ -3,7 +3,7 @@
 Closure is judged on decoded legs; value on the receipt's transfers, which
 also catch legs on venues no decoder reads.
 """
-from arb_census.venues import TRANSFER, WETH, decode, holds_at_emitter
+from arb_census.venues import TRANSFER, WETH, WETH_DEPOSIT, WETH_WITHDRAWAL, decode, holds_at_emitter
 
 # Spending under this share of a token's flow is rounding, not spending.
 DUST = 1e-4
@@ -44,13 +44,14 @@ def legs_of(receipt, meta):
 
 
 def banked(receipt, legs=()):
-    """Net ERC-20 transfers to the sender and its target: what the bot kept.
+    """Net ERC-20 transfers into the bot's addresses (`bot_addresses`): what
+    the bot kept.
 
     Native ETH paid to or taken from a venue shows in no Transfer log, so the
     decoded legs' native flows are counted against WETH: without them, a bot
     that paid ETH into a v4 pool and took WETH back looks to have kept it all.
     """
-    who = {receipt["from"].lower(), (receipt.get("to") or "").lower()}
+    who = bot_addresses(receipt)
     net = {}
     for log in receipt["logs"]:
         t = log["topics"]
@@ -66,6 +67,20 @@ def banked(receipt, legs=()):
     if paid_in:
         net[WETH] = net.get(WETH, 0) - paid_in
     return {k: v for k, v in net.items() if v}
+
+
+def bot_addresses(receipt):
+    """The sender, its target, and any other address that wraps or unwraps
+    WETH in this receipt: a bot's executor, which can hold its profit or pay
+    its ETH without the sender or target touching either. (No venue wrapped
+    or unwrapped in 500 sampled arbitrages on Curve, Fluid, Balancer, Uniswap
+    v4 and the market-maker venues, R23.)"""
+    who = {receipt["from"].lower(), (receipt.get("to") or "").lower()}
+    for log in receipt["logs"]:
+        t = log["topics"]
+        if len(t) == 2 and log["address"].lower() == WETH and t[0] in (WETH_DEPOSIT, WETH_WITHDRAWAL):
+            who.add("0x" + t[1][-40:])
+    return who
 
 
 def native_flow(receipt, legs):
