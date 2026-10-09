@@ -120,6 +120,8 @@ pub mod revert {
     pub const UNKNOWN_ADAPTER: [u8; 4] = [0x07, 0x69, 0xba, 0xab];
     /// `Error(string)`
     pub const ERROR_STRING: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
+    /// Aerodrome's router: `InsufficientOutputAmount()` — its minimum output (R24).
+    pub const INSUFFICIENT_OUTPUT_AMOUNT: [u8; 4] = [0x42, 0x30, 0x1c, 0x23];
 }
 
 /// The class of a revert, from its data and — for failures that carry none,
@@ -137,6 +139,7 @@ pub fn classify(data: &[u8], message: Option<&str>) -> RevertClass {
         DEBT_NOT_REPAID => RevertClass::FlashRepaymentShortfall,
         UNACCOUNTED_RESIDUE | PROFIT_TOKEN_NOT_BORROWED => RevertClass::ProfitInvariantViolated,
         ROUTE_EXPIRED => RevertClass::Expired,
+        INSUFFICIENT_OUTPUT_AMOUNT => RevertClass::MinOutNotMet,
         NOT_EXECUTOR | SELECTOR_NOT_ALLOWED | UNKNOWN_ADAPTER => RevertClass::Unauthorized,
         ERROR_STRING => match reason(data).as_deref() {
             Some("Too little received") => RevertClass::MinOutNotMet,

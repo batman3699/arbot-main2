@@ -43,6 +43,7 @@ pub struct PerVenue {
     pub uniswap_v3: u64,
     pub slipstream: u64,
     pub pancake_v3: u64,
+    pub aerodrome_v2: u64,
 }
 
 impl PerVenue {
@@ -53,6 +54,7 @@ impl PerVenue {
             // its crossings cost the same (R22's router simulation).
             Venue::Slipstream | Venue::SlipstreamV3 => self.slipstream,
             Venue::PancakeV3 => self.pancake_v3,
+            Venue::AerodromeV2 => self.aerodrome_v2,
         }
     }
 }
@@ -135,9 +137,20 @@ pub const ZERO_SLOT_PREMIUM: u64 = 17_100;
 /// price have all been crossed or written before, and the rising-price mean is
 /// higher by the share it meets that have not.
 pub const MEASURED: SettlementGas = SettlementGas {
-    hop: PerVenue { uniswap_v3: 225_700, slipstream: 303_000, pancake_v3: 236_000 },
-    crossing_down: PerVenue { uniswap_v3: 21_300, slipstream: 43_400, pancake_v3: 32_100 },
-    crossing_up: PerVenue { uniswap_v3: 27_200, slipstream: 48_300, pancake_v3: 36_300 },
+    hop: PerVenue {
+        uniswap_v3: 225_700,
+        slipstream: 303_000,
+        pancake_v3: 236_000,
+        // R24: PancakeSwap's measured hop (both through GENERIC adapters) plus
+        // what Aerodrome's router swap used over PancakeSwap's SmartRouter's,
+        // 205,780 − 175,239 gas: `eth_simulateV1` of 0.01 WETH → USDC from an
+        // override-funded account, 2026-10-09. Verification check 4 re-measures
+        // it through the executor.
+        aerodrome_v2: 266_500,
+    },
+    // Aerodrome v2 crosses no ticks.
+    crossing_down: PerVenue { uniswap_v3: 21_300, slipstream: 43_400, pancake_v3: 32_100, aerodrome_v2: 0 },
+    crossing_up: PerVenue { uniswap_v3: 27_200, slipstream: 48_300, pancake_v3: 36_300, aerodrome_v2: 0 },
     word: 0,
     // Twice the most any recorded trade needed (11,800).
     hop_margin: 30_000,
@@ -145,6 +158,8 @@ pub const MEASURED: SettlementGas = SettlementGas {
         uniswap_v3: 21_300 + 2 * ZERO_SLOT_PREMIUM,
         slipstream: 43_400 + 3 * ZERO_SLOT_PREMIUM,
         pancake_v3: 32_100 + 3 * ZERO_SLOT_PREMIUM,
+        // It crosses no ticks.
+        aerodrome_v2: 0,
     },
     // A cold read of the next word (2,100) and a loop of the swap.
     word_ceiling: 10_000,

@@ -59,6 +59,7 @@ fn pool(addr: Address, venue: Venue, token1: Address, depth_usd: f64) -> PoolSna
         last_log: None,
         dynamic_fee: None,
         seq: 0,
+        reserves: None,
     }
 }
 

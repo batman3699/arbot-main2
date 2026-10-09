@@ -9,6 +9,7 @@
 //! | `Swap`, not newer | nothing — it is the confirmed copy of a preconfirmed swap already applied | nothing |
 //! | `Swap` that leaves the ladder | applied, pool reloaded | that pool left out until reloaded: it cannot be priced |
 //! | `Mint` / `Burn` | pool reloaded — a range's liquidity changed | nothing |
+//! | `Sync` (Aerodrome v2, R24) | held with the burst; its reserves replace the pool's in the burst's one write | in the burst's event, sized by its reserve change |
 //! | a removed log (reorg) | pool reloaded — what was applied may not have happened | nothing |
 //! | `Reconnected` / `Gap` | what is held applied, whole book `Rebuilding`, then reloaded | nothing — state is unknown until rebuilt |
 //! | `Head` | the latest sealed block, for the next fingerprint | nothing |
@@ -43,7 +44,7 @@
 //! both feeds: the book refuses the second copy as not newer, and the event both
 //! would produce has one `Ordinal`, which the plane's redelivery check catches.
 
-use crate::live::book::{PoolBook, SwapApplied, SwapWrite};
+use crate::live::book::{PoolBook, PoolSnapshot, StateWrite, SwapApplied, SwapWrite, SyncWrite};
 use crate::live::abi;
 use crate::live::inventory::Venue;
 use crate::live::sim::BlockContext;
@@ -53,6 +54,7 @@ use apex_state::feed::event::{EventKind, StateEvent};
 use apex_state::Ordinal;
 use apex_types::ids::{ChainId, PoolId};
 use apex_types::state::StateFingerprint;
+use apex_types::compat::{u256_to_alloy, u256_to_ethers};
 use apex_types::time::UnixNanos;
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -79,6 +81,9 @@ pub const PANCAKE_SWAP: B256 = b256!("19b47279256b2a23a1665c810c8d55a1758940ee09
 pub const MINT: B256 = b256!("7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde");
 /// `Burn(address,int24,int24,uint128,uint256,uint256)`
 pub const BURN: B256 = b256!("0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c");
+/// Aerodrome v2's `Sync(uint256,uint256)`: a volatile pool's reserves after
+/// every swap, mint and burn — its whole state (R24).
+pub const SYNC: B256 = b256!("cf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a");
 
 /// Stablecoins valued at $1 when a swap's notional is estimated. The notional
 /// only decides whether a swap is large enough to search after (§12.4), so a
@@ -106,11 +111,13 @@ pub struct SwapLog {
     pub pending: bool,
 }
 
-/// The `Swap` topic a venue's pools emit.
+/// The log that carries a venue's post-trade state: a `Swap` for the
+/// concentrated-liquidity venues, `Sync` for Aerodrome v2.
 pub const fn swap_topic(venue: Venue) -> B256 {
     match venue {
         Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => SWAP,
         Venue::PancakeV3 => PANCAKE_SWAP,
+        Venue::AerodromeV2 => SYNC,
     }
 }
 
@@ -141,6 +148,131 @@ pub fn decode_swap(l: &RawLog) -> Option<SwapLog> {
     })
 }
 
+/// One decoded `Sync` (R24).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncLog {
+    pub pool: Address,
+    pub reserve0: U256,
+    pub reserve1: U256,
+    pub block: u64,
+    pub log_index: u64,
+    pub tx: B256,
+    pub pending: bool,
+}
+
+/// `None` for anything that is not a well-formed `Sync` with a position.
+pub fn decode_sync(l: &RawLog) -> Option<SyncLog> {
+    if l.topics.first() != Some(&SYNC) || l.data.len() != 64 {
+        return None;
+    }
+    Some(SyncLog {
+        pool: l.address,
+        reserve0: abi::word_u256(&l.data, 0)?,
+        reserve1: abi::word_u256(&l.data, 1)?,
+        block: l.block_number?,
+        log_index: l.log_index?,
+        tx: l.transaction_hash?,
+        pending: l.pending,
+    })
+}
+
+/// A log the feed holds until its burst is over: a swap's post-swap price, or
+/// a volatile pool's reserves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Held {
+    Swap(SwapLog),
+    Sync(SyncLog),
+}
+
+impl Held {
+    pub fn pool(&self) -> Address {
+        match self {
+            Self::Swap(s) => s.pool,
+            Self::Sync(s) => s.pool,
+        }
+    }
+
+    pub fn block(&self) -> u64 {
+        match self {
+            Self::Swap(s) => s.block,
+            Self::Sync(s) => s.block,
+        }
+    }
+
+    pub fn log_index(&self) -> u64 {
+        match self {
+            Self::Swap(s) => s.log_index,
+            Self::Sync(s) => s.log_index,
+        }
+    }
+
+    pub fn tx(&self) -> B256 {
+        match self {
+            Self::Swap(s) => s.tx,
+            Self::Sync(s) => s.tx,
+        }
+    }
+
+    pub fn pending(&self) -> bool {
+        match self {
+            Self::Swap(s) => s.pending,
+            Self::Sync(s) => s.pending,
+        }
+    }
+
+    fn write(&self) -> StateWrite {
+        match self {
+            Self::Swap(s) => StateWrite::Swap(SwapWrite {
+                pool: s.pool,
+                sqrt_price_x96: s.sqrt_price_x96,
+                liquidity: s.liquidity,
+                tick: s.tick,
+                at: (s.block, s.log_index),
+            }),
+            Self::Sync(s) => StateWrite::Sync(SyncWrite {
+                pool: s.pool,
+                reserve0: s.reserve0,
+                reserve1: s.reserve1,
+                at: (s.block, s.log_index),
+            }),
+        }
+    }
+}
+
+/// A pool's price, token1 per token0 in whole units: from its reserves, or its
+/// square-root price.
+pub fn pool_price(p: &PoolSnapshot) -> Option<f64> {
+    let raw = match &p.reserves {
+        Some(r) => u256_f64(r.reserve1) / u256_f64(r.reserve0),
+        None => {
+            let sqrt = u256_f64(p.state.sqrt_price_x96) / 2f64.powi(96);
+            sqrt * sqrt
+        }
+    };
+    let v = raw * 10f64.powi(i32::from(p.decimals.0) - i32::from(p.decimals.1));
+    (v.is_finite() && v > 0.0).then_some(v)
+}
+
+/// A `Sync`'s size in USD: the change in either reserve, whichever side can be
+/// priced, the larger if both can — the net of what the trade put in and took
+/// out.
+pub fn reserve_change_usd(
+    before: (U256, U256),
+    after: (U256, U256),
+    tokens: (Address, Address),
+    decimals: (u8, u8),
+    prices: &BTreeMap<Address, f64>,
+) -> Option<f64> {
+    let side = |a: U256, b: U256, token: Address, dec: u8| {
+        let d = if a > b { a - b } else { b - a };
+        prices.get(&token).map(|p| u256_f64(u256_to_ethers(d)) / 10f64.powi(i32::from(dec)) * p)
+    };
+    match (side(before.0, after.0, tokens.0, decimals.0), side(before.1, after.1, tokens.1, decimals.1)) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, y) => x.or(y),
+    }
+}
+
 /// A USD price per whole token for every token the book can price: stables at
 /// $1, and anything paired with a priced token through the deepest such pool.
 /// Two passes price every token within two pools of a stable — one quoted only
@@ -155,13 +287,8 @@ pub fn usd_prices(book: &PoolBook) -> BTreeMap<Address, f64> {
         pools.sort_by(|a, b| b.spec.depth_usd.total_cmp(&a.spec.depth_usd));
         for p in pools {
             let (t0, t1) = (p.spec.token0, p.spec.token1);
-            let sqrt = u256_f64(p.state.sqrt_price_x96) / 2f64.powi(96);
             // token1 per token0, in whole units.
-            let raw = sqrt * sqrt;
-            let one_per_zero = raw * 10f64.powi(i32::from(p.decimals.0) - i32::from(p.decimals.1));
-            if !one_per_zero.is_finite() || one_per_zero <= 0.0 {
-                continue;
-            }
+            let Some(one_per_zero) = pool_price(p) else { continue };
             match (prices.get(&t0).copied(), prices.get(&t1).copied()) {
                 (Some(_), Some(_)) | (None, None) => {}
                 (None, Some(p1)) => {
@@ -225,8 +352,8 @@ pub struct FeedHandler {
     last_head: Option<Head>,
     /// The newest block a preconfirmed log came from.
     newest_preconfirmed: Option<u64>,
-    /// The burst still arriving, in arrival order, each swap with when it came.
-    held: Vec<(SwapLog, UnixNanos)>,
+    /// The burst still arriving, in arrival order, each log with when it came.
+    held: Vec<(Held, UnixNanos)>,
 }
 
 impl FeedHandler {
@@ -264,7 +391,14 @@ impl FeedHandler {
             Notification::Log(l) if l.removed => vec![Effect::Reload(vec![l.address])],
             Notification::Log(l) => match l.topics.first() {
                 Some(t) if *t == MINT || *t == BURN => vec![Effect::Reload(vec![l.address])],
-                Some(t) if *t == SWAP || *t == PANCAKE_SWAP => self.hold(book, &l, now),
+                Some(t) if *t == SWAP || *t == PANCAKE_SWAP => match decode_swap(&l) {
+                    Some(s) => self.hold(book, Held::Swap(s), now),
+                    None => Vec::new(),
+                },
+                Some(t) if *t == SYNC => match decode_sync(&l) {
+                    Some(s) => self.hold(book, Held::Sync(s), now),
+                    None => Vec::new(),
+                },
                 _ => Vec::new(),
             },
         }
@@ -288,13 +422,12 @@ impl FeedHandler {
         self.held.last().map(|(_, at)| UnixNanos(at.0.saturating_add(quiet)))
     }
 
-    fn hold(&mut self, book: &PoolBook, l: &RawLog, now: UnixNanos) -> Vec<Effect> {
-        let Some(s) = decode_swap(l) else { return Vec::new() };
-        // A swap from a later block than a held preconfirmed one: that block
+    fn hold(&mut self, book: &PoolBook, s: Held, now: UnixNanos) -> Vec<Effect> {
+        // A log from a later block than a held preconfirmed one: that block
         // began after the held flashblock was published, so the burst is over.
-        // Only a preconfirmed swap dates the burst — a held confirmed copy is
-        // from an older block, and would end it at the next swap of its own.
-        let later = self.held.iter().any(|(h, _)| h.pending && h.block < s.block);
+        // Only a preconfirmed log dates the burst — a held confirmed copy is
+        // from an older block, and would end it at the next log of its own.
+        let later = self.held.iter().any(|(h, _)| h.pending() && h.block() < s.block());
         let effects = if later { self.flush(book) } else { Vec::new() };
         self.held.push((s, now));
         effects
@@ -313,6 +446,8 @@ impl FeedHandler {
     pub fn flush(&mut self, book: &PoolBook) -> Vec<Effect> {
         let held = std::mem::take(&mut self.held);
         let Some(&(_, observed_at)) = held.last() else { return Vec::new() };
+        // The book before the burst: a `Sync` is sized by what it changed.
+        let before = book.snapshot();
         let results = Self::apply(book, &held);
 
         // Each pool's last word, and every pool that left its ladder on the way.
@@ -320,20 +455,47 @@ impl FeedHandler {
         let mut reload: Vec<Address> = Vec::new();
         for ((s, _), r) in held.iter().zip(&results) {
             if matches!(r, SwapApplied::Updated | SwapApplied::NeedsReload) {
-                last.insert(s.pool, *r);
+                last.insert(s.pool(), *r);
             }
             if *r == SwapApplied::NeedsReload {
-                reload.push(s.pool);
+                reload.push(s.pool());
             }
         }
-        let moved: Vec<&SwapLog> = held
+
+        // Each log's size, in arrival order: a swap by its amounts, a `Sync` by
+        // the change from the pool's reserves before it in the burst.
+        let prices = usd_prices(book);
+        let mut reserves: BTreeMap<Address, (U256, U256)> = BTreeMap::new();
+        let mut sized: Vec<Option<f64>> = Vec::with_capacity(held.len());
+        for ((h, _), r) in held.iter().zip(&results) {
+            let applied = matches!(r, SwapApplied::Updated | SwapApplied::NeedsReload);
+            let p = before.get(&h.pool());
+            sized.push(match (h, p) {
+                (Held::Swap(s), Some(p)) => notional_usd(s, (p.spec.token0, p.spec.token1), p.decimals, &prices),
+                (Held::Sync(s), Some(p)) => {
+                    let prev = reserves
+                        .get(&s.pool)
+                        .copied()
+                        .or_else(|| p.reserves.map(|r| (u256_to_alloy(r.reserve0), u256_to_alloy(r.reserve1))));
+                    let now = (s.reserve0, s.reserve1);
+                    if applied {
+                        reserves.insert(s.pool, now);
+                    }
+                    prev.and_then(|b| reserve_change_usd(b, now, (p.spec.token0, p.spec.token1), p.decimals, &prices))
+                }
+                _ => None,
+            });
+        }
+
+        let moved: Vec<(&Held, Option<f64>)> = held
             .iter()
             .zip(&results)
-            .filter(|((s, _), r)| {
+            .zip(&sized)
+            .filter(|(((s, _), r), _)| {
                 matches!(r, SwapApplied::Updated | SwapApplied::NeedsReload)
-                    && last.get(&s.pool) == Some(&SwapApplied::Updated)
+                    && last.get(&s.pool()) == Some(&SwapApplied::Updated)
             })
-            .map(|((s, _), _)| s)
+            .map(|(((s, _), _), n)| (s, *n))
             .collect();
 
         let mut effects = Vec::new();
@@ -346,47 +508,34 @@ impl FeedHandler {
         effects
     }
 
-    fn apply(book: &PoolBook, held: &[(SwapLog, UnixNanos)]) -> Vec<SwapApplied> {
-        let writes: Vec<SwapWrite> = held
-            .iter()
-            .map(|(s, _)| SwapWrite {
-                pool: s.pool,
-                sqrt_price_x96: s.sqrt_price_x96,
-                liquidity: s.liquidity,
-                tick: s.tick,
-                at: (s.block, s.log_index),
-            })
-            .collect();
-        book.apply_swaps(&writes)
+    fn apply(book: &PoolBook, held: &[(Held, UnixNanos)]) -> Vec<SwapApplied> {
+        let writes: Vec<StateWrite> = held.iter().map(|(s, _)| s.write()).collect();
+        book.apply_writes(&writes)
     }
 
-    fn event(&self, book: &PoolBook, moved: &[&SwapLog], observed_at: UnixNanos) -> Option<StateEvent> {
-        let last = *moved.last()?;
-        let prices = usd_prices(book);
+    fn event(&self, book: &PoolBook, moved: &[(&Held, Option<f64>)], observed_at: UnixNanos) -> Option<StateEvent> {
+        let (last, _) = *moved.last()?;
         let mut pools: Vec<Address> = Vec::new();
         let mut notional = Some(0.0f64);
         // Identify the change itself, so two different bursts can never share
         // a fingerprint however their other fields line up.
         let mut delta = Vec::with_capacity(moved.len() * (32 + 8 + 20));
-        for s in moved {
-            if !pools.contains(&s.pool) {
-                pools.push(s.pool);
+        for (s, size) in moved {
+            if !pools.contains(&s.pool()) {
+                pools.push(s.pool());
             }
-            let size = book
-                .get(s.pool)
-                .and_then(|p| notional_usd(s, (p.spec.token0, p.spec.token1), p.decimals, &prices));
-            notional = notional.zip(size).map(|(a, b)| a.max(b));
-            delta.extend_from_slice(s.tx.as_slice());
-            delta.extend_from_slice(&s.log_index.to_be_bytes());
-            delta.extend_from_slice(s.pool.as_slice());
+            notional = notional.zip(*size).map(|(a, b)| a.max(b));
+            delta.extend_from_slice(s.tx().as_slice());
+            delta.extend_from_slice(&s.log_index().to_be_bytes());
+            delta.extend_from_slice(s.pool().as_slice());
         }
 
         let head = self.last_head.as_ref();
         let fingerprint = StateFingerprint {
             chain_id: self.chain,
             parent_block_hash: head.map_or(B256::ZERO, |h| h.hash),
-            confirmed_block_number: head.map_or(last.block.saturating_sub(1), |h| h.number),
-            preconf_sequence: last.pending.then_some(last.block),
+            confirmed_block_number: head.map_or(last.block().saturating_sub(1), |h| h.number),
+            preconf_sequence: last.pending().then_some(last.block()),
             flashblock_index: None,
             state_root_or_equivalent: None,
             block_hash_if_available: None,
@@ -400,11 +549,11 @@ impl FeedHandler {
             // second as a redelivery. `flashblock_index` is 0 because the provider
             // does not say which flashblock carried it — the ordering within a
             // block is the log index, which it does say.
-            at: Ordinal { block: last.block, flashblock_index: 0, tx_index: 0, log_index: last.log_index, payload_id: 0 },
+            at: Ordinal { block: last.block(), flashblock_index: 0, tx_index: 0, log_index: last.log_index(), payload_id: 0 },
             observed_at,
             fingerprint,
             kind: EventKind::PendingSwap {
-                target: last.tx,
+                target: last.tx(),
                 pools: pools.iter().map(|a| PoolId { chain: self.chain, address: *a }).collect(),
                 notional_usd: notional,
             },

@@ -62,6 +62,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, l: u128) -> PoolSn
         last_log: None,
         dynamic_fee: None,
         seq: 0,
+        reserves: None,
     }
 }
 
@@ -650,4 +651,60 @@ fn an_unread_lender_sizes_nothing() {
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let pricer = LivePricer::new(b, cycles.clone(), flat(3_000_000_000_000), gas::MEASURED).with_lender(rx);
     assert!(cycles.keys().all(|id| pricer.best_size(*id, &fp(), budget()).is_err()));
+}
+
+// ------------------------------------------------------------------ Aerodrome v2 (R24)
+
+const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
+const AERO_R0: u128 = 1_823_383_892_520_317_644_689;
+
+/// A volatile pool beside a Uniswap pool of the same pair: WETH/USDC.
+fn mixed(uni_tick: i32, r1: u128) -> PoolBook {
+    use apex_runtime::live::cp::{self, Loaded, Reserves};
+    let reserves = Reserves { reserve0: U256::from(AERO_R0), reserve1: U256::from(r1) };
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };
+    let aero = cp::snapshot(&spec, loaded, alloy_primitives::B256::ZERO, 100);
+    PoolBook::from_snapshots(
+        [pool(UNI, Venue::UniswapV3, uni_tick, 500, 1_400_000_000_000_000_000), aero],
+        ReconstructionStatus::Verified,
+    )
+}
+
+/// Each hop is quoted by its own pool's model: the volatile hop by the pool's
+/// arithmetic, crossing nothing; the Uniswap hop by its ladder.
+#[test]
+fn a_cycle_through_a_volatile_pool_quotes_each_hop_by_its_own_model() {
+    use apex_runtime::live::cp::quote_out;
+    let b = mixed(-197_350, 4_541_987_609_188);
+    let snap = b.snapshot();
+    let cycle = frontier::cycles(BASE, WETH, &snap).into_iter().find(|c| c.legs[0].pool == AERO).expect("a cycle");
+    let live = LiveCycle::new(&cycle, &snap).expect("priceable");
+    let input = U256::from(10u128.pow(17));
+    let q = live.quote(input).expect("fills");
+    let aero = b.get(AERO).unwrap();
+    assert_eq!(Some(q.outputs[0]), quote_out(&aero.reserves.unwrap(), 3_000, input, true));
+    assert_eq!((q.hops[0].venue, q.hops[0].crossed, q.hops[0].word_steps), (Venue::AerodromeV2, 0, 0));
+    assert_eq!(q.hops[1].venue, Venue::UniswapV3);
+}
+
+/// Paying the start token out, a volatile pool can pay no more than its reserve of it.
+#[test]
+fn a_volatile_pool_paying_weth_bounds_the_input_by_its_weth_reserve() {
+    let b = mixed(-197_350, 4_541_987_609_188);
+    let snap = b.snapshot();
+    let cycle = frontier::cycles(BASE, WETH, &snap).into_iter().find(|c| c.legs[1].pool == AERO).expect("a cycle");
+    let live = LiveCycle::new(&cycle, &snap).expect("priceable");
+    assert_eq!(live.max_input(), U256::from(AERO_R0));
+}
+
+/// A constant-product pool has no tick neighbourhood to declare.
+#[test]
+fn a_volatile_pool_declares_no_tick_neighbourhood() {
+    let b = mixed(-197_350, 4_541_987_609_188);
+    let snap = b.snapshot();
+    let cycle = frontier::cycles(BASE, WETH, &snap).into_iter().find(|c| c.legs[0].pool == AERO).unwrap();
+    let t = frontier::template(BASE, &cycle, &snap);
+    let pools: Vec<Address> = t.tick_neighborhood.keys().map(|p| p.address).collect();
+    assert_eq!(pools, vec![UNI]);
 }

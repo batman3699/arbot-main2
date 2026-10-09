@@ -365,6 +365,7 @@ fn the_universe_is_the_reachable_weth_pairs_with_two_pools() {
         ("aerodrome_slipstream", vec![rec(&p(5), weth, other)]),
         ("pancakeswap_v3", vec![rec(&p(6), weth, other), rec(&p(7), weth, usdc)]),
         ("aerodrome_slipstream_v3", vec![rec(&p(8), weth, other)]),
+        ("aerodrome_v2", vec![]),
     ] {
         std::fs::create_dir_all(dir.path().join(venue)).unwrap();
         std::fs::write(dir.path().join(venue).join("pools.jsonl"), lines.join("\n")).unwrap();
@@ -402,7 +403,7 @@ fn the_universe_follows_its_filter() {
     std::fs::create_dir_all(dir.path().join("uniswap_v3")).unwrap();
     let lines = [rec(1, 500, 5e6), rec(2, 3_000, 60e6), rec(3, 100, 1e5), rec(4, 3_000, 5e4)];
     std::fs::write(dir.path().join("uniswap_v3").join("pools.jsonl"), lines.join("\n")).unwrap();
-    for v in ["aerodrome_slipstream", "pancakeswap_v3", "aerodrome_slipstream_v3"] {
+    for v in ["aerodrome_slipstream", "pancakeswap_v3", "aerodrome_slipstream_v3", "aerodrome_v2"] {
         std::fs::create_dir_all(dir.path().join(v)).unwrap();
         std::fs::write(dir.path().join(v).join("pools.jsonl"), "").unwrap();
     }

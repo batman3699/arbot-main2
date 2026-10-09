@@ -17,6 +17,9 @@
 //! crossing 8 ticks — 0.0000 bps. The ~140 bps the legacy fast path lost to the
 //! quoter was the missing ladder; with one, there is no gap to report.
 //!
+//! A constant-product hop (R24) is the pool's own `getAmountOut` arithmetic
+//! (`live::cp`), and crosses nothing.
+//!
 //! # One pricer, two ports, one cost
 //!
 //! `LivePricer` serves Engine C (`TemplatePricer`, at search time) and
@@ -86,20 +89,21 @@ impl LiveCycle {
         let mut hops = [None; 2];
         let mut amount = amount_in;
         for (i, (pool, zero_for_one)) in self.legs.iter().enumerate() {
-            let q =
-                quote_exact_input_multi_tick(&pool.state, &pool.ladder, amount, *zero_for_one, MAX_TICKS)?;
-            // A partial fill is not a price for the whole input.
-            if q.exhausted || q.amount_in_consumed < amount {
-                return None;
-            }
-            amount = q.amount_out;
+            // Each pool by its own model (R24): reserves, or a ladder.
+            let (out, crossed, word_steps) = match &pool.reserves {
+                Some(r) => (crate::live::cp::quote_out(r, pool.state.fee_ppm, amount, *zero_for_one)?, 0, 0),
+                None => {
+                    let q = quote_exact_input_multi_tick(&pool.state, &pool.ladder, amount, *zero_for_one, MAX_TICKS)?;
+                    // A partial fill is not a price for the whole input.
+                    if q.exhausted || q.amount_in_consumed < amount {
+                        return None;
+                    }
+                    (q.amount_out, q.ticks_crossed, q.word_steps)
+                }
+            };
+            amount = out;
             outputs[i] = amount;
-            hops[i] = Some(HopSteps {
-                venue: pool.spec.venue,
-                zero_for_one: *zero_for_one,
-                crossed: q.ticks_crossed,
-                word_steps: q.word_steps,
-            });
+            hops[i] = Some(HopSteps { venue: pool.spec.venue, zero_for_one: *zero_for_one, crossed, word_steps });
         }
         Some(CycleQuote { outputs, hops: [hops[0]?, hops[1]?] })
     }
@@ -124,7 +128,17 @@ impl LiveCycle {
     pub fn max_input(&self) -> U256 {
         let (pool, zero_for_one) = &self.legs[1];
         // Selling token0 means receiving token1, and the reverse.
-        let held = if *zero_for_one { pool.state.balance1 } else { pool.state.balance0 };
+        let held = match &pool.reserves {
+            // A volatile pool holds exactly its reserves.
+            Some(r) => Some(if *zero_for_one { r.reserve1 } else { r.reserve0 }),
+            None => {
+                if *zero_for_one {
+                    pool.state.balance1
+                } else {
+                    pool.state.balance0
+                }
+            }
+        };
         held.unwrap_or_default()
     }
 }

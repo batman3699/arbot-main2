@@ -78,7 +78,7 @@ else:
     print(f"  book        {b['status']}, {b['held']}/{b['universe']} pools held, {b['admitted']} admitted, {s['resident']} cycles")
     print(f"  venues      {venues}")
     print(f"  reloads     {rl['full']} full, {rl['partial']} partial, {rl['failed']} failed; pools refused {rl['pools_refused']}, removed {rl['pools_removed']}")
-    print(f"  reads       view {rf['view']}, twap {rf['twap']}, l1 {rf['l1']} failures")
+    print(f"  reads       view {rf['view']}, twap {rf['twap']}, l1 {rf['l1']}, fees {rf.get('fees', 0)} failures")
     print(f"  feed        {fd['sessions']} sessions ({max(fd['sessions'] - 1, 0)} reconnects), {fd['dropped']} dropped, lossless {fd['fast_lane_lossless']}")
     q = r.get("queue")
     if q:  # R21: absent from a report before the queue

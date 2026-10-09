@@ -69,6 +69,14 @@ pub mod selector {
     pub const ADAPTER_OF: [u8; 4] = [0xb9, 0x69, 0xa5, 0x30];
     /// `isSelectorAllowed(uint16,bytes4)`
     pub const IS_SELECTOR_ALLOWED: [u8; 4] = [0x28, 0x4a, 0xea, 0x3f];
+    /// `stable()` — Aerodrome v2's curve flag (R24).
+    pub const STABLE: [u8; 4] = [0x22, 0xbe, 0x3d, 0xe1];
+    /// `getReserves()` — Aerodrome v2: `(uint256, uint256, uint256)`.
+    pub const GET_RESERVES: [u8; 4] = [0x09, 0x02, 0xf1, 0xac];
+    /// `getFee(address,bool)` — Aerodrome v2's factory, in basis points.
+    pub const GET_FEE: [u8; 4] = [0xcc, 0x56, 0xb2, 0xc5];
+    /// `isPool(address)` — Aerodrome v2's factory.
+    pub const IS_POOL: [u8; 4] = [0x5b, 0x16, 0xeb, 0xb7];
 }
 
 const WORD: usize = 32;
@@ -100,6 +108,14 @@ pub fn call_address(sel: [u8; 4], a: Address) -> Vec<u8> {
     let mut out = sel.to_vec();
     out.extend_from_slice(&[0u8; 12]);
     out.extend_from_slice(a.as_slice());
+    out
+}
+
+/// `f(address,bool)`.
+pub fn call_address_bool(sel: [u8; 4], a: Address, b: bool) -> Vec<u8> {
+    let mut out = call_address(sel, a);
+    out.extend_from_slice(&[0u8; 31]);
+    out.push(u8::from(b));
     out
 }
 

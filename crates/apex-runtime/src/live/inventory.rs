@@ -45,10 +45,14 @@ pub enum Venue {
     /// pool and router code as the first, with its own pools, router and fee
     /// module (R22). Named after its inventory directory.
     SlipstreamV3,
+    /// Aerodrome v2's volatile (x·y=k) pools, factory `0x420D…` (R24). Stable
+    /// pools are refused.
+    AerodromeV2,
 }
 
 impl Venue {
-    pub const ALL: [Self; 4] = [Self::UniswapV3, Self::Slipstream, Self::PancakeV3, Self::SlipstreamV3];
+    pub const ALL: [Self; 5] =
+        [Self::UniswapV3, Self::Slipstream, Self::PancakeV3, Self::SlipstreamV3, Self::AerodromeV2];
 
     pub const fn id(self) -> VenueId {
         match self {
@@ -56,6 +60,7 @@ impl Venue {
             Self::Slipstream => venue_ids::AERODROME_SLIPSTREAM,
             Self::PancakeV3 => venue_ids::PANCAKESWAP_V3,
             Self::SlipstreamV3 => venue_ids::AERODROME_SLIPSTREAM_V3,
+            Self::AerodromeV2 => venue_ids::AERODROME_VOLATILE,
         }
     }
 
@@ -66,6 +71,7 @@ impl Venue {
             Self::Slipstream => "aerodrome_slipstream",
             Self::PancakeV3 => "pancakeswap_v3",
             Self::SlipstreamV3 => "aerodrome_slipstream_v3",
+            Self::AerodromeV2 => "aerodrome_v2",
         }
     }
 
@@ -73,22 +79,30 @@ impl Venue {
     /// the chain: SwapRouter02's `factory()` for Uniswap and Slipstream's
     /// router's for Slipstream (2026-09-30); for PancakeSwap, the `factory()`
     /// of its WETH/USDC pools and of its `SmartRouter` (2026-10-03); for
-    /// Slipstream's second deployment, its router's (2026-10-08).
+    /// Slipstream's second deployment, its router's (2026-10-08); for Aerodrome
+    /// v2, its router's `defaultFactory()` (2026-10-09).
     pub const fn factory(self) -> Address {
         match self {
             Self::UniswapV3 => address!("33128a8fC17869897dcE68Ed026d694621f6FDfD"),
             Self::Slipstream => address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"),
             Self::PancakeV3 => address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"),
             Self::SlipstreamV3 => address!("f8f2eB4940CFE7d13603DDDD87f123820Fc061Ef"),
+            Self::AerodromeV2 => address!("420DD381b31aEf6683db6B902084cB0FFECe40Da"),
         }
     }
 
     /// Uniswap and PancakeSwap fix a pool's fee at creation. Slipstream's fee
     /// module can change it — pools at one tick spacing were measured charging
     /// 212 and 2,500 ppm — so its fee is read with the rest of the state, every
-    /// time.
+    /// time. Aerodrome v2's factory sets a pool's fee, which no swap moves; the
+    /// book re-reads it each head (R24).
     pub const fn fee_is_static(self) -> bool {
-        matches!(self, Self::UniswapV3 | Self::PancakeV3)
+        matches!(self, Self::UniswapV3 | Self::PancakeV3 | Self::AerodromeV2)
+    }
+
+    /// A constant-product venue: reserves and a fee, no ticks (R24).
+    pub const fn is_constant_product(self) -> bool {
+        matches!(self, Self::AerodromeV2)
     }
 }
 
@@ -161,6 +175,9 @@ struct Record {
     fee_ppm_onchain: Option<u64>,
     #[serde(default)]
     hub_usd_liquidity: Option<f64>,
+    /// Aerodrome v2's curve flag (R24).
+    #[serde(default)]
+    stable: Option<bool>,
 }
 
 /// Every pool of the venues that passes `filter`.
@@ -186,6 +203,11 @@ pub fn load(data_dir: &Path, filter: UniverseFilter) -> Result<Vec<PoolSpec>, In
                 line: i + 1,
                 detail: e.to_string(),
             })?;
+            // Aerodrome v2: volatile pools only. A stable pool's curve is not
+            // the one priced, and a record that does not say is not trusted.
+            if venue.is_constant_product() && r.stable != Some(false) {
+                continue;
+            }
             let fee = match (r.fee_ppm_onchain, venue) {
                 (Some(f), _) => f,
                 // A dynamic-fee record's `fee` is its tick spacing: skipped,

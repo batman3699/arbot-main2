@@ -181,6 +181,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, dynamic_fee: Optio
         last_log: None,
         dynamic_fee,
         seq: 0,
+        reserves: None,
     }
 }
 

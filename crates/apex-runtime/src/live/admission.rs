@@ -13,7 +13,7 @@
 //! | bytecode | the code hash the book read, at the read's block |
 //! | factory, tokens, decimals | the book's reads, already held to the inventory and the venue's factory |
 //! | fee | the chain's fee for Uniswap and PancakeSwap (static); **dynamic** for Slipstream, whose module sets it |
-//! | reconstruction | concentrated-liquidity logs — what the book does |
+//! | reconstruction | concentrated-liquidity logs — what the book does — or `Sync` for a constant-product pool (R24) |
 //! | depth | the inventory's figure, GeckoTerminal's: **non-authoritative**, it filters and never sizes |
 //! | gas | a share of the R6 fork run's two-hop cycle, **not measured** per hop |
 //! | reverts | none observed yet |
@@ -29,7 +29,7 @@
 
 use crate::commit::VenueCommitments;
 use crate::live::book::{PoolBook, PoolSnapshot};
-use crate::live::feed::{swap_topic, BURN, MINT};
+use crate::live::feed::{swap_topic, BURN, MINT, SYNC};
 use crate::live::frontier::WETH;
 use crate::live::inventory::Venue;
 use crate::plane::{Commitments, Decline};
@@ -90,7 +90,11 @@ pub fn record(p: &PoolSnapshot, chain: ChainId, read_block: u64) -> PoolAdmissio
         } else {
             FeeBehavior::Dynamic
         }),
-        reconstruction: Some(ReconstructionMethod::ConcentratedLiquidityLogs),
+        reconstruction: Some(if p.spec.venue.is_constant_product() {
+            ReconstructionMethod::ReserveSync
+        } else {
+            ReconstructionMethod::ConcentratedLiquidityLogs
+        }),
         depth: Some(DepthEstimate::ExternalNonAuthoritative {
             // Whole dollars, in micros. `as` takes a NaN or a negative figure to
             // zero, which the registry's floor refuses.
@@ -99,7 +103,11 @@ pub fn record(p: &PoolSnapshot, chain: ChainId, read_block: u64) -> PoolAdmissio
         gas_profile: Some(GasProfile { per_hop: GAS_PER_HOP, measured: false }),
         revert_profile: Some(RevertProfile::default()),
         transfer_semantics: Some((semantics(p.spec.token0), semantics(p.spec.token1))),
-        update_mapping: Some(vec![swap_topic(p.spec.venue), MINT, BURN]),
+        update_mapping: Some(if p.spec.venue.is_constant_product() {
+            vec![SYNC]
+        } else {
+            vec![swap_topic(p.spec.venue), MINT, BURN]
+        }),
     }
 }
 

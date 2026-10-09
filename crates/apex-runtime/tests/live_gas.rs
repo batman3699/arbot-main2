@@ -23,12 +23,12 @@ fn hop(venue: Venue, zero_for_one: bool, crossed: u32, word_steps: u32) -> HopSt
 #[test]
 fn a_settlement_is_its_hops_and_what_they_cross() {
     let m = SettlementGas {
-        hop: PerVenue { uniswap_v3: 100_000, slipstream: 200_000, pancake_v3: 300_000 },
-        crossing_down: PerVenue { uniswap_v3: 1_000, slipstream: 2_000, pancake_v3: 3_000 },
-        crossing_up: PerVenue { uniswap_v3: 10_000, slipstream: 20_000, pancake_v3: 30_000 },
+        hop: PerVenue { uniswap_v3: 100_000, slipstream: 200_000, pancake_v3: 300_000, aerodrome_v2: 400_000 },
+        crossing_down: PerVenue { uniswap_v3: 1_000, slipstream: 2_000, pancake_v3: 3_000, aerodrome_v2: 4_000 },
+        crossing_up: PerVenue { uniswap_v3: 10_000, slipstream: 20_000, pancake_v3: 30_000, aerodrome_v2: 40_000 },
         word: 7,
         hop_margin: 500,
-        crossing_ceiling: PerVenue { uniswap_v3: 40_000, slipstream: 50_000, pancake_v3: 60_000 },
+        crossing_ceiling: PerVenue { uniswap_v3: 40_000, slipstream: 50_000, pancake_v3: 60_000, aerodrome_v2: 70_000 },
         word_ceiling: 900,
     };
     let got = m.estimate(&[hop(Venue::Slipstream, true, 3, 1), hop(Venue::PancakeV3, false, 2, 2)]);
@@ -48,7 +48,7 @@ fn a_settlement_is_its_hops_and_what_they_cross() {
 /// The ceiling is never below the expectation, whatever a model says.
 #[test]
 fn the_ceiling_is_never_below_the_expectation() {
-    let m = SettlementGas { crossing_ceiling: PerVenue { uniswap_v3: 0, slipstream: 0, pancake_v3: 0 }, ..MEASURED };
+    let m = SettlementGas { crossing_ceiling: PerVenue { uniswap_v3: 0, slipstream: 0, pancake_v3: 0, aerodrome_v2: 0 }, ..MEASURED };
     let got = m.estimate(&[hop(Venue::UniswapV3, false, 5, 0), hop(Venue::PancakeV3, true, 5, 0)]);
     assert_eq!(got.ceiling, got.expected);
 }
@@ -76,6 +76,7 @@ fn venue(name: &str) -> Venue {
         "uniswap_v3" => Venue::UniswapV3,
         "slipstream" => Venue::Slipstream,
         "pancake_v3" => Venue::PancakeV3,
+        "aerodrome_v2" => Venue::AerodromeV2,
         other => panic!("unknown venue {other}"),
     }
 }

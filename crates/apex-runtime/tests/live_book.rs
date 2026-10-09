@@ -9,7 +9,8 @@
 use alloy_primitives::{address, hex, keccak256, Address, U256};
 use apex_chain::rpc::{RpcError, RpcTransport};
 use apex_runtime::live::abi::{self, selector, MULTICALL3};
-use apex_runtime::live::book::{DynamicFee, PoolBook, ReloadError, SwapApplied, SwapWrite, Unloadable};
+use apex_runtime::live::book::{DynamicFee, PoolBook, ReloadError, StateWrite, SwapApplied, SwapWrite, SyncWrite, Unloadable};
+use apex_runtime::live::cp::Reserves;
 use apex_runtime::live::inventory::{self, PoolSpec, UniverseFilter, Venue};
 use apex_runtime::live::reads::ChainReads;
 use apex_types::state::ReconstructionStatus;
@@ -61,6 +62,10 @@ fn every_selector_is_its_signatures_hash() {
         (selector::IS_FJORD, "isFjord()"),
         (selector::ADAPTER_OF, "adapterOf(uint16)"),
         (selector::IS_SELECTOR_ALLOWED, "isSelectorAllowed(uint16,bytes4)"),
+        (selector::STABLE, "stable()"),
+        (selector::GET_RESERVES, "getReserves()"),
+        (selector::GET_FEE, "getFee(address,bool)"),
+        (selector::IS_POOL, "isPool(address)"),
     ] {
         assert_eq!(sel, keccak256(sig.as_bytes())[..4], "{sig}");
     }
@@ -162,6 +167,7 @@ fn the_inventory_applies_the_census_filters() {
         json!({"pool":"0x0000000000000000000000000000000000000008","token0":a,"token1":b,"fee":50,"fee_ppm_onchain":425,"hub_usd_liquidity":3e6}),
         json!({"pool":"0x0000000000000000000000000000000000000009","token0":a,"token1":b,"fee":200,"hub_usd_liquidity":3e6}),
     ]);
+    write_inventory(dir.path(), "aerodrome_v2", &[]);
     let specs = inventory::load(dir.path(), UniverseFilter::default()).unwrap();
     let pools: Vec<u8> = specs.iter().map(|s| s.pool.as_slice()[19]).collect();
     assert_eq!(
@@ -828,4 +834,153 @@ async fn a_pool_filed_under_pancakeswap_from_another_factory_is_refused() {
     let (book, refused) = PoolBook::load(&ChainReads::new(node), &[cake], 100).await.unwrap();
     assert!(book.is_empty());
     assert!(matches!(refused[0].why, Unloadable::WrongFactory { .. }), "{refused:?}");
+}
+
+// ------------------------------------------------------------------ Aerodrome v2 (R24)
+
+const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
+const AERO_R0: u128 = 1_823_383_892_520_317_644_689;
+const AERO_R1: u128 = 4_541_987_609_188;
+
+/// `cast calldata "getFee(address,bool)" 0xcdac0d6c6c59727a65f871236188350531885c43 false`
+#[test]
+fn get_fee_encodes_as_cast_does() {
+    assert_eq!(
+        hex::encode(abi::call_address_bool(selector::GET_FEE, AERO, false)),
+        "cc56b2c5000000000000000000000000cdac0d6c6c59727a65f871236188350531885c430000000000000000000000000000000000000000000000000000000000000000"
+    );
+}
+
+fn aero_spec() -> PoolSpec {
+    PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4_900_000.0 }
+}
+
+fn aero_healthy(node: &Scripted) {
+    let f = Venue::AerodromeV2.factory();
+    node.set(AERO, abi::call0(selector::TOKEN0), wa(WETH));
+    node.set(AERO, abi::call0(selector::TOKEN1), wa(USDC));
+    node.set(AERO, abi::call0(selector::FACTORY), wa(f));
+    node.set(AERO, abi::call0(selector::STABLE), w(U256::ZERO));
+    let mut reserves = w(U256::from(AERO_R0));
+    reserves.extend(w(U256::from(AERO_R1)));
+    reserves.extend(w(U256::from(1_791_000_000u64)));
+    node.set(AERO, abi::call0(selector::GET_RESERVES), reserves);
+    node.set(WETH, abi::call0(selector::DECIMALS), w(U256::from(18)));
+    node.set(USDC, abi::call0(selector::DECIMALS), w(U256::from(6)));
+    node.set(f, abi::call_address_bool(selector::GET_FEE, AERO, false), w(U256::from(30)));
+    node.set(f, abi::call_address(selector::IS_POOL, AERO), w(U256::from(1)));
+}
+
+async fn aero_book(node: Arc<Scripted>) -> (PoolBook, Vec<apex_runtime::live::book::Unloaded>) {
+    PoolBook::load(&ChainReads::new(node), &[aero_spec()], 100).await.expect("reads")
+}
+
+fn eth(v: u128) -> ethers_core::types::U256 {
+    ethers_core::types::U256::from(v)
+}
+
+#[tokio::test]
+async fn a_volatile_aerodrome_pool_loads_with_its_reserves_and_fee() {
+    let node = Arc::new(Scripted::default());
+    aero_healthy(&node);
+    let (book, refused) = aero_book(node).await;
+    assert!(refused.is_empty(), "{refused:?}");
+    let p = book.get(AERO).expect("loaded");
+    assert_eq!(p.reserves, Some(Reserves { reserve0: eth(AERO_R0), reserve1: eth(AERO_R1) }));
+    assert_eq!(p.state.fee_ppm, 3_000, "30 bps");
+    assert_eq!(p.decimals, (18, 6));
+    assert!(p.ladder_covers_price(), "no ladder to leave");
+    // Its tick state is empty: a concentrated-liquidity quote of it fails closed.
+    assert_eq!(p.state.liquidity, 0);
+    assert!(p.state.sqrt_price_x96.is_zero());
+}
+
+#[tokio::test]
+async fn a_stable_aerodrome_pool_is_refused() {
+    let node = Arc::new(Scripted::default());
+    aero_healthy(&node);
+    node.set(AERO, abi::call0(selector::STABLE), w(U256::from(1)));
+    let (book, refused) = aero_book(node).await;
+    assert!(book.is_empty());
+    assert_eq!(refused[0].why, Unloadable::NotVolatile);
+}
+
+/// A pool with an empty side prices nothing, so it is not held — the same
+/// refusal a concentrated-liquidity pool without liquidity gets.
+#[tokio::test]
+async fn an_empty_aerodrome_pool_is_refused() {
+    let node = Arc::new(Scripted::default());
+    aero_healthy(&node);
+    let mut reserves = w(U256::from(AERO_R0));
+    reserves.extend(w(U256::ZERO));
+    reserves.extend(w(U256::from(1_791_000_000u64)));
+    node.set(AERO, abi::call0(selector::GET_RESERVES), reserves);
+    let (book, refused) = aero_book(node).await;
+    assert!(book.is_empty());
+    assert_eq!(refused[0].why, Unloadable::NoLiquidity);
+}
+
+/// The pool's own `factory()` is not enough: the factory must know it.
+#[tokio::test]
+async fn an_aerodrome_pool_its_factory_does_not_know_is_refused() {
+    let node = Arc::new(Scripted::default());
+    aero_healthy(&node);
+    node.set(Venue::AerodromeV2.factory(), abi::call_address(selector::IS_POOL, AERO), w(U256::ZERO));
+    let (book, refused) = aero_book(node).await;
+    assert!(book.is_empty());
+    assert!(matches!(refused[0].why, Unloadable::WrongFactory { .. }), "{refused:?}");
+}
+
+/// A `Sync` replaces the reserves outright; an older one is refused; a write
+/// of the other kind of state is refused, whichever way round.
+#[tokio::test]
+async fn a_sync_replaces_the_reserves_and_an_older_one_is_refused() {
+    let node = Arc::new(Scripted::default());
+    aero_healthy(&node);
+    healthy(&node, Venue::UniswapV3.factory());
+    let (book, _) = PoolBook::load(&ChainReads::new(node), &[aero_spec(), spec()], 100).await.unwrap();
+    let (a, b) = (U256::from(5u64), U256::from(7u64));
+    assert_eq!(book.apply_sync(AERO, a, b, (101, 2)), SwapApplied::Updated);
+    assert_eq!(book.get(AERO).unwrap().reserves, Some(Reserves { reserve0: eth(5), reserve1: eth(7) }));
+    assert_eq!(book.apply_sync(AERO, b, a, (101, 1)), SwapApplied::Stale);
+    assert_eq!(book.apply_sync(AERO, b, a, (100, 9)), SwapApplied::Stale, "already in the read");
+    assert_eq!(book.apply_sync(WETH_USDC, a, b, (102, 0)), SwapApplied::Unknown, "not a reserve pool");
+    assert_eq!(book.apply_swap(AERO, U256::from(1u64) << 96, 1, 0, (102, 1)), SwapApplied::Unknown, "not a tick pool");
+    // Both kinds in one write, in order.
+    let writes = [
+        StateWrite::Sync(SyncWrite { pool: AERO, reserve0: b, reserve1: a, at: (103, 0) }),
+        StateWrite::Swap(SwapWrite {
+            pool: WETH_USDC,
+            sqrt_price_x96: U256::from(4_109_375_649_317_904_751_454_295u128),
+            liquidity: 9,
+            tick: TICK as i32,
+            at: (103, 1),
+        }),
+    ];
+    assert_eq!(book.apply_writes(&writes), vec![SwapApplied::Updated, SwapApplied::Updated]);
+}
+
+/// A reload never rolls back a newer `Sync`.
+#[tokio::test]
+async fn a_reload_keeps_a_newer_sync() {
+    let node = Arc::new(Scripted::default());
+    aero_healthy(&node);
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[aero_spec()], 100).await.unwrap();
+    book.apply_sync(AERO, U256::from(5u64), U256::from(7u64), (101, 0));
+    book.reload(&reads, &[AERO], 100).await.unwrap();
+    assert_eq!(book.get(AERO).unwrap().reserves, Some(Reserves { reserve0: eth(5), reserve1: eth(7) }));
+}
+
+/// The factory's fee manager can change a pool's fee; each head re-reads it.
+#[tokio::test]
+async fn a_fee_refresh_follows_the_factory() {
+    let node = Arc::new(Scripted::default());
+    aero_healthy(&node);
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[aero_spec()], 100).await.unwrap();
+    assert_eq!(book.refresh_cp_fees(&reads, 101).await.unwrap(), 0, "unchanged");
+    node.set(Venue::AerodromeV2.factory(), abi::call_address_bool(selector::GET_FEE, AERO, false), w(U256::from(50)));
+    assert_eq!(book.refresh_cp_fees(&reads, 102).await.unwrap(), 1);
+    assert_eq!(book.get(AERO).unwrap().state.fee_ppm, 5_000);
 }

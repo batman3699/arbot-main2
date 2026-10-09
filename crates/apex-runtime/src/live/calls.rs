@@ -39,6 +39,9 @@
 //!   the `SmartRouter`'s `exactInputSingle` — `IV3SwapRouter`'s, with no
 //!   deadline of its own; the plan's covers it. Tokens and fee identify the
 //!   pool.
+//! - **Aerodrome v2** (R24): the `GENERIC` op through adapter 4, calling the
+//!   router's `swapExactTokensForTokens` with one volatile route. Tokens,
+//!   `stable` and factory identify the pool.
 //! - **The loan**: Balancer V2, the only lender wired. The executor takes
 //!   exactly one loan, so a commitment naming any other source — or none — is
 //!   refused rather than built into a plan that reverts.
@@ -54,8 +57,8 @@
 use crate::live::abi::{self, selector};
 use crate::live::book::PoolBook;
 use crate::live::frontier::{
-    Cycle, Leg, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER, PANCAKE_SMART_ROUTER, SLIPSTREAM_ADAPTER,
-    SLIPSTREAM_ROUTER, SLIPSTREAM_V3_ADAPTER, SLIPSTREAM_V3_ROUTER,
+    Cycle, Leg, AERODROME_V2_ADAPTER, AERODROME_V2_ROUTER, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER,
+    PANCAKE_SMART_ROUTER, SLIPSTREAM_ADAPTER, SLIPSTREAM_ROUTER, SLIPSTREAM_V3_ADAPTER, SLIPSTREAM_V3_ROUTER,
 };
 use crate::live::inventory::Venue;
 use crate::live::pricing::LiveCycle;
@@ -65,9 +68,9 @@ use alloy_primitives::{Address, B256, U256};
 use apex_exec::call::ExecutorCall;
 use apex_exec::commitment::{plan_commitment, Loan, LoanProvider, Op, Step};
 use apex_exec::encode::{
-    apply_slippage, generic_step, slipstream_exact_input_single, univ3_path, univ3_step,
-    v3_router_exact_input_single, PathHop, PlanEncoder, SlipstreamSwap, V3RouterSwap,
-    SLIPSTREAM_EXACT_INPUT_SINGLE, V3_ROUTER_EXACT_INPUT_SINGLE,
+    aerodrome_swap_exact_tokens_for_tokens, apply_slippage, generic_step, slipstream_exact_input_single, univ3_path,
+    univ3_step, v3_router_exact_input_single, AerodromeSwap, PathHop, PlanEncoder, SlipstreamSwap, V3RouterSwap,
+    AERODROME_SWAP_EXACT_TOKENS_FOR_TOKENS, SLIPSTREAM_EXACT_INPUT_SINGLE, V3_ROUTER_EXACT_INPUT_SINGLE,
 };
 use apex_exec::sign::SignedPlan;
 use apex_types::candidate::Candidate;
@@ -201,6 +204,19 @@ impl LiveCallBuilder {
                     data: generic_step(PANCAKE_ADAPTER, leg.token_in, amount_in, &call),
                 })
             }
+            Venue::AerodromeV2 => {
+                let call = aerodrome_swap_exact_tokens_for_tokens(&AerodromeSwap {
+                    token_in: leg.token_in,
+                    token_out: leg.token_out,
+                    factory: Venue::AerodromeV2.factory(),
+                    recipient: k.executor_address,
+                    deadline: k.deadline,
+                    amount_in,
+                    min_out,
+                })
+                .map_err(|e| refuse(e.to_string()))?;
+                Ok(Step { op: Op::Generic, data: generic_step(AERODROME_V2_ADAPTER, leg.token_in, amount_in, &call) })
+            }
         }
     }
 }
@@ -232,6 +248,11 @@ pub const fn binding(venue: Venue) -> Option<AdapterBinding> {
             id: SLIPSTREAM_V3_ADAPTER,
             router: SLIPSTREAM_V3_ROUTER,
             selector: SLIPSTREAM_EXACT_INPUT_SINGLE,
+        }),
+        Venue::AerodromeV2 => Some(AdapterBinding {
+            id: AERODROME_V2_ADAPTER,
+            router: AERODROME_V2_ROUTER,
+            selector: AERODROME_SWAP_EXACT_TOKENS_FOR_TOKENS,
         }),
     }
 }

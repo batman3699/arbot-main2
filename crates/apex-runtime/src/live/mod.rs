@@ -12,6 +12,7 @@ pub mod admission;
 pub mod book;
 pub mod calls;
 pub mod costs;
+pub mod cp;
 pub mod feed;
 pub mod frontier;
 pub mod gas;

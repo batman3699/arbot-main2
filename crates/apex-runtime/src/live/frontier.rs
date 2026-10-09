@@ -68,6 +68,15 @@ pub const SLIPSTREAM_V3_ADAPTER: u16 = 3;
 /// holds `exactInputSingle` `0xa026383e` (read 2026-10-08).
 pub const SLIPSTREAM_V3_ROUTER: Address = address!("698Cb2b6dd822994581fEa6eA4Fc755d1363A92F");
 
+/// The adapter id Aerodrome v2's router is registered under (R24).
+pub const AERODROME_V2_ADAPTER: u16 = 4;
+
+/// Aerodrome's v2 `Router` on Base: what adapter 4 must be. Its
+/// `defaultFactory()` is `0x420D…`, its `weth()` WETH, and its
+/// `getAmountsOut` matched the WETH/USDC pool's own quote to the unit
+/// (2026-10-09).
+pub const AERODROME_V2_ROUTER: Address = address!("cF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43");
+
 /// Domain separator for [`route_hash`].
 pub const ROUTE_HASH_DOMAIN: &[u8] = b"apex.route.v1";
 
@@ -199,7 +208,8 @@ pub fn template(chain: ChainId, c: &Cycle, snapshot: &BTreeMap<Address, Arc<Pool
             .legs
             .iter()
             .filter_map(|l| {
-                snapshot.get(&l.pool).map(|p| {
+                // A constant-product pool has no ticks to name (R24).
+                snapshot.get(&l.pool).filter(|p| p.reserves.is_none()).map(|p| {
                     (
                         PoolId { chain, address: l.pool },
                         TickNeighborhood { lower: p.ladder.lower_bound(), upper: p.ladder.upper_bound() },

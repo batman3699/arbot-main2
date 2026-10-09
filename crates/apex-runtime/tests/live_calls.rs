@@ -11,8 +11,8 @@ mod support;
 use alloy_primitives::{address, Address, B256, U256};
 use apex_exec::commitment::{plan_commitment, LoanProvider, Op};
 use apex_exec::encode::{
-    generic_step, slipstream_exact_input_single, univ3_path, univ3_step, v3_router_exact_input_single, PathHop,
-    SlipstreamSwap, V3RouterSwap,
+    aerodrome_swap_exact_tokens_for_tokens, generic_step, slipstream_exact_input_single, univ3_path, univ3_step,
+    v3_router_exact_input_single, AerodromeSwap, PathHop, SlipstreamSwap, V3RouterSwap,
 };
 use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
@@ -20,7 +20,8 @@ use apex_math::cl_swap::TickLadder;
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
 use apex_runtime::live::calls::LiveCallBuilder;
 use apex_runtime::live::frontier::{
-    self, Cycle, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER, SLIPSTREAM_ADAPTER, SLIPSTREAM_V3_ADAPTER, WETH,
+    self, Cycle, AERODROME_V2_ADAPTER, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER, SLIPSTREAM_ADAPTER,
+    SLIPSTREAM_V3_ADAPTER, WETH,
 };
 use apex_runtime::live::inventory::{PoolSpec, Venue};
 use apex_runtime::live::pricing::LiveCycle;
@@ -63,6 +64,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, spacing: i32) -> P
         last_log: None,
         dynamic_fee: None,
         seq: 0,
+        reserves: None,
     }
 }
 
@@ -163,6 +165,19 @@ fn expected_step(b: &PoolBook, pool: Address, token_in: Address, token_out: Addr
             })
             .unwrap();
             (Op::Generic, generic_step(PANCAKE_ADAPTER, token_in, amount_in, &call))
+        }
+        Venue::AerodromeV2 => {
+            let call = aerodrome_swap_exact_tokens_for_tokens(&AerodromeSwap {
+                token_in,
+                token_out,
+                factory: Venue::AerodromeV2.factory(),
+                recipient: EXECUTOR,
+                deadline: DEADLINE,
+                amount_in,
+                min_out,
+            })
+            .unwrap();
+            (Op::Generic, generic_step(AERODROME_V2_ADAPTER, token_in, amount_in, &call))
         }
     }
 }
@@ -520,4 +535,49 @@ async fn the_second_slipstream_factory_is_reachable_once_adapter_three_is_regist
     let v3 = binding(Venue::SlipstreamV3).unwrap();
     r.holds(v3.id, SLIPSTREAM_V3_ROUTER, v3.selector, true);
     assert_eq!(reach(r).await, vec![Venue::UniswapV3, Venue::Slipstream, Venue::PancakeV3, Venue::SlipstreamV3]);
+}
+
+// ------------------------------------------------------------------ Aerodrome v2 (R24)
+
+const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
+
+fn aero(r1: u128) -> PoolSnapshot {
+    use apex_runtime::live::cp::{self, Loaded, Reserves};
+    let reserves = Reserves {
+        reserve0: ethers_core::types::U256::from(1_823_383_892_520_317_644_689u128),
+        reserve1: ethers_core::types::U256::from(r1),
+    };
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };
+    cp::snapshot(&spec, loaded, B256::ZERO, 100)
+}
+
+/// R24: a volatile hop is adapter 4's router call, in either venue order. The
+/// Aerodrome pool prices WETH at ~2,491 USDC (tick ≈ −198,118); Uniswap's is
+/// moved ~8% either side of it.
+#[test]
+fn an_aerodrome_hop_is_adapter_fours_router_call() {
+    for uni in [-197_350, -199_000] {
+        let b = Arc::new(PoolBook::from_snapshots(
+            [pool(UNI, Venue::UniswapV3, uni, 500, 10), aero(4_541_987_609_188)],
+            ReconstructionStatus::Verified,
+        ));
+        let (cycle, c) = priced(&b);
+        let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &commitment(&c, 1)).expect("builds");
+        let input = c.input_amount.get();
+        let mid = u256_to_alloy(
+            LiveCycle::new(&cycle, &b.snapshot()).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
+        );
+        let floor = (input + U256::from(1u64)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
+        let [l0, l1] = &cycle.legs;
+        let want = [
+            expected_step(&b, l0.pool, l0.token_in, l0.token_out, input, mid),
+            expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, floor),
+        ];
+        for (got, (op, data)) in call.plan().steps.iter().zip(want) {
+            assert_eq!((got.op, &got.data), (op, &data));
+        }
+        let aero_step = cycle.legs.iter().position(|l| l.pool == AERO).unwrap();
+        assert_eq!(call.plan().steps[aero_step].op, Op::Generic);
+    }
 }

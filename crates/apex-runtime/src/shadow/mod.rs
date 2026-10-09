@@ -47,7 +47,7 @@ use crate::live::admission::{self, LiveCommitments};
 use crate::live::book::PoolBook;
 use crate::live::calls::{self, LiveCallBuilder};
 use crate::live::costs::{self, Costs};
-use crate::live::feed::{Effect, FeedHandler, BURN, MINT, PANCAKE_SWAP, SWAP};
+use crate::live::feed::{Effect, FeedHandler, BURN, MINT, PANCAKE_SWAP, SWAP, SYNC};
 use crate::live::frontier::{self, BALANCER_FLASH, BALANCER_VAULT, WETH};
 use crate::live::gas;
 use crate::live::near_miss::{NearMissReport, NearMisses};
@@ -138,6 +138,8 @@ struct Stats {
     pools_removed: AtomicU64,
     view_failures: AtomicU64,
     twap_failures: AtomicU64,
+    /// Aerodrome v2's per-pool fees, re-read each head (R24).
+    fee_failures: AtomicU64,
     l1_failures: AtomicU64,
     capacity_samples: AtomicU64,
     flashblocks_seen: AtomicU64,
@@ -541,7 +543,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
 impl Shadow {
     /// The capture feed: notifications → the book → effects.
     async fn feed(&self, bus: &EventBus, stopped: watch::Receiver<bool>) {
-        let filter = LogFilter { addresses: self.universe.clone(), topics0: vec![SWAP, PANCAKE_SWAP, MINT, BURN] };
+        let filter = LogFilter { addresses: self.universe.clone(), topics0: vec![SWAP, PANCAKE_SWAP, MINT, BURN, SYNC] };
         let subs = vec![Subscription::NewHeads, Subscription::PendingLogs(filter.clone()), Subscription::Logs(filter)];
         let feed = match WsFeed::new(self.config.rpc_ws.expose(), subs, WsSettings::default()) {
             Ok(f) => f,
@@ -740,6 +742,7 @@ impl Shadow {
     async fn head_loop(&self) {
         let mut heads = self.heads.subscribe();
         let (mut view, mut twap, mut l1_health) = (Health::default(), Health::default(), Health::default());
+        let mut fees = Health::default();
         let mut l1: Option<(u64, L1FeeParameters)> = None;
         let every = self.config.policy.l1_every_blocks;
         loop {
@@ -758,6 +761,11 @@ impl Shadow {
                 });
             }
             twap.note("Slipstream's TWAPs", self.book.refresh_twaps(&self.reads, h.number).await.map(|_| ()), &self.stats.twap_failures);
+            fees.note(
+                "Aerodrome v2's fees",
+                self.book.refresh_cp_fees(&self.reads, h.number).await.map(|_| ()),
+                &self.stats.fee_failures,
+            );
             if l1.is_none_or(|(at, _)| h.number >= at.saturating_add(every)) {
                 let read = costs::read_l1(&self.reads, h.number).await;
                 if let Ok(p) = &read {
@@ -853,6 +861,7 @@ impl Shadow {
             read_failures: ReadFailures {
                 view: get(&self.stats.view_failures),
                 twap: get(&self.stats.twap_failures),
+                fees: get(&self.stats.fee_failures),
                 l1: get(&self.stats.l1_failures),
             },
             costs: CostReport { base_fee_wei: get(&self.stats.base_fee_wei), route_other_wei: self.costs.route_costs().other_wei },
@@ -998,6 +1007,8 @@ pub struct ReadFailures {
     pub view: u64,
     pub twap: u64,
     pub l1: u64,
+    /// Aerodrome v2's fee re-reads (R24).
+    pub fees: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -90,6 +90,12 @@ pub struct PoolSnapshot {
     /// from a counter every write advances, so it moves on every change to this
     /// pool and on no other. See [`PoolBook::versions_for`].
     pub seq: u64,
+    /// A constant-product pool's reserves (R24): its whole state with its fee,
+    /// `state.fee_ppm`. `None` for a concentrated-liquidity pool. A
+    /// constant-product pool's tick state is empty — zero price and liquidity,
+    /// no balances, no ladder — so a concentrated-liquidity path that missed the
+    /// dispatch fails closed.
+    pub reserves: Option<crate::live::cp::Reserves>,
 }
 
 impl PoolSnapshot {
@@ -97,7 +103,8 @@ impl PoolSnapshot {
     /// it a quote would walk off the ladder, so the pricer refuses the pool until
     /// it is reloaded.
     pub fn ladder_covers_price(&self) -> bool {
-        self.ladder.covers(self.state.tick)
+        // A constant-product pool has no ladder to leave.
+        self.reserves.is_some() || self.ladder.covers(self.state.tick)
     }
 
     /// Set the fee from the tick, for a pool whose fee is a function of it.
@@ -174,6 +181,8 @@ pub enum Unloadable {
     /// A Slipstream pool's fee regime could not be read: which read failed. A
     /// pool priced at a fee nobody read is priced wrong by up to its cap.
     FeeUnreadable { read: &'static str },
+    /// An Aerodrome v2 pool on the stable curve, which is not the one priced.
+    NotVolatile,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +211,22 @@ pub struct SwapWrite {
     pub liquidity: u128,
     pub tick: i32,
     pub at: LogPosition,
+}
+
+/// One `Sync` log's reserves, as [`PoolBook::apply_writes`] writes them (R24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncWrite {
+    pub pool: Address,
+    pub reserve0: U256,
+    pub reserve1: U256,
+    pub at: LogPosition,
+}
+
+/// A log's post-trade state, of either kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateWrite {
+    Swap(SwapWrite),
+    Sync(SyncWrite),
 }
 
 pub struct PoolBook {
@@ -482,6 +507,10 @@ impl PoolBook {
         specs: &[PoolSpec],
         block: u64,
     ) -> Result<(BTreeMap<Address, PoolSnapshot>, Vec<Unloaded>), ReadError> {
+        // Constant-product pools are read on their own below (R24).
+        let (cp_specs, specs): (Vec<PoolSpec>, Vec<PoolSpec>) =
+            specs.iter().cloned().partition(|s| s.venue.is_constant_product());
+        let specs = &specs[..];
         let calls: Vec<(Address, Vec<u8>)> = specs.iter().flat_map(state_calls).collect();
         let answers = reads.multicall(&calls, block).await?;
 
@@ -527,6 +556,7 @@ impl PoolBook {
                     last_log: None,
                     dynamic_fee: None,
                     seq: 0,
+                    reserves: None,
                 },
             );
         }
@@ -555,6 +585,21 @@ impl PoolBook {
                 Err(read) => {
                     pools.remove(&pool);
                     refused.push(Unloaded { pool, why: Unloadable::FeeUnreadable { read } });
+                }
+            }
+        }
+
+        // Constant-product pools: their own reads, no ladder, no fee module.
+        if !cp_specs.is_empty() {
+            let calls: Vec<(Address, Vec<u8>)> = cp_specs.iter().flat_map(crate::live::cp::state_calls).collect();
+            let answers = reads.multicall(&calls, block).await?;
+            for (spec, a) in cp_specs.iter().zip(answers.chunks(crate::live::cp::READS)) {
+                match crate::live::cp::decode_state(spec, a) {
+                    Ok(loaded) => {
+                        let code_hash = reads.code_hash(spec.pool, block).await?;
+                        pools.insert(spec.pool, crate::live::cp::snapshot(spec, loaded, code_hash, block));
+                    }
+                    Err(why) => refused.push(Unloaded { pool: spec.pool, why }),
                 }
             }
         }
@@ -673,6 +718,34 @@ impl PoolBook {
         }))
     }
 
+    /// Re-read each constant-product pool's fee at `block` (R24): the
+    /// factory's fee manager can set one per pool. Returns how many changed. A
+    /// pool whose fee does not decode keeps the one it has.
+    pub async fn refresh_cp_fees(&self, reads: &ChainReads, block: u64) -> Result<usize, ReadError> {
+        let snap = self.snapshot();
+        let targets: Vec<(Address, Address)> =
+            snap.values().filter(|p| p.reserves.is_some()).map(|p| (p.spec.pool, p.spec.venue.factory())).collect();
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let calls: Vec<(Address, Vec<u8>)> =
+            targets.iter().map(|(p, f)| (*f, abi::call_address_bool(selector::GET_FEE, *p, false))).collect();
+        let answers = reads.multicall(&calls, block).await?;
+        Ok(self.write(|map, w, status| {
+            let mut changed = 0;
+            for ((pool, _), a) in targets.iter().zip(answers) {
+                let Some(fee) = a.as_deref().and_then(crate::live::cp::fee_ppm_from) else { continue };
+                let Some(old) = map.get(pool).filter(|o| o.state.fee_ppm != fee) else { continue };
+                let mut next = (**old).clone();
+                next.state.fee_ppm = fee;
+                next.seq = w.seq;
+                map.insert(*pool, Arc::new(next));
+                changed += 1;
+            }
+            (changed, status)
+        }))
+    }
+
     /// `Verified` after a full read; `Rebuilding` from a feed gap until the next
     /// one. Only `Verified` may authorize a live ticket (INV-08).
     pub fn status(&self) -> ReconstructionStatus {
@@ -741,19 +814,61 @@ impl PoolBook {
     /// routes ever to pay were exactly that). Each swap is judged newer or not
     /// against the pools as the swaps before it in `swaps` left them.
     pub fn apply_swaps(&self, swaps: &[SwapWrite]) -> Vec<SwapApplied> {
+        self.apply_writes(&swaps.iter().map(|s| StateWrite::Swap(*s)).collect::<Vec<_>>())
+    }
+
+    /// Several logs' states, swaps and syncs, in order, as **one** write: a
+    /// reader sees the book before all of them or after all of them (R24).
+    pub fn apply_writes(&self, writes: &[StateWrite]) -> Vec<SwapApplied> {
         self.write(|map, w, status| {
-            let applied = swaps.iter().map(|s| Self::swap_into(map, w.seq, s)).collect();
+            let applied = writes
+                .iter()
+                .map(|s| match s {
+                    StateWrite::Swap(s) => Self::swap_into(map, w.seq, s),
+                    StateWrite::Sync(s) => Self::sync_into(map, w.seq, s),
+                })
+                .collect();
             (applied, status)
         })
     }
 
+    /// Apply a `Sync` log's reserves, if newer than what the pool holds.
+    pub fn apply_sync(&self, pool: Address, reserve0: U256, reserve1: U256, at: LogPosition) -> SwapApplied {
+        self.apply_writes(&[StateWrite::Sync(SyncWrite { pool, reserve0, reserve1, at })])[0]
+    }
+
+    /// Newer than the last log applied, or, for a pool whose state came from a
+    /// read, from a later block than the read.
+    fn is_newer(old: &PoolSnapshot, at: LogPosition) -> bool {
+        match old.last_log {
+            Some(last) => at > last,
+            None => at.0 > old.block,
+        }
+    }
+
+    /// A `Sync` replaces a constant-product pool's reserves outright; it is
+    /// refused for any other pool.
+    fn sync_into(map: &mut BTreeMap<Address, Arc<PoolSnapshot>>, seq: u64, s: &SyncWrite) -> SwapApplied {
+        let Some(old) = map.get(&s.pool).filter(|o| o.reserves.is_some()) else { return SwapApplied::Unknown };
+        if !Self::is_newer(old, s.at) {
+            return SwapApplied::Stale;
+        }
+        let mut next = (**old).clone();
+        next.reserves = Some(crate::live::cp::Reserves {
+            reserve0: u256_to_ethers(s.reserve0),
+            reserve1: u256_to_ethers(s.reserve1),
+        });
+        next.block = s.at.0;
+        next.last_log = Some(s.at);
+        next.seq = seq;
+        map.insert(s.pool, Arc::new(next));
+        SwapApplied::Updated
+    }
+
     fn swap_into(map: &mut BTreeMap<Address, Arc<PoolSnapshot>>, seq: u64, s: &SwapWrite) -> SwapApplied {
-        let Some(old) = map.get(&s.pool) else { return SwapApplied::Unknown };
-        let newer = match old.last_log {
-            Some(last) => s.at > last,
-            None => s.at.0 > old.block,
-        };
-        if !newer {
+        // A tick write is refused for a constant-product pool.
+        let Some(old) = map.get(&s.pool).filter(|o| o.reserves.is_none()) else { return SwapApplied::Unknown };
+        if !Self::is_newer(old, s.at) {
             return SwapApplied::Stale;
         }
         let mut next = (**old).clone();
@@ -829,6 +944,7 @@ impl PoolBook {
                     snap.state.tick = old.state.tick;
                     snap.block = old.block;
                     snap.last_log = old.last_log;
+                    snap.reserves = old.reserves;
                     // The fresh regime at the kept tick.
                     snap.fee_from_tick();
                 }

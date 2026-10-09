@@ -9,8 +9,9 @@
 
 use alloy_primitives::{address, hex, keccak256, Address, U256};
 use apex_exec::encode::{
-    generic_step, slipstream_exact_input_single, v3_router_exact_input_single, EncodeError, SlipstreamSwap,
-    V3RouterSwap, SLIPSTREAM_EXACT_INPUT_SINGLE, V3_ROUTER_EXACT_INPUT_SINGLE,
+    aerodrome_swap_exact_tokens_for_tokens, generic_step, slipstream_exact_input_single, v3_router_exact_input_single,
+    AerodromeSwap, EncodeError, SlipstreamSwap, V3RouterSwap, AERODROME_SWAP_EXACT_TOKENS_FOR_TOKENS,
+    SLIPSTREAM_EXACT_INPUT_SINGLE, V3_ROUTER_EXACT_INPUT_SINGLE,
 };
 
 const WETH: Address = address!("4200000000000000000000000000000000000006");
@@ -144,4 +145,54 @@ fn a_v3_router_swap_that_cannot_be_bounded_or_placed_is_refused() {
     assert_eq!(v3_router_exact_input_single(&unbounded), Err(EncodeError::ZeroMinOut));
     let wide = V3RouterSwap { fee: 1 << 24, ..v3_swap() };
     assert_eq!(v3_router_exact_input_single(&wide), Err(EncodeError::FeeTooLarge { fee: 1 << 24 }));
+}
+
+// ------------------------------------------------------------------ Aerodrome v2 (R24)
+
+const AERO_FACTORY: Address = address!("420DD381b31aEf6683db6B902084cB0FFECe40Da");
+
+/// `cast calldata "swapExactTokensForTokens(uint256,uint256,(address,address,bool,address)[],address,uint256)"
+///  1500000000000000000 4000000000 "[(WETH,USDC,false,AERO_FACTORY)]" EXECUTOR 1790000000`
+const AERO_SWAP: &str = "cac88ea900000000000000000000000000000000000000000000000014d1120d7b16000000000000000000000000000000000000000000000000000000000000ee6b280000000000000000000000000000000000000000000000000000000000000000a00000000000000000000000001c3d856d29ea2118c8d955070a6ad83c984586f3000000000000000000000000000000000000000000000000000000006ab13b8000000000000000000000000000000000000000000000000000000000000000010000000000000000000000004200000000000000000000000000000000000006000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda029130000000000000000000000000000000000000000000000000000000000000000000000000000000000000000420dd381b31aef6683db6b902084cb0ffece40da";
+
+/// The same, `1 2 "[(USDC,WETH,false,AERO_FACTORY)]" EXECUTOR 3`: the other direction.
+const AERO_BACK: &str = "cac88ea90000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000a00000000000000000000000001c3d856d29ea2118c8d955070a6ad83c984586f300000000000000000000000000000000000000000000000000000000000000030000000000000000000000000000000000000000000000000000000000000001000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000042000000000000000000000000000000000000060000000000000000000000000000000000000000000000000000000000000000000000000000000000000000420dd381b31aef6683db6b902084cb0ffece40da";
+
+fn aero_swap() -> AerodromeSwap {
+    AerodromeSwap {
+        token_in: WETH,
+        token_out: USDC,
+        factory: AERO_FACTORY,
+        recipient: EXECUTOR,
+        deadline: 1_790_000_000,
+        amount_in: U256::from(1_500_000_000_000_000_000u128),
+        min_out: U256::from(4_000_000_000u64),
+    }
+}
+
+#[test]
+fn the_aerodrome_selector_is_its_signatures_hash() {
+    let sig = "swapExactTokensForTokens(uint256,uint256,(address,address,bool,address)[],address,uint256)";
+    assert_eq!(AERODROME_SWAP_EXACT_TOKENS_FOR_TOKENS, keccak256(sig.as_bytes())[..4]);
+}
+
+/// One volatile route, held byte-for-byte to `cast`, both directions.
+#[test]
+fn an_aerodrome_swap_encodes_as_cast_does() {
+    assert_eq!(hex::encode(aerodrome_swap_exact_tokens_for_tokens(&aero_swap()).unwrap()), AERO_SWAP);
+    let back = AerodromeSwap {
+        token_in: USDC,
+        token_out: WETH,
+        amount_in: U256::from(1u64),
+        min_out: U256::from(2u64),
+        deadline: 3,
+        ..aero_swap()
+    };
+    assert_eq!(hex::encode(aerodrome_swap_exact_tokens_for_tokens(&back).unwrap()), AERO_BACK);
+}
+
+#[test]
+fn an_aerodrome_swap_without_a_minimum_is_refused() {
+    let unbounded = AerodromeSwap { min_out: U256::ZERO, ..aero_swap() };
+    assert_eq!(aerodrome_swap_exact_tokens_for_tokens(&unbounded), Err(EncodeError::ZeroMinOut));
 }

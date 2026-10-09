@@ -254,6 +254,48 @@ pub fn v3_router_exact_input_single(s: &V3RouterSwap) -> Result<Vec<u8>, EncodeE
     Ok(out)
 }
 
+/// `swapExactTokensForTokens(uint256,uint256,(address,address,bool,address)[],address,uint256)`:
+/// Aerodrome's v2 router, one route (R24).
+pub const AERODROME_SWAP_EXACT_TOKENS_FOR_TOKENS: [u8; 4] = [0xca, 0xc8, 0x8e, 0xa9];
+
+/// One hop through Aerodrome's v2 router: a single **volatile** route. The
+/// router pulls `amount_in` from the caller by `transferFrom`, so the adapter
+/// step approves it, and pays `recipient`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AerodromeSwap {
+    pub token_in: Address,
+    pub token_out: Address,
+    /// The pool factory the route names; the router finds the pool by tokens,
+    /// `stable` and factory.
+    pub factory: Address,
+    pub recipient: Address,
+    /// Unix seconds; the plan's deadline, which the executor checks first.
+    pub deadline: u64,
+    pub amount_in: U256,
+    pub min_out: U256,
+}
+
+pub fn aerodrome_swap_exact_tokens_for_tokens(s: &AerodromeSwap) -> Result<Vec<u8>, EncodeError> {
+    if s.min_out.is_zero() {
+        return Err(EncodeError::ZeroMinOut);
+    }
+    let mut out = Vec::with_capacity(4 + 10 * WORD);
+    out.extend_from_slice(&AERODROME_SWAP_EXACT_TOKENS_FOR_TOKENS);
+    push_u256(&mut out, s.amount_in);
+    push_u256(&mut out, s.min_out);
+    // The routes array's offset: past the five head words.
+    push_uint(&mut out, (5 * WORD) as u64);
+    push_address(&mut out, s.recipient);
+    push_uint(&mut out, s.deadline);
+    // One route: (from, to, stable, factory), all static, so inline.
+    push_uint(&mut out, 1);
+    push_address(&mut out, s.token_in);
+    push_address(&mut out, s.token_out);
+    push_uint(&mut out, 0); // stable: false — volatile pools only
+    push_address(&mut out, s.factory);
+    Ok(out)
+}
+
 /// Assembles the executor's `PlanV2` from encoded steps.
 ///
 /// Deliberately thin: it is the place where the pieces meet, and every piece is

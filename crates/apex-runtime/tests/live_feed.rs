@@ -10,7 +10,9 @@ use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
-use apex_runtime::live::feed::{self, Effect, FeedHandler, BURN, MINT, PANCAKE_SWAP, SWAP};
+use apex_runtime::live::feed::{
+    self, decode_sync, reserve_change_usd, Effect, FeedHandler, BURN, MINT, PANCAKE_SWAP, SWAP, SYNC,
+};
 use apex_runtime::live::sim::BlockContext;
 use apex_runtime::live::frontier::WETH;
 use apex_runtime::live::inventory::{PoolSpec, Venue};
@@ -54,6 +56,7 @@ fn book() -> PoolBook {
         last_log: None,
         dynamic_fee: None,
         seq: 0,
+        reserves: None,
     };
     PoolBook::from_snapshots([snap], ReconstructionStatus::Verified)
 }
@@ -631,4 +634,84 @@ fn the_block_being_built_follows_the_feed() {
     // A head without a base fee is no context to simulate in.
     h.handle(&book, Notification::Head(Head { base_fee_per_gas: None, ..head_at(104, 1_008) }), NOW);
     assert_eq!(h.block_being_built(), None);
+}
+
+// ------------------------------------------------------------------ Aerodrome v2 (R24)
+
+const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
+
+fn sync_log(r0: u128, r1: u128, block: u64, index: u64) -> RawLog {
+    let mut data = U256::from(r0).to_be_bytes::<32>().to_vec();
+    data.extend(U256::from(r1).to_be_bytes::<32>());
+    RawLog {
+        pending: true,
+        removed: false,
+        address: AERO,
+        topics: vec![SYNC],
+        data,
+        block_number: Some(block),
+        transaction_hash: Some(B256::repeat_byte(index as u8 + 1)),
+        log_index: Some(index),
+    }
+}
+
+/// One volatile WETH/USDC pool: 1,000 WETH against 2,500,000 USDC.
+fn aero_book() -> PoolBook {
+    use apex_runtime::live::cp::{self, Loaded, Reserves};
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let reserves = Reserves {
+        reserve0: EU256::from(1_000u128 * 10u128.pow(18)),
+        reserve1: EU256::from(2_500_000u128 * 10u128.pow(6)),
+    };
+    let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };
+    PoolBook::from_snapshots([cp::snapshot(&spec, loaded, B256::ZERO, 100)], ReconstructionStatus::Verified)
+}
+
+#[test]
+fn a_sync_decodes_to_its_reserves() {
+    let s = decode_sync(&sync_log(5, 7, 101, 3)).expect("decodes");
+    assert_eq!((s.pool, s.reserve0, s.reserve1, s.block, s.log_index), (AERO, U256::from(5u64), U256::from(7u64), 101, 3));
+    let mut short = sync_log(5, 7, 101, 3);
+    short.data.truncate(32);
+    assert!(decode_sync(&short).is_none());
+}
+
+/// A burst's `Sync` is applied with the burst, in one write, and the event's
+/// notional is the reserve change priced: ~10 WETH in, ~24,750 USDC out.
+#[test]
+fn a_sync_is_applied_with_its_burst_and_sized_by_its_reserve_change() {
+    let book = aero_book();
+    let mut h = FeedHandler::new(BASE);
+    let r0 = 1_010u128 * 10u128.pow(18);
+    let r1 = 2_475_247_524_752u128; // 2,500,000 USDC · 1000 / 1010
+    let effects = settle(&mut h, &book, Notification::Log(sync_log(r0, r1, 101, 0)));
+    assert_eq!(book.get(AERO).unwrap().reserves.unwrap().reserve0, EU256::from(r0));
+    let e = event_of(&effects);
+    let EventKind::PendingSwap { pools, notional_usd, .. } = &e.kind else { panic!("not a swap event") };
+    assert_eq!(pools.iter().map(|p| p.address).collect::<Vec<_>>(), vec![AERO]);
+    let n = notional_usd.expect("sized");
+    assert!((n - 24_752.0).abs() < 300.0, "{n}");
+}
+
+#[test]
+fn reserve_change_usd_takes_the_larger_priced_side() {
+    let prices: std::collections::BTreeMap<Address, f64> = [(USDC, 1.0)].into_iter().collect();
+    let n = reserve_change_usd(
+        (U256::from(10u128.pow(18)), U256::from(3_000_000_000u64)),
+        (U256::from(2u128 * 10u128.pow(18)), U256::from(500_000_000u64)),
+        (WETH, USDC),
+        (18, 6),
+        &prices,
+    );
+    assert_eq!(n, Some(2_500.0), "only USDC is priced: 2,500 USDC out");
+    // Both priced: the larger side, as a swap's notional takes its larger side.
+    let both: std::collections::BTreeMap<Address, f64> = [(USDC, 1.0), (WETH, 2_000.0)].into_iter().collect();
+    let n = reserve_change_usd(
+        (U256::from(10u128.pow(18)), U256::from(3_000_000_000u64)),
+        (U256::from(2u128 * 10u128.pow(18)), U256::from(500_000_000u64)),
+        (WETH, USDC),
+        (18, 6),
+        &both,
+    );
+    assert_eq!(n, Some(2_500.0), "1 WETH in is $2,000; 2,500 USDC out is the larger");
 }

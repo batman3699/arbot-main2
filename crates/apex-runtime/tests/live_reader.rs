@@ -101,6 +101,7 @@ fn pool(addr: Address, venue: Venue, tick: i32) -> PoolSnapshot {
         last_log: None,
         dynamic_fee: None,
         seq: 0,
+        reserves: None,
     }
 }
 

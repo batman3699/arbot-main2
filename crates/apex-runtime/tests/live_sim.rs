@@ -180,6 +180,7 @@ fn the_classification_table() {
         (revert::SELECTOR_NOT_ALLOWED, "SelectorNotAllowed(uint16,bytes4)"),
         (revert::UNKNOWN_ADAPTER, "UnknownAdapter(uint16)"),
         (revert::ERROR_STRING, "Error(string)"),
+        (revert::INSUFFICIENT_OUTPUT_AMOUNT, "InsufficientOutputAmount()"),
     ] {
         assert_eq!(sel, keccak256(sig.as_bytes())[..4], "{sig}");
     }
@@ -196,6 +197,7 @@ fn the_classification_table() {
         (with(revert::NOT_EXECUTOR), RevertClass::Unauthorized),
         (with(revert::SELECTOR_NOT_ALLOWED), RevertClass::Unauthorized),
         (with(revert::UNKNOWN_ADAPTER), RevertClass::Unauthorized),
+        (with(revert::INSUFFICIENT_OUTPUT_AMOUNT), RevertClass::MinOutNotMet),
         (error_string("Too little received"), RevertClass::MinOutNotMet),
         (error_string("Transaction too old"), RevertClass::Expired),
         (error_string("BAL#528"), RevertClass::InsufficientLiquidity),
