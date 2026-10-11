@@ -134,6 +134,9 @@ pub struct RawLog {
     pub block_number: Option<u64>,
     pub transaction_hash: Option<B256>,
     pub log_index: Option<u64>,
+    /// The log's transaction's position in its block, which a preconfirmed log
+    /// already has (R25: the race ledger finds a trigger's flashblock by it).
+    pub transaction_index: Option<u64>,
 }
 
 /// One flashblock, as the pending block built through it. Base's flashblock
@@ -221,6 +224,7 @@ pub fn parse_notification(msg: &Value, ids: &BTreeMap<String, Kind>) -> Option<N
                     .and_then(Value::as_str)
                     .and_then(|s| s.parse().ok()),
                 log_index: r.get("logIndex").and_then(quantity),
+                transaction_index: r.get("transactionIndex").and_then(quantity),
             }))
         }
     }

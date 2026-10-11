@@ -6,7 +6,9 @@
 #   watch -n 60 scripts/shadow-status.sh   # refreshed every minute
 #
 # Reads var/apex/ only: the pid file, the JSON-lines report and the log. Prints
-# nothing those files do not already hold, and they hold no secret.
+# nothing those files do not already hold, and they hold no secret. On the
+# co-located host (R25, ops/host/README.md) there is no pid file or log file:
+# the process is systemd's apex-shadow unit and its log is the journal.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -21,10 +23,22 @@ def proc(pid):
         return None
     return out if len(out) == 3 and out[0] == "apex" else None
 
+def unit_pid():
+    try:
+        out = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", "apex-shadow"],
+                             capture_output=True, text=True).stdout.strip()
+        return int(out) or None
+    except (OSError, ValueError):
+        return None
+
 pid = None
 try:
     pid = int(open("var/apex/shadow.pid").read().strip())
 except (OSError, ValueError):
+    pid = unit_pid()
+try:
+    print(f"revision: {open('/opt/apex/REVISION').read().strip()}")
+except OSError:
     pass
 running = proc(pid) if pid else None
 if running:
@@ -79,6 +93,13 @@ else:
     print(f"  venues      {venues}")
     print(f"  reloads     {rl['full']} full, {rl['partial']} partial, {rl['failed']} failed; pools refused {rl['pools_refused']}, removed {rl['pools_removed']}")
     print(f"  reads       view {rf['view']}, twap {rf['twap']}, l1 {rf['l1']}, fees {rf.get('fees', 0)} failures")
+    fb, ra, sg = r.get("flashblocks", {}), r.get("race", {}), r.get("signer", {})
+    if fb:  # R25: absent from a report before the race ledger
+        print(f"  flashblocks {fb['frames']} frames, {fb['sessions']} sessions, {fb['decode_failures']} undecoded, "
+              f"{fb['incomplete_blocks']} incomplete blocks, {fb['ledger_failures']} ledger write failures")
+        print(f"  race        {ra.get('written', 0)} lines, {ra.get('dropped', 0)} dropped")
+        print(f"  signer      nonce at boot {sg.get('boot_nonce')}" + ("" if not sg.get("nonce_moved") else
+              "  -- SIGNER NONCE MOVED: revoke the trader key (ops/host/README.md)"))
     print(f"  feed        {fd['sessions']} sessions ({max(fd['sessions'] - 1, 0)} reconnects), {fd['dropped']} dropped, lossless {fd['fast_lane_lossless']}")
     q = r.get("queue")
     if q:  # R21: absent from a report before the queue
@@ -95,7 +116,13 @@ try:
         plain = (re.sub(r"\x1b\[[0-9;]*m", "", l).rstrip() for l in f)
         warn = [l for l in plain if " WARN " in l or " ERROR " in l]
 except OSError:
-    warn = []
+    try:  # the co-located host: the unit's journal
+        out = subprocess.run(["journalctl", "-u", "apex-shadow", "--no-pager", "-o", "cat", "-n", "20000"],
+                             capture_output=True, text=True).stdout
+        plain = (re.sub(r"\x1b\[[0-9;]*m", "", l).rstrip() for l in out.splitlines())
+        warn = [l for l in plain if " WARN " in l or " ERROR " in l]
+    except OSError:
+        warn = []
 if warn:
     print()
     print(f"recent warnings ({len(warn)} in the log):")

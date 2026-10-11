@@ -38,6 +38,7 @@ pub mod commit;
 pub mod econ;
 pub mod live;
 pub mod plane;
+pub mod probe;
 pub mod risk;
 pub mod search;
 pub mod shadow;

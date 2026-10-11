@@ -23,6 +23,8 @@ apex-types = { path = "../apex-types" }
 apex-capture = { path = "../apex-capture" }
 apex-chain = { path = "../apex-chain" }
 apex-config = { path = "../apex-config" }
+# R25: `apex probe`'s round trips (the version apex-chain already builds).
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 apex-obs = { path = "../apex-obs" }
 apex-econ = { path = "../apex-econ" }
 apex-math = { path = "../apex-math" }

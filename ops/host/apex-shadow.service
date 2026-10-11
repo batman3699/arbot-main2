@@ -1,0 +1,38 @@
+# The co-located shadow (Task 8.5 R25): the capture path over the null
+# dispatcher. Nothing is broadcast. See ops/host/README.md.
+[Unit]
+Description=APEX shadow (Task 8.5): the capture path over the null dispatcher; nothing is broadcast
+Wants=network-online.target chrony.service
+After=network-online.target chrony.service
+
+[Service]
+Type=simple
+User=apex
+Group=apex
+WorkingDirectory=/opt/apex
+# Read by systemd as root before it drops to apex: root:root 0600.
+EnvironmentFile=/etc/apex/shadow.env
+ExecStart=/opt/apex/bin/apex shadow --config ops/shadow.base.yaml
+Restart=on-failure
+RestartSec=10
+# The shadow drains on SIGINT or SIGTERM; 90 s covers a Tier 2 in flight.
+KillSignal=SIGINT
+TimeoutStopSec=90
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/opt/apex/var
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

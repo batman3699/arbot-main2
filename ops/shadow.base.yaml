@@ -29,6 +29,13 @@ inventory: data/base
 journal: var/apex/shadow.journal
 report: var/apex/shadow.report.jsonl
 misses: var/apex/shadow.misses.jsonl
+# R25: the race ledger (one line per handled proposal) and Base's public
+# flashblock stream with its ledger. Measurement only; nothing priced reads
+# them. Each is a file per UTC day: race-YYYY-MM-DD.jsonl.
+race: var/apex/race.jsonl
+flashblocks:
+  stream: wss://mainnet.flashblocks.base.org/ws
+  ledger: var/apex/flashblocks.jsonl
 
 executor:
   # The Phase 5 executor, deployed 2026-10-03 by script/DeployAndConfigure.s.sol

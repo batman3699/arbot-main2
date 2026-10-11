@@ -130,3 +130,6 @@ python3 Convert.py
 # pipeline lands.
 /base_venues_complete.yaml
 /generate_base_venues.py
+
+# ops/host/deploy.sh output: the co-located host's archives (Task 8.5 R25).
+/dist/

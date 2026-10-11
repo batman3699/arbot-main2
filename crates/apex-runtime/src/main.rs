@@ -81,6 +81,9 @@ async fn main() -> ExitCode {
         )
         .init();
 
+    if std::env::args().nth(1).as_deref() == Some("probe") {
+        return probe().await;
+    }
     if std::env::args().nth(1).as_deref() == Some("shadow") {
         return shadow().await;
     }
@@ -105,6 +108,33 @@ async fn main() -> ExitCode {
         }
         Err(e) => {
             error!(error = %e, "apex refused to start");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `apex probe [--minutes N]`: the region probe (Task 8.5 R25). Reads only
+/// `APEX_SECRET_BLOCKPI_KEY`, and runs without it (no BlockPI figures).
+async fn probe() -> ExitCode {
+    let mut minutes = 60u64;
+    let mut argv = std::env::args().skip(2);
+    while let Some(flag) = argv.next() {
+        match (flag.as_str(), argv.next().and_then(|v| v.parse::<u64>().ok())) {
+            ("--minutes", Some(m)) if m > 0 => minutes = m,
+            _ => {
+                error!("usage: apex probe [--minutes N]");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let report = apex_runtime::probe::run(minutes, &Env::secrets_only()).await;
+    match serde_json::to_string_pretty(&report) {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!(error = %e, "the probe's report did not serialize");
             ExitCode::FAILURE
         }
     }

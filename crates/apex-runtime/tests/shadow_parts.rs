@@ -43,6 +43,10 @@ inventory: data/base
 journal: {journal}
 report: var/r.jsonl
 misses: var/m.jsonl
+race: var/r.jsonl
+flashblocks:
+  stream: wss://mainnet.flashblocks.base.org/ws
+  ledger: var/f.jsonl
 executor:
   address: "0x00000000000000000000000000000000000000e1"
   code_hash: "0x00000000000000000000000000000000000000000000000000000000000000c0"
@@ -93,6 +97,9 @@ fn a_resolved_key_is_held_as_a_secret() {
     assert!(!format!("{c:?}").contains(SECRET), "Debug printed the key");
     assert_eq!(c.signer.key_env, "APEX_SECRET_SHADOW_TEST_TRADER");
     assert_eq!(c.executor.plan_version, 2);
+    assert_eq!(c.race, std::path::PathBuf::from("var/r.jsonl"));
+    assert_eq!(c.flashblocks.stream, "wss://mainnet.flashblocks.base.org/ws");
+    assert_eq!(c.flashblocks.ledger, std::path::PathBuf::from("var/f.jsonl"));
 }
 
 /// An unset placeholder refuses to start, naming the variable — and only

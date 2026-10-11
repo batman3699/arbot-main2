@@ -88,6 +88,7 @@ fn swap(tick: i32, block: u64, index: u64, pending: bool, weth_in: i128, usdc_ou
         block_number: Some(block),
         transaction_hash: Some(keccak256(block.to_be_bytes())),
         log_index: Some(index),
+        transaction_index: None,
     }
 }
 
@@ -323,6 +324,7 @@ fn cake_log() -> RawLog {
             "87676ded616a1ff7066ea0c4450c12bc2262a85990f30dc3d1f5fe940d7d0e22"
         )),
         log_index: Some(393),
+        transaction_index: None,
     }
 }
 
@@ -652,6 +654,7 @@ fn sync_log(r0: u128, r1: u128, block: u64, index: u64) -> RawLog {
         block_number: Some(block),
         transaction_hash: Some(B256::repeat_byte(index as u8 + 1)),
         log_index: Some(index),
+        transaction_index: None,
     }
 }
 

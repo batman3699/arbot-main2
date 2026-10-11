@@ -19,6 +19,8 @@
 //! | capacity | a flashblock sample at boot, then one every `sample_every_s`, into the recorder behind the chain adapter | R5 |
 //! | full reload | a full reload every `full_reload_every_s`: pools a failed read removed come back, and the admissions' evidence stays inside its bound | R9 |
 //! | report | the funnel, capture assurance and every counter, logged and appended to `report`; the miss ledger drained into `misses` | R9 |
+//! | race | one line per handled proposal, with every stage's time, to `race` (a file per UTC day), off the capture path | R25 |
+//! | flashblocks | Base's public flashblock stream, as it reached this host, to `flashblocks.ledger`: the clock the race ledger is measured against | R25 |
 //!
 //! # What it proves, and what it cannot
 //!
@@ -35,8 +37,10 @@
 
 pub mod config;
 pub mod funnel;
+pub mod ledger;
 pub mod nothing_sent;
 pub mod queue;
+pub mod race;
 pub mod reload;
 
 use crate::bus::{EventBus, Lane, Subscription as BusSubscription};
@@ -72,6 +76,7 @@ use apex_capture::scheduler::CaptureAssurance;
 use apex_capture::signer::{ExecutorAuth, LaneConfig, SignerPool};
 use apex_chain::adapter::ReplacementPolicy;
 use apex_chain::base::flashblock::{sample, FlashblockRecorder};
+use apex_chain::base::flashblock_stream::{FlashblockIndexer, FlashblockStream, FlashblockStreamStats};
 use apex_chain::rpc::failover::{FailoverSettings, FailoverTransport};
 use apex_chain::rpc::ws::{Head, LogFilter, Notification, Subscription, WsFeed, WsSettings, WsStats};
 use apex_chain::rpc::RpcTransport;
@@ -98,8 +103,8 @@ use serde_json::{json, Value};
 use std::future::Future;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
@@ -152,6 +157,10 @@ struct Stats {
     queue_stale: AtomicU64,
     queue_conflicts: AtomicU64,
     queue_max_depth: AtomicU64,
+    /// R25: blocks the flashblock ledger could not see whole, and ledger lines
+    /// (race or flashblock) that could not be written.
+    incomplete_blocks: AtomicU64,
+    ledger_failures: AtomicU64,
 }
 
 fn bump(c: &AtomicU64) {
@@ -216,8 +225,22 @@ struct Shadow {
     largest_window: AtomicU64,
     recorder: tokio::sync::Mutex<FlashblockRecorder>,
     feed_stats: Versioned<Option<Arc<WsStats>>>,
+    /// The race ledger's two ends (R25): capture records, a worker writes.
+    race: race::RaceWriter,
+    race_lines: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<race::RaceLine>>,
+    flashblock_stats: Versioned<Option<Arc<FlashblockStreamStats>>>,
+    /// The signer's pending nonce at the first view, and whether it has moved
+    /// since: a shadow never sends, so a move means the key was used elsewhere.
+    boot_nonce: OnceLock<u64>,
+    nonce_moved: AtomicBool,
     stats: Stats,
     started: Instant,
+}
+
+/// Whether the signer's nonce differs from its first reading. A shadow never
+/// broadcasts, so any move means the key was used elsewhere (R25).
+pub fn nonce_moved(boot: Option<u64>, now: u64) -> bool {
+    boot.is_some_and(|b| b != now)
 }
 
 /// The census's pools that can form a cycle the live frontier prices: pairs
@@ -274,7 +297,20 @@ pub async fn run(config: ShadowConfig, env: &Env, stop: impl Future<Output = ()>
             Box::pin(async move { s.capture(&mut *capture.lock().await).await })
         }));
     }
-    for (name, task) in [("reload", Task::Reload), ("heads", Task::Heads), ("capacity", Task::Capacity), ("full-reload", Task::FullReload)] {
+    {
+        let (s, stopped) = (Arc::clone(&shadow), feed_stopped.clone());
+        spawn("flashblocks", Box::new(move || {
+            let (s, stopped) = (Arc::clone(&s), stopped.clone());
+            Box::pin(async move { s.flashblock_ledger(stopped).await })
+        }));
+    }
+    for (name, task) in [
+        ("reload", Task::Reload),
+        ("heads", Task::Heads),
+        ("capacity", Task::Capacity),
+        ("full-reload", Task::FullReload),
+        ("race", Task::Race),
+    ] {
         let s = Arc::clone(&shadow);
         spawn(name, Box::new(move || {
             let s = Arc::clone(&s);
@@ -300,6 +336,9 @@ pub async fn run(config: ShadowConfig, env: &Env, stop: impl Future<Output = ()>
     info!("stopping: the feed first, then every worker");
     let _ = feed_stop.send(true);
     shutdown.stop_workers(&mut workers).await;
+    // The race writer was stopped between lines: what it had not reached
+    // still goes to the ledger.
+    shadow.drain_race_lines();
     Ok(shadow.report(&bus))
 }
 
@@ -309,6 +348,7 @@ enum Task {
     Heads,
     Capacity,
     FullReload,
+    Race,
 }
 
 async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
@@ -512,6 +552,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         "shadow booted"
     );
     let (heads, _) = watch::channel(None);
+    let (race, race_lines) = race::RaceWriter::new(4_096);
     Ok(Shadow {
         universe: specs.iter().map(|p| p.pool).collect(),
         venues,
@@ -534,6 +575,11 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         largest_window: AtomicU64::new(0),
         recorder: tokio::sync::Mutex::new(FlashblockRecorder::new(FlashblockRecorder::DEFAULT_WINDOW)),
         feed_stats: Versioned::new(None, ReconstructionStatus::Rebuilding),
+        race,
+        race_lines: tokio::sync::Mutex::new(race_lines),
+        flashblock_stats: Versioned::new(None, ReconstructionStatus::Rebuilding),
+        boot_nonce: OnceLock::new(),
+        nonce_moved: AtomicBool::new(false),
         stats: Stats::default(),
         started,
         config,
@@ -628,14 +674,19 @@ impl Shadow {
                 queue.clear();
                 continue;
             }
-            let popped = queue.pop_best(SystemClock.now());
+            let now = SystemClock.now();
+            let popped = queue.pop_best(now);
             let stale: Vec<Handled> =
                 popped.stale.iter().map(|(p, age)| self.plane.decline_stale(&p.proposal, *age)).collect();
+            for (p, _) in &popped.stale {
+                self.race.record(race::race_line(p, now, now, (race::RaceOutcome::Stale, None)));
+            }
             self.stats.queue_stale.fetch_add(stale.len() as u64, Ordering::Relaxed);
             self.funnel.record(&stale);
             self.stats.queue_max_depth.fetch_max(queue.max_depth() as u64, Ordering::Relaxed);
             let Some(best) = popped.best else { continue };
             let handled = self.plane.handle_proposal(&best.event, &best.proposal).await;
+            self.race.record(race::race_line(&best, now, SystemClock.now(), race::outcome_of(&handled)));
             if dispatched(&handled) {
                 let n = queue.drop_conflicting(&pools_of(&best.proposal));
                 self.stats.queue_conflicts.fetch_add(n as u64, Ordering::Relaxed);
@@ -646,13 +697,14 @@ impl Shadow {
 
     /// One event: counted, then proposed and queued while the book is verified.
     async fn take(&self, queue: &mut PendingQueue, ev: Arc<StateEvent>) {
+        let received = SystemClock.now();
         self.funnel.event();
         if self.book.status() != ReconstructionStatus::Verified {
             self.funnel.skipped_unverified();
             return;
         }
         match self.plane.propose(&ev).await {
-            Ok(proposals) => queue.merge(&ev, proposals),
+            Ok(proposals) => queue.merge(&ev, proposals, received),
             Err(handled) => self.funnel.record(std::slice::from_ref(&handled)),
         }
     }
@@ -662,6 +714,7 @@ impl Shadow {
             Task::Reload => self.reload_loop().await,
             Task::Heads => self.head_loop().await,
             Task::Capacity => self.capacity_loop().await,
+            Task::Race => self.race_writer().await,
             Task::FullReload => {
                 let mut every = tokio::time::interval(Duration::from_secs(self.config.policy.full_reload_every_s));
                 every.tick().await;
@@ -753,6 +806,15 @@ impl Shadow {
             let window = self.largest_window.load(Ordering::Relaxed);
             view.note("the live reader's view", self.reader.refresh(&h, window).await, &self.stats.view_failures);
             if let Some(v) = self.reader.view() {
+                let boot = *self.boot_nonce.get_or_init(|| v.signer_pending_nonce);
+                if nonce_moved(Some(boot), v.signer_pending_nonce) {
+                    self.nonce_moved.store(true, Ordering::Relaxed);
+                    error!(
+                        boot,
+                        now = v.signer_pending_nonce,
+                        "the signer's nonce moved: a shadow never sends, so the trader key was used elsewhere; revoke it (ops/host/README.md)"
+                    );
+                }
                 let held = Some(ethers_core::types::U256::from(v.lender_holding));
                 self.lender.send_if_modified(|now| {
                     let moved = *now != held;
@@ -778,6 +840,47 @@ impl Shadow {
                 self.stats.base_fee_wei.store(u64::try_from(fee).unwrap_or(u64::MAX), Ordering::Relaxed);
             }
         }
+    }
+
+    /// The race ledger's writer: off the capture path, a failed write counted.
+    async fn race_writer(&self) {
+        let mut rx = self.race_lines.lock().await;
+        while let Some(line) = rx.recv().await {
+            self.write_race_line(&line);
+        }
+    }
+
+    fn write_race_line(&self, line: &race::RaceLine) {
+        if ledger::append_line(&self.config.race, line.handled_ns, line).is_err() {
+            bump(&self.stats.ledger_failures);
+        }
+    }
+
+    /// Whatever the race writer had not reached when it was stopped.
+    fn drain_race_lines(&self) {
+        if let Ok(mut rx) = self.race_lines.try_lock() {
+            while let Ok(line) = rx.try_recv() {
+                self.write_race_line(&line);
+            }
+        }
+    }
+
+    /// Base's public flashblock stream, as it reached this host, to its ledger:
+    /// the clock the race ledger is measured against (R25). Measurement only.
+    async fn flashblock_ledger(&self, stop: watch::Receiver<bool>) {
+        let stream = FlashblockStream::new(&self.config.flashblocks.stream);
+        self.flashblock_stats.store(Some(stream.stats()), ReconstructionStatus::Verified);
+        let (task, mut rx) = stream.spawn(stop);
+        let mut ix = FlashblockIndexer::new();
+        while let Some((f, at)) = rx.recv().await {
+            if let Some(seen) = ix.observe(&f, at) {
+                if ledger::append_line(&self.config.flashblocks.ledger, at, &seen).is_err() {
+                    bump(&self.stats.ledger_failures);
+                }
+            }
+            self.stats.incomplete_blocks.store(ix.incomplete_blocks(), Ordering::Relaxed);
+        }
+        let _ = task.await;
     }
 
     async fn capacity_loop(&self) {
@@ -830,6 +933,7 @@ impl Shadow {
 
         let (skipped, unpriced, declined, invalidated) = self.search.counters().snapshot();
         let feed = self.feed_stats.load().value.as_ref().clone();
+        let flashblocks = self.flashblock_stats.load().value.as_ref().clone();
         let r = Report {
             unix_s: SystemClock.now().0 / 1_000_000_000,
             uptime_s: self.started.elapsed().as_secs(),
@@ -885,6 +989,18 @@ impl Shadow {
                 stale: get(&self.stats.queue_stale),
                 conflicts: get(&self.stats.queue_conflicts),
                 max_depth: get(&self.stats.queue_max_depth),
+            },
+            flashblocks: FlashblockReport {
+                sessions: flashblocks.as_ref().map_or(0, |f| f.sessions()),
+                frames: flashblocks.as_ref().map_or(0, |f| f.frames()),
+                decode_failures: flashblocks.as_ref().map_or(0, |f| f.decode_failures()),
+                incomplete_blocks: get(&self.stats.incomplete_blocks),
+                ledger_failures: get(&self.stats.ledger_failures),
+            },
+            race: RaceReport { written: self.race.written(), dropped: self.race.dropped() },
+            signer: SignerReport {
+                boot_nonce: self.boot_nonce.get().copied(),
+                nonce_moved: self.nonce_moved.load(Ordering::Relaxed),
             },
         };
         info!(
@@ -954,6 +1070,35 @@ pub struct Report {
     pub near_miss: NearMissReport,
     /// R21's queue: what it dropped, and how deep it got.
     pub queue: QueueReport,
+    /// R25: Base's public flashblock stream and both ledgers.
+    pub flashblocks: FlashblockReport,
+    pub race: RaceReport,
+    /// R25's tripwire: the signer's nonce at boot, and whether it has moved.
+    pub signer: SignerReport,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FlashblockReport {
+    pub sessions: u64,
+    pub frames: u64,
+    pub decode_failures: u64,
+    /// Blocks joined mid-way or with a missing index: their ranges unknown.
+    pub incomplete_blocks: u64,
+    /// Race or flashblock ledger lines that could not be written.
+    pub ledger_failures: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RaceReport {
+    pub written: u64,
+    /// Lines dropped because the writer had fallen 4,096 behind.
+    pub dropped: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SignerReport {
+    pub boot_nonce: Option<u64>,
+    pub nonce_moved: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]

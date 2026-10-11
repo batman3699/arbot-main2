@@ -30,36 +30,37 @@ fn drain(q: &mut PendingQueue, now: u64) -> Vec<B256> {
 #[test]
 fn the_most_valuable_proposal_is_handled_first() {
     let mut q = PendingQueue::default();
-    q.merge(&event(), vec![proposal(1, &[1], T0, Some(5)), proposal(2, &[2], T0, Some(1_798)), proposal(3, &[3], T0, None)]);
+    q.merge(&event(), vec![proposal(1, &[1], T0, Some(5)), proposal(2, &[2], T0, Some(1_798)), proposal(3, &[3], T0, None)], UnixNanos(0));
     assert_eq!(drain(&mut q, T0), vec![B256::repeat_byte(2), B256::repeat_byte(1), B256::repeat_byte(3)]);
 }
 
 #[test]
 fn a_newer_proposal_for_a_route_replaces_the_older() {
     let mut q = PendingQueue::default();
-    q.merge(&event(), vec![proposal(1, &[1], T0, Some(9))]);
-    q.merge(&event(), vec![proposal(1, &[1], T0 + 10, Some(3))]);
+    q.merge(&event(), vec![proposal(1, &[1], T0, Some(9))], UnixNanos(0));
+    q.merge(&event(), vec![proposal(1, &[1], T0 + 10, Some(3))], UnixNanos(T0 + 12));
     assert_eq!(q.len(), 1);
     let best = q.pop_best(UnixNanos(T0 + 10)).best.expect("one");
     assert_eq!(best.proposal.net_hint, Some(U256::from(3)), "the newer price, not the larger");
+    assert_eq!(best.received, UnixNanos(T0 + 12), "when its event was taken, for the race ledger (R25)");
 }
 
 #[test]
 fn an_older_proposal_does_not_replace_a_newer_one() {
     let mut q = PendingQueue::default();
-    q.merge(&event(), vec![proposal(1, &[1], T0 + 10, Some(3))]);
-    q.merge(&event(), vec![proposal(1, &[1], T0, Some(9))]);
+    q.merge(&event(), vec![proposal(1, &[1], T0 + 10, Some(3))], UnixNanos(0));
+    q.merge(&event(), vec![proposal(1, &[1], T0, Some(9))], UnixNanos(0));
     assert_eq!(q.pop_best(UnixNanos(T0 + 10)).best.expect("one").proposal.net_hint, Some(U256::from(3)));
 }
 
 #[test]
 fn a_proposal_is_stale_only_past_one_second() {
     let mut q = PendingQueue::default();
-    q.merge(&event(), vec![proposal(1, &[1], T0, Some(1))]);
+    q.merge(&event(), vec![proposal(1, &[1], T0, Some(1))], UnixNanos(0));
     let at_limit = q.pop_best(UnixNanos(T0 + MAX_PROPOSAL_AGE.0));
     assert!(at_limit.stale.is_empty() && at_limit.best.is_some(), "exactly 1 s old is still fresh");
 
-    q.merge(&event(), vec![proposal(2, &[2], T0, Some(1))]);
+    q.merge(&event(), vec![proposal(2, &[2], T0, Some(1))], UnixNanos(0));
     let past = q.pop_best(UnixNanos(T0 + MAX_PROPOSAL_AGE.0 + 1));
     assert_eq!(past.stale.len(), 1);
     assert_eq!(past.stale[0].1 .0, MAX_PROPOSAL_AGE.0 + 1, "it carries its age");
@@ -72,6 +73,7 @@ fn ties_go_to_the_newest_then_the_lowest_route() {
     q.merge(
         &event(),
         vec![proposal(7, &[1], T0, Some(4)), proposal(5, &[2], T0 + 1, Some(4)), proposal(6, &[3], T0 + 1, Some(4))],
+        UnixNanos(0),
     );
     assert_eq!(drain(&mut q, T0 + 1), vec![B256::repeat_byte(5), B256::repeat_byte(6), B256::repeat_byte(7)]);
 }
@@ -82,6 +84,7 @@ fn proposals_sharing_a_traded_pool_are_dropped() {
     q.merge(
         &event(),
         vec![proposal(1, &[1, 2], T0, Some(1)), proposal(2, &[2, 3], T0, Some(1)), proposal(3, &[4, 5], T0, Some(1))],
+        UnixNanos(0),
     );
     let traded = pools_of(&proposal(9, &[2, 9], T0, None));
     assert_eq!(q.drop_conflicting(&traded), 2);
@@ -91,7 +94,7 @@ fn proposals_sharing_a_traded_pool_are_dropped() {
 #[test]
 fn the_deepest_the_queue_got_is_kept() {
     let mut q = PendingQueue::default();
-    q.merge(&event(), vec![proposal(1, &[1], T0, Some(1)), proposal(2, &[2], T0, Some(1))]);
+    q.merge(&event(), vec![proposal(1, &[1], T0, Some(1)), proposal(2, &[2], T0, Some(1))], UnixNanos(0));
     let _ = q.pop_best(UnixNanos(T0));
     let _ = q.pop_best(UnixNanos(T0));
     assert_eq!(q.max_depth(), 2);

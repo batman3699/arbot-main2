@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod flashblock;
+pub mod flashblock_stream;
 pub mod observe;
 pub mod reconcile;
 pub mod submit;

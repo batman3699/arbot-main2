@@ -5876,6 +5876,31 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
   - Once adapter 4 is registered, the universe goes from 33 pools and 116 two-hop cycles to 41 pools (6 of them Aerodrome v2) and 158.
   - 14 mutants, all killed (two only after a test was added or tightened).
   - The owner transaction is prepared: `BatchRouter.multicall([clone, clone], [registerAdapter(4, router), allowSelector(4, 0xcac88ea9)])` from `0x69D5…8A3`, 91,880 gas. Dry-run as the owner it succeeds; as the trader it reverts `NotOwner`. Until it is broadcast, the shadow leaves the venue out by itself.
+- [x] **R25 — a co-located shadow and a race ledger (code; the host run is the operator's).** Spec `docs/superpowers/specs/2026-10-11-colocated-shadow-design.md`, plan `docs/superpowers/plans/2026-10-12-colocated-shadow.md`. The 2026-10-10 finding was that rivals take our real gaps in the same block, a flashblock ahead, while we watch from New Zealand. So the next measurement is from next to the builder, with a ledger that says by how many flashblocks each race was lost. Nothing on the trading path reads what this adds.
+  - `apex_chain::base::flashblock_stream` reads Base's public flashblock stream (`wss://mainnet.flashblocks.base.org/ws`, brotli JSON, no receipts or logs). Each frame is stamped on receipt, before decoding. `FlashblockIndexer` gives each flashblock the transaction-index range it added, and trusts a block only when seen whole; a block joined mid-way or with a missing index is counted incomplete and never guessed. Decoding is pinned by 15 recorded frames (block 52,477,080 whole, 52,477,081 in part).
+  - `RawLog` carries `transactionIndex` when the provider sends it.
+  - `apex probe [--minutes N]` measures the host: index-0 arrival after the slot opened, BlockPI's `pendingLogs` delay behind the raw flashblock, and round trips to Base's RPC, its Cloudflare edge, the sequencer and BlockPI. **From Wellington, 5 minutes on 2026-10-12:** arrival offset p50 137 / p90 209 ms; BlockPI delay p10 −8 / p50 22 / p90 95 ms (n = 361; BlockPI sometimes beats the raw stream to NZ); round trips 13 ms (edge), 172 ms (BlockPI), 209 ms (Base RPC), 219 ms (sequencer). These agree with the hand measurement of 2026-10-11 (~128 ms; 6/45/92 ms).
+  - The shadow writes two ledgers, a file per UTC day: `race-*.jsonl`, one line per handled proposal, and `flashblocks-*.jsonl`. A race line holds the trigger (block, log index, transaction), the times observed / received / proposed / picked / handled, and the outcome under the funnel's labels, with the ticket id. A writer task does the file work and a full channel drops the line and counts it, so capture never waits. Lines still queued at shutdown are drained.
+  - **Tripwire:** a shadow never sends, so the trader's pending nonce cannot move. The head loop compares it with its first reading; a move logs ERROR on every head and sets `signer.nonce_moved`. The report gains `flashblocks`, `race` and `signer`, and `shadow-status.sh` prints them (and, on the host, reads systemd's pid and journal).
+  - `scripts/data/race_analysis.py` takes each race line on a ticketed route and finds:
+    - the trigger's flashblock k (from its receipt);
+    - the rival: the first later transaction within four blocks that swapped through every pool of the route;
+    - where our transaction would have landed, sent at proposal and after Tier 2, at ε = 0/20/40 ms.
+    It reports G1 (k's arrival → received: p50 ≤ 80, p90 ≤ 130 ms), G2 (by k+1 on ≥ 50% at ε = 20 ms), the share landed ahead of the rival, and the rivals' offsets. It loads only the ledger around the triggers (two weeks of the stream is ~6.6M lines), and resolves each trigger and rival once.
+  - `ops/host/` holds:
+    - the systemd unit, hardened, with a root-only `EnvironmentFile`;
+    - `provision.sh` (Amazon Time Sync, swap, an `apex` user, the pinned toolchain);
+    - `deploy.sh`, which packages a revision plus only the five `pools.jsonl` files the shadow loads (6.5 MB of `data/base`'s 470 MB) under a SHA-256 manifest;
+    - the runbook: SSM only, no inbound rule, transfer by presigned URL, the probe, install, checks, updating, analysis.
+  - **Revocation is prepared:** `BatchRouter.multicall([clone], [setExecutor(0xCB43…, false)])`. Dry-run on 2026-10-12: the trader is an executor now (`true`); as the owner the call succeeds (`0x`, 43,839 gas); as the trader it reverts `NotOwner()`. The calldata is in the runbook.
+  - **Smoke run** (debug binary, a scratch config, 2026-10-12): it booted on all five venues (41 pools, 158 cycles). The flashblock ledger wrote 3,625 frames, 0 undecoded, 1 incomplete block (the join). The trader's nonce at boot is 0, so the key has never sent.
+  - 19 mutants, all killed. Three of them only after a test was strengthened: a frame whose two block numbers disagree, nearest rank on seven samples, and a trigger that swaps through both pools.
+  - Deviations from the plan:
+    - the plan's rotation test expected 2026-10-12 for 1,791,743,507 s, which is 2026-10-11 18:31 UTC;
+    - the analyzer bisects and indexes instead of scanning;
+    - `race_line` moved into `shadow::race` so it could be tested;
+    - the env file is root:root 0600, since systemd reads it as root.
+  - **Pending, Task 7 (operator):** the AWS role and security group, probes in us-east-1 and us-east-2, the host, the dry-run, then a new fourteen-day clock. After one hour: both ledgers non-empty and G1 reported. After seven days: the §7 decision.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 

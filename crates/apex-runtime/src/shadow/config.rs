@@ -66,6 +66,8 @@ struct Raw {
     journal: PathBuf,
     report: PathBuf,
     misses: PathBuf,
+    race: PathBuf,
+    flashblocks: FlashblocksConfig,
     executor: ExecutorConfig,
     signer: SignerConfig,
     policy: Policy,
@@ -172,6 +174,15 @@ pub struct CapacityConfig {
     pub sample_for_s: u64,
 }
 
+/// Base's public flashblock stream and where its ledger goes (R25).
+/// Measurement only: nothing priced or signed reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlashblocksConfig {
+    pub stream: String,
+    pub ledger: PathBuf,
+}
+
 /// A resolved shadow configuration. `Debug` shows no secret.
 #[derive(Clone, Debug)]
 pub struct ShadowConfig {
@@ -185,6 +196,9 @@ pub struct ShadowConfig {
     pub journal: PathBuf,
     pub report: PathBuf,
     pub misses: PathBuf,
+    /// The race ledger: one line per handled proposal, a file per UTC day (R25).
+    pub race: PathBuf,
+    pub flashblocks: FlashblocksConfig,
     pub executor: ExecutorConfig,
     pub signer: SignerConfig,
     pub policy: Policy,
@@ -258,6 +272,8 @@ impl ShadowConfig {
             journal: raw.journal,
             report: raw.report,
             misses: raw.misses,
+            race: raw.race,
+            flashblocks: raw.flashblocks,
             executor: raw.executor,
             signer: raw.signer,
             policy: raw.policy,

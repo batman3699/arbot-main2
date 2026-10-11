@@ -120,6 +120,22 @@ fn a_pending_log_is_marked_pending_and_a_confirmed_one_is_not() {
     assert!(confirmed.transaction_hash.is_some());
 }
 
+/// R25: a log's transaction's position in its block, which a preconfirmed log
+/// already has: the race ledger finds a trigger's flashblock by it.
+#[test]
+fn a_log_carries_its_transaction_index_when_the_provider_sends_it() {
+    let mut v = log_json(None, false);
+    v["transactionIndex"] = json!("0x12f");
+    let Some(Notification::Log(with)) = parse_notification(&note("0x3", v), &ids()) else {
+        panic!("pending log did not parse")
+    };
+    assert_eq!(with.transaction_index, Some(303));
+    let Some(Notification::Log(without)) = parse_notification(&note("0x3", log_json(None, false)), &ids()) else {
+        panic!("pending log did not parse")
+    };
+    assert_eq!(without.transaction_index, None);
+}
+
 /// A reorged log arrives again with `removed: true`. Dropping the flag would
 /// apply a swap that did not happen.
 #[test]

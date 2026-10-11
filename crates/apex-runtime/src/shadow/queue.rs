@@ -23,6 +23,8 @@ pub const MAX_PROPOSAL_AGE: DurationNanos = DurationNanos(1_000_000_000);
 pub struct Pending {
     pub event: Arc<StateEvent>,
     pub proposal: RouteProposal,
+    /// When the capture loop took the event: the end of detection (G1, R25).
+    pub received: UnixNanos,
 }
 
 /// What one pick took out of the queue.
@@ -42,14 +44,14 @@ pub struct PendingQueue {
 }
 
 impl PendingQueue {
-    /// Add an event's proposals. A route already queued takes the newer
-    /// proposal: it was priced against newer state.
-    pub fn merge(&mut self, event: &Arc<StateEvent>, proposals: Vec<RouteProposal>) {
+    /// Add an event's proposals, taken at `received`. A route already queued
+    /// takes the newer proposal: it was priced against newer state.
+    pub fn merge(&mut self, event: &Arc<StateEvent>, proposals: Vec<RouteProposal>, received: UnixNanos) {
         for proposal in proposals {
             let key = proposal.route.route_hash;
             let newer = self.by_route.get(&key).is_none_or(|q| proposal.found_at.0 >= q.proposal.found_at.0);
             if newer {
-                self.by_route.insert(key, Pending { event: Arc::clone(event), proposal });
+                self.by_route.insert(key, Pending { event: Arc::clone(event), proposal, received });
             }
         }
         self.max_depth = self.max_depth.max(self.by_route.len());
