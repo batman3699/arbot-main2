@@ -62,9 +62,11 @@ fn a_handled_proposal_becomes_a_line_with_each_stage_in_place() {
     ev.observed_at = UnixNanos(10);
     ev.kind = EventKind::PendingSwap { target: B256::repeat_byte(0x7a), pools: vec![], notional_usd: None };
     let mut proposal = test_proposal(B256::repeat_byte(0x11), &[]);
-    proposal.found_at = UnixNanos(30);
+    // Engine C dates a proposal by its event: `found_at` is not when the
+    // search returned, and the line must not take it for that.
+    proposal.found_at = UnixNanos(10);
     proposal.net_hint = Some(U256::from(1_798u64));
-    let p = Pending { event: Arc::new(ev), proposal, received: UnixNanos(20) };
+    let p = Pending { event: Arc::new(ev), proposal, received: UnixNanos(20), proposed: UnixNanos(30) };
 
     let l = race_line(&p, UnixNanos(40), UnixNanos(50), (RaceOutcome::Dispatched, Some(263)));
     assert_eq!(l.trigger, RaceTrigger { block: 52_342_205, log_index: 51, tx: format!("0x{}", "7a".repeat(32)) });

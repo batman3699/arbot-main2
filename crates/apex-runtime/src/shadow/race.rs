@@ -50,7 +50,8 @@ pub struct RaceLine {
     pub observed_ns: u64,
     /// When the capture loop took it: the end of detection (G1).
     pub received_ns: u64,
-    /// When the search priced the route.
+    /// When the search returned the proposal: the earliest a fast path could
+    /// have signed and sent it.
     pub proposed_ns: u64,
     /// When the queue picked it.
     pub picked_ns: u64,
@@ -74,7 +75,7 @@ pub fn race_line(p: &Pending, picked: UnixNanos, handled_at: UnixNanos, outcome:
         trigger: RaceTrigger { block: p.event.at.block, log_index: p.event.at.log_index, tx },
         observed_ns: p.event.observed_at.0,
         received_ns: p.received.0,
-        proposed_ns: p.proposal.found_at.0,
+        proposed_ns: p.proposed.0,
         picked_ns: picked.0,
         handled_ns: handled_at.0,
         outcome: outcome.0,

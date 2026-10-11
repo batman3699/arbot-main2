@@ -704,7 +704,7 @@ impl Shadow {
             return;
         }
         match self.plane.propose(&ev).await {
-            Ok(proposals) => queue.merge(&ev, proposals, received),
+            Ok(proposals) => queue.merge(&ev, proposals, received, SystemClock.now()),
             Err(handled) => self.funnel.record(std::slice::from_ref(&handled)),
         }
     }
