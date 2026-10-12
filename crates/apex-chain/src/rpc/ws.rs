@@ -205,29 +205,30 @@ pub fn parse_notification(msg: &Value, ids: &BTreeMap<String, Kind>) -> Option<N
                     .count(),
             }))
         }
-        Kind::Logs | Kind::PendingLogs => {
-            let topics = r
-                .get("topics")?
-                .as_array()?
-                .iter()
-                .map(|t| t.as_str().and_then(|s| s.parse().ok()))
-                .collect::<Option<Vec<B256>>>()?;
-            Some(Notification::Log(RawLog {
-                pending: kind == Kind::PendingLogs,
-                removed: r.get("removed").and_then(Value::as_bool).unwrap_or(false),
-                address: r.get("address")?.as_str()?.parse().ok()?,
-                topics,
-                data: alloy_primitives::hex::decode(r.get("data")?.as_str()?).ok()?,
-                block_number: r.get("blockNumber").and_then(quantity),
-                transaction_hash: r
-                    .get("transactionHash")
-                    .and_then(Value::as_str)
-                    .and_then(|s| s.parse().ok()),
-                log_index: r.get("logIndex").and_then(quantity),
-                transaction_index: r.get("transactionIndex").and_then(quantity),
-            }))
-        }
+        Kind::Logs | Kind::PendingLogs => parse_log(r, kind == Kind::PendingLogs).map(Notification::Log),
     }
+}
+
+/// One log object, as `eth_getLogs` returns it or a `logs` notification
+/// carries it (R26 reads the former). `pending` for `pendingLogs`.
+pub fn parse_log(r: &Value, pending: bool) -> Option<RawLog> {
+    let topics = r
+        .get("topics")?
+        .as_array()?
+        .iter()
+        .map(|t| t.as_str().and_then(|s| s.parse().ok()))
+        .collect::<Option<Vec<B256>>>()?;
+    Some(RawLog {
+        pending,
+        removed: r.get("removed").and_then(Value::as_bool).unwrap_or(false),
+        address: r.get("address")?.as_str()?.parse().ok()?,
+        topics,
+        data: alloy_primitives::hex::decode(r.get("data")?.as_str()?).ok()?,
+        block_number: r.get("blockNumber").and_then(quantity),
+        transaction_hash: r.get("transactionHash").and_then(Value::as_str).and_then(|s| s.parse().ok()),
+        log_index: r.get("logIndex").and_then(quantity),
+        transaction_index: r.get("transactionIndex").and_then(quantity),
+    })
 }
 
 fn quantity(v: &Value) -> Option<u64> {

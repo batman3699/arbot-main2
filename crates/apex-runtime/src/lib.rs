@@ -33,6 +33,7 @@
 //! and suppression decides whether a ticket should exist at all. That decision
 //! is step 1 of §16.2, and step 1 is here.
 
+pub mod armed;
 pub mod bus;
 pub mod commit;
 pub mod econ;

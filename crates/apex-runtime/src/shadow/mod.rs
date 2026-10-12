@@ -21,6 +21,7 @@
 //! | report | the funnel, capture assurance and every counter, logged and appended to `report`; the miss ledger drained into `misses` | R9 |
 //! | race | one line per handled proposal, with every stage's time, to `race` (a file per UTC day), off the capture path | R25 |
 //! | flashblocks | Base's public flashblock stream, as it reached this host, to `flashblocks.ledger`: the clock the race ledger is measured against | R25 |
+//! | armed | every 200 ms, the arming engine over the verified book: the best routes' gaps armed as validity transactions would be, recorded to `armed.ledger`, never sent | R26 |
 //!
 //! # What it proves, and what it cannot
 //!
@@ -161,6 +162,8 @@ struct Stats {
     /// (race or flashblock) that could not be written.
     incomplete_blocks: AtomicU64,
     ledger_failures: AtomicU64,
+    /// R26: armed-ledger lines that could not be written.
+    armed_write_failures: AtomicU64,
 }
 
 fn bump(c: &AtomicU64) {
@@ -233,6 +236,8 @@ struct Shadow {
     /// since: a shadow never sends, so a move means the key was used elsewhere.
     boot_nonce: OnceLock<u64>,
     nonce_moved: AtomicBool,
+    /// R26: the arming engine (armed-shadow).
+    armed: Arc<crate::armed::engine::Engine>,
     stats: Stats,
     started: Instant,
 }
@@ -310,6 +315,7 @@ pub async fn run(config: ShadowConfig, env: &Env, stop: impl Future<Output = ()>
         ("capacity", Task::Capacity),
         ("full-reload", Task::FullReload),
         ("race", Task::Race),
+        ("armed", Task::Armed),
     ] {
         let s = Arc::clone(&shadow);
         spawn(name, Box::new(move || {
@@ -349,6 +355,7 @@ enum Task {
     Capacity,
     FullReload,
     Race,
+    Armed,
 }
 
 async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
@@ -405,6 +412,11 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         warn!(pool = %u.pool, why = ?u.why, "not loaded at boot; the first full reload reads it again");
     }
     let book = Arc::new(book);
+    // R26: the armed predicates' storage words, read back at the boot block.
+    let unarmable = crate::armed::engine::verify_layouts(&reads, &book.snapshot(), head).await;
+    for pool in &unarmable {
+        warn!(%pool, "its watched storage words did not read back as loaded: never armed");
+    }
     let (frontier, cycles) = frontier::build(base, WETH, &book.snapshot());
     if cycles.is_empty() {
         return Err(ShadowError::Boot("the book holds no WETH cycle; nothing to search".into()));
@@ -455,6 +467,21 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     // R21: what the lender holds, for sizing. Seeded with the boot read; the
     // head loop replaces it after every view the reader takes.
     let (lender, lender_now) = watch::channel(Some(ethers_core::types::U256::from(holding)));
+    let armed = Arc::new(crate::armed::engine::Engine::new(
+        cycles.clone(),
+        crate::armed::engine::EngineSettings {
+            max_arms: config.armed.max_arms,
+            rungs: config.armed.rungs,
+            window_s: config.armed.window_s,
+            block_time_ms: config.armed.block_time_ms,
+            band_cap_bps: config.armed.band_cap_bps,
+            liquidity_floor_bps: config.armed.liquidity_floor_bps,
+            executor: config.executor.address,
+            chain_id: base.0,
+            reprice_budget: crate::armed::engine::REPRICE_BUDGET,
+        },
+        unarmable,
+    ));
     let pricer =
         Arc::new(LivePricer::new(Arc::clone(&book), cycles.clone(), unpriced, gas::MEASURED).with_lender(lender_now));
     let pricer_near_misses = pricer.near_misses();
@@ -580,6 +607,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         flashblock_stats: Versioned::new(None, ReconstructionStatus::Rebuilding),
         boot_nonce: OnceLock::new(),
         nonce_moved: AtomicBool::new(false),
+        armed,
         stats: Stats::default(),
         started,
         config,
@@ -715,6 +743,7 @@ impl Shadow {
             Task::Heads => self.head_loop().await,
             Task::Capacity => self.capacity_loop().await,
             Task::Race => self.race_writer().await,
+            Task::Armed => self.armed_loop().await,
             Task::FullReload => {
                 let mut every = tokio::time::interval(Duration::from_secs(self.config.policy.full_reload_every_s));
                 every.tick().await;
@@ -838,6 +867,36 @@ impl Shadow {
             if let (Some(fee), Some((_, p))) = (h.base_fee_per_gas, l1) {
                 self.costs.set(fee, p);
                 self.stats.base_fee_wei.store(u64::try_from(fee).unwrap_or(u64::MAX), Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// R26: armed-shadow. Every 200 ms, the engine's pass over the verified
+    /// book, off the async threads; its lines to the armed ledger.
+    async fn armed_loop(&self) {
+        let mut every = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            every.tick().await;
+            if self.book.status() != ReconstructionStatus::Verified {
+                continue;
+            }
+            let Some(head) = self.heads.borrow().clone() else { continue };
+            let px = crate::armed::threshold::Pricing {
+                costs: self.costs.route_costs(),
+                gas: gas::MEASURED,
+                cap: *self.lender.borrow(),
+                margin_wei: ethers_core::types::U256::from(self.config.armed.margin_wei),
+            };
+            let (engine, snapshot) = (Arc::clone(&self.armed), self.book.snapshot());
+            let base_fee = head.base_fee_per_gas.unwrap_or(0);
+            let now = SystemClock.now().0;
+            let lines = tokio::task::spawn_blocking(move || engine.tick(&snapshot, head.number, base_fee, &px, now))
+                .await
+                .unwrap_or_default();
+            for line in &lines {
+                if ledger::append_line(&self.config.armed.ledger, now, line).is_err() {
+                    bump(&self.stats.armed_write_failures);
+                }
             }
         }
     }
@@ -1002,6 +1061,17 @@ impl Shadow {
                 boot_nonce: self.boot_nonce.get().copied(),
                 nonce_moved: self.nonce_moved.load(Ordering::Relaxed),
             },
+            armed: {
+                let (move_checks, move_tick_mismatches, move_liquidity_changes) = self.book.move_checks();
+                ArmedReport {
+                    mode: "shadow",
+                    engine: self.armed.stats(),
+                    write_failures: get(&self.stats.armed_write_failures),
+                    move_checks,
+                    move_tick_mismatches,
+                    move_liquidity_changes,
+                }
+            },
         };
         info!(
             head = ?r.head,
@@ -1075,6 +1145,21 @@ pub struct Report {
     pub race: RaceReport,
     /// R25's tripwire: the signer's nonce at boot, and whether it has moved.
     pub signer: SignerReport,
+    /// R26: the arming engine, and the move model's check on every Swap.
+    pub armed: ArmedReport,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ArmedReport {
+    pub mode: &'static str,
+    pub engine: crate::armed::engine::EngineStats,
+    pub write_failures: u64,
+    /// Applied Swaps checked against `move_to_price`.
+    pub move_checks: u64,
+    /// The model's tick was wrong: its error. Should stay near zero.
+    pub move_tick_mismatches: u64,
+    /// The tick agreed, the liquidity did not: an unapplied mint or burn.
+    pub move_liquidity_changes: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]

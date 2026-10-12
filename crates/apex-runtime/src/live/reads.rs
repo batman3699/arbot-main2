@@ -56,6 +56,17 @@ impl ChainReads {
         parse_quantity(&v).ok_or_else(|| ReadError::Malformed(format!("eth_blockNumber: {v}")))
     }
 
+    /// One storage word of `a` at `block` (R26: the armed layouts' check).
+    pub async fn storage_at(&self, a: Address, slot: u64, block: u64) -> Result<ethers_core::types::U256, ReadError> {
+        let v = self
+            .rpc
+            .call("eth_getStorageAt", json!([format!("{a:#x}"), format!("{slot:#x}"), format!("{block:#x}")]))
+            .await?;
+        v.as_str()
+            .and_then(|s| ethers_core::types::U256::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            .ok_or_else(|| ReadError::Malformed(format!("eth_getStorageAt: {v}")))
+    }
+
     /// Every call, at `block`. `None` for a call that failed — reverted, or a
     /// selector the target does not have — which is an answer about that call
     /// and not a reason to lose the others.

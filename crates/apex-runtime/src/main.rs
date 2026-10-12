@@ -81,6 +81,9 @@ async fn main() -> ExitCode {
         )
         .init();
 
+    if std::env::args().nth(1).as_deref() == Some("armed-eval") {
+        return armed_eval().await;
+    }
     if std::env::args().nth(1).as_deref() == Some("probe") {
         return probe().await;
     }
@@ -108,6 +111,71 @@ async fn main() -> ExitCode {
         }
         Err(e) => {
             error!(error = %e, "apex refused to start");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `apex armed-eval [--config PATH]`: judge the arms closed since the last run
+/// (R26). `apex armed-eval --summary [--dir DIR]`: the bid curve so far,
+/// from the verdict files alone, with no config and no secret.
+async fn armed_eval() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    if args.first().map(String::as_str) == Some("--summary") {
+        let dir = match args.as_slice() {
+            [_] => "var/apex".to_string(),
+            [_, flag, dir] if flag == "--dir" => dir.clone(),
+            _ => {
+                error!("usage: apex armed-eval --summary [--dir DIR]");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match apex_runtime::armed::run::summary(std::path::Path::new(&dir)) {
+            Ok(s) => match serde_json::to_string_pretty(&s) {
+                Ok(text) => {
+                    println!("{text}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    error!(error = %e, "the summary did not serialize");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(e) => {
+                error!(error = %e, dir, "armed-eval summary failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let config = match args.as_slice() {
+        [] => DEFAULT_SHADOW_CONFIG.to_string(),
+        [flag, path] if flag == "--config" => path.clone(),
+        _ => {
+            error!("usage: apex armed-eval [--config PATH] | apex armed-eval --summary [--dir DIR]");
+            return ExitCode::FAILURE;
+        }
+    };
+    let env = Env::secrets_only();
+    let loaded = match apex_runtime::shadow::config::ShadowConfig::load(&config, &env) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "armed-eval: the config did not load");
+            return ExitCode::FAILURE;
+        }
+    };
+    match apex_runtime::armed::run::run(&loaded).await {
+        Ok(r) => match serde_json::to_string(&r) {
+            Ok(text) => {
+                println!("{text}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                error!(error = %e, "the run report did not serialize");
+                ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            error!(error = %e, "armed-eval failed");
             ExitCode::FAILURE
         }
     }

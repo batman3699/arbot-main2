@@ -1,0 +1,28 @@
+# R26: judge closed armed-shadow arms against the chain. Nothing is sent.
+# See ops/host/README.md §9.
+[Unit]
+Description=APEX armed-eval (Task 8.5 R26): judge armed-shadow arms; nothing is sent
+After=network-online.target apex-shadow.service
+
+[Service]
+Type=oneshot
+User=apex
+Group=apex
+WorkingDirectory=/opt/apex
+EnvironmentFile=/etc/apex/shadow.env
+ExecStart=/opt/apex/bin/apex armed-eval --config ops/shadow.base.yaml
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/opt/apex/var
+TimeoutStartSec=240

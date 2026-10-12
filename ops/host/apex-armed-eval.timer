@@ -1,0 +1,11 @@
+# R26: armed-eval every 5 minutes. See ops/host/README.md §9.
+[Unit]
+Description=APEX armed-eval every 5 minutes (Task 8.5 R26)
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

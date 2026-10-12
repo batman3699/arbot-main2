@@ -202,3 +202,66 @@ On the host, with only the BlockPI key in the analyzer's environment:
 It prints G1 and G2 (`g1_pass`, `g2_pass`), the share of contested gaps we
 would have landed ahead of the rival (`ahead_share`), and the rivals' offsets
 from the trigger's flashblock.
+
+## 9. Armed-shadow (R26)
+
+The shadow's `armed` worker arms the best routes' gaps every 200 ms, the way
+validity transactions would wait in Base's builder: built and recorded, never
+sent (`var/apex/armed-YYYY-MM-DD.jsonl`). `apex armed-eval` judges each arm
+once its window has closed. It asks whether the arm would have fired, whether
+it would have won against the rival and at which bid, and what it would have
+netted (`var/apex/armed-verdicts-YYYY-MM-DD.jsonl`).
+
+Install the timer (once, after the binary from §4 or §7):
+
+```
+# install -m 0644 /opt/apex/ops/host/apex-armed-eval.service /opt/apex/ops/host/apex-armed-eval.timer /etc/systemd/system/
+# systemctl daemon-reload && systemctl enable --now apex-armed-eval.timer
+```
+
+Checks:
+
+```
+# systemctl list-timers apex-armed-eval.timer       # next run within 5 minutes
+# journalctl -u apex-armed-eval -n 20 --no-pager     # each run prints {"judged":…,"fired":…,"cursor":…}
+$ ops/host/remote.sh armed                           # the bid curve so far
+$ ops/host/remote.sh                                 # the "armed" and "moves" lines
+```
+
+**Reading the summary.** It is keyed by UTC day, then by bid fraction `f`
+in per mille (50 = 5% of the arm's expected surplus bid as priority fee):
+
+- `fires`: arms whose predicates all held at some transaction in their
+  window. A higher rung of the same slot firing on the same transaction
+  counts once.
+- `wins_optimistic` and `wins_pessimistic`: won if we landed in the
+  trigger's flashblock, or in the next one.
+- `net_usd_*`: what the wins netted after gas at the block's base fee, the
+  bid and the L1 fee. Intermediate residue is not counted.
+- `included_reverts`: fires that would have landed and reverted; their fee
+  is a cost.
+- `simulated` and `sim_agreed`: fires checked with `eth_simulateV1`, and how
+  many agreed with the exact quote to the wei.
+- `unfired_trigger_unmet` and `unfired_band_missed`: arms that never fired.
+  Either the trigger pool never moved far enough, or it did while the other
+  pool was outside its band.
+  - Mostly unmet: the rungs are further out than the market moves in a
+    window.
+  - Mostly band missed: the bands are too narrow, or the arms are too old
+    for the pools they watch.
+
+**Gate A** (spec §6) needs all of these before the live pilot:
+- at least 3 days of armed-shadow and at least 30 fires;
+- a positive pessimistic net per day at some `f`;
+- the simulation agreeing on at least 95% of checked fires;
+- the operator's approval.
+
+The status lines:
+- `armed`: arms, renewals, armable slots, unarmable pools (boot layout
+  check), the engine's last pass in ms;
+- `moves`: every applied Swap checked against the move model.
+  - **Wrong ticks are the model's error and should stay near zero.**
+  - Liquidity changes are mints and burns the book had not applied yet. On
+    Base's Slipstream and Uniswap pools, liquidity is added and removed
+    around swaps, so expect 7–13% (the 2026-10-12 smoke runs).
+

@@ -68,6 +68,7 @@ struct Raw {
     misses: PathBuf,
     race: PathBuf,
     flashblocks: FlashblocksConfig,
+    armed: ArmedConfig,
     executor: ExecutorConfig,
     signer: SignerConfig,
     policy: Policy,
@@ -183,6 +184,30 @@ pub struct FlashblocksConfig {
     pub ledger: PathBuf,
 }
 
+/// R26: armed backruns. Only `shadow` is built; `live` is the pilot's plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArmedMode {
+    Shadow,
+    Live,
+}
+
+/// R26: the arming engine's settings and its two ledgers.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArmedConfig {
+    pub mode: ArmedMode,
+    pub ledger: PathBuf,
+    pub verdicts: PathBuf,
+    pub max_arms: usize,
+    pub rungs: u8,
+    pub window_s: u64,
+    pub block_time_ms: u64,
+    pub margin_wei: u64,
+    pub band_cap_bps: u32,
+    pub liquidity_floor_bps: u32,
+}
+
 /// A resolved shadow configuration. `Debug` shows no secret.
 #[derive(Clone, Debug)]
 pub struct ShadowConfig {
@@ -199,6 +224,8 @@ pub struct ShadowConfig {
     /// The race ledger: one line per handled proposal, a file per UTC day (R25).
     pub race: PathBuf,
     pub flashblocks: FlashblocksConfig,
+    /// Armed backruns, R26.
+    pub armed: ArmedConfig,
     pub executor: ExecutorConfig,
     pub signer: SignerConfig,
     pub policy: Policy,
@@ -263,6 +290,21 @@ impl ShadowConfig {
         if raw.universe.max_fee_ppm == 0 {
             return Err(invalid("a universe fee ceiling of zero admits no pool"));
         }
+        let a = &raw.armed;
+        if a.mode == ArmedMode::Live {
+            return Err(invalid("armed.mode live is not built yet: the pilot is R26's second plan, after gate A"));
+        }
+        if !(1..=64).contains(&a.max_arms)
+            || !(1..=3).contains(&a.rungs)
+            || !(2..=50).contains(&a.window_s)
+            || a.block_time_ms == 0
+            || a.band_cap_bps == 0
+            || a.liquidity_floor_bps > 10_000
+        {
+            return Err(invalid(
+                "armed: max_arms 1-64, rungs 1-3, window_s 2-50, block_time_ms > 0, band_cap_bps > 0, liquidity_floor_bps <= 10000",
+            ));
+        }
         Ok(Self {
             version,
             chain_id: raw.chain_id,
@@ -274,6 +316,7 @@ impl ShadowConfig {
             misses: raw.misses,
             race: raw.race,
             flashblocks: raw.flashblocks,
+            armed: raw.armed,
             executor: raw.executor,
             signer: raw.signer,
             policy: raw.policy,

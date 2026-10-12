@@ -44,6 +44,24 @@ pub fn quote_out(r: &Reserves, fee_ppm: u32, amount_in: U256, zero_for_one: bool
     (!out.is_zero()).then_some(out)
 }
 
+/// Reserves after token0's price in token1 (`reserve1 / reserve0`) moves by
+/// `bps` basis points, up or down, along `x·y = k` (R26). The product never
+/// grows, so a moved pool is never shown richer than the curve allows. `None`
+/// for an empty side, a move of 10,000 bps or more down, or overflow.
+pub fn move_reserves(r: &Reserves, up: bool, bps: u32) -> Option<Reserves> {
+    if r.reserve0.is_zero() || r.reserve1.is_zero() || bps == 0 || (!up && bps >= 10_000) {
+        return None;
+    }
+    let k = r.reserve0.checked_mul(r.reserve1)?;
+    let moved = U256::from(if up { 10_000 + bps } else { 10_000 - bps });
+    // p' = p · moved / 10⁴, and reserve0' = sqrt(k / p') = reserve0 · sqrt(10⁴ / moved).
+    let reserve0 = (r.reserve0.checked_mul(r.reserve0)?.checked_mul(U256::from(10_000u32))? / moved).integer_sqrt();
+    if reserve0.is_zero() {
+        return None;
+    }
+    Some(Reserves { reserve0, reserve1: k / reserve0 })
+}
+
 /// The reads one pool's state takes, in the order [`decode_state`] decodes them.
 pub const READS: usize = 9;
 

@@ -295,3 +295,22 @@ fn a_non_websocket_url_is_refused() {
     assert!(WsFeed::new("not a url", subs(), fast()).is_err());
     assert!(WsFeed::new("wss://example.org/ws", Vec::new(), fast()).is_err(), "no subscriptions");
 }
+
+/// R26: a log object as `eth_getLogs` returns it parses like a notification's.
+#[test]
+fn a_log_object_from_get_logs_parses_like_a_notification() {
+    let r = serde_json::json!({
+        "address": "0xd0b53d9277642d899df5c87a3966a349a798f224",
+        "topics": ["0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"],
+        "data": "0x",
+        "blockNumber": "0x10",
+        "transactionHash": "0x00000000000000000000000000000000000000000000000000000000000000ab",
+        "transactionIndex": "0x3",
+        "logIndex": "0x7",
+        "removed": false
+    });
+    let l = apex_chain::rpc::ws::parse_log(&r, false).unwrap();
+    assert_eq!((l.block_number, l.transaction_index, l.log_index), (Some(16), Some(3), Some(7)));
+    assert!(!l.pending && !l.removed);
+    assert!(apex_chain::rpc::ws::parse_log(&serde_json::json!({"topics": []}), false).is_none());
+}

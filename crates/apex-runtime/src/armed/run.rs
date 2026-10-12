@@ -1,0 +1,602 @@
+//! `apex armed-eval` (R26): every closed arm judged against the chain, and a
+//! verdict per arm, written to the verdict ledger.
+//!
+//! One run takes arms whose window closed at least [`SETTLE_BLOCKS`] ago and
+//! after the cursor (`armed-eval.cursor` beside the verdicts). For each it:
+//! 1. rebuilds the watched words from one `eth_getLogs` over the run's pools;
+//! 2. finds the fire point and the rival (`eval::judge`);
+//! 3. quotes the fire exactly: both pools loaded at the fire block's parent,
+//!    that block's writes replayed up to the trigger, then `quote_fixed`;
+//! 4. checks the quote with `eth_simulateV1`: the fire block's earlier
+//!    transactions on those pools, then the armed call from the trader;
+//! 5. places both in their flashblocks (the flashblock ledger) and judges the
+//!    landing for every bid fraction.
+//!
+//! WETH gross and the intermediate residue (what overshoot past the threshold
+//! leaves in the executor) are reported apart.
+
+use super::eval::{self, bid_wei_per_gas, judge, landing, merge_renewals, net_wei, Landing, Point, TxEffect, Write, F_PERMILLE};
+use super::lines::{Arm, ArmedLine};
+use super::predicate::{layout, price_mask};
+use crate::live::book::{PoolBook, StateWrite, SwapWrite, SyncWrite};
+use crate::live::feed::{decode_swap, decode_sync, BURN, MINT, PANCAKE_SWAP, SWAP, SYNC};
+use crate::live::frontier::{self, WETH};
+use crate::live::inventory::{self, PoolSpec, Venue};
+use crate::live::pricing::LiveCycle;
+use crate::live::reads::ChainReads;
+use crate::shadow::config::ShadowConfig;
+use crate::shadow::ledger;
+use alloy_primitives::{keccak256, Address, B256};
+use apex_chain::base::flashblock_stream::FlashblockSeen;
+use apex_chain::rpc::failover::{FailoverSettings, FailoverTransport};
+use apex_chain::rpc::ws::{parse_log, RawLog};
+use apex_chain::rpc::RpcTransport;
+use apex_types::compat::u256_to_ethers;
+use apex_types::ids::ChainId;
+use ethers_core::types::U256;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Blocks a window must have closed for before its arm is judged: a minute.
+pub const SETTLE_BLOCKS: u64 = 30;
+/// Blocks per `eth_getLogs`.
+const LOG_CHUNK: u64 = 500;
+
+fn topic_i32(topic: &B256) -> i32 {
+    i32::from_be_bytes(topic.0[28..32].try_into().unwrap_or([0; 4]))
+}
+
+fn data_u128(data: &[u8], i: usize) -> Option<u128> {
+    let w = data.get(i * 32..i * 32 + 32)?;
+    Some(u128::from_be_bytes(w[16..32].try_into().ok()?))
+}
+
+/// A transaction's hash, and its writes keyed by log index.
+type TxWrites = (String, Vec<(u64, Write)>);
+
+/// The watched pools' logs as per-transaction effects, in chain order. A
+/// removed log, an unknown pool or an undecodable log adds nothing.
+pub fn effects_of(logs: &[RawLog], venues: &BTreeMap<Address, Venue>) -> Vec<TxEffect> {
+    let mut by_tx: BTreeMap<(u64, u64), TxWrites> = BTreeMap::new();
+    for l in logs.iter().filter(|l| !l.removed) {
+        let (Some(block), Some(txi), Some(li), Some(venue)) =
+            (l.block_number, l.transaction_index, l.log_index, venues.get(&l.address))
+        else {
+            continue;
+        };
+        let lay = layout(*venue);
+        let a = format!("{:#x}", l.address);
+        let mut writes = Vec::new();
+        match l.topics.first() {
+            Some(t) if *t == SWAP || *t == PANCAKE_SWAP => {
+                if let (Some(s), Some(ps), Some(ls)) = (decode_swap(l), lay.price_slot, lay.liquidity_slot) {
+                    writes.push(Write::Set { address: a.clone(), slot: ps, value: u256_to_ethers(s.sqrt_price_x96) });
+                    writes.push(Write::Set { address: a.clone(), slot: ls, value: U256::from(s.liquidity) });
+                    writes.push(Write::Tick { address: a.clone(), tick: s.tick });
+                }
+            }
+            Some(t) if *t == SYNC => {
+                if let (Some(s), Some((s0, s1))) = (decode_sync(l), lay.reserve_slots) {
+                    writes.push(Write::Set { address: a.clone(), slot: s0, value: u256_to_ethers(s.reserve0) });
+                    writes.push(Write::Set { address: a.clone(), slot: s1, value: u256_to_ethers(s.reserve1) });
+                }
+            }
+            // Mint(sender, amount, amount0, amount1) and Burn(amount, amount0,
+            // amount1), with the tick range in topics 2 and 3.
+            Some(t) if (*t == MINT || *t == BURN) && l.topics.len() == 4 => {
+                let amount = if *t == MINT { data_u128(&l.data, 1) } else { data_u128(&l.data, 0) };
+                if let (Some(amount), Some(ls)) = (amount, lay.liquidity_slot) {
+                    let delta = i128::try_from(amount).unwrap_or(i128::MAX);
+                    writes.push(Write::Liquidity {
+                        address: a.clone(),
+                        slot: ls,
+                        lower: topic_i32(&l.topics[2]),
+                        upper: topic_i32(&l.topics[3]),
+                        delta: if *t == MINT { delta } else { -delta },
+                    });
+                }
+            }
+            _ => {}
+        }
+        let tx = l.transaction_hash.map_or_else(String::new, |h| format!("{h:#x}"));
+        let entry = by_tx.entry((block, txi)).or_insert_with(|| (tx, Vec::new()));
+        entry.1.extend(writes.into_iter().map(|w| (li, w)));
+    }
+    by_tx
+        .into_iter()
+        .map(|((block, tx_index), (tx, mut writes))| {
+            writes.sort_by_key(|(li, _)| *li);
+            TxEffect { block, tx_index, tx, writes: writes.into_iter().map(|(_, w)| w).collect() }
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PerF {
+    pub f_permille: u32,
+    pub bid_wei_per_gas: String,
+    pub landing: Landing,
+    /// Net in wei when landed, from the exact quote; `None` when it did not price.
+    pub net_wei: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SimCheck {
+    pub ok: bool,
+    pub gross_wei: Option<String>,
+    pub gas_used: u64,
+    pub agrees: bool,
+}
+
+/// A fire or rival position: block, transaction index, hash, flashblock.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Position {
+    pub block: u64,
+    pub tx_index: u64,
+    pub tx: String,
+    pub flashblock: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Verdict {
+    pub at_ns: u64,
+    pub arm_id: u64,
+    pub route_hash: String,
+    pub trigger_leg: u8,
+    pub rung: u8,
+    pub fired: bool,
+    /// The trigger was met in the window (by itself): unfired, the band missed.
+    /// Absent from verdicts written before it was recorded.
+    #[serde(default)]
+    pub trigger_met: Option<bool>,
+    /// A higher rung of the same slot fired on the same transaction: it, not
+    /// this one, would execute first.
+    pub shadowed: bool,
+    pub fire: Option<Position>,
+    pub rival: Option<Position>,
+    /// The rival's effective priority fee per gas.
+    pub rival_priority_wei: Option<String>,
+    /// WETH gross of the fire (hop 2's output less the loan).
+    pub gross_wei: Option<String>,
+    /// Hop 1's output beyond `mid`: intermediate token left in the executor.
+    pub residue: Option<String>,
+    pub quote_error: Option<String>,
+    pub sim: Option<SimCheck>,
+    pub base_fee_wei: String,
+    pub per_f: Vec<PerF>,
+    pub weth_usd: f64,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct RunReport {
+    pub judged: usize,
+    pub fired: usize,
+    pub quoted: usize,
+    pub simulated: usize,
+    pub sim_agreed: usize,
+    pub cursor: u64,
+}
+
+fn now_ns() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+}
+
+fn hex_u128(v: &Value) -> Option<u128> {
+    u128::from_str_radix(v.as_str()?.trim_start_matches("0x"), 16).ok()
+}
+
+/// The JSON lines of a daily ledger for `days` days up to `now`.
+fn read_lines<T: serde::de::DeserializeOwned>(base: &Path, now: u64, days: u64) -> Vec<T> {
+    let mut out = Vec::new();
+    for d in (0..days).rev() {
+        let path: PathBuf = ledger::daily_path(base, now.saturating_sub(d * 86_400_000_000_000));
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        out.extend(text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str(l).ok()));
+    }
+    out
+}
+
+/// Judge every arm closed since the last run.
+pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
+    let urls: Vec<String> = config.rpc_http.iter().map(|u| u.expose().clone()).collect();
+    let rpc: Arc<dyn RpcTransport> = Arc::new(
+        FailoverTransport::connect(&urls, config.chain_id, FailoverSettings::default())
+            .await
+            .map_err(|e| e.to_string())?,
+    );
+    drop(urls);
+    let reads = ChainReads::new(Arc::clone(&rpc));
+    let head = reads.head().await.map_err(|e| e.to_string())?;
+    let dir = config.armed.verdicts.parent().map(Path::to_path_buf).unwrap_or_default();
+    let cursor_path = dir.join("armed-eval.cursor");
+    let cursor: u64 = std::fs::read_to_string(&cursor_path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let now = now_ns();
+
+    // Today's and yesterday's arms: a window is seconds long.
+    let lines: Vec<ArmedLine> = read_lines(&config.armed.ledger, now, 2);
+    let due: Vec<Arm> = merge_renewals(lines)
+        .into_iter()
+        .filter(|a| a.to_block > cursor && a.to_block + SETTLE_BLOCKS <= head)
+        .collect();
+    let mut report = RunReport { cursor, ..Default::default() };
+    if due.is_empty() {
+        return Ok(report);
+    }
+    let new_cursor = due.iter().map(|a| a.to_block).max().unwrap_or(cursor);
+    let specs = inventory::load(&config.inventory, config.universe.filter()).map_err(|e| e.to_string())?;
+    let venues: BTreeMap<Address, Venue> = specs.iter().map(|s| (s.pool, s.venue)).collect();
+    let pools: BTreeSet<Address> = due.iter().flat_map(|a| a.pools.iter().filter_map(|p| p.parse().ok())).collect();
+    let from = due.iter().map(|a| a.armed_block + 1).min().unwrap_or(head);
+    let to = due.iter().map(|a| a.to_block).max().unwrap_or(head);
+    let logs = get_logs(&*rpc, &pools, from, to).await?;
+    let effects = effects_of(&logs, &venues);
+    let flashblocks: Vec<FlashblockSeen> = read_lines(&config.flashblocks.ledger, now, 2);
+    let weth_usd = weth_usd(&reads, head).await.unwrap_or(0.0);
+
+    let mut judged: Vec<(Arm, eval::Judged)> = Vec::new();
+    for arm in due {
+        let own: Vec<TxEffect> = effects
+            .iter()
+            .filter(|e| {
+                e.writes.iter().any(|w| match w {
+                    Write::Set { address, .. } | Write::Tick { address, .. } | Write::Liquidity { address, .. } => {
+                        arm.pools.contains(address)
+                    }
+                })
+            })
+            .cloned()
+            .collect();
+        if let Some(j) = judge(&arm, &own) {
+            judged.push((arm, j));
+        }
+    }
+    // A slot's rungs that fire on one transaction: the highest executes first.
+    let mut top: BTreeMap<(String, u8, u64, u64), (u8, u64)> = BTreeMap::new();
+    for (a, j) in &judged {
+        if let Some(f) = &j.fire {
+            let e = top.entry((a.route_hash.clone(), a.trigger_leg, f.block, f.tx_index)).or_insert((a.rung, a.arm_id));
+            if a.rung > e.0 {
+                *e = (a.rung, a.arm_id);
+            }
+        }
+    }
+    let ctx = Ctx { reads: &reads, rpc: &*rpc, config, specs: &specs, logs: &logs, flashblocks: &flashblocks, weth_usd, now };
+    for (arm, j) in &judged {
+        report.judged += 1;
+        let shadowed = j.fire.as_ref().is_some_and(|f| {
+            top.get(&(arm.route_hash.clone(), arm.trigger_leg, f.block, f.tx_index)).is_some_and(|(_, id)| *id != arm.arm_id)
+        });
+        let v = verdict(&ctx, arm, j, shadowed, &mut report).await;
+        ledger::append_line(&config.armed.verdicts, now, &v).map_err(|e| e.to_string())?;
+    }
+    report.cursor = new_cursor;
+    std::fs::write(&cursor_path, report.cursor.to_string()).map_err(|e| e.to_string())?;
+    Ok(report)
+}
+
+struct Ctx<'a> {
+    reads: &'a ChainReads,
+    rpc: &'a dyn RpcTransport,
+    config: &'a ShadowConfig,
+    specs: &'a [PoolSpec],
+    logs: &'a [RawLog],
+    flashblocks: &'a [FlashblockSeen],
+    weth_usd: f64,
+    now: u64,
+}
+
+async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, report: &mut RunReport) -> Verdict {
+    let mut v = Verdict {
+        at_ns: ctx.now,
+        arm_id: arm.arm_id,
+        route_hash: arm.route_hash.clone(),
+        trigger_leg: arm.trigger_leg,
+        rung: arm.rung,
+        fired: j.fire.is_some(),
+        trigger_met: Some(j.trigger_met),
+        shadowed,
+        fire: None,
+        rival: None,
+        rival_priority_wei: None,
+        gross_wei: None,
+        residue: None,
+        quote_error: None,
+        sim: None,
+        base_fee_wei: arm.base_fee_wei.clone(),
+        per_f: Vec::new(),
+        weth_usd: ctx.weth_usd,
+    };
+    let Some(fire) = &j.fire else { return v };
+    report.fired += 1;
+    let block = block_object(ctx.rpc, fire.block, true).await;
+    let base_fee = block.as_ref().and_then(|b| hex_u128(b.get("baseFeePerGas")?)).unwrap_or(0);
+    v.base_fee_wei = base_fee.to_string();
+
+    // The exact quote at the fire.
+    match quote_at_fire(ctx.reads, ctx.specs, arm, fire, ctx.logs).await {
+        Ok((gross, residue)) => {
+            report.quoted += 1;
+            v.gross_wei = Some(gross.to_string());
+            v.residue = Some(residue.to_string());
+        }
+        Err(e) => v.quote_error = Some(e),
+    }
+    // The simulation check.
+    if let Some(b) = &block {
+        if let Some(sim) = simulate(ctx.rpc, ctx.config, arm, fire, b, ctx.logs).await {
+            report.simulated += 1;
+            let agrees = v.gross_wei.is_some() && v.gross_wei.as_deref() == sim.gross_wei.as_deref();
+            report.sim_agreed += usize::from(agrees);
+            v.sim = Some(SimCheck { agrees, ..sim });
+        }
+    }
+    // Positions and the rival's bid. Flashblocks when the ledger places both;
+    // otherwise whole blocks (index 0), where a rival in the fire's own block
+    // competes by fee and the pessimistic case gives it the block.
+    let fire_fb = locate(ctx.flashblocks, fire.block, fire.tx_index);
+    let rival_fb = j.rival.as_ref().map(|r| locate(ctx.flashblocks, r.block, r.tx_index));
+    let granular = fire_fb.is_some() && rival_fb.is_none_or(|x| x.is_some());
+    v.fire = Some(Position { block: fire.block, tx_index: fire.tx_index, tx: fire.tx.clone(), flashblock: fire_fb });
+    let fire_at = (fire.block, if granular { fire_fb.unwrap_or(0) } else { 0 });
+    let mut rival_at = None;
+    let mut rival_bid = 0u128;
+    if let Some(r) = &j.rival {
+        let r_fb = rival_fb.flatten();
+        rival_bid = priority_of(ctx.rpc, r).await.unwrap_or(0);
+        v.rival = Some(Position { block: r.block, tx_index: r.tx_index, tx: r.tx.clone(), flashblock: r_fb });
+        v.rival_priority_wei = Some(rival_bid.to_string());
+        rival_at = Some((r.block, if granular { r_fb.unwrap_or(0) } else { 0 }));
+    }
+    let surplus = U256::from_dec_str(&arm.surplus_wei).unwrap_or_default();
+    let gross = v.gross_wei.as_deref().and_then(|g| U256::from_dec_str(g).ok());
+    let other: u128 = arm.other_wei.parse().unwrap_or(0);
+    for f in F_PERMILLE {
+        let bid = bid_wei_per_gas(surplus, arm.gas_expected, f);
+        let l = landing(fire_at, rival_at, bid, rival_bid);
+        let net = gross.map(|g| net_wei(g, arm.gas_expected, base_fee, bid, other).to_string());
+        v.per_f.push(PerF { f_permille: f, bid_wei_per_gas: bid.to_string(), landing: l, net_wei: net });
+    }
+    v
+}
+
+/// The fire, quoted exactly: both pools at the fire block's parent, that
+/// block's writes to them up to and including the trigger, then the armed
+/// plan's hops. `(WETH gross, intermediate residue)`.
+async fn quote_at_fire(
+    reads: &ChainReads,
+    specs: &[PoolSpec],
+    arm: &Arm,
+    fire: &Point,
+    logs: &[RawLog],
+) -> Result<(U256, U256), String> {
+    let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
+    let mine: Vec<PoolSpec> = specs.iter().filter(|s| pools.contains(&s.pool)).cloned().collect();
+    let (book, unloaded) = PoolBook::load(reads, &mine, fire.block - 1).await.map_err(|e| e.to_string())?;
+    if !unloaded.is_empty() {
+        return Err("a pool did not load at the fire's parent".into());
+    }
+    let mut writes = Vec::new();
+    for l in logs.iter().filter(|l| {
+        !l.removed
+            && l.block_number == Some(fire.block)
+            && pools.contains(&l.address)
+            && l.transaction_index.is_some_and(|i| i <= fire.tx_index)
+    }) {
+        let at = (fire.block, l.log_index.unwrap_or(0));
+        match l.topics.first() {
+            Some(t) if *t == SWAP || *t == PANCAKE_SWAP => {
+                let s = decode_swap(l).ok_or("an undecodable swap")?;
+                writes.push(StateWrite::Swap(SwapWrite { pool: s.pool, sqrt_price_x96: s.sqrt_price_x96, liquidity: s.liquidity, tick: s.tick, at }));
+            }
+            Some(t) if *t == SYNC => {
+                let s = decode_sync(l).ok_or("an undecodable sync")?;
+                writes.push(StateWrite::Sync(SyncWrite { pool: s.pool, reserve0: s.reserve0, reserve1: s.reserve1, at }));
+            }
+            Some(t) if *t == MINT || *t == BURN => return Err("a mint or burn before the trigger in its block".into()),
+            _ => {}
+        }
+    }
+    book.apply_writes(&writes);
+    let snap = book.snapshot();
+    let (_, cycles) = frontier::build(ChainId::BASE, WETH, &snap);
+    let cycle = cycles
+        .values()
+        .find(|c| format!("{:#x}", c.commitment.route_hash) == arm.route_hash)
+        .ok_or("the route is not in the reloaded pools")?;
+    let live = LiveCycle::new(cycle, &snap).ok_or("a pool left its ladder")?;
+    let size = U256::from_dec_str(&arm.size_wei).map_err(|e| e.to_string())?;
+    let mid = U256::from_dec_str(&arm.mid).map_err(|e| e.to_string())?;
+    let q = live.quote_fixed(size, mid).ok_or("hop 1 returns less than mid: it would revert")?;
+    if q.outputs[1] <= size {
+        return Err("below the loan plus one: it would revert".into());
+    }
+    Ok((q.outputs[1] - size, q.outputs[0] - mid))
+}
+
+/// The armed call simulated where it would have run: the fire block's earlier
+/// transactions on the arm's pools replayed, then the call from the trader.
+/// Call objects as `live::sim` sends them (`data`, proven on BlockPI).
+async fn simulate(rpc: &dyn RpcTransport, config: &ShadowConfig, arm: &Arm, fire: &Point, block: &Value, logs: &[RawLog]) -> Option<SimCheck> {
+    let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
+    let touched: BTreeSet<B256> = logs
+        .iter()
+        .filter(|l| l.block_number == Some(fire.block) && pools.contains(&l.address))
+        .filter_map(|l| l.transaction_hash)
+        .collect();
+    let mut calls: Vec<Value> = block
+        .get("transactions")?
+        .as_array()?
+        .iter()
+        .filter(|t| {
+            let i = t.get("transactionIndex").and_then(hex_u128).unwrap_or(u128::MAX);
+            let h: Option<B256> = t.get("hash").and_then(|h| h.as_str()?.parse().ok());
+            i <= u128::from(fire.tx_index) && h.is_some_and(|h| touched.contains(&h))
+        })
+        .map(|t| json!({"from": t["from"], "to": t["to"], "data": t["input"], "value": t["value"], "gas": t["gas"]}))
+        .collect();
+    calls.push(json!({
+        "from": format!("{:#x}", config.signer.address),
+        "to": format!("{:#x}", config.executor.address),
+        "data": arm.calldata,
+        "gas": format!("{:#x}", arm.gas_limit),
+    }));
+    let params = json!([{
+        "blockStateCalls": [{
+            "blockOverrides": {
+                "number": format!("{:#x}", fire.block),
+                "time": block["timestamp"],
+                "baseFeePerGas": block["baseFeePerGas"],
+            },
+            "calls": calls,
+        }],
+        "validation": false,
+    }, format!("{:#x}", fire.block - 1)]);
+    let out = rpc.call("eth_simulateV1", params).await.ok()?;
+    let last = out.get(0)?.get("calls")?.as_array()?.last()?.clone();
+    let ok = last.get("status").and_then(Value::as_str) == Some("0x1");
+    let gas_used = last.get("gasUsed").and_then(hex_u128).map_or(0, |g| u64::try_from(g).unwrap_or(u64::MAX));
+    let topic = keccak256(b"ProfitRealised(address,uint256,uint256)");
+    let gross = last.get("logs").and_then(Value::as_array).and_then(|logs| {
+        logs.iter().find_map(|l| {
+            let t0: B256 = l.get("topics")?.get(0)?.as_str()?.parse().ok()?;
+            let data = l.get("data")?.as_str()?;
+            (t0 == topic).then(|| U256::from_str_radix(data.get(2..66)?, 16).ok()).flatten()
+        })
+    });
+    Some(SimCheck { ok, gross_wei: gross.map(|g| g.to_string()), gas_used, agrees: false })
+}
+
+async fn get_logs(rpc: &dyn RpcTransport, pools: &BTreeSet<Address>, from: u64, to: u64) -> Result<Vec<RawLog>, String> {
+    let addresses: Vec<String> = pools.iter().map(|a| format!("{a:#x}")).collect();
+    let topics: Vec<String> = [SWAP, PANCAKE_SWAP, SYNC, MINT, BURN].iter().map(|t| format!("{t:#x}")).collect();
+    let mut out = Vec::new();
+    let mut start = from;
+    while start <= to {
+        let end = (start + LOG_CHUNK - 1).min(to);
+        let v = rpc
+            .call(
+                "eth_getLogs",
+                json!([{"address": addresses, "topics": [topics], "fromBlock": format!("{start:#x}"), "toBlock": format!("{end:#x}")}]),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        out.extend(v.as_array().ok_or("eth_getLogs: not an array")?.iter().filter_map(|l| parse_log(l, false)));
+        start = end + 1;
+    }
+    Ok(out)
+}
+
+async fn block_object(rpc: &dyn RpcTransport, n: u64, full: bool) -> Option<Value> {
+    rpc.call("eth_getBlockByNumber", json!([format!("{n:#x}"), full])).await.ok().filter(|v| !v.is_null())
+}
+
+/// The rival's effective priority fee per gas.
+async fn priority_of(rpc: &dyn RpcTransport, r: &Point) -> Option<u128> {
+    let t = rpc.call("eth_getTransactionByHash", json!([r.tx])).await.ok()?;
+    let b = block_object(rpc, r.block, false).await?;
+    let base = hex_u128(b.get("baseFeePerGas")?)?;
+    match (t.get("maxPriorityFeePerGas").and_then(hex_u128), t.get("maxFeePerGas").and_then(hex_u128)) {
+        (Some(p), Some(m)) => Some(p.min(m.saturating_sub(base))),
+        _ => Some(hex_u128(t.get("gasPrice")?)?.saturating_sub(base)),
+    }
+}
+
+/// The flashblock that added `tx_index` to `block`, from the ledger.
+fn locate(fbs: &[FlashblockSeen], block: u64, tx_index: u64) -> Option<u32> {
+    fbs.iter()
+        .filter(|f| f.block == block)
+        .find(|f| {
+            f.first_tx
+                .is_some_and(|first| tx_index >= u64::from(first) && tx_index < u64::from(first) + u64::from(f.tx_count))
+        })
+        .map(|f| f.index)
+}
+
+/// WETH in USD from the deep Uniswap WETH/USDC pool's price at `head`.
+async fn weth_usd(reads: &ChainReads, head: u64) -> Option<f64> {
+    let pool: Address = "0xd0b53D9277642d899DF5C87A3966A349A798F224".parse().ok()?;
+    let w = reads.storage_at(pool, 0, head).await.ok()?;
+    let sqrt = (w & price_mask()).as_u128() as f64 / 2f64.powi(96);
+    Some(sqrt * sqrt * 1e12)
+}
+
+/// One UTC day's figures for one bid fraction.
+#[derive(Debug, Default, Serialize)]
+pub struct DayF {
+    pub fires: u64,
+    pub wins_optimistic: u64,
+    pub wins_pessimistic: u64,
+    pub net_usd_optimistic: f64,
+    pub net_usd_pessimistic: f64,
+    /// Fires that would have landed and reverted: their fee is a cost.
+    pub included_reverts: u64,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct Summary {
+    /// By UTC day, then bid fraction per mille.
+    pub days: BTreeMap<String, BTreeMap<u32, DayF>>,
+    pub arms_judged: u64,
+    /// Arms that never fired: their trigger never met in the window, or met
+    /// with the other pool outside its band. Rung steps against band widths.
+    pub unfired_trigger_unmet: u64,
+    pub unfired_band_missed: u64,
+    pub simulated: u64,
+    pub sim_agreed: u64,
+}
+
+/// The bid curve so far, from every verdict file in `dir`. Reads files only.
+pub fn summary(dir: &Path) -> Result<Summary, String> {
+    let mut s = Summary::default();
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("armed-verdicts-") && n.ends_with(".jsonl"))
+        })
+        .collect();
+    files.sort();
+    for f in files {
+        let day = f
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim_start_matches("armed-verdicts-").to_string())
+            .unwrap_or_default();
+        for line in std::fs::read_to_string(&f).map_err(|e| e.to_string())?.lines() {
+            let Ok(v) = serde_json::from_str::<Verdict>(line) else { continue };
+            s.arms_judged += 1;
+            match (v.fired, v.trigger_met) {
+                (false, Some(false)) => s.unfired_trigger_unmet += 1,
+                (false, Some(true)) => s.unfired_band_missed += 1,
+                _ => {}
+            }
+            if let Some(sim) = &v.sim {
+                s.simulated += 1;
+                s.sim_agreed += u64::from(sim.agrees);
+            }
+            if !v.fired || v.shadowed {
+                continue;
+            }
+            let reverts = v.quote_error.as_deref().is_some_and(|e| e.contains("revert"));
+            for p in &v.per_f {
+                let d = s.days.entry(day.clone()).or_default().entry(p.f_permille).or_default();
+                d.fires += 1;
+                let usd = p.net_wei.as_deref().and_then(|n| n.parse::<f64>().ok()).map_or(0.0, |n| n / 1e18 * v.weth_usd);
+                if p.landing.optimistic {
+                    d.wins_optimistic += 1;
+                    d.net_usd_optimistic += usd;
+                    d.included_reverts += u64::from(reverts);
+                }
+                if p.landing.pessimistic {
+                    d.wins_pessimistic += 1;
+                    d.net_usd_pessimistic += usd;
+                }
+            }
+        }
+    }
+    Ok(s)
+}

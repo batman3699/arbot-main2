@@ -83,29 +83,42 @@ impl LiveCycle {
         Some(Self { legs: [pool(0)?, pool(1)?] })
     }
 
+    /// One hop at `amount`: what it returns and the steps it takes. `None` if
+    /// it cannot fill the whole input.
+    fn hop(&self, i: usize, amount: U256) -> Option<(U256, HopSteps)> {
+        let (pool, zero_for_one) = &self.legs[i];
+        // Each pool by its own model (R24): reserves, or a ladder.
+        let (out, crossed, word_steps) = match &pool.reserves {
+            Some(r) => (crate::live::cp::quote_out(r, pool.state.fee_ppm, amount, *zero_for_one)?, 0, 0),
+            None => {
+                let q = quote_exact_input_multi_tick(&pool.state, &pool.ladder, amount, *zero_for_one, MAX_TICKS)?;
+                // A partial fill is not a price for the whole input.
+                if q.exhausted || q.amount_in_consumed < amount {
+                    return None;
+                }
+                (q.amount_out, q.ticks_crossed, q.word_steps)
+            }
+        };
+        Some((out, HopSteps { venue: pool.spec.venue, zero_for_one: *zero_for_one, crossed, word_steps }))
+    }
+
     /// Both hops at `amount_in`. `None` if either cannot fill it whole.
     pub fn quote(&self, amount_in: U256) -> Option<CycleQuote> {
-        let mut outputs = [U256::zero(); 2];
-        let mut hops = [None; 2];
-        let mut amount = amount_in;
-        for (i, (pool, zero_for_one)) in self.legs.iter().enumerate() {
-            // Each pool by its own model (R24): reserves, or a ladder.
-            let (out, crossed, word_steps) = match &pool.reserves {
-                Some(r) => (crate::live::cp::quote_out(r, pool.state.fee_ppm, amount, *zero_for_one)?, 0, 0),
-                None => {
-                    let q = quote_exact_input_multi_tick(&pool.state, &pool.ladder, amount, *zero_for_one, MAX_TICKS)?;
-                    // A partial fill is not a price for the whole input.
-                    if q.exhausted || q.amount_in_consumed < amount {
-                        return None;
-                    }
-                    (q.amount_out, q.ticks_crossed, q.word_steps)
-                }
-            };
-            amount = out;
-            outputs[i] = amount;
-            hops[i] = Some(HopSteps { venue: pool.spec.venue, zero_for_one: *zero_for_one, crossed, word_steps });
+        let (first, a) = self.hop(0, amount_in)?;
+        let (second, b) = self.hop(1, first)?;
+        Some(CycleQuote { outputs: [first, second], hops: [a, b] })
+    }
+
+    /// The hops as an armed plan runs them (R26): hop 1 sells `amount_in`, hop
+    /// 2 sells exactly `mid`, its fixed input. `None` when hop 1 returns less
+    /// than `mid` (the plan would revert) or either cannot fill.
+    pub fn quote_fixed(&self, amount_in: U256, mid: U256) -> Option<CycleQuote> {
+        let (first, a) = self.hop(0, amount_in)?;
+        if first < mid {
+            return None;
         }
-        Some(CycleQuote { outputs, hops: [hops[0]?, hops[1]?] })
+        let (second, b) = self.hop(1, mid)?;
+        Some(CycleQuote { outputs: [first, second], hops: [a, b] })
     }
 
     /// What each hop returns for `amount_in`, in order: the figures a plan's
@@ -167,6 +180,11 @@ impl CostedCycle {
     pub const fn capped(mut self, cap: Option<U256>) -> Self {
         self.cap = cap;
         self
+    }
+
+    /// The cycle's venue arithmetic, without costs (R26: the armed plan's hops).
+    pub const fn cycle(&self) -> &LiveCycle {
+        &self.cycle
     }
 
     fn cost_of(&self, gas: GasEstimate) -> U256 {

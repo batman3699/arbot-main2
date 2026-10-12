@@ -98,6 +98,14 @@ else:
         print(f"  flashblocks {fb['frames']} frames, {fb['sessions']} sessions, {fb['decode_failures']} undecoded, "
               f"{fb['incomplete_blocks']} incomplete blocks, {fb['ledger_failures']} ledger write failures")
         print(f"  race        {ra.get('written', 0)} lines, {ra.get('dropped', 0)} dropped")
+    am = r.get("armed")
+    if am:  # R26: absent from a report before armed-shadow
+        e = am["engine"]
+        print(f"  armed       {e['arms']} arms, {e['renewals']} renewals, {e['slots_armable']} armable slots, "
+              f"{e['unarmable_pools']} unarmable pools, last pass {e['last_tick_us'] / 1000:.1f} ms, "
+              f"{am['write_failures']} write failures")
+        print(f"  moves       {am['move_checks']} swaps checked against the move model: {am['move_tick_mismatches']} wrong ticks, "
+              f"{am['move_liquidity_changes']} liquidity changes (unapplied mints/burns)")
         print(f"  signer      nonce at boot {sg.get('boot_nonce')}" + ("" if not sg.get("nonce_moved") else
               "  -- SIGNER NONCE MOVED: revoke the trader key (ops/host/README.md)"))
     print(f"  feed        {fd['sessions']} sessions ({max(fd['sessions'] - 1, 0)} reconnects), {fd['dropped']} dropped, lossless {fd['fast_lane_lossless']}")

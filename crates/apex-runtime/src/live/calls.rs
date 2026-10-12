@@ -55,7 +55,7 @@
 //! that would revert `UnknownAdapter`.
 
 use crate::live::abi::{self, selector};
-use crate::live::book::PoolBook;
+use crate::live::book::{PoolBook, PoolSnapshot};
 use crate::live::frontier::{
     Cycle, Leg, AERODROME_V2_ADAPTER, AERODROME_V2_ROUTER, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER,
     PANCAKE_SMART_ROUTER, SLIPSTREAM_ADAPTER, SLIPSTREAM_ROUTER, SLIPSTREAM_V3_ADAPTER, SLIPSTREAM_V3_ROUTER,
@@ -158,66 +158,80 @@ impl CallBuilder for LiveCallBuilder {
     }
 }
 
+/// One hop as the executor's step for its venue: shared by the reactive plan
+/// and the armed one (R26). `pool` is the hop's pool as the book holds it, for
+/// its fee and tick spacing.
+pub fn encode_step(
+    leg: &Leg,
+    pool: &PoolSnapshot,
+    amount_in: U256,
+    min_out: U256,
+    executor: Address,
+    deadline: u64,
+) -> Result<Step, String> {
+    match leg.venue {
+        Venue::UniswapV3 => {
+            // The chain's fee, read with the pool's state: the router finds
+            // the pool by tokens and fee, and the inventory's figure is only
+            // what the pool was admitted under.
+            let hop = PathHop { token_in: leg.token_in, fee: pool.state.fee_ppm };
+            let path = univ3_path(&[hop], leg.token_out).map_err(|e| e.to_string())?;
+            let data = univ3_step(&path, amount_in, min_out).map_err(|e| e.to_string())?;
+            Ok(Step { op: Op::UniV3, data })
+        }
+        Venue::Slipstream | Venue::SlipstreamV3 => {
+            let call = slipstream_exact_input_single(&SlipstreamSwap {
+                token_in: leg.token_in,
+                token_out: leg.token_out,
+                tick_spacing: pool.state.tick_spacing,
+                recipient: executor,
+                deadline,
+                amount_in,
+                min_out,
+            })
+            .map_err(|e| e.to_string())?;
+            // Each factory's pools run through its own router's adapter.
+            let adapter = binding(leg.venue).ok_or("no adapter for a Slipstream hop")?.id;
+            Ok(Step { op: Op::Generic, data: generic_step(adapter, leg.token_in, amount_in, &call) })
+        }
+        Venue::PancakeV3 => {
+            let call = v3_router_exact_input_single(&V3RouterSwap {
+                token_in: leg.token_in,
+                token_out: leg.token_out,
+                // The chain's fee, as for Uniswap: the router finds the
+                // pool by tokens and fee.
+                fee: pool.state.fee_ppm,
+                recipient: executor,
+                amount_in,
+                min_out,
+            })
+            .map_err(|e| e.to_string())?;
+            Ok(Step {
+                op: Op::Generic,
+                data: generic_step(PANCAKE_ADAPTER, leg.token_in, amount_in, &call),
+            })
+        }
+        Venue::AerodromeV2 => {
+            let call = aerodrome_swap_exact_tokens_for_tokens(&AerodromeSwap {
+                token_in: leg.token_in,
+                token_out: leg.token_out,
+                factory: Venue::AerodromeV2.factory(),
+                recipient: executor,
+                deadline,
+                amount_in,
+                min_out,
+            })
+            .map_err(|e| e.to_string())?;
+            Ok(Step { op: Op::Generic, data: generic_step(AERODROME_V2_ADAPTER, leg.token_in, amount_in, &call) })
+        }
+    }
+}
+
 impl LiveCallBuilder {
     /// One hop as the executor's step for its venue.
     fn step(&self, leg: &Leg, amount_in: U256, min_out: U256, k: &ExecutionCommitment) -> Result<Step, Decline> {
         let pool = self.book.get(leg.pool).ok_or_else(stale)?;
-        match leg.venue {
-            Venue::UniswapV3 => {
-                // The chain's fee, read with the pool's state: the router finds
-                // the pool by tokens and fee, and the inventory's figure is only
-                // what the pool was admitted under.
-                let hop = PathHop { token_in: leg.token_in, fee: pool.state.fee_ppm };
-                let path = univ3_path(&[hop], leg.token_out).map_err(|e| refuse(e.to_string()))?;
-                let data = univ3_step(&path, amount_in, min_out).map_err(|e| refuse(e.to_string()))?;
-                Ok(Step { op: Op::UniV3, data })
-            }
-            Venue::Slipstream | Venue::SlipstreamV3 => {
-                let call = slipstream_exact_input_single(&SlipstreamSwap {
-                    token_in: leg.token_in,
-                    token_out: leg.token_out,
-                    tick_spacing: pool.state.tick_spacing,
-                    recipient: k.executor_address,
-                    deadline: k.deadline,
-                    amount_in,
-                    min_out,
-                })
-                .map_err(|e| refuse(e.to_string()))?;
-                // Each factory's pools run through its own router's adapter.
-                let adapter = binding(leg.venue).ok_or_else(|| refuse("no adapter for a Slipstream hop"))?.id;
-                Ok(Step { op: Op::Generic, data: generic_step(adapter, leg.token_in, amount_in, &call) })
-            }
-            Venue::PancakeV3 => {
-                let call = v3_router_exact_input_single(&V3RouterSwap {
-                    token_in: leg.token_in,
-                    token_out: leg.token_out,
-                    // The chain's fee, as for Uniswap: the router finds the
-                    // pool by tokens and fee.
-                    fee: pool.state.fee_ppm,
-                    recipient: k.executor_address,
-                    amount_in,
-                    min_out,
-                })
-                .map_err(|e| refuse(e.to_string()))?;
-                Ok(Step {
-                    op: Op::Generic,
-                    data: generic_step(PANCAKE_ADAPTER, leg.token_in, amount_in, &call),
-                })
-            }
-            Venue::AerodromeV2 => {
-                let call = aerodrome_swap_exact_tokens_for_tokens(&AerodromeSwap {
-                    token_in: leg.token_in,
-                    token_out: leg.token_out,
-                    factory: Venue::AerodromeV2.factory(),
-                    recipient: k.executor_address,
-                    deadline: k.deadline,
-                    amount_in,
-                    min_out,
-                })
-                .map_err(|e| refuse(e.to_string()))?;
-                Ok(Step { op: Op::Generic, data: generic_step(AERODROME_V2_ADAPTER, leg.token_in, amount_in, &call) })
-            }
-        }
+        encode_step(leg, &pool, amount_in, min_out, k.executor_address, k.deadline).map_err(refuse)
     }
 }
 

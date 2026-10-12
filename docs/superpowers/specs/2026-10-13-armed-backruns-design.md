@@ -106,7 +106,8 @@ grows with the move, so the search is monotonic. A slot with no such
 move inside the ladder is not armed.
 
 **Rungs.** Each slot is armed at up to three moves: the threshold `m₁`,
-then `m₂ = 2·m₁` and `m₃ = 4·m₁` (`rungs: 3`). Each rung has its own size,
+then `m₂ = m₁ + 5` and `m₃ = m₁ + 20` ticks, or bps on a reserve pool
+(`rungs: 3`; additive since the smoke runs, see the plan). Each rung has its own size,
 its own bid and its own sender, all set at its own threshold. A bid fixed
 at break-even would be close to nothing and lose every same-flashblock
 race. On a large move every rung up to it becomes eligible, and the
@@ -119,7 +120,8 @@ score is `P(move ≥ m_r within W) × expected net at m_r`. The net is taken
 before the bid in armed-shadow, where no `f` is bound, and after gate A's
 bid in armed-live. `P` is learned online, per pool and direction, from the
 feed's swap history: the distribution of the largest move over every
-W-second window.
+W-second window. Only rungs priced at the pools' current versions are ranked:
+an older pricing's trigger and band are prices the pools may have left.
 
 **The plan.**
 - **Size** `s*`: the best size at the threshold state.
@@ -290,7 +292,7 @@ armed:
   ledger: var/apex/armed.jsonl
   verdicts: var/apex/armed-verdicts.jsonl
   max_arms: 16          # virtual senders in shadow; real senders in live
-  rungs: 3              # moves m1, 2·m1, 4·m1 per slot
+  rungs: 3              # moves m1, m1 + 5, m1 + 20 per slot
   window_s: 10
   block_time_ms: 2000   # 200 after Denim
   margin_wei: 0         # hurdle = surplus over base gas and L1 fee > margin

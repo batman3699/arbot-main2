@@ -20,6 +20,31 @@ This plan is the spec's rollout steps 1–3: armed-shadow and the evaluator. The
 2. **Overshoot lands as residue, not WETH.** When the trigger moves past the threshold, hop 1 returns more than `mid`. Hop 2 still sells exactly `mid`, and the excess intermediate token stays in the executor. `_assertSettled` checks only the loan token, so this does not revert. The evaluator reports WETH gross and that residue separately.
 3. **No `verify_pool_slots.py`.** The engine's boot check (`verify_layouts`, Task 5) reads every universe pool's watched words at the boot block and compares them with the freshly loaded book. A pool that fails is left unarmable. A venue table test pins the layout. An offline script would only repeat that check.
 
+## Changes found by the smoke runs (2026-10-12 UTC, executing this plan)
+
+Two local release smoke runs against mainnet, each with the evaluator, changed the following. Each change has its own test.
+
+1. **Rungs are additive: the threshold, then +5 and +20 ticks (or bps), not ×2 and ×4.**
+   - The pools sit a few ticks apart, so the threshold m₁ is often 1–4, and 2m₁ and 4m₁ collapse onto it.
+   - When m₁ is large, 4m₁ is beyond any move seen.
+   - Code: `RUNG_OFFSETS = [0, 5, 20]`.
+2. **For a hop-2 trigger, the band's `mid` is the least hop 1 returns across the band.** Without this, leg-1 slots never armed: hop 1's adverse edge always fell short of the rung's `mid`, so every adverse edge would have reverted.
+3. **The ranking's prior counts only for moves no larger than the largest seen.** Otherwise the Laplace prior gives an unseen 2,000-tick move the same odds as a seen 3-tick one.
+4. **The live move check counts wrong ticks and liquidity changes separately.**
+   - Wrong ticks are the model's error, and were 0 in 6,692 real swaps.
+   - Liquidity changes are mints and burns the book had not applied, 7–13% of swaps on Base.
+   - `move_checks()` is `(checked, tick_mismatched, liquidity_changed)`, and the gate is on wrong ticks.
+5. **`eth_simulateV1` call objects carry `data`, not `input`**, as `live/sim.rs` does.
+6. **Only rungs priced at the pools' current versions are ranked, armed or renewed.**
+   - The engine reprices 24 of 308 slots a pass (about 16 ms each). The first smoke run armed from rungs priced up to ~5 s earlier, while `start_words` came from the current book.
+   - Its bands sat 2–4 ticks off the other pool's price, so 336 arms fired 0.
+   - `reprice_budget` is now an `EngineSettings` field (24 in the shadow), so a test can starve it.
+7. **Verdicts record `trigger_met`, and the summary splits unfired arms** into `unfired_trigger_unmet` and `unfired_band_missed`. Those two call for opposite tuning: rung steps, or band widths and arm age.
+8. **An arm's window ends when its last block is the head.**
+   - The engine's head comes from `newHeads`, a sealed block. So at `head == to_block` the window is over: the sender is freed and an unchanged arm renewed then, valid from the next block.
+   - The plan's `busy < head` and `to_block < head` were one block late. Live, that left one block in six with no valid transaction. The shadow's merged windows would have counted fires in that block, overstating coverage.
+   - Found by the sender-reuse mutant surviving.
+
 ## Global Constraints
 
 - Never print, echo or log a secret (`APEX_SECRET_*`, keys); the armed ledger holds calldata and predicates only.
@@ -29,7 +54,7 @@ This plan is the spec's rollout steps 1–3: armed-shadow and the evaluator. The
 - Verify the commit in a clean worktree with its own `CARGO_TARGET_DIR`.
 - Commits end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Venue storage layout (verified on chain 2026-10-12): price word (mask 2^160−1) at slot 0 for Uniswap v3 and PancakeSwap v3, slot 6 for Slipstream and SlipstreamV3; liquidity (mask 2^128−1) at slot 4 (Uniswap v3), 5 (PancakeSwap v3), 16 (Slipstream, SlipstreamV3); Aerodrome v2 reserves at slots 20 and 21.
-- Defaults: `max_arms: 16`, `rungs: 3` (m₁, 2m₁, 4m₁), `window_s: 10`, `block_time_ms: 2000`, `margin_wei: 0`, `band_cap_bps: 5`, `liquidity_floor_bps: 9800`; bid fractions `f` ∈ {0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9}.
+- Defaults: `max_arms: 16`, `rungs: 3` (m₁, m₁ + 5, m₁ + 20; see "Changes found by the smoke runs"), `window_s: 10`, `block_time_ms: 2000`, `margin_wei: 0`, `band_cap_bps: 5`, `liquidity_floor_bps: 9800`; bid fractions `f` ∈ {0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9}.
 - No `flashblock_index` predicate anywhere (Denim).
 
 ## File structure
@@ -849,7 +874,7 @@ fn predicates_encode_as_the_rpc_takes_them() {
     assert_eq!(v[0]["params"]["op"], ">=");
     assert_eq!(v[0]["params"]["value"], format!("{:#x}", at.state.sqrt_price_x96));
     let e = serde_json::to_value(expiry(52_510_000)).unwrap();
-    assert_eq!(e, serde_json::json!({"type": "block_number", "params": {"op": "<=", "value": "0x32142f0"}}));
+    assert_eq!(e, serde_json::json!({"type": "block_number", "params": {"op": "<=", "value": "0x3213d30"}}));
     let back: Vec<Predicate> = serde_json::from_value(v).unwrap();
     assert_eq!(back, preds);
 }
@@ -1999,7 +2024,7 @@ fn bids_and_nets_are_exact() {
     // 0.5 × 3e14 wei over 3e5 gas = 5e8 wei per gas.
     assert_eq!(bid_wei_per_gas(U256::from(300_000_000_000_000u64), 300_000, 500), 500_000_000);
     // gross 1e15 − 3e5 × (5e6 + 5e8) − 1e10
-    assert_eq!(net_wei(U256::from(10u64.pow(15)), 300_000, 5_000_000, 500_000_000, 10_000_000_000), 838_500_000_000_000);
+    assert_eq!(net_wei(U256::from(10u64.pow(15)), 300_000, 5_000_000, 500_000_000, 10_000_000_000), 848_490_000_000_000);
 }
 ```
 
@@ -3042,7 +3067,13 @@ and to the usage comment: `#   ops/host/remote.sh armed         # armed-shadow's
   - `move_reserves`: `10_000 + bps` → `10_000 - bps`: `armed_move`;
   - the live check's mismatch (`!=` → `==`): `armed_move`;
   - `trigger_up` (negated): `armed_threshold`;
-  - `rungs`'s bisection (`lo = mid` → `lo = mid - 1`), and the rung multiplier (`1 << (index - 1)` → `index`): `armed_threshold`;
+  - `rungs`'s bisection (`lo = mid` → `lo = mid - 1`), and the rung offsets (`RUNG_OFFSETS[index - 1]` → `0`): `armed_threshold`;
+  - `band`'s hop-2-trigger `mid` (`a.min(b).min(..)` → `rung.point.mid`): `armed_threshold`, `armed_engine`;
+  - `MoveStats`'s prior (`step <= largest` → `true`): `armed_engine`;
+  - the live check's split (tick mismatch counted as a liquidity change): `armed_move`;
+  - the engine's freshness filter (`k.seqs != [a.seq, b.seq]` → `false`): `armed_engine`;
+  - `judge`'s `trigger_met` (`|=` → `=`): `armed_eval`;
+  - the summary's split (`Some(false)` ↔ `Some(true)`) and its shadowed skip: `armed_run`;
   - `band`'s fixed-size check (`>` → `>=` with `margin + 1`): `armed_threshold`;
   - `predicate::trigger`'s op (`AtLeast` ↔ `AtMost`): `armed_predicate`;
   - Pancake's liquidity slot (5 → 4): `armed_predicate`;
@@ -3053,7 +3084,7 @@ and to the usage comment: `#   ops/host/remote.sh armed         # armed-shadow's
   - `next_flashblock`'s wrap (`(block + 1, 1)` → `(block + 1, 0)`): `armed_eval`;
   - `bid_wei_per_gas`'s divisor: `armed_eval`;
   - `effects_of`'s Burn sign: `armed_run`;
-  - the engine's sender reuse (`*busy < head` → `<=`): `armed_engine`.
+  - the engine's window end (`*busy <= head`, `to_block <= head`, `to_block > head`, each moved by one), and the changed-rung guard deleted: `armed_engine`.
 
   A survivor is either tested or deleted.
 

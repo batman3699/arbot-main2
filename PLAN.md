@@ -5902,6 +5902,54 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - `race_line` moved into `shadow::race` so it could be tested;
     - the env file is root:root 0600, since systemd reads it as root.
   - **Pending, Task 7 (operator):** the AWS role and security group, probes in us-east-1 and us-east-2, the host, the dry-run, then a new fourteen-day clock. After one hour: both ledgers non-empty and G1 reported. After seven days: the §7 decision.
+- [x] **R26 — armed backruns through Base validity transactions: armed-shadow and `apex armed-eval` (code; the deploy is the operator's).** Spec `docs/superpowers/specs/2026-10-13-armed-backruns-design.md`, plan `docs/superpowers/plans/2026-10-13-armed-backruns.md`.
+  - **Why.** Base Cobalt (2026-09-30) lets a transaction wait in the builder until storage predicates hold. It is evaluated against the state just before it runs, so it can land in its trigger's flashblock. Rivals that take our gaps a flashblock ahead are that, and reacting can't beat it. Nothing here sends: the shadow builds and records the arms, and the evaluator judges them against the chain.
+  - `apex_math::cl_move::move_to_price` moves a CL pool to a price across its tick ladder, crossing initialized ticks. `cp::move_reserves` moves a reserve pool along its curve. `PoolSnapshot::moved` uses both.
+    - Every Swap the book applies is checked against the model from the state before it. Wrong ticks (the model's error) and liquidity changes (mints and burns the book had not applied) are counted apart.
+    - Smoke runs: **0 wrong ticks in 6,692 real swaps**; liquidity changed on 7–13%.
+  - `armed::threshold`: for each (cycle, trigger leg), the smallest move of the trigger pool against the cycle's own swap that pays, found by doubling then bisecting. Rungs sit at that move, +5 and +20 ticks (or bps).
+    - The other pool gets a band, the widest of 5, 2 and 1 steps, across which the rung's fixed size still pays.
+    - With the trigger on hop 2's pool, `mid` is the least hop 1 returns across the band.
+  - `armed::predicate`: storage predicates on the venues' verified words, plus a block bound.
+    - The words: price at slot 0 (Uniswap v3, PancakeSwap v3) or 6 (Slipstream); liquidity at 4, **5 (PancakeSwap v3)** or 16; Aerodrome v2 reserves at 20 and 21.
+    - At boot, `verify_layouts` reads every pool's words back against the loaded book (41 of 41 in the smoke runs). A pool that fails is never armed.
+    - `armed::plan` carries break-even floors: hop 1 `minOut = mid`, hop 2 `minOut = loan + 1`, `minProfit = 1`.
+  - `armed::engine` runs in the shadow every 200 ms:
+    - reprices up to 24 slots a pass;
+    - ranks rungs by P(move ≥ step in the window) × surplus, with P learned per pool and direction;
+    - arms the best 16 on virtual senders and renews the unchanged;
+    - writes `armed-*.jsonl`.
+    - **Only rungs priced at the pools' current versions are armed or renewed.** The first smoke run armed from bands priced up to ~5 s earlier, and 336 arms fired 0.
+    - **A window ends when its last block is the head** (`newHeads` is sealed). Freeing and renewing a block later would have left one block in six uncovered live.
+  - `apex armed-eval` runs every 5 minutes on a timer.
+    - It rebuilds each arm's words from Swap, Sync, Mint and Burn logs, then finds the fire and the rival (the first later transaction that turns a predicate false).
+    - It quotes the fire exactly at the parent block with the earlier writes replayed, and checks it with `eth_simulateV1`.
+    - It sweeps bids at f = 5–90% of surplus and judges landing optimistically (the trigger's flashblock) and pessimistically (the next one).
+    - `--summary` gives the bid curve by day, and splits unfired arms into trigger never met and band missed.
+  - **Smoke runs** (release build, local, 2026-10-12 13:47–14:17 UTC, a quiet US morning): 2,044 arms, all judged, 1 fire, 2,031 with the trigger never met, 12 band misses.
+    - Checked against raw Swap logs: the best move toward the trigger in a 10 s window was p50 0, p90 ~1, max 2.8 ticks. The needed move was 4–16 ticks for rung 1. Fires need spikes.
+    - **The one fire was exact and lost on gas.** The quote and `eth_simulateV1` agreed to the wei (gross 3,533,976,118,901 wei; gas 560,466 against 571,100 expected).
+    - The rival took it in the same flashblock at 1.81 Mwei/gas on 238,025 gas. Our 560k-gas flash-loan path caps our bid at 0.88 Mwei/gas at f = 90%. At the rival's gas, the same surplus would bid ~8 Mwei/gas.
+  - Changes from the plan, each from a smoke run or a surviving mutant, listed in the plan:
+    - additive rungs;
+    - hop-2-trigger band `mid`;
+    - the ranking prior;
+    - the move-check split;
+    - `data` in simulate calls;
+    - fresh-only arming;
+    - `trigger_met`;
+    - the window end.
+  - 29 mutants, all killed. Seven only after a test was added:
+    - bisection at non-power-of-two thresholds;
+    - the band's strict margin;
+    - a position's `[lower, upper)` range;
+    - the window's last block;
+    - the window end, a real off-by-one;
+    - the changed-rung guard at its boundary, and deleted.
+  - **Pending (operator):**
+    - the deploy: it restarts R25's 14-day clock;
+    - after 3 days, gate A from `ops/host/remote.sh armed`: ≥ 30 fires, a positive pessimistic net per day at some f, simulation agreeing on ≥ 95%, and approval.
+    - Then the live pilot's own plan, capped at US$25 a day.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 

@@ -10,7 +10,7 @@
 //! number) and `diff.transactions`. A block is trusted only whole: joined
 //! mid-way or with a missing index, its ranges are unknown and never guessed.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -90,7 +90,7 @@ pub fn decode_frame(bytes: &[u8], binary: bool) -> Result<Frame, FrameError> {
 }
 
 /// One flashblock, as it reached this host.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlashblockSeen {
     pub block: u64,
     pub index: u32,

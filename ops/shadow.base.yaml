@@ -36,6 +36,20 @@ race: var/apex/race.jsonl
 flashblocks:
   stream: wss://mainnet.flashblocks.base.org/ws
   ledger: var/apex/flashblocks.jsonl
+# R26: armed backruns. armed-shadow arms each top route's gap as a validity
+# transaction would wait in Base's builder: built and recorded, never sent.
+# `apex armed-eval` (a timer on the host) judges every arm against the chain.
+armed:
+  mode: shadow
+  ledger: var/apex/armed.jsonl
+  verdicts: var/apex/armed-verdicts.jsonl
+  max_arms: 16
+  rungs: 3
+  window_s: 10
+  block_time_ms: 2000
+  margin_wei: 0
+  band_cap_bps: 5
+  liquidity_floor_bps: 9800
 
 executor:
   # The Phase 5 executor, deployed 2026-10-03 by script/DeployAndConfigure.s.sol

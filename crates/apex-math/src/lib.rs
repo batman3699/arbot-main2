@@ -30,6 +30,7 @@
 //! is where that env plane is dismantled.
 
 pub mod cl_math;
+pub mod cl_move;
 pub mod cl_state;
 pub mod cl_swap;
 pub mod engine;

@@ -47,6 +47,17 @@ race: var/r.jsonl
 flashblocks:
   stream: wss://mainnet.flashblocks.base.org/ws
   ledger: var/f.jsonl
+armed:
+  mode: shadow
+  ledger: var/a.jsonl
+  verdicts: var/v.jsonl
+  max_arms: 16
+  rungs: 3
+  window_s: 10
+  block_time_ms: 2000
+  margin_wei: 0
+  band_cap_bps: 5
+  liquidity_floor_bps: 9800
 executor:
   address: "0x00000000000000000000000000000000000000e1"
   code_hash: "0x00000000000000000000000000000000000000000000000000000000000000c0"
@@ -100,6 +111,21 @@ fn a_resolved_key_is_held_as_a_secret() {
     assert_eq!(c.race, std::path::PathBuf::from("var/r.jsonl"));
     assert_eq!(c.flashblocks.stream, "wss://mainnet.flashblocks.base.org/ws");
     assert_eq!(c.flashblocks.ledger, std::path::PathBuf::from("var/f.jsonl"));
+    assert_eq!((c.armed.max_arms, c.armed.rungs, c.armed.window_s), (16, 3, 10));
+    assert_eq!(c.armed.ledger, std::path::PathBuf::from("var/a.jsonl"));
+}
+
+/// R26: only armed-shadow is built; armed-live waits for the pilot's plan.
+#[test]
+fn armed_live_is_refused_until_the_pilot_is_built() {
+    let var = "APEX_SECRET_SHADOW_TEST_LIVE";
+    let text = yaml(var, "var/apex/shadow.journal").replace("mode: shadow", "mode: live");
+    let err = ShadowConfig::from_yaml_str(&text, &env(var, SECRET)).unwrap_err();
+    assert!(err.to_string().contains("armed.mode live"), "{err}");
+    let text = yaml(var, "var/apex/shadow.journal").replace("max_arms: 16", "max_arms: 0");
+    let err = ShadowConfig::from_yaml_str(&text, &env(var, SECRET)).unwrap_err();
+    assert!(err.to_string().contains("max_arms 1-64"), "no senders: {err}");
+    assert!(ShadowConfig::from_yaml_str(&yaml(var, "var/apex/shadow.journal"), &env(var, SECRET)).is_ok());
 }
 
 /// An unset placeholder refuses to start, naming the variable — and only

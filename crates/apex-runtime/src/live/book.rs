@@ -67,6 +67,15 @@ pub const WORDS_PER_SIDE: usize = 2;
 /// Where a log sits in the chain's order: `(block, log index)`.
 pub type LogPosition = (u64, u64);
 
+/// Where a pool's price would be moved, to price an armed backrun (R26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Move {
+    /// A concentrated pool's price, to this tick's sqrt price.
+    Tick(i32),
+    /// A constant-product pool's price of token0 in token1, by basis points.
+    Bps { up: bool, bps: u32 },
+}
+
 /// One pool, as of one block.
 #[derive(Clone, Debug)]
 pub struct PoolSnapshot {
@@ -105,6 +114,23 @@ impl PoolSnapshot {
     pub fn ladder_covers_price(&self) -> bool {
         // A constant-product pool has no ladder to leave.
         self.reserves.is_some() || self.ladder.covers(self.state.tick)
+    }
+
+    /// This pool after its price moved `to`, crossed exactly and with the fee
+    /// set for the new tick (R26). `None` past what the book proves or for a
+    /// move of the other kind.
+    pub fn moved(&self, to: Move) -> Option<Self> {
+        let mut next = self.clone();
+        match (to, &self.reserves) {
+            (Move::Bps { up, bps }, Some(r)) => next.reserves = Some(crate::live::cp::move_reserves(r, up, bps)?),
+            (Move::Tick(t), None) => {
+                let target = apex_math::cl_math::get_sqrt_ratio_at_tick(t)?;
+                next.state = apex_math::cl_move::move_to_price(&self.state, &self.ladder, target)?;
+                next.fee_from_tick();
+            }
+            _ => return None,
+        }
+        Some(next)
     }
 
     /// Set the fee from the tick, for a pool whose fee is a function of it.
@@ -235,6 +261,19 @@ pub struct PoolBook {
     /// Every pool the book was built over, whether or not it holds it now: what
     /// a full reload reads.
     universe: Vec<PoolSpec>,
+    /// R26: every applied Swap checked against the move model.
+    moves: MoveChecks,
+}
+
+/// How the move model fared against every applied Swap (R26).
+#[derive(Debug, Default)]
+struct MoveChecks {
+    checked: std::sync::atomic::AtomicU64,
+    /// The model's tick was not the swap's: the model's error.
+    tick_mismatched: std::sync::atomic::AtomicU64,
+    /// The tick agreed but the liquidity did not: a mint or burn the book had
+    /// not applied. On Base, mostly liquidity added and removed around swaps.
+    liquidity_changed: std::sync::atomic::AtomicU64,
 }
 
 /// What the writer lock guards besides the right to write.
@@ -634,6 +673,7 @@ impl PoolBook {
             pools: Versioned::new(pools, provenance),
             writer: Mutex::new(WriterState { seq: 0, last_gap: 0, newest_read }),
             universe,
+            moves: MoveChecks::default(),
         }
     }
 
@@ -820,16 +860,63 @@ impl PoolBook {
     /// Several logs' states, swaps and syncs, in order, as **one** write: a
     /// reader sees the book before all of them or after all of them (R24).
     pub fn apply_writes(&self, writes: &[StateWrite]) -> Vec<SwapApplied> {
-        self.write(|map, w, status| {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (applied, checks) = self.write(|map, w, status| {
+            let mut checks = (0u64, 0u64, 0u64);
             let applied = writes
                 .iter()
                 .map(|s| match s {
-                    StateWrite::Swap(s) => Self::swap_into(map, w.seq, s),
+                    StateWrite::Swap(s) => {
+                        // R26: the move model, from the state before this swap.
+                        if let Some(old) = map.get(&s.pool).filter(|o| o.reserves.is_none() && Self::is_newer(o, s.at)) {
+                            let target = u256_to_ethers(s.sqrt_price_x96);
+                            if let Some(m) = apex_math::cl_move::move_to_price(&old.state, &old.ladder, target) {
+                                checks.0 += 1;
+                                if m.tick != s.tick {
+                                    checks.1 += 1;
+                                } else if m.liquidity != s.liquidity {
+                                    checks.2 += 1;
+                                }
+                                if m.liquidity != s.liquidity || m.tick != s.tick {
+                                    tracing::debug!(
+                                        target: "moves",
+                                        pool = %s.pool,
+                                        venue = ?old.spec.venue,
+                                        at = ?s.at,
+                                        from_tick = old.state.tick,
+                                        model_tick = m.tick,
+                                        event_tick = s.tick,
+                                        from_liquidity = old.state.liquidity,
+                                        model_liquidity = m.liquidity,
+                                        event_liquidity = s.liquidity,
+                                        "the move model disagrees with a swap"
+                                    );
+                                }
+                            }
+                        }
+                        Self::swap_into(map, w.seq, s)
+                    }
                     StateWrite::Sync(s) => Self::sync_into(map, w.seq, s),
                 })
                 .collect();
-            (applied, status)
-        })
+            ((applied, checks), status)
+        });
+        self.moves.checked.fetch_add(checks.0, Relaxed);
+        self.moves.tick_mismatched.fetch_add(checks.1, Relaxed);
+        self.moves.liquidity_changed.fetch_add(checks.2, Relaxed);
+        applied
+    }
+
+    /// Swaps checked against the move model (R26): how many, how many the
+    /// model's tick got wrong (its error), and how many agreed on the tick but
+    /// not the liquidity (a Mint or Burn the book had not applied yet).
+    pub fn move_checks(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.moves.checked.load(Relaxed),
+            self.moves.tick_mismatched.load(Relaxed),
+            self.moves.liquidity_changed.load(Relaxed),
+        )
     }
 
     /// Apply a `Sync` log's reserves, if newer than what the pool holds.
