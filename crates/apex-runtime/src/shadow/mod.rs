@@ -21,7 +21,7 @@
 //! | report | the funnel, capture assurance and every counter, logged and appended to `report`; the miss ledger drained into `misses` | R9 |
 //! | race | one line per handled proposal, with every stage's time, to `race` (a file per UTC day), off the capture path | R25 |
 //! | flashblocks | Base's public flashblock stream, as it reached this host, to `flashblocks.ledger`: the clock the race ledger is measured against | R25 |
-//! | armed | every 200 ms, the arming engine over the verified book: the best routes' gaps armed as validity transactions would be, recorded to `armed.ledger`, never sent | R26 |
+//! | armed | pass after pass, the arming engine over the verified book: the best routes' gaps armed as validity transactions would be, recorded to `armed.ledger`, never sent | R26 |
 //!
 //! # What it proves, and what it cannot
 //!
@@ -926,12 +926,14 @@ impl Shadow {
         }
     }
 
-    /// R26: armed-shadow. Every 200 ms, the engine's pass over the verified
-    /// book, off the async threads; its lines to the armed ledger.
+    /// R26: armed-shadow. The engine's pass over the verified book, off the
+    /// async threads; its lines to the armed ledger. A pass that left slots
+    /// waiting is followed at once by the next (R27.1).
     async fn armed_loop(&self) {
-        let mut every = tokio::time::interval(Duration::from_millis(200));
+        let mut waiting = 0;
         loop {
-            every.tick().await;
+            // Nothing is priced on the paths that skip a pass: they pause.
+            tokio::time::sleep(crate::armed::engine::pause_after(std::mem::take(&mut waiting))).await;
             if self.book.status() != ReconstructionStatus::Verified {
                 continue;
             }
@@ -945,9 +947,13 @@ impl Shadow {
             let (engine, snapshot) = (Arc::clone(&self.armed), self.book.snapshot());
             let base_fee = head.base_fee_per_gas.unwrap_or(0);
             let now = SystemClock.now().0;
-            let lines = tokio::task::spawn_blocking(move || engine.tick(&snapshot, head.number, base_fee, &px, now))
-                .await
-                .unwrap_or_default();
+            let (lines, left) = tokio::task::spawn_blocking(move || {
+                let lines = engine.tick(&snapshot, head.number, base_fee, &px, now);
+                (lines, engine.stats().stale_waiting)
+            })
+            .await
+            .unwrap_or_default();
+            waiting = left;
             for line in &lines {
                 if ledger::append_line(&self.config.armed.ledger, now, line).is_err() {
                     bump(&self.stats.armed_write_failures);

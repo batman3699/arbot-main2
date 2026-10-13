@@ -6031,8 +6031,10 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - prices on all but one of the machine's cores (`engine::workers`, at most six; three on the host);
     - takes changed slots first, then the oldest;
     - starts slots for 150 ms (`REPRICE_FOR`), then arms what it has; it always prices one.
+    - is followed at once by the next while any slot waits, and 50 ms later when none does (`pause_after`). The first build waited out a 200 ms tick after each 150 ms pass, with 72 slots stale.
     - Threads write what one thread writes (a test holds the lines equal on 1, 2, 3 and 8).
   - **Counted, so saturation shows:** `slots`, `slots_current`, `stale_waiting`, and over the run `passes`, `pass_us_total`, `waiting_total`, `current_total`. The status prints them as `armed pass`.
+  - **First build on the host (c13ec1c, 17:41 UTC, 10 minutes):** 85 slots a second on three threads (58 on one), 82% of 316 slots priced at the book as it stood, 72 still waiting a pass. Three threads on the host's two physical cores price 1.9 times what one does. Still saturated: the size search is the cost (128 quotes a search, every search), and that is the next change.
   - 6 mutants, all killed. Gates green but the two known-red scripts.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port

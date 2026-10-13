@@ -205,7 +205,7 @@ from the trigger's flashblock.
 
 ## 9. Armed-shadow (R26)
 
-The shadow's `armed` worker arms the best routes' gaps every 200 ms, the way
+The shadow's `armed` worker arms the best routes' gaps pass after pass, the way
 validity transactions would wait in Base's builder: built and recorded, never
 sent (`var/apex/armed-YYYY-MM-DD.jsonl`). `apex armed-eval` judges each arm
 once its window has closed. It asks whether the arm would have fired, whether
@@ -269,8 +269,9 @@ The status lines:
   is not armed until it is repriced, so the share "priced at the book as it
   stood" is the share a sender could take, and "left waiting a pass" is the
   backlog. A pass prices on all but one of the machine's cores for 150 ms,
-  changed slots first. A low share with slots waiting means the pass is
-  saturated: fewer slots, fewer rungs or more cores;
+  changed slots first, and the next follows at once while any slot waits
+  (50 ms later when none does). A low share with slots waiting means the
+  pass is saturated: fewer slots, fewer rungs or more cores;
 - `lenders` (R27): what each flash lender holds of WETH. A trade borrows from
   Balancer while its holding covers the size, and from the Morpho lender above.
   Arms past Balancer's holding are labelled `"lender": "morpho"` in

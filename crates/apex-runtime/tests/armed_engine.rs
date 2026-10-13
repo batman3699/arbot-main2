@@ -441,3 +441,16 @@ fn a_pass_stops_starting_slots_when_its_time_is_up() {
     let s = engine.stats();
     assert_eq!((s.slots_priced, s.slots_current, s.stale_waiting), (5, 5, 7));
 }
+
+/// R27.1: a pass that left slots waiting is followed at once by the next. On
+/// 2026-10-13 a 150 ms pass waited out the rest of a 200 ms tick with 72 slots
+/// still stale. With nothing waiting, the next pass comes soon enough to meet
+/// a flashblock's writes (200 ms apart) early, and an empty pass costs 0.4 ms.
+#[test]
+fn a_pass_that_left_slots_waiting_is_followed_at_once() {
+    use apex_runtime::armed::engine::{pause_after, IDLE_PAUSE};
+    assert_eq!(pause_after(1), Duration::ZERO);
+    assert_eq!(pause_after(106), Duration::ZERO);
+    assert_eq!(pause_after(0), IDLE_PAUSE);
+    assert_eq!(IDLE_PAUSE, Duration::from_millis(50));
+}

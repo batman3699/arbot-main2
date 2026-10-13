@@ -33,6 +33,20 @@ pub const REPRICE_BUDGET: usize = 256;
 /// Balancer's holding. So it prices on [`workers`] threads, for this long.
 pub const REPRICE_FOR: Duration = Duration::from_millis(150);
 
+/// The pause before a pass when the last left nothing waiting. A flashblock's
+/// writes land 200 ms apart, and a pass with nothing stale takes 0.4 ms.
+pub const IDLE_PAUSE: Duration = Duration::from_millis(50);
+
+/// The pause before the next pass, the last having left `waiting` stale slots:
+/// none while any wait.
+pub fn pause_after(waiting: u64) -> Duration {
+    if waiting > 0 {
+        Duration::ZERO
+    } else {
+        IDLE_PAUSE
+    }
+}
+
 /// The threads a pass prices on: all but one of the machine's, at most six.
 /// The capture path's own work is small beside a pass: on the host its threads
 /// used about 2 s of CPU each in 13 minutes.
