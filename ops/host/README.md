@@ -264,6 +264,13 @@ in per mille (50 = 5% of the arm's expected surplus bid as priority fee):
 The status lines:
 - `armed`: arms, renewals, armable slots, unarmable pools (boot layout
   check), the engine's last pass in ms;
+- `armed pass` (R27.1): how the engine keeps up, averaged over the run. A slot
+  is a cycle with one of its pools as the trigger. A slot whose pool changed
+  is not armed until it is repriced, so the share "priced at the book as it
+  stood" is the share a sender could take, and "left waiting a pass" is the
+  backlog. A pass prices on all but one of the machine's cores for 150 ms,
+  changed slots first. A low share with slots waiting means the pass is
+  saturated: fewer slots, fewer rungs or more cores;
 - `lenders` (R27): what each flash lender holds of WETH. A trade borrows from
   Balancer while its holding covers the size, and from the Morpho lender above.
   Arms past Balancer's holding are labelled `"lender": "morpho"` in

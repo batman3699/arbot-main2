@@ -509,6 +509,8 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
             executor: config.executor.address,
             chain_id: base.0,
             reprice_budget: crate::armed::engine::REPRICE_BUDGET,
+            reprice_for: crate::armed::engine::REPRICE_FOR,
+            workers: crate::armed::engine::workers(),
         },
         unarmable,
     ));

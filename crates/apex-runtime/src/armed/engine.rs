@@ -17,12 +17,28 @@ use apex_types::cost::GasUsed;
 use apex_search::frontier::RouteId;
 use ethers_core::types::U256;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-/// Slots repriced per tick at most, in the shadow: the rest wait for the next
-/// 200 ms. About 16 ms a slot in a release build.
-pub const REPRICE_BUDGET: usize = 24;
+/// Slots repriced per pass at most, in the shadow. [`REPRICE_FOR`] is the
+/// bound that binds: slots differ in cost, and one pass of 24 took 744 ms.
+pub const REPRICE_BUDGET: usize = 256;
+
+/// How long a pass goes on starting slots, in the shadow: the rest wait for
+/// the next, and the arms priced so far go out.
+///
+/// The pass ran every 200 ms on one thread and was pegged: 12 h of CPU in the
+/// 13 h R26.3 was up, 83 slots a second, and 58 once R27's sizes ran past
+/// Balancer's holding. So it prices on [`workers`] threads, for this long.
+pub const REPRICE_FOR: Duration = Duration::from_millis(150);
+
+/// The threads a pass prices on: all but one of the machine's, at most six.
+/// The capture path's own work is small beside a pass: on the host its threads
+/// used about 2 s of CPU each in 13 minutes.
+pub fn workers() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1)).clamp(1, 6)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct EngineSettings {
@@ -36,6 +52,10 @@ pub struct EngineSettings {
     pub chain_id: u64,
     /// Slots repriced per tick at most ([`REPRICE_BUDGET`] in the shadow).
     pub reprice_budget: usize,
+    /// How long a pass goes on starting slots ([`REPRICE_FOR`] in the shadow).
+    pub reprice_for: Duration,
+    /// The threads a pass prices its slots on.
+    pub workers: usize,
 }
 
 impl EngineSettings {
@@ -77,6 +97,19 @@ pub struct EngineStats {
     pub slots_armable: u64,
     pub unarmable_pools: u64,
     pub last_tick_us: u64,
+    /// The slots the engine prices: each cycle, either pool the trigger.
+    pub slots: u64,
+    /// Of those, the slots priced at the book as the last pass saw it: the
+    /// ones a sender can take.
+    pub slots_current: u64,
+    /// The stale slots the last pass left for the next.
+    pub stale_waiting: u64,
+    /// Passes so far, and over them: their time, the slots each left waiting,
+    /// and the slots each found current.
+    pub passes: u64,
+    pub pass_us_total: u64,
+    pub waiting_total: u64,
+    pub current_total: u64,
 }
 
 pub struct Engine {
@@ -89,6 +122,13 @@ pub struct Engine {
     priced: AtomicU64,
     armable: AtomicU64,
     last_tick_us: AtomicU64,
+    slots: u64,
+    current: AtomicU64,
+    waiting: AtomicU64,
+    passes: AtomicU64,
+    pass_us_total: AtomicU64,
+    waiting_total: AtomicU64,
+    current_total: AtomicU64,
 }
 
 /// A pool's position for move statistics: its tick, or log-price in bps.
@@ -122,6 +162,7 @@ impl Engine {
             senders: vec![0; settings.max_arms],
             next_arm_id: 0,
         };
+        let slots = 2 * cycles.values().filter(|c| !c.legs.iter().any(|l| unarmable.contains(&l.pool))).count() as u64;
         Self {
             cycles,
             settings,
@@ -132,6 +173,13 @@ impl Engine {
             priced: AtomicU64::new(0),
             armable: AtomicU64::new(0),
             last_tick_us: AtomicU64::new(0),
+            slots,
+            current: AtomicU64::new(0),
+            waiting: AtomicU64::new(0),
+            passes: AtomicU64::new(0),
+            pass_us_total: AtomicU64::new(0),
+            waiting_total: AtomicU64::new(0),
+            current_total: AtomicU64::new(0),
         }
     }
 
@@ -143,6 +191,13 @@ impl Engine {
             slots_armable: self.armable.load(Relaxed),
             unarmable_pools: self.unarmable.len() as u64,
             last_tick_us: self.last_tick_us.load(Relaxed),
+            slots: self.slots,
+            slots_current: self.current.load(Relaxed),
+            stale_waiting: self.waiting.load(Relaxed),
+            passes: self.passes.load(Relaxed),
+            pass_us_total: self.pass_us_total.load(Relaxed),
+            waiting_total: self.waiting_total.load(Relaxed),
+            current_total: self.current_total.load(Relaxed),
         }
     }
 
@@ -165,9 +220,11 @@ impl Engine {
             st.moves.observe(p.spec.pool, position(p), now_ns);
         }
 
-        // Reprice stale slots, stalest first, within the budget. A slot is
-        // stale when either pool changed or its window has passed.
-        let mut stale: Vec<((RouteId, u8), u64)> = Vec::new();
+        // Reprice stale slots within the budget. A slot is stale when either
+        // pool changed or its window has passed. One whose pool changed is not
+        // armed until it is repriced, while one that only aged still is, on
+        // its last pricing: so the changed go first, then the oldest.
+        let mut stale: Vec<((RouteId, u8), (bool, u64))> = Vec::new();
         for (id, c) in &self.cycles {
             if c.legs.iter().any(|l| self.unarmable.contains(&l.pool)) {
                 continue;
@@ -175,23 +232,19 @@ impl Engine {
             let (Some(a), Some(b)) = (snapshot.get(&c.legs[0].pool), snapshot.get(&c.legs[1].pool)) else { continue };
             for leg in 0..2u8 {
                 let k = st.computed.get(&(*id, leg));
-                let fresh = k.is_some_and(|k| k.seqs == [a.seq, b.seq] && now_ns < k.at_ns.saturating_add(window_ns));
+                let current = k.is_some_and(|k| k.seqs == [a.seq, b.seq]);
+                let fresh = current && k.is_some_and(|k| now_ns < k.at_ns.saturating_add(window_ns));
                 if !fresh {
-                    stale.push(((*id, leg), k.map_or(0, |k| k.at_ns)));
+                    stale.push(((*id, leg), (current, k.map_or(0, |k| k.at_ns))));
                 }
             }
         }
-        stale.sort_by_key(|(_, age)| *age);
-        for ((id, leg), _) in stale.into_iter().take(s.reprice_budget) {
-            let c = &self.cycles[&id];
-            let pair = [Arc::clone(&snapshot[&c.legs[0].pool]), Arc::clone(&snapshot[&c.legs[1].pool])];
-            let found: Vec<(Rung, Band)> = rungs(c, &pair, usize::from(leg), px, s.rungs)
-                .into_iter()
-                .filter_map(|r| band(c, &pair, usize::from(leg), &r, px, s.band_cap_bps).map(|b| (r, b)))
-                .collect();
-            self.priced.fetch_add(1, Relaxed);
-            st.computed.insert((id, leg), Computed { seqs: [pair[0].seq, pair[1].seq], at_ns: now_ns, rungs: found });
-        }
+        stale.sort_by_key(|(_, order)| *order);
+        let work: Vec<(RouteId, u8)> = stale.iter().take(s.reprice_budget).map(|(slot, _)| *slot).collect();
+        let done = self.reprice(&work, snapshot, px, now_ns, started);
+        let waiting = (stale.len() - done.len()) as u64;
+        self.priced.fetch_add(done.len() as u64, Relaxed);
+        st.computed.extend(done);
         self.armable.store(st.computed.values().filter(|k| !k.rungs.is_empty()).count() as u64, Relaxed);
 
         // Rank every rung priced at this book: P(move ≥ step within the
@@ -200,12 +253,14 @@ impl Engine {
         // are prices the pools may have left, so it is neither armed nor renewed.
         let moves = &st.moves;
         let mut ranked: Vec<(f64, Key)> = Vec::new();
+        let mut current = 0u64;
         for ((id, leg), k) in &st.computed {
             let c = &self.cycles[id];
             let (Some(a), Some(b)) = (snapshot.get(&c.legs[0].pool), snapshot.get(&c.legs[1].pool)) else { continue };
             if k.seqs != [a.seq, b.seq] {
                 continue;
             }
+            current += 1;
             let pool = c.legs[usize::from(*leg)].pool;
             for (r, b) in &k.rungs {
                 let p = moves.p_at_least(pool, trigger_up(c, usize::from(*leg)), r.step);
@@ -273,8 +328,56 @@ impl Engine {
             out.push(ArmedLine::Arm(Box::new(arm.clone())));
             st.live.insert(key, Live { arm, fingerprint });
         }
-        self.last_tick_us.store(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX), Relaxed);
+        let took = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        self.last_tick_us.store(took, Relaxed);
+        self.current.store(current, Relaxed);
+        self.waiting.store(waiting, Relaxed);
+        self.passes.fetch_add(1, Relaxed);
+        self.pass_us_total.fetch_add(took, Relaxed);
+        self.waiting_total.fetch_add(waiting, Relaxed);
+        self.current_total.fetch_add(current, Relaxed);
         out
+    }
+
+    /// `work`'s slots priced at `snapshot`, in order, on the pass's threads,
+    /// until the pass's time is up. The first is always priced, or a book too
+    /// slow for the time would never be priced at all.
+    fn reprice(
+        &self,
+        work: &[(RouteId, u8)],
+        snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>,
+        px: &Pricing,
+        now_ns: u64,
+        started: std::time::Instant,
+    ) -> Vec<((RouteId, u8), Computed)> {
+        let s = self.settings;
+        let next = AtomicUsize::new(0);
+        let price = || {
+            let mut out = Vec::new();
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= work.len() || (i > 0 && started.elapsed() >= s.reprice_for) {
+                    return out;
+                }
+                let (id, leg) = work[i];
+                let c = &self.cycles[&id];
+                let pair = [Arc::clone(&snapshot[&c.legs[0].pool]), Arc::clone(&snapshot[&c.legs[1].pool])];
+                let found: Vec<(Rung, Band)> = rungs(c, &pair, usize::from(leg), px, s.rungs)
+                    .into_iter()
+                    .filter_map(|r| band(c, &pair, usize::from(leg), &r, px, s.band_cap_bps).map(|b| (r, b)))
+                    .collect();
+                out.push(((id, leg), Computed { seqs: [pair[0].seq, pair[1].seq], at_ns: now_ns, rungs: found }));
+            }
+        };
+        let threads = s.workers.clamp(1, work.len().max(1));
+        if threads == 1 {
+            return price();
+        }
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..threads).map(|_| scope.spawn(price)).collect();
+            // A thread that panicked loses its slots to the next pass.
+            handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

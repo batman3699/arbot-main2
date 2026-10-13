@@ -104,6 +104,11 @@ else:
         print(f"  armed       {e['arms']} arms, {e['renewals']} renewals, {e['slots_armable']} armable slots, "
               f"{e['unarmable_pools']} unarmable pools, last pass {e['last_tick_us'] / 1000:.1f} ms, "
               f"{am['write_failures']} write failures")
+        if e.get("passes"):  # R27.1: absent from a report before it
+            n, slots = e["passes"], max(e["slots"], 1)
+            print(f"  armed pass  {n} passes, {e['pass_us_total'] / n / 1000:.0f} ms each; of {e['slots']} slots, "
+                  f"{100 * e['current_total'] / n / slots:.0f}% priced at the book as it stood, "
+                  f"{e['waiting_total'] / n:.1f} left waiting a pass (now {e['slots_current']} and {e['stale_waiting']})")
         print(f"  moves       {am['move_checks']} swaps checked against the move model: {am['move_tick_mismatches']} wrong ticks, "
               f"{am['move_liquidity_changes']} liquidity changes (unapplied mints/burns)")
     ln = r.get("lenders")

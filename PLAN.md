@@ -6016,7 +6016,24 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
   - **The real extra gas is 121,700, not 94,167.**
     - The first injected runs used `0x…beef`, which holds WETH dust. Morpho's transfer into a lender holding nothing writes its balance from zero.
     - Measured on the same cycle, Morpho's extra gas over Balancer: none 121,700; dust in the lender 94,340; in the executor 110,260; in both **82,900**. Balancer's gas is unchanged by executor dust.
-    - `MORPHO_EXTRA_GAS` = 122,000. If the owner leaves 1 wei of WETH in the lender and the executor (two tiny transfers), it can drop to 83,000.
+    - `MORPHO_EXTRA_GAS` = 122,000. If the owner leaves 1 wei of WETH in the lender and the executor, it can drop to 83,000. `script/SeedWethDust.s.sol` does that (the owner broadcasts; dry run: 3 transactions, 208,568 gas).
+  - **On the host since 2026-10-13 16:42:37 UTC** (c141258; R26.3's 13 h 12 m is `/opt/apex/var/run-5`).
+    - Boot: "the Morpho lender verified", 82,909 WETH in Morpho against Balancer's 18.69.
+    - First 10 minutes: 328 of 812 arms borrowed from Morpho, at 19.9 to 569 WETH. The largest Balancer arm was 18.69 WETH, the vault's holding.
+    - No fire yet, so the evaluator has not judged a Morpho-funded one.
+- [x] **R27.1 — the armed pass keeps up.** Found reading R27's first minutes.
+  - **The pass was pegged, and R27 made it slower.**
+    - It ran every 200 ms on one thread, 24 slots at most, oldest-priced first.
+    - R26.3 used 12 h 01 m of CPU in the 13 h 12 m it was up, and priced 83 slots a second (68 to 92 over 158 five-minute intervals: flat, the mark of a ceiling).
+    - R27's sizes run to hundreds of WETH and cross more ticks: 58 slots a second, with three of the host's four cores idle.
+  - **Why it costs money.** A slot (a cycle with one pool as the trigger) whose pool changed is not armed until it is repriced. With every pass full, a slot whose pool had just moved waited behind every slot that had only aged, and the pools that move most are the ones worth arming.
+  - **The pass now:**
+    - prices on all but one of the machine's cores (`engine::workers`, at most six; three on the host);
+    - takes changed slots first, then the oldest;
+    - starts slots for 150 ms (`REPRICE_FOR`), then arms what it has; it always prices one.
+    - Threads write what one thread writes (a test holds the lines equal on 1, 2, 3 and 8).
+  - **Counted, so saturation shows:** `slots`, `slots_current`, `stale_waiting`, and over the run `passes`, `pass_us_total`, `waiting_total`, `current_total`. The status prints them as `armed pass`.
+  - 6 mutants, all killed. Gates green but the two known-red scripts.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 

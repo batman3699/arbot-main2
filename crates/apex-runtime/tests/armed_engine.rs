@@ -54,6 +54,7 @@ use apex_runtime::live::gas;
 use apex_types::ids::ChainId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 const EXECUTOR: Address = address!("8940B565D050974b2b589B70De43bCb753b1F93B");
 
@@ -76,8 +77,62 @@ fn setup_with(max_arms: usize, reprice_budget: usize, rungs: u8) -> (Engine, BTr
         executor: EXECUTOR,
         chain_id: 8453,
         reprice_budget,
+        reprice_for: Duration::MAX,
+        workers: 1,
     };
     (Engine::new(cycles, settings, BTreeSet::new()), snap)
+}
+
+const CAKE: Address = address!("72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38");
+
+/// Three pools of one pair: six cycles, twelve slots, every sender to spare.
+fn setup_three(reprice_budget: usize, reprice_for: Duration, workers: usize) -> (Engine, BTreeMap<Address, Arc<PoolSnapshot>>) {
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> = [
+        (UNI, pool(UNI, Venue::UniswapV3, -197_350, 500)),
+        (SLIP, pool(SLIP, Venue::Slipstream, -197_350, 400)),
+        (CAKE, pool(CAKE, Venue::PancakeV3, -197_350, 100)),
+    ]
+    .into_iter()
+    .map(|(a, p)| (a, Arc::new(p)))
+    .collect();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let settings = EngineSettings {
+        max_arms: 256,
+        rungs: 6,
+        window_s: 10,
+        block_time_ms: 2_000,
+        band_cap_bps: 5,
+        liquidity_floor_bps: 9_800,
+        executor: EXECUTOR,
+        chain_id: 8453,
+        reprice_budget,
+        reprice_for,
+        workers,
+    };
+    (Engine::new(cycles, settings, BTreeSet::new()), snap)
+}
+
+/// `snap` with `pool` one tick up, as version `seq` of the book.
+fn one_moved(snap: &BTreeMap<Address, Arc<PoolSnapshot>>, pool: Address, seq: u64) -> BTreeMap<Address, Arc<PoolSnapshot>> {
+    let mut b = snap[&pool].moved(Move::Tick(snap[&pool].state.tick + 1)).unwrap();
+    b.seq = seq;
+    let mut moved = snap.clone();
+    moved.insert(pool, Arc::new(b));
+    moved
+}
+
+/// The slots (route and trigger leg) `lines` arm or renew.
+fn slots_covered(lines: &[ArmedLine], armed: &mut BTreeMap<u64, (String, u8)>) -> BTreeSet<(String, u8)> {
+    lines
+        .iter()
+        .map(|l| match l {
+            ArmedLine::Arm(a) => {
+                armed.insert(a.arm_id, (a.route_hash.clone(), a.trigger_leg));
+                (a.route_hash.clone(), a.trigger_leg)
+            }
+            ArmedLine::Renew { arm_id, .. } => armed[arm_id].clone(),
+        })
+        .collect()
 }
 
 fn px() -> Pricing {
@@ -152,9 +207,12 @@ fn an_unarmable_pool_arms_nothing() {
     let settings = EngineSettings {
         max_arms: 4, rungs: 3, window_s: 10, block_time_ms: 2_000, band_cap_bps: 5,
         liquidity_floor_bps: 9_800, executor: EXECUTOR, chain_id: 8453, reprice_budget: REPRICE_BUDGET,
+        reprice_for: Duration::MAX, workers: 1,
     };
     let engine = Engine::new(cycles, settings, [SLIP].into_iter().collect());
     assert!(engine.tick(&snap, 1_000, 5_000_000, &px(), 1).is_empty());
+    let s = engine.stats();
+    assert_eq!((s.slots, s.slots_priced, s.stale_waiting), (0, 0, 0), "its slots are not the engine's to price");
 }
 
 #[test]
@@ -315,4 +373,71 @@ fn a_rung_past_balancers_holding_borrows_from_morpho() {
         assert_eq!(a.lender, if size <= small { "balancer" } else { "morpho" }, "arm {} at {size}", a.arm_id);
         assert_eq!(a.calldata.contains(&needle), a.lender == "morpho");
     }
+}
+
+/// R27.1: a slot whose pool changed is not armed until it is repriced, while
+/// one whose window merely passed still is, on its last pricing. So the
+/// changed slots are repriced first. On 2026-10-13 the pass was pegged (12 h
+/// of CPU in 13 h up) and took its slots oldest-priced first, which put a slot
+/// whose pool had just moved behind every slot that had only aged.
+#[test]
+fn a_slot_whose_pool_changed_is_repriced_before_one_that_only_aged() {
+    for changed in [UNI, SLIP, CAKE] {
+        // Eight slots a pass: two passes price all twelve.
+        let (engine, snap) = setup_three(8, Duration::MAX, 1);
+        let mut armed = BTreeMap::new();
+        let mut all = slots_covered(&engine.tick(&snap, 1_000, 5_000_000, &px(), 1), &mut armed);
+        all.extend(slots_covered(&engine.tick(&snap, 1_000, 5_000_000, &px(), 2), &mut armed));
+        assert_eq!(all.len(), 12, "six cycles, either pool the trigger");
+
+        // 11 s on, block 1,005 sealed: every window has passed, every sender
+        // is free, and one pool has moved. Eight slots run through it.
+        let moved = one_moved(&snap, changed, 1);
+        let covered = slots_covered(&engine.tick(&moved, 1_005, 5_000_000, &px(), 11_000_000_002), &mut armed);
+        assert_eq!(covered, all, "the eight changed slots repriced; the four that only aged still armed ({changed:#x} moved)");
+        let s = engine.stats();
+        assert_eq!((s.slots, s.slots_current, s.stale_waiting), (12, 12, 4));
+    }
+}
+
+/// R27.1: a pass prices its slots on several threads, and writes what one
+/// thread would. R27's larger sizes cost a third of the pass's throughput (83
+/// to 58 slots a second) with three of the host's four cores idle.
+#[test]
+fn a_pass_on_several_threads_writes_what_one_thread_writes() {
+    let run = |workers: usize| {
+        let (engine, snap) = setup_three(usize::MAX, Duration::MAX, workers);
+        let mut lines = engine.tick(&snap, 1_000, 5_000_000, &px(), 1);
+        let moved = one_moved(&snap, SLIP, 1);
+        lines.extend(engine.tick(&moved, 1_005, 5_000_000, &px(), 2));
+        lines.extend(engine.tick(&one_moved(&moved, CAKE, 2), 1_010, 5_000_000, &px(), 11_000_000_000));
+        (lines, engine.stats().slots_priced)
+    };
+    let (one, priced) = run(1);
+    assert!(one.len() >= 12 && priced == 12 + 8 + 12, "{} lines, {priced} slots priced", one.len());
+    for workers in [2, 3, 8] {
+        assert_eq!(run(workers), (one.clone(), priced), "{workers} threads");
+    }
+}
+
+/// R27.1: a pass stops starting slots when its time is up, so the arms it has
+/// priced go out; but it always prices one, or a slow book would never be
+/// priced at all. What it leaves is counted.
+#[test]
+fn a_pass_stops_starting_slots_when_its_time_is_up() {
+    for workers in [1, 3] {
+        let (engine, snap) = setup_three(usize::MAX, Duration::ZERO, workers);
+        for pass in 1..=3u64 {
+            engine.tick(&snap, 1_000, 5_000_000, &px(), pass);
+            let s = engine.stats();
+            assert_eq!((s.slots_priced, s.slots_current, s.stale_waiting), (pass, pass, 12 - pass), "{workers} threads, pass {pass}");
+        }
+        let s = engine.stats();
+        assert_eq!((s.passes, s.waiting_total, s.current_total), (3, 11 + 10 + 9, 1 + 2 + 3));
+    }
+    // The count is a bound too.
+    let (engine, snap) = setup_three(5, Duration::MAX, 3);
+    engine.tick(&snap, 1_000, 5_000_000, &px(), 1);
+    let s = engine.stats();
+    assert_eq!((s.slots_priced, s.slots_current, s.stale_waiting), (5, 5, 7));
 }
