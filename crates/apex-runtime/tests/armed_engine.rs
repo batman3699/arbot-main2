@@ -102,6 +102,12 @@ fn the_engine_arms_its_best_slots_and_renews_them() {
         assert!(a.calldata.starts_with("0x") && a.calldata.len() > 10);
         assert!(a.sender_slot < 4);
         assert_eq!(a.start_words.len(), 4, "price and liquidity of both pools");
+        // The fire lies past the threshold the ceiling was priced at (fires
+        // used up to 7.4% over it), and execution runs to 1.25x the net gas
+        // before its refund: the limit is the shared formula over 1.25x the
+        // ceiling, at least 1.75x the expected gas. Four fires on 2026-10-12
+        // ran out at 1.25x the ceiling.
+        assert!(u128::from(a.gas_limit) * 4 >= u128::from(a.gas_expected) * 7, "limit {} for {} expected", a.gas_limit, a.gas_expected);
     }
     assert!(arms.iter().any(|a| a.trigger_leg == 1), "triggers on hop 2's pool are armed too");
     let senders: BTreeSet<_> = arms.iter().map(|a| a.sender_slot).collect();
@@ -110,11 +116,19 @@ fn the_engine_arms_its_best_slots_and_renews_them() {
     assert!(engine.tick(&snap, 1_000, 5_000_000, &px(), 2).is_empty());
     // A head is a sealed block: at 1,004 the window still holds block 1,005.
     assert!(engine.tick(&snap, 1_004, 5_000_000, &px(), 3).is_empty());
-    // Block 1,005 sealed, the book unchanged: renewed at once, so block 1,006
-    // is covered too; not re-armed.
-    let later = engine.tick(&snap, 1_005, 5_000_000, &px(), 4);
+    // Block 1,005 sealed 12 s after arming, the book unchanged: renewed at
+    // once, so block 1,006 is covered too; not re-armed. A renewal is a new
+    // transaction: its deadline runs from now, as the arm's did (0 + 10 + 1).
+    let later = engine.tick(&snap, 1_005, 5_000_000, &px(), 12_000_000_000);
     assert_eq!(later.len(), 4);
-    assert!(later.iter().all(|l| matches!(l, ArmedLine::Renew { to_block: 1_010, .. })));
+    let word = |d: u64| format!("{d:064x}");
+    for l in &later {
+        let ArmedLine::Renew { arm_id, to_block: 1_010, deadline: Some(23), calldata: Some(c), .. } = l else { panic!("a renewal: {l:?}") };
+        let a = arms.iter().find(|a| a.arm_id == *arm_id).unwrap();
+        assert_eq!(a.deadline, 11);
+        assert!(a.calldata.contains(&word(11)) && !a.calldata.contains(&word(23)));
+        assert!(c.contains(&word(23)), "re-signed with the new deadline");
+    }
     let s = engine.stats();
     assert_eq!((s.arms, s.renewals), (4, 4));
 }

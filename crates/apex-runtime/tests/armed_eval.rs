@@ -3,7 +3,7 @@
 use apex_runtime::armed::eval::{
     bid_wei_per_gas, judge, landing, merge_renewals, net_wei, next_flashblock, Point, TxEffect, Write, F_PERMILLE,
 };
-use apex_runtime::armed::lines::{Arm, ArmedLine, Word};
+use apex_runtime::armed::lines::{Arm, ArmedLine, Renewal, Word};
 use apex_runtime::armed::predicate::{expiry, Op, Predicate};
 use ethers_core::types::U256;
 
@@ -53,6 +53,7 @@ fn arm() -> Arm {
         calldata: "0x".into(),
         calldata_hash: "0x".into(),
         sender_slot: 0,
+        renewals: Vec::new(),
     }
 }
 
@@ -121,11 +122,22 @@ fn nothing_after_the_window_counts() {
 
 #[test]
 fn renewals_extend_an_arm_and_its_block_bound() {
-    let lines = vec![ArmedLine::Arm(Box::new(arm())), ArmedLine::Renew { arm_id: 7, to_block: 110, at_ns: 1 }];
+    let lines = vec![
+        ArmedLine::Arm(Box::new(arm())),
+        ArmedLine::Renew { arm_id: 7, to_block: 110, at_ns: 1, deadline: Some(40), calldata: Some("0xrenewed".into()) },
+        // A line written before renewals carried their own transaction.
+        ArmedLine::Renew { arm_id: 7, to_block: 115, at_ns: 2, deadline: None, calldata: None },
+    ];
     let merged = merge_renewals(lines);
-    assert_eq!(merged[0].to_block, 110);
-    assert!(merged[0].predicates.contains(&expiry(110)));
-    assert!(!merged[0].predicates.contains(&expiry(105)));
+    let a = &merged[0];
+    assert_eq!(a.to_block, 115);
+    assert!(a.predicates.contains(&expiry(115)));
+    assert!(!a.predicates.contains(&expiry(105)));
+    // A renewal is its own transaction, re-signed with a fresh deadline: valid
+    // after the window before it, and no further back.
+    assert_eq!(a.renewals, vec![Renewal { after_block: 105, to_block: 110, deadline: 40, calldata: "0xrenewed".into() }]);
+    assert_eq!((a.calldata_at(101), a.calldata_at(105)), ("0x", "0x"), "the arm's own in its window");
+    assert_eq!((a.calldata_at(106), a.calldata_at(115)), ("0xrenewed", "0xrenewed"));
 }
 
 #[test]

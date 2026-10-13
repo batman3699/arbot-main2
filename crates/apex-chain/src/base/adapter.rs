@@ -63,14 +63,26 @@ pub trait BaseRpc: Send + Sync {
 /// measurement, and it is stated here rather than spread through the code.
 pub const GAS_HEADROOM_BPS: u64 = 1_200;
 
-/// §21.3's `G_safe` over a p99: the figure plus [`GAS_HEADROOM_BPS`].
+/// What a transaction can run before its refund, over the net gas a receipt or
+/// a simulation reports, in basis points.
+///
+/// EIP-3529 caps a refund at a fifth of the gas a transaction ran, so it can
+/// run to 1.25x its net figure, and the gas model is calibrated on net figures.
+/// The executor's settlements refund near the cap (pools' locks and emptied
+/// balances): five simulated on Base on 2026-10-13 needed a limit of 1.221 to
+/// 1.254x the gas they used. This is the EVM's rule, not headroom.
+pub const REFUND_HEADROOM_BPS: u64 = 2_500;
+
+/// §21.3's `G_safe` over a p99: what the p99 can run before its refund
+/// ([`REFUND_HEADROOM_BPS`]), plus [`GAS_HEADROOM_BPS`].
 ///
 /// One formula for the two places that need it: the economics, pricing the
 /// limit a candidate's simulation runs at, and the adapter, choosing the limit
 /// it is signed with. Two copies would let the simulation pass at a limit the
 /// signed transaction then runs out of.
 pub const fn gas_limit_over(p99: apex_types::cost::GasUsed) -> GasLimit {
-    GasLimit(p99.0.saturating_add(p99.0.saturating_mul(GAS_HEADROOM_BPS) / 10_000))
+    let ran = p99.0.saturating_add(p99.0.saturating_mul(REFUND_HEADROOM_BPS) / 10_000);
+    GasLimit(ran.saturating_add(ran.saturating_mul(GAS_HEADROOM_BPS) / 10_000))
 }
 
 pub struct BaseAdapter<R: BaseRpc> {

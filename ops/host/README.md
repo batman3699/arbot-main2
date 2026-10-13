@@ -242,6 +242,11 @@ in per mille (50 = 5% of the arm's expected surplus bid as priority fee):
   is a cost.
 - `simulated` and `sim_agreed`: fires checked with `eth_simulateV1`, and how
   many agreed with the exact quote to the wei.
+  - The simulation replays the whole fire block so far, then the transaction
+    that would execute in that block, a renewal's own after one.
+  - Before R26.1 it replayed only the pool-touching transactions, and a
+    disagreement meant nothing. Since then, one is a finding: re-run it by
+    hand before believing either side.
 - `unfired_trigger_unmet` and `unfired_band_missed`: arms that never fired.
   Either the trigger pool never moved far enough, or it did while the other
   pool was outside its band.

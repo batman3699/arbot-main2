@@ -326,7 +326,7 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
     }
     // The simulation check.
     if let Some(b) = &block {
-        if let Some(sim) = simulate(ctx.rpc, ctx.config, arm, fire, b, ctx.logs).await {
+        if let Some(sim) = simulate(ctx.rpc, ctx.config, arm, fire, b).await {
             report.simulated += 1;
             let agrees = v.gross_wei.is_some() && v.gross_wei.as_deref() == sim.gross_wei.as_deref();
             report.sim_agreed += usize::from(agrees);
@@ -419,31 +419,41 @@ async fn quote_at_fire(
 /// The armed call simulated where it would have run: the fire block's earlier
 /// transactions on the arm's pools replayed, then the call from the trader.
 /// Call objects as `live::sim` sends them (`data`, proven on BlockPI).
-async fn simulate(rpc: &dyn RpcTransport, config: &ShadowConfig, arm: &Arm, fire: &Point, block: &Value, logs: &[RawLog]) -> Option<SimCheck> {
-    let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
-    let touched: BTreeSet<B256> = logs
-        .iter()
-        .filter(|l| l.block_number == Some(fire.block) && pools.contains(&l.address))
-        .filter_map(|l| l.transaction_hash)
-        .collect();
-    let mut calls: Vec<Value> = block
+/// Every transaction of `block` up to and including `fire_tx_index`, in order,
+/// as `eth_simulateV1` calls (a creation without `to`). The whole block so far,
+/// not only what touched the arm's pools: a transaction that touched them can
+/// depend on one that did not, and replaying only the first made 22 exact fires
+/// revert on 2026-10-12. `None` when the block has no transaction list.
+pub fn replay_calls(block: &Value, fire_tx_index: u64) -> Option<Vec<Value>> {
+    let calls = block
         .get("transactions")?
         .as_array()?
         .iter()
-        .filter(|t| {
-            let i = t.get("transactionIndex").and_then(hex_u128).unwrap_or(u128::MAX);
-            let h: Option<B256> = t.get("hash").and_then(|h| h.as_str()?.parse().ok());
-            i <= u128::from(fire.tx_index) && h.is_some_and(|h| touched.contains(&h))
+        .filter(|t| t.get("transactionIndex").and_then(hex_u128).is_some_and(|i| i <= u128::from(fire_tx_index)))
+        .map(|t| {
+            let mut c = json!({"from": t["from"], "data": t["input"], "value": t["value"], "gas": t["gas"]});
+            if let Some(to) = t.get("to").filter(|to| !to.is_null()) {
+                c["to"] = to.clone();
+            }
+            c
         })
-        .map(|t| json!({"from": t["from"], "to": t["to"], "data": t["input"], "value": t["value"], "gas": t["gas"]}))
         .collect();
+    Some(calls)
+}
+
+/// The `eth_simulateV1` request for `arm` firing at `fire`: on the parent
+/// block's state, the fire's block so far ([`replay_calls`]), then the
+/// transaction that would execute in that block ([`Arm::calldata_at`]) from
+/// `signer` at the arm's gas limit.
+pub fn simulate_request(arm: &Arm, fire: &Point, block: &Value, signer: Address, executor: Address) -> Option<Value> {
+    let mut calls = replay_calls(block, fire.tx_index)?;
     calls.push(json!({
-        "from": format!("{:#x}", config.signer.address),
-        "to": format!("{:#x}", config.executor.address),
-        "data": arm.calldata,
+        "from": format!("{signer:#x}"),
+        "to": format!("{executor:#x}"),
+        "data": arm.calldata_at(fire.block),
         "gas": format!("{:#x}", arm.gas_limit),
     }));
-    let params = json!([{
+    Some(json!([{
         "blockStateCalls": [{
             "blockOverrides": {
                 "number": format!("{:#x}", fire.block),
@@ -453,7 +463,11 @@ async fn simulate(rpc: &dyn RpcTransport, config: &ShadowConfig, arm: &Arm, fire
             "calls": calls,
         }],
         "validation": false,
-    }, format!("{:#x}", fire.block - 1)]);
+    }, format!("{:#x}", fire.block.checked_sub(1)?)]))
+}
+
+async fn simulate(rpc: &dyn RpcTransport, config: &ShadowConfig, arm: &Arm, fire: &Point, block: &Value) -> Option<SimCheck> {
+    let params = simulate_request(arm, fire, block, config.signer.address, config.executor.address)?;
     let out = rpc.call("eth_simulateV1", params).await.ok()?;
     let last = out.get(0)?.get("calls")?.as_array()?.last()?.clone();
     let ok = last.get("status").and_then(Value::as_str) == Some("0x1");

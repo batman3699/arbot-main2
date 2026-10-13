@@ -12,6 +12,8 @@ use crate::live::book::PoolSnapshot;
 use crate::live::frontier::Cycle;
 use crate::live::reads::ChainReads;
 use alloy_primitives::{keccak256, Address};
+use apex_chain::base::adapter::gas_limit_over;
+use apex_types::cost::GasUsed;
 use apex_search::frontier::RouteId;
 use ethers_core::types::U256;
 use std::collections::{BTreeMap, BTreeSet};
@@ -237,10 +239,23 @@ impl Engine {
             if let Some(live) = st.live.get_mut(&key) {
                 if live.fingerprint == fingerprint {
                     if live.arm.to_block <= head {
+                        // A new transaction on the same sender: re-signed with a
+                        // deadline that runs from now, as the arm's did.
+                        let deadline = self.deadline(now_ns);
+                        let Some((calldata, calldata_hash)) = self.calldata(c, band, snapshot, deadline) else { continue };
                         live.arm.to_block = to_block;
+                        live.arm.deadline = deadline;
+                        live.arm.calldata.clone_from(&calldata);
+                        live.arm.calldata_hash = calldata_hash;
                         st.senders[usize::from(live.arm.sender_slot)] = to_block;
                         self.renewals.fetch_add(1, Relaxed);
-                        out.push(ArmedLine::Renew { arm_id: live.arm.arm_id, to_block, at_ns: now_ns });
+                        out.push(ArmedLine::Renew {
+                            arm_id: live.arm.arm_id,
+                            to_block,
+                            at_ns: now_ns,
+                            deadline: Some(deadline),
+                            calldata: Some(calldata),
+                        });
                     }
                     continue;
                 }
@@ -284,11 +299,9 @@ impl Engine {
         let mut predicates = predicate::trigger(trigger_pool, &rung.trigger, trigger_up(c, t))?;
         predicates.extend(predicate::band(other_pool, &band.edges, s.liquidity_floor_bps)?);
         predicates.push(predicate::expiry(to_block));
-        let deadline = now_ns / 1_000_000_000 + s.window_s + 1;
-        let pools = [&**snapshot.get(&c.legs[0].pool)?, &**snapshot.get(&c.legs[1].pool)?];
+        let deadline = self.deadline(now_ns);
         let point = &band.point;
-        let call = armed_call(c, pools, point.size, point.mid, s.executor, s.chain_id, deadline).ok()?;
-        let data = call.data();
+        let (calldata, calldata_hash) = self.calldata(c, band, snapshot, deadline)?;
         let start_ticks = [trigger_pool, other_pool]
             .iter()
             .filter(|p| p.reserves.is_none())
@@ -314,14 +327,33 @@ impl Engine {
             surplus_wei: point.surplus.to_string(),
             cost_wei: point.cost.to_string(),
             gas_expected: point.gas.expected.0,
-            gas_limit: point.gas.ceiling.0.saturating_mul(5) / 4,
+            // The fire lies past the threshold the ceiling was priced at: fires
+            // used up to 7.4% over it in the first 10 hours, and four ran out
+            // at 1.25x it. So the shared formula, refunds included, goes over
+            // 1.25x the ceiling. Unused limit is not charged on Base.
+            gas_limit: gas_limit_over(GasUsed(point.gas.ceiling.0.saturating_mul(5) / 4)).0,
             base_fee_wei: base_fee_wei.to_string(),
             other_wei: px.costs.other_wei.to_string(),
             deadline,
-            calldata: format!("0x{}", alloy_primitives::hex::encode(data)),
-            calldata_hash: format!("{:#x}", keccak256(data)),
+            calldata,
+            calldata_hash,
             sender_slot: u16::try_from(sender).unwrap_or(u16::MAX),
+            renewals: Vec::new(),
         })
+    }
+
+    /// An arm's or renewal's deadline in seconds: its window, plus one.
+    fn deadline(&self, now_ns: u64) -> u64 {
+        now_ns / 1_000_000_000 + self.settings.window_s + 1
+    }
+
+    /// The plan at `band`'s point with `deadline`, as calldata and its hash.
+    fn calldata(&self, c: &Cycle, band: &Band, snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>, deadline: u64) -> Option<(String, String)> {
+        let s = self.settings;
+        let pools = [&**snapshot.get(&c.legs[0].pool)?, &**snapshot.get(&c.legs[1].pool)?];
+        let call = armed_call(c, pools, band.point.size, band.point.mid, s.executor, s.chain_id, deadline).ok()?;
+        let data = call.data();
+        Some((format!("0x{}", alloy_primitives::hex::encode(data)), format!("{:#x}", keccak256(data))))
     }
 }
 

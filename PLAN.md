@@ -5950,6 +5950,24 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - the deploy: it restarts R25's 14-day clock;
     - after 3 days, gate A from `ops/host/remote.sh armed`: ≥ 30 fires, a positive pessimistic net per day at some f, simulation agreeing on ≥ 95%, and approval.
     - Then the live pilot's own plan, capped at US$25 a day.
+- [x] **R26.1 — three defects found by the host's first 10 hours of armed-shadow (code; the redeploy is the operator's).** The host judged 48,044 arms and 136 fires (2026-10-12 15:06 to 2026-10-13 01:13 UTC). The status reported 52 of 88 simulations agreeing with the quote. Re-simulated with the whole block replayed, **every fire with a quote matched it to the wei**, so the quotes were exact and three bugs were not:
+  1. **The evaluator replayed only the transactions that touched the arm's pools.** One of them can depend on one that did not, so 22 exact fires "reverted". `replay_calls` now replays the whole block up to and including the fire, and `simulate_request` is a tested pure function.
+  2. **A renewal kept the arm's deadline.** It extended the block bound, but the calldata still lapsed 11 s after arming, so 9 fires past a renewal reverted at ~67k gas. A renewal is a new transaction: the engine re-signs it with a deadline from now, the `Renew` line carries its calldata, and `Arm::calldata_at(block)` picks the transaction that would execute in a block.
+  3. **Gas limits ignored refunds, in both lanes.** A receipt's gas is net of refunds, and EIP-3529 lets a refund take back up to a fifth of what ran.
+     - Five settlements needed a limit of 1.221–1.254x the gas they used. Four armed fires ran out at the arm's 1.25x ceiling.
+     - The reactive lane's limit was the ceiling plus 12%, so any trade using over ~90% of its ceiling ran out. Out-of-gas reverts carry no data: the 76 `Unknown` reverts are the suspects.
+     - `gas_limit_over` now applies `REFUND_HEADROOM_BPS` (2,500) before §21.3's 12%: a 330,000 p99 signs at 462,000, not 369,600.
+     - Arms take that formula over 1.25x their ceiling, because fires ran up to 7.4% past the ceiling priced at the threshold.
+  - Dollar picture over the same 10 hours (WETH $2,428):
+    - **Reactive lane:** 295 proposals, $151 expected net.
+      - $104 reverted in simulation, $80 of it three tickets in the 21:00 UTC spike (`MinOutNotMet`: the gaps were gone by then).
+      - 32 sent in time: $10.57.
+    - **Armed lane:** $24.28 gross over 127 quoted fires. $8.75 (bid 5%) to $9.04 (bid 50%) if an arm lands in its trigger's flashblock; $0 if only in the next.
+  - **bloXroute, assessed and declined.**
+    - Its Base benchmark (2025-10-17, from Tokyo, equal gas prices) shows inclusion order, not where our races are lost.
+    - Speed Boost is $1,000 a month plus a 0.000003 ETH tip per transaction. That buys a few ms on a host already 7.5 ms from the sequencer.
+    - Armed transactions wait in the builder, so delivery speed doesn't decide them.
+  - 9 new mutants, all killed. The live adapter's pinned limit and two window fixtures follow the new formula, with the same windows.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 

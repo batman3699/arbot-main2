@@ -30,8 +30,9 @@ fn model(budget: u64) -> MeasuredCapacityModel {
     MeasuredCapacityModel::from_observations(&obs).unwrap()
 }
 
-/// The support candidate's p99 is 330,000 gas: 369,600 with §21.3's headroom.
-const NEEDED: GasLimit = GasLimit(369_600);
+/// The support candidate's p99 is 330,000 gas: 412,500 run before its refund,
+/// 462,000 with §21.3's headroom.
+const NEEDED: GasLimit = GasLimit(462_000);
 
 /// **Before the first model, nothing fits** — rejected with no window, before
 /// signing — and nothing is estimated as if it could land.

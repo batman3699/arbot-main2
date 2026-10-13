@@ -6,7 +6,7 @@
 //! tick and liquidity, a Sync its reserves, and a Mint or Burn moves the
 //! in-range liquidity by its amount when the pool's tick is inside its range.
 
-use super::lines::{Arm, ArmedLine};
+use super::lines::{Arm, ArmedLine, Renewal};
 use super::predicate::{Op, Predicate};
 use ethers_core::types::U256;
 use std::collections::BTreeMap;
@@ -162,8 +162,11 @@ pub fn merge_renewals(lines: Vec<ArmedLine>) -> Vec<Arm> {
             ArmedLine::Arm(a) => {
                 arms.insert(a.arm_id, *a);
             }
-            ArmedLine::Renew { arm_id, to_block, .. } => {
+            ArmedLine::Renew { arm_id, to_block, deadline, calldata, .. } => {
                 if let Some(a) = arms.get_mut(&arm_id) {
+                    if let (Some(deadline), Some(calldata)) = (deadline, calldata) {
+                        a.renewals.push(Renewal { after_block: a.to_block, to_block, deadline, calldata });
+                    }
                     a.to_block = a.to_block.max(to_block);
                     for p in &mut a.predicates {
                         if let Predicate::BlockNumber { value, .. } = p {

@@ -272,9 +272,22 @@ fn the_safe_gas_limit_covers_the_tail() {
     let safe = BaseAdapter::<CountingRpc>::safe_gas_limit(&c);
     assert!(safe.0 > c.total_execution_cost.gas_used_distribution.p99.0);
     assert!(safe.0 > c.total_execution_cost.gas_used_distribution.p50.0 * 2 / 2);
-    assert_eq!(safe.0, 300_000 + 36_000, "12% headroom over p99");
+    assert_eq!(safe.0, 375_000 + 45_000, "the refunded execution of the p99, then 12% headroom");
     // One formula: the economics prices a candidate's limit with the same one.
     assert_eq!(safe, gas_limit_over(GasUsed(300_000)));
+}
+
+/// A receipt's gas is net of refunds, and EIP-3529 lets a refund take back up
+/// to a fifth of what ran, so a limit must cover up to 1.25x the figure every
+/// measurement reports. Five settlements of the executor, simulated on Base on
+/// 2026-10-13 with the whole block before them replayed: the gas each used, and
+/// the smallest limit it ran at. At the p99 plus 12% alone, all five run out.
+#[test]
+fn the_limit_covers_what_runs_before_the_refund() {
+    for (used, smallest) in [(531_248u64, 652_996u64), (542_176, 664_586), (533_007, 654_669), (560_460, 684_342), (459_348, 575_958)] {
+        assert!(used + used * 1_200 / 10_000 < smallest, "the old limit ran out at {used}");
+        assert!(gas_limit_over(GasUsed(used)).0 >= smallest, "{used} gas needs a limit of {smallest}");
+    }
 }
 
 /// A smaller gas limit can mean an earlier flashblock (INV-37). That is the
@@ -283,7 +296,8 @@ fn the_safe_gas_limit_covers_the_tail() {
 #[test]
 fn a_smaller_gas_limit_can_buy_an_earlier_window() {
     let a = adapter(discovered_regime(T0));
-    let small = a.optimize_submission_cost(&candidate(5_000_000, 100_000_000), T0);
+    // A 4M p99 signs at 5.6M, which fits the first window; 25M at 35M does not.
+    let small = a.optimize_submission_cost(&candidate(4_000_000, 100_000_000), T0);
     let large = a.optimize_submission_cost(&candidate(25_000_000, 100_000_000), T0);
 
     let (SubmissionDecision::Submit { earliest_eligible_flashblock: ks, .. }, SubmissionDecision::Submit { earliest_eligible_flashblock: kl, .. }) =
@@ -405,9 +419,9 @@ fn headroom_that_costs_more_than_the_edge_is_refused() {
 #[test]
 fn a_window_the_state_cannot_survive_to_is_refused() {
     let a = adapter(discovered_regime(T0));
-    // 25M of gas lands at window 3, which is 600 ms out. Ask 500 ms before the
-    // candidate's deadline.
-    let c = candidate(25_000_000, 100_000_000);
+    // A 20M p99 signs at 28M and lands at window 3, which is 600 ms out. Ask
+    // 500 ms before the candidate's deadline.
+    let c = candidate(20_000_000, 100_000_000);
     let late = UnixNanos(c.deadline.0 - 500_000_000);
     let decision = a.optimize_submission_cost(&c, late);
     let SubmissionDecision::Reject(RejectReason::StateExpiresFirst { valid_for, earliest_landing }) =

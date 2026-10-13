@@ -4,7 +4,7 @@
 use alloy_primitives::{address, Address, B256};
 use apex_chain::rpc::ws::RawLog;
 use apex_runtime::armed::eval::Write;
-use apex_runtime::armed::run::{effects_of, summary};
+use apex_runtime::armed::run::{effects_of, replay_calls, simulate_request, summary};
 use apex_runtime::live::feed::{BURN, MINT, SWAP, SYNC};
 use apex_runtime::live::inventory::Venue;
 use ethers_core::types::U256;
@@ -119,4 +119,61 @@ fn the_summary_sums_the_bid_curve_and_splits_the_misses() {
     assert_eq!((f500.fires, f500.wins_optimistic, f500.wins_pessimistic), (1, 1, 1));
     assert_eq!((f500.net_usd_optimistic, f500.net_usd_pessimistic), (2.5, 2.5));
     assert_eq!(day.len(), 2);
+}
+
+/// The simulation replays every transaction of the fire's block up to and
+/// including the fire, in order, whatever it touched: one that touched our
+/// pools can depend on one that did not (an approval, a transfer, a nonce), and
+/// replaying only the first made 22 exact fires revert on 2026-10-12.
+#[test]
+fn a_fire_is_simulated_after_its_whole_block_so_far() {
+    let tx = |i: u64, to: Option<&str>| {
+        serde_json::json!({
+            "transactionIndex": format!("{i:#x}"), "hash": format!("0x{i:064x}"), "from": "0x00000000000000000000000000000000000000f0",
+            "to": to, "input": format!("0x{i:02x}"), "value": "0x0", "gas": "0x5208",
+        })
+    };
+    let block = serde_json::json!({ "transactions": [
+        tx(0, Some("0x4200000000000000000000000000000000000015")),
+        tx(1, None),
+        tx(2, Some("0x00000000000000000000000000000000000000aa")),
+        tx(3, Some("0x00000000000000000000000000000000000000aa")),
+    ]});
+    let calls = replay_calls(&block, 2).unwrap();
+    assert_eq!(calls.len(), 3, "transactions 0 to 2: the fire's own included, the one after it not");
+    assert_eq!(calls.iter().map(|c| c["data"].as_str().unwrap()).collect::<Vec<_>>(), ["0x00", "0x01", "0x02"]);
+    assert!(calls[1].get("to").is_none(), "a creation replays as one");
+    assert_eq!(calls[2]["to"], "0x00000000000000000000000000000000000000aa");
+    assert_eq!(calls[0]["gas"], "0x5208");
+    assert!(replay_calls(&serde_json::json!({}), 2).is_none());
+}
+
+/// The simulated transaction is the one that would execute in the fire's
+/// block: a renewal's, past the window before it, signed with its own deadline.
+#[test]
+fn a_fire_after_a_renewal_simulates_the_renewal() {
+    use apex_runtime::armed::eval::Point;
+    use apex_runtime::armed::lines::{Arm, Renewal};
+    let text = r#"{"arm_id":7,"at_ns":0,"armed_block":100,"to_block":110,"route_hash":"0xr","trigger_leg":0,"rung":1,"step":3,
+        "pools":["0xaa","0xbb"],"venues":["UniswapV3","UniswapV3"],"predicates":[],"start_words":[],"start_ticks":[],
+        "size_wei":"1","mid":"1","output_wei":"2","surplus_wei":"1","cost_wei":"0","gas_expected":1,"gas_limit":900000,
+        "base_fee_wei":"5000000","other_wei":"0","deadline":11,"calldata":"0xfirst","calldata_hash":"0x","sender_slot":0}"#;
+    let mut arm: Arm = serde_json::from_str(text).unwrap();
+    assert!(arm.renewals.is_empty(), "an arm line carries no renewals");
+    arm.renewals.push(Renewal { after_block: 105, to_block: 110, deadline: 23, calldata: "0xrenewed".into() });
+    let block = serde_json::json!({"timestamp": "0x10", "baseFeePerGas": "0x4c4b40", "transactions": [
+        {"transactionIndex": "0x0", "from": "0x01", "to": "0x02", "input": "0x", "value": "0x0", "gas": "0x1"},
+    ]});
+    let signer: Address = address!("CB436Ba3acb945b3fc8EE6345857262584356595");
+    let executor: Address = address!("8940B565D050974b2b589B70De43bCb753b1F93B");
+    let at = |block: u64| Point { block, tx_index: 0, tx: "0x".into() };
+    let ours = |p: serde_json::Value| p[0]["blockStateCalls"][0]["calls"].as_array().unwrap().last().unwrap().clone();
+    let first = simulate_request(&arm, &at(104), &block, signer, executor).unwrap();
+    assert_eq!(ours(first.clone())["data"], "0xfirst");
+    assert_eq!(first[1], "0x67", "on the parent block's state");
+    assert_eq!(first[0]["blockStateCalls"][0]["calls"].as_array().unwrap().len(), 2, "the block so far, then ours");
+    let renewed = ours(simulate_request(&arm, &at(108), &block, signer, executor).unwrap());
+    assert_eq!(renewed["data"], "0xrenewed");
+    assert_eq!(renewed["gas"], "0xdbba0");
+    assert_eq!(renewed["from"], format!("{signer:#x}"));
 }

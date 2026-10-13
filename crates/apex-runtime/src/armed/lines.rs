@@ -9,7 +9,28 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ArmedLine {
     Arm(Box<Arm>),
-    Renew { arm_id: u64, to_block: u64, at_ns: u64 },
+    /// The arm's window extended. A renewal is a new transaction, re-signed
+    /// with a fresh deadline: the arm's own lapses with its first window.
+    /// Lines written before R26.1 carry neither.
+    Renew {
+        arm_id: u64,
+        to_block: u64,
+        at_ns: u64,
+        #[serde(default)]
+        deadline: Option<u64>,
+        #[serde(default)]
+        calldata: Option<String>,
+    },
+}
+
+/// A renewal folded into its arm by `merge_renewals`: its own transaction,
+/// valid in the blocks after `after_block` (the window before it).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Renewal {
+    pub after_block: u64,
+    pub to_block: u64,
+    pub deadline: u64,
+    pub calldata: String,
 }
 
 /// One storage word an arm watches, as it read when armed.
@@ -52,4 +73,15 @@ pub struct Arm {
     pub calldata: String,
     pub calldata_hash: String,
     pub sender_slot: u16,
+    /// Folded in by `merge_renewals`; never written with the arm.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub renewals: Vec<Renewal>,
+}
+
+impl Arm {
+    /// The calldata that would execute in `block`: the latest renewal's whose
+    /// window it falls past, else the arm's own.
+    pub fn calldata_at(&self, block: u64) -> &str {
+        self.renewals.iter().rev().find(|r| block > r.after_block).map_or(&self.calldata, |r| &r.calldata)
+    }
 }
