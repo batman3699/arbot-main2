@@ -166,7 +166,14 @@ fn moves_are_counted_over_windows() {
         m.observe(UNI, x, t * s);
     }
     assert_eq!(m.p_at_least(UNI, true, 20), 0.5, "seen: (1 hit + 1) / (2 windows + 2)");
-    assert_eq!(m.p_at_least(UNI, true, 40), 0.0, "a move larger than any seen gets no prior");
+    assert_eq!(m.p_at_least(UNI, true, 30), 0.5, "the largest seen");
+    // Past the largest move seen, the measured tail: P(>= m) falls as m^-2.87
+    // (38 pools, 2026-10-12/13), anchored at the largest seen. Not zero, or a
+    // spike rung never gets a sender; not the prior, or it gets them all.
+    let tail = |m: f64| 0.5 * (30.0 / m).powf(2.87);
+    assert!((m.p_at_least(UNI, true, 40) - tail(40.0)).abs() < 1e-12);
+    assert!((m.p_at_least(UNI, true, 300) - tail(300.0)).abs() < 1e-12);
+    assert!(m.p_at_least(UNI, true, 300) < 0.0014 * m.p_at_least(UNI, true, 30), "ten times the largest seen: about 1/740");
     assert_eq!(m.p_at_least(UNI, false, 1), 0.0, "no downward move seen yet");
     assert_eq!(m.p_at_least(SLIP, true, 1), 0.5, "an unseen pool is a coin toss");
 }

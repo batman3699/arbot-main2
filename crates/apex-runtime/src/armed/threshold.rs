@@ -24,7 +24,14 @@ use std::sync::Arc;
 pub const MAX_STEP: u32 = 2_000;
 
 /// Each rung's move past the threshold, in ticks or bps.
-pub const RUNG_OFFSETS: [u32; 3] = [0, 5, 20];
+///
+/// Spaced about two apart from +20, so a move between two rungs still pays the
+/// lower one at least ~75% of its best. The larger rungs are for spikes (R26.3):
+/// over 10.6 hours on 38 pools (2026-10-12/13), 89 single transactions moved a
+/// price 20 ticks or more, 9 moved it 50, and 2 moved it 200. The 21:00 UTC
+/// spike, $80 of gaps the reactive lane saw, was a 43-tick jump that the rungs
+/// up to +20 could take only a corner of.
+pub const RUNG_OFFSETS: [u32; 6] = [0, 5, 20, 50, 100, 200];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Pricing {
@@ -52,7 +59,7 @@ pub struct Point {
 
 #[derive(Clone, Debug)]
 pub struct Rung {
-    /// 1, 2, 3: the threshold, and [`RUNG_OFFSETS`] past it.
+    /// 1 to 6: the threshold, and [`RUNG_OFFSETS`] past it.
     pub index: u8,
     /// The move, in ticks or bps.
     pub step: u32,
@@ -126,7 +133,7 @@ pub fn rungs(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, px: &Pric
         }
     }
     let mut out = vec![Rung { index: 1, step: hi, point, trigger }];
-    for index in 2..=count.min(3) {
+    for index in 2..=count.min(RUNG_OFFSETS.len() as u8) {
         let step = hi.saturating_add(RUNG_OFFSETS[usize::from(index - 1)]);
         let Some((point, trigger)) = (step <= MAX_STEP).then(|| at(cycle, pair, leg, px, step)).flatten() else { break };
         out.push(Rung { index, step, point, trigger });

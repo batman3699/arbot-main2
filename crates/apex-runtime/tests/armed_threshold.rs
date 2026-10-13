@@ -79,17 +79,19 @@ fn the_threshold_is_the_smallest_move_that_clears_the_margin() {
     for c in &cycles {
         for leg in 0..2 {
             let pair = pair(c, &snap);
-            let found = rungs(c, &pair, leg, &px(0), 3);
+            let found = rungs(c, &pair, leg, &px(0), 6);
             assert!(!found.is_empty(), "a big enough move opens the gap");
             let first = &found[0];
             let up = trigger_up(c, leg);
             let one_less = pair[leg].moved(move_of(&pair[leg], up, first.step - 1)).unwrap();
             assert!(best_at(c, &pair, leg, one_less, &px(0)).is_none(), "minimal at step {}", first.step);
-            // Rungs: the threshold, then 5 and 20 steps past it, each paying more.
-            assert_eq!(RUNG_OFFSETS, [0, 5, 20]);
-            assert_eq!(found.iter().map(|r| r.step).collect::<Vec<_>>(), vec![first.step, first.step + 5, first.step + 20]);
+            // Rungs: the threshold, then 5, 20, 50, 100 and 200 steps past it,
+            // each paying more: a spike pays the rungs it reaches (R26.3).
+            assert_eq!(RUNG_OFFSETS, [0, 5, 20, 50, 100, 200]);
+            assert_eq!(found.iter().map(|r| r.step).collect::<Vec<_>>(), RUNG_OFFSETS.map(|o| first.step + o).to_vec());
             assert!(found.windows(2).all(|w| w[1].point.surplus > w[0].point.surplus));
-            assert_eq!(found.iter().map(|r| r.index).collect::<Vec<_>>(), vec![1, 2, 3]);
+            assert_eq!(found.iter().map(|r| r.index).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
+            assert_eq!(rungs(c, &pair, leg, &px(0), 9).len(), 6, "no more rungs than offsets");
             // A margin raises the threshold.
             let stricter = rungs(c, &pair, leg, &px(first.point.surplus.as_u128() * 2), 1);
             assert!(stricter[0].step > first.step);

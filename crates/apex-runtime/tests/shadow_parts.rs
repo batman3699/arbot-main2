@@ -125,6 +125,11 @@ fn armed_live_is_refused_until_the_pilot_is_built() {
     let text = yaml(var, "var/apex/shadow.journal").replace("max_arms: 16", "max_arms: 0");
     let err = ShadowConfig::from_yaml_str(&text, &env(var, SECRET)).unwrap_err();
     assert!(err.to_string().contains("max_arms 1-64"), "no senders: {err}");
+    let six = yaml(var, "var/apex/shadow.journal").replace("rungs: 3", "rungs: 6");
+    assert!(ShadowConfig::from_yaml_str(&six, &env(var, SECRET)).is_ok());
+    let seven = yaml(var, "var/apex/shadow.journal").replace("rungs: 3", "rungs: 7");
+    let err = ShadowConfig::from_yaml_str(&seven, &env(var, SECRET)).unwrap_err();
+    assert!(err.to_string().contains("rungs 1-6"), "{err}");
     assert!(ShadowConfig::from_yaml_str(&yaml(var, "var/apex/shadow.journal"), &env(var, SECRET)).is_ok());
 }
 
@@ -198,6 +203,8 @@ fn the_shipped_config_parses() {
     assert_eq!(c.policy.max_cost_confidence_bps, 10_000);
     // R20: the shadow prices the deep pools the census's 500 ppm left out.
     assert_eq!(c.universe, UniverseConfig { max_fee_ppm: 3_000, min_depth_usd: 100_000 });
+    // R26.3: every rung, up to 200 ticks past the threshold, for spikes.
+    assert_eq!(c.armed.rungs, 6);
 }
 
 /// **The run sets its own universe filter (R20).** The shadow's config names

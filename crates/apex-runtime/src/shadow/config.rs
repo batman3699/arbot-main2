@@ -295,14 +295,14 @@ impl ShadowConfig {
             return Err(invalid("armed.mode live is not built yet: the pilot is R26's second plan, after gate A"));
         }
         if !(1..=64).contains(&a.max_arms)
-            || !(1..=3).contains(&a.rungs)
+            || !(1..=crate::armed::threshold::RUNG_OFFSETS.len()).contains(&usize::from(a.rungs))
             || !(2..=50).contains(&a.window_s)
             || a.block_time_ms == 0
             || a.band_cap_bps == 0
             || a.liquidity_floor_bps > 10_000
         {
             return Err(invalid(
-                "armed: max_arms 1-64, rungs 1-3, window_s 2-50, block_time_ms > 0, band_cap_bps > 0, liquidity_floor_bps <= 10000",
+                "armed: max_arms 1-64, rungs 1-6, window_s 2-50, block_time_ms > 0, band_cap_bps > 0, liquidity_floor_bps <= 10000",
             ));
         }
         Ok(Self {

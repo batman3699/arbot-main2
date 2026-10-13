@@ -27,7 +27,7 @@ Two local release smoke runs against mainnet, each with the evaluator, changed t
 1. **Rungs are additive: the threshold, then +5 and +20 ticks (or bps), not ×2 and ×4.**
    - The pools sit a few ticks apart, so the threshold m₁ is often 1–4, and 2m₁ and 4m₁ collapse onto it.
    - When m₁ is large, 4m₁ is beyond any move seen.
-   - Code: `RUNG_OFFSETS = [0, 5, 20]`.
+   - Code: `RUNG_OFFSETS = [0, 5, 20]`. R26.3 added +50, +100 and +200 for spikes, with a measured tail for moves past the largest seen (PLAN.md).
 2. **For a hop-2 trigger, the band's `mid` is the least hop 1 returns across the band.** Without this, leg-1 slots never armed: hop 1's adverse edge always fell short of the rung's `mid`, so every adverse edge would have reverted.
 3. **The ranking's prior counts only for moves no larger than the largest seen.** Otherwise the Laplace prior gives an unseen 2,000-tick move the same odds as a seen 3-tick one.
 4. **The live move check counts wrong ticks and liquidity changes separately.**
@@ -54,7 +54,7 @@ Two local release smoke runs against mainnet, each with the evaluator, changed t
 - Verify the commit in a clean worktree with its own `CARGO_TARGET_DIR`.
 - Commits end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Venue storage layout (verified on chain 2026-10-12): price word (mask 2^160−1) at slot 0 for Uniswap v3 and PancakeSwap v3, slot 6 for Slipstream and SlipstreamV3; liquidity (mask 2^128−1) at slot 4 (Uniswap v3), 5 (PancakeSwap v3), 16 (Slipstream, SlipstreamV3); Aerodrome v2 reserves at slots 20 and 21.
-- Defaults: `max_arms: 16`, `rungs: 3` (m₁, m₁ + 5, m₁ + 20; see "Changes found by the smoke runs"), `window_s: 10`, `block_time_ms: 2000`, `margin_wei: 0`, `band_cap_bps: 5`, `liquidity_floor_bps: 9800`; bid fractions `f` ∈ {0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9}.
+- Defaults: `max_arms: 16`, `rungs: 6` since R26.3 (m₁, then + 5, 20, 50, 100, 200; see "Changes found by the smoke runs"), `window_s: 10`, `block_time_ms: 2000`, `margin_wei: 0`, `band_cap_bps: 5`, `liquidity_floor_bps: 9800`; bid fractions `f` ∈ {0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 0.9}.
 - No `flashblock_index` predicate anywhere (Denim).
 
 ## File structure

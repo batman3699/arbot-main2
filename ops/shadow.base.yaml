@@ -44,7 +44,7 @@ armed:
   ledger: var/apex/armed.jsonl
   verdicts: var/apex/armed-verdicts.jsonl
   max_arms: 16
-  rungs: 3
+  rungs: 6
   window_s: 10
   block_time_ms: 2000
   margin_wei: 0

@@ -106,8 +106,9 @@ grows with the move, so the search is monotonic. A slot with no such
 move inside the ladder is not armed.
 
 **Rungs.** Each slot is armed at up to three moves: the threshold `m₁`,
-then `m₂ = m₁ + 5` and `m₃ = m₁ + 20` ticks, or bps on a reserve pool
-(`rungs: 3`; additive since the smoke runs, see the plan). Each rung has its own size,
+then `m₁ + 5`, `+ 20`, `+ 50`, `+ 100` and `+ 200` ticks, or bps on a
+reserve pool (`rungs: 6`; additive since the smoke runs, and the last three
+for spikes since R26.3, see the plan). Each rung has its own size,
 its own bid and its own sender, all set at its own threshold. A bid fixed
 at break-even would be close to nothing and lose every same-flashblock
 race. On a large move every rung up to it becomes eligible, and the
@@ -292,7 +293,7 @@ armed:
   ledger: var/apex/armed.jsonl
   verdicts: var/apex/armed-verdicts.jsonl
   max_arms: 16          # virtual senders in shadow; real senders in live
-  rungs: 3              # moves m1, m1 + 5, m1 + 20 per slot
+  rungs: 6              # moves m1, m1 + 5, + 20, + 50, + 100, + 200 per slot
   window_s: 10
   block_time_ms: 2000   # 200 after Denim
   margin_wei: 0         # hurdle = surplus over base gas and L1 fee > margin

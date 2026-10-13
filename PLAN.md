@@ -5973,6 +5973,16 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
   - A failed run never advances the cursor, and the range only grows, so in the timer one busy stretch would have stalled the verdicts for good. `get_logs` now halves a range the provider refuses as too full (`too_many_logs`) until it fits, in block order. A single block too full, or any other failure, is returned at once.
   - The re-judge: 118 of 149 simulated fires agree with the quote to the wei. Each of the other 31 is one of the three defects R26.1 fixed: 18 past a renewal's stale deadline, 9 refused quotes, 4 out of gas at the old limit.
   - 3 mutants: two killed, the guard's removal hangs (a refused block splits into itself).
+- [x] **R26.3 — rungs for spikes.**
+  - The 21:00 UTC spike on 2026-10-12 was a 43-tick jump on PancakeSwap WETH/USDC. The reactive lane saw $80 of gaps in it, while the armed lane, whose rungs stopped at threshold + 20, took $0.51.
+  - **Measured over run-2** (10.6 hours, 38 pools, 145,897 Swap and Sync logs):
+    - 89 single transactions moved a price 20 ticks or more, 9 moved it 50, and 2 moved it 200 (a −234/+227 pair in one block);
+    - 5-block windows: 123 moves of 20 ticks or more, 9 of 50, 1 of 200;
+    - P(move ≥ m) falls as m^−2.87.
+    - Profit grows about as the move squared, so a rung's expected value falls only as m^−0.9: spike rungs are worth a sender.
+  - **Rungs** at threshold + 0, 5, 20, 50, 100 and 200 ticks or bps (`RUNG_OFFSETS`, `rungs: 6`). From +20 they double, so a move between two still pays the lower one at least ~75% of its best. The config takes its bound from the offsets.
+  - **The ranking's odds past the largest move a pool has made** were zero, so a spike rung never got a sender. They are now the share at the largest seen, thinned by `TAIL_EXPONENT` (2.87): ten times the largest seen gets about 1/740 of its odds. That is not the uniform prior that filled every sender in the first smoke run.
+  - Still 16 senders; the ranking (odds × surplus) decides between small and spike rungs.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
