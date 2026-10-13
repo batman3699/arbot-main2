@@ -6035,7 +6035,9 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - Threads write what one thread writes (a test holds the lines equal on 1, 2, 3 and 8).
   - **Counted, so saturation shows:** `slots`, `slots_current`, `stale_waiting`, and over the run `passes`, `pass_us_total`, `waiting_total`, `current_total`. The status prints them as `armed pass`.
   - **First build on the host (c13ec1c, 17:41 UTC, 10 minutes):** 85 slots a second on three threads (58 on one), 82% of 316 slots priced at the book as it stood, 72 still waiting a pass. Three threads on the host's two physical cores price 1.9 times what one does. Still saturated: the size search is the cost (128 quotes a search, every search), and that is the next change.
-  - 6 mutants, all killed. Gates green but the two known-red scripts.
+  - **With the pause (b9478f5, on the host since 2026-10-13 18:09:44 UTC, 10 minutes):** 95% of the 316 slots priced at the book as it stood (82% before the pause), 19 waiting a pass (72), 9.2 passes a second at 75 ms. The first build's 28 minutes are `/opt/apex/var/run-7`, R27's 59 minutes `run-6`.
+  - **Not fixed: the reactive lane prices a candidate more slowly since R27.** Received to proposed was 40 ms at the median over R26.3's 167 candidates, 62 ms over R27's 12 and 52 ms over the next build's 3. Same cause, the size search over a range 4,400 times wider.
+  - 7 mutants, all killed. Gates green but the two known-red scripts.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
