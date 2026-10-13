@@ -5968,6 +5968,11 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - Speed Boost is $1,000 a month plus a 0.000003 ETH tip per transaction. That buys a few ms on a host already 7.5 ms from the sequencer.
     - Armed transactions wait in the builder, so delivery speed doesn't decide them.
   - 9 new mutants, all killed. The live adapter's pinned limit and two window fixtures follow the new formula, with the same windows.
+- [x] **R26.2 — the evaluator splits a log range too full for one query.**
+  - Re-judging R26's 51,242 arms with R26.1's evaluator (in 43 slices of 15 minutes), one slice failed. Its 450 blocks (2026-10-13 00:00 UTC) held more than BlockPI's 20,000-result cap.
+  - A failed run never advances the cursor, and the range only grows, so in the timer one busy stretch would have stalled the verdicts for good. `get_logs` now halves a range the provider refuses as too full (`too_many_logs`) until it fits, in block order. A single block too full, or any other failure, is returned at once.
+  - The re-judge: 118 of 149 simulated fires agree with the quote to the wei. Each of the other 31 is one of the three defects R26.1 fixed: 18 past a renewal's stale deadline, 9 refused quotes, 4 out of gas at the old limit.
+  - 3 mutants: two killed, the guard's removal hangs (a refused block splits into itself).
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 

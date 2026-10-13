@@ -4,7 +4,7 @@
 use alloy_primitives::{address, Address, B256};
 use apex_chain::rpc::ws::RawLog;
 use apex_runtime::armed::eval::Write;
-use apex_runtime::armed::run::{effects_of, replay_calls, simulate_request, summary};
+use apex_runtime::armed::run::{effects_of, get_logs, replay_calls, simulate_request, summary};
 use apex_runtime::live::feed::{BURN, MINT, SWAP, SYNC};
 use apex_runtime::live::inventory::Venue;
 use ethers_core::types::U256;
@@ -176,4 +176,60 @@ fn a_fire_after_a_renewal_simulates_the_renewal() {
     assert_eq!(renewed["data"], "0xrenewed");
     assert_eq!(renewed["gas"], "0xdbba0");
     assert_eq!(renewed["from"], format!("{signer:#x}"));
+}
+
+/// A provider that answers at most `cap` blocks of logs a query, one log a
+/// block, and refuses wider ranges the way BlockPI does; or fails outright.
+struct Capped {
+    cap: u64,
+    outright: bool,
+    asked: std::sync::Mutex<Vec<(u64, u64)>>,
+}
+
+#[async_trait::async_trait]
+impl apex_chain::rpc::RpcTransport for Capped {
+    async fn call(&self, _method: &str, params: serde_json::Value) -> Result<serde_json::Value, apex_chain::rpc::RpcError> {
+        let q = |k: &str| u64::from_str_radix(params[0][k].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+        let (from, to) = (q("fromBlock"), q("toBlock"));
+        self.asked.lock().unwrap().push((from, to));
+        let refuse = |last: &str| apex_chain::rpc::RpcError::Exhausted { method: "eth_getLogs".into(), endpoints: 1, last: last.into() };
+        if self.outright {
+            return Err(refuse("https://base.blockpi.network/***: error sending request: connection refused"));
+        }
+        if to - from + 1 > self.cap {
+            return Err(refuse(&format!("https://base.blockpi.network/***: node error -32602: query exceeds max results 20000, retry with the range {from}-{}", from + self.cap - 1)));
+        }
+        Ok(serde_json::Value::Array(
+            (from..=to)
+                .map(|b| serde_json::json!({
+                    "address": format!("{POOL:#x}"), "topics": [format!("{SWAP:#x}")], "data": "0x",
+                    "blockNumber": format!("{b:#x}"), "transactionHash": format!("0x{b:064x}"),
+                    "logIndex": "0x0", "transactionIndex": "0x0",
+                }))
+                .collect(),
+        ))
+    }
+}
+
+/// A range with more logs than the provider returns at once is split until it
+/// fits, in order, instead of failing the run: a failed run never advances the
+/// cursor, so one busy quarter hour (2026-10-13 00:00 UTC, 20,000 logs in 450
+/// blocks) would have stalled the verdicts for good. Any other failure is
+/// returned at once, without splitting.
+#[tokio::test]
+async fn a_range_too_full_for_one_query_is_split_until_it_fits() {
+    let pools: std::collections::BTreeSet<Address> = [POOL].into_iter().collect();
+    let rpc = Capped { cap: 70, outright: false, asked: Default::default() };
+    let logs = get_logs(&rpc, &pools, 1_000, 1_499).await.unwrap();
+    assert_eq!(logs.iter().map(|l| l.block_number.unwrap()).collect::<Vec<_>>(), (1_000..=1_499).collect::<Vec<_>>(), "every block once, in order");
+    assert!(rpc.asked.lock().unwrap().iter().all(|(f, t)| t >= f));
+
+    let down = Capped { cap: 70, outright: true, asked: Default::default() };
+    assert!(get_logs(&down, &pools, 1_000, 1_499).await.unwrap_err().contains("connection refused"));
+    assert_eq!(down.asked.lock().unwrap().len(), 1, "a provider that is down is not asked 500 more times");
+
+    // A single block too full for one query cannot be split: its error returns.
+    let full = Capped { cap: 0, outright: false, asked: Default::default() };
+    assert!(get_logs(&full, &pools, 1_000, 1_001).await.unwrap_err().contains("exceeds max results"));
+    assert_eq!(*full.asked.lock().unwrap(), vec![(1_000, 1_001), (1_000, 1_000)]);
 }

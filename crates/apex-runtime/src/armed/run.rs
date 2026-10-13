@@ -483,22 +483,47 @@ async fn simulate(rpc: &dyn RpcTransport, config: &ShadowConfig, arm: &Arm, fire
     Some(SimCheck { ok, gross_wei: gross.map(|g| g.to_string()), gas_used, agrees: false })
 }
 
-async fn get_logs(rpc: &dyn RpcTransport, pools: &BTreeSet<Address>, from: u64, to: u64) -> Result<Vec<RawLog>, String> {
+/// Whether a provider refused a log query for returning too many results
+/// (BlockPI: "query exceeds max results 20000"; geth-style: "query returned
+/// more than 10000 results"): a narrower range will do.
+fn too_many_logs(error: &str) -> bool {
+    error.contains("exceeds max results") || error.contains("returned more than")
+}
+
+/// The watched pools' logs over `from..=to`, in block order, `LOG_CHUNK`
+/// blocks a query. A range with more logs than the provider returns at once is
+/// halved until it fits: a failed run never advances the cursor, so one busy
+/// stretch would otherwise stall the verdicts for good. Any other failure is
+/// returned at once.
+pub async fn get_logs(rpc: &dyn RpcTransport, pools: &BTreeSet<Address>, from: u64, to: u64) -> Result<Vec<RawLog>, String> {
     let addresses: Vec<String> = pools.iter().map(|a| format!("{a:#x}")).collect();
     let topics: Vec<String> = [SWAP, PANCAKE_SWAP, SYNC, MINT, BURN].iter().map(|t| format!("{t:#x}")).collect();
     let mut out = Vec::new();
-    let mut start = from;
-    while start <= to {
-        let end = (start + LOG_CHUNK - 1).min(to);
-        let v = rpc
+    // Ranges still to query, the next one last.
+    let mut todo: Vec<(u64, u64)> = Vec::new();
+    let mut start = to.saturating_add(1);
+    while start > from {
+        let first = start.saturating_sub(LOG_CHUNK).max(from);
+        todo.push((first, start - 1));
+        start = first;
+    }
+    while let Some((start, end)) = todo.pop() {
+        let answer = rpc
             .call(
                 "eth_getLogs",
                 json!([{"address": addresses, "topics": [topics], "fromBlock": format!("{start:#x}"), "toBlock": format!("{end:#x}")}]),
             )
             .await
-            .map_err(|e| e.to_string())?;
-        out.extend(v.as_array().ok_or("eth_getLogs: not an array")?.iter().filter_map(|l| parse_log(l, false)));
-        start = end + 1;
+            .map_err(|e| e.to_string());
+        match answer {
+            Ok(v) => out.extend(v.as_array().ok_or("eth_getLogs: not an array")?.iter().filter_map(|l| parse_log(l, false))),
+            Err(e) if end > start && too_many_logs(&e) => {
+                let mid = start + (end - start) / 2;
+                todo.push((mid + 1, end));
+                todo.push((start, mid));
+            }
+            Err(e) => return Err(e),
+        }
     }
     Ok(out)
 }
