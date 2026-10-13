@@ -1,8 +1,8 @@
 //! R27's proof, on Base, through the deployed executor: an ERC-3156 loan from
 //! `MorphoFlashLender` settles correctly, and a real cycle above Balancer's
 //! 19 WETH settles to its exact quote. The lender is the one the shadow's config
-//! names under `lenders.morpho` once deployed; until then its code is injected
-//! by state override.
+//! names under `lenders.morpho` once deployed (its code checked against the
+//! build), or a fixed address before; the historical checks inject its code.
 //!
 //! cargo build of the contract first: `forge build`. Then, in the main tree:
 //! APEX_SECRET_BLOCKPI_KEY=… APEX_SECRET_TRADER_KEY=0x…01 \
@@ -132,18 +132,24 @@ async fn a_morpho_loan_settles_through_the_deployed_executor() {
     let settings = FailoverSettings { request_timeout: std::time::Duration::from_secs(60), ..FailoverSettings::default() };
     let rpc: Arc<dyn RpcTransport> = Arc::new(FailoverTransport::connect(&urls, 8453, settings).await.unwrap());
     let reads = ChainReads::new(Arc::clone(&rpc));
-    let (lender, overrides) = match &config.lenders.morpho {
-        Some(m) => (m.address, json!({})),
-        // Injected code, with the standing approval a deployed lender keeps
-        // after its first loan: the steady state, which is what trades pay.
-        None => (
-            INJECTED,
-            json!({
-                format!("{INJECTED:#x}"): { "code": lender_code() },
-                format!("{WETH:#x}"): { "stateDiff": { weth_allowance_slot(INJECTED, MORPHO): format!("{:#066x}", U256::MAX) } },
-            }),
-        ),
+    // The lender the config names once deployed, or a fixed address before.
+    // Checks 2 and 3 run at block 52,526,060, before any deployment, so the
+    // lender's code is injected there either way: the build's, which must be
+    // the deployed code. With it, the standing approval a deployed lender keeps
+    // after its first loan: the steady state trades pay.
+    let code = lender_code();
+    let lender = match &config.lenders.morpho {
+        Some(m) => {
+            let built = keccak256(alloy_primitives::hex::decode(&code).unwrap());
+            assert_eq!(built, m.code_hash, "the build is the deployed lender's code");
+            m.address
+        }
+        None => INJECTED,
     };
+    let overrides = json!({
+        format!("{lender:#x}"): { "code": code },
+        format!("{WETH:#x}"): { "stateDiff": { weth_allowance_slot(lender, MORPHO): format!("{:#066x}", U256::MAX) } },
+    });
     let ten = format!("{:#066x}", U256::from(10u64) * U256::from(10u64).pow(U256::from(18)));
     let one = U256::from(10u64).pow(U256::from(18));
 

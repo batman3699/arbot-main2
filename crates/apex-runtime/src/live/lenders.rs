@@ -22,11 +22,17 @@ pub const MORPHO_BLUE: Address = address!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEF
 
 /// What a loan through `MorphoFlashLender` costs over Balancer's.
 ///
-/// R27 Task 2 measured it on Base on 2026-10-13, through the deployed executor,
-/// on ticket 51's cycle at 15 WETH (block 52,526,060): Balancer 461,224 gas,
-/// Morpho 555,391 (the stateless lender, Morpho already approved). That is
-/// 94,167 more, rounded up here.
-pub const MORPHO_EXTRA_GAS: u64 = 95_000;
+/// Measured on Base on 2026-10-13, through the deployed executor, with the
+/// deployed lender's code (Morpho approved), on ticket 51's cycle at 15 WETH
+/// (block 52,526,060): Balancer 461,224 gas, Morpho 582,924, so 121,700 more,
+/// rounded up here.
+///
+/// The figure follows the lender's and executor's WETH balances: a balance
+/// written from zero costs ~20k gas more than one changed from non-zero, and
+/// the Morpho path's refunds are capped. With 1 wei of WETH left in each it
+/// was 82,900. The first injected runs, at an address holding dust, read
+/// 94,167.
+pub const MORPHO_EXTRA_GAS: u64 = 122_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LenderChoice {

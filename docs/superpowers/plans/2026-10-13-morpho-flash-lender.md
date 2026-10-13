@@ -27,6 +27,7 @@
    - Quoted on the chain's logs, the 20 WETH gross was 1.086e13 wei above the simulation's. Quoted on the replay's own logs, it matches to the wei.
    - The proof also uses a 60 s request timeout: a spike block replayed to its trigger outlasts the default 3 s.
 3. **Measured** (`PROOF 3`, ticket 51's cycle at 15 WETH): Balancer 461,224 gas, Morpho 555,391, so `MORPHO_EXTRA_GAS` = 95,000.
+6. **The deployed lender costs 121,700 gas over Balancer, not 94,167.** The earlier figure came from an injection address holding WETH dust. With 1 wei of WETH in both the lender and the executor it is 82,900. `MORPHO_EXTRA_GAS` = 122,000 until the owner seeds that dust.
 4. **The proof reads the deployed lender from the config** (`lenders.morpho`), not from an `APEX_MORPHO_LENDER` variable: `env_coverage` refuses a new non-secret variable (blueprint §2.4, no late configuration lookup).
 5. **The evaluator compares a simulation against a quote on the replay's own state when the replay diverges from the chain** (`replayed_logs`, `replay_diverged`, `SimCheck.replay_diverged`). It also waits up to `EVAL_REQUEST_TIMEOUT` (60 s) for an answer.
    - Morpho-sized fires happen in spike blocks, where replays diverge. Without this, R27's own success criterion (Morpho fires agreeing with their quotes) would fail on replay artefacts.

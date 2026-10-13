@@ -6009,7 +6009,14 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - Armed: each rung's loan follows its size, and arms record `lender`.
     - Config: optional `lenders.morpho { address, code_hash }`, whose code is read and checked at boot. Status: a `lenders` line.
   - 13 Rust mutants, all killed (one after a test was added for the replay's topic filter). Gates green but the two known-red scripts.
-  - **Pending (operator):** broadcast `script/DeployMorphoFlashLender.s.sol`. The dry run gives runtime code hash `0x248bf9d05e91ff2e785fe73abbc4f2fb83ed9a533d0d0d93979c19720c6358b4`. Then `lenders.morpho` in the config, and a shadow redeploy (a new 14-day clock).
+  - **Deployed by the owner** at `0xDF64CC1991899340edd2e1d870AC7F8c0a4D1A9c` (block 52,552,304, tx `0xebbaee8c…5334`, 505,264 gas, 0.00000267 ETH).
+    - Verified on chain: its 2,090 bytes hash to the build's `0x248bf9d0…58b4`; `MORPHO()` is Morpho Blue; `maxFlashLoan(WETH)` equals Morpho's holding (82,727.55 WETH); the fee is 0.
+    - `lenders.morpho` is set in `ops/shadow.base.yaml`.
+    - **The proof passes against it.** Its historical checks inject the deployed code (asserted equal to the build) at the deployed address, because the lender did not exist at block 52,526,060.
+  - **The real extra gas is 121,700, not 94,167.**
+    - The first injected runs used `0x…beef`, which holds WETH dust. Morpho's transfer into a lender holding nothing writes its balance from zero.
+    - Measured on the same cycle, Morpho's extra gas over Balancer: none 121,700; dust in the lender 94,340; in the executor 110,260; in both **82,900**. Balancer's gas is unchanged by executor dust.
+    - `MORPHO_EXTRA_GAS` = 122,000. If the owner leaves 1 wei of WETH in the lender and the executor (two tiny transfers), it can drop to 83,000.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 

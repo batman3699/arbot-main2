@@ -205,6 +205,10 @@ fn the_shipped_config_parses() {
     assert_eq!(c.universe, UniverseConfig { max_fee_ppm: 3_000, min_depth_usd: 100_000 });
     // R26.3: every rung, up to 200 ticks past the threshold, for spikes.
     assert_eq!(c.armed.rungs, 6);
+    // R27: the Morpho lender the owner deployed, pinned to the code it runs.
+    let m = c.lenders.morpho.expect("the Morpho lender is configured");
+    assert_eq!(m.address, address!("DF64CC1991899340edd2e1d870AC7F8c0a4D1A9c"));
+    assert_eq!(format!("{:#x}", m.code_hash), "0x248bf9d05e91ff2e785fe73abbc4f2fb83ed9a533d0d0d93979c19720c6358b4");
 }
 
 /// **The run sets its own universe filter (R20).** The shadow's config names
