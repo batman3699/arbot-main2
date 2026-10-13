@@ -218,3 +218,81 @@ As of the reviewed revision, APEX has promising execution and capture infrastruc
 - Live pricing: https://github.com/batman3699/arbot-main2/blob/main/crates/apex-runtime/src/live/pricing.rs
 - Live gas and lenders: https://github.com/batman3699/arbot-main2/blob/main/crates/apex-runtime/src/live/gas.rs and https://github.com/batman3699/arbot-main2/blob/main/crates/apex-runtime/src/live/lenders.rs
 - P&L attribution and coverage oracle: https://github.com/batman3699/arbot-main2/blob/main/crates/apex-obs/src/pnl.rs and https://github.com/batman3699/arbot-main2/blob/main/crates/apex-obs/src/coverage.rs
+
+
+---
+
+## 10. Live AWS shadow telemetry addendum — 14 October 2026
+
+**Why this update matters:** The initial audit primarily reviewed code, runbooks, design gates, and previously recorded performance results. This addendum incorporates a read-only inspection of the running AWS shadow host on 14 October 2026 (approximately 22:44 UTC on 13 October / 11:44 NZDT on 14 October). These are live-host observations, not a claim that the system is executing live trades.
+
+**Method and boundaries:** The connected AWS integration queried the EC2/SSM control plane and used AWS Systems Manager to run read-only inspection and aggregation commands against the host. The apex-shadow.service was active. The inspection did not edit files, change services, read environment files, access private keys, or enable dispatch. The data snapshots were taken at slightly different moments while the service continued running, so small counter differences between the latest report and JSONL files are expected.
+
+### 10.1 What the host actually reported
+
+| Signal | Observed result | Interpretation |
+|---|---:|---|
+| Armed lifecycle records | 29,098 (16,350 arm, 12,748 renew) | The armed engine is actively creating and refreshing candidates. |
+| Armed-verdict records | 16,021 | Large evaluated sample, but it is not a count of profitable opportunities. |
+| Verdicts marked fired=true | 0 / 16,021 | No shadow verdict in this file recorded a fire. |
+| Verdicts marked trigger_met=true | 5 / 16,021 | Five trigger conditions were reported as met; this alone does not mean an executable profitable trade existed. |
+| Trigger-met verdicts with populated sim, gross_wei, or per_f | 0 | The downstream evidence needed to judge these cases is absent from these verdict records. |
+| Flashblock ledger | 90,213 records spanning 8,203 unique block numbers in the JSONL snapshot | High-volume capture is operating; record count is not equivalent to distinct opportunities. |
+| Shadow report funnel | 19,060 events; 94 skipped as unverified; zero redelivered or suppressed; one LOW_EV/NoProfitableSize decline | Capture is functioning, but the current report does not show a meaningful completed profitable-trade sample. |
+| Funnel closures | Five failed/Reverted; one shadow_dispatched/in_time; one LOW_EV/NoProfitableSize decline | These are shadow pipeline classifications. Do **not** describe the five as confirmed on-chain transaction reverts unless a separate chain receipt proves that. |
+| Null dispatch / settlement | null_dispatched=1; settlement_asked=0 | Consistent with the host running in shadow mode rather than broadcasting transactions. |
+| Capture / feed integrity | capture_assurance=1.0; 19,060 published; zero dropped | Positive evidence for the feed's measured capture path, not proof of execution profitability. |
+| Flashblock decoding | Zero decode failures, incomplete blocks, or ledger failures in the latest report | No obvious ingestion-quality failure in these counters. |
+| Armed engine freshness | 316 slots; 316 current; zero stale waiting; last tick 2,876 μs | Slot freshness looks healthy in this snapshot. |
+| Universe admitted to the live book | 41 held/admitted pools, five venues, book status Verified | More venue coverage is not the first issue demonstrated by this evidence. |
+| Miss ledger | Six rows: five SIM_FAIL, one LOW_EV | The failure/decline ledger is small relative to capture volume; inspect its relationship to the funnel before drawing broad conclusions. |
+
+These records establish that the shadow process is alive, receiving data, maintaining current armed slots, and recording evaluations. They do **not** establish a positive expected-value distribution, profitable landed trades, or realized net P&L after gas, L1 data fees, competitive bids, reverts, and lender costs.
+
+### 10.2 New priority P0 — trace the trigger-to-verdict gap
+
+This is now the first engineering investigation. In the armed-verdict file, all 16,021 sampled verdicts have fired=false; all have sim=null, gross_wei=null, an empty per_f, and no populated fire field. Five are nevertheless marked trigger_met=true. Separately, the shadow report describes five funnel closures as failed/Reverted.
+
+Do not assume those two sets of five are the same cases. Establish their relationship by candidate/arm identifier and timestamps, then follow each case through the code path.
+
+**Required work:**
+
+1. Trace all five trigger_met=true verdicts from trigger detection through repricing, quote/size selection, candidate admission, simulation, and final verdict. For each case, identify exactly which stage ran, which stage did not run, and the explicit reason.
+2. Join the five failed/Reverted funnel classifications to their source events and determine whether Reverted means a local simulation revert, an internal classifier, a timeout/stale-state failure, or a real on-chain receipt. Do not conflate these.
+3. Explain why the verdict schema leaves sim, gross_wei, and per_f empty for trigger-met cases. If they are intentionally not populated in shadow mode, record the reason explicitly and add separate downstream counters that make the omission distinguishable from an unvisited stage or telemetry bug.
+4. Add or strengthen a deterministic regression test for each relevant outcome: trigger observed but not actionable; no profitable size; simulation failure; simulation success; stale/invalidation rejection; and dispatch-to-null. Preserve the existing fail-closed checks.
+5. Re-run read-only shadow capture and verify every funnel outcome has a consistent terminal reason, with matched counts and no unexplained gaps between trigger, candidate, simulation, verdict, and ledger.
+
+**Acceptance criterion:** Every trigger-met candidate and every funnel closure can be explained end-to-end by stable identifier, stage timestamps, and an unambiguous terminal outcome. “No trade” can be a correct result; an unexplained or unmeasurable “no trade” cannot inform profit optimization.
+
+### 10.3 New priority P1 — instrument latency with matched samples
+
+The seven rows in the current race ledger show receive-to-proposed latency with a median of approximately **104.9 ms**, a p90 of approximately **111.2 ms**, and a maximum of approximately **142.9 ms**. With only seven observations, these are diagnostic signals, not stable performance estimates. The sample is small enough that it should not by itself justify a redesign, but it is sufficient to warrant investigation.
+
+Earlier PLAN measurements reported lower receive-to-proposed medians in a different/smaller sample. Do not compare those results until the build, host, timestamp definitions, and measurement window are matched.
+
+Record p50/p90/p99 and sample count for the same candidate across: event received, trigger detected, route/size proposal, exact quote complete, candidate admitted, simulation complete, and final decision. Separate queue wait from CPU time and RPC/simulation time. Optimize the measured dominant stage only after the trigger-to-verdict gap above is understood.
+
+### 10.4 New priority P1 — make near-miss counters decision-grade
+
+The latest shadow report exposes 80,224 measured near-miss observations, best_bps=6.74, pays=10, plus threshold counters of 24 within 0.5 bps, 65 within 1 bps, 1,898 within 2 bps, 12,051 within 5 bps, 23,952 within 10 bps, and 42,224 beyond 10 bps. These are raw report fields, not proof of 80,224 unique arbitrage opportunities; the code's precise counting and denominator semantics must be confirmed before using them to prioritize strategy changes.
+
+Document the definition of each field, whether buckets are disjoint, what “pays” means, what the basis-point gap is measured against, and whether observations are deduplicated by candidate/block/pool/route. Reconcile their totals against the emitted rows. Then break misses down by explicit reason: price moved, no profitable size, gas/L1 cost, lender capacity, failed quote, failed simulation, state staleness, latency, and estimated competitive priority fee. Rank the causes by **counterfactual net WETH/USD left on the table**, using conservative, replayable estimates rather than raw counts.
+
+### 10.5 What the new evidence changes in the plan
+
+The recommended order is revised as follows:
+
+1. **Explain the trigger-to-verdict and failure-classification gap** (Section 10.2). This is the highest-confidence immediate task from the current telemetry.
+2. **Make the profit/miss funnel measurable end-to-end**, including matched stage timings and fully defined near-miss counters. Preserve candidate IDs and terminal reasons; alert on dropped ledger rows.
+3. **Quantify latency with a comparable sample**, then optimize only the dominant measured stage.
+4. **Return to the economic model questions from the original audit**, including the expected-failure-cost/scenario-prior accounting test and measured bid/landing assumptions. The AWS snapshot does not prove or disprove those code-level concerns.
+5. **Continue to obey the existing shadow/live gates.** The present evidence does not meet a bar for claiming profitability or for enabling broadcasting. Do not loosen risk thresholds, increase hop limits, add venues, or increase bidding merely to make the fire count rise.
+6. **Harden AWS access for ongoing analysis:** replace broad/root-level analytics access with a dedicated least-privilege role limited to the telemetry and read-only control-plane queries needed. Do not add SSH ingress, export secrets, or put raw calldata/private transaction payloads into a general-purpose analytics store.
+
+The existing gate requirements in the [armed-backruns design](https://github.com/batman3699/arbot-main2/blob/main/docs/superpowers/specs/2026-10-13-armed-backruns-design.md) remain authoritative. This addendum does not authorize live sending or change runtime configuration.
+
+### 10.6 Follow-up measurements
+
+The next report should include, at minimum: counts and unique candidate IDs for every funnel stage; all five trigger-met cases with terminal reasons; reconciliation of the five failed/Reverted closures against their underlying evidence; quote and simulation completion rates; stage latency p50/p90/p99 with sample sizes; near-miss denominator/bucket validation; and conservative counterfactual net EV for genuinely executable opportunities. A new venue or route-search feature should be approved only if this evidence identifies a specific coverage gap and holdout replay shows incremental positive net value.
+
