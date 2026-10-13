@@ -3,7 +3,9 @@
 use alloy_primitives::{address, Address};
 use apex_exec::commitment::LoanProvider;
 use apex_runtime::live::frontier::{BALANCER_FLASH, BALANCER_VAULT, WETH};
-use apex_runtime::live::lenders::{loan, morpho, Lenders, BALANCER, MORPHO_EXTRA_GAS, MORPHO_FLASH};
+use apex_runtime::live::lenders::{
+    loan, morpho, morpho_extra_gas, Lenders, BALANCER, MORPHO_EXTRA_GAS, MORPHO_EXTRA_GAS_DUSTED, MORPHO_FLASH,
+};
 use ethers_core::types::U256;
 
 const LENDER: Address = address!("00000000000000000000000000000000000000ee");
@@ -14,7 +16,7 @@ fn weth(n: u64) -> U256 {
 
 #[test]
 fn a_size_borrows_from_balancer_while_it_covers_it_then_from_morpho() {
-    let both = Lenders { balancer: weth(19), morpho: Some((LENDER, weth(82_679))) };
+    let both = Lenders { balancer: weth(19), morpho: Some((LENDER, weth(82_679))), morpho_extra_gas: MORPHO_EXTRA_GAS };
     assert_eq!(both.cap(), weth(82_679));
     assert_eq!(both.for_size(weth(1)), Some(BALANCER));
     assert_eq!(both.for_size(weth(19)), Some(BALANCER), "the whole holding is lendable");
@@ -27,8 +29,29 @@ fn a_size_borrows_from_balancer_while_it_covers_it_then_from_morpho() {
     let alone = Lenders::balancer_only(weth(19));
     assert_eq!((alone.cap(), alone.for_size(weth(20))), (weth(19), None));
     // Morpho holding less than Balancer still caps at the larger.
-    let thin = Lenders { balancer: weth(19), morpho: Some((LENDER, weth(5))) };
+    let thin = Lenders { balancer: weth(19), morpho: Some((LENDER, weth(5))), morpho_extra_gas: MORPHO_EXTRA_GAS };
     assert_eq!((thin.cap(), thin.for_size(weth(10))), (weth(19), Some(BALANCER)));
+}
+
+/// A Morpho loan costs less gas while the lender and the executor each hold
+/// some WETH: no balance is then written from zero. Measured on ticket 51's
+/// cycle at 15 WETH: 121,700 over Balancer with neither holding any, 82,900
+/// with 1 wei in each (the owner left it there on 2026-10-13, block
+/// 52,564,816). The shadow reads both balances at boot.
+#[test]
+fn a_morpho_loan_costs_less_gas_while_both_contracts_hold_weth() {
+    let (none, some) = (U256::zero(), U256::one());
+    assert_eq!((MORPHO_EXTRA_GAS, MORPHO_EXTRA_GAS_DUSTED), (122_000, 83_000));
+    assert_eq!(morpho_extra_gas(some, some), MORPHO_EXTRA_GAS_DUSTED);
+    assert_eq!(morpho_extra_gas(weth(3), weth(7)), MORPHO_EXTRA_GAS_DUSTED);
+    for (lender, executor) in [(none, none), (some, none), (none, some)] {
+        assert_eq!(morpho_extra_gas(lender, executor), MORPHO_EXTRA_GAS, "lender {lender}, executor {executor}");
+    }
+    let dusted =
+        Lenders { balancer: weth(19), morpho: Some((LENDER, weth(82_679))), morpho_extra_gas: MORPHO_EXTRA_GAS_DUSTED };
+    assert_eq!((dusted.extra_gas(weth(19)), dusted.extra_gas(weth(20))), (0, 83_000));
+    let choice = dusted.for_size(weth(20)).unwrap();
+    assert_eq!((choice.extra_gas, choice.address, choice.id), (83_000, LENDER, MORPHO_FLASH));
 }
 
 /// The deployed executor counts Aave's later pull as profit (simulated

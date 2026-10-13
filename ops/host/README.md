@@ -276,7 +276,11 @@ The status lines:
   Balancer while its holding covers the size, and from the Morpho lender above.
   Arms past Balancer's holding are labelled `"lender": "morpho"` in
   `armed-*.jsonl`. "morpho not configured" means `lenders.morpho` is absent from
-  the config.
+  the config. "at 83,000 gas over Balancer" is what a Morpho loan is priced at
+  while the Morpho lender and the executor each hold some WETH, read at boot;
+  122,000 means one of them holds none (the boot log warns), and
+  `script/SeedWethDust.s.sol` puts 1 wei back. Send it through an RPC other
+  than BlockPI's protected endpoint, which refuses transactions to WETH;
 - `moves`: every applied Swap checked against the move model.
   - **Wrong ticks are the model's error and should stay near zero.**
   - Liquidity changes are mints and burns the book had not applied yet. On

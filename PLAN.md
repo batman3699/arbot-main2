@@ -6016,7 +6016,16 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
   - **The real extra gas is 121,700, not 94,167.**
     - The first injected runs used `0x…beef`, which holds WETH dust. Morpho's transfer into a lender holding nothing writes its balance from zero.
     - Measured on the same cycle, Morpho's extra gas over Balancer: none 121,700; dust in the lender 94,340; in the executor 110,260; in both **82,900**. Balancer's gas is unchanged by executor dust.
-    - `MORPHO_EXTRA_GAS` = 122,000. If the owner leaves 1 wei of WETH in the lender and the executor, it can drop to 83,000. `script/SeedWethDust.s.sol` does that (the owner broadcasts; dry run: 3 transactions, 208,568 gas).
+    - `MORPHO_EXTRA_GAS` = 122,000. With 1 wei of WETH in the lender and the executor it is 83,000 (`MORPHO_EXTRA_GAS_DUSTED`).
+  - **The owner seeded that dust on 2026-10-13** (`script/SeedWethDust.s.sol`, Base block 52,564,816, 3 transactions, 142,612 gas, 0.00000078 ETH): the lender and the executor each hold 1 wei of WETH.
+    - The shadow reads both balances at boot and prices a Morpho loan at 83,000 gas while each holds some, at 122,000 with a warning otherwise (`lenders::morpho_extra_gas`). The status's `lenders` line shows the figure.
+    - The proof measures both through the deployed executor: 121,700 with neither holding any, 82,900 with 1 wei in each; Balancer's 461,224 and the profit are the same either way. It holds each constant to within 1,000 gas above its measurement.
+    - 4 mutants, all killed.
+    - Not deployed on its own: it rides with the next revision. The host prices Morpho loans at 122,000 until then.
+  - **BlockPI's protected endpoint refuses a transaction to WETH.** The first broadcast, through the keyed BlockPI endpoint, failed four times with `-32605: The address associated with your transaction has been flagged for security concerns ... blocked by the MEV protection mechanism`, and nothing was sent.
+    - GoPlus's address list returns nothing for the owner, the trader, the executor or the lender, and `honeypot_related_address` for Base's WETH (`0x4200…0006`). The owner's contract creation went through the same endpoint the day before. So the screen is very likely on `to`; that BlockPI uses GoPlus is an inference.
+    - The dust went through `https://mainnet.base.org`.
+    - **Open before any live canary:** trades call the executor, not WETH, so they should pass; the trader has never sent a transaction, so that is untested.
   - **On the host since 2026-10-13 16:42:37 UTC** (c141258; R26.3's 13 h 12 m is `/opt/apex/var/run-5`).
     - Boot: "the Morpho lender verified", 82,909 WETH in Morpho against Balancer's 18.69.
     - First 10 minutes: 328 of 812 arms borrowed from Morpho, at 19.9 to 569 WETH. The largest Balancer arm was 18.69 WETH, the vault's holding.

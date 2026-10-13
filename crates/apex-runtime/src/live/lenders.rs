@@ -29,10 +29,26 @@ pub const MORPHO_BLUE: Address = address!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEF
 ///
 /// The figure follows the lender's and executor's WETH balances: a balance
 /// written from zero costs ~20k gas more than one changed from non-zero, and
-/// the Morpho path's refunds are capped. With 1 wei of WETH left in each it
-/// was 82,900. The first injected runs, at an address holding dust, read
-/// 94,167.
+/// the Morpho path's refunds are capped. The first injected runs, at an
+/// address holding dust, read 94,167.
 pub const MORPHO_EXTRA_GAS: u64 = 122_000;
+
+/// The same with some WETH in both the lender and the executor: 82,900 on that
+/// cycle with 1 wei in each, rounded up here. The owner left 1 wei in each on
+/// 2026-10-13 (`script/SeedWethDust.s.sol`, Base block 52,564,816). The
+/// executor counts profit from its starting balance and the lender pulls back
+/// exactly what it lent, so a trade leaves both where they were.
+pub const MORPHO_EXTRA_GAS_DUSTED: u64 = 83_000;
+
+/// What a Morpho loan costs over Balancer's, by what the lender and the
+/// executor hold of the loan token.
+pub fn morpho_extra_gas(lender_holds: U256, executor_holds: U256) -> u64 {
+    if lender_holds.is_zero() || executor_holds.is_zero() {
+        MORPHO_EXTRA_GAS
+    } else {
+        MORPHO_EXTRA_GAS_DUSTED
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LenderChoice {
@@ -58,11 +74,13 @@ pub struct Lenders {
     pub balancer: U256,
     /// The Morpho lender's address and Morpho Blue's holding, when configured.
     pub morpho: Option<(Address, U256)>,
+    /// What a Morpho loan costs over Balancer's ([`morpho_extra_gas`]).
+    pub morpho_extra_gas: u64,
 }
 
 impl Lenders {
     pub const fn balancer_only(holding: U256) -> Self {
-        Self { balancer: holding, morpho: None }
+        Self { balancer: holding, morpho: None, morpho_extra_gas: MORPHO_EXTRA_GAS }
     }
 
     /// The most any size may borrow.
@@ -75,7 +93,7 @@ impl Lenders {
         if size <= self.balancer {
             return Some(BALANCER);
         }
-        self.morpho.filter(|(_, m)| size <= *m).map(|(a, _)| morpho(a))
+        self.morpho.filter(|(_, m)| size <= *m).map(|(a, _)| LenderChoice { extra_gas: self.morpho_extra_gas, ..morpho(a) })
     }
 
     /// The gas `size`'s loan adds over Balancer's.

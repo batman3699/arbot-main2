@@ -227,15 +227,31 @@ async fn a_morpho_loan_settles_through_the_deployed_executor() {
     let small = U256::from(15u64) * one;
     let [mid15, out15] = live.hop_outputs(u256_to_ethers(small)).unwrap().map(u256_to_alloy);
     assert!(out15 > small);
-    let mut gas = Vec::new();
-    for (provider, addr) in [(LoanProvider::Balancer, BALANCER_VAULT), (LoanProvider::Erc3156, lender)] {
-        let mut calls = replay_calls(&block, tx_index).unwrap();
-        calls.push(ours(call_data(Loan { token: WETH, amount: small, provider, provider_addr: addr }, steps(small, mid15), deadline)));
-        let r = simulate(&*rpc, BLOCK - 1, &block, overrides.clone(), calls).await;
-        let last = r.last().unwrap();
-        assert_eq!(last["status"], "0x1", "{provider:?} at 15 WETH: {last}");
-        assert_eq!(gross_of(last), Some(out15 - small));
-        gas.push(hexq(&last["gasUsed"]));
+    // Twice: with the lender's and the executor's own WETH as it was at that
+    // block (none), and with 1 wei in each, as the owner left them on
+    // 2026-10-13. A balance written from zero costs more.
+    let mut dusted = overrides.clone();
+    for holder in [lender, EXECUTOR] {
+        dusted[format!("{WETH:#x}")]["stateDiff"][weth_slot(holder)] = json!(format!("{:#066x}", U256::from(1u64)));
     }
-    println!("PROOF 3 ok: 15 WETH, Balancer gas {}, Morpho gas {}, extra_gas={}", gas[0], gas[1], gas[1].saturating_sub(gas[0]));
+    let mut extra = Vec::new();
+    for (state, name) in [(&overrides, "no WETH in either"), (&dusted, "1 wei of WETH in each")] {
+        let mut gas = Vec::new();
+        for (provider, addr) in [(LoanProvider::Balancer, BALANCER_VAULT), (LoanProvider::Erc3156, lender)] {
+            let mut calls = replay_calls(&block, tx_index).unwrap();
+            calls.push(ours(call_data(Loan { token: WETH, amount: small, provider, provider_addr: addr }, steps(small, mid15), deadline)));
+            let r = simulate(&*rpc, BLOCK - 1, &block, state.clone(), calls).await;
+            let last = r.last().unwrap();
+            assert_eq!(last["status"], "0x1", "{provider:?} at 15 WETH, {name}: {last}");
+            assert_eq!(gross_of(last), Some(out15 - small), "{provider:?}, {name}: profit is counted from the starting balance");
+            gas.push(hexq(&last["gasUsed"]));
+        }
+        println!("PROOF 3 ok: 15 WETH, {name}: Balancer gas {}, Morpho gas {}, extra_gas={}", gas[0], gas[1], gas[1] - gas[0]);
+        extra.push(gas[1] - gas[0]);
+    }
+    // The gas model's two figures are these, rounded up to the thousand.
+    use apex_runtime::live::lenders::{MORPHO_EXTRA_GAS, MORPHO_EXTRA_GAS_DUSTED};
+    for (measured, model) in [(extra[0], MORPHO_EXTRA_GAS), (extra[1], MORPHO_EXTRA_GAS_DUSTED)] {
+        assert!(measured <= model && model < measured + 1_000, "measured {measured}, modelled {model}");
+    }
 }

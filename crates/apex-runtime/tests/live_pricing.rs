@@ -667,7 +667,7 @@ fn a_route_sizes_past_balancer_into_morpho_at_its_extra_gas() {
         .find_map(|id| free.best_size(*id, &fp(), budget()).ok().map(|s| (*id, s.amount_in)))
         .expect("one direction pays");
     let balancer = unbounded / 4;
-    let lenders = Lenders { balancer, morpho: Some((Address::repeat_byte(0xee), unbounded * 2)) };
+    let lenders = Lenders { balancer, morpho: Some((Address::repeat_byte(0xee), unbounded * 2)), morpho_extra_gas: MORPHO_EXTRA_GAS };
     let (_tx, rx) = tokio::sync::watch::channel(Some(lenders));
     let pricer = LivePricer::new(b.clone(), cycles.clone(), flat(3_000_000_000_000), gas::MEASURED).with_lender(rx);
     let sized = pricer.best_size(id, &fp(), budget()).expect("pays");

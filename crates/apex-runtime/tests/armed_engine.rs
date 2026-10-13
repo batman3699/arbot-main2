@@ -360,7 +360,8 @@ fn a_rung_past_balancers_holding_borrows_from_morpho() {
     let lender = Address::repeat_byte(0xee);
     let (engine, snap) = setup(16);
     let small = U256::from(10u128.pow(17)); // 0.1 WETH
-    let px = Pricing { lenders: Some(Lenders { balancer: small, morpho: Some((lender, U256::from(10u128.pow(21)))) }), ..px() };
+    let lenders = Lenders { balancer: small, morpho: Some((lender, U256::from(10u128.pow(21)))), morpho_extra_gas: 122_000 };
+    let px = Pricing { lenders: Some(lenders), ..px() };
     let arms: Vec<Arm> = engine
         .tick(&snap, 1_000, 5_000_000, &px, 1)
         .into_iter()
