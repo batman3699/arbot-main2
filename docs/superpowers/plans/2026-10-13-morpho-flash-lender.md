@@ -15,6 +15,22 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-13-morpho-flash-lender-design.md` (`e122cb3`).
 
+## Changes found while executing (2026-10-13)
+
+1. **The lender keeps no state, and approves Morpho once for good.**
+   - Morpho Blue calls back only the caller of its `flashLoan`, so a callback from Morpho is for a loan this contract started, and the borrower and initiator can travel in the callback data.
+   - Dropping the two storage writes (and their clears), and approving `type(uint256).max` once instead of each loan, cut Morpho's extra gas over Balancer from **148,053 to 94,167**.
+   - Gas divides the bid in a priority auction, and the contract is immutable once deployed. The `LoanInFlight`/`NoLoan` guards went with the state.
+   - Tests: a nested loan is repaid on its own; a callback with no loan behind it moves nothing; the initiator is the caller, not the borrower. 9 tests, 8 mutants killed.
+2. **The proof quotes on the replay's own state.**
+   - At block 52,526,060 three replayed swaps on the 0.05% pool ran with different amounts from the chain's: they depend on transactions that fail in replay (346 of 902 did).
+   - Quoted on the chain's logs, the 20 WETH gross was 1.086e13 wei above the simulation's. Quoted on the replay's own logs, it matches to the wei.
+   - The proof also uses a 60 s request timeout: a spike block replayed to its trigger outlasts the default 3 s.
+3. **Measured** (`PROOF 3`, ticket 51's cycle at 15 WETH): Balancer 461,224 gas, Morpho 555,391, so `MORPHO_EXTRA_GAS` = 95,000.
+4. **The proof reads the deployed lender from the config** (`lenders.morpho`), not from an `APEX_MORPHO_LENDER` variable: `env_coverage` refuses a new non-secret variable (blueprint §2.4, no late configuration lookup).
+5. **The evaluator compares a simulation against a quote on the replay's own state when the replay diverges from the chain** (`replayed_logs`, `replay_diverged`, `SimCheck.replay_diverged`). It also waits up to `EVAL_REQUEST_TIMEOUT` (60 s) for an answer.
+   - Morpho-sized fires happen in spike blocks, where replays diverge. Without this, R27's own success criterion (Morpho fires agreeing with their quotes) would fail on replay artefacts.
+
 ## Global Constraints
 
 - **Secrets:**

@@ -300,14 +300,24 @@ fn a_cycle_below_its_floor_is_refused() {
     assert!(matches!(&err, Decline::Uncommittable { detail } if detail.contains("minimum profit")), "{err:?}");
 }
 
-/// The executor takes exactly one loan, and only Balancer's is wired.
+/// R27: the commitment's lender is the plan's. Balancer's vault; the Morpho
+/// lender, once it is configured, as an ERC-3156 loan from its address;
+/// nothing else.
 #[test]
-fn only_balancers_loan_is_wired() {
+fn the_plan_borrows_from_the_commitments_lender() {
+    use apex_runtime::live::lenders::MORPHO_FLASH;
+    let lender = Address::repeat_byte(0xee);
     let b = book(-197_350, -197_300);
     let (cycle, c) = priced(&b);
-    for source in [FlashProviderId(0), FlashProviderId(2)] {
+    let morpho_k = ExecutionCommitment { flash_source: MORPHO_FLASH, ..commitment(&c, 1) };
+    let err = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &morpho_k).unwrap_err();
+    assert!(matches!(&err, Decline::Uncommittable { detail } if detail.contains("Morpho")), "unconfigured: {err:?}");
+    let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).with_morpho(lender).build(&c, &morpho_k).expect("builds");
+    let loan = call.plan().loans[0];
+    assert_eq!((loan.provider, loan.provider_addr, loan.amount), (LoanProvider::Erc3156, lender, c.input_amount.get()));
+    for source in [FlashProviderId(0), FlashProviderId(3)] {
         let k = ExecutionCommitment { flash_source: source, ..commitment(&c, 1) };
-        let err = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &k).unwrap_err();
+        let err = LiveCallBuilder::new(b.clone(), [cycle.clone()]).with_morpho(lender).build(&c, &k).unwrap_err();
         assert!(matches!(err, Decline::Uncommittable { .. }), "{source:?}: {err:?}");
     }
 }

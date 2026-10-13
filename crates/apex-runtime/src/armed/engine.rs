@@ -242,7 +242,7 @@ impl Engine {
                         // A new transaction on the same sender: re-signed with a
                         // deadline that runs from now, as the arm's did.
                         let deadline = self.deadline(now_ns);
-                        let Some((calldata, calldata_hash)) = self.calldata(c, band, snapshot, deadline) else { continue };
+                        let Some((calldata, calldata_hash, _)) = self.calldata(c, band, snapshot, deadline, px) else { continue };
                         live.arm.to_block = to_block;
                         live.arm.deadline = deadline;
                         live.arm.calldata.clone_from(&calldata);
@@ -301,7 +301,7 @@ impl Engine {
         predicates.push(predicate::expiry(to_block));
         let deadline = self.deadline(now_ns);
         let point = &band.point;
-        let (calldata, calldata_hash) = self.calldata(c, band, snapshot, deadline)?;
+        let (calldata, calldata_hash, lender) = self.calldata(c, band, snapshot, deadline, px)?;
         let start_ticks = [trigger_pool, other_pool]
             .iter()
             .filter(|p| p.reserves.is_none())
@@ -338,6 +338,7 @@ impl Engine {
             calldata,
             calldata_hash,
             sender_slot: u16::try_from(sender).unwrap_or(u16::MAX),
+            lender,
             renewals: Vec::new(),
         })
     }
@@ -347,13 +348,24 @@ impl Engine {
         now_ns / 1_000_000_000 + self.settings.window_s + 1
     }
 
-    /// The plan at `band`'s point with `deadline`, as calldata and its hash.
-    fn calldata(&self, c: &Cycle, band: &Band, snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>, deadline: u64) -> Option<(String, String)> {
+    /// The plan at `band`'s point with `deadline`, as calldata, its hash, and
+    /// the lender it borrows from: Balancer while it covers the size, then the
+    /// Morpho lender (R27).
+    fn calldata(
+        &self,
+        c: &Cycle,
+        band: &Band,
+        snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>,
+        deadline: u64,
+        px: &Pricing,
+    ) -> Option<(String, String, String)> {
         let s = self.settings;
         let pools = [&**snapshot.get(&c.legs[0].pool)?, &**snapshot.get(&c.legs[1].pool)?];
-        let call = armed_call(c, pools, band.point.size, band.point.mid, s.executor, s.chain_id, deadline).ok()?;
+        let choice = px.lenders.and_then(|l| l.for_size(band.point.size)).unwrap_or(crate::live::lenders::BALANCER);
+        let call = armed_call(c, pools, band.point.size, band.point.mid, s.executor, s.chain_id, deadline, &choice).ok()?;
         let data = call.data();
-        Some((format!("0x{}", alloy_primitives::hex::encode(data)), format!("{:#x}", keccak256(data))))
+        let lender = if choice.id == crate::live::lenders::MORPHO_FLASH { "morpho" } else { "balancer" };
+        Some((format!("0x{}", alloy_primitives::hex::encode(data)), format!("{:#x}", keccak256(data)), lender.into()))
     }
 }
 

@@ -39,12 +39,14 @@ use crate::econ::{Evaluated, GasEstimate, RouteCosts, RouteCurves, SettledRoute}
 use crate::live::book::{PoolBook, PoolSnapshot};
 use crate::live::frontier::Cycle;
 use crate::live::gas::{HopSteps, SettlementGas};
+use crate::live::lenders::Lenders;
 use crate::live::near_miss::{NearMisses, LADDER_WEI};
 use crate::plane::Decline;
 use apex_math::cl_swap::quote_exact_input_multi_tick;
 use apex_math::finite_size::{best_size, NoSize, Priced, SearchBudget, SizedOpportunity, SizedRoute};
 use apex_search::engine_c::TemplatePricer;
 use apex_search::frontier::{RouteId, RouteProposal};
+use apex_types::cost::GasUsed;
 use apex_types::route::RouteCommitment;
 use apex_types::state::StateFingerprint;
 use ethers_core::types::U256;
@@ -158,28 +160,38 @@ impl LiveCycle {
 
 /// What the lender holds of the start token, as last read: the most any cycle
 /// may borrow (R21). `None` until read, which sizes nothing.
-pub type LenderHolding = tokio::sync::watch::Receiver<Option<U256>>;
+pub type LenderHolding = tokio::sync::watch::Receiver<Option<Lenders>>;
 
 /// A cycle and what settling it costs: what Engine C and the economics size.
 pub struct CostedCycle {
     cycle: LiveCycle,
     costs: RouteCosts,
     gas: SettlementGas,
-    /// A bound on the input beside the paying pool's holding: the lender's.
-    cap: Option<U256>,
+    /// What the lenders hold: a bound on the input beside the paying pool's
+    /// holding, and the gas each size's loan adds (R21, R27).
+    lenders: Option<Lenders>,
 }
 
 impl CostedCycle {
     pub const fn new(cycle: LiveCycle, costs: RouteCosts, gas: SettlementGas) -> Self {
-        Self { cycle, costs, gas, cap: None }
+        Self { cycle, costs, gas, lenders: None }
     }
 
-    /// Bound every size at `cap` as well as at the paying pool's holding: the
-    /// lender's holding, for a cycle that borrows (R21).
+    /// Bound every size at what the lenders hold, as well as at the paying
+    /// pool's holding, and charge a size its lender's extra gas (R21, R27).
     #[must_use]
-    pub const fn capped(mut self, cap: Option<U256>) -> Self {
-        self.cap = cap;
+    pub const fn lent(mut self, lenders: Option<Lenders>) -> Self {
+        self.lenders = lenders;
         self
+    }
+
+    /// The settlement's gas at `amount_in`, its loan's extra gas included.
+    fn gas_for(&self, hops: &[HopSteps], amount_in: U256) -> GasEstimate {
+        let mut g = self.gas.estimate(hops);
+        let extra = self.lenders.map_or(0, |l| l.extra_gas(amount_in));
+        g.expected = GasUsed(g.expected.0 + extra);
+        g.ceiling = GasUsed(g.ceiling.0 + extra);
+        g
     }
 
     /// The cycle's venue arithmetic, without costs (R26: the armed plan's hops).
@@ -238,20 +250,20 @@ impl SizedRoute for CostedCycle {
 
     fn max_input(&self) -> U256 {
         let held = self.cycle.max_input();
-        self.cap.map_or(held, |c| held.min(c))
+        self.lenders.map_or(held, |l| held.min(l.cap()))
     }
 
     /// The output and its cost from one quote: the crossings that price the size
     /// are the ones its settlement pays for.
     fn priced(&self, amount_in: U256) -> Option<Priced> {
         let q = self.cycle.quote(amount_in)?;
-        Some(Priced { output: q.outputs[1], cost: self.cost_of(self.gas.estimate(&q.hops)) })
+        Some(Priced { output: q.outputs[1], cost: self.cost_of(self.gas_for(&q.hops, amount_in)) })
     }
 }
 
 impl SettledRoute for CostedCycle {
     fn gas_at(&self, amount_in: U256) -> Option<GasEstimate> {
-        self.cycle.quote(amount_in).map(|q| self.gas.estimate(&q.hops))
+        self.cycle.quote(amount_in).map(|q| self.gas_for(&q.hops, amount_in))
     }
 }
 
@@ -278,11 +290,11 @@ impl LivePricer {
         Self { book, cycles, by_hash, costs, gas, near_misses: Arc::default(), lender: None }
     }
 
-    /// Size every cycle within the lender's holding as `lender` reports it.
-    /// Every live cycle borrows from Balancer (`frontier::BALANCER_FLASH`), so
-    /// the cap applies to all of them. Without it, sizing is bounded only by the
-    /// paying pool, and an optimum above the lender's holding is refused whole
-    /// by the risk gate rather than traded smaller.
+    /// Size every cycle within what the lenders hold as `lender` reports it
+    /// (R21, R27): Balancer's vault, and the Morpho lender when configured.
+    /// Without it, sizing is bounded only by the paying pool, and an optimum
+    /// above the lenders' holding is refused whole by the risk gate rather than
+    /// traded smaller.
     #[must_use]
     pub fn with_lender(mut self, lender: LenderHolding) -> Self {
         self.lender = Some(lender);
@@ -314,8 +326,9 @@ impl LivePricer {
 
     fn live(&self, id: RouteId) -> Option<CostedCycle> {
         let cycle = LiveCycle::new(self.cycles.get(&id)?, &self.book.snapshot())?;
-        let cap = self.lender.as_ref().map(|l| (*l.borrow()).unwrap_or_default());
-        Some(CostedCycle::new(cycle, self.costs(), self.gas).capped(cap))
+        // An unread holding sizes nothing, as an unread pool balance does.
+        let lenders = self.lender.as_ref().map(|l| (*l.borrow()).unwrap_or(Lenders::balancer_only(U256::zero())));
+        Some(CostedCycle::new(cycle, self.costs(), self.gas).lent(lenders))
     }
 }
 

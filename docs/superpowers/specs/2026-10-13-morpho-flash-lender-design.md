@@ -65,6 +65,8 @@ one limit on sizing.
 
 An ERC-3156 lender over Morpho Blue: immutable, no owner, holding nothing between transactions.
 
+**As built (the plan's "Changes found while executing"):** stateless. The borrower and initiator travel in Morpho's callback data, which only this contract's own loan can produce, and Morpho is approved once for the maximum. That cut the extra gas over Balancer from 148,053 to 94,167. The in-flight record below was the first design.
+
 - `constructor(IMorpho morpho)`; `morpho()` returns it.
 - `maxFlashLoan(token)` = `token.balanceOf(morpho)`; `flashFee(token, amount)` = 0.
 - `flashLoan(receiver, token, amount, data)`:

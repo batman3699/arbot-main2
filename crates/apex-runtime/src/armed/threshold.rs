@@ -37,8 +37,9 @@ pub const RUNG_OFFSETS: [u32; 6] = [0, 5, 20, 50, 100, 200];
 pub struct Pricing {
     pub costs: RouteCosts,
     pub gas: SettlementGas,
-    /// The lender's holding: the most any size may borrow.
-    pub cap: Option<U256>,
+    /// What the lenders hold: the most any size may borrow, and from whom
+    /// (R21, R27).
+    pub lenders: Option<crate::live::lenders::Lenders>,
     /// What the surplus over base costs must exceed (`armed.margin_wei`).
     pub margin_wei: U256,
 }
@@ -94,7 +95,7 @@ pub fn best_at(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, trigger
     let mut pools = pair.clone();
     pools[leg] = Arc::new(trigger);
     let live = LiveCycle::new(cycle, &map_of(cycle, pools))?;
-    let route = CostedCycle::new(live, px.costs, px.gas).capped(px.cap);
+    let route = CostedCycle::new(live, px.costs, px.gas).lent(px.lenders);
     let best = best_size(&route, SearchBudget::default()).ok()?;
     let Surplus::Gain(surplus) = best.net else { return None };
     if surplus <= px.margin_wei {

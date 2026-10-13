@@ -264,6 +264,11 @@ in per mille (50 = 5% of the arm's expected surplus bid as priority fee):
 The status lines:
 - `armed`: arms, renewals, armable slots, unarmable pools (boot layout
   check), the engine's last pass in ms;
+- `lenders` (R27): what each flash lender holds of WETH. A trade borrows from
+  Balancer while its holding covers the size, and from the Morpho lender above.
+  Arms past Balancer's holding are labelled `"lender": "morpho"` in
+  `armed-*.jsonl`. "morpho not configured" means `lenders.morpho` is absent from
+  the config.
 - `moves`: every applied Swap checked against the move model.
   - **Wrong ticks are the model's error and should stay near zero.**
   - Liquidity changes are mints and burns the book had not applied yet. On

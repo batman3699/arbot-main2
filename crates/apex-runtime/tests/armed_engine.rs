@@ -84,7 +84,7 @@ fn px() -> Pricing {
     Pricing {
         costs: RouteCosts { other_wei: 20_000_000_000, wei_per_gas: 5_000_000 },
         gas: gas::MEASURED,
-        cap: Some(U256::from(10u128.pow(21))),
+        lenders: Some(apex_runtime::live::lenders::Lenders::balancer_only(U256::from(10u128.pow(21)))),
         margin_wei: U256::zero(),
     }
 }
@@ -292,4 +292,27 @@ fn a_changed_rung_waits_for_its_window() {
     }
     assert!(keys.is_subset(&covered), "every rung armed at 1,000 is armed or renewed at 1,005");
     assert!(rearmed >= 1, "a one-tick move changes some rung's plan");
+}
+
+/// R27: a rung sized past Balancer's holding borrows from the Morpho lender,
+/// and its calldata names that lender; one within it borrows from Balancer.
+#[test]
+fn a_rung_past_balancers_holding_borrows_from_morpho() {
+    use apex_runtime::live::lenders::Lenders;
+    let lender = Address::repeat_byte(0xee);
+    let (engine, snap) = setup(16);
+    let small = U256::from(10u128.pow(17)); // 0.1 WETH
+    let px = Pricing { lenders: Some(Lenders { balancer: small, morpho: Some((lender, U256::from(10u128.pow(21)))) }), ..px() };
+    let arms: Vec<Arm> = engine
+        .tick(&snap, 1_000, 5_000_000, &px, 1)
+        .into_iter()
+        .filter_map(|l| if let ArmedLine::Arm(a) = l { Some(*a) } else { None })
+        .collect();
+    let needle = format!("{lender:#x}").trim_start_matches("0x").to_string();
+    assert!(arms.iter().any(|a| a.lender == "morpho"), "some rung sizes past 0.1 WETH");
+    for a in &arms {
+        let size = U256::from_dec_str(&a.size_wei).unwrap();
+        assert_eq!(a.lender, if size <= small { "balancer" } else { "morpho" }, "arm {} at {size}", a.arm_id);
+        assert_eq!(a.calldata.contains(&needle), a.lender == "morpho");
+    }
 }

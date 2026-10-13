@@ -275,7 +275,9 @@ pub struct LiveEconomics {
     continuous: ContinuousBudget,
     refine: RefineBudget,
     strategy: apex_types::ids::StrategyId,
-    flash: Option<FlashTerms>,
+    /// The lenders a borrowing route may be quoted against; the first added
+    /// that a route names is its own (R27).
+    flash: Vec<FlashTerms>,
 }
 
 impl LiveEconomics {
@@ -292,7 +294,7 @@ impl LiveEconomics {
             continuous: ContinuousBudget::default(),
             refine: RefineBudget::default(),
             strategy,
-            flash: None,
+            flash: Vec::new(),
         }
     }
 
@@ -310,11 +312,13 @@ impl LiveEconomics {
         self.costs.store(costs, apex_types::state::ReconstructionStatus::Verified);
     }
 
-    /// The lender a borrowing route is quoted against. Without it, a proposal
-    /// that names a lender cannot be committed.
+    /// A lender a borrowing route may be quoted against. Without its terms, a
+    /// proposal that names a lender cannot be committed. Several may be added
+    /// (R27): a route borrows from its own while that lender covers the amount,
+    /// and from another of the same asset that does when it does not.
     #[must_use]
-    pub const fn with_flash(mut self, terms: FlashTerms) -> Self {
-        self.flash = Some(terms);
+    pub fn with_flash(mut self, terms: FlashTerms) -> Self {
+        self.flash.push(terms);
         self
     }
 
@@ -331,11 +335,18 @@ impl LiveEconomics {
         amount: AlloyU256,
     ) -> Result<Option<apex_types::flash::FlashSourceQuote>, Decline> {
         let Some(provider) = p.flash_source else { return Ok(None) };
-        let t = self.flash.filter(|t| t.provider == provider).ok_or_else(|| {
+        let own = self.flash.iter().find(|t| t.provider == provider).ok_or_else(|| {
             Decline::Uncommittable { detail: format!("no terms for flash provider {}", provider.0) }
         })?;
+        // R27: past its own lender's holding, another lender of the same asset
+        // that covers the amount; failing every one, its own, quoted unavailable.
+        let t = if amount <= own.available {
+            own
+        } else {
+            self.flash.iter().find(|t| t.asset == own.asset && amount <= t.available).unwrap_or(own)
+        };
         Ok(Some(apex_types::flash::FlashSourceQuote {
-            provider,
+            provider: t.provider,
             asset: t.asset,
             amount,
             // Fee-free lenders only: see `FlashTerms`.

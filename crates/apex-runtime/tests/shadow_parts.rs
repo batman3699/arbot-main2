@@ -503,3 +503,22 @@ async fn the_miss_ledger_is_drained() {
     plane.on_event(&stream[1]).await;
     assert_eq!(plane.drain_misses().len(), 1, "the next period's alone");
 }
+
+/// R27: the Morpho lender is configured by address and the code it must run.
+/// Absent, the shadow borrows from Balancer alone. A wrong code hash refuses.
+#[test]
+fn the_morpho_lender_is_named_with_its_code() {
+    use apex_runtime::shadow::config::{lender_code_ok, MorphoLenderConfig};
+    let var = "APEX_SECRET_SHADOW_TEST_LENDER";
+    let plain = ShadowConfig::from_yaml_str(&yaml(var, "var/apex/shadow.journal"), &env(var, SECRET)).unwrap();
+    assert_eq!(plain.lenders.morpho, None);
+    let text = yaml(var, "var/apex/shadow.journal")
+        + "lenders:\n  morpho:\n    address: \"0x00000000000000000000000000000000000000ee\"\n    code_hash: \"0x1111111111111111111111111111111111111111111111111111111111111111\"\n";
+    let c = ShadowConfig::from_yaml_str(&text, &env(var, SECRET)).unwrap();
+    let m = c.lenders.morpho.clone().unwrap();
+    assert_eq!(m, MorphoLenderConfig { address: address!("00000000000000000000000000000000000000ee"), code_hash: B256::repeat_byte(0x11) });
+    assert!(lender_code_ok(B256::repeat_byte(0x11), &m).is_ok());
+    assert!(lender_code_ok(B256::repeat_byte(0x22), &m).unwrap_err().contains("code"));
+    let typo = text.replace("code_hash", "codehash");
+    assert!(ShadowConfig::from_yaml_str(&typo, &env(var, SECRET)).is_err(), "unknown fields refused");
+}

@@ -53,6 +53,7 @@ fn arm() -> Arm {
         calldata: "0x".into(),
         calldata_hash: "0x".into(),
         sender_slot: 0,
+        lender: "balancer".into(),
         renewals: Vec::new(),
     }
 }

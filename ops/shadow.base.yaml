@@ -124,3 +124,12 @@ capacity:
 universe:
   max_fee_ppm: 3000
   min_depth_usd: 100000
+
+# R27: MorphoFlashLender (Morpho Blue's free flash loans as ERC-3156). Set once
+# deployed: its address, and keccak256 of its runtime code read back from the
+# chain. The shadow refuses to start if the code there differs. Absent, every
+# loan is Balancer's.
+# lenders:
+#   morpho:
+#     address: "0x..."
+#     code_hash: "0x..."

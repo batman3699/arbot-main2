@@ -233,3 +233,52 @@ async fn a_range_too_full_for_one_query_is_split_until_it_fits() {
     assert!(get_logs(&full, &pools, 1_000, 1_001).await.unwrap_err().contains("exceeds max results"));
     assert_eq!(*full.asked.lock().unwrap(), vec![(1_000, 1_001), (1_000, 1_000)]);
 }
+
+/// R27: what the replay itself wrote to the arm's pools, as the book applies
+/// it: each log on a watched pool from a replayed transaction, under that
+/// transaction's real index and hash, in order; nothing from other addresses.
+/// A replay diverges from the chain when those differ from the chain's own
+/// logs before the fire: at block 52,526,060 three swaps on the 0.05% pool
+/// ran with other amounts, and a quote meant to match the simulation must be
+/// taken on the replay's state.
+#[test]
+fn the_replays_own_logs_and_whether_they_diverge() {
+    use apex_runtime::armed::run::{replay_diverged, replayed_logs};
+    let other = address!("00000000000000000000000000000000000000cc");
+    let block = serde_json::json!({ "number": "0x64", "transactions": [
+        {"transactionIndex": "0x0", "hash": format!("0x{:064x}", 10)},
+        {"transactionIndex": "0x1", "hash": format!("0x{:064x}", 11)},
+        {"transactionIndex": "0x2", "hash": format!("0x{:064x}", 12)},
+    ]});
+    let swap_log = |addr: Address, data: &str| serde_json::json!({
+        "address": format!("{addr:#x}"), "topics": [format!("{SWAP:#x}")], "data": data,
+    });
+    let results = vec![
+        serde_json::json!({"status": "0x1", "logs": [
+            swap_log(POOL, "0x01"),
+            swap_log(other, "0x02"),
+            // An event the book does not apply (a Collect): not a write.
+            serde_json::json!({"address": format!("{POOL:#x}"), "topics": [format!("{:#x}", B256::repeat_byte(0x70))], "data": "0x05"}),
+        ]}),
+        serde_json::json!({"status": "0x0", "logs": []}),
+        serde_json::json!({"status": "0x1", "logs": [swap_log(POOL, "0x03")]}),
+        // Our own call, after the replay: not part of it.
+        serde_json::json!({"status": "0x1", "logs": [swap_log(POOL, "0x04")]}),
+    ];
+    let replay = replayed_logs(&block, 2, &results, &[POOL]);
+    assert_eq!(replay.len(), 2);
+    assert_eq!((replay[0].transaction_index, replay[1].transaction_index), (Some(0), Some(2)));
+    assert_eq!(replay[1].transaction_hash, Some(format!("0x{:064x}", 12).parse::<B256>().unwrap()));
+    assert_eq!((replay[0].data.clone(), replay[1].data.clone()), (vec![1u8], vec![3u8]));
+    assert!(replay.iter().all(|l| l.block_number == Some(100)), "the block's own number");
+
+    let chain = |data: &[u8], tx: u64| apex_chain::rpc::ws::RawLog { data: data.to_vec(), transaction_index: Some(tx), ..replay[0].clone() };
+    let same = vec![chain(&[1], 0), chain(&[3], 2)];
+    let at = replay[0].block_number.unwrap();
+    assert!(!replay_diverged(&same, &replay, at, 2, &[POOL]));
+    assert!(replay_diverged(&[chain(&[1], 0), chain(&[9], 2)], &replay, at, 2, &[POOL]), "an amount differs");
+    assert!(replay_diverged(&[chain(&[1], 0)], &replay, at, 2, &[POOL]), "a swap is missing");
+    // The chain's logs after the fire, or on other pools, are not compared.
+    let later = vec![chain(&[1], 0), chain(&[3], 2), chain(&[7], 3)];
+    assert!(!replay_diverged(&later, &replay, at, 2, &[POOL]));
+}

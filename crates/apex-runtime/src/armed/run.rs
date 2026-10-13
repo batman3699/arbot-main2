@@ -129,7 +129,16 @@ pub struct SimCheck {
     pub gross_wei: Option<String>,
     pub gas_used: u64,
     pub agrees: bool,
+    /// The replay wrote the arm's pools differently from the chain (R27). The
+    /// simulation is then checked against a quote on the replay's own state.
+    #[serde(default)]
+    pub replay_diverged: bool,
 }
+
+/// How long the evaluator waits for one answer: a busy block replayed up to a
+/// fire is a heavy simulation (block 52,526,060's 902 transactions outlasted
+/// the default 3 s), and a timed-out one would leave its fire unchecked.
+pub const EVAL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A fire or rival position: block, transaction index, hash, flashblock.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -203,7 +212,11 @@ fn read_lines<T: serde::de::DeserializeOwned>(base: &Path, now: u64, days: u64) 
 pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
     let urls: Vec<String> = config.rpc_http.iter().map(|u| u.expose().clone()).collect();
     let rpc: Arc<dyn RpcTransport> = Arc::new(
-        FailoverTransport::connect(&urls, config.chain_id, FailoverSettings::default())
+        FailoverTransport::connect(
+            &urls,
+            config.chain_id,
+            FailoverSettings { request_timeout: EVAL_REQUEST_TIMEOUT, ..FailoverSettings::default() },
+        )
             .await
             .map_err(|e| e.to_string())?,
     );
@@ -326,11 +339,21 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
     }
     // The simulation check.
     if let Some(b) = &block {
-        if let Some(sim) = simulate(ctx.rpc, ctx.config, arm, fire, b).await {
+        if let Some((sim, replay)) = simulate(ctx.rpc, ctx.config, arm, fire, b).await {
             report.simulated += 1;
-            let agrees = v.gross_wei.is_some() && v.gross_wei.as_deref() == sim.gross_wei.as_deref();
+            // A replayed transaction can run differently from the chain (its
+            // amounts can hang on one that fails in replay). The quote is the
+            // chain's; the simulation is held to a quote on its own state.
+            let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
+            let diverged = replay_diverged(ctx.logs, &replay, fire.block, fire.tx_index, &pools);
+            let expected = if diverged {
+                quote_at_fire(ctx.reads, ctx.specs, arm, fire, &replay).await.ok().map(|(g, _)| g.to_string())
+            } else {
+                v.gross_wei.clone()
+            };
+            let agrees = expected.is_some() && expected.as_deref() == sim.gross_wei.as_deref();
             report.sim_agreed += usize::from(agrees);
-            v.sim = Some(SimCheck { agrees, ..sim });
+            v.sim = Some(SimCheck { agrees, replay_diverged: diverged, ..sim });
         }
     }
     // Positions and the rival's bid. Flashblocks when the ledger places both;
@@ -362,30 +385,28 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
     v
 }
 
-/// The fire, quoted exactly: both pools at the fire block's parent, that
-/// block's writes to them up to and including the trigger, then the armed
-/// plan's hops. `(WETH gross, intermediate residue)`.
-async fn quote_at_fire(
+/// The book of `pools` as it stood after transaction `tx_index` of `block`: the
+/// pools at `block`'s parent, then that block's writes to them through that
+/// transaction. A Mint or Burn among them refuses, because the book would need
+/// a reload to apply it.
+pub async fn book_after(
     reads: &ChainReads,
     specs: &[PoolSpec],
-    arm: &Arm,
-    fire: &Point,
+    pools: &[Address],
+    block: u64,
+    tx_index: u64,
     logs: &[RawLog],
-) -> Result<(U256, U256), String> {
-    let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
+) -> Result<Arc<BTreeMap<Address, Arc<crate::live::book::PoolSnapshot>>>, String> {
     let mine: Vec<PoolSpec> = specs.iter().filter(|s| pools.contains(&s.pool)).cloned().collect();
-    let (book, unloaded) = PoolBook::load(reads, &mine, fire.block - 1).await.map_err(|e| e.to_string())?;
+    let (book, unloaded) = PoolBook::load(reads, &mine, block - 1).await.map_err(|e| e.to_string())?;
     if !unloaded.is_empty() {
-        return Err("a pool did not load at the fire's parent".into());
+        return Err("a pool did not load at the block's parent".into());
     }
     let mut writes = Vec::new();
     for l in logs.iter().filter(|l| {
-        !l.removed
-            && l.block_number == Some(fire.block)
-            && pools.contains(&l.address)
-            && l.transaction_index.is_some_and(|i| i <= fire.tx_index)
+        !l.removed && l.block_number == Some(block) && pools.contains(&l.address) && l.transaction_index.is_some_and(|i| i <= tx_index)
     }) {
-        let at = (fire.block, l.log_index.unwrap_or(0));
+        let at = (block, l.log_index.unwrap_or(0));
         match l.topics.first() {
             Some(t) if *t == SWAP || *t == PANCAKE_SWAP => {
                 let s = decode_swap(l).ok_or("an undecodable swap")?;
@@ -400,7 +421,21 @@ async fn quote_at_fire(
         }
     }
     book.apply_writes(&writes);
-    let snap = book.snapshot();
+    Ok(book.snapshot())
+}
+
+/// The fire, quoted exactly: both pools at the fire block's parent, that
+/// block's writes to them up to and including the trigger, then the armed
+/// plan's hops. `(WETH gross, intermediate residue)`.
+async fn quote_at_fire(
+    reads: &ChainReads,
+    specs: &[PoolSpec],
+    arm: &Arm,
+    fire: &Point,
+    logs: &[RawLog],
+) -> Result<(U256, U256), String> {
+    let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
+    let snap = book_after(reads, specs, &pools, fire.block, fire.tx_index, logs).await?;
     let (_, cycles) = frontier::build(ChainId::BASE, WETH, &snap);
     let cycle = cycles
         .values()
@@ -466,10 +501,20 @@ pub fn simulate_request(arm: &Arm, fire: &Point, block: &Value, signer: Address,
     }, format!("{:#x}", fire.block.checked_sub(1)?)]))
 }
 
-async fn simulate(rpc: &dyn RpcTransport, config: &ShadowConfig, arm: &Arm, fire: &Point, block: &Value) -> Option<SimCheck> {
+/// The simulation's check, and the logs its replay wrote to the arm's pools.
+async fn simulate(
+    rpc: &dyn RpcTransport,
+    config: &ShadowConfig,
+    arm: &Arm,
+    fire: &Point,
+    block: &Value,
+) -> Option<(SimCheck, Vec<RawLog>)> {
     let params = simulate_request(arm, fire, block, config.signer.address, config.executor.address)?;
     let out = rpc.call("eth_simulateV1", params).await.ok()?;
-    let last = out.get(0)?.get("calls")?.as_array()?.last()?.clone();
+    let calls = out.get(0)?.get("calls")?.as_array()?;
+    let last = calls.last()?.clone();
+    let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
+    let replay = replayed_logs(block, fire.tx_index, &calls[..calls.len() - 1], &pools);
     let ok = last.get("status").and_then(Value::as_str) == Some("0x1");
     let gas_used = last.get("gasUsed").and_then(hex_u128).map_or(0, |g| u64::try_from(g).unwrap_or(u64::MAX));
     let topic = keccak256(b"ProfitRealised(address,uint256,uint256)");
@@ -480,7 +525,69 @@ async fn simulate(rpc: &dyn RpcTransport, config: &ShadowConfig, arm: &Arm, fire
             (t0 == topic).then(|| U256::from_str_radix(data.get(2..66)?, 16).ok()).flatten()
         })
     });
-    Some(SimCheck { ok, gross_wei: gross.map(|g| g.to_string()), gas_used, agrees: false })
+    Some((SimCheck { ok, gross_wei: gross.map(|g| g.to_string()), gas_used, agrees: false, replay_diverged: false }, replay))
+}
+
+/// What the replay itself wrote to `pools`, as the book applies it (R27):
+/// each Swap, Sync, Mint or Burn from a replayed transaction, under that
+/// transaction's real index and hash, in order. `results` are the replay's
+/// calls, as many as `block` has transactions up to `tx_index`.
+pub fn replayed_logs(block: &Value, tx_index: u64, results: &[Value], pools: &[Address]) -> Vec<RawLog> {
+    let number = block.get("number").and_then(hex_u128).and_then(|n| u64::try_from(n).ok());
+    let txs: Vec<(u64, Option<B256>)> = block
+        .get("transactions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            let i = u64::try_from(t.get("transactionIndex").and_then(hex_u128)?).ok()?;
+            (i <= tx_index).then(|| (i, t.get("hash").and_then(|h| h.as_str()?.parse().ok())))
+        })
+        .collect();
+    let applied = [SWAP, PANCAKE_SWAP, SYNC, MINT, BURN];
+    let mut out = Vec::new();
+    let mut log_index = 0u64;
+    for ((index, hash), r) in txs.iter().zip(results) {
+        for l in r.get("logs").and_then(Value::as_array).into_iter().flatten() {
+            let Some(address) = l.get("address").and_then(|a| a.as_str()?.parse::<Address>().ok()) else { continue };
+            let topics: Vec<B256> =
+                l.get("topics").and_then(Value::as_array).into_iter().flatten().filter_map(|t| t.as_str()?.parse().ok()).collect();
+            let Some(data) = l.get("data").and_then(Value::as_str).and_then(|d| alloy_primitives::hex::decode(d).ok()) else { continue };
+            if !pools.contains(&address) || !topics.first().is_some_and(|t| applied.contains(t)) {
+                continue;
+            }
+            out.push(RawLog {
+                pending: false,
+                removed: false,
+                address,
+                topics,
+                data,
+                block_number: number,
+                transaction_hash: *hash,
+                log_index: Some(log_index),
+                transaction_index: Some(*index),
+            });
+            log_index += 1;
+        }
+    }
+    out
+}
+
+/// Whether the replay's writes to `pools` in `block`, through `tx_index`,
+/// differ from the chain's (R27).
+pub fn replay_diverged(chain: &[RawLog], replay: &[RawLog], block: u64, tx_index: u64, pools: &[Address]) -> bool {
+    let writes = |logs: &[RawLog]| {
+        logs.iter()
+            .filter(|l| {
+                !l.removed
+                    && l.block_number == Some(block)
+                    && pools.contains(&l.address)
+                    && l.transaction_index.is_some_and(|i| i <= tx_index)
+            })
+            .map(|l| (l.address, l.transaction_index, l.topics.first().copied(), l.data.clone()))
+            .collect::<Vec<_>>()
+    };
+    writes(chain) != writes(replay)
 }
 
 /// Whether a provider refused a log query for returning too many results

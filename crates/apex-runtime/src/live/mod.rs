@@ -17,6 +17,7 @@ pub mod feed;
 pub mod frontier;
 pub mod gas;
 pub mod inventory;
+pub mod lenders;
 pub mod near_miss;
 pub mod pricing;
 pub mod reader;

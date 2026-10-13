@@ -70,6 +70,10 @@ impl RpcTransport for Node {
                 assert_eq!(params[1], json!("pending"));
                 Ok(json!("0x7"))
             }
+            // Morpho Blue's WETH when the request names it (R27): 82,679 WETH.
+            "eth_call" if params.to_string().to_lowercase().contains("bbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb") => {
+                Ok(json!(aggregate3_answer(U256::from(82_679u128 * 10u128.pow(18)))))
+            }
             // The lender's WETH: 29.08 WETH, as Balancer's vault held on Base.
             "eth_call" => Ok(json!(aggregate3_answer(U256::from(29_082_963_936_604_904_861u128)))),
             other => panic!("unexpected {other}"),
@@ -119,6 +123,7 @@ fn config(max_age: Duration) -> ReaderConfig {
         plan_version: 2,
         signer: SIGNER,
         lender: BALANCER_VAULT,
+        morpho: None,
         loan_token: WETH,
         fee_ceiling_wei: 100_000_000,
         min_profit: 1,
@@ -231,4 +236,29 @@ async fn a_failed_read_keeps_the_last_view() {
     let no_fee = Head { base_fee_per_gas: None, ..head(101) };
     assert!(fresh.refresh(&no_fee, 30_000_000).await.is_err());
     assert!(fresh.view().is_none());
+}
+
+/// R27: with the Morpho lender configured, a fifth read takes Morpho Blue's
+/// holding, and a ticket borrowing from it is checked against that.
+#[tokio::test]
+async fn a_ticket_borrowing_from_morpho_is_checked_against_morphos_holding() {
+    use apex_runtime::live::lenders::{MORPHO_BLUE, MORPHO_FLASH};
+    let n = node();
+    let r = ChainReader::new(n.clone(), book(), ReaderConfig { morpho: Some(MORPHO_BLUE), ..config(Duration::from_secs(60)) });
+    r.refresh(&head(101), 30_000_000).await.unwrap();
+    assert_eq!(n.calls.swap(0, Ordering::SeqCst), 5, "Morpho's holding is a fifth read");
+    let mut t = ticket();
+    assert_eq!(r.read(&t).await.unwrap().flash_available, 29_082_963_936_604_904_861, "no lender named: Balancer's");
+    t.flash_source = Some(apex_types::flash::FlashSourceQuote {
+        provider: MORPHO_FLASH,
+        asset: apex_types::ids::TokenId { chain: t.chain_id, address: WETH },
+        amount: t.exact_input,
+        premium: U256::ZERO,
+        gas_overhead: 0,
+        callback_constraints: apex_types::flash::CallbackConstraints { repay_by_transfer: true, reentrancy_permitted: false, max_callback_gas: u64::MAX },
+        availability_probability: 1.0,
+        state_dependencies: Vec::new(),
+        reliability_score: 1.0,
+    });
+    assert_eq!(r.read(&t).await.unwrap().flash_available, 82_679 * 10u128.pow(18));
 }

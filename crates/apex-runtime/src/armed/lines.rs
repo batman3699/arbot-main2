@@ -73,9 +73,17 @@ pub struct Arm {
     pub calldata: String,
     pub calldata_hash: String,
     pub sender_slot: u16,
+    /// Who lends the size: "balancer" or "morpho" (R27). Lines before R27
+    /// borrowed from Balancer.
+    #[serde(default = "balancer")]
+    pub lender: String,
     /// Folded in by `merge_renewals`; never written with the arm.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renewals: Vec<Renewal>,
+}
+
+fn balancer() -> String {
+    "balancer".into()
 }
 
 impl Arm {

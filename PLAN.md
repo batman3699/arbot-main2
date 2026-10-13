@@ -5983,6 +5983,33 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
   - **Rungs** at threshold + 0, 5, 20, 50, 100 and 200 ticks or bps (`RUNG_OFFSETS`, `rungs: 6`). From +20 they double, so a move between two still pays the lower one at least ~75% of its best. The config takes its bound from the offsets.
   - **The ranking's odds past the largest move a pool has made** were zero, so a spike rung never got a sender. They are now the share at the largest seen, thinned by `TAIL_EXPONENT` (2.87): ten times the largest seen gets about 1/740 of its odds. That is not the uniform prior that filled every sender in the first smoke run.
   - Still 16 senders; the ranking (odds × surplus) decides between small and spike rungs.
+- [x] **R27 — a Morpho flash lender, so trades size past Balancer's 19 WETH (code; the deploy is the operator's).** Spec `docs/superpowers/specs/2026-10-13-morpho-flash-lender-design.md`, plan `docs/superpowers/plans/2026-10-13-morpho-flash-lender.md`.
+  - **Why:** every loan came from Balancer's vault, which holds ~19 WETH.
+    - It capped 61% of the armed + 20 rungs, 98% of + 50, 95% of + 100 and all of + 200.
+    - Priced with a larger lender at one block, rung surplus rose +102% (+ 50), +203% (+ 100) and +304% (+ 200).
+  - **The deployed executor cannot settle an Aave loan.** It counts Aave's pulled-later repayment as profit.
+    - Simulated: a 1 WETH loan with no steps "profited" 1 WETH, and the Balancer control reverted.
+    - Never build `LoanProvider::Aave` for it; `lenders::loan` refuses it.
+  - **`MorphoFlashLender`** (`contracts/lenders/`), Morpho Blue's free flash loan as ERC-3156, which the executor settles correctly:
+    - stateless, ownerless, immutable;
+    - Morpho approved once for the maximum;
+    - 2,090 bytes of runtime;
+    - 9 Foundry tests, 8 mutants killed.
+    - The first, stateful design cost 148,053 gas over Balancer; the stateless one costs 94,167. Gas is the bid divisor in a priority auction.
+  - **Proven on Base through the deployed executor,** with the lender's code injected (`tests/morpho_lender_proof.rs`, `--ignored`):
+    1. An empty 1 WETH loan reverts for zero profit.
+    2. Ticket 51's cycle (the 21:00 UTC spike, block 52,526,060) at **20 WETH from Morpho** settles: gross 13,005,938,766,390,153 wei = the quote to the wei; Morpho is repaid in full; the lender is unchanged.
+    3. At 15 WETH: Balancer 461,224 gas, Morpho 555,391.
+  - **Replays diverge from the chain in busy blocks.** At that block, three replayed swaps on the 0.05% pool ran with other amounts, because 346 of 902 transactions failed in replay. A quote on the chain's logs was 1.086e13 wei above the simulation; on the replay's own logs it matched exactly.
+    - The evaluator now holds a diverged replay to a quote on its own state (`replayed_logs`, `replay_diverged`, `SimCheck.replay_diverged`).
+    - It waits up to 60 s for an answer. The default 3 s could drop a spike block's simulation unseen.
+  - **Both lanes** (`live::lenders`): a size borrows from Balancer while it covers it, then from the Morpho lender (`FlashProviderId(2)`, `LoanProvider::Erc3156`).
+    - The cap is the larger holding, and a size past Balancer's pays `MORPHO_EXTRA_GAS` (95,000).
+    - Reactive: the economics fall back to the lender that covers the amount, the call builder writes the commitment's lender, and last-mile check 9 reads that lender's holding.
+    - Armed: each rung's loan follows its size, and arms record `lender`.
+    - Config: optional `lenders.morpho { address, code_hash }`, whose code is read and checked at boot. Status: a `lenders` line.
+  - 13 Rust mutants, all killed (one after a test was added for the replay's topic filter). Gates green but the two known-red scripts.
+  - **Pending (operator):** broadcast `script/DeployMorphoFlashLender.s.sol`. The dry run gives runtime code hash `0x248bf9d05e91ff2e785fe73abbc4f2fb83ed9a533d0d0d93979c19720c6358b4`. Then `lenders.morpho` in the config, and a shadow redeploy (a new 14-day clock).
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 

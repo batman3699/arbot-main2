@@ -106,6 +106,11 @@ else:
               f"{am['write_failures']} write failures")
         print(f"  moves       {am['move_checks']} swaps checked against the move model: {am['move_tick_mismatches']} wrong ticks, "
               f"{am['move_liquidity_changes']} liquidity changes (unapplied mints/burns)")
+    ln = r.get("lenders")
+    if ln:  # R27: absent from a report before the Morpho lender
+        weth = lambda w: f"{int(w) / 1e18:,.2f} WETH" if w is not None else "unread"
+        print(f"  lenders     balancer {weth(ln.get('balancer_wei'))}, "
+              + (f"morpho {weth(ln['morpho_wei'])}" if ln.get("morpho_wei") is not None else "morpho not configured"))
         print(f"  signer      nonce at boot {sg.get('boot_nonce')}" + ("" if not sg.get("nonce_moved") else
               "  -- SIGNER NONCE MOVED: revoke the trader key (ops/host/README.md)"))
     print(f"  feed        {fd['sessions']} sessions ({max(fd['sessions'] - 1, 0)} reconnects), {fd['dropped']} dropped, lossless {fd['fast_lane_lossless']}")

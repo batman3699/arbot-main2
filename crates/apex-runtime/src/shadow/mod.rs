@@ -224,7 +224,7 @@ struct Shadow {
     /// The block being built, from the feed: what Tier 2 simulates in (R18).
     building: watch::Sender<Option<BlockContext>>,
     /// What the lender holds, for sizing (R21); read with the reader's view.
-    lender: watch::Sender<Option<ethers_core::types::U256>>,
+    lender: watch::Sender<Option<crate::live::lenders::Lenders>>,
     largest_window: AtomicU64,
     recorder: tokio::sync::Mutex<FlashblockRecorder>,
     feed_stats: Versioned<Option<Arc<WsStats>>>,
@@ -460,13 +460,43 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         available: U256::from(holding),
         callback: CallbackConstraints { repay_by_transfer: true, reentrancy_permitted: false, max_callback_gas: u64::MAX },
     };
+    // R27: the Morpho lender, when configured. Its code is read and must be the
+    // code it was deployed with; what it lends is Morpho Blue's holding.
+    let morpho = match &config.lenders.morpho {
+        None => None,
+        Some(m) => {
+            let found = reads.code_hash(m.address, head).await.map_err(|e| boot_err("the Morpho lender's code", e))?;
+            crate::shadow::config::lender_code_ok(found, m).map_err(ShadowError::Boot)?;
+            let held = reads
+                .multicall(&[(WETH, abi::call_address(selector::BALANCE_OF, crate::live::lenders::MORPHO_BLUE))], head)
+                .await
+                .map_err(|e| boot_err("Morpho's holding", e))?
+                .first()
+                .cloned()
+                .flatten()
+                .and_then(|d| abi::word_uint(&d, 0, 128))
+                .ok_or_else(|| ShadowError::Boot("Morpho's holding did not decode".into()))?;
+            info!(lender = %m.address, morpho_weth = held, "the Morpho lender verified");
+            Some((m.address, held))
+        }
+    };
+    let morpho_terms = morpho.map(|(_, held)| FlashTerms {
+        provider: crate::live::lenders::MORPHO_FLASH,
+        available: U256::from(held),
+        // ERC-3156: the lender pulls its repayment after the callback.
+        callback: CallbackConstraints { repay_by_transfer: false, ..terms.callback },
+        ..terms
+    });
 
     // Built before the economics it serves, so it starts at costs no route
     // clears; `Costs::new` aligns it with the economics' before anything prices.
     let unpriced = RouteCosts { other_wei: u128::MAX, wei_per_gas: u128::MAX };
     // R21: what the lender holds, for sizing. Seeded with the boot read; the
     // head loop replaces it after every view the reader takes.
-    let (lender, lender_now) = watch::channel(Some(ethers_core::types::U256::from(holding)));
+    let (lender, lender_now) = watch::channel(Some(crate::live::lenders::Lenders {
+        balancer: ethers_core::types::U256::from(holding),
+        morpho: morpho.map(|(a, h)| (a, ethers_core::types::U256::from(h))),
+    }));
     let armed = Arc::new(crate::armed::engine::Engine::new(
         cycles.clone(),
         crate::armed::engine::EngineSettings {
@@ -486,7 +516,15 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         Arc::new(LivePricer::new(Arc::clone(&book), cycles.clone(), unpriced, gas::MEASURED).with_lender(lender_now));
     let pricer_near_misses = pricer.near_misses();
     let econ = Arc::new(
-        LiveEconomics::new(pricer.clone(), ScenarioPriors::default(), chain_costs, StrategyId(1)).with_flash(terms),
+        {
+            let e = LiveEconomics::new(pricer.clone(), ScenarioPriors::default(), chain_costs, StrategyId(1)).with_flash(terms);
+            // The terms' `available` is the boot read, a pricing hint for the
+            // risk gate; last-mile check 9 reads the chosen lender live.
+            match morpho_terms {
+                Some(t) => e.with_flash(t),
+                None => e,
+            }
+        },
     );
     let costs = Costs::new(Arc::clone(&econ), Arc::clone(&pricer));
     let search = Arc::new(FrontierSearch::new(
@@ -518,6 +556,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
             plan_version: e.plan_version,
             signer: key.address(),
             lender: BALANCER_VAULT,
+            morpho: morpho.map(|_| crate::live::lenders::MORPHO_BLUE),
             loan_token: WETH,
             fee_ceiling_wei: p.fee_ceiling_wei,
             min_profit: p.min_profit_wei,
@@ -558,7 +597,13 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
             Box::new(SystemClock),
         )),
         commitments: commitments.clone(),
-        calls: Arc::new(LiveCallBuilder::new(Arc::clone(&book), cycles.into_values())),
+        calls: Arc::new({
+            let b = LiveCallBuilder::new(Arc::clone(&book), cycles.into_values());
+            match morpho {
+                Some((a, _)) => b.with_morpho(a),
+                None => b,
+            }
+        }),
         signer,
         live: reader.clone(),
         settlement: nothing_sent.clone(),
@@ -844,7 +889,15 @@ impl Shadow {
                         "the signer's nonce moved: a shadow never sends, so the trader key was used elsewhere; revoke it (ops/host/README.md)"
                     );
                 }
-                let held = Some(ethers_core::types::U256::from(v.lender_holding));
+                let held = Some(crate::live::lenders::Lenders {
+                    balancer: ethers_core::types::U256::from(v.lender_holding),
+                    morpho: self
+                        .config
+                        .lenders
+                        .morpho
+                        .as_ref()
+                        .map(|m| (m.address, ethers_core::types::U256::from(v.morpho_holding))),
+                });
                 self.lender.send_if_modified(|now| {
                     let moved = *now != held;
                     *now = held;
@@ -884,7 +937,7 @@ impl Shadow {
             let px = crate::armed::threshold::Pricing {
                 costs: self.costs.route_costs(),
                 gas: gas::MEASURED,
-                cap: *self.lender.borrow(),
+                lenders: *self.lender.borrow(),
                 margin_wei: ethers_core::types::U256::from(self.config.armed.margin_wei),
             };
             let (engine, snapshot) = (Arc::clone(&self.armed), self.book.snapshot());
@@ -1072,6 +1125,13 @@ impl Shadow {
                     move_liquidity_changes,
                 }
             },
+            lenders: {
+                let l = *self.lender.borrow();
+                LendersReport {
+                    balancer_wei: l.map(|l| l.balancer.to_string()),
+                    morpho_wei: l.and_then(|l| l.morpho).map(|(_, h)| h.to_string()),
+                }
+            },
         };
         info!(
             head = ?r.head,
@@ -1147,6 +1207,16 @@ pub struct Report {
     pub signer: SignerReport,
     /// R26: the arming engine, and the move model's check on every Swap.
     pub armed: ArmedReport,
+    /// R27: what each lender holds of WETH, as last read.
+    pub lenders: LendersReport,
+}
+
+/// What each flash lender holds, in wei (R27).
+#[derive(Clone, Debug, Serialize)]
+pub struct LendersReport {
+    pub balancer_wei: Option<String>,
+    /// `None` when the Morpho lender is not configured.
+    pub morpho_wei: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

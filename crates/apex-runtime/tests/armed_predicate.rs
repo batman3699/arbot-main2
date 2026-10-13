@@ -109,7 +109,7 @@ fn the_armed_plan_carries_break_even_floors() {
     let c = cycles.values().next().unwrap();
     let (p0, p1) = if c.legs[0].pool == UNI { (&a, &b) } else { (&b, &a) };
     let (size, mid) = (U256::from(10u128.pow(18)), U256::from(3_000_000_000u64));
-    let call = armed_call(c, [p0, p1], size, mid, EXECUTOR, 8453, 1_791_800_000).unwrap();
+    let call = armed_call(c, [p0, p1], size, mid, EXECUTOR, 8453, 1_791_800_000, &apex_runtime::live::lenders::BALANCER).unwrap();
     let plan = call.plan();
     assert_eq!(plan.min_profit, alloy_primitives::U256::from(1));
     assert_eq!(plan.deadline, 1_791_800_000);

@@ -57,7 +57,7 @@
 use crate::live::abi::{self, selector};
 use crate::live::book::{PoolBook, PoolSnapshot};
 use crate::live::frontier::{
-    Cycle, Leg, AERODROME_V2_ADAPTER, AERODROME_V2_ROUTER, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER,
+    Cycle, Leg, AERODROME_V2_ADAPTER, AERODROME_V2_ROUTER, BALANCER_FLASH, PANCAKE_ADAPTER,
     PANCAKE_SMART_ROUTER, SLIPSTREAM_ADAPTER, SLIPSTREAM_ROUTER, SLIPSTREAM_V3_ADAPTER, SLIPSTREAM_V3_ROUTER,
 };
 use crate::live::inventory::Venue;
@@ -66,7 +66,7 @@ use crate::live::reads::{ChainReads, ReadError};
 use crate::plane::{CallBuilder, Decline};
 use alloy_primitives::{Address, B256, U256};
 use apex_exec::call::ExecutorCall;
-use apex_exec::commitment::{plan_commitment, Loan, LoanProvider, Op, Step};
+use apex_exec::commitment::{plan_commitment, Op, Step};
 use apex_exec::encode::{
     aerodrome_swap_exact_tokens_for_tokens, apply_slippage, generic_step, slipstream_exact_input_single, univ3_path,
     univ3_step, v3_router_exact_input_single, AerodromeSwap, PathHop, PlanEncoder, SlipstreamSwap, V3RouterSwap,
@@ -84,12 +84,21 @@ pub struct LiveCallBuilder {
     book: Arc<PoolBook>,
     /// By route hash: a candidate carries a commitment, not an id.
     cycles: BTreeMap<B256, Cycle>,
+    /// The Morpho lender's address, when it is configured (R27).
+    morpho: Option<Address>,
 }
 
 impl LiveCallBuilder {
     pub fn new(book: Arc<PoolBook>, cycles: impl IntoIterator<Item = Cycle>) -> Self {
         let cycles = cycles.into_iter().map(|c| (c.commitment.route_hash, c)).collect();
-        Self { book, cycles }
+        Self { book, cycles, morpho: None }
+    }
+
+    /// Build loans from the Morpho lender at `lender` as well as Balancer's (R27).
+    #[must_use]
+    pub fn with_morpho(mut self, lender: Address) -> Self {
+        self.morpho = Some(lender);
+        self
     }
 }
 
@@ -107,12 +116,15 @@ impl CallBuilder for LiveCallBuilder {
             return Err(refuse("the commitment is for another route"));
         }
         let cycle = self.cycles.get(&k.route_hash).ok_or_else(|| refuse("no live cycle for this route"))?;
-        if k.flash_source != BALANCER_FLASH {
-            return Err(refuse(format!(
-                "flash source {} is not wired: the executor takes one loan, and only Balancer's is",
-                k.flash_source.0
-            )));
-        }
+        // The commitment's lender is the plan's (R27): Balancer's vault, or the
+        // Morpho lender once configured; never anything else.
+        let choice = match k.flash_source {
+            BALANCER_FLASH => crate::live::lenders::BALANCER,
+            crate::live::lenders::MORPHO_FLASH => crate::live::lenders::morpho(
+                self.morpho.ok_or_else(|| refuse("the Morpho lender is not configured"))?,
+            ),
+            other => return Err(refuse(format!("flash source {} is not wired", other.0))),
+        };
         let [input] = k.exact_inputs[..] else {
             return Err(refuse(format!("a cycle has one exact input, not {}", k.exact_inputs.len())));
         };
@@ -142,12 +154,7 @@ impl CallBuilder for LiveCallBuilder {
             self.step(&cycle.legs[0], input, mid, k)?,
             self.step(&cycle.legs[1], mid, floor.max(bound), k)?,
         ];
-        let loan = Loan {
-            token: cycle.start,
-            amount: input,
-            provider: LoanProvider::Balancer,
-            provider_addr: BALANCER_VAULT,
-        };
+        let loan = crate::live::lenders::loan(&choice, cycle.start, input).map_err(refuse)?;
         // Zero: the hops' own bounds are the slippage policy, and the executor
         // refuses a cycle-level figure above its configured maximum.
         let plan = PlanEncoder::build(loan, steps, 0, k.min_profit, k.chain_id.0, k.deadline);

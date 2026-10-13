@@ -56,6 +56,9 @@ pub struct ChainView {
     pub signer_pending_nonce: u64,
     /// The lender's holding of the loan token.
     pub lender_holding: u128,
+    /// Morpho Blue's holding of the loan token, which the Morpho lender lends
+    /// (R27); 0 when the Morpho lender is not configured.
+    pub morpho_holding: u128,
     /// The capacity model's largest measured window; 0 while it is `Unknown`.
     pub block_gas: u64,
     pub refreshed_at: Instant,
@@ -71,6 +74,9 @@ pub struct ReaderConfig {
     pub plan_version: u32,
     pub signer: Address,
     pub lender: Address,
+    /// Morpho Blue, when the Morpho lender is configured: its holding is that
+    /// lender's (R27).
+    pub morpho: Option<Address>,
     pub loan_token: Address,
     pub fee_ceiling_wei: u128,
     pub min_profit: i128,
@@ -115,6 +121,17 @@ impl ChainReader {
             reads.multicall(&lender, head.number),
         );
         let malformed = |what: &str| ReadError::Malformed(format!("{what} did not decode"));
+        let morpho_holding = match c.morpho {
+            None => 0,
+            Some(m) => reads
+                .multicall(&[(c.loan_token, abi::call_address(selector::BALANCE_OF, m))], head.number)
+                .await?
+                .first()
+                .cloned()
+                .flatten()
+                .and_then(|d| abi::word_uint(&d, 0, 128))
+                .ok_or_else(|| malformed("Morpho's balance"))?,
+        };
         let view = ChainView {
             block: head.number,
             base_fee_wei: base_fee,
@@ -130,6 +147,7 @@ impl ChainReader {
                 .flatten()
                 .and_then(|d| abi::word_uint(&d, 0, 128))
                 .ok_or_else(|| malformed("the lender's balance"))?,
+            morpho_holding,
             block_gas,
             refreshed_at: Instant::now(),
         };
@@ -159,7 +177,12 @@ impl LiveReader for ChainReader {
             remaining_block_gas: v.block_gas,
             signer_balance_wei: v.signer_balance_wei,
             flash_required: u128::try_from(t.exact_input).unwrap_or(u128::MAX),
-            flash_available: v.lender_holding,
+            // The holding of the lender the ticket borrows from (R27).
+            flash_available: if t.flash_source.as_ref().is_some_and(|f| f.provider == crate::live::lenders::MORPHO_FLASH) {
+                v.morpho_holding
+            } else {
+                v.lender_holding
+            },
             live_hooks: None,
             live_venue_versions: self.book.versions_for(&pools),
             chain_pending_nonce: v.signer_pending_nonce,

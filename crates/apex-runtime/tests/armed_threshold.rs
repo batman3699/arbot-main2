@@ -62,7 +62,7 @@ fn px(margin: u128) -> Pricing {
     Pricing {
         costs: RouteCosts { other_wei: 20_000_000_000, wei_per_gas: 5_000_000 },
         gas: gas::MEASURED,
-        cap: Some(U256::from(10u128.pow(21))),
+        lenders: Some(apex_runtime::live::lenders::Lenders::balancer_only(U256::from(10u128.pow(21)))),
         margin_wei: U256::from(margin),
     }
 }

@@ -653,6 +653,17 @@ async fn a_borrowing_route_is_quoted_on_its_lenders_terms() {
     let exact = base().with_flash(terms(1, size.get()));
     assert_eq!(exact.assemble(&p, refinement()).unwrap().flash_source.unwrap().availability_probability, 1.0, "the whole holding is lendable");
 
+    // R27: past its own lender's holding, a route borrows from another lender of
+    // the same asset that covers it; with both covering, its own (Balancer).
+    let short = size.get() - AlloyU256::from(1u64);
+    let fallback = base().with_flash(terms(1, short)).with_flash(terms(2, AlloyU256::MAX));
+    let q = fallback.assemble(&p, refinement()).unwrap().flash_source.unwrap();
+    assert_eq!((q.provider, q.availability_probability), (FlashProviderId(2), 1.0));
+    let both = base().with_flash(terms(1, AlloyU256::MAX)).with_flash(terms(2, AlloyU256::MAX));
+    assert_eq!(both.assemble(&p, refinement()).unwrap().flash_source.unwrap().provider, FlashProviderId(1));
+    let neither = base().with_flash(terms(1, short)).with_flash(terms(2, short));
+    let q = neither.assemble(&p, refinement()).unwrap().flash_source.unwrap();
+    assert_eq!((q.provider, q.availability_probability), (FlashProviderId(1), 0.0), "quoted on its own terms, unavailable");
     p.flash_source = None;
     assert!(base().with_flash(terms(1, AlloyU256::MAX)).assemble(&p, refinement()).unwrap().flash_source.is_none());
 }
