@@ -82,8 +82,9 @@ rival while bidding zero.
 ### 1. `apex canary`: a command that sends
 
 `apex canary --config ops/canary.base.yaml` runs the shadow's process with one
-difference: the reactive plane's lane is `DispatchLane::Live`. The armed lane,
-the reports, the race ledger and the flashblock ledger are unchanged.
+difference: the reactive plane's lane is a new `DispatchLane::Canary` (§1a).
+The armed lane, the reports, the race ledger and the flashblock ledger are
+unchanged.
 
 - **`apex shadow` stays unable to send.** Its lane still holds an
   `Arc<NullDispatcher>`, a type that cannot send. The loader refuses a
@@ -95,6 +96,43 @@ the reports, the race ledger and the flashblock ledger are unchanged.
   The two share the trader key and must never run together.
 
 Starting the canary ends the current shadow run (archived as `run-10`).
+
+### 1a. INV-17 on the canary lane
+
+Found while planning, and decided by the operator on 2026-10-15 ("canary-only
+waiver").
+
+**The problem.** INV-17 lets only a `Proven` route authorize a live ticket.
+Every reactive candidate is `Heuristic`, because the allocation certificate is
+Phase 12's `certify`. On a `Live` lane the risk gate would refuse every one, and
+the canary would send nothing. The shadow passes only because the gate waives
+`RouteAuthorizationValid` on a shadow lane and names the waiver (operator
+decision, 2026-09-30).
+
+**The canary gets the same waiver, on its own lane:**
+
+- **A new lane and lane kind:** `DispatchLane::Canary(Arc<dyn Sender>)` and
+  `LaneKind::Canary`.
+- **What the gate waives:** on a canary lane, exactly `RouteAuthorizationValid`.
+  It returns `Admission::CanaryOnly { waived }`. Posture, the breaker, the
+  canary's hold and every other clause refuse as on a live lane.
+- **What the plane refuses:**
+  - a `CanaryOnly` admission on any lane but `Canary`;
+  - a `ShadowOnly` admission on any lane but `Shadow`.
+- **The waiver is on the record:** it is written into every send record.
+
+**What stands in for the certificate:**
+
+- exact quotes on the five venues;
+- the certified size (R27.2);
+- Tier 2 at the exact size;
+- hop minimums at the exact quote;
+- the loss cap.
+
+A wrong quote can cost a revert's gas and no more.
+
+**It is lifted** when a certificate exists, or by a later decision informed by
+landed trades matching their predictions to the wei.
 
 ### 2. The configuration
 
@@ -188,7 +226,7 @@ says so.
    though the risk gate (§8) should already have stopped it.
 2. **A send record is appended to `canary.jsonl` and fsynced**, before
    anything leaves the process: ticket, nonce, transaction hash, gas limit, fee
-   caps, predicted gross and net, and the time.
+   caps, predicted gross and net, the waived clauses, and the time.
 3. **`eth_sendRawTransaction`** goes to the first `rpc.http` endpoint, BlockPI's
    keyed and MEV-protected one, with the request's exact signed bytes (INV-10).
 4. **The answer is returned:**
@@ -379,6 +417,10 @@ Every guard gets a test that fails without it, and a mutation run.
   - a revert → `SettlementReverted`, with its nonce released as landed;
   - a timeout with the nonce unconsumed → unresolved.
 - **Recovery.** Each row of §9's table.
+- **INV-17 on the canary lane.**
+  - The gate on a canary lane waives only route authorization, and names it.
+  - A `CanaryOnly` admission never reaches a live or shadow lane.
+  - A live lane still refuses a `Heuristic` candidate.
 - **Kill switches on chain.** A view with `executors(trader)` false, or the
   circuit open, reads the executor's version as 0.
 - **End to end on a fork** (ignored by default; network). Anvil forks Base at
