@@ -6133,6 +6133,13 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - **Four passes a candidate:** about 12 ms at the median and 67 ms at the 90th percentile before, 1 ms and 6 ms now. On the largest candidates the old pair took up to 200 ms: a whole flashblock, between "proposed" and the simulation.
     - The new pair nets strictly more on 16 cases and is never under the old by more than the tolerance.
   - **Not here:** one pass instead of four (shared state on the capture path, INV-11); the failure cost charged twice in the scenarios.
+  - **On the host since 2026-10-14 02:28:03 UTC** (0a6c4fa; R27.2's 71 minutes are `/opt/apex/var/run-9`). First 10 minutes: an armed pass 11 ms, 99.9% of slots priced at the book as it stood, 0.5 waiting a pass, half a core.
+    - **The reactive figures are not in:** no candidate reached the plane in R27.2's 71 minutes or in these 10 (6,625 and 813 events, every priced route declined by Engine C). Received-to-proposed and picked-to-handled are to be read against R27.1's 26 candidates (53.6 ms and 3.3 ms at the median, 111 and 126 at the 90th percentile) once there are ten or more.
+  - **What the contest analyzer says of the reactive lane** (run-5, R26.3's 13.2 hours, co-located; `scripts/data/race_analysis.py`, 2026-10-14):
+    - 60 gaps were contested by a rival within four blocks. Of the run's 40 signed tickets, 23 had no rival; of the 17 that had one, sending after Tier 2 lands a flashblock or more ahead on 10, in the rival's flashblock on 4, behind on 3.
+    - **So about 33 of 40 would have landed first,** and 4 more with a priority fee: the lane bids none.
+    - Detection is the slow stage: from the trigger's flashblock reaching Base's public stream to the loop taking the event from BlockPI's `pendingLogs` is 98 ms at the median and 263 ms at the 90th percentile, 21 ms of it inside the process. The host already receives the public stream.
+    - The analyzer hit BlockPI's rate limit on the next run it was pointed at. It must not share the shadow's key while the shadow runs.
 - [x] **R27.3 — BlockPI's units go by the byte, and the host moves 8 GB a day.** The operator reported 210 million of 500 million request units used since the AWS launch: 5.2 million an hour, 2.3 days left at that rate.
   - BlockPI prices a method not in its table at 5 units per 250 bytes, and that fits: read from the host's sockets on 2026-10-14, in 35 minutes,
     - the HTTP reads (per-head multicalls, and a ladder reload for every mint or burn: 843 in that time) received 93 MB and sent 50 MB;
