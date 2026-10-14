@@ -202,7 +202,7 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
     let declared = plan_commitment(&plan, 8453, EXECUTOR);
     let call = ExecutorCall::from_checked(SignedPlan::check(plan, declared, 8453, EXECUTOR).unwrap());
     let key = LaneKey::from_hex(&Secret::new(DEV_KEY.to_string())).unwrap();
-    let nonce = u64::from_str_radix(cast(&["nonce", &format!("{DEV:#x}"), "--rpc-url", LOCAL]).trim_start_matches("0x"), 10).unwrap_or(0);
+    let nonce = cast(&["nonce", &format!("{DEV:#x}"), "--rpc-url", LOCAL]).parse::<u64>().expect("a nonce");
     let signed = key
         .sign_eip1559(&Eip1559Tx {
             chain_id: 8453,
