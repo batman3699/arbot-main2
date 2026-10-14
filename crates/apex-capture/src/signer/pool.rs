@@ -313,6 +313,12 @@ impl LaneAssignment<'_> {
 
     /// Take the next nonce for this lane. Only reachable through an assignment,
     /// which is what makes "one allocator at a time per lane" structural.
+    /// The lane's configured gas reserve, in wei (§18.2): what it must keep
+    /// beyond the transaction it is about to sign (R28).
+    pub fn gas_reserve_wei(&self) -> u128 {
+        self.pool.lanes[self.index].cfg.gas_reserve_wei
+    }
+
     pub fn reserve_nonce(&self, chain_pending: u64, now: UnixNanos) -> ReservedNonce {
         recover(&self.pool.lanes[self.index].nonce).reserve(chain_pending, now)
     }

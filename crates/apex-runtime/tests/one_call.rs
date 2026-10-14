@@ -201,10 +201,32 @@ fn fee_caps_are_per_gas_and_under_the_ceiling() {
     let mut r = readings();
     r.observed_fee_wei = 200_000;
     r.fee_ceiling_wei = 5_000_000;
-    assert_eq!(fee_caps(&r), FeeCaps { max_fee_per_gas: 400_000, max_priority_fee_per_gas: 0 });
+    let mut cost = candidate(1, 47_079_437, 320_000_000_000).total_execution_cost;
+    cost.priority_fee = 0;
+    assert_eq!(fee_caps(&r, &cost), FeeCaps { max_fee_per_gas: 400_000, max_priority_fee_per_gas: 0 });
 
     r.fee_ceiling_wei = 300_000;
-    assert_eq!(fee_caps(&r).max_fee_per_gas, 300_000, "the ceiling binds");
+    assert_eq!(fee_caps(&r, &cost).max_fee_per_gas, 300_000, "the ceiling binds");
+}
+
+/// **R28: the tip is signed per unit of gas.** The economics charges the tip as
+/// a total; the caps divide it by the expected gas, rounding down, and add it
+/// to twice the base fee under the ceiling.
+#[test]
+fn the_tip_is_signed_per_unit_of_expected_gas() {
+    let mut r = readings();
+    r.observed_fee_wei = 200_000;
+    r.fee_ceiling_wei = 5_000_000;
+    let mut cost = candidate(1, 47_079_437, 320_000_000_000).total_execution_cost;
+    cost.gas_used_distribution.p50 = apex_types::cost::GasUsed(400_000);
+    cost.priority_fee = 4_000_000_399; // 10,000.000998 a gas
+    let caps = fee_caps(&r, &cost);
+    assert_eq!(caps.max_priority_fee_per_gas, 10_000);
+    assert_eq!(caps.max_fee_per_gas, 410_000);
+    // Under a ceiling that binds, the tip never exceeds the cap.
+    let mut low = r.clone();
+    low.fee_ceiling_wei = 5_000;
+    assert_eq!(fee_caps(&low, &cost), FeeCaps { max_fee_per_gas: 5_000, max_priority_fee_per_gas: 5_000 });
 }
 
 /// And the plane actually uses them.
@@ -214,5 +236,5 @@ async fn the_signer_is_given_the_fee_caps_of_the_readings() {
     let r = readings();
     let plane = plane(Arc::new(FixtureCalls), Arc::new(AlwaysSucceeds), signer.clone(), r.clone());
     run_one(&plane).await;
-    assert_eq!(signer.seen.lock().unwrap()[0].1, fee_caps(&r));
+    assert_eq!(signer.seen.lock().unwrap()[0].1, fee_caps(&r, &candidate(1, 47_079_437, 320_000_000_000).total_execution_cost));
 }

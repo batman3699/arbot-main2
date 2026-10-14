@@ -252,7 +252,7 @@ async fn the_plane_signs_the_simulated_call_with_the_lane_key() {
     assert_eq!(tx.chain_id().map(|c| c.as_u64()), Some(BASE.0));
     assert_eq!(tx.nonce().map(|n| n.as_u64()), Some(r.chain_pending_nonce));
     assert_eq!(tx.gas().map(|g| g.as_u64()), Some(payload.gas_limit.0));
-    assert_eq!(fees, fee_caps(&r));
+    assert_eq!(fees, fee_caps(&r, &candidate(1, 47_079_437, 320_000_000_000).total_execution_cost));
     match &tx {
         TypedTransaction::Eip1559(inner) => {
             assert_eq!(inner.max_fee_per_gas.map(|v| v.as_u128()), Some(fees.max_fee_per_gas));

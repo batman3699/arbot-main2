@@ -169,6 +169,9 @@ pub enum AdapterError {
     /// The chain answered something this adapter cannot interpret. Never
     /// converted into a default (§5.6).
     Uninterpretable { detail: String },
+    /// The transaction was included and reverted (R28): a cost with a cause,
+    /// not an unreachable chain.
+    Reverted { tx: B256, class: apex_types::sim::RevertClass, gas_used: u64, spent_wei: u128 },
 }
 
 impl std::fmt::Display for AdapterError {
@@ -178,6 +181,9 @@ impl std::fmt::Display for AdapterError {
             Self::NotSupportedOnThisChain { what } => write!(f, "{what} is not supported here"),
             Self::Rejected(r) => write!(f, "{r}"),
             Self::Uninterpretable { detail } => write!(f, "uninterpretable answer: {detail}"),
+            Self::Reverted { tx, class, gas_used, spent_wei } => {
+                write!(f, "{tx} reverted ({class:?}) after {gas_used} gas, costing {spent_wei} wei")
+            }
         }
     }
 }

@@ -242,6 +242,150 @@ async fn an_identical_commitment_cannot_be_locked_twice() {
     assert!(plane.lock(&c).is_ok(), "releasing the lock frees the commitment");
 }
 
+/// **R28: the on-chain floor is one wei.** Once sent, a trade that lands with
+/// any positive gross loses less than one that reverts after both swaps, so the
+/// commitment's minimum is the loan plus one wei, whatever the expected net.
+#[tokio::test]
+async fn the_floor_is_one_wei_whatever_the_expected_net() {
+    let plane = landing_plane();
+    let c = candidate(1, 47_079_437, 320_000_000_000);
+    let locked = plane.lock(&c).expect("locks");
+    assert_eq!(locked.commitment().min_profit, alloy_primitives::U256::from(1u64));
+}
+
+/// Refuses every payload, as an endpoint that answered no.
+struct Refuses;
+
+impl apex_capture::dispatch::Dispatcher for Refuses {
+    fn dispatch(
+        &self,
+        _req: &apex_capture::dispatch::DispatchRequest,
+        _permit: &apex_capture::recover::DispatchPermit<'_>,
+        _now: UnixNanos,
+    ) -> Result<apex_capture::dispatch::AckLadder, apex_capture::dispatch::DispatchError> {
+        Err(apex_capture::dispatch::DispatchError::Rejected {
+            lane: apex_types::ids::SubmissionLaneId(1),
+            detail: "no".into(),
+        })
+    }
+}
+
+fn plane_over(pool: &Arc<SignerPool>, dispatch: DispatchLane, chain: FakeChain, readings: apex_runtime::plane::LiveReadings) -> Plane {
+    let plane = Plane::new(Ports {
+        registry: Arc::new(TicketRegistry::new(Box::new(InMemoryJournal::new()), Box::new(ManualClock::at(BOOT.0)))),
+        pool: Arc::clone(pool),
+        gate: Arc::new(DispatchGate::shut()),
+        dispatch,
+        chain: Arc::new(chain),
+        search: Arc::new(FixedSearch::new(vec![candidate(1, 47_079_437, 320_000_000_000)])),
+        econ: Arc::new(PassThroughEconomics::default()),
+        sim: Arc::new(AlwaysSucceeds),
+        risk: Arc::new(AlwaysAdmits),
+        commitments: Arc::new(FixtureCommitments),
+        calls: Arc::new(FixtureCalls),
+        signer: Arc::new(EchoSigner),
+        live: Arc::new(FixedReadings(readings)),
+        settlement: Arc::new(LandsAndFinalizes),
+    });
+    plane.boot(&NoChain, BOOT).expect("boot");
+    plane
+}
+
+fn next_nonce(pool: &SignerPool) -> u64 {
+    let need = apex_capture::signer::LaneRequirements {
+        chain: pool.auth().chain,
+        executor: pool.auth().executor,
+        executor_version: pool.auth().executor_version,
+        min_gas_reserve_wei: 0,
+    };
+    pool.assign(&need).expect("the lane is free").reserve_nonce(0, BOOT).get()
+}
+
+fn only_outcome(handled: &[Handled]) -> apex_types::ticket::TicketOutcome {
+    match handled {
+        [Handled::Closed { outcome, .. }] => (**outcome).clone(),
+        other => panic!("expected one closed ticket, got {other:?}"),
+    }
+}
+
+/// **R28: a refused send gives its nonce back.** The endpoint said nothing
+/// reached the chain; keeping the nonce reserved would make the next ticket
+/// sign behind a gap that never closes.
+#[tokio::test]
+async fn a_refused_send_releases_its_nonce() {
+    let pool = Arc::new(pool());
+    let plane = plane_over(&pool, DispatchLane::Live(Arc::new(Refuses)), FakeChain::landing(), readings());
+    let _ = plane.on_event(&recorded_stream()[0]).await;
+    assert_eq!(next_nonce(&pool), 0, "the refused send's nonce is reused");
+}
+
+/// **R28: a transaction that reverted on chain closes as a revert**, with its
+/// cost, and its nonce is spent: a later ticket signs the next one.
+#[tokio::test]
+async fn an_onchain_revert_closes_as_a_revert_and_spends_its_nonce() {
+    let pool = Arc::new(pool());
+    let plane = plane_over(&pool, DispatchLane::Live(Arc::new(NullDispatcher::new())), FakeChain::landing().reverting(), readings());
+    let outcome = only_outcome(&plane.on_event(&recorded_stream()[0]).await);
+    let apex_types::ticket::TicketOutcome::ExplicitFailure {
+        code: apex_types::ticket::TerminalFailure::Reverted { revert_class, .. },
+        ..
+    } = &outcome
+    else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(*revert_class, apex_types::sim::RevertClass::MinOutNotMet);
+    assert_eq!(next_nonce(&pool), 1, "nonce 0 was spent");
+}
+
+/// **R28: a ticket refused before it is sent gives its nonce back.** The nonce
+/// is reserved before Tier 2, the risk gate and last-mile; a refusal by any of
+/// them sent nothing, and a reservation kept for it would make the next send
+/// sign one nonce too high and wait behind the gap for ever.
+#[tokio::test]
+async fn a_ticket_refused_before_it_is_sent_gives_its_nonce_back() {
+    let mut poor = readings();
+    poor.signer_balance_wei = 1_000;
+    let pool = Arc::new(pool());
+    let plane = plane_over(&pool, DispatchLane::Live(Arc::new(NullDispatcher::new())), FakeChain::landing(), poor);
+    let outcome = only_outcome(&plane.on_event(&recorded_stream()[0]).await);
+    assert!(format!("{outcome:?}").contains("signer_balance"), "refused at last-mile: {outcome:?}");
+    assert_eq!(next_nonce(&pool), 0, "the refused ticket's nonce is reused");
+}
+
+/// **R28: the requirement is the reserve plus the most the trade can cost**, to
+/// the wei: gas limit 400,000 at a max fee of twice the 200,000 base fee, plus
+/// the lane's 1 ETH reserve. One wei less is refused.
+#[tokio::test]
+async fn the_signer_must_hold_its_reserve_and_the_most_the_trade_can_cost() {
+    let need = 1_000_000_000_000_000_000u128 + 400_000 * 400_000;
+    let outcome_with = |balance: u128| {
+        let mut r = readings();
+        r.signer_balance_wei = balance;
+        let chain = FakeChain::landing().choosing(apex_types::cost::GasLimit(400_000));
+        plane_over(&Arc::new(pool()), DispatchLane::Live(Arc::new(NullDispatcher::new())), chain, r)
+    };
+    let enough = only_outcome(&outcome_with(need).on_event(&recorded_stream()[0]).await);
+    assert!(!format!("{enough:?}").contains("signer_balance"), "exactly enough: {enough:?}");
+    let short = only_outcome(&outcome_with(need - 1).on_event(&recorded_stream()[0]).await);
+    assert!(format!("{short:?}").contains("signer_balance"), "one wei short: {short:?}");
+}
+
+/// **R28: a sending lane checks the signer can pay.** Gas limit times the max
+/// fee, plus the lane's reserve, against the balance the reader saw; a shadow
+/// lane, whose trader holds nothing, does not.
+#[tokio::test]
+async fn a_sending_lane_refuses_a_signer_that_cannot_pay() {
+    let mut poor = readings();
+    poor.signer_balance_wei = 1_000;
+    let live = plane_over(&Arc::new(pool()), DispatchLane::Live(Arc::new(NullDispatcher::new())), FakeChain::landing(), poor.clone());
+    let outcome = only_outcome(&live.on_event(&recorded_stream()[0]).await);
+    assert!(format!("{outcome:?}").contains("signer_balance"), "{outcome:?}");
+
+    let shadow = plane_over(&Arc::new(pool()), DispatchLane::Shadow(Arc::new(NullDispatcher::new())), FakeChain::landing(), poor);
+    let outcome = only_outcome(&shadow.on_event(&recorded_stream()[0]).await);
+    assert!(!format!("{outcome:?}").contains("signer_balance"), "the shadow does not check: {outcome:?}");
+}
+
 /// The same thing through the plane, concurrently — which is the case that
 /// actually happens. A websocket reconnect replays a block while the first
 /// delivery is still in flight.

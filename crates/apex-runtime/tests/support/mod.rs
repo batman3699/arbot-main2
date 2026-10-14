@@ -462,7 +462,10 @@ pub fn readings() -> LiveReadings {
         observed_fee_wei: 200_000,
         fee_ceiling_wei: 5_000_000,
         remaining_block_gas: 20_000_000,
-        signer_balance_wei: 1_000_000_000_000_000_000,
+        // R28: twice the test pools' 1 ETH reserve, so a live lane's funding
+        // check (gas limit x max fee + reserve) passes; a test about an
+        // underfunded signer lowers it.
+        signer_balance_wei: 2_000_000_000_000_000_000,
         flash_required: 0,
         flash_available: 0,
         live_hooks: None,
@@ -481,11 +484,19 @@ pub struct FakeChain {
     pub reconciled: AtomicU64,
     /// The gas limit it schedules with, when not the candidate's own.
     pub chooses: Option<GasLimit>,
+    /// R28: every transaction reconciles as a revert.
+    pub reverts: bool,
 }
 
 impl FakeChain {
     pub fn landing() -> Self {
-        Self { landed: true, observed: AtomicU64::new(0), reconciled: AtomicU64::new(0), chooses: None }
+        Self { landed: true, observed: AtomicU64::new(0), reconciled: AtomicU64::new(0), chooses: None, reverts: false }
+    }
+
+    /// Every transaction reconciles as a revert at hop 2's minimum (R28).
+    pub fn reverting(mut self) -> Self {
+        self.reverts = true;
+        self
     }
 
     /// Schedules every candidate at `limit`, so a test can tell the limit the
@@ -550,6 +561,14 @@ impl ChainExecutionAdapter for FakeChain {
     }
     async fn reconcile_final_state(&self, _h: B256) -> AdapterResult<PnlAttribution> {
         self.reconciled.fetch_add(1, Ordering::SeqCst);
+        if self.reverts {
+            return Err(apex_chain::adapter::AdapterError::Reverted {
+                tx: _h,
+                class: apex_types::sim::RevertClass::MinOutNotMet,
+                gas_used: 411_945,
+                spent_wei: 2_471_670_000_000,
+            });
+        }
         Ok(PnlAttribution {
             ticket_id: apex_types::ids::TicketId(0),
             chain: BASE,

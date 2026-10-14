@@ -163,6 +163,8 @@ pub enum Decline {
     /// §33 bucket that says so. Folding it into a generic failure would put a
     /// venue problem in a bucket nobody acts on.
     VenueUnverified { detail: String },
+    /// R28: the transaction was included and reverted on chain.
+    SettlementReverted { class: RevertClass, gas_used: u64, spent_wei: u128 },
 }
 
 impl std::fmt::Display for Decline {
@@ -184,6 +186,9 @@ impl std::fmt::Display for Decline {
             Self::ChainUnavailable { detail } => write!(f, "the chain could not be asked: {detail}"),
             Self::Uncommittable { detail } => write!(f, "no commitment could be built: {detail}"),
             Self::VenueUnverified { detail } => write!(f, "venue not verified: {detail}"),
+            Self::SettlementReverted { class, gas_used, spent_wei } => {
+                write!(f, "reverted on chain ({class:?}) after {gas_used} gas, costing {spent_wei} wei")
+            }
         }
     }
 }
@@ -221,6 +226,10 @@ impl ExplainsMiss for Decline {
             // true today. An Ethereum adapter must carry the distinction on the
             // error rather than have this function guess.
             Self::DispatchFailed(_) => MissReason::SequencerRejected,
+            // R28: a deadline that passed is lateness; a revert after the swaps
+            // means the state moved under the trade.
+            Self::SettlementReverted { class: RevertClass::Expired, .. } => MissReason::TooSlow,
+            Self::SettlementReverted { .. } => MissReason::CompetitorWon,
         }
     }
 }
@@ -510,22 +519,21 @@ pub struct FeeCaps {
 }
 
 /// The caps a ticket signs with, from the readings taken for its last-mile
-/// check.
+/// check and the costs its economics charged.
 ///
-/// Twice the base fee observed at the head — the conventional EIP-1559 headroom,
-/// so a transaction survives a run of full blocks rather than failing on the
-/// first increase — and never above the policy ceiling, which is the same
-/// ceiling revalidation checks the observed fee against.
+/// Twice the base fee observed at the head, plus the tip — the conventional
+/// EIP-1559 headroom, so a transaction survives a run of full blocks rather
+/// than failing on the first increase — and never above the policy ceiling,
+/// which is the same ceiling revalidation checks the observed fee against.
 ///
-/// **No tip.** §4.5 says a priority fee on Base ranks within the sequencer's
-/// window, and nothing has measured what it buys; `LiveEconomics` prices the
-/// priority fee at zero for the same reason. A fabricated bid is a cost the EV
-/// would then have to clear.
-pub fn fee_caps(r: &LiveReadings) -> FeeCaps {
-    FeeCaps {
-        max_fee_per_gas: r.observed_fee_wei.saturating_mul(2).min(r.fee_ceiling_wei),
-        max_priority_fee_per_gas: 0,
-    }
+/// **The tip** is the economics' `priority_fee` (R28: a share of the expected
+/// net), signed per unit of the expected gas, rounded down, and never above the
+/// max fee, which EIP-1559 requires.
+pub fn fee_caps(r: &LiveReadings, c: &TotalExecutionCost) -> FeeCaps {
+    let gas = u128::from(c.gas_used_distribution.p50.0).max(1);
+    let tip = c.priority_fee / gas;
+    let max_fee_per_gas = r.observed_fee_wei.saturating_mul(2).saturating_add(tip).min(r.fee_ceiling_wei);
+    FeeCaps { max_fee_per_gas, max_priority_fee_per_gas: tip.min(max_fee_per_gas) }
 }
 
 /// What the plane knows about a ticket that its signed bytes do not say, handed
@@ -640,6 +648,28 @@ pub struct Ports {
     pub signer: Arc<dyn Signer>,
     pub live: Arc<dyn LiveReader>,
     pub settlement: Arc<dyn SettlementFeed>,
+}
+
+/// A nonce reserved for a ticket that has not been sent (R28).
+///
+/// The plane reserves the nonce before Tier 2, the risk gate and last-mile, and
+/// any of them can refuse the ticket. A refused ticket sent nothing, and a
+/// reservation kept for it advances the lane's high-water mark: the next send
+/// would sign one nonce too high and wait behind a gap the chain never fills.
+/// So until the payload is handed to the dispatcher, dropping this gives the
+/// reservation back; after that, the dispatch's own outcome decides.
+struct Unsent<'a, 'p> {
+    assignment: &'a apex_capture::signer::LaneAssignment<'p>,
+    nonce: apex_capture::signer::ReservedNonce,
+    armed: bool,
+}
+
+impl Drop for Unsent<'_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.assignment.release_nonce(self.nonce, false);
+        }
+    }
 }
 
 /// Observations already handled, by `(chain, ordinal)`.
@@ -964,8 +994,11 @@ impl Plane {
     /// which tells an operator to go verify the venue, and it was arriving as a
     /// generic `TooSlow`.
     pub fn lock(&self, candidate: &Candidate) -> Result<Locked<'_>, LockFailure> {
-        let min_profit =
-            U256::from(u128::try_from(candidate.expected_net_profit.max(1)).unwrap_or(u128::MAX));
+        // R28: one wei. Once sent, a trade that lands with any positive gross
+        // loses less than one that reverts after both swaps, which on Base pays
+        // its gas. The decision to send is where the expected net is held to
+        // the policy's minimum (risk gate; last-mile check 6).
+        let min_profit = U256::from(1u64);
         let commitment = self
             .ports
             .commitments
@@ -1161,6 +1194,8 @@ impl Plane {
         let assignment = self.ports.pool.assign(&need).map_err(Decline::NoSignerLane)?;
         let readings = self.ports.live.read(&ticket_snapshot(guard, candidate)).await?;
         let nonce = assignment.reserve_nonce(readings.chain_pending_nonce, now);
+        // R28: given back on any refusal before the send (see `Unsent`).
+        let mut unsent = Unsent { assignment: &assignment, nonce, armed: true };
         self.advance(guard, TicketStatus::Reserved)?;
 
         // ---- Step 3: reserve compute.
@@ -1216,6 +1251,16 @@ impl Plane {
         self.authorized.fetch_add(1, Ordering::Relaxed);
 
         // ---- Step 4: last-mile revalidation.
+        let fees = fee_caps(&readings, &repriced.total_execution_cost);
+        // R28: a lane that sends must hold the most this transaction can cost,
+        // plus its reserve. A shadow lane's trader holds nothing, and a ticket
+        // refused for that would measure the wallet, not the trade.
+        let required_reserve_wei = match self.ports.dispatch.kind() {
+            LaneKind::Shadow => 0,
+            LaneKind::Live | LaneKind::Canary => u128::from(gas_limit.0)
+                .saturating_mul(fees.max_fee_per_gas)
+                .saturating_add(assignment.gas_reserve_wei()),
+        };
         let ticket = ticket_snapshot(guard, &repriced);
         let ctx = last_mile_context(
             &ticket,
@@ -1224,6 +1269,7 @@ impl Plane {
             nonce,
             assignment.lane(),
             gas_limit,
+            required_reserve_wei,
             self.ports.registry.now(),
         );
         let proof = last_mile(&ctx).map_err(|f| Decline::Revalidation(f.check))?;
@@ -1233,7 +1279,6 @@ impl Plane {
         // that may be on chain, because it may be.
         self.advance(guard, TicketStatus::Signed)?;
         let authorization = SigningAuthorization::new(ticket.ticket_id, nonce, proof);
-        let fees = fee_caps(&readings);
         let payload = self.ports.signer.sign(&authorization, &call, gas_limit, fees)?;
 
         // ---- Step 6: dispatch. Again, journalled first.
@@ -1262,13 +1307,27 @@ impl Plane {
             expected_net_wei: candidate.expected_net_profit,
             waived: labels(admission.waived()),
         };
+        // From here the dispatch's own outcome decides what the nonce is.
+        unsent.armed = false;
         let dispatched = match &self.ports.dispatch {
             DispatchLane::Shadow(null) => null.dispatch(&request, &permit, dispatched_at),
             DispatchLane::Live(sender) | DispatchLane::Canary(sender) => {
                 sender.send(&request, &permit, dispatched_at, &context).await
             }
         };
-        let mut ladder = dispatched.map_err(Decline::DispatchFailed)?;
+        let mut ladder = match dispatched {
+            Ok(l) => l,
+            Err(e) => {
+                // R28: an endpoint that answered no sent nothing, so the nonce
+                // goes back; one that did not answer may have sent it, and the
+                // nonce stays spent until the chain says otherwise.
+                if matches!(e, DispatchError::Rejected { .. }) {
+                    let _ = assignment.release_nonce(nonce, false);
+                }
+                self.ports.pool.record_outcome(assignment.lane(), false);
+                return Err(Decline::DispatchFailed(e));
+            }
+        };
         drop(submission_permit);
 
         // §16.7's numerator: a dispatcher accepted it, and before the deadline.
@@ -1330,12 +1389,17 @@ impl Plane {
         }
 
         // ---- Step 10: reconcile against the chain.
-        let realized = self
-            .ports
-            .chain
-            .reconcile_final_state(payload.hash)
-            .await
-            .map_err(|e| Decline::ChainUnavailable { detail: e.to_string() })?;
+        let realized = match self.ports.chain.reconcile_final_state(payload.hash).await {
+            Ok(r) => r,
+            // R28: included and reverted. The nonce is spent; the ticket closes
+            // as the revert it is, with what it cost.
+            Err(apex_chain::adapter::AdapterError::Reverted { class, gas_used, spent_wei, .. }) => {
+                let _ = assignment.release_nonce(nonce, true);
+                self.ports.pool.record_outcome(assignment.lane(), false);
+                return Err(Decline::SettlementReverted { class, gas_used, spent_wei });
+            }
+            Err(e) => return Err(Decline::ChainUnavailable { detail: e.to_string() }),
+        };
         let _ = assignment.release_nonce(nonce, true);
         self.advance(guard, TicketStatus::Reconciled)?;
         Ok(Completed::Settled(Box::new(realized)))
@@ -1473,6 +1537,7 @@ fn last_mile_context(
     nonce: apex_capture::signer::ReservedNonce,
     assigned_lane: apex_types::ids::SignerLaneId,
     gas_limit: GasLimit,
+    required_reserve_wei: u128,
     now: UnixNanos,
 ) -> LastMileContext {
     let c = locked.commitment();
@@ -1495,7 +1560,7 @@ fn last_mile_context(
         required_gas: gas_limit,
         remaining_block_gas: readings.remaining_block_gas,
         signer_balance_wei: readings.signer_balance_wei,
-        required_reserve_wei: 0,
+        required_reserve_wei,
         flash_required: readings.flash_required,
         flash_available: readings.flash_available,
         committed_hooks: None,
@@ -1546,6 +1611,9 @@ fn terminal_for(d: &Decline, at: TicketStatus, lane: SubmissionLaneId) -> Termin
         Decline::Uncommittable { .. } => TerminalFailure::Abandoned { at_status: at },
         Decline::VenueUnverified { detail } => {
             TerminalFailure::RiskRejected { rule: detail.clone() }
+        }
+        Decline::SettlementReverted { class, .. } => {
+            TerminalFailure::Reverted { revert_class: *class, data: Vec::new() }
         }
     }
 }
