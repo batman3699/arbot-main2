@@ -77,11 +77,11 @@
 use crate::bus::StateEvent;
 use apex_search::frontier::RouteProposal;
 use crate::workers::{refine_concurrently, Budgets, ResourceClass};
-use apex_capture::dispatch::{DispatchError, DispatchRequest, Dispatcher, NullDispatcher};
+use apex_capture::dispatch::{AckLadder, DispatchError, DispatchRequest, Dispatcher, NullDispatcher};
 use apex_capture::scheduler::{CaptureAssurance, Scheduler};
 use apex_econ::eligibility::Clause;
 use apex_exec::call::ExecutorCall;
-use apex_capture::recover::{reconcile, scan, ChainOutcomeSource, DispatchGate, RecoveryError};
+use apex_capture::recover::{reconcile, scan, ChainOutcomeSource, DispatchGate, DispatchPermit, RecoveryError};
 use apex_capture::registry::{TicketGuard, TicketRegistry};
 use apex_capture::revalidate::{
     last_mile, LastMileCheck, LastMileContext, SigningAuthorization,
@@ -96,7 +96,7 @@ use apex_types::ack::LifecycleStage;
 use apex_types::candidate::{Candidate, DiscreteSize};
 use apex_types::commitment::ExecutionCommitment;
 use apex_types::cost::{GasLimit, TotalExecutionCost};
-use apex_types::ids::{ChainId, SubmissionLaneId, TicketId};
+use apex_types::ids::{ChainId, StrategyId, SubmissionLaneId, TicketId, VenueId};
 use apex_types::miss::{ExplainsMiss, MissReason, SearchPath};
 use apex_types::pnl::PnlAttribution;
 use apex_types::sim::{RevertClass, SimulationResult};
@@ -404,9 +404,12 @@ pub trait RiskGate: Send + Sync {
 pub enum DispatchLane {
     /// §16.1's null dispatcher. Records; sends nothing.
     Shadow(Arc<NullDispatcher>),
-    /// Anything that implements [`Dispatcher`]. Only an [`Admission::Full`]
-    /// reaches it.
-    Live(Arc<dyn Dispatcher + Send + Sync>),
+    /// Anything that sends. Only an [`Admission::Full`] reaches it.
+    Live(Arc<dyn Sender>),
+    /// R28's canary: sends, and an [`Admission::CanaryOnly`] reaches it as well
+    /// as a full one. INV-17's route clause is waived on it and named on every
+    /// admission and send record (spec §1a, operator decision 2026-10-15).
+    Canary(Arc<dyn Sender>),
 }
 
 impl DispatchLane {
@@ -414,6 +417,7 @@ impl DispatchLane {
         match self {
             Self::Shadow(_) => LaneKind::Shadow,
             Self::Live(_) => LaneKind::Live,
+            Self::Canary(_) => LaneKind::Canary,
         }
     }
 }
@@ -423,17 +427,22 @@ impl DispatchLane {
 pub enum LaneKind {
     Shadow,
     Live,
+    /// R28: a lane that sends, on which INV-17's route clause alone is waived.
+    Canary,
 }
 
 /// The risk gate's yes, and how much of a yes it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Admission {
-    /// Every clause held. May reach either lane.
+    /// Every clause held. May reach any lane.
     Full,
     /// Every clause held except `waived`, which only a shadow plane may waive.
-    /// **Reaches only [`DispatchLane::Shadow`]**: on a live lane the plane
+    /// **Reaches only [`DispatchLane::Shadow`]**: on any other lane the plane
     /// refuses it before signing, whatever the gate that granted it was told.
     ShadowOnly { waived: Vec<Clause> },
+    /// Every clause held except `waived`, waived for the canary (R28).
+    /// **Reaches only [`DispatchLane::Canary`].**
+    CanaryOnly { waived: Vec<Clause> },
 }
 
 impl Admission {
@@ -441,7 +450,16 @@ impl Admission {
     pub fn waived(&self) -> &[Clause] {
         match self {
             Self::Full => &[],
-            Self::ShadowOnly { waived } => waived,
+            Self::ShadowOnly { waived } | Self::CanaryOnly { waived } => waived,
+        }
+    }
+
+    /// Whether this admission may reach a lane of `lane`'s kind (INV-17).
+    pub const fn fits(&self, lane: LaneKind) -> bool {
+        match self {
+            Self::Full => true,
+            Self::ShadowOnly { .. } => matches!(lane, LaneKind::Shadow),
+            Self::CanaryOnly { .. } => matches!(lane, LaneKind::Canary),
         }
     }
 }
@@ -507,6 +525,55 @@ pub fn fee_caps(r: &LiveReadings) -> FeeCaps {
     FeeCaps {
         max_fee_per_gas: r.observed_fee_wei.saturating_mul(2).min(r.fee_ceiling_wei),
         max_priority_fee_per_gas: 0,
+    }
+}
+
+/// What the plane knows about a ticket that its signed bytes do not say, handed
+/// to a sending lane with them (R28). The canary writes it to its ledger before
+/// the transaction leaves, and reconciles the receipt against it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SendContext {
+    pub chain: ChainId,
+    pub strategy: StrategyId,
+    pub route_hash: B256,
+    pub venues: Vec<VenueId>,
+    pub gas_limit: GasLimit,
+    pub fees: FeeCaps,
+    /// What the cycle returns above what it borrowed, in wei of the loan token.
+    pub expected_gross_wei: U256,
+    pub expected_net_wei: i128,
+    /// The clauses the admission waived, by label. Empty on a live lane.
+    pub waived: Vec<String>,
+}
+
+/// A dispatcher that may wait on the network (R28).
+///
+/// `apex_capture::dispatch::Dispatcher` is synchronous: a transport handed bytes.
+/// Sending to an endpoint is I/O, and a blocking call on the capture path would
+/// stall the runtime's worker. So the lanes that send hold this, and every
+/// synchronous dispatcher is one through the blanket impl below, which is how
+/// the lifecycle tests' dispatchers keep driving the live protocol unchanged.
+#[async_trait::async_trait]
+pub trait Sender: Send + Sync {
+    async fn send(
+        &self,
+        req: &DispatchRequest,
+        permit: &DispatchPermit<'_>,
+        now: UnixNanos,
+        context: &SendContext,
+    ) -> Result<AckLadder, DispatchError>;
+}
+
+#[async_trait::async_trait]
+impl<D: Dispatcher + Send + Sync + ?Sized> Sender for D {
+    async fn send(
+        &self,
+        req: &DispatchRequest,
+        permit: &DispatchPermit<'_>,
+        now: UnixNanos,
+        _context: &SendContext,
+    ) -> Result<AckLadder, DispatchError> {
+        self.dispatch(req, permit, now)
     }
 }
 
@@ -1131,18 +1198,17 @@ impl Plane {
         // ---- Risk. A hard gate: everything past here holds reserved resources.
         let admission = self.ports.risk.admit(&repriced, &sim, self.ports.dispatch.kind())?;
 
-        // INV-17, structurally. A shadow-only admission never reaches a lane
-        // that sends, **whatever the gate that granted it was told** -- the
-        // gate is one component and this is the plane that owns the lane.
-        // Refused before `Authorized`, so it is a refusal rather than an
-        // admitted ticket that later failed.
-        if let (DispatchLane::Live(_), Admission::ShadowOnly { waived }) =
-            (&self.ports.dispatch, &admission)
-        {
+        // INV-17, structurally. A waiver reaches only the lane it was granted
+        // for, **whatever the gate that granted it was told**: the gate is one
+        // component and this is the plane that owns the lane. Refused before
+        // `Authorized`, so it is a refusal rather than an admitted ticket that
+        // later failed.
+        let lane_kind = self.ports.dispatch.kind();
+        if !admission.fits(lane_kind) {
             return Err(Decline::RiskRefused {
                 rule: format!(
-                    "INV-17: {} was waived for a shadow lane, and this plane's lane sends",
-                    labels(waived).join(", ")
+                    "INV-17: {} was waived for another lane, and this plane's lane is {lane_kind:?}",
+                    labels(admission.waived()).join(", ")
                 ),
             });
         }
@@ -1167,8 +1233,8 @@ impl Plane {
         // that may be on chain, because it may be.
         self.advance(guard, TicketStatus::Signed)?;
         let authorization = SigningAuthorization::new(ticket.ticket_id, nonce, proof);
-        let payload =
-            self.ports.signer.sign(&authorization, &call, gas_limit, fee_caps(&readings))?;
+        let fees = fee_caps(&readings);
+        let payload = self.ports.signer.sign(&authorization, &call, gas_limit, fees)?;
 
         // ---- Step 6: dispatch. Again, journalled first.
         self.advance(guard, TicketStatus::Dispatching)?;
@@ -1185,9 +1251,22 @@ impl Plane {
             .reserve(ResourceClass::Submission)
             .ok_or(Decline::NoBudget(ResourceClass::Submission))?;
         let dispatched_at = self.ports.registry.now();
+        let context = SendContext {
+            chain: candidate.chain_id,
+            strategy: candidate.strategy,
+            route_hash: candidate.route.route_hash,
+            venues: candidate.venue_set.clone(),
+            gas_limit,
+            fees,
+            expected_gross_wei: candidate.gross_profit,
+            expected_net_wei: candidate.expected_net_profit,
+            waived: labels(admission.waived()),
+        };
         let dispatched = match &self.ports.dispatch {
             DispatchLane::Shadow(null) => null.dispatch(&request, &permit, dispatched_at),
-            DispatchLane::Live(sender) => sender.dispatch(&request, &permit, dispatched_at),
+            DispatchLane::Live(sender) | DispatchLane::Canary(sender) => {
+                sender.send(&request, &permit, dispatched_at, &context).await
+            }
         };
         let mut ladder = dispatched.map_err(Decline::DispatchFailed)?;
         drop(submission_permit);

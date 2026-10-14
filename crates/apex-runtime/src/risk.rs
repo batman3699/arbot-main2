@@ -52,6 +52,13 @@ use apex_types::sim::SimulationResult;
 use apex_types::time::UnixNanos;
 use std::sync::Mutex;
 
+/// What may stop every candidate for a reason outside the risk crate (R28): the
+/// canary's halts and its stop file. Read on every admission, like the posture,
+/// because it is a fact about the system and not about the candidate.
+pub trait Hold: Send + Sync {
+    fn reason(&self) -> Option<String>;
+}
+
 /// §28's hard gate.
 pub struct LiveRiskGate {
     posture: Mutex<PostureLadder>,
@@ -61,6 +68,8 @@ pub struct LiveRiskGate {
     /// clock could not be tested against a deadline without sleeping — the same
     /// argument `apex_capture::clock` makes.
     clock: Box<dyn apex_capture::clock::Clock>,
+    /// R28: the canary's halts and stop file. `None` outside a canary.
+    hold: Option<std::sync::Arc<dyn Hold>>,
 }
 
 impl LiveRiskGate {
@@ -75,7 +84,15 @@ impl LiveRiskGate {
             breaker: Mutex::new(breaker),
             policy,
             clock,
+            hold: None,
         }
+    }
+
+    /// R28: refuse every candidate while `hold` gives a reason.
+    #[must_use]
+    pub fn with_hold(mut self, hold: std::sync::Arc<dyn Hold>) -> Self {
+        self.hold = Some(hold);
+        self
     }
 
     pub fn policy(&self) -> EligibilityPolicy {
@@ -116,6 +133,12 @@ impl RiskGate for LiveRiskGate {
             });
         }
 
+        // ---- 1a. A hold: the canary's halt or stop file. Also a fact about
+        // the system, so it answers before any clause.
+        if let Some(reason) = self.hold.as_ref().and_then(|h| h.reason()) {
+            return Err(Decline::RiskRefused { rule: reason });
+        }
+
         // ---- 2. Breaker.
         let now = self.clock.now();
         let tripped = {
@@ -143,16 +166,22 @@ impl RiskGate for LiveRiskGate {
         // never waived, and neither is any other clause: a shadow run measuring
         // trades that fail the EV or Pr(profit) clauses would be measuring trades
         // nothing would ever make. Operator decision, 2026-09-30.
+        //
+        // R28: the canary gets the same waiver, on its own lane, and nothing
+        // else (operator decision 2026-10-15, spec §1a). What stands in for the
+        // certificate: exact quotes, the certified size, Tier 2 at that size,
+        // hop minimums at the exact quote, and the canary's loss cap.
         let waived = match lane {
-            LaneKind::Shadow if !ctx.route_authorization_valid => {
+            LaneKind::Shadow | LaneKind::Canary if !ctx.route_authorization_valid => {
                 ctx.route_authorization_valid = true;
                 vec![Clause::RouteAuthorizationValid]
             }
-            LaneKind::Shadow | LaneKind::Live => Vec::new(),
+            LaneKind::Shadow | LaneKind::Live | LaneKind::Canary => Vec::new(),
         };
 
         match EligibilityGate::evaluate(&ctx, &self.policy) {
             Decision::Admit if waived.is_empty() => Ok(Admission::Full),
+            Decision::Admit if lane == LaneKind::Canary => Ok(Admission::CanaryOnly { waived }),
             Decision::Admit => Ok(Admission::ShadowOnly { waived }),
             Decision::Reject { clause } => Err(Decline::RiskRefused {
                 rule: format!("{} ({})", clause.label(), clause.source()),

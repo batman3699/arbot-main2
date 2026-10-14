@@ -149,6 +149,35 @@ impl RiskGate for RogueGate {
     }
 }
 
+/// Grants a canary-only admission whatever lane it is told (R28).
+struct RogueCanaryGate;
+
+impl RiskGate for RogueCanaryGate {
+    fn admit(&self, _c: &Candidate, _s: &SimulationResult, _l: LaneKind) -> Result<Admission, Decline> {
+        Ok(Admission::CanaryOnly { waived: vec![Clause::RouteAuthorizationValid] })
+    }
+}
+
+/// Sends nothing and keeps every context it was handed (R28).
+#[derive(Default)]
+struct KeepsContext(std::sync::Mutex<Vec<apex_runtime::plane::SendContext>>);
+
+#[async_trait::async_trait]
+impl apex_runtime::plane::Sender for KeepsContext {
+    async fn send(
+        &self,
+        _req: &DispatchRequest,
+        _permit: &DispatchPermit<'_>,
+        now: UnixNanos,
+        context: &apex_runtime::plane::SendContext,
+    ) -> Result<AckLadder, DispatchError> {
+        self.0.lock().unwrap().push(context.clone());
+        let mut ladder = AckLadder::new(now);
+        let _ = ladder.observe(LifecycleStage::TransportAccepted, now);
+        Ok(ladder)
+    }
+}
+
 // ------------------------------------------------------------------ fixtures
 
 /// The policy the shadow run holds: the default. It once needed a permissive
@@ -210,9 +239,14 @@ impl Rig {
     fn live(sender: &Arc<SendingDispatcher>) -> Self {
         let null = Arc::new(NullDispatcher::new());
         Self {
-            dispatch: DispatchLane::Live(Arc::clone(sender) as Arc<dyn Dispatcher + Send + Sync>),
+            dispatch: DispatchLane::Live(Arc::clone(sender) as Arc<dyn apex_runtime::plane::Sender>),
             ..Self::shadow(&null)
         }
+    }
+
+    fn canary(sender: Arc<dyn apex_runtime::plane::Sender>) -> Self {
+        let null = Arc::new(NullDispatcher::new());
+        Self { dispatch: DispatchLane::Canary(sender), ..Self::shadow(&null) }
     }
 
     fn plane(&self) -> Plane {
@@ -315,6 +349,40 @@ async fn a_shadow_waiver_cannot_reach_a_live_lane() {
     assert!(rule.contains("INV-17"), "refused for: {rule}");
     assert_eq!(sender.calls.load(Ordering::SeqCst), 0);
     assert_eq!(rig.signer.calls(), 0);
+}
+
+/// **R28's decision, as a test.** On a canary plane a heuristic route is sent,
+/// and the sender is told which clause was waived.
+#[tokio::test]
+async fn a_heuristic_route_is_sent_on_a_canary_lane_with_its_waiver() {
+    let sender = Arc::new(KeepsContext::default());
+    let rig = Rig::canary(Arc::clone(&sender) as Arc<dyn apex_runtime::plane::Sender>);
+    let plane = rig.plane();
+    let _ = one_outcome(&plane, 0).await;
+    let seen = sender.0.lock().unwrap();
+    assert_eq!(seen.len(), 1, "sent once");
+    assert_eq!(seen[0].waived, vec![Clause::RouteAuthorizationValid.label().to_string()]);
+    assert_eq!(seen[0].expected_net_wei, rig.candidate.expected_net_profit);
+}
+
+/// A canary waiver granted on a live plane is refused by the plane itself.
+#[tokio::test]
+async fn a_canary_waiver_cannot_reach_a_live_lane() {
+    let sender = Arc::new(SendingDispatcher::default());
+    let rig = Rig { risk: Arc::new(RogueCanaryGate), ..Rig::live(&sender) };
+    let rule = refused_by(&one_outcome(&rig.plane(), 0).await);
+    assert!(rule.contains("INV-17"), "refused for: {rule}");
+    assert_eq!(sender.calls.load(Ordering::SeqCst), 0);
+}
+
+/// And a shadow waiver cannot reach a canary lane.
+#[tokio::test]
+async fn a_shadow_waiver_cannot_reach_a_canary_lane() {
+    let sender = Arc::new(KeepsContext::default());
+    let rig = Rig { risk: Arc::new(RogueGate), ..Rig::canary(Arc::clone(&sender) as Arc<dyn apex_runtime::plane::Sender>) };
+    let rule = refused_by(&one_outcome(&rig.plane(), 0).await);
+    assert!(rule.contains("INV-17"), "refused for: {rule}");
+    assert!(sender.0.lock().unwrap().is_empty());
 }
 
 /// Exactly one clause is waivable. A heuristic route that *also* fails another

@@ -512,7 +512,7 @@ async fn the_status_is_journalled_before_the_irreversible_act() {
         pool: Arc::new(pool()),
         gate: Arc::new(DispatchGate::shut()),
         dispatch: DispatchLane::Live(
-            Arc::clone(&dispatcher) as Arc<dyn apex_capture::dispatch::Dispatcher + Send + Sync>,
+            Arc::clone(&dispatcher) as Arc<dyn apex_runtime::plane::Sender>,
         ),
         chain: Arc::new(FakeChain::landing()),
         search: Arc::new(FixedSearch::new(vec![candidate(1, 47_079_437, 320_000_000_000)])),

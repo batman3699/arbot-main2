@@ -302,6 +302,57 @@ fn a_shadow_lane_waives_nothing_else() {
     }
 }
 
+/// **R28's waiver, at the gate.** On a canary lane a heuristic route is admitted
+/// `CanaryOnly`, naming INV-17's clause; a proven one waives nothing; a live lane
+/// still refuses the heuristic route.
+#[test]
+fn a_canary_lane_waives_route_authorization_and_names_it() {
+    let gate = healthy_gate();
+    let mut c = admissible();
+    c.certificate_status = CertificateStatus::Heuristic;
+    assert_eq!(
+        gate.admit(&c, &good_sim(&c), LaneKind::Canary),
+        Ok(Admission::CanaryOnly { waived: vec![Clause::RouteAuthorizationValid] })
+    );
+    assert!(gate.admit(&c, &good_sim(&c), LaneKind::Live).is_err(), "a live lane still refuses it");
+    let proven = admissible();
+    assert_eq!(gate.admit(&proven, &good_sim(&proven), LaneKind::Canary), Ok(Admission::Full));
+}
+
+/// Every other clause refuses on a canary lane exactly as on a live one.
+#[test]
+fn a_canary_lane_waives_nothing_else() {
+    let gate = healthy_gate();
+    let mut c = admissible();
+    c.certificate_status = CertificateStatus::Heuristic;
+    c.robust_ev = 0;
+    let err = gate.admit(&c, &good_sim(&c), LaneKind::Canary).expect_err("must refuse");
+    let Decline::RiskRefused { rule } = err else { panic!("{err:?}") };
+    assert!(rule.starts_with(Clause::ExpectedNetEvPositive.label()), "refused as: {rule}");
+}
+
+struct Held(&'static str);
+
+impl apex_runtime::risk::Hold for Held {
+    fn reason(&self) -> Option<String> {
+        Some(self.0.to_string())
+    }
+}
+
+/// **A hold stops every candidate, with its own reason, on every lane.**
+#[test]
+fn a_hold_refuses_with_its_reason() {
+    let gate = healthy_gate().with_hold(std::sync::Arc::new(Held("canary halted: loss cap")));
+    let c = admissible();
+    for lane in [LaneKind::Shadow, LaneKind::Live, LaneKind::Canary] {
+        assert_eq!(
+            gate.admit(&c, &good_sim(&c), lane),
+            Err(Decline::RiskRefused { rule: "canary halted: loss cap".into() }),
+            "{lane:?}"
+        );
+    }
+}
+
 /// **The tier read is the one that answered, not the one requested.**
 ///
 /// `apex-sim`'s header: `SimulationResult::tier` records "which one was actually
