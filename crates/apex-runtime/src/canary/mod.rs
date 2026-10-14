@@ -14,6 +14,7 @@
 pub mod chain;
 pub mod ledger;
 pub mod limits;
+pub mod recover;
 pub mod send;
 
 pub use ledger::{Halt, Outcome, Record, Sent, Settled};

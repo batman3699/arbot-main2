@@ -15,6 +15,8 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod support;
+
 const WETH: Address = address!("4200000000000000000000000000000000000006");
 const EXECUTOR: Address = address!("8940B565D050974b2b589B70De43bCb753b1F93B");
 const OWNER: Address = address!("69D54e5fC0b9325D7250f0D0A11690327A3dd8A3");
@@ -204,5 +206,50 @@ async fn no_receipt_by_the_timeout_halts_as_unresolved() {
     in_flight.insert(sent(tx, 0));
     let seen = chain.observe(tx).await.unwrap();
     assert!(seen.is_empty(), "not included");
+    assert!(matches!(canary.halted(), Some(apex_runtime::canary::Halt::Unresolved { .. })));
+}
+
+use apex_capture::recover::ChainOutcomeSource;
+use apex_runtime::canary::recover::CanaryRecovery;
+use apex_types::ticket::{TerminalFailure, TicketOutcome, TicketStatus};
+
+fn open_ticket(id: u64) -> apex_types::ticket::OpportunityTicket {
+    let mut t = support::ticket_at(TicketStatus::Dispatching);
+    t.ticket_id = apex_types::ids::TicketId(id);
+    t.status = TicketStatus::Dispatching;
+    t
+}
+
+#[tokio::test]
+async fn a_ticket_with_no_send_record_never_left_the_process() {
+    let d = tempfile::tempdir().unwrap();
+    let (canary, _f, chain) = rig(d.path(), Node { receipt: Mutex::new(None), latest_nonce: 0, polls: Mutex::new(0) });
+    let rec = CanaryRecovery::build(&canary, &chain).await;
+    let out = rec.resolve(&open_ticket(5)).unwrap();
+    let TicketOutcome::ExplicitFailure { code: TerminalFailure::Abandoned { .. }, cause, .. } = out else { panic!() };
+    assert!(cause.contains("no send record"), "{cause}");
+    assert_eq!(canary.halted(), None);
+}
+
+#[tokio::test]
+async fn a_sent_ticket_with_a_receipt_is_reconciled() {
+    let d = tempfile::tempdir().unwrap();
+    let tx = B256::repeat_byte(6);
+    let (canary, _f, chain) = rig(d.path(), Node { receipt: Mutex::new(Some(receipt(tx, true, 30_000_000_000, 970_000_000_000, 1_000_000_000_000))), latest_nonce: 1, polls: Mutex::new(0) });
+    canary.sent(sent(tx, 0)).unwrap(); // ticket 9
+    let rec = CanaryRecovery::build(&canary, &chain).await;
+    assert!(matches!(rec.resolve(&open_ticket(9)).unwrap(), TicketOutcome::Success { stage: TicketStatus::Reconciled, .. }));
+    assert_eq!(canary.report().totals.landed, 1);
+}
+
+#[tokio::test]
+async fn a_sent_ticket_with_no_receipt_is_abandoned_and_halts() {
+    let d = tempfile::tempdir().unwrap();
+    let tx = B256::repeat_byte(7);
+    let (canary, _f, chain) = rig(d.path(), Node { receipt: Mutex::new(None), latest_nonce: 0, polls: Mutex::new(0) });
+    canary.sent(sent(tx, 0)).unwrap();
+    let rec = CanaryRecovery::build(&canary, &chain).await;
+    let TicketOutcome::ExplicitFailure { cause, .. } = rec.resolve(&open_ticket(9)).unwrap() else { panic!() };
+    assert!(cause.contains("unresolved at boot"), "{cause}");
     assert!(matches!(canary.halted(), Some(apex_runtime::canary::Halt::Unresolved { .. })));
 }
