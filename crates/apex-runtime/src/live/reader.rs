@@ -61,6 +61,9 @@ pub struct ChainView {
     pub morpho_holding: u128,
     /// The capacity model's largest measured window; 0 while it is `Unknown`.
     pub block_gas: u64,
+    /// R28: `executors(signer)` and `isCircuitOpen()`, the owner's two stops.
+    pub executor_allows_signer: bool,
+    pub circuit_open: bool,
     pub refreshed_at: Instant,
 }
 
@@ -114,13 +117,29 @@ impl ChainReader {
         let at = format!("{:#x}", head.number);
         let base_fee = head.base_fee_per_gas.ok_or_else(|| ReadError::Malformed("a head without a base fee".into()))?;
         let lender = [(c.loan_token, abi::call_address(selector::BALANCE_OF, c.lender))];
-        let (code, balance, nonce, holding) = tokio::join!(
+        // R28: the owner's two stops, read with everything else.
+        let switches = [
+            (c.executor, abi::call_address(selector::EXECUTORS, c.signer)),
+            (c.executor, abi::call0(selector::IS_CIRCUIT_OPEN)),
+        ];
+        let (code, balance, nonce, holding, switched) = tokio::join!(
             reads.code_hash(c.executor, head.number),
             self.rpc.call("eth_getBalance", json!([c.signer, at])),
             self.rpc.call("eth_getTransactionCount", json!([c.signer, "pending"])),
             reads.multicall(&lender, head.number),
+            reads.multicall(&switches, head.number),
         );
         let malformed = |what: &str| ReadError::Malformed(format!("{what} did not decode"));
+        let switched = switched?;
+        let flag = |i: usize, what: &str| {
+            switched
+                .get(i)
+                .cloned()
+                .flatten()
+                .and_then(|d| abi::word_uint(&d, 0, 8))
+                .map(|v| v != 0)
+                .ok_or_else(|| malformed(what))
+        };
         let morpho_holding = match c.morpho {
             None => 0,
             Some(m) => reads
@@ -149,6 +168,8 @@ impl ChainReader {
                 .ok_or_else(|| malformed("the lender's balance"))?,
             morpho_holding,
             block_gas,
+            executor_allows_signer: flag(0, "executors(signer)")?,
+            circuit_open: flag(1, "isCircuitOpen()")?,
             refreshed_at: Instant::now(),
         };
         self.view.store(Some(view), ReconstructionStatus::Verified);
@@ -171,7 +192,17 @@ impl LiveReader for ChainReader {
         let pools: Vec<Address> = t.route_commitment.hops.iter().map(|h| h.pool.address).collect();
         Ok(LiveReadings {
             executor: c.executor.into_array(),
-            executor_version: if v.executor_code_hash == c.executor_code_hash { c.plan_version } else { 0 },
+            // Version 0, which check 2 refuses, unless this is the configured
+            // code, it still lets the signer trade, and the owner has not opened
+            // its circuit (R28).
+            executor_version: if v.executor_code_hash == c.executor_code_hash
+                && v.executor_allows_signer
+                && !v.circuit_open
+            {
+                c.plan_version
+            } else {
+                0
+            },
             observed_fee_wei: v.base_fee_wei,
             fee_ceiling_wei: c.fee_ceiling_wei,
             remaining_block_gas: v.block_gas,

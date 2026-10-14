@@ -39,6 +39,24 @@ struct Node {
     code: Mutex<String>,
     balance_fails: Mutex<bool>,
     calls: AtomicUsize,
+    /// R28: `executors(signer)` and `isCircuitOpen()`.
+    allowed: Mutex<bool>,
+    open: Mutex<bool>,
+}
+
+/// `aggregate3`'s `(bool success, bytes returnData)[]`, one 32-byte word each.
+fn aggregate3_answers(words: &[U256]) -> String {
+    let w = |v: U256| v.to_be_bytes::<32>().to_vec();
+    let u = |v: usize| w(U256::from(v));
+    let n = words.len();
+    let mut out = [u(32), u(n)].concat();
+    for i in 0..n {
+        out.extend(u(n * 32 + i * 128));
+    }
+    for word in words {
+        out.extend([u(1), u(64), u(32), w(*word)].concat());
+    }
+    format!("0x{}", hex::encode(out))
 }
 
 fn aggregate3_answer(word: U256) -> String {
@@ -70,6 +88,12 @@ impl RpcTransport for Node {
                 assert_eq!(params[1], json!("pending"));
                 Ok(json!("0x7"))
             }
+            // R28: the executor's two switches, `executors(signer)` and
+            // `isCircuitOpen()`, in one multicall.
+            "eth_call" if params.to_string().to_lowercase().contains("9ac2a011") => Ok(json!(aggregate3_answers(&[
+                U256::from(u8::from(*self.allowed.lock().unwrap())),
+                U256::from(u8::from(*self.open.lock().unwrap())),
+            ]))),
             // Morpho Blue's WETH when the request names it (R27): 82,679 WETH.
             "eth_call" if params.to_string().to_lowercase().contains("bbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb") => {
                 Ok(json!(aggregate3_answer(U256::from(82_679u128 * 10u128.pow(18)))))
@@ -82,7 +106,7 @@ impl RpcTransport for Node {
 }
 
 fn node() -> Arc<Node> {
-    Arc::new(Node { code: Mutex::new(CODE.into()), balance_fails: Mutex::new(false), calls: AtomicUsize::new(0) })
+    Arc::new(Node { code: Mutex::new(CODE.into()), balance_fails: Mutex::new(false), calls: AtomicUsize::new(0), allowed: Mutex::new(true), open: Mutex::new(false) })
 }
 
 fn pool(addr: Address, venue: Venue, tick: i32) -> PoolSnapshot {
@@ -149,6 +173,24 @@ fn ticket() -> apex_types::ticket::OpportunityTicket {
     t
 }
 
+/// **R28: the owner's switches stop a ticket before it is signed.** An executor
+/// that no longer allows the signer, or whose circuit is open, reads as version
+/// 0, which last-mile check 2 refuses, so no gas is spent finding out.
+#[tokio::test]
+async fn the_executors_switches_read_as_no_executor() {
+    for (allowed, open, expect_version) in [(true, false, true), (false, false, false), (true, true, false)] {
+        let n = node();
+        *n.allowed.lock().unwrap() = allowed;
+        *n.open.lock().unwrap() = open;
+        let reader = ChainReader::new(n.clone(), book(), config(Duration::from_secs(60)));
+        reader.refresh(&head(100), 30_000_000).await.expect("refreshes");
+        let v = reader.view().unwrap();
+        assert_eq!((v.executor_allows_signer, v.circuit_open), (allowed, open));
+        let r = reader.read(&ticket()).await.expect("reads");
+        assert_eq!(r.executor_version != 0, expect_version, "allowed {allowed}, open {open}");
+    }
+}
+
 /// **Read once a block, and every check gets its value — without a call.**
 #[tokio::test]
 async fn a_view_is_read_once_a_block_and_tickets_read_it_without_a_call() {
@@ -156,7 +198,7 @@ async fn a_view_is_read_once_a_block_and_tickets_read_it_without_a_call() {
     let b = book();
     let r = ChainReader::new(n.clone(), b.clone(), config(Duration::from_secs(60)));
     r.refresh(&head(101), 30_000_000).await.unwrap();
-    assert_eq!(n.calls.swap(0, Ordering::SeqCst), 4, "four reads a block");
+    assert_eq!(n.calls.swap(0, Ordering::SeqCst), 5, "five reads a block: R28 added the executor's switches");
 
     let t = ticket();
     let got = r.read(&t).await.unwrap();
@@ -246,7 +288,7 @@ async fn a_ticket_borrowing_from_morpho_is_checked_against_morphos_holding() {
     let n = node();
     let r = ChainReader::new(n.clone(), book(), ReaderConfig { morpho: Some(MORPHO_BLUE), ..config(Duration::from_secs(60)) });
     r.refresh(&head(101), 30_000_000).await.unwrap();
-    assert_eq!(n.calls.swap(0, Ordering::SeqCst), 5, "Morpho's holding is a fifth read");
+    assert_eq!(n.calls.swap(0, Ordering::SeqCst), 6, "Morpho's holding is a sixth read (R28 added the executor's switches)");
     let mut t = ticket();
     assert_eq!(r.read(&t).await.unwrap().flash_available, 29_082_963_936_604_904_861, "no lender named: Balancer's");
     t.flash_source = Some(apex_types::flash::FlashSourceQuote {
