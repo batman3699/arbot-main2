@@ -35,6 +35,7 @@
 
 pub mod armed;
 pub mod bus;
+pub mod canary;
 pub mod commit;
 pub mod econ;
 pub mod live;
