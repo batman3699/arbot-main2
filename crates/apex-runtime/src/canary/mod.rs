@@ -13,6 +13,7 @@
 
 pub mod ledger;
 pub mod limits;
+pub mod send;
 
 pub use ledger::{Halt, Outcome, Record, Sent, Settled};
 pub use limits::{Canary, CanaryReport, Limits, Totals};
