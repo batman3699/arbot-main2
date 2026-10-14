@@ -138,7 +138,7 @@ fn fp() -> StateFingerprint {
 }
 
 fn budget() -> SearchBudget {
-    SearchBudget { max_evaluations: 128, min_input: U256::from(10u64.pow(12)) }
+    SearchBudget { max_evaluations: 128, min_input: U256::from(10u64.pow(12)), ..SearchBudget::default() }
 }
 
 /// A cost every size shares, with gas free: what pricing was before R12.
@@ -738,4 +738,61 @@ fn a_volatile_pool_declares_no_tick_neighbourhood() {
     let t = frontier::template(BASE, &cycle, &snap);
     let pools: Vec<Address> = t.tick_neighborhood.keys().map(|p| p.address).collect();
     assert_eq!(pools, vec![UNI]);
+}
+
+// ------------------------------------------------------------------ rounding (R27.2)
+
+/// A cycle states what its arithmetic truncates: two units of its middle
+/// token, in the input token at the second pool's price. The size search
+/// raises its bounds and its tolerance by it.
+///
+/// One unit, because the steps a quote has fully crossed truncate the same
+/// way at every nearby size and only the last moves with the size; two, for
+/// margin. For USDC at about 2,680 to the WETH a unit is 3.7 x 10^8 wei.
+#[test]
+fn a_cycles_rounding_is_two_units_of_its_middle_token() {
+    let free = RouteCosts { other_wei: 0, wei_per_gas: 1 };
+    let concentrated = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L), pool(SLIP, Venue::Slipstream, -197_300, 80, L)]);
+    // The volatile pool's reserves put WETH at 2,491 USDC.
+    let volatile = mixed(-197_350, 4_541_987_609_188);
+    let mut seen = 0;
+    for b in [&concentrated, &volatile] {
+        let snap = b.snapshot();
+        for cycle in frontier::cycles(BASE, WETH, &snap) {
+            let live = LiveCycle::new(&cycle, &snap).expect("priceable");
+            let unit = live.mid_unit();
+            assert!(unit > U256::from(3 * 10u64.pow(8)) && unit < U256::from(45 * 10u64.pow(7)), "a unit of USDC in wei: {unit}");
+            // The second hop pays a little less for it: its fee, and its own
+            // truncation. Never more.
+            let [mid, out] = live.hop_outputs(U256::from(10u64.pow(16))).expect("0.01 WETH fills");
+            assert!(unit * mid >= out, "{unit} a unit, {mid} units, {out} out");
+            assert!(unit * mid <= out + out / 250, "{unit} a unit, {mid} units, {out} out");
+            let route = CostedCycle::new(live, free, gas::MEASURED);
+            assert_eq!(route.rounding(), unit * 2 + 2);
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 4, "both directions of both books");
+}
+
+/// The search assumes a cost that never falls as a size grows. A larger size
+/// crosses no fewer ticks and steps no fewer words, so it is enough that gas
+/// never falls as either rises, on any venue, in either direction.
+#[test]
+fn gas_never_falls_as_crossings_or_words_rise() {
+    let venues = [Venue::UniswapV3, Venue::Slipstream, Venue::PancakeV3, Venue::SlipstreamV3, Venue::AerodromeV2];
+    for venue in venues {
+        for zero_for_one in [true, false] {
+            let at = |crossed: u32, word_steps: u32| gas::MEASURED.estimate(&[HopSteps { venue, zero_for_one, crossed, word_steps }]);
+            for crossed in 0..40 {
+                for words in 0..8 {
+                    let here = at(crossed, words);
+                    for more in [at(crossed + 1, words), at(crossed, words + 1)] {
+                        assert!(more.expected >= here.expected && more.ceiling >= here.ceiling, "{venue:?} {zero_for_one}: {crossed} crossed, {words} words");
+                    }
+                }
+            }
+            assert!(at(0, 0).expected.0 > 0);
+        }
+    }
 }

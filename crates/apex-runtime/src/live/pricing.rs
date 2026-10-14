@@ -135,6 +135,25 @@ impl LiveCycle {
         self.hop_outputs(amount_in).map(|[_, last]| last)
     }
 
+    /// One unit of the middle token in the input token, at the second pool's
+    /// price before its fee, rounded up (R27.2). What a truncated first hop
+    /// can cost the cycle's output: [`CostedCycle::rounding`] is built on it.
+    pub fn mid_unit(&self) -> U256 {
+        let (pool, zero_for_one) = &self.legs[1];
+        let whole = |v: ethers_core::types::U512| U256::try_from(v).unwrap_or(U256::MAX).saturating_add(U256::one());
+        // token1 for a unit of token0, as a ratio.
+        let (one, zero) = match &pool.reserves {
+            Some(r) => (r.reserve1.full_mul(U256::one()), r.reserve0.full_mul(U256::one())),
+            None => (pool.state.sqrt_price_x96.full_mul(pool.state.sqrt_price_x96), U256::one().full_mul(U256::one() << 192)),
+        };
+        // Selling token0 pays token1, and the reverse.
+        let (paid, sold) = if *zero_for_one { (one, zero) } else { (zero, one) };
+        if sold.is_zero() {
+            return U256::MAX;
+        }
+        whole(paid / sold)
+    }
+
     /// The second pool pays the start token out, so its real holding of it
     /// bounds what the cycle can return — and an arbitrage returns about what it
     /// took. From `balanceOf`, never from virtual reserves, which overstate a
@@ -258,6 +277,15 @@ impl SizedRoute for CostedCycle {
     fn priced(&self, amount_in: U256) -> Option<Priced> {
         let q = self.cycle.quote(amount_in)?;
         Some(Priced { output: q.outputs[1], cost: self.cost_of(self.gas_for(&q.hops, amount_in)) })
+    }
+
+    /// Two units of the middle token, in the input token, and two of the
+    /// input token itself (R27.2). A hop truncates its output. The steps a
+    /// quote has fully crossed truncate the same way at every nearby size, so
+    /// only the last step's truncation moves with the size: under one unit a
+    /// hop, and two are taken.
+    fn rounding(&self) -> U256 {
+        self.cycle.mid_unit().saturating_mul(U256::from(2u64)).saturating_add(U256::from(2u64))
     }
 }
 
