@@ -241,8 +241,12 @@ impl CanaryChain {
 impl SettlementFeed for CanaryChain {
     async fn observe(&self, tx: B256) -> Result<Vec<TransactionObservation>, Decline> {
         let included = |v: Value| -> Result<Vec<TransactionObservation>, Decline> {
-            let read = read_receipt(&v, self.s.weth, self.s.executor, &self.s.recipients)
-                .map_err(|detail| Decline::ChainUnavailable { detail })?;
+            // A receipt exists, so the transaction landed: one that cannot be
+            // read is money the canary cannot account for, and it halts.
+            let read = read_receipt(&v, self.s.weth, self.s.executor, &self.s.recipients).map_err(|detail| {
+                self.record(tx, Settled::Unexplained { detail: format!("its receipt did not read: {detail}") });
+                Decline::ChainUnavailable { detail }
+            })?;
             self.in_flight.set_receipt(&tx, v);
             Ok(vec![TransactionObservation::included(read.receipt, unix_nanos())])
         };

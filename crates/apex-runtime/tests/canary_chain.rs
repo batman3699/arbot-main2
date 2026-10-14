@@ -197,6 +197,22 @@ async fn transfers_disagreeing_with_the_event_halt_as_unexplained() {
     assert!(matches!(canary.halted(), Some(apex_runtime::canary::Halt::Unexplained { .. })));
 }
 
+/// Final review: a transaction that landed and whose receipt cannot be read is
+/// money the canary cannot account for. It halts as unexplained at settlement,
+/// rather than closing the ticket with nothing recorded and trading on.
+#[tokio::test]
+async fn a_landed_receipt_that_cannot_be_read_halts_as_unexplained() {
+    let d = tempfile::tempdir().unwrap();
+    let tx = B256::repeat_byte(5);
+    let mut unreadable = receipt(tx, true, 30, 970, 1_000);
+    unreadable.as_object_mut().unwrap().remove("l1Fee");
+    let (canary, in_flight, chain) = rig(d.path(), Node { receipt: Mutex::new(Some(unreadable)), latest_nonce: 1, polls: Mutex::new(0) });
+    canary.sent(sent(tx, 0)).unwrap();
+    in_flight.insert(sent(tx, 0));
+    assert!(chain.observe(tx).await.is_err(), "no observation built from an unreadable receipt");
+    assert!(matches!(canary.halted(), Some(apex_runtime::canary::Halt::Unexplained { .. })), "{:?}", canary.halted());
+}
+
 #[tokio::test]
 async fn no_receipt_by_the_timeout_halts_as_unresolved() {
     let d = tempfile::tempdir().unwrap();
