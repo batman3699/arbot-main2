@@ -231,6 +231,25 @@ fn the_canary_tripwire_fires_only_beyond_our_sends() {
     assert!(nonce_beyond_ours(10, 12, 1));
 }
 
+/// R28: the shipped canary configuration, as the host will run it.
+#[test]
+fn the_shipped_canary_config_parses() {
+    let path = format!("{}/../../ops/canary.base.yaml", env!("CARGO_MANIFEST_DIR"));
+    let c = ShadowConfig::load_canary(&path, &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap();
+    let k = c.canary.expect("a canary section");
+    assert_eq!(k.loss_cap_wei, 1_000_000_000_000_000);
+    assert_eq!((k.max_consecutive_reverts, k.max_consecutive_refusals, k.max_landed), (5, 2, 100));
+    assert_eq!((k.receipt_poll_ms, k.settle_timeout_ms), (250, 10_000));
+    assert_eq!(k.profit_recipient, address!("69D54e5fC0b9325D7250f0D0A11690327A3dd8A3"));
+    assert_eq!(c.signer.gas_reserve_wei, 100_000_000_000_000);
+    assert_eq!(c.policy.max_cost_confidence_bps, 1_000, "a live run keeps the default");
+    assert_eq!(c.policy.tip_share_bps, 2_000);
+    assert!(c.journal.to_str().unwrap().contains("canary"));
+    // Everything else is the shadow's.
+    let shadow = ShadowConfig::load(&path.replace("canary", "shadow"), &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap();
+    assert_eq!((c.executor, c.universe, c.lenders.clone()), (shadow.executor, shadow.universe, shadow.lenders));
+}
+
 /// R28: a tip share above the whole net is refused.
 #[test]
 fn a_tip_share_above_the_net_is_refused() {

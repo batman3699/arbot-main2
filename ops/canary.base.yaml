@@ -1,0 +1,166 @@
+# `apex canary` on Base (Task 8.5 R28): the reactive lane SENDS, one ticket at
+# a time, under the canary's limits at the end of this file. The armed lane
+# stays in shadow. See ops/host/README.md §10 and
+# docs/superpowers/specs/2026-10-15-live-canary-design.md.
+#
+# Everything but the journal, the signer's reserve, the cost-confidence cap and
+# the canary section is the shadow's (tests/shadow_parts.rs holds them equal).
+#
+# No secret is in this file. Placeholders for APEX_SECRET_ variables resolve
+# from the environment at boot, and an unset one refuses to start; the signer's
+# key is named by its variable and read once, never parsed from YAML.
+# `scripts/shadow.sh` maps the operator's .env onto these names.
+#
+# Placeholders are resolved before the YAML is parsed, comments included: a
+# dollar-brace in a comment is a placeholder too.
+#
+# Unknown fields are refused: a misspelt one would otherwise take a default.
+
+chain_id: 8453
+
+rpc:
+  # BlockPI's keyed endpoint: `eth_simulateV1`, `pendingLogs` and
+  # `newFlashblocks` were each probed on it (PLAN.md, Task 8.5 R1, R5, R7).
+  http:
+    - https://base.blockpi.network/v1/rpc/${APEX_SECRET_BLOCKPI_KEY}
+  ws: wss://base.blockpi.network/v1/ws/${APEX_SECRET_BLOCKPI_KEY}
+
+# The census's inventory (outside git). The run loads the pools that can form
+# a WETH cycle: pairs with WETH and at least two pools at <= 500 ppm and
+# >= $100k depth.
+inventory: data/base
+
+# The canary's own journal: recovery reconciles it against the chain and
+# canary.jsonl. Must be named as a canary's, never a shadow's.
+journal: var/apex/canary.journal
+report: var/apex/shadow.report.jsonl
+misses: var/apex/shadow.misses.jsonl
+# R25: the race ledger (one line per handled proposal) and Base's public
+# flashblock stream with its ledger. Measurement only; nothing priced reads
+# them. Each is a file per UTC day: race-YYYY-MM-DD.jsonl.
+race: var/apex/race.jsonl
+flashblocks:
+  stream: wss://mainnet.flashblocks.base.org/ws
+  ledger: var/apex/flashblocks.jsonl
+# R26: armed backruns. armed-shadow arms each top route's gap as a validity
+# transaction would wait in Base's builder: built and recorded, never sent.
+# `apex armed-eval` (a timer on the host) judges every arm against the chain.
+armed:
+  mode: shadow
+  ledger: var/apex/armed.jsonl
+  verdicts: var/apex/armed-verdicts.jsonl
+  max_arms: 16
+  rungs: 6
+  window_s: 10
+  block_time_ms: 2000
+  margin_wei: 0
+  band_cap_bps: 5
+  liquidity_floor_bps: 9800
+
+executor:
+  # The Phase 5 executor, deployed 2026-10-03 by script/DeployAndConfigure.s.sol
+  # (Base blocks 52,105,407-8; docs/apex/DEPLOYED.md): an EIP-1167 clone of the
+  # implementation 0x5C48...5Cee, owned by its BatchRouter 0x9ecd...52C2. The
+  # code hash is keccak256 of the clone's 45-byte runtime code, read back from
+  # the chain; other code there reads as version 0, and last-mile check 2
+  # refuses every ticket.
+  address: "0x8940B565D050974b2b589B70De43bCb753b1F93B"
+  code_hash: "0x68ea95b65ff6d634c1e8e766cf66ecd3996eb0342cdc2f1179485ae03b7fa488"
+  # The plan version the call builder encodes (PLAN_VERSION_V2).
+  plan_version: 2
+
+signer:
+  lane: 1
+  key_env: APEX_SECRET_TRADER_KEY
+  # The trader the deploy authorized (`setExecutor`, read back on chain). The
+  # key must sign as it, or the run refuses to start. Not .env's PRIVATE_KEY:
+  # that signs as the router's owner, and scripts/shadow.sh never reads it.
+  address: "0xCB436Ba3acb945b3fc8EE6345857262584356595"
+  # 0.0001 ETH kept back: the trader starts with 0.0014 (R28). Last-mile check 7
+  # requires it, plus the most a trade can cost, before every send.
+  gas_reserve_wei: 100000000000000
+
+policy:
+  # 0.1 gwei: Base's base fee has run ~0.002-0.01 gwei; a ticket signs at
+  # twice the observed fee, capped here, and is refused above it.
+  fee_ceiling_wei: 100000000
+  # Any positive net. The on-chain floor question (expected net against the
+  # executor's gross check) is open before any canary (PLAN.md, R6 finding).
+  min_profit_wei: 1
+  slippage_bps_per_hop: 30
+  # A full reload every 15 minutes refreshes the evidence; an hour's bound
+  # allows three to fail.
+  max_evidence_age_blocks: 1800
+  # Three blocks: a view the head task has stopped refreshing is not a reading.
+  max_view_age_ms: 6000
+  full_reload_every_s: 900
+  report_every_s: 300
+  # The L1 fee oracle moves with L1 blocks; once a minute.
+  l1_every_blocks: 30
+  # The risk gate's cost-confidence cap: the gas estimate's p50-to-p99 width
+  # in wei, as a share of the expected profit. The default (1,000 bps, a tenth)
+  # refused the first trade ever to pass Tier 2 in the block being built
+  # (ticket 46, 2026-10-06: half a cent expected, a 1,629 bps width, still
+  # profitable at p99 gas). Operator decision: 10,000 bps for the shadow only,
+  # refusing just a trade its worst-case gas would leave without profit. A live
+  # run keeps the default (operator, 2026-10-06): this one does.
+  max_cost_confidence_bps: 1000
+  # R28: a fifth of each trade's expected net, bid as its priority fee. Rivals
+  # tipped 0.004 gwei at the median and 0.40 at the 90th percentile (R25's
+  # contest analysis); on a cents-sized trade this is ~0.005-0.01 gwei.
+  tip_share_bps: 2000
+
+# How a settlement fails, and what failing costs: what the chain does not say.
+# The costliest revert on the R6/R7 fork (hop 2's minimum) used 411,945 gas.
+# The failure rate is not measured: it is one of the things this run measures.
+# What a success uses is not here: it is each route's own, at its size, from
+# the ticks it crosses (live::gas::MEASURED, R12), and every ticket's gas limit
+# is built from that.
+costs:
+  gas_on_failure: 411945
+  failure_ppm: 50000
+
+# R5: `newFlashblocks` is ~750 KiB/s, so it is sampled, never held open.
+# Hourly since R27.3: BlockPI charges by the byte, and 20 s every 15 minutes
+# was 1.4 GB a day, a sixth of everything the host moves, for a figure (the
+# largest gas window seen) that changes little from hour to hour.
+capacity:
+  boot_sample_s: 60
+  sample_every_s: 3600
+  sample_for_s: 20
+
+# Which pools the run may price (R20, operator decision 2026-10-06). The
+# census's 500 ppm left out Base's deepest WETH/USDC and WETH/cbBTC pools,
+# Uniswap's 0.3% ($60M, $6.3M) and Slipstream's spacing-100 ($8.8M at ~570
+# ppm, $17M at 2,500), where the large swaps behind every real gap land.
+# Pricing is exact at any fee; a 30 bps pool simply pays less often.
+universe:
+  max_fee_ppm: 3000
+  min_depth_usd: 100000
+
+# R27: MorphoFlashLender, Morpho Blue's free flash loans as ERC-3156. Deployed
+# by the owner on 2026-10-13 (Base block 52,552,304, tx 0xebbaee8c...5334). The
+# code hash is keccak256 of its 2,090-byte runtime, read back from the chain and
+# equal to the build's; the shadow refuses to start if the code there differs.
+# Remove this section and every loan is Balancer's.
+lenders:
+  morpho:
+    address: "0xDF64CC1991899340edd2e1d870AC7F8c0a4D1A9c"
+    code_hash: "0x248bf9d05e91ff2e785fe73abbc4f2fb83ed9a533d0d0d93979c19720c6358b4"
+
+# R28: the canary (docs/superpowers/specs/2026-10-15-live-canary-design.md §8).
+canary:
+  ledger: var/apex/canary.jsonl
+  # `touch` it to stop new sends; remove it to resume. Not a halt.
+  stop_file: var/apex/canary.stop
+  # The executor must pay profit and fees here, or the canary refuses to start
+  # (the owner's recipient change, ops/host/README.md §10).
+  profit_recipient: "0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3"
+  # 0.001 ETH lost on losing trades; wins do not offset it. A full-cost revert
+  # is ~0.0000024 ETH, so ~400 of them.
+  loss_cap_wei: 1000000000000000
+  max_consecutive_reverts: 5
+  max_consecutive_refusals: 2
+  max_landed: 100
+  receipt_poll_ms: 250
+  settle_timeout_ms: 10000

@@ -287,3 +287,114 @@ The status lines:
     Base's Slipstream and Uniswap pools, liquidity is added and removed
     around swaps, so expect 7–13% (the 2026-10-12 smoke runs).
 
+
+## 10. The canary (R28)
+
+`apex canary` is the shadow's process with its reactive lane **sending real
+transactions** from the trader key, one at a time, under the limits in
+`ops/canary.base.yaml`. The armed lane stays in shadow. It writes the same
+report, misses, race and flashblock files as the shadow, so `shadow-status.sh`
+works unchanged and adds a `canary` line. The spec is
+`docs/superpowers/specs/2026-10-15-live-canary-design.md`.
+
+### a. The owner's two transactions, in this order
+
+Both are signed by the owner (`0x69D5…8A3`), typed at the prompt. Dry-run them
+first (`BLOCKPI_KEY` exported from `.env` for foundry's `base` endpoint, never
+on the command line; or `--rpc-url https://mainnet.base.org`).
+
+1. **Point profit and fees at the owner.** The executor pays both to the
+   BatchRouter today, which cannot withdraw them. The canary refuses to start
+   until `profitRecipient()` and `feeRecipient()` read the owner.
+
+```
+$ PR=$(cast calldata "setProfitRecipient(address)" 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3)
+$ FR=$(cast calldata "setFeeRecipient(address)" 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3)
+$ OUTER=$(cast calldata "multicall(address[],bytes[])" "[0x8940B565D050974b2b589B70De43bCb753b1F93B,0x8940B565D050974b2b589B70De43bCb753b1F93B]" "[$PR,$FR]")
+$ cast call --from 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3 0x9ecde68C269EbbaFD44bbB4DfC9D6716B47952C2 $OUTER --rpc-url base   # 0x
+$ cast call --from 0xCB436Ba3acb945b3fc8EE6345857262584356595 0x9ecde68C269EbbaFD44bbB4DfC9D6716B47952C2 $OUTER --rpc-url base   # NotOwner() (0x30cd7471)
+$ cast estimate --from 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3 0x9ecde68C269EbbaFD44bbB4DfC9D6716B47952C2 $OUTER --rpc-url base
+$ cast send 0x9ecde68C269EbbaFD44bbB4DfC9D6716B47952C2 $OUTER --rpc-url base --interactive
+$ cast call 0x8940B565D050974b2b589B70De43bCb753b1F93B "profitRecipient()(address)" --rpc-url base   # 0x69D5…8A3
+$ cast call 0x8940B565D050974b2b589B70De43bCb753b1F93B "feeRecipient()(address)" --rpc-url base      # 0x69D5…8A3
+```
+
+2. **Fund the trader with 0.0014 ETH.** The owner keeps ~0.000065 ETH for the
+   on-chain kill switch below (~61,000 gas at a few thousandths of a gwei).
+
+```
+$ cast send 0xCB436Ba3acb945b3fc8EE6345857262584356595 --value 0.0014ether --rpc-url base --interactive
+$ cast balance 0xCB436Ba3acb945b3fc8EE6345857262584356595 --rpc-url base --ether   # 0.0014
+```
+
+Dry-run on 2026-10-15 through `https://mainnet.base.org`: the recipient change
+`0x` as the owner, `NotOwner()` as the trader, 50,893 gas; the funding 21,000
+gas; gas price 0.006 gwei.
+
+### b. From shadow to canary
+
+The shadow's 14-day run ends here: archive it first.
+
+```
+# systemctl stop apex-shadow && systemctl disable apex-shadow
+# mv /opt/apex/var/apex /opt/apex/var/run-10 && install -d -o apex -g apex /opt/apex/var/apex
+# (install the build as in §7)
+# install -m 0644 /opt/apex/ops/host/apex-canary.service /etc/systemd/system/apex-canary.service
+# systemctl daemon-reload && systemctl enable --now apex-canary
+```
+
+`apex-canary.service` reads the same `/etc/apex/shadow.env` (the endpoint key
+and the trader key) and conflicts with `apex-shadow.service`: the two share the
+trader key and its nonces, and starting one stops the other.
+
+### c. Checks
+
+```
+# journalctl -u apex-canary --no-pager | grep -E "canary booted|the canary sends through|the canary's ledger is read"
+# cd /opt/apex && scripts/shadow-status.sh          # the `canary` line: sent, landed, reverted, refused, net, lost, open
+# tail -3 /opt/apex/var/apex/canary.jsonl           # each send's record, then its outcome
+```
+
+- **The first send is also the test of BlockPI's address screen** for a
+  trader → executor transaction. A refusal costs nothing and appears as a
+  `refused` outcome with the endpoint's message; two in a row halt the canary.
+- A boot that says `the executor pays profit to … not canary.profit_recipient`
+  means step a.1 has not landed.
+
+### d. Stopping it
+
+- **Soft:** `touch /opt/apex/var/apex/canary.stop`. The risk gate refuses every
+  candidate while the file exists; remove it to resume. Not a halt.
+- **Halts** (loss cap 0.001 ETH on losing trades, 5 reverts in a row, 2 refused
+  sends in a row, an unresolved or unexplained transaction, the nonce tripwire,
+  100 landed trades) are written to `canary.jsonl` and survive a restart. The
+  status line says `HALTED: <reason>`. After reviewing it:
+
+```
+# systemctl stop apex-canary && sudo -u apex /opt/apex/scripts/canary-reset.sh /opt/apex/var/apex/canary.jsonl && systemctl start apex-canary
+```
+
+- **Hard, the owner's own, on chain.** Open the executor's circuit, or revoke
+  the trader (§6). The live reader reads `isCircuitOpen()` and
+  `executors(trader)` every block, so either one stops sends at the next block,
+  before any gas is spent:
+
+```
+$ TRIP=$(cast calldata "multicall(address[],bytes[])" "[0x8940B565D050974b2b589B70De43bCb753b1F93B]" "[$(cast calldata 'tripCircuit()')]")
+$ cast call --from 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3 0x9ecde68C269EbbaFD44bbB4DfC9D6716B47952C2 $TRIP --rpc-url base   # 0x
+$ cast send 0x9ecde68C269EbbaFD44bbB4DfC9D6716B47952C2 $TRIP --rpc-url base --interactive
+$ cast call 0x8940B565D050974b2b589B70De43bCb753b1F93B "isCircuitOpen()(bool)" --rpc-url base   # true
+```
+
+  To close it again, the same with `resetCircuit()`. Dry-run on 2026-10-15:
+  `0x` as the owner, 60,814 gas.
+- **Off:** `systemctl stop apex-canary`.
+
+### e. The profit
+
+It arrives at the owner as WETH. Unwrapping calls WETH, which BlockPI's
+protected endpoint refuses (`-32605`), so use another RPC:
+
+```
+$ cast send 0x4200000000000000000000000000000000000006 "withdraw(uint256)" <wei> --rpc-url https://mainnet.base.org --interactive
+```

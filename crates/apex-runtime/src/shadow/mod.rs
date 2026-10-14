@@ -449,7 +449,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         );
     }
     // R28: a canary trades only once the executor pays its profit where the
-    // configuration says (the owner's recipient change, ops/host/README.md §9).
+    // configuration says (the owner's recipient change, ops/host/README.md §10).
     if let Some(k) = &config.canary {
         let e = config.executor.address;
         let read = reads

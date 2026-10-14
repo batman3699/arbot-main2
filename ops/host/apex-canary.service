@@ -1,0 +1,43 @@
+# The live canary (Task 8.5 R28): the shadow's process with its reactive lane
+# SENDING real transactions from the trader key, one at a time, under the
+# limits in ops/canary.base.yaml. The armed lane stays in shadow.
+# See ops/host/README.md section 10. Never runs beside apex-shadow: they share the
+# trader key and its nonces.
+[Unit]
+Description=APEX canary (Task 8.5 R28): the reactive lane sends real trades under its limits
+Conflicts=apex-shadow.service
+Wants=network-online.target chrony.service
+After=network-online.target chrony.service
+
+[Service]
+Type=simple
+User=apex
+Group=apex
+WorkingDirectory=/opt/apex
+# Read by systemd as root before it drops to apex: root:root 0600.
+EnvironmentFile=/etc/apex/shadow.env
+ExecStart=/opt/apex/bin/apex canary --config ops/canary.base.yaml
+Restart=on-failure
+RestartSec=10
+# The canary drains on SIGINT or SIGTERM; 90 s covers a Tier 2 and a
+# settlement (10 s) in flight.
+KillSignal=SIGINT
+TimeoutStopSec=90
+UMask=0027
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/opt/apex/var
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
