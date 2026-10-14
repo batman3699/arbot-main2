@@ -119,6 +119,13 @@ else:
               + (f" at {ln['morpho_extra_gas']:,} gas over Balancer" if ln.get("morpho_extra_gas") else ""))
         print(f"  signer      nonce at boot {sg.get('boot_nonce')}" + ("" if not sg.get("nonce_moved") else
               "  -- SIGNER NONCE MOVED: revoke the trader key (ops/host/README.md)"))
+    cn = r.get("canary")
+    if cn:  # R28: present only in a canary's report
+        t = cn["totals"]
+        print(f"  canary      sent {t['sent']} landed {t['landed']} reverted {t['reverted_early'] + t['reverted_late']} "
+              f"refused {t['refused']} net {int(t['net_wei']) / 1e18:+.6f} ETH lost {int(t['lost_wei']) / 1e18:.6f} ETH open {cn['open']}"
+              + (f"  -- HALTED: {cn['halted']}" if cn.get("halted") else "")
+              + ("  -- STOP FILE" if cn.get("stop_file") else ""))
     print(f"  feed        {fd['sessions']} sessions ({max(fd['sessions'] - 1, 0)} reconnects), {fd['dropped']} dropped, lossless {fd['fast_lane_lossless']}")
     q = r.get("queue")
     if q:  # R21: absent from a report before the queue

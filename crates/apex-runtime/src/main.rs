@@ -71,6 +71,8 @@ use tracing::{error, info, warn};
 const DEFAULT_JOURNAL: &str = "var/apex/tickets.journal";
 const DEFAULT_INPUTS: &str = "ops/inputs.yaml";
 const DEFAULT_SHADOW_CONFIG: &str = "ops/shadow.base.yaml";
+/// R28: the live canary's configuration.
+const DEFAULT_CANARY_CONFIG: &str = "ops/canary.base.yaml";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -89,6 +91,9 @@ async fn main() -> ExitCode {
     }
     if std::env::args().nth(1).as_deref() == Some("shadow") {
         return shadow().await;
+    }
+    if std::env::args().nth(1).as_deref() == Some("canary") {
+        return canary().await;
     }
 
     match run().await {
@@ -249,6 +254,52 @@ async fn shadow() -> ExitCode {
         }
         Err(e) => {
             error!(error = %e, "apex shadow refused to start");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `apex canary [--config ops/canary.base.yaml]` (R28): the shadow's process with
+/// its reactive lane sending, under the canary's limits.
+async fn canary() -> ExitCode {
+    let mut config = DEFAULT_CANARY_CONFIG.to_string();
+    let mut argv = std::env::args().skip(2);
+    while let Some(flag) = argv.next() {
+        match flag.as_str() {
+            "--config" => match argv.next() {
+                Some(path) => config = path,
+                None => {
+                    error!("--config needs a path");
+                    return ExitCode::FAILURE;
+                }
+            },
+            other => {
+                error!("usage: apex canary [--config {DEFAULT_CANARY_CONFIG}]; unknown argument `{other}`");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    // `secrets_only`, as the shadow: the endpoints' key and the signer's are
+    // the only values read from the environment.
+    let env = Env::secrets_only();
+    let loaded = match apex_runtime::shadow::config::ShadowConfig::load_canary(&config, &env) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "apex canary refused to start");
+            return ExitCode::FAILURE;
+        }
+    };
+    match apex_runtime::shadow::run(loaded, &env, wait_for_signal()).await {
+        Ok(report) => {
+            info!(
+                events = report.funnel.events,
+                canary = ?report.canary.as_ref().map(|c| &c.totals),
+                "apex canary stopped"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!(error = %e, "apex canary refused to start");
             ExitCode::FAILURE
         }
     }

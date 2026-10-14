@@ -45,6 +45,10 @@ pub mod race;
 pub mod reload;
 
 use crate::bus::{EventBus, Lane, Subscription as BusSubscription};
+use crate::canary::chain::{CanaryChain, ChainSettings};
+use crate::canary::limits::{Canary, CanaryReport, Limits};
+use crate::canary::recover::CanaryRecovery;
+use crate::canary::send::{CanaryDispatcher, InFlight};
 use crate::econ::{ChainCosts, FlashTerms, LiveEconomics, RouteCosts, ScenarioPriors};
 use crate::live::abi::{self, selector};
 use crate::live::adapter::LiveAdapter;
@@ -78,6 +82,7 @@ use apex_capture::signer::{ExecutorAuth, LaneConfig, SignerPool};
 use apex_chain::adapter::ReplacementPolicy;
 use apex_chain::base::flashblock::{sample, FlashblockRecorder};
 use apex_chain::base::flashblock_stream::{FlashblockIndexer, FlashblockStream, FlashblockStreamStats};
+use apex_chain::base::send::HttpSubmitter;
 use apex_chain::rpc::failover::{FailoverSettings, FailoverTransport};
 use apex_chain::rpc::ws::{Head, LogFilter, Notification, Subscription, WsFeed, WsSettings, WsStats};
 use apex_chain::rpc::RpcTransport;
@@ -238,6 +243,8 @@ struct Shadow {
     /// since: a shadow never sends, so a move means the key was used elsewhere.
     boot_nonce: OnceLock<u64>,
     nonce_moved: AtomicBool,
+    /// R28: the canary, when this run is `apex canary`.
+    canary: Option<Arc<Canary>>,
     /// R26: the arming engine (armed-shadow).
     armed: Arc<crate::armed::engine::Engine>,
     stats: Stats,
@@ -248,6 +255,13 @@ struct Shadow {
 /// broadcasts, so any move means the key was used elsewhere (R25).
 pub fn nonce_moved(boot: Option<u64>, now: u64) -> bool {
     boot.is_some_and(|b| b != now)
+}
+
+/// R28: the canary's tripwire. Its own sends move the nonce; a nonce beyond the
+/// boot reading plus every send since means the key is in use elsewhere. A view
+/// that lags our latest send reads below that, and is not a theft.
+pub fn nonce_beyond_ours(boot: u64, now: u64, sent: u64) -> bool {
+    now > boot.saturating_add(sent)
 }
 
 /// The census's pools that can form a cycle the live frontier prices: pairs
@@ -434,6 +448,24 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
             "the executor's code is not the configured code: last-mile check 2 refuses every ticket until it is"
         );
     }
+    // R28: a canary trades only once the executor pays its profit where the
+    // configuration says (the owner's recipient change, ops/host/README.md §9).
+    if let Some(k) = &config.canary {
+        let e = config.executor.address;
+        let read = reads
+            .multicall(&[(e, abi::call0(selector::PROFIT_RECIPIENT)), (e, abi::call0(selector::FEE_RECIPIENT))], head)
+            .await
+            .map_err(|e| boot_err("the executor's recipients", e))?;
+        let at = |i: usize| read.get(i).cloned().flatten().and_then(|d| abi::word_address(&d, 0));
+        if at(0) != Some(k.profit_recipient) || at(1) != Some(k.profit_recipient) {
+            return Err(ShadowError::Boot(format!(
+                "the executor pays profit to {:?} and fees to {:?}, not canary.profit_recipient {}: the owner's recipient change comes first",
+                at(0),
+                at(1),
+                k.profit_recipient
+            )));
+        }
+    }
 
     // Costs, from the chain now; the head task keeps them current.
     let c = &config.costs;
@@ -596,32 +628,86 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         ExecutorAuth { chain: base, executor: e.address.into_array(), executor_version: version },
         vec![LaneConfig { id: lane, address: key.address().into_array(), gas_reserve_wei: s.gas_reserve_wei }],
     ));
+    let trader = key.address();
     let signer = Arc::new(LocalSigner::new(base).with_lane(lane, key));
-    let adapter = Arc::new(LiveAdapter::new(
-        vec![SubmissionLaneId(1)],
-        ReplacementPolicy { supported: true, min_fee_bump_bps: 1_000, max_attempts: 2 },
-    ));
     let null = Arc::new(NullDispatcher::new());
     let nothing_sent = Arc::new(NothingSent::default());
+    // R28: the canary's pieces, when this is `apex canary`.
+    let canary = match &config.canary {
+        None => None,
+        Some(k) => {
+            let c = Arc::new(
+                Canary::open(
+                    &k.ledger,
+                    &k.stop_file,
+                    Limits {
+                        loss_cap_wei: k.loss_cap_wei,
+                        max_consecutive_reverts: k.max_consecutive_reverts,
+                        max_consecutive_refusals: k.max_consecutive_refusals,
+                        max_landed: k.max_landed,
+                    },
+                )
+                .map_err(|e| boot_err("the canary ledger", e))?,
+            );
+            let in_flight = Arc::new(InFlight::default());
+            let chain = Arc::new(CanaryChain::new(
+                Arc::clone(&rpc),
+                Arc::clone(&c),
+                Arc::clone(&in_flight),
+                ChainSettings {
+                    weth: WETH,
+                    executor: config.executor.address,
+                    trader,
+                    recipients: vec![k.profit_recipient],
+                    poll: Duration::from_millis(k.receipt_poll_ms),
+                    timeout: Duration::from_millis(k.settle_timeout_ms),
+                },
+            ));
+            let submitter = HttpSubmitter::new(config.rpc_http[0].expose(), Duration::from_secs(3))
+                .map_err(|e| ShadowError::Boot(format!("the canary's submitter: {e}")))?;
+            info!(endpoint = submitter.label(), "the canary sends through this endpoint");
+            let dispatcher = Arc::new(CanaryDispatcher::new(Arc::clone(&c), Arc::new(submitter), in_flight));
+            Some((c, chain, dispatcher))
+        }
+    };
+    let adapter = Arc::new({
+        let a = LiveAdapter::new(
+            vec![SubmissionLaneId(1)],
+            ReplacementPolicy { supported: true, min_fee_bump_bps: 1_000, max_attempts: 2 },
+        );
+        match &canary {
+            Some((_, chain, _)) => a.with_attribution(Arc::clone(chain) as Arc<dyn crate::live::adapter::Attribution>),
+            None => a,
+        }
+    });
     // The block being built, as the feed has seen it: Tier 2 simulates in it.
     let (building, building_now) = watch::channel(None);
     let plane = Arc::new(Plane::new(Ports {
         registry: Arc::new(TicketRegistry::new(Box::new(journal), Box::new(SystemClock))),
         pool,
         gate: Arc::new(DispatchGate::shut()),
-        dispatch: DispatchLane::Shadow(Arc::clone(&null)),
+        dispatch: match &canary {
+            Some((_, _, d)) => DispatchLane::Canary(Arc::clone(d) as Arc<dyn crate::plane::Sender>),
+            None => DispatchLane::Shadow(Arc::clone(&null)),
+        },
         chain: adapter.clone(),
         search: search.clone(),
         econ,
         sim: Arc::new(LiveSimulator::new(Arc::clone(&rpc), base, building_now, Arc::new(SystemClock))),
-        // Nothing records a loss on a lane that sends nothing, so the breaker
-        // never trips here; its limits are the live run's to set.
-        risk: Arc::new(LiveRiskGate::new(
-            PostureLadder::new(),
-            CircuitBreaker::new(U256::MAX, U256::MAX, u32::MAX),
-            config.policy.eligibility(),
-            Box::new(SystemClock),
-        )),
+        // Nothing records a loss into the breaker, so it never trips here; a
+        // canary's limits are its own (R28), and they hold every candidate.
+        risk: Arc::new({
+            let g = LiveRiskGate::new(
+                PostureLadder::new(),
+                CircuitBreaker::new(U256::MAX, U256::MAX, u32::MAX),
+                config.policy.eligibility(),
+                Box::new(SystemClock),
+            );
+            match &canary {
+                Some((c, _, _)) => g.with_hold(Arc::clone(c) as Arc<dyn crate::risk::Hold>),
+                None => g,
+            }
+        }),
         commitments: commitments.clone(),
         calls: Arc::new({
             let b = LiveCallBuilder::new(Arc::clone(&book), cycles.into_values());
@@ -632,9 +718,22 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         }),
         signer,
         live: reader.clone(),
-        settlement: nothing_sent.clone(),
+        settlement: match &canary {
+            Some((_, chain, _)) => Arc::clone(chain) as Arc<dyn crate::plane::SettlementFeed>,
+            None => nothing_sent.clone(),
+        },
     }));
-    let reconciled = plane.boot(&*nothing_sent, SystemClock.now()).map_err(|e| boot_err("recovery", e))?;
+    let reconciled = match &canary {
+        Some((c, chain, _)) => {
+            let recovery = CanaryRecovery::build(c, chain).await;
+            plane.boot(&recovery, SystemClock.now())
+        }
+        None => plane.boot(&*nothing_sent, SystemClock.now()),
+    }
+    .map_err(|e| boot_err("recovery", e))?;
+    if let Some((c, _, _)) = &canary {
+        info!(halted = ?c.halted(), open = c.open_sends().len(), "the canary's ledger is read");
+    }
 
     info!(
         config = %config.version,
@@ -647,7 +746,8 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         reconciled,
         route_other_wei = costs.route_costs().other_wei,
         lender_weth = holding,
-        "shadow booted"
+        "{} booted",
+        if config.canary.is_some() { "canary" } else { "shadow" }
     );
     let (heads, _) = watch::channel(None);
     let (race, race_lines) = race::RaceWriter::new(4_096);
@@ -679,6 +779,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         flashblock_stats: Versioned::new(None, ReconstructionStatus::Rebuilding),
         boot_nonce: OnceLock::new(),
         nonce_moved: AtomicBool::new(false),
+        canary: canary.map(|(c, _, _)| c),
         armed,
         stats: Stats::default(),
         started,
@@ -908,7 +1009,15 @@ impl Shadow {
             view.note("the live reader's view", self.reader.refresh(&h, window).await, &self.stats.view_failures);
             if let Some(v) = self.reader.view() {
                 let boot = *self.boot_nonce.get_or_init(|| v.signer_pending_nonce);
-                if nonce_moved(Some(boot), v.signer_pending_nonce) {
+                if let Some(c) = &self.canary {
+                    // R28: the canary's own sends move the nonce; only a move
+                    // beyond them means the key is in use elsewhere.
+                    let sent = c.sent_since_boot();
+                    if nonce_beyond_ours(boot, v.signer_pending_nonce, sent) {
+                        self.nonce_moved.store(true, Ordering::Relaxed);
+                        let _ = c.halt(crate::canary::Halt::Tripwire { boot, now: v.signer_pending_nonce, sent });
+                    }
+                } else if nonce_moved(Some(boot), v.signer_pending_nonce) {
                     self.nonce_moved.store(true, Ordering::Relaxed);
                     error!(
                         boot,
@@ -1177,6 +1286,7 @@ impl Shadow {
                     morpho_extra_gas: l.filter(|l| l.morpho.is_some()).map(|l| l.morpho_extra_gas),
                 }
             },
+            canary: self.canary.as_ref().map(|c| c.report()),
         };
         info!(
             head = ?r.head,
@@ -1254,6 +1364,8 @@ pub struct Report {
     pub armed: ArmedReport,
     /// R27: what each lender holds of WETH, as last read.
     pub lenders: LendersReport,
+    /// R28: the canary, when this run is one.
+    pub canary: Option<CanaryReport>,
 }
 
 /// What each flash lender holds, in wei (R27).

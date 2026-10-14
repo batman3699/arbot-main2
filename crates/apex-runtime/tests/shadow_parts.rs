@@ -187,6 +187,50 @@ fn what_the_run_will_not_do_is_refused() {
     assert!(matches!(refused(ok.replace(&format!(r#"["https://rpc.example/v1/${{{var}}}"]"#), "[]")), ShadowConfigError::Invalid(_)));
 }
 
+fn canary_section() -> &'static str {
+    r#"
+canary:
+  ledger: var/apex/canary.jsonl
+  stop_file: var/apex/canary.stop
+  profit_recipient: "0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3"
+  loss_cap_wei: 1000000000000000
+  max_consecutive_reverts: 5
+  max_consecutive_refusals: 2
+  max_landed: 100
+  receipt_poll_ms: 250
+  settle_timeout_ms: 10000
+"#
+}
+
+/// **R28: each command refuses the other's configuration.** The shadow refuses
+/// a canary section (it must stay unable to send); the canary refuses a file
+/// without one, and a shadow's journal, which recovery would close as never sent.
+#[test]
+fn each_command_refuses_the_others_configuration() {
+    let var = "APEX_SECRET_SHADOW_TEST_CANARY";
+    let shadow = yaml(var, "var/apex/shadow.journal");
+    let canary = format!("{}{}", yaml(var, "var/apex/canary.journal"), canary_section());
+    let e = env(var, SECRET);
+    assert!(ShadowConfig::from_yaml_str(&shadow, &e).is_ok());
+    assert!(ShadowConfig::from_yaml_str(&canary.replace("canary.journal", "shadow.journal"), &e).is_err(), "a shadow with a canary section");
+    assert!(ShadowConfig::canary_from_yaml_str(&shadow.replace("shadow.journal", "canary.journal"), &e).is_err(), "a canary without one");
+    assert!(ShadowConfig::canary_from_yaml_str(&format!("{shadow}{}", canary_section()), &e).is_err(), "a canary on a shadow journal");
+    let c = ShadowConfig::canary_from_yaml_str(&canary, &e).expect("a canary config");
+    let k = c.canary.expect("the section");
+    assert_eq!(k.loss_cap_wei, 1_000_000_000_000_000);
+    assert_eq!(k.max_consecutive_reverts, 5);
+}
+
+/// Review focus 4: the canary's tripwire fires only beyond its own sends.
+#[test]
+fn the_canary_tripwire_fires_only_beyond_our_sends() {
+    use apex_runtime::shadow::nonce_beyond_ours;
+    assert!(!nonce_beyond_ours(10, 10, 0));
+    assert!(!nonce_beyond_ours(10, 10, 1), "the view lags our send: not a theft");
+    assert!(!nonce_beyond_ours(10, 11, 1));
+    assert!(nonce_beyond_ours(10, 12, 1));
+}
+
 /// R28: a tip share above the whole net is refused.
 #[test]
 fn a_tip_share_above_the_net_is_refused() {

@@ -78,6 +78,9 @@ struct Raw {
     /// R27: the lenders beside Balancer's vault. Absent, every loan is Balancer's.
     #[serde(default)]
     lenders: LendersConfig,
+    /// R28: the live canary. Only `apex canary` accepts it.
+    #[serde(default)]
+    canary: Option<CanaryConfig>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +115,31 @@ pub fn lender_code_ok(found: B256, config: &MorphoLenderConfig) -> Result<(), St
     } else {
         Err(format!("the Morpho lender at {:#x} runs code {found:#x}, not {:#x}", config.address, config.code_hash))
     }
+}
+
+/// R28: the live canary. Present only in a canary's configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CanaryConfig {
+    pub ledger: PathBuf,
+    /// `touch` it to stop new sends; remove it to resume. Not a halt.
+    pub stop_file: PathBuf,
+    /// The executor must pay here, or the canary refuses to start.
+    pub profit_recipient: Address,
+    /// Losses on losing trades; wins do not offset them.
+    pub loss_cap_wei: u128,
+    pub max_consecutive_reverts: u32,
+    pub max_consecutive_refusals: u32,
+    pub max_landed: u32,
+    pub receipt_poll_ms: u64,
+    pub settle_timeout_ms: u64,
+}
+
+/// Which command is loading: each refuses the other's configuration.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Shadow,
+    Canary,
 }
 
 /// The executor every ticket is committed to.
@@ -269,6 +297,8 @@ pub struct ShadowConfig {
     pub universe: UniverseConfig,
     /// The flash lenders beside Balancer's vault (R27).
     pub lenders: LendersConfig,
+    /// R28: the live canary, when this is `apex canary`'s configuration.
+    pub canary: Option<CanaryConfig>,
 }
 
 fn scrub(mut message: String, secrets: &[String]) -> String {
@@ -290,6 +320,21 @@ impl ShadowConfig {
     }
 
     pub fn from_yaml_str(text: &str, env: &Env) -> Result<Self, ShadowConfigError> {
+        Self::parse(text, env, Command::Shadow)
+    }
+
+    /// `ops/canary.base.yaml` (R28).
+    pub fn canary_from_yaml_str(text: &str, env: &Env) -> Result<Self, ShadowConfigError> {
+        Self::parse(text, env, Command::Canary)
+    }
+
+    pub fn load_canary(path: &str, env: &Env) -> Result<Self, ShadowConfigError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| ShadowConfigError::Io { path: path.to_string(), detail: e.to_string() })?;
+        Self::canary_from_yaml_str(&text, env)
+    }
+
+    fn parse(text: &str, env: &Env, command: Command) -> Result<Self, ShadowConfigError> {
         let version = keccak256(text.as_bytes());
         let resolved = apex_config::interpolate(text, env).map_err(ShadowConfigError::Unresolved)?;
         let raw: Raw = serde_yaml::from_str(&resolved).map_err(|e| {
@@ -310,11 +355,34 @@ impl ShadowConfig {
                 apex_config::SECRET_PREFIX
             )));
         }
-        let named_shadow = |p: &PathBuf| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("shadow"));
-        if !named_shadow(&raw.journal) {
-            return Err(invalid(
-                "the journal must be named as a shadow's: recovery closes everything in it as never sent",
-            ));
+        // R28: each command refuses the other's configuration. `apex shadow`
+        // never sends, whatever its file says; a canary's journal is reconciled
+        // against the chain and must never be a shadow's.
+        let named = |p: &PathBuf, what: &str| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(what));
+        match (command, &raw.canary) {
+            (Command::Shadow, Some(_)) => {
+                return Err(invalid("a canary section in a shadow's configuration: `apex shadow` never sends; run `apex canary`"))
+            }
+            (Command::Shadow, None) if !named(&raw.journal, "shadow") => {
+                return Err(invalid(
+                    "the journal must be named as a shadow's: recovery closes everything in it as never sent",
+                ))
+            }
+            (Command::Canary, None) => return Err(invalid("`apex canary` needs a canary section")),
+            (Command::Canary, Some(_)) if !named(&raw.journal, "canary") || named(&raw.journal, "shadow") => {
+                return Err(invalid("the journal must be named as a canary's, never a shadow's"))
+            }
+            (Command::Canary, Some(k))
+                if k.loss_cap_wei == 0
+                    || k.max_consecutive_reverts == 0
+                    || k.max_consecutive_refusals == 0
+                    || k.max_landed == 0
+                    || k.receipt_poll_ms == 0
+                    || k.settle_timeout_ms == 0 =>
+            {
+                return Err(invalid("canary: every limit and period must be above zero"))
+            }
+            _ => {}
         }
         let p = &raw.policy;
         if p.report_every_s == 0 || p.full_reload_every_s == 0 || p.l1_every_blocks == 0 {
@@ -363,6 +431,7 @@ impl ShadowConfig {
             capacity: raw.capacity,
             universe: raw.universe,
             lenders: raw.lenders,
+            canary: raw.canary,
         })
     }
 }
