@@ -6085,6 +6085,18 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - **Never under the old search by more than its tolerance,** on any case. The budget ended none.
     - **The assumptions held:** across 30,525 priced sizes no cost fell, and no gross sat under its neighbours' line by more than the route's rounding.
     - Every target the spec set was met: at most 64 quotes (26), a median of at most 32 (12), at most 8 where no size pays (4), three times faster at the median (11.8), the 99th percentile no slower (3.8 ms against 24.3).
+  - **On the host since 2026-10-14 01:16:58 UTC** (4f16428; R27.1's 7 h 7 m is `/opt/apex/var/run-8`). First 10 minutes against R27.1's run:
+
+    | | R27.1 | R27.2 |
+    |---|---|---|
+    | An armed pass | 96 ms | 13 ms |
+    | Slots priced at the book as it stood | 92.5% | 99.8% |
+    | Slots left waiting a pass | 31.7 | 0.8 |
+    | The process's CPU | 2.15 cores | 0.55 of one |
+
+    - Both of the spec's armed targets are met (99%, and under one waiting).
+    - **The reactive figure is not in yet:** no candidate reached the plane in those 10 minutes. R27.1's 26 candidates took 53.6 ms from received to proposed at the median, 111 at the 90th percentile.
+    - The boot log reads `lender_weth=1 executor_weth=1 extra_gas=83000`: Morpho loans are priced with the dust in place.
   - **Found on the way, and not fixed here: the reactive lane sizes every candidate again.**
     - `LiveEconomics::evaluate` runs `continuous::optimize`, a 60-iteration golden section on the net from the top of the range, then `discrete::refine`'s climb. It never used Engine C's size.
     - Measured on 145 paying cases: 211 quotes and 2.7 ms at the median, 8.5 ms at the 90th percentile, 14 ms at most, **and it runs four times a candidate**: about 11 ms at the median and 34 ms at the 90th percentile, on the capture path after "proposed".
