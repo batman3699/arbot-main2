@@ -6047,6 +6047,52 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
   - **With the pause (b9478f5, on the host since 2026-10-13 18:09:44 UTC, 10 minutes):** 95% of the 316 slots priced at the book as it stood (82% before the pause), 19 waiting a pass (72), 9.2 passes a second at 75 ms. The first build's 28 minutes are `/opt/apex/var/run-7`, R27's 59 minutes `run-6`.
   - **Not fixed: the reactive lane prices a candidate more slowly since R27.** Received to proposed was 40 ms at the median over R26.3's 167 candidates, 62 ms over R27's 12 and 52 ms over the next build's 3. Same cause, the size search over a range 4,400 times wider.
   - 7 mutants, all killed. Gates green but the two known-red scripts.
+- [x] **R27.2 — a size search that bounds what it has not priced.** Spec `docs/superpowers/specs/2026-10-14-size-search-design.md`, plan `docs/superpowers/plans/2026-10-14-size-search.md`.
+  - **Why.** `best_size` was a ternary search over wei, from a millionth of a token to the route's cap.
+    - It never converged inside its budget, so **every search cost 128 quotes**.
+    - Since R27 the cap is what Morpho or the paying pool holds, and the first twenty iterations quoted sizes of hundreds of WETH: one search took 0.8 to 1.1 ms under Balancer's cap and 1.3 to 4.2 ms under Morpho's.
+    - Engine C runs it for every template an event touches (received to proposed: 40 ms at the median before R27, 52 to 62 ms after), and the armed lane 12 to 15 times a slot.
+  - **The operator's design review (2026-10-14) found the first draft unsafe**, and was right on both counts:
+    - a cost step below the gross's peak can put the best net outside the bracket a walk on the gross leaves;
+    - a golden-section search on the net proves nothing, the net not being unimodal.
+  - **The search now bounds every size it has not priced.**
+    - The gross is concave, so it lies under the line through any two priced sizes, outside them; the origin stands to the left of the first.
+    - A region costs at least what its left end costs, so a cost step inside does not weaken its bound.
+    - It prices the midpoint of the region with the highest bound (four times the largest size, or a quarter of the smallest, at the ends) and stops when no bound is above `max(best, 0)` plus the tolerance.
+    - **So no size nets more than that.** Nothing assumes the net has one peak.
+    - The tolerance: one part in a million of the best net and the fixed cost, plus four times the route's rounding.
+  - **`SizedRoute::rounding`** (new, default zero): what truncation can take from a quoted output. A hop truncates, so the gross is a sawtooth under its concave curve, and every bounding line is raised by it. A live cycle's is two units of its middle token at the second pool's price (`LiveCycle::mid_unit`): about 10^-9 WETH through a dollar token, 10^-6 through an 8-decimal bitcoin token.
+  - **Held to exhaustive search**, not to the old search (`tests/size_search_oracle.rs`, table routes of a few thousand sizes):
+    - the review's counter-example; cost steps below, inside and above the peak; caps, refusals, flat and tied nets;
+    - 1,500 generated cases matched exactly with the tolerance at zero, at 8 quotes each on average and 31 at most;
+    - 80,000 truncated routes, none short by more than the tolerance (ignored test, a minute);
+    - in the library, every region's bound checked against every size in it, on 600 routes priced anywhere in their range.
+    - The old search, kept as a comparator, is strictly worse on 21 of 300 generated routes.
+  - **Mutation:** 34 mutants of the search, 29 killed. Every unsound one is killed: each bounding line, each `rounding`, each cost floor, the origin, the stop rule, the tie and refusal rules, the budget. Five live, and none changes an answer: where inside a region to price, the walk's factor of four, the region above the largest size taken first, which of two equal regions goes first, and a looser cost floor that is still a floor.
+  - **What building it removed:**
+    - a floating-point rule for where to price inside a region: it saved no quote over the midpoint;
+    - rounding the line up: a gross is a whole number, so the line's whole part bounds it;
+    - dropping priced sizes above a refusal: under the assumptions there are none.
+  - **Both searches over the live universe** (`tests/size_search_harness.rs`, ignored; block 52,565,834, 41 pools, 158 cycles, either pool the trigger, moved 0 to 200 ticks; 1,827 cases; release build, the laptop; one cost model):
+
+    | | Quotes, median / 99th / most | New, µs, median / 99th | Old, µs, median / 99th | Faster, median |
+    |---|---|---|---|---|
+    | Every case | 12 / 24 / 26 | 93 / 3,807 | 1,650 / 24,316 | 11.8× |
+    | A size pays (1,049) | 16 / 25 / 26 | 267 / 4,078 | 2,303 / 25,264 | 7.8× |
+    | No size pays (778) | 4 / 7 / 8 | 25 / 73 | 1,275 / 2,860 | 54× |
+
+    - The old search: 128 quotes on every case.
+    - **Never under the old search by more than its tolerance,** on any case. The budget ended none.
+    - **The assumptions held:** across 30,525 priced sizes no cost fell, and no gross sat under its neighbours' line by more than the route's rounding.
+    - Every target the spec set was met: at most 64 quotes (26), a median of at most 32 (12), at most 8 where no size pays (4), three times faster at the median (11.8), the 99th percentile no slower (3.8 ms against 24.3).
+  - **Found on the way, and not fixed here: the reactive lane sizes every candidate again.**
+    - `LiveEconomics::evaluate` runs `continuous::optimize`, a 60-iteration golden section on the net from the top of the range, then `discrete::refine`'s climb. It never used Engine C's size.
+    - Measured on 145 paying cases: 211 quotes and 2.7 ms at the median, 8.5 ms at the 90th percentile, 14 ms at most, **and it runs four times a candidate**: about 11 ms at the median and 34 ms at the 90th percentile, on the capture path after "proposed".
+    - `optimize` has both faults the review found. This is the next change.
+    - So R27.2 changes which routes Engine C proposes (within the tolerance) and how fast, and every size the armed lane arms; **it does not change a size the reactive lane executes.**
+  - **Also from the operator's profit audit (2026-10-14), checked and not changed here:**
+    - *Failure cost charged twice* (`LiveEconomics::scenarios`): confirmed. The expected failure cost is inside the cost every scenario pays, and the revert scenario pays the full success cost. It is about 10^11 wei a candidate, under a tenth of a cent, beside priors that scale the gross by 0.62. Worth fixing when the priors are measured.
+    - *Trigger met, nothing simulated* (armed verdicts): by design. `trigger_met` without `fired` is the other pool outside its band: no fire, so nothing to quote or simulate. The summary counts them as `unfired_band_missed`. The five `failed/Reverted` in the reactive funnel are Tier 2 simulation refusals, not chain reverts, and not the same five.
 
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
