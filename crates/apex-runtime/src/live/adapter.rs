@@ -70,16 +70,32 @@ impl BaseRpc for RefusingRpc {
     }
 }
 
+/// What reconciles a transaction that landed (R28): the canary's chain. The
+/// shadow has none, and refuses, as `RefusingRpc` always did.
+#[async_trait::async_trait]
+pub trait Attribution: Send + Sync {
+    async fn attribute(&self, tx: B256) -> AdapterResult<PnlAttribution>;
+}
+
 /// `BaseAdapter` over the latest measured capacity model.
 pub struct LiveAdapter {
     lanes: Vec<SubmissionLaneId>,
     replacement: ReplacementPolicy,
     inner: Versioned<Option<BaseAdapter<RefusingRpc>>>,
+    /// R28: the canary's reconciliation. `None` in a shadow.
+    attribution: Option<std::sync::Arc<dyn Attribution>>,
 }
 
 impl LiveAdapter {
     pub fn new(lanes: Vec<SubmissionLaneId>, replacement: ReplacementPolicy) -> Self {
-        Self { lanes, replacement, inner: Versioned::new(None, ReconstructionStatus::Rebuilding) }
+        Self { lanes, replacement, inner: Versioned::new(None, ReconstructionStatus::Rebuilding), attribution: None }
+    }
+
+    /// R28: reconcile through `a`.
+    #[must_use]
+    pub fn with_attribution(mut self, a: std::sync::Arc<dyn Attribution>) -> Self {
+        self.attribution = Some(a);
+        self
     }
 
     /// Rebuild the adapter over a new model.
@@ -158,6 +174,9 @@ impl ChainExecutionAdapter for LiveAdapter {
     }
 
     async fn reconcile_final_state(&self, h: B256) -> AdapterResult<PnlAttribution> {
-        RefusingRpc.attribute(h).await
+        match &self.attribution {
+            Some(a) => a.attribute(h).await,
+            None => RefusingRpc.attribute(h).await,
+        }
     }
 }

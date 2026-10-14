@@ -11,6 +11,7 @@
 //!
 //! The spec is `docs/superpowers/specs/2026-10-15-live-canary-design.md`.
 
+pub mod chain;
 pub mod ledger;
 pub mod limits;
 pub mod send;

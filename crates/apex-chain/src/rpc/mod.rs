@@ -90,6 +90,8 @@ pub const READ_METHODS: &[&str] = &[
     "eth_getTransactionByHash",
     "eth_getTransactionReceipt",
     "eth_getLogs",
+    // R28: a landed revert's reason. A read of a transaction already mined.
+    "debug_traceTransaction",
     // Base's Flashblocks-aware status. `Known` means the preconfirmation node
     // received a transaction -- §21.5, and `base::submit` maps it to
     // `NodeKnown`, never to an inclusion.
