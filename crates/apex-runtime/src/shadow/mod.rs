@@ -541,7 +541,9 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     let pricer_near_misses = pricer.near_misses();
     let econ = Arc::new(
         {
-            let e = LiveEconomics::new(pricer.clone(), ScenarioPriors::default(), chain_costs, StrategyId(1)).with_flash(terms);
+            let e = LiveEconomics::new(pricer.clone(), ScenarioPriors::default(), chain_costs, StrategyId(1))
+                .with_tip_share(config.policy.tip_share_bps)
+                .with_flash(terms);
             // The terms' `available` is the boot read, a pricing hint for the
             // risk gate; last-mile check 9 reads the chosen lender live.
             match morpho_terms {

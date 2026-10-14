@@ -173,6 +173,10 @@ pub struct Policy {
     /// The risk gate's cost-confidence cap for this run: how large a share of
     /// the expected profit the gas estimate's p50-to-p99 width may be, in bps.
     pub max_cost_confidence_bps: u32,
+    /// R28: the share of each candidate's expected net bid as its priority fee,
+    /// in bps. In both the shadow's file and the canary's, so the two price the
+    /// same trade the same way.
+    pub tip_share_bps: u32,
 }
 
 impl Policy {
@@ -315,6 +319,9 @@ impl ShadowConfig {
         let p = &raw.policy;
         if p.report_every_s == 0 || p.full_reload_every_s == 0 || p.l1_every_blocks == 0 {
             return Err(invalid("a period of zero"));
+        }
+        if p.tip_share_bps > 10_000 {
+            return Err(invalid("policy.tip_share_bps above 10000 bids more than the net"));
         }
         if raw.capacity.sample_every_s == 0 || raw.capacity.boot_sample_s == 0 || raw.capacity.sample_for_s == 0 {
             return Err(invalid("a capacity sample of zero"));

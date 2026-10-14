@@ -99,6 +99,10 @@ policy:
   # refusing just a trade its worst-case gas would leave without profit. A live
   # run keeps the default.
   max_cost_confidence_bps: 10000
+  # R28: a fifth of each trade's expected net, bid as its priority fee. Rivals
+  # tipped 0.004 gwei at the median and 0.40 at the 90th percentile (R25's
+  # contest analysis); on a cents-sized trade this is ~0.005-0.01 gwei.
+  tip_share_bps: 2000
 
 # How a settlement fails, and what failing costs: what the chain does not say.
 # The costliest revert on the R6/R7 fork (hop 2's minimum) used 411,945 gas.

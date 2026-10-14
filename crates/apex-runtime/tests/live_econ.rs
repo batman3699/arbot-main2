@@ -645,6 +645,38 @@ async fn the_gross_is_what_the_cycle_returns_above_what_it_took() {
     assert!(c.expected_net_profit < i128::try_from(output - input).unwrap());
 }
 
+/// **R28: the tip is a share of the expected net, and a loss pays none.**
+#[test]
+fn the_tip_is_a_share_of_the_net() {
+    use apex_runtime::econ::tip_for;
+    assert_eq!(tip_for(1_000_000, 2_000), 200_000);
+    assert_eq!(tip_for(9_999, 2_000), 1_999, "rounded down");
+    assert_eq!(tip_for(0, 2_000), 0);
+    assert_eq!(tip_for(-5, 2_000), 0, "a loss pays no tip");
+    assert_eq!(tip_for(i128::MAX, 10_000), i128::MAX as u128, "no overflow at the extremes");
+    assert_eq!(tip_for(1_000, 20_000), 1_000, "a share above the whole is the whole: a tip never exceeds the net");
+}
+
+/// **R28: the economics charges the tip, and the size does not move.** The tip
+/// scales the net, so the size that maximizes the net before it maximizes the
+/// net after.
+#[tokio::test]
+async fn the_tip_is_charged_and_the_size_is_unchanged() {
+    let plain = econ_over(200, L1FeeModel::unvalidated());
+    let tipped = econ_over(200, L1FeeModel::unvalidated()).with_tip_share(2_000);
+    let p = proposal(2);
+    let r0 = apex_runtime::workers::refine_concurrently(&plain, &p).await.expect("refines");
+    let r1 = apex_runtime::workers::refine_concurrently(&tipped, &p).await.expect("refines");
+    assert_eq!(r0.input_amount, r1.input_amount, "the tip does not move the size");
+    let c0 = plain.assemble(&p, r0).expect("assembles");
+    let c1 = tipped.assemble(&p, r1).expect("assembles");
+    assert_eq!(c0.total_execution_cost.priority_fee, 0);
+    let tip = apex_runtime::econ::tip_for(c0.expected_net_profit, 2_000);
+    assert!(tip > 0, "the fixture pays");
+    assert_eq!(c1.total_execution_cost.priority_fee, tip);
+    assert_eq!(c1.expected_net_profit, c0.expected_net_profit - i128::try_from(tip).unwrap());
+}
+
 /// **A route that borrows says so, on its lender's measured terms.** The first
 /// version put `None` on every candidate while the plan borrowed from Balancer,
 /// so the commitment said "borrows nothing" about a trade that cannot run

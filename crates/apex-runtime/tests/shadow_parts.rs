@@ -77,6 +77,7 @@ policy:
   report_every_s: 300
   l1_every_blocks: 30
   max_cost_confidence_bps: 10000
+  tip_share_bps: 2000
 costs:
   gas_on_failure: 411945
   failure_ppm: 50000
@@ -186,6 +187,14 @@ fn what_the_run_will_not_do_is_refused() {
     assert!(matches!(refused(ok.replace(&format!(r#"["https://rpc.example/v1/${{{var}}}"]"#), "[]")), ShadowConfigError::Invalid(_)));
 }
 
+/// R28: a tip share above the whole net is refused.
+#[test]
+fn a_tip_share_above_the_net_is_refused() {
+    let var = "APEX_SECRET_SHADOW_TEST_TIP";
+    let text = yaml(var, "var/apex/shadow.journal").replace("tip_share_bps: 2000", "tip_share_bps: 10001");
+    assert!(matches!(ShadowConfig::from_yaml_str(&text, &env(var, SECRET)), Err(ShadowConfigError::Invalid(_))));
+}
+
 /// **The shipped file parses**, names a shadow journal, and keeps its secrets
 /// in placeholders.
 #[test]
@@ -201,6 +210,8 @@ fn the_shipped_config_parses() {
     // Operator decision, 2026-10-06: the shadow refuses only a trade its
     // worst-case gas would leave unprofitable.
     assert_eq!(c.policy.max_cost_confidence_bps, 10_000);
+    // R28: a fifth of the expected net, bid as the priority fee.
+    assert_eq!(c.policy.tip_share_bps, 2_000);
     // R20: the shadow prices the deep pools the census's 500 ppm left out.
     assert_eq!(c.universe, UniverseConfig { max_fee_ppm: 3_000, min_depth_usd: 100_000 });
     // R26.3: every rung, up to 200 ticks past the threshold, for spikes.

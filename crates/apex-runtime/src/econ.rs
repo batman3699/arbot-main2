@@ -278,6 +278,9 @@ pub struct LiveEconomics {
     /// The lenders a borrowing route may be quoted against; the first added
     /// that a route names is its own (R27).
     flash: Vec<FlashTerms>,
+    /// R28: the share of each candidate's expected net bid as its priority
+    /// fee, in bps. Zero until `with_tip_share`.
+    tip_share_bps: u32,
 }
 
 impl LiveEconomics {
@@ -298,6 +301,7 @@ impl LiveEconomics {
             refine: RefineBudget::start_only(),
             strategy,
             flash: Vec::new(),
+            tip_share_bps: 0,
         }
     }
 
@@ -313,6 +317,14 @@ impl LiveEconomics {
     /// landing mid-candidate can move that screen by one block's base fee.
     pub fn set_costs(&self, costs: ChainCosts) {
         self.costs.store(costs, apex_types::state::ReconstructionStatus::Verified);
+    }
+
+    /// R28: bid this share of each candidate's expected net, in bps, as its
+    /// priority fee. The tip scales the net, so it does not move the size.
+    #[must_use]
+    pub fn with_tip_share(mut self, share_bps: u32) -> Self {
+        self.tip_share_bps = share_bps;
+        self
     }
 
     /// A lender a borrowing route may be quoted against. Without its terms, a
@@ -526,7 +538,6 @@ impl Economics for LiveEconomics {
     }
 
     fn assemble(&self, p: &RouteProposal, r: Refinement) -> Result<Candidate, Decline> {
-        let cost = cost_i128(&r.costs);
         // **The gross is what the cycle returns above what it took.**
         // `expected_output` is `reprice`'s answer — the curve's OUTPUT at the
         // refined size, input included. The first version used it as the gross
@@ -543,6 +554,12 @@ impl Economics for LiveEconomics {
         let gross = i128::try_from(to_u128(r.expected_output))
             .unwrap_or(i128::MAX)
             .saturating_sub(i128::try_from(to_u128(r.input_amount.get())).unwrap_or(i128::MAX));
+        // R28: the tip, a share of the net before it, charged as the priority
+        // fee. A revert also pays the tip on the gas it used, and the failure
+        // cost leaves that out: under 1% of the net at a 20% tip and a 5% prior.
+        let mut costs = r.costs;
+        costs.priority_fee = tip_for(gross.saturating_sub(cost_i128(&costs)), self.tip_share_bps);
+        let cost = cost_i128(&costs);
         let set = self.priors.scenario_set(gross, cost);
         let robust_ev = scenario_ev(&set, EthersU256::zero())
             .map_err(|e| Decline::Uncommittable { detail: format!("scenario set: {e:?}") })?;
@@ -571,7 +588,7 @@ impl Economics for LiveEconomics {
         if let apex_sim::tier0::Tier0Verdict::Reject { .. } =
             apex_sim::tier0::screen(&apex_sim::tier0::Tier0Input {
                 gross_profit_wei: gross,
-                cost: r.costs.clone(),
+                cost: costs.clone(),
                 gas_price_wei: to_u128(self.costs().gas_price_wei),
             })
         {
@@ -604,7 +621,7 @@ impl Economics for LiveEconomics {
             gross_profit: AlloyU256::from(u128::try_from(gross.max(0)).unwrap_or(u128::MAX)),
             dex_fees: AlloyU256::ZERO,
             flash_fee: AlloyU256::ZERO,
-            total_execution_cost: r.costs,
+            total_execution_cost: costs,
             expected_net_profit: gross.saturating_sub(cost),
             robust_ev,
             // **`Heuristic`, not `Proven`.** §16.2: never silently promote a
@@ -625,6 +642,14 @@ impl Economics for LiveEconomics {
             submission_policy: apex_types::ticket::SubmissionPolicy::Private,
         })
     }
+}
+
+/// R28: the priority fee, as a share of the expected net, in basis points. A
+/// net at or below zero pays nothing. Split so the product cannot overflow.
+pub fn tip_for(net: i128, share_bps: u32) -> u128 {
+    let Ok(net) = u128::try_from(net) else { return 0 };
+    let share = u128::from(share_bps.min(10_000));
+    net / 10_000 * share + net % 10_000 * share / 10_000
 }
 
 /// Everything spent, in wei.
