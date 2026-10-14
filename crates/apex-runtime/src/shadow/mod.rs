@@ -1033,6 +1033,7 @@ impl Shadow {
         let c = &self.config.capacity;
         let mut duration = Duration::from_secs(c.boot_sample_s);
         loop {
+            let modelled;
             {
                 let mut rec = self.recorder.lock().await;
                 match sample(self.config.rpc_ws.expose(), WsSettings::default(), duration, &mut rec).await {
@@ -1042,18 +1043,25 @@ impl Shadow {
                     }
                     Err(e) => warn!(error = %e, "flashblock sample failed"),
                 }
-                match rec.model() {
+                modelled = match rec.model() {
                     Ok(model) => {
                         self.largest_window.store(model.largest_measured_window(), Ordering::Relaxed);
                         self.adapter.set_capacity(model);
+                        true
                     }
-                    Err(e) => info!(error = ?e, "no capacity model yet; every submission is refused until one"),
-                }
+                    Err(e) => {
+                        info!(error = ?e, "no capacity model yet; every submission is refused until one");
+                        false
+                    }
+                };
                 self.stats.capacity_blocks.store(rec.blocks() as u64, Ordering::Relaxed);
                 self.stats.capacity_refused.store(rec.refused(), Ordering::Relaxed);
             }
             duration = Duration::from_secs(c.sample_for_s);
-            tokio::time::sleep(Duration::from_secs(c.sample_every_s)).await;
+            // Without a model every submission is refused: sample again within
+            // a minute, not at the next hour (R27.3).
+            let wait = if modelled { c.sample_every_s } else { c.sample_every_s.min(60) };
+            tokio::time::sleep(Duration::from_secs(wait)).await;
         }
     }
 

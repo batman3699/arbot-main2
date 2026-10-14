@@ -205,6 +205,9 @@ fn the_shipped_config_parses() {
     assert_eq!(c.universe, UniverseConfig { max_fee_ppm: 3_000, min_depth_usd: 100_000 });
     // R26.3: every rung, up to 200 ticks past the threshold, for spikes.
     assert_eq!(c.armed.rungs, 6);
+    // R27.3: the heavy flashblock subscription is sampled hourly. BlockPI
+    // charges by the byte, and it was a sixth of the host's traffic.
+    assert_eq!((c.capacity.boot_sample_s, c.capacity.sample_every_s, c.capacity.sample_for_s), (60, 3_600, 20));
     // R27: the Morpho lender the owner deployed, pinned to the code it runs.
     let m = c.lenders.morpho.expect("the Morpho lender is configured");
     assert_eq!(m.address, address!("DF64CC1991899340edd2e1d870AC7F8c0a4D1A9c"));

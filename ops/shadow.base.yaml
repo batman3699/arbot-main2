@@ -111,9 +111,12 @@ costs:
   failure_ppm: 50000
 
 # R5: `newFlashblocks` is ~750 KiB/s, so it is sampled, never held open.
+# Hourly since R27.3: BlockPI charges by the byte, and 20 s every 15 minutes
+# was 1.4 GB a day, a sixth of everything the host moves, for a figure (the
+# largest gas window seen) that changes little from hour to hour.
 capacity:
   boot_sample_s: 60
-  sample_every_s: 900
+  sample_every_s: 3600
   sample_for_s: 20
 
 # Which pools the run may price (R20, operator decision 2026-10-06). The

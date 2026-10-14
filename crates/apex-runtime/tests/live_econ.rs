@@ -76,6 +76,33 @@ impl SettledRoute for RoundTrip {
 
 struct Curves {
     route: Option<RoundTrip>,
+    /// Every size the stage has asked the route to price.
+    priced: Arc<std::sync::atomic::AtomicU32>,
+}
+
+/// The route, counting what it is asked to price.
+struct Counted<'a>(&'a RoundTrip, &'a std::sync::atomic::AtomicU32);
+
+impl SizedRoute for Counted<'_> {
+    fn output(&self, amount_in: EthersU256) -> Option<EthersU256> {
+        self.0.output(amount_in)
+    }
+    fn fixed_cost(&self) -> EthersU256 {
+        self.0.fixed_cost()
+    }
+    fn max_input(&self) -> EthersU256 {
+        self.0.max_input()
+    }
+    fn priced(&self, amount_in: EthersU256) -> Option<apex_math::finite_size::Priced> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.priced(amount_in)
+    }
+}
+
+impl SettledRoute for Counted<'_> {
+    fn gas_at(&self, amount_in: EthersU256) -> Option<GasEstimate> {
+        self.0.gas_at(amount_in)
+    }
 }
 
 impl RouteCurves for Curves {
@@ -85,7 +112,7 @@ impl RouteCurves for Curves {
         f: &mut dyn FnMut(&dyn SettledRoute) -> Result<Evaluated, Decline>,
     ) -> Result<Evaluated, Decline> {
         match &self.route {
-            Some(r) => f(r),
+            Some(r) => f(&Counted(r, &self.priced)),
             None => Err(Decline::SimulationFailed { class: None }),
         }
     }
@@ -114,7 +141,13 @@ fn econ_over(spread_bps: u64, model: L1FeeModel) -> LiveEconomics {
 }
 
 fn econ_with_gas(spread_bps: u64, model: L1FeeModel, gas_per_weth: u64) -> LiveEconomics {
-    LiveEconomics::new(
+    counted_econ(spread_bps, model, gas_per_weth).0
+}
+
+/// The economics, and the count of every size its route is asked to price.
+fn counted_econ(spread_bps: u64, model: L1FeeModel, gas_per_weth: u64) -> (LiveEconomics, Arc<std::sync::atomic::AtomicU32>) {
+    let priced = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let econ = LiveEconomics::new(
         Arc::new(Curves {
             route: Some(RoundTrip {
                 reserve: 1_000_000_000_000_000_000_000,
@@ -123,11 +156,13 @@ fn econ_with_gas(spread_bps: u64, model: L1FeeModel, gas_per_weth: u64) -> LiveE
                 fixed_cost: GAS,
                 gas_per_weth,
             }),
+            priced: Arc::clone(&priced),
         }),
         ScenarioPriors::default(),
         chain_costs(model),
         StrategyId(1),
-    )
+    );
+    (econ, priced)
 }
 
 fn proposal(hops: usize) -> RouteProposal {
@@ -203,7 +238,7 @@ async fn a_spread_that_cannot_clear_the_cost_has_no_profitable_size() {
     // Distinct from an unpriceable route: one is economics, the other is a
     // broken adapter, and folding them hides the second inside the first.
     let unpriceable = LiveEconomics::new(
-        Arc::new(Curves { route: None }),
+        Arc::new(Curves { route: None, priced: Arc::default() }),
         ScenarioPriors::default(),
         chain_costs(L1FeeModel::unvalidated()),
         StrategyId(1),
@@ -335,7 +370,7 @@ async fn an_assembled_candidate_is_never_proven() {
 fn an_estimated_l1_fee_is_not_authoritative() {
     for model in [L1FeeModel::unvalidated(), L1FeeModel::validated(12, 50)] {
         let econ = LiveEconomics::new(
-            Arc::new(Curves { route: None }),
+            Arc::new(Curves { route: None, priced: Arc::default() }),
             ScenarioPriors::default(),
             chain_costs(model),
             StrategyId(1),
@@ -666,4 +701,27 @@ async fn a_borrowing_route_is_quoted_on_its_lenders_terms() {
     assert_eq!((q.provider, q.availability_probability), (FlashProviderId(1), 0.0), "quoted on its own terms, unavailable");
     p.flash_source = None;
     assert!(base().with_flash(terms(1, AlloyU256::MAX)).assemble(&p, refinement()).unwrap().flash_source.is_none());
+}
+
+/// **R27.3: a pass of the stage prices a few dozen sizes, not two hundred.**
+/// Until then each pass was a golden section on the net (62 quotes) and a
+/// climb from its float (120 to 250 more), four passes a candidate, on the
+/// capture path. A pass is now the certified size search and one quote to
+/// mint the size it found. Measured here on 2026-10-14: 15 quotes on a route
+/// that pays, 5 on one that does not.
+#[tokio::test]
+async fn a_pass_of_the_stage_prices_a_few_dozen_sizes() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (econ, priced) = counted_econ(200, L1FeeModel::unvalidated(), 30_000);
+    econ.size(&proposal(2)).await.expect("sizable");
+    let paying = priced.swap(0, Relaxed);
+    assert!((2..=24).contains(&paying), "{paying} quotes to size a route that pays");
+    // Each of the port's methods is its own pass, and costs the same.
+    econ.reprice(&proposal(2)).await.expect("priced");
+    assert_eq!(priced.swap(0, Relaxed), paying);
+
+    let (thin, priced) = counted_econ(61, L1FeeModel::unvalidated(), 0);
+    thin.size(&proposal(2)).await.expect_err("61 bps cannot clear the gas");
+    let unpaid = priced.load(Relaxed);
+    assert!((2..=8).contains(&unpaid), "{unpaid} quotes to find that no size pays");
 }

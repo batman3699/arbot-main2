@@ -19,10 +19,24 @@
 //! priced sizes no cost fell and no gross sat under its neighbours' line by
 //! more than the route's rounding.
 //!
+//! R27.3 added the economics stage's sizing: the pair that mints a candidate's
+//! size (a warm start, then the refinement) against the pair it replaced, on
+//! the 1,049 cases that pay. One pass, and the stage runs four a candidate:
+//!
+//! | | quotes p50 / max | us p50 / p90 / p99 / max |
+//! |---|---|---|
+//! | new pair | 17 / 27 | 240 / 1,526 / 3,511 / 3,942 |
+//! | old pair | 211 / 243 | 3,123 / 16,654 / 36,653 / 50,066 |
+//!
+//! The new pair netted strictly more on 16 cases and was never under the old
+//! by more than the search's tolerance.
+//!
 //! In the main tree, in release (a debug build is 30 times slower):
 //! APEX_SECRET_BLOCKPI_KEY=… APEX_SECRET_TRADER_KEY=0x…01 \
 //!   cargo test -j 3 --release --offline -p apex-runtime --test size_search_harness -- --ignored --nocapture
 
+#[path = "../../apex-econ/tests/support/golden_climb.rs"]
+mod golden_climb;
 #[path = "../../apex-math/tests/support/ternary.rs"]
 mod ternary;
 
@@ -173,7 +187,7 @@ async fn both_size_searches_over_the_live_universe() {
 
     let mut cases: Vec<Case> = Vec::new();
     let (mut swept, mut cost_falls, mut bends) = (0u64, 0u64, 0u64);
-    let mut resized: Vec<(f64, f64)> = Vec::new();
+    let mut resized: Vec<[f64; 5]> = Vec::new();
     for cycle in cycles.values() {
         for leg in 0..2usize {
             for step in MOVES {
@@ -224,14 +238,34 @@ async fn both_size_searches_over_the_live_universe() {
                     spent: new_quotes >= budget.max_evaluations,
                 });
 
-                // The economics stage sizes a candidate again, by its own
-                // search: what that costs, on the cases that pay.
-                if new.is_ok() && step == 20 {
+                // R27.3: the economics stage sizes a candidate again. Its pair
+                // (a warm start, then the refinement that mints the size)
+                // against the pair it replaced, on the cases that pay.
+                if new.is_ok() {
                     let c = Counting::new(&route);
-                    let t = Instant::now();
-                    let start = optimize(&c, ContinuousBudget::default());
-                    let _ = std::hint::black_box(start.and_then(|s| refine_detailed(&c, s, RefineBudget::default())));
-                    resized.push((t.elapsed().as_secs_f64() * 1e6, f64::from(c.quotes())));
+                    let start = optimize(&c, ContinuousBudget::default()).expect("a warm start");
+                    let found = refine_detailed(&c, start, RefineBudget::start_only()).expect("priced");
+                    let pair_quotes = c.quotes();
+                    let c = Counting::new(&route);
+                    let (_, old_net, _) = golden_climb::golden_then_climb(&c, ContinuousBudget::default().min_input).expect("the old pair prices");
+                    let old_quotes = c.quotes();
+                    let wei = |n: Surplus| {
+                        let v = n.magnitude().min(U256::from(u128::MAX)).as_u128() as f64;
+                        if matches!(n, Surplus::Gain(_)) { v } else { -v }
+                    };
+                    assert!(
+                        wei(found.net).max(0.0) + tolerance >= wei(old_net).max(0.0),
+                        "{} leg {leg} step {step}: the new pair nets {}, the old {}, tolerance {tolerance}",
+                        cases.last().unwrap().venues, wei(found.net), wei(old_net)
+                    );
+                    let pair_us = micros(|| {
+                        let s = optimize(&route, ContinuousBudget::default());
+                        let _ = std::hint::black_box(s.and_then(|s| refine_detailed(&route, s, RefineBudget::start_only())));
+                    });
+                    let old_us = micros(|| {
+                        let _ = std::hint::black_box(golden_climb::golden_then_climb(&route, ContinuousBudget::default().min_input));
+                    });
+                    resized.push([pair_us, old_us, f64::from(pair_quotes), f64::from(old_quotes), f64::from(u8::from(wei(found.net) > wei(old_net)))]);
                 }
 
                 // The assumptions, across a sweep of sizes: a cost that never
@@ -294,14 +328,16 @@ async fn both_size_searches_over_the_live_universe() {
     println!("largest size asked over the size settled on, where a size pays: p50 {:.1} p90 {:.1} p99 {:.1} max {:.1}", reach.0, reach.1, reach.2, reach.3);
     println!("old search: quotes p50 {:.0} max {:.0}; the new search's budget ended {spent} of {} cases", old_quotes.0, old_quotes.3, cases.len());
     println!("assumptions over {swept} priced sizes: the cost fell {cost_falls} times; the gross sat under its neighbours' line by more than the rounding {bends} times");
-    if !resized.is_empty() {
-        let us = spread(resized.iter().map(|r| r.0).collect());
-        let quotes = spread(resized.iter().map(|r| r.1).collect());
-        println!(
-            "the economics stage's own sizing (optimize, then refine), once, on {} paying cases: us p50 {:.0} p90 {:.0} max {:.0}; quotes p50 {:.0} max {:.0}. It runs four times a candidate.",
-            resized.len(), us.0, us.1, us.3, quotes.0, quotes.3
-        );
-    }
+    let col = |i: usize| spread(resized.iter().map(|r| r[i]).collect());
+    let (pair_us, was_us, pair_quotes, was_quotes) = (col(0), col(1), col(2), col(3));
+    let better = resized.iter().filter(|r| r[4] > 0.0).count();
+    println!(
+        "the economics stage's sizing, one pass, on {} paying cases (it runs four a candidate):",
+        resized.len()
+    );
+    println!("  new pair: quotes p50 {:.0} p90 {:.0} max {:.0}; us p50 {:.0} p90 {:.0} p99 {:.0} max {:.0}", pair_quotes.0, pair_quotes.1, pair_quotes.3, pair_us.0, pair_us.1, pair_us.2, pair_us.3);
+    println!("  old pair: quotes p50 {:.0} p90 {:.0} max {:.0}; us p50 {:.0} p90 {:.0} p99 {:.0} max {:.0}", was_quotes.0, was_quotes.1, was_quotes.3, was_us.0, was_us.1, was_us.2, was_us.3);
+    println!("  the new pair nets strictly more on {better}; it is never under the old by more than the tolerance");
 
     // The targets (spec, "Testing"). Not loosened to fit.
     let quotes = spread(cases.iter().map(|c| c.new_quotes).collect());
@@ -314,6 +350,10 @@ async fn both_size_searches_over_the_live_universe() {
     assert!(unpaid.0 <= 8.0, "the median where no size pays: {}", unpaid.0);
     assert!(faster.0 >= 3.0, "the median search is {:.1} times faster", faster.0);
     assert!(new.2 <= old.2, "the 99th percentile: {} us against {}", new.2, old.2);
+    // R27.3: one pass of the stage is at most 64 quotes and, at the median, at
+    // least five times faster than the pair it replaced.
+    assert!(pair_quotes.3 <= 64.0, "the most quotes in a pass: {}", pair_quotes.3);
+    assert!(was_us.0 >= 5.0 * pair_us.0, "a pass at the median: {} us against {}", pair_us.0, was_us.0);
     assert_eq!(cost_falls, 0, "a cost fell as its size grew");
     assert_eq!(bends, 0, "a gross sat further under its neighbours' line than the route's rounding");
 }

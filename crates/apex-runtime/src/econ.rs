@@ -292,7 +292,10 @@ impl LiveEconomics {
             priors,
             costs: apex_state::Versioned::new(costs, apex_types::state::ReconstructionStatus::Verified),
             continuous: ContinuousBudget::default(),
-            refine: RefineBudget::default(),
+            // R27.3: the warm start is the certified search's own size, so the
+            // refinement prices it and mints it. A climb from there can gain
+            // no more than the search's tolerance.
+            refine: RefineBudget::start_only(),
             strategy,
             flash: Vec::new(),
         }
@@ -368,7 +371,8 @@ impl LiveEconomics {
         self.priors
     }
 
-    /// One pass: continuous warm start, then discrete refinement.
+    /// One pass: the warm start (the certified size search, R27.3), then the
+    /// refinement that mints its size.
     ///
     /// The four port methods each call this. That is four evaluations of the same
     /// curve where one would do, and it is a deliberate cost: §46.2 requires the

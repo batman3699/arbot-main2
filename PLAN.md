@@ -6106,6 +6106,41 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - *Failure cost charged twice* (`LiveEconomics::scenarios`): confirmed. The expected failure cost is inside the cost every scenario pays, and the revert scenario pays the full success cost. It is about 10^11 wei a candidate, under a tenth of a cent, beside priors that scale the gross by 0.62. Worth fixing when the priors are measured.
     - *Trigger met, nothing simulated* (armed verdicts): by design. `trigger_met` without `fired` is the other pool outside its band: no fire, so nothing to quote or simulate. The summary counts them as `unfired_band_missed`. The five `failed/Reverted` in the reactive funnel are Tier 2 simulation refusals, not chain reverts, and not the same five.
 
+- [x] **R27.3 — the economics stage sizes a candidate by the certified search.** Spec `docs/superpowers/specs/2026-10-14-economics-sizing-design.md`. Asked for by the operator on 2026-10-14, after R27.2 found it.
+  - **What it was.** A candidate's executed size never came from Engine C. `LiveEconomics::evaluate` sized it again:
+    1. `continuous::optimize`, a 60-iteration golden section on the **net**, in `f64`, from the top of the range;
+    2. `discrete::refine_detailed`, a climb from the nearest whole number, in steps from one token to one wei, up to 256 quotes;
+    - four times a candidate, once for each method of the economics port.
+    - `optimize` had both faults the operator's review found in R27.2's first draft: a stepped net is not unimodal, and the climb after it is local.
+  - **What it is.**
+    - `optimize` asks `best_size`, within the same budget (`iterations + 2` quotes). Its contract is unchanged: a warm start, `None` when nothing prices, and nothing about whether the route pays.
+    - **The size reaches `refine` exactly.** A `ContinuousOptimum` still shows the outside a float and a count, and has no path to a `DiscreteSize`; it carries the size to the wei for `apex_econ::sizing` alone (`pub(super)`). An `f64` holds a size near 18 WETH only to the nearest 2,048 wei.
+    - `LiveEconomics` refines with `RefineBudget::start_only()`: one quote, which prices the start and mints it. A climb from a certified start can gain no more than the search's tolerance.
+    - `refine` is still the only function that mints a size (INV-18). `RefineBudget::default()` is unchanged for other callers.
+  - **The reactive lane's executed size changes**, for the first time since the shadow began: to the certified search's size on the book the economics stage sees.
+  - **Held to exhaustive search** (`apex-econ/tests/sizing_oracle.rs`): on 300 generated table routes the pair returns exactly the best net of every size, and mints no size when none pays. The old pair, kept in the tests as a comparator, falls short on 15 of the 204 that pay and never does better.
+    - The exact start: a route in wei whose best size no float can hold comes back to the wei, in one quote.
+    - The warm start carries the route's rounding: a route whose first quote truncates to nothing is not given up.
+    - A pass of the stage is 15 quotes on the fixture that pays and 5 on the one that does not (`live_econ.rs`).
+    - 9 mutants, all killed.
+  - **Both pairs over the live universe** (the R27.2 harness, 1,049 paying cases, release build, the laptop), one pass:
+
+    | | Quotes, median / most | µs, median / 90th / 99th / most |
+    |---|---|---|
+    | New pair | 17 / 27 | 240 / 1,526 / 3,511 / 3,942 |
+    | Old pair | 211 / 243 | 3,123 / 16,654 / 36,653 / 50,066 |
+
+    - **Four passes a candidate:** about 12 ms at the median and 67 ms at the 90th percentile before, 1 ms and 6 ms now. On the largest candidates the old pair took up to 200 ms: a whole flashblock, between "proposed" and the simulation.
+    - The new pair nets strictly more on 16 cases and is never under the old by more than the tolerance.
+  - **Not here:** one pass instead of four (shared state on the capture path, INV-11); the failure cost charged twice in the scenarios.
+- [x] **R27.3 — BlockPI's units go by the byte, and the host moves 8 GB a day.** The operator reported 210 million of 500 million request units used since the AWS launch: 5.2 million an hour, 2.3 days left at that rate.
+  - BlockPI prices a method not in its table at 5 units per 250 bytes, and that fits: read from the host's sockets on 2026-10-14, in 35 minutes,
+    - the HTTP reads (per-head multicalls, and a ladder reload for every mint or burn: 843 in that time) received 93 MB and sent 50 MB;
+    - the websocket feed (`newHeads`, `pendingLogs`, `logs`) received 49 MB;
+    - the capacity sample (`newFlashblocks`, 20 s every 15 minutes at ~750 KiB/s) is 15 MiB a time;
+    - the evaluator's `eth_getLogs` is 3.7 MB every five minutes for the 20 pools then armed.
+  - **Changed:** the capacity sample is hourly (`sample_every_s: 3600`), about a sixth of the traffic, and retried within a minute while there is no model, since every submission is refused until there is one.
+  - **Not changed, in order of size:** applying a mint or burn to the ladder instead of reloading the pool; the evaluator reading the shadow's own log record instead of asking again.
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
 I had this task down as "`Simulator` over `apex-sim::tier0`", on the reasoning that §20 lets a lower tier only *reject* and therefore makes Tier 0 the honest shadow simulator. **The reasoning was right and the conclusion was wrong.**

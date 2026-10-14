@@ -1,25 +1,26 @@
 //! Discrete refinement — the only place a trade size is decided (§14.3,
 //! INV-18).
 //!
-//! Takes the continuous warm start, evaluates **integer** sizes against the
-//! exact AMM arithmetic, and returns the one that will be executed. It is the
-//! only function in the workspace that can mint an `apex_types::DiscreteSize`,
+//! Takes the warm start, evaluates **integer** sizes against the exact AMM
+//! arithmetic, and returns the one that will be executed. It is the only
+//! function in the workspace that can mint an `apex_types::DiscreteSize`,
 //! because it is the only one that can produce the `DiscreteRefined` witness
 //! the constructor demands.
 //!
 //! # The guarantee, and why it holds by construction
 //!
-//! **The refined size is never worse than the nearest integer to the continuous
-//! optimum.** Not because the search is clever, but because it *starts* there
-//! and only ever moves to a strictly better point. A hill climb cannot regress
-//! below its own starting point, so the property is structural rather than
-//! something the search has to get right.
+//! **The refined size is never worse than its start.** Not because the climb
+//! is clever, but because it *starts* there and only ever moves to a strictly
+//! better point. A hill climb cannot regress below its own starting point, so
+//! the property is structural rather than something the climb has to get
+//! right.
 //!
-//! That framing matters because the alternative — "search the range and trust
-//! it beats the warm start" — is a claim about the optimiser, and optimisers on
-//! a lattice with truncating integer arithmetic are exactly where quiet
-//! regressions live. Net profit is concave, so the climb also finds the global
-//! integer optimum; but the guarantee does not depend on that being true.
+//! It is a local guarantee and no more. A net that steps up with gas has more
+//! than one peak, and a climb finds the one its start is on. Since R27.3 the
+//! start is the size `apex_math::finite_size::best_size` certified, to the
+//! wei ([`super::continuous`]): finding the best size is that search's job,
+//! and what is left for this one is to price it and mint it
+//! ([`RefineBudget::start_only`]).
 //!
 //! # `None` means no size, not zero
 //!
@@ -42,6 +43,20 @@ pub struct RefineBudget {
     /// The largest step the climb will take before halving. Sizes span many
     /// orders of magnitude, so a fixed step either crawls or overshoots.
     pub max_step: U256,
+}
+
+impl RefineBudget {
+    /// Price the start and mint it: no climb (R27.3).
+    ///
+    /// For a start that is already the best size a search could certify. Since
+    /// R27.3 the warm start is `apex_math::finite_size::best_size`'s own size,
+    /// handed over exactly, and that search stops only when no size can net
+    /// more than its tolerance above it. A climb from there can gain no more
+    /// than that tolerance, and on the capture path it cost 120 to 250 quotes,
+    /// four times a candidate.
+    pub fn start_only() -> Self {
+        Self { max_evaluations: 1, ..Self::default() }
+    }
 }
 
 impl Default for RefineBudget {
@@ -91,7 +106,11 @@ pub fn refine_detailed<R: SizedRoute + ?Sized>(
         return None;
     }
 
-    let start = nearest_integer(continuous.value(), lo, hi);
+    // The warm start's own size, to the wei: a float could not carry it.
+    // Clamped, not refused: a warm start made on another route, or on this
+    // one before its range moved, is a bad suggestion and not an error. What
+    // it must not do is start outside the range and price there.
+    let start = continuous.at().clamp(lo, hi);
     let mut evaluations = 0u32;
     let mut evaluate = |x: U256| -> Probe {
         if evaluations >= budget.max_evaluations {
@@ -175,35 +194,4 @@ pub fn refine<R: SizedRoute + ?Sized>(
     budget: RefineBudget,
 ) -> Option<DiscreteSize> {
     refine_detailed(route, continuous, budget)?.size
-}
-
-/// Round a continuous value to the nearest integer in `[lo, hi]`.
-///
-/// Clamping rather than refusing: a warm start outside the range is a bad
-/// suggestion, not an error, and the climb recovers from it. What it must not
-/// do is start outside the range and evaluate there.
-fn nearest_integer(value: f64, lo: U256, hi: U256) -> U256 {
-    if !value.is_finite() || value <= 0.0 {
-        return lo;
-    }
-    let rounded = value.round();
-    U256::from_dec_str(&format!("{rounded:.0}"))
-        .unwrap_or(hi)
-        .clamp(lo, hi)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_start_is_clamped_into_range() {
-        let lo = U256::from(10u64);
-        let hi = U256::from(100u64);
-        assert_eq!(nearest_integer(-5.0, lo, hi), lo);
-        assert_eq!(nearest_integer(f64::NAN, lo, hi), lo);
-        assert_eq!(nearest_integer(1e30, lo, hi), hi);
-        assert_eq!(nearest_integer(42.4, lo, hi), U256::from(42u64));
-        assert_eq!(nearest_integer(42.6, lo, hi), U256::from(43u64));
-    }
 }

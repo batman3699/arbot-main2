@@ -1,40 +1,46 @@
-//! The continuous warm start (§14.3).
+//! The warm start (§14.3).
 //!
-//! A real-valued maximiser of net profit, used to tell [`super::discrete`]
-//! where to begin. It is deliberately **not** trusted for anything else, and
-//! nothing here returns a type that can reach a candidate.
+//! Where [`super::discrete`] begins: the size the route's net is highest at,
+//! found by `apex_math::finite_size::best_size`. It is deliberately **not** a
+//! trade size, and nothing here returns a type that can reach a candidate.
 //!
-//! # Why an f64 optimum is not a trade size
+//! # What it was, and why it changed (R27.3)
 //!
-//! Three reasons, in increasing order of how quietly they bite.
+//! Until R27.3 this was a golden-section search on the net, in `f64`, from
+//! the top of the route's range. A net that steps up with gas is not
+//! unimodal, so that search proved nothing, and a cost step below the gross's
+//! peak could leave the best size outside wherever it converged; the climb
+//! that followed is local and could not find it. It also cost 62 quotes, the
+//! first of them at the largest sizes the route allowed, and the climb up to
+//! 256 more. `best_size` bounds every size it has not priced, and stops when
+//! none can net more than its tolerance above its best (R27.2).
 //!
-//! 1. No AMM accepts a fractional wei, so the answer has to be rounded
-//!    regardless.
-//! 2. `f64` has 53 bits of mantissa. A wei-denominated size on an 18-decimal
-//!    token routinely exceeds 2^53, so the continuous optimum cannot even
-//!    *represent* every integer in its own search range — it is quantised, and
-//!    quantised more coarsely the larger the trade.
-//! 3. The objective is evaluated in f64 here and in exact integer arithmetic
-//!    there. Those disagree, and the disagreement is not symmetric: integer
-//!    truncation in the AMM always rounds against the trader.
+//! # Why the float is still not a trade size
 //!
-//! So this returns a `ContinuousOptimum`, which carries no path to a
-//! `DiscreteSize`.
+//! `f64` has 53 bits of mantissa. A wei-denominated size on an 18-decimal
+//! token routinely exceeds 2^53: near 18 WETH a float holds a size only to the
+//! nearest 2,048 wei. The search's size is a whole number it priced, and can
+//! sit just under a cost step that such rounding would cross.
+//!
+//! So a [`ContinuousOptimum`] shows the outside a float, for reporting, and
+//! carries the exact size to [`super::discrete`] and to nothing else. It has
+//! no path to a `DiscreteSize`: `refine` still mints the only one.
 
-use apex_math::finite_size::SizedRoute;
+use apex_math::finite_size::{best_size, NoSize, Priced, SearchBudget, SizedRoute};
 use ethers_core::types::U256;
+use std::cell::Cell;
 
-/// An approximate maximiser, in the input token's smallest unit, as a real
-/// number.
+/// The size a route's net is highest at, as [`optimize`] found it.
 ///
-/// A plain newtype over `f64` with no conversion to `U256` and no constructor
-/// outside this module. `refine` takes one and reads [`Self::value`]; nothing
-/// else can turn it into a size.
+/// Outside this module it is a float and a count: no conversion to `U256`, no
+/// constructor. `refine` takes one; nothing else can turn it into a size.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContinuousOptimum {
     value: f64,
     /// How many route evaluations produced it, for the §29 budget accounting.
     evaluations: u32,
+    /// The size itself, to the wei: where the refinement starts.
+    at: U256,
 }
 
 impl ContinuousOptimum {
@@ -45,12 +51,18 @@ impl ContinuousOptimum {
     pub const fn evaluations(&self) -> u32 {
         self.evaluations
     }
+
+    /// The size the search priced, exactly. For the refinement alone.
+    pub(super) const fn at(&self) -> U256 {
+        self.at
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContinuousBudget {
-    /// Golden-section iterations. Each halves the bracket by ~0.618, so 60 is
-    /// ample for any range a trade occupies and still bounded (§29).
+    /// The warm start prices at most this many sizes and two (§29): what the
+    /// golden section it replaced could spend. The search usually needs far
+    /// fewer.
     pub iterations: u32,
     pub min_input: U256,
 }
@@ -64,87 +76,53 @@ impl Default for ContinuousBudget {
     }
 }
 
-/// Golden-section search for the net-profit maximiser.
-///
-/// Net profit is concave under a fixed cost — a concave output minus a linear
-/// cost — so it is unimodal and golden-section converges without needing a
-/// derivative, which matters because the objective is an AMM quote rather than
-/// a formula.
+/// A route, counting what it is asked to price.
+struct Counted<'a, R: SizedRoute + ?Sized> {
+    route: &'a R,
+    quotes: Cell<u32>,
+}
+
+impl<R: SizedRoute + ?Sized> SizedRoute for Counted<'_, R> {
+    fn output(&self, amount_in: U256) -> Option<U256> {
+        self.route.output(amount_in)
+    }
+    fn fixed_cost(&self) -> U256 {
+        self.route.fixed_cost()
+    }
+    fn max_input(&self) -> U256 {
+        self.route.max_input()
+    }
+    fn priced(&self, amount_in: U256) -> Option<Priced> {
+        self.quotes.set(self.quotes.get() + 1);
+        self.route.priced(amount_in)
+    }
+    fn rounding(&self) -> U256 {
+        self.route.rounding()
+    }
+}
+
+/// The size the route's net is highest at.
 ///
 /// `None` when the route cannot be priced anywhere in range. Note that this
-/// says nothing about profitability: an unprofitable route still has a
-/// maximiser, and deciding whether to trade it is [`super::discrete`]'s job,
-/// not this one's. Conflating "where is the best size" with "is it worth
-/// trading" is how a warm start turns into a decision.
+/// says nothing about profitability: an unprofitable route still has a best
+/// size the search priced, and deciding whether to trade it is
+/// [`super::discrete`]'s job, not this one's. Conflating "where is the best
+/// size" with "is it worth trading" is how a warm start turns into a decision.
 pub fn optimize<R: SizedRoute + ?Sized>(
     route: &R,
     budget: ContinuousBudget,
 ) -> Option<ContinuousOptimum> {
-    let lo_u = budget.min_input.max(U256::one());
-    let hi_u = route.max_input();
-    if hi_u < lo_u {
-        return None;
-    }
-
-    let (mut lo, mut hi) = (u256_to_f64(lo_u), u256_to_f64(hi_u));
-    let mut evaluations = 0u32;
-    // A size the route refuses scores below every size it prices. A
-    // concentrated pool's quote runs off its proven ladder, or past its tick
-    // limit, beyond some size, and every larger size is refused too — so the
-    // section closes on what the route can price rather than stopping at the
-    // first refusal, which for a pool holding far more than it can price is the
-    // first probe.
-    let mut net = |x: f64| -> f64 {
-        let Some(amount) = f64_to_u256(x) else { return f64::NEG_INFINITY };
-        if amount < lo_u || amount > hi_u {
-            return f64::NEG_INFINITY;
-        }
-        evaluations += 1;
-        // Each size at its own cost: gas grows with the ticks a size crosses.
-        route
-            .priced(amount)
-            .map_or(f64::NEG_INFINITY, |p| u256_to_f64(p.output) - x - u256_to_f64(p.cost))
+    let counted = Counted { route, quotes: Cell::new(0) };
+    let search = SearchBudget {
+        max_evaluations: budget.iterations.saturating_add(2),
+        min_input: budget.min_input,
+        ..SearchBudget::default()
     };
-
-    // 1 / phi.
-    const INV_PHI: f64 = 0.618_033_988_749_894_9;
-    let mut c = hi - (hi - lo) * INV_PHI;
-    let mut d = lo + (hi - lo) * INV_PHI;
-    let (mut fc, mut fd) = (net(c), net(d));
-    // Both probes refused: what the route prices lies below the lower one.
-    // Narrow until a probe prices, within the same iteration budget.
-    let mut narrowing = budget.iterations;
-    while fc == f64::NEG_INFINITY && narrowing > 0 && hi - lo > 1.0 {
-        narrowing -= 1;
-        hi = c;
-        c = hi - (hi - lo) * INV_PHI;
-        d = lo + (hi - lo) * INV_PHI;
-        fc = net(c);
-        fd = net(d);
-    }
-
-    for _ in 0..budget.iterations {
-        if hi - lo <= 1.0 {
-            break;
-        }
-        if fc > fd {
-            hi = d;
-            d = c;
-            fd = fc;
-            c = hi - (hi - lo) * INV_PHI;
-            fc = net(c);
-        } else {
-            lo = c;
-            c = d;
-            fc = fd;
-            d = lo + (hi - lo) * INV_PHI;
-            fd = net(d);
-        }
-    }
-
-    let (value, best) = if fc > fd { (c, fc) } else { (d, fd) };
-    // Nothing priced: no warm start to give.
-    (best > f64::NEG_INFINITY).then_some(ContinuousOptimum { value, evaluations })
+    let best = match best_size(&counted, search) {
+        Ok(found) | Err(NoSize::NoProfitableSize { best: found }) => found,
+        Err(NoSize::Unpriceable | NoSize::RangeEmpty) => return None,
+    };
+    Some(ContinuousOptimum { value: u256_to_f64(best.amount_in), evaluations: counted.quotes.get(), at: best.amount_in })
 }
 
 /// `U256` -> `f64`, losing precision above 2^53 exactly as described in the
@@ -153,16 +131,6 @@ fn u256_to_f64(value: U256) -> f64 {
     // `to_string` then parse is exact to f64's precision and cannot overflow
     // the way a limb-wise shift-and-add can.
     value.to_string().parse::<f64>().unwrap_or(f64::MAX)
-}
-
-/// `f64` -> `U256`. `None` for negative, NaN or infinite input: those are not
-/// trade sizes, and rounding one to zero would look like a refusal rather than
-/// the bug it is.
-fn f64_to_u256(value: f64) -> Option<U256> {
-    if !value.is_finite() || value < 0.0 {
-        return None;
-    }
-    U256::from_dec_str(&format!("{:.0}", value)).ok()
 }
 
 #[cfg(test)]
@@ -178,18 +146,10 @@ mod tests {
         let o = ContinuousOptimum {
             value: 1.5,
             evaluations: 3,
+            at: U256::one(),
         };
         assert_eq!(o.value(), 1.5);
         assert_eq!(o.evaluations(), 3);
-    }
-
-    #[test]
-    fn f64_conversion_refuses_what_is_not_a_size() {
-        assert_eq!(f64_to_u256(-1.0), None);
-        assert_eq!(f64_to_u256(f64::NAN), None);
-        assert_eq!(f64_to_u256(f64::INFINITY), None);
-        assert_eq!(f64_to_u256(0.0), Some(U256::zero()));
-        assert_eq!(f64_to_u256(1e18), Some(U256::from(1_000_000_000_000_000_000u128)));
     }
 
     /// The precision claim in the module docs, as a test rather than a
