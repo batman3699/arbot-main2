@@ -90,7 +90,7 @@ fn line_at(ax: U256, ag: I256, bx: U256, bg: I256, x: U256) -> Option<I256>;
 // the size to price next:
 //   Low  [lo, x0)        gross ≤ max(g0 + r, line((x0, g0 + r), (x1, g1)) at lo)       cost ≥ fixed    next max(x0 / 4, lo)
 //   Mid  (xi, xi+1)      gross ≤ min(max(gi + r, line(left, (xi, gi + r)) at xi+1),
-//                                    max(gi+1 + r, line((xi+1, gi+1 + r), xi+2) at xi)) cost ≥ ci       next: crossing or midpoint
+//                                    max(gi+1 + r, line((xi+1, gi+1 + r), xi+2) at xi)) cost ≥ ci       next: the midpoint
 //   High (xn, top]       gross ≤ max(gn + r, line(left, (xn, gn + r)) at top)           cost ≥ cn       next min(4 xn, top), or the midpoint after a refusal
 // `left` of the first probe is the origin (0, 0), exact.
 ```
@@ -114,7 +114,7 @@ fn line_at(ax: U256, ag: I256, bx: U256, bg: I256, x: U256) -> Option<I256>;
 
 - [ ] **Step 1:** Failing tests in `live_pricing.rs`: `a_cycles_rounding_is_two_units_of_its_middle_token` (a dollar token through a concentrated pool; a constant-product second pool); `gas_never_falls_as_crossings_rise` (`SettlementGas::estimate` over every venue, direction, 0..40 crossings and words).
 - [ ] **Step 2:** Implement; update `budget()` in `live_pricing.rs` to `SearchBudget { max_evaluations: 128, min_input: …, ..SearchBudget::default() }`.
-- [ ] **Step 3:** In `apex-econ/tests/discrete.rs`: `refine_is_no_worse_from_the_new_searchs_size` (refine's net from `best_size`'s size ≥ its net from `ternary_best_size`'s, less the tolerance).
+- [ ] **Step 3:** ~~`refine` from either search's size.~~ Dropped while executing: `LiveEconomics::evaluate` does not start refine from `best_size` but from `continuous::optimize`, so nothing in `apex-econ` depends on this change. The harness times that pair instead (Task 4).
 - [ ] **Step 4:** In `apex-math/tests/finite_size.rs`: the comparator and quote counts on `cycle(…)` fixtures.
 - [ ] **Step 5:** All five gates. Commit: `feat(pricing): a live cycle states its rounding (Task 8.5 R27.2)`.
 
@@ -141,3 +141,13 @@ fn line_at(ax: U256, ag: I256, bx: U256, bg: I256, x: U256) -> Option<I256>;
 - Spec coverage: §1 search → Tasks 1–2; `rounding` → Tasks 1–3; lanes and `refine` → Task 3; harness and targets → Task 4; rollout → Task 5.
 - The oracle tests are written before the search and seen to fail on the old one (Task 1, step 5).
 - No placeholder: every test is named with what it asserts; the search's bounds and rules are written out.
+
+## Changes found while executing
+
+1. **No floating point.** The first cut priced, between two sizes of equal cost, where the two bounding lines cross. Measured on the eighteen constant-product fixtures it saved nothing over the midpoint (217 quotes either way), so it and its `f64` helpers were deleted.
+2. **Both bounding lines stay.** With either alone the same fixtures take over 300 quotes against 198; a test pins the total.
+3. **The line is not rounded up.** A gross is a whole number, so the line's whole part bounds it.
+4. **A direct test of the bounds** (`no_size_in_a_region_nets_more_than_its_bound`, in the library) was added: the oracle tests alone let several unsound mutants live, because a wrong bound often prunes a region that did not hold the best size anyway.
+5. **`rounding` is needed at every line.** Three of the four were shown by routes the search got wrong without it (kept as a test); the fourth only by the direct test.
+6. **Dead under A3, deleted:** dropping the priced sizes above a refusal.
+7. **`refine` does not start from this search** (see Task 3, step 3).

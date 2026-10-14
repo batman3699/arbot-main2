@@ -42,7 +42,7 @@
 //! right number for the wrong reason. A rate-only search cannot express a
 //! quantity at all.
 
-use ethers_core::types::U256;
+use ethers_core::types::{I256, U256};
 
 /// Profit or loss, exactly, without squeezing a 256-bit quantity into a signed
 /// integer.
@@ -133,6 +133,19 @@ pub trait SizedRoute {
     fn priced(&self, amount_in: U256) -> Option<Priced> {
         Some(Priced { output: self.output(amount_in)?, cost: self.fixed_cost() })
     }
+
+    /// How far a quoted output can sit below the route's concave curve, in
+    /// input-token units: what integer truncation takes. Zero for a route
+    /// whose arithmetic is exact.
+    ///
+    /// [`best_size`] bounds the sizes it has not priced from the concavity of
+    /// the gross. A truncated output is a sawtooth under that curve, and a
+    /// bound drawn through two truncated quotes can be low by this much; the
+    /// search raises its bounds and its tolerance by it rather than assume it
+    /// away (R27.2).
+    fn rounding(&self) -> U256 {
+        U256::zero()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,6 +163,14 @@ pub struct SearchBudget {
     /// Smallest input worth considering, in input-token units. Below this the
     /// fee arithmetic truncates to nothing and the answer is noise.
     pub min_input: U256,
+    /// The first size priced: one at which the route's integer arithmetic is
+    /// exact to well under a basis point (R27.2). The search walks up and
+    /// down from it, so no size is left out.
+    pub start: U256,
+    /// The search stops when no size it has not priced can beat its best by
+    /// more than this, in parts per million of that best net plus the fixed
+    /// cost (R27.2). Four times the route's [`SizedRoute::rounding`] is added.
+    pub tolerance_ppm: u32,
 }
 
 impl Default for SearchBudget {
@@ -157,6 +178,8 @@ impl Default for SearchBudget {
         Self {
             max_evaluations: 128,
             min_input: U256::from(1_000_000_000_000u64), // 1e-6 of an 18-decimal token
+            start: U256::from(1_000_000_000_000_000_000u64), // one 18-decimal token
+            tolerance_ppm: 1,
         }
     }
 }
@@ -208,118 +231,316 @@ impl apex_types::miss::ExplainsMiss for NoSize {
     }
 }
 
-/// What one probe of a size search learned.
-enum Probe {
-    Net(Surplus),
+/// One size the search has priced.
+#[derive(Clone, Copy, Debug)]
+struct Probe {
+    x: U256,
+    output: U256,
+    cost: U256,
+    /// `output - x`.
+    gross: I256,
+    /// `gross - cost`.
+    net: I256,
+}
+
+fn signed(v: U256) -> Option<I256> {
+    I256::try_from(v).ok()
+}
+
+impl Probe {
+    /// `None` when the figures do not fit a signed word: read as a refusal.
+    fn of(x: U256, priced: Priced) -> Option<Self> {
+        let gross = signed(priced.output)?.checked_sub(signed(x)?)?;
+        let net = gross.checked_sub(signed(priced.cost)?)?;
+        Some(Self { x, output: priced.output, cost: priced.cost, gross, net })
+    }
+}
+
+/// The line through `(ax, ag)` and `(bx, bg)`, `ax < bx`, at `x`, less any
+/// fraction above zero: a gross is a whole number, so what bounds it also
+/// bounds it at the next whole number down. `None` on overflow, which a caller
+/// reads as "no bound".
+fn line_at(ax: U256, ag: I256, bx: U256, bg: I256, x: U256) -> Option<I256> {
+    let run = signed(bx.checked_sub(ax)?)?;
+    if run <= I256::zero() {
+        return None;
+    }
+    let along = signed(x)?.checked_sub(signed(ax)?)?;
+    // Division truncates toward zero: down for a rise, up for a fall.
+    ag.checked_add(bg.checked_sub(ag)?.checked_mul(along)?.checked_div(run)?)
+}
+
+/// Sizes the search has not priced, between two it has or at an end of the
+/// range.
+struct Region {
+    /// No size in the region nets more than this. `None`: not known.
+    bound: Option<I256>,
+    /// The size to price to learn more about it.
+    next: U256,
+    /// The region above every size priced.
+    open: bool,
+}
+
+/// What pricing one size did.
+enum Asked {
+    Priced,
     /// The route cannot be priced at this size, nor at any larger one.
     Refused,
     /// The evaluation budget is gone.
     Spent,
 }
 
+struct Search<'a, R: SizedRoute + ?Sized> {
+    route: &'a R,
+    budget: SearchBudget,
+    lo: U256,
+    /// The largest size not known to be refused.
+    top: U256,
+    /// A refusal has bounded the range: the walk up closes in on it by halves.
+    refused: bool,
+    /// Every size priced within the range, by size.
+    probes: Vec<Probe>,
+    /// The highest net priced, the smallest size among equals.
+    best: Option<Probe>,
+    evaluations: u32,
+    fixed: I256,
+    rounding: I256,
+}
+
+impl<R: SizedRoute + ?Sized> Search<'_, R> {
+    fn price(&mut self, x: U256) -> Asked {
+        if self.evaluations >= self.budget.max_evaluations {
+            return Asked::Spent;
+        }
+        self.evaluations += 1;
+        match self.route.priced(x).and_then(|priced| Probe::of(x, priced)) {
+            Some(p) => {
+                if self.best.is_none_or(|b| p.net > b.net || (p.net == b.net && p.x < b.x)) {
+                    self.best = Some(p);
+                }
+                let at = self.probes.partition_point(|q| q.x < x);
+                self.probes.insert(at, p);
+                Asked::Priced
+            }
+            None => {
+                // `x >= lo >= 1`. A larger size is refused too, so nothing
+                // priced lies above this one.
+                self.top = x - U256::one();
+                self.refused = true;
+                Asked::Refused
+            }
+        }
+    }
+
+    /// What a size not yet priced must beat to matter: the best net (or
+    /// nothing, when the best is a loss) and the tolerance.
+    fn bar(&self) -> I256 {
+        let best = self.best.map_or(I256::zero(), |b| b.net.max(I256::zero()));
+        let share = best
+            .checked_add(self.fixed)
+            .and_then(|v| v.checked_mul(I256::from(self.budget.tolerance_ppm)))
+            .and_then(|v| v.checked_div(I256::from(1_000_000)))
+            .unwrap_or_else(I256::zero);
+        let sawtooth = self.rounding.checked_mul(I256::from(4)).unwrap_or_else(I256::zero);
+        best.checked_add(share).and_then(|v| v.checked_add(sawtooth)).unwrap_or(best)
+    }
+
+    /// The sizes not yet priced, as regions between the priced ones, low to
+    /// high, each with a bound on its net.
+    ///
+    /// A region's net is bounded by concavity: the gross lies under the line
+    /// through any two priced sizes, outside those two. Each line is drawn
+    /// through its nearer point raised by the route's rounding, and the
+    /// origin, where the gross is zero, stands to the left of the first size.
+    /// A region's cost is at least its left end's, or the fixed cost below the
+    /// smallest size priced. A bound that overflows is no bound.
+    fn regions(&self) -> Vec<Region> {
+        let n = self.probes.len();
+        let Some(last) = self.probes.last() else { return Vec::new() };
+        let origin = (U256::zero(), I256::zero());
+        let at = |i: usize| (self.probes[i].x, self.probes[i].gross);
+        let raised = |i: usize| Some((self.probes[i].x, self.probes[i].gross.checked_add(self.rounding)?));
+        let left_of = |i: usize| if i == 0 { origin } else { at(i - 1) };
+        let less = |gross: Option<I256>, cost: Option<I256>| gross?.checked_sub(cost?);
+        let one = U256::one();
+        let mut regions = Vec::with_capacity(n + 1);
+
+        // Below the smallest size priced: the line through the two smallest,
+        // carried down. One priced size bounds nothing below it.
+        let first = &self.probes[0];
+        if first.x > self.lo {
+            let gross = if n >= 2 {
+                raised(0).and_then(|(x, g)| {
+                    let b = at(1);
+                    Some(line_at(x, g, b.0, b.1, self.lo)?.max(g))
+                })
+            } else {
+                None
+            };
+            regions.push(Region {
+                bound: less(gross, Some(self.fixed)),
+                next: (first.x / 4).max(self.lo),
+                open: false,
+            });
+        }
+
+        // Between two priced sizes: under the line from the left, carried
+        // right, and under the line from the right, carried left.
+        for i in 0..n - 1 {
+            let (a, b) = (&self.probes[i], &self.probes[i + 1]);
+            if b.x - a.x < U256::from(2u64) {
+                continue;
+            }
+            let from_left = raised(i).and_then(|(x, g)| {
+                let l = left_of(i);
+                Some(line_at(l.0, l.1, x, g, b.x)?.max(g))
+            });
+            let from_right = if i + 2 < n {
+                raised(i + 1).and_then(|(x, g)| {
+                    let r = at(i + 2);
+                    Some(line_at(x, g, r.0, r.1, a.x)?.max(g))
+                })
+            } else {
+                None
+            };
+            let gross = match (from_left, from_right) {
+                (Some(l), Some(r)) => Some(l.min(r)),
+                (l, r) => l.or(r),
+            };
+            regions.push(Region {
+                bound: less(gross, signed(a.cost)),
+                // Halve it: toward the gross's peak, or toward a cost step inside.
+                next: a.x + (b.x - a.x) / 2,
+                open: false,
+            });
+        }
+
+        // Above the largest size priced.
+        if last.x < self.top {
+            let gross = raised(n - 1).and_then(|(x, g)| {
+                let l = left_of(n - 1);
+                Some(line_at(l.0, l.1, x, g, self.top)?.max(g))
+            });
+            regions.push(Region {
+                bound: less(gross, signed(last.cost)),
+                next: if self.refused {
+                    last.x + (self.top - last.x + one) / 2
+                } else {
+                    last.x.saturating_mul(U256::from(4u64)).min(self.top)
+                },
+                open: true,
+            });
+        }
+        regions
+    }
+
+    /// The size to price next, or `None` when no size left unpriced can net
+    /// more than [`Self::bar`].
+    fn next(&self) -> Option<U256> {
+        let bar = self.bar();
+        let regions = self.regions();
+        let above = |r: &&Region| r.bound.is_none_or(|b| b > bar);
+        // The region above the largest size first, while it can still pay: it
+        // sets the scale of the answer.
+        if let Some(open) = regions.last().filter(|r| r.open).filter(above) {
+            return Some(open.next);
+        }
+        // Then the highest bound, no bound being the highest; of equals, the
+        // higher region.
+        regions.iter().filter(above).max_by_key(|r| (r.bound.is_none(), r.bound)).map(|r| r.next)
+    }
+}
+
 /// Find the input that maximises net profit, or say why there is none.
 ///
 /// `net(x) = output(x) - x - cost(x)`, with each size's cost from
-/// [`SizedRoute::priced`]. Under a fixed cost it is concave — a concave
-/// function minus a linear one — so it is unimodal and a ternary search finds
-/// the maximum without evaluating every size. The search is over integers and
-/// narrows to a handful of candidates, which are then scanned exactly; ternary
-/// search alone can be off by one on a lattice.
+/// [`SizedRoute::priced`].
 ///
-/// A cost that steps up with the size (gas, per tick crossed) leaves `net`
-/// concave between its steps and small steps across them, so the search may
-/// stop near the best size rather than on it. What it reports is still exact:
-/// a size, and the net that size earns at its own cost.
+/// **The search bounds what it has not priced (R27.2).** It assumes, of the
+/// sizes the route prices:
+///
+/// - the gross, `output(x) - x`, is concave, from zero at zero size, to within
+///   [`SizedRoute::rounding`];
+/// - the cost never falls as the size grows, and is never under
+///   [`SizedRoute::fixed_cost`];
+/// - a refused size bounds the range: every larger size is refused too.
+///
+/// Then every size it has not priced lies in a region whose net it can bound
+/// ([`Search::next`]). It prices inside the region with the highest bound and
+/// stops when none can beat its best by more than its tolerance:
+///
+/// `(max(best, 0) + fixed_cost) * tolerance_ppm / 10^6 + 4 * rounding`.
+///
+/// So when it stops by that rule, **no size nets more than `max(best, 0)` plus
+/// the tolerance**, and a route it calls unprofitable has no size netting more
+/// than the tolerance. A cost that steps up (gas, per tick crossed) does not
+/// weaken this: a region is charged the cost of its left end, so a size just
+/// under a step is found. Nothing here assumes the net has one peak.
+///
+/// Outside those assumptions, and when the budget ends it, the search still
+/// reports a size it priced and the net that size earns: no more is claimed.
+///
+/// Until R27.2 this was a ternary search over the whole range. It never
+/// converged inside its budget, so every search cost the full 128 quotes, the
+/// first of them at the largest sizes the route allowed; and across a cost
+/// step it promised nothing. `tests/support/ternary.rs` keeps it as a
+/// comparator.
 ///
 /// **A size the route refuses bounds the search; it does not end it.** A
 /// concentrated pool's quote runs off its proven ladder, or past its tick
-/// limit, beyond some size — and more input runs further, so every larger size
-/// is refused too. The range ends at what its pool *holds*, which for a deep
-/// pool is thousands of times what it can price, so the first probes are
-/// usually refused. The search narrows below each refusal. Until 2026-10-05 a
-/// refusal ended it, and a route paying 44 bps at a tenth of a WETH reported no
-/// profitable size because its pool held a million.
+/// limit, beyond some size, and more input runs further, so every larger size
+/// is refused too. Until 2026-10-05 a refusal ended the search, and a route
+/// paying 44 bps at a tenth of a WETH reported no profitable size because its
+/// pool held a million.
 pub fn best_size<R: SizedRoute + ?Sized>(
     route: &R,
     budget: SearchBudget,
 ) -> Result<SizedOpportunity, NoSize> {
-    let lo_bound = budget.min_input.max(U256::one());
-    let hi_bound = route.max_input();
-    if hi_bound < lo_bound {
+    let lo = budget.min_input.max(U256::one());
+    let hi = route.max_input();
+    if hi < lo {
         return Err(NoSize::RangeEmpty);
     }
-
-    let mut evaluations = 0u32;
-    let mut best: Option<SizedOpportunity> = None;
-    let mut evaluate = |x: U256, best: &mut Option<SizedOpportunity>| -> Probe {
-        if evaluations >= budget.max_evaluations {
-            return Probe::Spent;
-        }
-        evaluations += 1;
-        let Some(priced) = route.priced(x) else { return Probe::Refused };
-        let net = Surplus::of(priced.output, x.saturating_add(priced.cost));
-        let candidate = SizedOpportunity {
-            amount_in: x,
-            output: priced.output,
-            net,
-        };
-        if best.is_none_or(|b| candidate.net > b.net) {
-            *best = Some(candidate);
-        }
-        Probe::Net(net)
+    let mut search = Search {
+        route,
+        budget,
+        lo,
+        top: hi,
+        refused: false,
+        probes: Vec::new(),
+        best: None,
+        evaluations: 0,
+        // A cost too large to hold bounds nothing; a rounding too large to
+        // hold leaves every region unbounded.
+        fixed: signed(route.fixed_cost()).unwrap_or_else(I256::zero),
+        rounding: signed(route.rounding()).unwrap_or(I256::MAX),
     };
 
-    let (mut lo, mut hi) = (lo_bound, hi_bound);
-    let three = U256::from(3u64);
-    while hi > lo && hi - lo > U256::from(2u64) {
-        let span = hi - lo;
-        let m1 = lo + span / three;
-        let m2 = hi - span / three;
-        if m1 >= m2 {
-            break;
-        }
-        // The lower probe first: refused, the higher one would be too.
-        let f1 = match evaluate(m1, &mut best) {
-            Probe::Net(f) => f,
-            Probe::Refused => {
-                hi = m1 - U256::one();
-                continue;
-            }
-            Probe::Spent => break,
-        };
-        let f2 = match evaluate(m2, &mut best) {
-            Probe::Net(f) => f,
-            Probe::Refused => {
-                hi = m2 - U256::one();
-                continue;
-            }
-            Probe::Spent => break,
-        };
-        if f1 < f2 {
-            lo = m1 + U256::one();
-        } else {
-            hi = m2;
-        }
+    // The first size: `start`, or the largest quarter of it the route prices.
+    let mut x = budget.start.clamp(lo, hi);
+    while matches!(search.price(x), Asked::Refused) && x > lo {
+        x = (x / 4).max(lo);
     }
-
-    // Exact scan of the narrowed bracket. Bounded: the loop above reduces the
-    // span geometrically, so this is a handful of points. A refusal ends it:
-    // every size past it is refused too.
-    let mut x = lo;
-    while x <= hi {
-        if !matches!(evaluate(x, &mut best), Probe::Net(_)) {
-            break;
-        }
-        x = x.saturating_add(U256::one());
-        if x == U256::zero() {
+    while let Some(x) = search.next() {
+        if matches!(search.price(x), Asked::Spent) {
             break;
         }
     }
 
-    match best {
+    match search.best {
         None => Err(NoSize::Unpriceable),
-        Some(b) if b.net.is_gain() => Ok(b),
-        Some(b) => Err(NoSize::NoProfitableSize { best: b }),
+        Some(p) => {
+            let found = SizedOpportunity {
+                amount_in: p.x,
+                output: p.output,
+                net: Surplus::of(p.output, p.x.saturating_add(p.cost)),
+            };
+            if found.net.is_gain() {
+                Ok(found)
+            } else {
+                Err(NoSize::NoProfitableSize { best: found })
+            }
+        }
     }
 }
 
@@ -357,4 +578,121 @@ pub fn marginal_gross_bps<R: SizedRoute + ?Sized>(route: &R, probe: U256) -> Opt
     let ratio = scaled / probe;
     let bps = i64::try_from(ratio.min(U256::from(i64::MAX as u64)).as_u64()).ok()?;
     Some(bps - 10_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A route over the sizes `1..=n`: `gross[x]` before its output is
+    /// truncated to a multiple of `unit`, and `cost[x]`.
+    struct Table {
+        gross: Vec<i64>,
+        cost: Vec<u64>,
+        unit: u64,
+    }
+
+    impl Table {
+        fn out(&self, x: u64) -> u64 {
+            (x as i64 + self.gross[x as usize]) as u64 / self.unit * self.unit
+        }
+        fn net(&self, x: u64) -> i64 {
+            self.out(x) as i64 - x as i64 - self.cost[x as usize] as i64
+        }
+    }
+
+    impl SizedRoute for Table {
+        fn output(&self, amount_in: U256) -> Option<U256> {
+            Some(U256::from(self.out(amount_in.as_u64())))
+        }
+        fn fixed_cost(&self) -> U256 {
+            U256::from(self.cost[1])
+        }
+        fn max_input(&self) -> U256 {
+            U256::from(self.gross.len() as u64 - 1)
+        }
+        fn priced(&self, amount_in: U256) -> Option<Priced> {
+            Some(Priced { output: self.output(amount_in)?, cost: U256::from(self.cost[amount_in.as_u64() as usize]) })
+        }
+        /// A truncated output is under the exact one by less than a unit.
+        fn rounding(&self) -> U256 {
+            U256::from(if self.unit > 1 { self.unit } else { 0 })
+        }
+    }
+
+    /// A fixed sequence: the same routes on every run.
+    struct Seq(u64);
+
+    impl Seq {
+        fn up_to(&mut self, most: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % (most + 1)
+        }
+    }
+
+    /// **No size in a region nets more than the region's bound.** The search's
+    /// guarantee is this and nothing else: it stops when no bound is above its
+    /// bar. Checked by pricing every size, on 600 routes (a concave gross with
+    /// kinks, a cost that steps, an output exact or truncated) each priced at
+    /// a handful of sizes anywhere in its range, not only where the search
+    /// would go.
+    #[test]
+    fn no_size_in_a_region_nets_more_than_its_bound() {
+        let mut bounded = 0;
+        for seed in 0..600u64 {
+            let mut seq = Seq(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5);
+            let n = 30 + seq.up_to(770);
+            let (mut gross, mut cost) = (vec![0i64], vec![0u64]);
+            let (mut slope, mut level) = (seq.up_to(80) as i64 - 1, seq.up_to(500));
+            for _ in 1..=n {
+                if seq.up_to(40) == 0 {
+                    slope = (slope - seq.up_to(25) as i64).max(-1);
+                }
+                if seq.up_to(60) == 0 {
+                    level += seq.up_to(900);
+                }
+                gross.push(gross.last().unwrap() + slope);
+                cost.push(level);
+            }
+            let table = Table { gross, cost, unit: [1, 1, 7, 64][(seed % 4) as usize] };
+            let mut search = Search {
+                route: &table,
+                budget: SearchBudget { max_evaluations: u32::MAX, min_input: U256::one(), start: U256::one(), tolerance_ppm: 0 },
+                lo: U256::one(),
+                top: U256::from(n),
+                refused: false,
+                probes: Vec::new(),
+                best: None,
+                evaluations: 0,
+                fixed: signed(table.fixed_cost()).unwrap(),
+                rounding: signed(table.rounding()).unwrap(),
+            };
+            for _ in 0..2 + seq.up_to(9) {
+                let x = U256::from(1 + seq.up_to(n - 1));
+                if search.probes.iter().all(|p| p.x != x) {
+                    search.price(x);
+                }
+            }
+            // The regions, as `regions` orders them: below, between, above.
+            let sizes: Vec<u64> = search.probes.iter().map(|p| p.x.as_u64()).collect();
+            let mut spans = Vec::new();
+            if sizes[0] > 1 {
+                spans.push((1, sizes[0] - 1));
+            }
+            spans.extend(sizes.windows(2).filter(|w| w[1] - w[0] >= 2).map(|w| (w[0] + 1, w[1] - 1)));
+            if *sizes.last().unwrap() < n {
+                spans.push((sizes.last().unwrap() + 1, n));
+            }
+            let regions = search.regions();
+            assert_eq!(regions.len(), spans.len(), "seed {seed}");
+            for (region, (from, to)) in regions.iter().zip(spans) {
+                assert!(U256::from(from) <= region.next && region.next <= U256::from(to), "seed {seed}: the next size is in its region");
+                let Some(bound) = region.bound else { continue };
+                let (size, net) = (from..=to).map(|x| (x, table.net(x))).max_by_key(|(_, net)| *net).unwrap();
+                assert!(I256::from(net) <= bound, "seed {seed}: size {size} in {from}..={to} nets {net}, over its bound {bound}");
+                bounded += 1;
+            }
+        }
+        assert!(bounded > 2_000, "{bounded} bounds checked");
+    }
 }

@@ -20,10 +20,13 @@ What the search promises, each claim separate:
    Both hold for every venue here. The tolerance includes the route's integer
    rounding, which is stated, not ignored. Today's search makes no such promise
    once costs step.
-3. **The reactive lane's executed size** is still
-   `apex_econ::sizing::discrete::refine`'s, which is never worse than the size
-   it starts from. That is refine's contract and all this document claims for
-   it; it is not a proof of the integer optimum.
+3. **The reactive lane's executed size does not change at all.** It never
+   came from this search: the economics stage sizes a candidate again, with
+   its own search (`apex_econ::sizing::continuous::optimize`, then
+   `discrete::refine`). Engine C's size is only a hint, and what this search
+   decides there is whether a route is proposed. (Found while building this;
+   the first draft said refine starts from Engine C's size, which was wrong.
+   See "Not in R27.2".)
 
 ## Evidence
 
@@ -89,7 +92,7 @@ search, in microseconds:
 |---|---|
 | **P0: the gross bracket can leave out the best net size.** A cost step below the gross's peak can put the best net below the bracket. | Correct. The search no longer confines itself to a bracket. Every unpriced size sits in a region with a proven upper bound on its net, and the search ends only when no region can beat the best found (§1). |
 | **P0: golden section on the net is unjustified**, the net not being unimodal. | Correct. Nothing in the new search assumes the net has one peak. Concavity is used for the gross alone. |
-| **P1: `refine` does not guarantee the integer optimum.** | Correct; the claim is withdrawn (Goal, claim 3). A test holds refine's net from the new search's size at least equal to its net from the old search's. |
+| **P1: `refine` does not guarantee the integer optimum.** | Correct; the claim is withdrawn. Reading the code for it showed more: refine does not start from this search at all (Goal, claim 3). |
 | **P1: the old search is not an oracle.** | Correct. The oracle is exhaustive search on bounded integer domains; the old search is kept as a comparator only (Testing). |
 | **P1: 24 quotes against the prototype's 26.** | The 26 was the prototype, a different search. Quote counts are now defined, measured first, then fixed as gates (Testing). |
 | **P1: ties and flat nets.** | Specified (§1, "Ties"). |
@@ -164,10 +167,8 @@ bound charges the whole region the cost of its left end.
    - **above the largest priced size:** 4 times it, capped at the range's top
      (or the midpoint, once a refusal has bounded the range);
    - **below the smallest:** a quarter of it, floored at `min_input`;
-   - **between two priced sizes of equal cost:** where the two gross lines
-     cross, kept a sixteenth of the region away from its ends;
-   - **between two of different cost:** the midpoint, which closes in on the
-     step.
+   - **between two priced sizes:** the midpoint, which closes in on the
+     gross's peak, or on a cost step inside.
 4. The answer is the best net among the sizes priced: `Ok` for a gain,
    `NoProfitableSize { best }` otherwise, `Unpriceable` if nothing priced, as
    today.
@@ -235,9 +236,10 @@ gap's gross. At 1 WETH the rounding of two hops is about 0.01 bps of the size.
 Neither lane's code changes; both call `best_size` with
 `SearchBudget::default()`.
 
-- **Reactive.** Engine C's size is a hint (`size_hint`). The executed size is
-  `discrete::refine`'s, which starts at the hint and moves only to better
-  sizes.
+- **Reactive.** Engine C calls the search for every template an event
+  touches: that is the cost this change removes. Its size is a hint
+  (`size_hint`); the economics stage sizes the candidate again by its own
+  search, which this change does not touch.
 - **Armed.** `threshold::best_at` takes the search's size as the rung's size.
   The rung's plan, band and surplus are quoted exactly at that size, as today.
 - **`NoProfitableSize { best }`** is still the best size priced. With no gap
@@ -287,8 +289,10 @@ Neither lane's code changes; both call `best_size` with
 - **The old search stays in the tests as a comparator:** on every case the new
   net is at least the old net less the tolerance. Agreement with it proves
   nothing by itself.
-- **`refine`:** on every case, refine's net from the new search's size is at
-  least its net from the old search's, less the tolerance.
+- **Every bound is tested where it is made:** on 600 generated routes, each
+  priced at a handful of sizes anywhere in its range, every size is priced and
+  none in a region nets more than the region's bound. The guarantee is that
+  and nothing else.
 - **Existing tests pass unchanged.** `best_size_returns_ok_only_for_a_gain`,
   `a_refused_size_bounds_the_search_rather_than_ending_it`,
   `the_search_respects_its_compute_budget` and
@@ -354,8 +358,14 @@ Neither lane's code changes; both call `best_size` with
 - **The near-miss ladder** (R14): seven more quotes a route on the reactive
   path. After this change it is most of a no-gap route's pricing. Left as it
   is, and raised separately.
-- **`discrete::refine`'s climb** (up to 256 quotes): once per candidate,
-  beside a simulation that takes tens of milliseconds.
+- **The economics stage's own sizing.** Found while building this: a
+  candidate is sized again by `continuous::optimize`, a 60-iteration golden
+  section on the net from the top of the range, then `discrete::refine`'s
+  climb of up to 256 quotes, and `LiveEconomics` runs the pair four times a
+  candidate. `optimize` has the two faults the review found in this document's
+  first draft, and since R27 its first quotes are at the sizes Morpho allows.
+  It is on the capture path of every candidate, after "proposed". The harness
+  times it; replacing it is the next change, not this one.
 - **How the armed lane shares its sixteen senders between small and spike
   rungs.** Since R26.3, rungs 3 to 6 hold 71 to 84% of the arms and have not
   fired. A ranking question, raised separately.

@@ -439,3 +439,65 @@ fn a_route_refused_everywhere_is_unpriceable() {
     let r = Refusing { inner: deep, limit: U256::zero() };
     assert_eq!(best_size(&r, SearchBudget::default()).unwrap_err(), NoSize::Unpriceable);
 }
+
+#[path = "support/synth.rs"]
+mod synth;
+#[path = "support/ternary.rs"]
+mod ternary;
+
+/// A cycle that declares what its 6-decimal middle token truncates: two units
+/// of it, in the input token.
+struct Declared(TwoVenueCycle, U256);
+
+impl SizedRoute for Declared {
+    fn output(&self, amount_in: U256) -> Option<U256> {
+        self.0.output(amount_in)
+    }
+    fn fixed_cost(&self) -> U256 {
+        self.0.fixed_cost()
+    }
+    fn max_input(&self) -> U256 {
+        self.0.max_input()
+    }
+    fn rounding(&self) -> U256 {
+        self.1
+    }
+}
+
+/// **R27.2: the search asks a fraction of what it did.** Until then it spent
+/// its whole budget, 128 quotes, on every route. Measured here on 2026-10-14:
+/// 198 quotes for these eighteen cycles, 20 at most, and 2 to 7 where no size
+/// pays. Half of that is the second bounding line: with either line alone the
+/// same cycles take over 300.
+///
+/// The old search is the comparator: the new net is never under it by more
+/// than the tolerance the search states.
+#[test]
+fn the_search_asks_a_fraction_of_what_it_did() {
+    // Two units of the 6-decimal middle token, at 2,000 of them to the WETH.
+    let rounding = U256::from(1_000_000_000u64);
+    let budget = SearchBudget::default();
+    let mut total = 0;
+    for spread in [50u64, 61, 65, 80, 200, 1000] {
+        for gas in [0u128, GAS, GAS * 100] {
+            let route = Declared(cycle(spread, 30, gas), rounding);
+            let counting = synth::Counting::new(&route);
+            let new = best_size(&counting, budget);
+            let quotes = counting.quotes();
+            total += quotes;
+            assert!(quotes <= 24, "spread {spread}, gas {gas}: {quotes} quotes");
+            if new.is_err() {
+                assert!(quotes <= 8, "spread {spread}, gas {gas}: no size pays, and it took {quotes} quotes to say so");
+            }
+            let net = |r: &Result<apex_math::finite_size::SizedOpportunity, NoSize>| match r {
+                Ok(b) => b.net.magnitude(),
+                Err(_) => U256::zero(),
+            };
+            let old = ternary::ternary_best_size(&route, budget.max_evaluations, budget.min_input);
+            let tolerance = (net(&new) + U256::from(gas)) * U256::from(budget.tolerance_ppm) / U256::from(1_000_000u64)
+                + rounding * U256::from(4u64);
+            assert!(net(&new) + tolerance >= net(&old), "spread {spread}, gas {gas}: new {:?}, old {:?}", new, old);
+        }
+    }
+    assert!(total <= 220, "{total} quotes for eighteen cycles");
+}
