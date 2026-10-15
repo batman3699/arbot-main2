@@ -8,7 +8,8 @@
 # Reads var/apex/ only: the pid file, the JSON-lines report and the log. Prints
 # nothing those files do not already hold, and they hold no secret. On the
 # co-located host (R25, ops/host/README.md) there is no pid file or log file:
-# the process is systemd's apex-shadow unit and its log is the journal.
+# the process is systemd's apex-shadow unit, or apex-canary while it runs
+# (R28), and its log is the journal.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -23,9 +24,18 @@ def proc(pid):
         return None
     return out if len(out) == 3 and out[0] == "apex" else None
 
+# R28: the unit is the canary's while it runs, else the shadow's (the two
+# conflict, so at most one is active).
+def unit():
+    try:
+        live = subprocess.run(["systemctl", "is-active", "--quiet", "apex-canary"]).returncode == 0
+    except OSError:
+        live = False
+    return "apex-canary" if live else "apex-shadow"
+
 def unit_pid():
     try:
-        out = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", "apex-shadow"],
+        out = subprocess.run(["systemctl", "show", "-p", "MainPID", "--value", unit()],
                              capture_output=True, text=True).stdout.strip()
         return int(out) or None
     except (OSError, ValueError):
@@ -143,7 +153,7 @@ try:
         warn = [l for l in plain if " WARN " in l or " ERROR " in l]
 except OSError:
     try:  # the co-located host: the unit's journal
-        out = subprocess.run(["journalctl", "-u", "apex-shadow", "--no-pager", "-o", "cat", "-n", "20000"],
+        out = subprocess.run(["journalctl", "-u", unit(), "--no-pager", "-o", "cat", "-n", "20000"],
                              capture_output=True, text=True).stdout
         plain = (re.sub(r"\x1b\[[0-9;]*m", "", l).rstrip() for l in out.splitlines())
         warn = [l for l in plain if " WARN " in l or " ERROR " in l]
