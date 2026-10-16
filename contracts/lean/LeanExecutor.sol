@@ -19,6 +19,10 @@ interface IAeroPool {
     function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
 }
 
+interface IMorphoFlashLoan {
+    function flashLoan(address token, uint256 assets, bytes calldata data) external;
+}
+
 interface IBalancerVault {
     function flashLoan(address recipient, address[] memory tokens, uint256[] memory amounts, bytes memory userData)
         external;
@@ -123,7 +127,7 @@ contract LeanExecutor {
         if (circuitOpen) revert CircuitOpen();
         (uint8 lender, uint256 amount, uint256 deadline,, uint256 hops) = LeanPlanCodec.header(plan);
         if (block.timestamp > deadline) revert Expired(deadline, block.timestamp);
-        if (lender > 0) revert BadPlan();
+        if (lender > 1) revert BadPlan();
         address last;
         for (uint256 i; i < hops; ++i) {
             (uint8 kind,, address tokenOut,) = LeanPlanCodec.hop(plan, i);
@@ -133,11 +137,15 @@ contract LeanExecutor {
         if (last != WETH) revert BadPlan();
 
         _tstore(T_LOAN, 1);
-        address[] memory tokens = new address[](1);
-        tokens[0] = WETH;
-        uint256[] memory amounts = new uint256[](1);
-        amounts[0] = amount;
-        IBalancerVault(BALANCER_VAULT).flashLoan(address(this), tokens, amounts, plan);
+        if (lender == 0) {
+            address[] memory tokens = new address[](1);
+            tokens[0] = WETH;
+            uint256[] memory amounts = new uint256[](1);
+            amounts[0] = amount;
+            IBalancerVault(BALANCER_VAULT).flashLoan(address(this), tokens, amounts, plan);
+        } else {
+            IMorphoFlashLoan(MORPHO_BLUE).flashLoan(WETH, amount, plan);
+        }
         _tstore(T_LOAN, 0);
     }
 
@@ -149,6 +157,14 @@ contract LeanExecutor {
         if (msg.sender != BALANCER_VAULT || _tload(T_LOAN) == 0) revert UnexpectedCallback();
         _tstore(T_LOAN, 0);
         _transfer(WETH, BALANCER_VAULT, _trade(plan, fees[0]));
+    }
+
+    /// Morpho Blue's flash loan callback: no fee, and Morpho pulls its
+    /// repayment after this returns (the constructor's approval).
+    function onMorphoFlashLoan(uint256, bytes calldata plan) external {
+        if (msg.sender != MORPHO_BLUE || _tload(T_LOAN) == 0) revert UnexpectedCallback();
+        _tstore(T_LOAN, 0);
+        _trade(plan, 0);
     }
 
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {

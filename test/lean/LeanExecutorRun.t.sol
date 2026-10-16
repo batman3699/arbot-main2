@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {LeanExecutor} from "../../contracts/lean/LeanExecutor.sol";
 import {BadPlan} from "../../contracts/lean/LeanPlanCodec.sol";
 import {LeanToken, MockV3Pool, MockAeroPool, MockVault, Poker} from "./LeanMocks.sol";
+import {MockMorphoFlash} from "../../contracts/mocks/MockMorphoFlash.sol";
 
 /// Task 8.5 R29: the lean executor's run path, against venue doubles. A trade
 /// borrows WETH from Balancer, swaps hop by hop paying each pool in its own
@@ -12,6 +13,7 @@ import {LeanToken, MockV3Pool, MockAeroPool, MockVault, Poker} from "./LeanMocks
 contract LeanExecutorRunTest is Test {
     address constant WETH = 0x4200000000000000000000000000000000000006;
     address constant VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
+    address constant MORPHO = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
 
     struct Hop {
         uint8 kind;
@@ -147,6 +149,32 @@ contract LeanExecutorRunTest is Test {
         vm.expectRevert(abi.encodeWithSelector(LeanExecutor.Expired.selector, deadline, deadline + 1));
         vm.prank(trader);
         lean.run(p);
+    }
+
+    /// Morpho Blue lends, calls back, and pulls its repayment: no fee.
+    function testMorphoLoanPaysTheProfitAndIsRepaid() public {
+        vm.etch(MORPHO, address(new MockMorphoFlash()).code);
+        weth.mint(MORPHO, 1000e18);
+        Hop[] memory hops = new Hop[](2);
+        hops[0] = Hop(0, address(wethToX), address(x), uint128(X_OUT));
+        hops[1] = Hop(1, address(xToWeth), WETH, LOAN + 1);
+        vm.expectCall(VAULT, abi.encodeWithSelector(MockVault.flashLoan.selector), 0);
+        vm.expectEmit(address(lean));
+        emit Profit(WETH_OUT - LOAN);
+        vm.prank(trader);
+        lean.run(plan(1, LOAN, uint40(block.timestamp + 60), 1, hops));
+        assertEq(weth.balanceOf(recipient), WETH_OUT - LOAN);
+        assertEq(weth.balanceOf(MORPHO), 1000e18, "Morpho pulled its loan back");
+        assertEq(weth.balanceOf(address(lean)), 0);
+    }
+
+    function testMorphoCallbackFromOutsideATradeReverts() public {
+        bytes memory p = cycle(LOAN + 1, 1);
+        vm.expectRevert(LeanExecutor.UnexpectedCallback.selector);
+        lean.onMorphoFlashLoan(LOAN, p);
+        vm.expectRevert(LeanExecutor.UnexpectedCallback.selector);
+        vm.prank(MORPHO);
+        lean.onMorphoFlashLoan(LOAN, p);
     }
 
     /// Review Focus 1: anyone can ask Balancer for a loan naming the executor.
