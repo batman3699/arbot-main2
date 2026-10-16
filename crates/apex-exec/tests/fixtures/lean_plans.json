@@ -1,0 +1,82 @@
+{
+  "_provenance": "Task 8.5 R29. Written 2026-10-17 by an independent packer (Python int.to_bytes, big-endian) from the fields below, per the byte table in contracts/lean/LeanPlanCodec.sol. apex_exec::lean's encoder (crates/apex-exec/tests/lean_plan.rs) and LeanPlanCodec (test/lean/LeanPlanFixture.t.sol) are both held to it and NEITHER writes it: a test that regenerated it would make the two sides agree by construction.",
+  "cases": {
+    "balancer_two_v3": {
+      "lender": 0,
+      "amount": "1937500000000000000",
+      "deadline": "1792133385",
+      "min_profit": "1",
+      "hops": [
+        {
+          "kind": 0,
+          "pool": "0x7C7420DD105E2779316423Ba3E973f434315EFA9",
+          "token_out": "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",
+          "min_out": "5782309"
+        },
+        {
+          "kind": 0,
+          "pool": "0x8c7080564B5A792A33Ef2FD473fbA6364d5495e5",
+          "token_out": "0x4200000000000000000000000000000000000006",
+          "min_out": "1937500000000000001"
+        }
+      ],
+      "hop_count": 2,
+      "encoded": "0x0000000000000000001ae361fc1451c000006ad1c90900000000000000000000000000000001007c7420dd105e2779316423ba3e973f434315efa9cbb7c0000ab88b473b1f5afd9ef808440eed33bf00000000000000000000000000583b25008c7080564b5a792a33ef2fd473fba6364d5495e5420000000000000000000000000000000000000600000000000000001ae361fc1451c001"
+    },
+    "morpho_pancake_aerodrome": {
+      "lender": 1,
+      "amount": "500000000000000000",
+      "deadline": "1800000000",
+      "min_profit": "7",
+      "hops": [
+        {
+          "kind": 1,
+          "pool": "0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "min_out": "1234567890"
+        },
+        {
+          "kind": 2,
+          "pool": "0xcDAC0d6c6C59727a65F871236188350531885C43",
+          "token_out": "0x4200000000000000000000000000000000000006",
+          "min_out": "500000000000000123"
+        }
+      ],
+      "hop_count": 2,
+      "encoded": "0x01000000000000000006f05b59d3b20000006b49d200000000000000000000000000000000070172ab388e2e2f6facef59e3c3fa2c4e29011c2d38833589fcd6edb6e08f4c7c32d4f71b54bda02913000000000000000000000000499602d202cdac0d6c6c59727a65f871236188350531885c434200000000000000000000000000000000000006000000000000000006f05b59d3b2007b"
+    },
+    "three_hops_at_the_limits": {
+      "lender": 0,
+      "amount": "340282366920938463463374607431768211455",
+      "deadline": "1099511627775",
+      "min_profit": "340282366920938463463374607431768211455",
+      "hops": [
+        {
+          "kind": 0,
+          "pool": "0xd0b53D9277642d899DF5C87A3966A349A798F224",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "min_out": "340282366920938463463374607431768211455"
+        },
+        {
+          "kind": 2,
+          "pool": "0x0000000000000000000000000000000000000001",
+          "token_out": "0xfFfFFfFFFfffFFfFFFfFfFFFFfFFFFfFFFfffFFF",
+          "min_out": "0"
+        },
+        {
+          "kind": 1,
+          "pool": "0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF",
+          "token_out": "0x4200000000000000000000000000000000000006",
+          "min_out": "1"
+        }
+      ],
+      "hop_count": 3,
+      "encoded": "0x00ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00d0b53d9277642d899df5c87a3966a349a798f224833589fcd6edb6e08f4c7c32d4f71b54bda02913ffffffffffffffffffffffffffffffff020000000000000000000000000000000000000001ffffffffffffffffffffffffffffffffffffffff0000000000000000000000000000000001ffffffffffffffffffffffffffffffffffffffff420000000000000000000000000000000000000600000000000000000000000000000001"
+    }
+  },
+  "names": [
+    "balancer_two_v3",
+    "morpho_pancake_aerodrome",
+    "three_hops_at_the_limits"
+  ]
+}

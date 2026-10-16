@@ -49,15 +49,24 @@
 
 use crate::commitment::PlanV2;
 use crate::encode::start_v2_calldata;
+use crate::lean::{run_calldata, LeanPlan, SignedLeanPlan};
 use crate::sign::SignedPlan;
 use alloy_primitives::{Address, B256};
 
-/// `startV2(plan)` against one executor on one chain.
+/// The plan a call carries: `startV2`'s for the Phase 5 executor, `run`'s for
+/// the lean one (R29).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CallPlan {
+    V2(PlanV2),
+    Lean(LeanPlan),
+}
+
+/// One executor call on one chain: `startV2(plan)` or `run(plan)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutorCall {
     to: Address,
     chain_id: u64,
-    plan: PlanV2,
+    plan: CallPlan,
     commitment: B256,
     data: Vec<u8>,
 }
@@ -71,7 +80,20 @@ impl ExecutorCall {
             to: checked.executor(),
             chain_id: checked.block_chain_id(),
             commitment: checked.commitment(),
-            plan: checked.plan().clone(),
+            plan: CallPlan::V2(checked.plan().clone()),
+            data,
+        }
+    }
+
+    /// The lean executor's call (R29), from a plan whose off-chain commitment
+    /// was recomputed and matched.
+    pub fn from_lean(checked: SignedLeanPlan) -> Self {
+        let data = run_calldata(checked.plan()).expect("a checked plan encodes: its commitment was computed from its bytes");
+        Self {
+            to: checked.executor(),
+            chain_id: checked.block_chain_id(),
+            commitment: checked.commitment(),
+            plan: CallPlan::Lean(checked.plan().clone()),
             data,
         }
     }
@@ -90,7 +112,7 @@ impl ExecutorCall {
         &self.data
     }
 
-    pub const fn plan(&self) -> &PlanV2 {
+    pub const fn plan(&self) -> &CallPlan {
         &self.plan
     }
 

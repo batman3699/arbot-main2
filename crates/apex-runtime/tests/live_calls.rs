@@ -199,7 +199,7 @@ fn a_priced_cycle_becomes_one_checked_plan_in_either_venue_order() {
         let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &k).expect("builds");
 
         assert_eq!((call.to(), call.chain_id()), (EXECUTOR, 8453));
-        let plan = call.plan();
+        let plan = v2(&call);
         assert_eq!(plan_commitment(plan, 8453, EXECUTOR), call.commitment());
         assert_eq!((plan.min_profit, plan.chain_id, plan.deadline), (U256::from(1u64), 8453, DEADLINE));
 
@@ -231,7 +231,7 @@ fn a_priced_cycle_becomes_one_checked_plan_in_either_venue_order() {
         let k = commitment(&c, u64::try_from((c.expected_output - input) / U256::from(2u64)).unwrap());
         let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &k).expect("builds");
         let want = expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, owed);
-        assert_eq!((call.plan().steps[1].op, call.plan().steps[1].data.clone()), want);
+        assert_eq!((v2(&call).steps[1].op, v2(&call).steps[1].data.clone()), want);
     }
 }
 
@@ -259,11 +259,11 @@ fn a_pancakeswap_hop_is_adapter_twos_router_call() {
             expected_step(&b, l0.pool, l0.token_in, l0.token_out, input, mid),
             expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, floor),
         ];
-        for (got, (op, data)) in call.plan().steps.iter().zip(want) {
+        for (got, (op, data)) in v2(&call).steps.iter().zip(want) {
             assert_eq!((got.op, &got.data), (op, &data));
         }
         let cake_step = cycle.legs.iter().position(|l| l.pool == PANCAKE).unwrap();
-        assert_eq!(call.plan().steps[cake_step].op, Op::Generic);
+        assert_eq!(v2(&call).steps[cake_step].op, Op::Generic);
     }
 }
 
@@ -313,7 +313,7 @@ fn the_plan_borrows_from_the_commitments_lender() {
     let err = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &morpho_k).unwrap_err();
     assert!(matches!(&err, Decline::Uncommittable { detail } if detail.contains("Morpho")), "unconfigured: {err:?}");
     let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).with_morpho(lender).build(&c, &morpho_k).expect("builds");
-    let loan = call.plan().loans[0];
+    let loan = v2(&call).loans[0];
     assert_eq!((loan.provider, loan.provider_addr, loan.amount), (LoanProvider::Erc3156, lender, c.input_amount.get()));
     for source in [FlashProviderId(0), FlashProviderId(3)] {
         let k = ExecutionCommitment { flash_source: source, ..commitment(&c, 1) };
@@ -524,7 +524,7 @@ fn a_second_slipstream_hop_is_adapter_threes_router_call() {
             expected_step(&b, l0.pool, l0.token_in, l0.token_out, input, mid),
             expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, floor),
         ];
-        for (got, (op, data)) in call.plan().steps.iter().zip(want) {
+        for (got, (op, data)) in v2(&call).steps.iter().zip(want) {
             assert_eq!((got.op, &got.data), (op, &data));
         }
     }
@@ -584,10 +584,18 @@ fn an_aerodrome_hop_is_adapter_fours_router_call() {
             expected_step(&b, l0.pool, l0.token_in, l0.token_out, input, mid),
             expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, floor),
         ];
-        for (got, (op, data)) in call.plan().steps.iter().zip(want) {
+        for (got, (op, data)) in v2(&call).steps.iter().zip(want) {
             assert_eq!((got.op, &got.data), (op, &data));
         }
         let aero_step = cycle.legs.iter().position(|l| l.pool == AERO).unwrap();
-        assert_eq!(call.plan().steps[aero_step].op, Op::Generic);
+        assert_eq!(v2(&call).steps[aero_step].op, Op::Generic);
+    }
+}
+
+/// The Phase 5 plan a call carries (R29 adds the lean one).
+fn v2(call: &apex_exec::call::ExecutorCall) -> &apex_exec::commitment::PlanV2 {
+    match call.plan() {
+        apex_exec::call::CallPlan::V2(p) => p,
+        other => panic!("not a Phase 5 plan: {other:?}"),
     }
 }

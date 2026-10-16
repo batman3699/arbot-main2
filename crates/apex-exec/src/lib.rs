@@ -38,9 +38,10 @@
 pub mod call;
 pub mod commitment;
 pub mod encode;
+pub mod lean;
 pub mod sign;
 
-pub use call::ExecutorCall;
+pub use call::{CallPlan, ExecutorCall};
 pub use commitment::{plan_commitment, Loan, LoanProvider, Op, PlanV2, Step, PLAN_VERSION_V2};
 pub use encode::{start_v2_calldata, EncodeError, PlanEncoder, START_V2_SELECTOR};
 pub use sign::{CommitmentMismatch, SignedPlan};

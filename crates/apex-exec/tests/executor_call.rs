@@ -50,7 +50,7 @@ fn a_call_is_the_encoding_of_the_plan_it_was_checked_against() {
     assert_eq!(call.commitment(), commitment);
     assert_eq!(call.data(), start_v2_calldata(&plan(), commitment).as_slice());
     assert_eq!(&call.data()[..4], &START_V2_SELECTOR);
-    assert_eq!(call.plan(), &plan());
+    assert_eq!(call.plan(), &apex_exec::call::CallPlan::V2(plan()));
 }
 
 /// The commitment in the calldata is the one the contract will recompute: it
