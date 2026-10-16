@@ -23,6 +23,11 @@ remappings = [
 # two agree by construction, which is the one thing a differential must not do.
 fs_permissions = [{ access = "read", path = "./crates/apex-exec/tests/fixtures" }]
 
+# Fork tests read Base over the network (Task 8.5 R29): never in the everyday
+# run or CI, only under `FOUNDRY_PROFILE=fork`, each top-level call its own
+# transaction so its gas is a transaction's.
+no_match_path = "test/fork/*"
+
 # Invariant runs are bounded for the everyday loop; `forge test --profile deep`
 # is what Task 5.6 Step 2's 100k-run bar uses. A suite nobody can run in a
 # minute is a suite that gets skipped, and a suite that only ever runs shallow
@@ -56,3 +61,8 @@ runs = 100000
 # result was reported as a Base check. Use `--rpc-url base`.
 [rpc_endpoints]
 base = "https://base.blockpi.network/v1/rpc/${BLOCKPI_KEY}"
+
+[profile.fork]
+match_path = "test/fork/*"
+no_match_path = "test/__none__/*"
+isolate = true

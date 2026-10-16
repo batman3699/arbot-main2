@@ -182,26 +182,8 @@ contract LeanExecutor {
         address tokenIn = WETH;
         for (uint256 i; i < hops; ++i) {
             (uint8 kind, address pool, address tokenOut, uint256 minOut) = LeanPlanCodec.hop(plan, i);
-            bool zeroForOne = tokenIn < tokenOut;
-            if (kind == 2) {
-                // Aerodrome v2: paid first, then asked for exactly the quote.
-                _transfer(tokenIn, pool, out);
-                if (zeroForOne) {
-                    IAeroPool(pool).swap(0, minOut, address(this), "");
-                } else {
-                    IAeroPool(pool).swap(minOut, 0, address(this), "");
-                }
-                out = minOut;
-            } else {
-                _tstore(T_POOL, uint160(pool));
-                _tstore(T_TOKEN_IN, uint160(tokenIn));
-                (int256 a0, int256 a1) =
-                    IV3Pool(pool).swap(address(this), zeroForOne, int256(out), zeroForOne ? MIN_LIMIT : MAX_LIMIT, "");
-                // The pool paid itself through its callback, or it was not paid.
-                if (_tload(T_POOL) != 0) revert UnexpectedCallback();
-                out = uint256(-(zeroForOne ? a1 : a0));
-                if (out < minOut) revert HopShort(i, out, minOut);
-            }
+            out = _hop(kind, pool, tokenIn, tokenOut, out, minOut);
+            if (out < minOut) revert HopShort(i, out, minOut);
             tokenIn = tokenOut;
         }
         owed = amount + fee;
@@ -210,6 +192,32 @@ contract LeanExecutor {
         uint256 gross = out - owed;
         _transfer(WETH, profitRecipient, gross);
         emit Profit(gross);
+    }
+
+    /// One swap of `amountIn` of `tokenIn` for `tokenOut` on `pool`: what it
+    /// returned. Aerodrome v2 is asked for exactly `minOut`.
+    function _hop(uint8 kind, address pool, address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut)
+        internal
+        returns (uint256 out)
+    {
+        bool zeroForOne = tokenIn < tokenOut;
+        if (kind == 2) {
+            // Aerodrome v2: paid first, then asked for exactly the quote.
+            _transfer(tokenIn, pool, amountIn);
+            if (zeroForOne) {
+                IAeroPool(pool).swap(0, minOut, address(this), "");
+            } else {
+                IAeroPool(pool).swap(minOut, 0, address(this), "");
+            }
+            return minOut;
+        }
+        _tstore(T_POOL, uint160(pool));
+        _tstore(T_TOKEN_IN, uint160(tokenIn));
+        (int256 a0, int256 a1) =
+            IV3Pool(pool).swap(address(this), zeroForOne, int256(amountIn), zeroForOne ? MIN_LIMIT : MAX_LIMIT, "");
+        // The pool paid itself through its callback, or it was not paid.
+        if (_tload(T_POOL) != 0) revert UnexpectedCallback();
+        out = uint256(-(zeroForOne ? a1 : a0));
     }
 
     /// Pay the pool being swapped with, and only it, once.
