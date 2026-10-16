@@ -1,9 +1,27 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {BadPlan, LeanPlanCodec} from "./LeanPlanCodec.sol";
+
 interface IERC20Min {
     function approve(address spender, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
+}
+
+/// Uniswap v3, both Slipstream factories and PancakeSwap v3 share it.
+interface IV3Pool {
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data)
+        external
+        returns (int256 amount0, int256 amount1);
+}
+
+interface IAeroPool {
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+interface IBalancerVault {
+    function flashLoan(address recipient, address[] memory tokens, uint256[] memory amounts, bytes memory userData)
+        external;
 }
 
 /// The lean executor (Task 8.5 R29): a WETH flash loan, pools called directly
@@ -18,14 +36,38 @@ contract LeanExecutor {
     address public constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
     address public constant MORPHO_BLUE = 0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb;
 
+    /// No price limit: the hop minimum is the bound (`MIN_SQRT_RATIO + 1`,
+    /// `MAX_SQRT_RATIO - 1`, as the routers pass for none).
+    uint160 private constant MIN_LIMIT = 4295128740;
+    uint160 private constant MAX_LIMIT = 1461446703485210103287273052203988822378723970341;
+
+    /// Transient slots (EIP-1153): live only inside one transaction.
+    /// The loan `run` started and its lender has not yet called back.
+    uint256 private constant T_LOAN = 0;
+    /// The pool being swapped with, until its callback pays it.
+    uint256 private constant T_POOL = 1;
+    /// What that pool is paid in.
+    uint256 private constant T_TOKEN_IN = 2;
+
     address public owner;
     mapping(address => bool) public executors;
     /// Read with the circuit on every trade: one slot, one cold read.
     address public profitRecipient;
     bool private circuitOpen;
 
+    /// The gross profit of a trade, paid to `profitRecipient`.
+    event Profit(uint256 gross);
+
     error NotOwner();
     error ZeroAddress();
+    error NotTrader();
+    error CircuitOpen();
+    error Expired(uint256 deadline, uint256 timestamp);
+    /// A lender or swap callback this executor did not ask for.
+    error UnexpectedCallback();
+    error HopShort(uint256 hop, uint256 out, uint256 minOut);
+    error Floor(uint256 out, uint256 required);
+    error TransferFailed();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -70,6 +112,113 @@ contract LeanExecutor {
     }
 
     function sweep(address token, address to, uint256 amount) external onlyOwner {
-        IERC20Min(token).transfer(to, amount);
+        _transfer(token, to, amount);
+    }
+
+    /// One trade. The checks the operator kept, cheapest first and all before
+    /// the loan, so a stale plan costs little: the trader, the circuit, the
+    /// plan's shape, its deadline.
+    function run(bytes calldata plan) external {
+        if (!executors[msg.sender]) revert NotTrader();
+        if (circuitOpen) revert CircuitOpen();
+        (uint8 lender, uint256 amount, uint256 deadline,, uint256 hops) = LeanPlanCodec.header(plan);
+        if (block.timestamp > deadline) revert Expired(deadline, block.timestamp);
+        if (lender > 0) revert BadPlan();
+        address last;
+        for (uint256 i; i < hops; ++i) {
+            (uint8 kind,, address tokenOut,) = LeanPlanCodec.hop(plan, i);
+            if (kind > 2) revert BadPlan();
+            last = tokenOut;
+        }
+        if (last != WETH) revert BadPlan();
+
+        _tstore(T_LOAN, 1);
+        address[] memory tokens = new address[](1);
+        tokens[0] = WETH;
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = amount;
+        IBalancerVault(BALANCER_VAULT).flashLoan(address(this), tokens, amounts, plan);
+        _tstore(T_LOAN, 0);
+    }
+
+    /// Balancer V2's flash loan callback. Anyone can ask the vault for a loan
+    /// naming this contract, so only the loan `run` started is served.
+    function receiveFlashLoan(address[] calldata, uint256[] calldata, uint256[] calldata fees, bytes calldata plan)
+        external
+    {
+        if (msg.sender != BALANCER_VAULT || _tload(T_LOAN) == 0) revert UnexpectedCallback();
+        _tstore(T_LOAN, 0);
+        _transfer(WETH, BALANCER_VAULT, _trade(plan, fees[0]));
+    }
+
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        _pay(amount0Delta, amount1Delta);
+    }
+
+    function pancakeV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        _pay(amount0Delta, amount1Delta);
+    }
+
+    /// The hops, then the floor and the profit. Returns what the lender is owed.
+    function _trade(bytes calldata plan, uint256 fee) private returns (uint256 owed) {
+        (, uint256 amount,, uint256 minProfit, uint256 hops) = LeanPlanCodec.header(plan);
+        uint256 out = amount;
+        address tokenIn = WETH;
+        for (uint256 i; i < hops; ++i) {
+            (uint8 kind, address pool, address tokenOut, uint256 minOut) = LeanPlanCodec.hop(plan, i);
+            bool zeroForOne = tokenIn < tokenOut;
+            if (kind == 2) {
+                // Aerodrome v2: paid first, then asked for exactly the quote.
+                _transfer(tokenIn, pool, out);
+                if (zeroForOne) {
+                    IAeroPool(pool).swap(0, minOut, address(this), "");
+                } else {
+                    IAeroPool(pool).swap(minOut, 0, address(this), "");
+                }
+                out = minOut;
+            } else {
+                _tstore(T_POOL, uint160(pool));
+                _tstore(T_TOKEN_IN, uint160(tokenIn));
+                (int256 a0, int256 a1) =
+                    IV3Pool(pool).swap(address(this), zeroForOne, int256(out), zeroForOne ? MIN_LIMIT : MAX_LIMIT, "");
+                // The pool paid itself through its callback, or it was not paid.
+                if (_tload(T_POOL) != 0) revert UnexpectedCallback();
+                out = uint256(-(zeroForOne ? a1 : a0));
+                if (out < minOut) revert HopShort(i, out, minOut);
+            }
+            tokenIn = tokenOut;
+        }
+        owed = amount + fee;
+        uint256 required = owed + minProfit;
+        if (out < required) revert Floor(out, required);
+        uint256 gross = out - owed;
+        _transfer(WETH, profitRecipient, gross);
+        emit Profit(gross);
+    }
+
+    /// Pay the pool being swapped with, and only it, once.
+    function _pay(int256 amount0Delta, int256 amount1Delta) private {
+        if (msg.sender != address(uint160(_tload(T_POOL)))) revert UnexpectedCallback();
+        _tstore(T_POOL, 0);
+        _transfer(address(uint160(_tload(T_TOKEN_IN))), msg.sender, uint256(amount0Delta > 0 ? amount0Delta : amount1Delta));
+    }
+
+    /// A transfer that tolerates tokens returning nothing, and refuses one
+    /// returning false.
+    function _transfer(address token, address to, uint256 amount) private {
+        (bool ok, bytes memory data) = token.call(abi.encodeWithSelector(IERC20Min.transfer.selector, to, amount));
+        if (!ok || (data.length != 0 && !abi.decode(data, (bool)))) revert TransferFailed();
+    }
+
+    function _tstore(uint256 slot, uint256 value) private {
+        assembly {
+            tstore(slot, value)
+        }
+    }
+
+    function _tload(uint256 slot) private view returns (uint256 value) {
+        assembly {
+            value := tload(slot)
+        }
     }
 }
