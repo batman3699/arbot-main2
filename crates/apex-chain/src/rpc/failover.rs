@@ -7,7 +7,9 @@ use super::{endpoint_label, is_read, parse_quantity, RpcError, RpcTransport};
 use apex_config::Secret;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{error, warn};
 
@@ -86,6 +88,46 @@ struct Endpoint {
     label: String,
     chain: AtomicU8,
     failures: AtomicU64,
+    /// R28.1: what it was asked, by method.
+    usage: Mutex<BTreeMap<String, Usage>>,
+}
+
+impl Endpoint {
+    fn record(&self, method: &str, sent: usize, received: usize, fault: bool) {
+        let mut usage = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        let u = usage.entry(method.to_string()).or_default();
+        u.attempts += 1;
+        u.faults += u64::from(fault);
+        u.bytes_out += sent as u64;
+        u.bytes_in += received as u64;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Usage {
+    attempts: u64,
+    faults: u64,
+    bytes_out: u64,
+    bytes_in: u64,
+}
+
+/// What one endpoint was asked by one method since the transport was built
+/// (R28.1): the traffic a provider bills, by what it was for.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MethodUsage {
+    /// The endpoint's label: safe to log.
+    pub endpoint: String,
+    pub method: String,
+    /// HTTP requests, every one: unlike [`FailoverTransport::requests`], a call
+    /// that took two endpoints counts at each.
+    pub attempts: u64,
+    /// Of those, the endpoint's faults: no answer, an error status, not
+    /// JSON-RPC. A revert is an answer.
+    pub faults: u64,
+    /// Request bodies, in bytes.
+    pub bytes_out: u64,
+    /// Response bodies, in bytes.
+    pub bytes_in: u64,
 }
 
 /// What one attempt against one endpoint produced.
@@ -159,6 +201,7 @@ impl FailoverTransport {
                 label,
                 chain: AtomicU8::new(UNVERIFIED),
                 failures: AtomicU64::new(0),
+                usage: Mutex::new(BTreeMap::new()),
             });
         }
         if endpoints.is_empty() {
@@ -234,6 +277,27 @@ impl FailoverTransport {
         self.requests.load(Ordering::Relaxed)
     }
 
+    /// Every endpoint's traffic, by method (R28.1).
+    pub fn usage(&self) -> Vec<MethodUsage> {
+        self.endpoints
+            .iter()
+            .flat_map(|e| {
+                let usage = e.usage.lock().unwrap_or_else(|p| p.into_inner());
+                usage
+                    .iter()
+                    .map(|(method, u)| MethodUsage {
+                        endpoint: e.label.clone(),
+                        method: method.clone(),
+                        attempts: u.attempts,
+                        faults: u.faults,
+                        bytes_out: u.bytes_out,
+                        bytes_in: u.bytes_in,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Failures since each endpoint last answered, by label.
     pub fn failures(&self) -> Vec<(String, u64)> {
         self.endpoints
@@ -262,15 +326,27 @@ impl FailoverTransport {
         }
     }
 
-    /// One request to one endpoint, classified.
+    /// One request to one endpoint, classified, and counted against it.
     async fn attempt(&self, ep: &Endpoint, method: &str, params: Value) -> Attempt {
+        let (mut sent, mut received) = (0, 0);
+        let outcome = self.exchange(ep, method, params, &mut sent, &mut received).await;
+        ep.record(method, sent, received, matches!(outcome, Attempt::Fault(_)));
+        outcome
+    }
+
+    async fn exchange(&self, ep: &Endpoint, method: &str, params: Value, sent: &mut usize, received: &mut usize) -> Attempt {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let body = match serde_json::to_vec(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })) {
+            Ok(b) => b,
+            Err(e) => return Attempt::Fault(format!("the request did not serialize: {e}")),
+        };
+        *sent = body.len();
         let response = match self
             .client
             .post(ep.url.expose().as_str())
             .timeout(self.settings.request_timeout)
-            .json(&body)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
             .send()
             .await
         {
@@ -283,9 +359,14 @@ impl FailoverTransport {
         if !status.is_success() {
             return Attempt::Fault(format!("http {status}"));
         }
-        let answer: Value = match response.json().await {
-            Ok(v) => v,
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
             Err(e) => return Attempt::Fault(format!("not JSON-RPC: {}", e.without_url())),
+        };
+        *received = bytes.len();
+        let answer: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => return Attempt::Fault(format!("not JSON-RPC: {e}")),
         };
         classify(&answer, id)
     }

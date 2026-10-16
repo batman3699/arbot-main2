@@ -8,9 +8,10 @@
 //! | a burst's swaps, each newer than its pool's last log | post-swap states applied exactly, **in one write** | one `PendingSwap` on the fast lane, naming every pool they moved |
 //! | `Swap`, not newer | nothing — it is the confirmed copy of a preconfirmed swap already applied | nothing |
 //! | `Swap` that leaves the ladder | applied, pool reloaded | that pool left out until reloaded: it cannot be priced |
-//! | `Mint` / `Burn` | pool reloaded — a range's liquidity changed | nothing |
+//! | `Mint` / `Burn` (R28.1) | held with the burst; the position applied to the ladder, and to active liquidity unless a later swap already counts it, in the burst's one write | nothing — no price moved |
+//! | `Mint` / `Burn` the book cannot apply exactly | pool reloaded | nothing |
 //! | `Sync` (Aerodrome v2, R24) | held with the burst; its reserves replace the pool's in the burst's one write | in the burst's event, sized by its reserve change |
-//! | a removed log (reorg) | pool reloaded — what was applied may not have happened | nothing |
+//! | a removed log (reorg) | pool reloaded — what was applied may not have happened; a position change is retracted, the pool flagged until a read at or after it | nothing |
 //! | `Reconnected` / `Gap` | what is held applied, whole book `Rebuilding`, then reloaded | nothing — state is unknown until rebuilt |
 //! | `Head` | the latest sealed block, for the next fingerprint | nothing |
 //!
@@ -44,7 +45,7 @@
 //! both feeds: the book refuses the second copy as not newer, and the event both
 //! would produce has one `Ordinal`, which the plane's redelivery check catches.
 
-use crate::live::book::{PoolBook, PoolSnapshot, StateWrite, SwapApplied, SwapWrite, SyncWrite};
+use crate::live::book::{LiquidityWrite, PoolBook, PoolSnapshot, StateWrite, SwapApplied, SwapWrite, SyncWrite};
 use crate::live::abi;
 use crate::live::inventory::Venue;
 use crate::live::sim::BlockContext;
@@ -176,12 +177,54 @@ pub fn decode_sync(l: &RawLog) -> Option<SyncLog> {
     })
 }
 
-/// A log the feed holds until its burst is over: a swap's post-swap price, or
-/// a volatile pool's reserves.
+/// One decoded `Mint` or `Burn` (R28.1): `delta` liquidity over
+/// `[tick_lower, tick_upper)`, negative for a burn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiquidityLog {
+    pub pool: Address,
+    pub tick_lower: i32,
+    pub tick_upper: i32,
+    pub delta: i128,
+    pub block: u64,
+    pub log_index: u64,
+    pub tx: B256,
+    pub pending: bool,
+}
+
+/// `None` for anything that is not a well-formed concentrated-liquidity `Mint`
+/// or `Burn` with a position. Uniswap v3, PancakeSwap v3 and Slipstream share
+/// both: owner and the two ticks indexed; a mint's liquidity is its second word
+/// of data (after the sender), a burn's its first.
+pub fn decode_liquidity(l: &RawLog) -> Option<LiquidityLog> {
+    let (words, at, sign) = match l.topics.first() {
+        Some(t) if *t == MINT => (4, 1, 1),
+        Some(t) if *t == BURN => (3, 0, -1),
+        _ => return None,
+    };
+    if l.topics.len() != 4 || l.data.len() != words * 32 {
+        return None;
+    }
+    let tick = |t: &B256| abi::word_int(t.as_slice(), 0, 24).and_then(|v| i32::try_from(v).ok());
+    let amount = i128::try_from(abi::word_uint(&l.data, at, 128)?).ok()?;
+    Some(LiquidityLog {
+        pool: l.address,
+        tick_lower: tick(&l.topics[2])?,
+        tick_upper: tick(&l.topics[3])?,
+        delta: sign * amount,
+        block: l.block_number?,
+        log_index: l.log_index?,
+        tx: l.transaction_hash?,
+        pending: l.pending,
+    })
+}
+
+/// A log the feed holds until its burst is over: a swap's post-swap price, a
+/// volatile pool's reserves, or a position change.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Held {
     Swap(SwapLog),
     Sync(SyncLog),
+    Liquidity(LiquidityLog),
 }
 
 impl Held {
@@ -189,6 +232,7 @@ impl Held {
         match self {
             Self::Swap(s) => s.pool,
             Self::Sync(s) => s.pool,
+            Self::Liquidity(s) => s.pool,
         }
     }
 
@@ -196,6 +240,7 @@ impl Held {
         match self {
             Self::Swap(s) => s.block,
             Self::Sync(s) => s.block,
+            Self::Liquidity(s) => s.block,
         }
     }
 
@@ -203,6 +248,7 @@ impl Held {
         match self {
             Self::Swap(s) => s.log_index,
             Self::Sync(s) => s.log_index,
+            Self::Liquidity(s) => s.log_index,
         }
     }
 
@@ -210,6 +256,7 @@ impl Held {
         match self {
             Self::Swap(s) => s.tx,
             Self::Sync(s) => s.tx,
+            Self::Liquidity(s) => s.tx,
         }
     }
 
@@ -217,6 +264,7 @@ impl Held {
         match self {
             Self::Swap(s) => s.pending,
             Self::Sync(s) => s.pending,
+            Self::Liquidity(s) => s.pending,
         }
     }
 
@@ -233,6 +281,13 @@ impl Held {
                 pool: s.pool,
                 reserve0: s.reserve0,
                 reserve1: s.reserve1,
+                at: (s.block, s.log_index),
+            }),
+            Self::Liquidity(s) => StateWrite::Liquidity(LiquidityWrite {
+                pool: s.pool,
+                tick_lower: s.tick_lower,
+                tick_upper: s.tick_upper,
+                delta: s.delta,
                 at: (s.block, s.log_index),
             }),
         }
@@ -388,9 +443,23 @@ impl FeedHandler {
             // Not the capture feed's: flashblocks are sampled on a connection of
             // their own, for the capacity model (R5). One here changes no pool.
             Notification::Flashblock(_) => Vec::new(),
-            Notification::Log(l) if l.removed => vec![Effect::Reload(vec![l.address])],
+            Notification::Log(l) if l.removed => {
+                // R28.1: a position change applied in place is taken back too,
+                // or a read from before it would have it carried on again.
+                if let Some(p) = decode_liquidity(&l) {
+                    book.retract_position(p.pool, (p.block, p.log_index));
+                }
+                vec![Effect::Reload(vec![l.address])]
+            }
             Notification::Log(l) => match l.topics.first() {
-                Some(t) if *t == MINT || *t == BURN => vec![Effect::Reload(vec![l.address])],
+                // R28.1: applied in place with the burst. A burn of nothing (a
+                // fee poke) changes nothing; one that does not decode is still a
+                // change, and reloads the pool.
+                Some(t) if *t == MINT || *t == BURN => match decode_liquidity(&l) {
+                    Some(p) if p.delta == 0 => Vec::new(),
+                    Some(p) => self.hold(book, Held::Liquidity(p), now),
+                    None => vec![Effect::Reload(vec![l.address])],
+                },
                 Some(t) if *t == SWAP || *t == PANCAKE_SWAP => match decode_swap(&l) {
                     Some(s) => self.hold(book, Held::Swap(s), now),
                     None => Vec::new(),
@@ -454,7 +523,13 @@ impl FeedHandler {
         let mut last: BTreeMap<Address, SwapApplied> = BTreeMap::new();
         let mut reload: Vec<Address> = Vec::new();
         for ((s, _), r) in held.iter().zip(&results) {
-            if matches!(r, SwapApplied::Updated | SwapApplied::NeedsReload) {
+            // A position change moves no price: it can take a pool out of the
+            // event, never bring one back.
+            let priced = match s {
+                Held::Liquidity(_) => *r == SwapApplied::NeedsReload,
+                Held::Swap(_) | Held::Sync(_) => matches!(r, SwapApplied::Updated | SwapApplied::NeedsReload),
+            };
+            if priced {
                 last.insert(s.pool(), *r);
             }
             if *r == SwapApplied::NeedsReload {
@@ -483,7 +558,7 @@ impl FeedHandler {
                     }
                     prev.and_then(|b| reserve_change_usd(b, now, (p.spec.token0, p.spec.token1), p.decimals, &prices))
                 }
-                _ => None,
+                (Held::Liquidity(_), _) | (_, None) => None,
             });
         }
 
@@ -492,7 +567,8 @@ impl FeedHandler {
             .zip(&results)
             .zip(&sized)
             .filter(|(((s, _), r), _)| {
-                matches!(r, SwapApplied::Updated | SwapApplied::NeedsReload)
+                !matches!(s, Held::Liquidity(_))
+                    && matches!(r, SwapApplied::Updated | SwapApplied::NeedsReload)
                     && last.get(&s.pool()) == Some(&SwapApplied::Updated)
             })
             .map(|(((s, _), _), n)| (s, *n))

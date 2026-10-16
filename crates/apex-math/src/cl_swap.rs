@@ -18,6 +18,30 @@ pub enum LadderStep {
     Exhausted,
 }
 
+/// Why a position change could not be applied to a ladder (R28.1): each means
+/// the ladder is not the chain's, and only a read can say what is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PositionUnknown {
+    /// A burn on a tick, inside the proven range, the ladder does not hold.
+    NotHeld(i32),
+    /// The net at this tick would overflow.
+    Overflow(i32),
+    /// No position v3-core would log: ticks out of order, a burn beyond a
+    /// tick's gross, or one that empties gross and leaves a net.
+    Inconsistent(i32),
+}
+
+/// A position change applied to a ladder (R28.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PositionApplied {
+    pub ladder: TickLadder,
+    /// On a ladder without gross, the first tick a burn left at a zero net. It is
+    /// kept, though it may no longer be initialized: the ladder is exact only
+    /// once read again. A stale zero-net tick under-states a quote by a unit,
+    /// where a missing initialized one over-states it (R11).
+    pub unconfirmed: Option<i32>,
+}
+
 /// A materialised, sorted view of a pool's initialized ticks over a bounded
 /// range, plus the bounds over which that view is known complete.
 ///
@@ -26,10 +50,14 @@ pub enum LadderStep {
 /// liquidity — exactly the constant-liquidity error in
 /// `quote_exact_input_single_tick`. Recording where knowledge stops turns that
 /// into a reported `Exhausted` and a caller-side fallback.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TickLadder {
     /// `(tick, liquidity_net)` sorted ascending by tick, deduplicated.
     ticks: Vec<(i32, i128)>,
+    /// Each tick's `liquidityGross`, aligned with `ticks`, when the ladder was
+    /// read with it (R28.1): what tells a burn that empties a tick from one
+    /// that leaves it initialized at a zero net.
+    gross: Option<Vec<u128>>,
     lower_bound: i32,
     upper_bound: i32,
 }
@@ -43,6 +71,21 @@ impl TickLadder {
         ticks.dedup_by_key(|(t, _)| *t);
         Self {
             ticks,
+            gross: None,
+            lower_bound: lower_bound.max(MIN_TICK),
+            upper_bound: upper_bound.min(MAX_TICK),
+        }
+    }
+
+    /// A ladder read with each tick's gross: `(tick, liquidity_gross,
+    /// liquidity_net)`, the order `ticks(int24)` returns them in. Sorted and
+    /// deduplicated as [`Self::new`] does.
+    pub fn with_gross(mut ticks: Vec<(i32, u128, i128)>, lower_bound: i32, upper_bound: i32) -> Self {
+        ticks.sort_unstable_by_key(|(t, _, _)| *t);
+        ticks.dedup_by_key(|(t, _, _)| *t);
+        Self {
+            gross: Some(ticks.iter().map(|(_, g, _)| *g).collect()),
+            ticks: ticks.into_iter().map(|(t, _, n)| (t, n)).collect(),
             lower_bound: lower_bound.max(MIN_TICK),
             upper_bound: upper_bound.min(MAX_TICK),
         }
@@ -55,6 +98,12 @@ impl TickLadder {
     /// and a caller cannot know that without being told which ones they were.
     pub fn ticks(&self) -> &[(i32, i128)] {
         &self.ticks
+    }
+
+    /// Each tick's gross, aligned with [`Self::ticks`], if the ladder was read
+    /// with it.
+    pub fn gross(&self) -> Option<&[u128]> {
+        self.gross.as_deref()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -76,6 +125,66 @@ impl TickLadder {
     /// Whether `tick` falls inside the range this ladder proved complete.
     pub fn covers(&self, tick: i32) -> bool {
         tick >= self.lower_bound && tick <= self.upper_bound
+    }
+
+    /// A `Mint` (`delta > 0`) or `Burn` (`delta < 0`) of `delta` liquidity over
+    /// `[tick_lower, tick_upper)`, applied in place (R28.1), as v3-core's
+    /// `Tick.update` does: gross moves by `delta` at both ticks, net rises by it
+    /// at the lower and falls by it at the upper, and a tick whose gross reaches
+    /// zero is no longer initialized. A tick outside the proven range is not
+    /// this ladder's to change and is skipped. The position applies whole or
+    /// not at all.
+    ///
+    /// Net and gross only add, so changes apply in any order: a log that
+    /// arrives late is as exact as one that arrives first.
+    pub fn apply_position(&self, tick_lower: i32, tick_upper: i32, delta: i128) -> Result<PositionApplied, PositionUnknown> {
+        if tick_lower >= tick_upper {
+            return Err(PositionUnknown::Inconsistent(tick_lower));
+        }
+        let mut ticks = self.ticks.clone();
+        let mut gross = self.gross.clone();
+        let mut unconfirmed = None;
+        let upper_change = delta.checked_neg().ok_or(PositionUnknown::Overflow(tick_upper))?;
+        for (tick, change) in [(tick_lower, delta), (tick_upper, upper_change)] {
+            if delta == 0 || !self.covers(tick) {
+                continue;
+            }
+            match ticks.binary_search_by_key(&tick, |(t, _)| *t) {
+                Ok(i) => {
+                    let net = ticks[i].1.checked_add(change).ok_or(PositionUnknown::Overflow(tick))?;
+                    match gross.as_mut() {
+                        Some(g) => {
+                            let after = g[i].checked_add_signed(delta).ok_or(PositionUnknown::Inconsistent(tick))?;
+                            if after == 0 {
+                                if net != 0 {
+                                    return Err(PositionUnknown::Inconsistent(tick));
+                                }
+                                ticks.remove(i);
+                                g.remove(i);
+                            } else {
+                                ticks[i].1 = net;
+                                g[i] = after;
+                            }
+                        }
+                        None => {
+                            if delta < 0 && net == 0 {
+                                unconfirmed = unconfirmed.or(Some(tick));
+                            }
+                            ticks[i].1 = net;
+                        }
+                    }
+                }
+                Err(_) if delta < 0 => return Err(PositionUnknown::NotHeld(tick)),
+                Err(i) => {
+                    ticks.insert(i, (tick, change));
+                    if let Some(g) = gross.as_mut() {
+                        g.insert(i, delta.unsigned_abs());
+                    }
+                }
+            }
+        }
+        let ladder = Self { ticks, gross, lower_bound: self.lower_bound, upper_bound: self.upper_bound };
+        Ok(PositionApplied { ladder, unconfirmed })
     }
 
     /// Next initialized tick in the direction of travel.

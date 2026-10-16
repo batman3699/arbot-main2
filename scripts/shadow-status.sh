@@ -102,6 +102,8 @@ else:
     print(f"  book        {b['status']}, {b['held']}/{b['universe']} pools held, {b['admitted']} admitted, {s['resident']} cycles")
     print(f"  venues      {venues}")
     print(f"  reloads     {rl['full']} full, {rl['partial']} partial, {rl['failed']} failed; pools refused {rl['pools_refused']}, removed {rl['pools_removed']}")
+    if "positions_in_place" in rl:  # R28.1: absent from a report before it
+        print(f"  positions   {rl['positions_in_place']} mints/burns applied in place, {rl['positions_read_again']} read again")
     print(f"  reads       view {rf['view']}, twap {rf['twap']}, l1 {rf['l1']}, fees {rf.get('fees', 0)} failures")
     fb, ra, sg = r.get("flashblocks", {}), r.get("race", {}), r.get("signer", {})
     if fb:  # R25: absent from a report before the race ledger
@@ -137,6 +139,15 @@ else:
               + (f"  -- HALTED: {cn['halted']}" if cn.get("halted") else "")
               + ("  -- STOP FILE" if cn.get("stop_file") else ""))
     print(f"  feed        {fd['sessions']} sessions ({max(fd['sessions'] - 1, 0)} reconnects), {fd['dropped']} dropped, lossless {fd['fast_lane_lossless']}")
+    rpc = r.get("rpc")
+    if rpc:  # R28.1: absent from a report before it
+        hours = max(r.get("uptime_s", 0), 1) / 3600
+        mb = lambda b: b / 1e6
+        total = sum(u["bytes_in"] + u["bytes_out"] for u in rpc)
+        print(f"  http        {mb(total):,.1f} MB since boot, {mb(total) / hours:,.1f} MB/h; by method, most received first:")
+        for u in rpc[:8]:
+            print(f"    {u['method']:<26} {u['attempts'] / hours:>9,.0f}/h  in {mb(u['bytes_in']) / hours:>8,.1f} MB/h  "
+                  f"out {mb(u['bytes_out']) / hours:>7,.1f} MB/h  faults {u['faults']:,}  {u['endpoint']}")
     q = r.get("queue")
     if q:  # R21: absent from a report before the queue
         print(f"  queue       {q['stale']} dropped as stale, {q['conflicts']} as conflicts, deepest {q['max_depth']}")

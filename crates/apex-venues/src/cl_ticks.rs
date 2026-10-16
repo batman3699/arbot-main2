@@ -66,6 +66,19 @@ pub trait TickDataSource: Send + Sync {
         ticks: &[i32],
         block: U64,
     ) -> Result<Vec<Option<i128>>>;
+
+    /// `ticks(tick)`'s `liquidityGross` and `liquidityNet` together, for each
+    /// requested tick, in order (R28.1). `None` from a source that reads net
+    /// alone: the ladder is built without gross, and a burn that leaves a tick
+    /// at a zero net cannot then be applied to it exactly.
+    async fn tick_liquidity(
+        &self,
+        _pool: Address,
+        _ticks: &[i32],
+        _block: U64,
+    ) -> Result<Option<Vec<Option<(u128, i128)>>>> {
+        Ok(None)
+    }
 }
 
 /// In-memory source seeded with a fixed tick table.
@@ -230,6 +243,30 @@ pub async fn build_ladder<S: TickDataSource + ?Sized>(
     let upper_bound = ((highest_word * 256 + 255) * spacing_i64)
         .clamp(i64::from(MIN_TICK), i64::from(MAX_TICK)) as i32;
 
+    // Gross with net, from a source that reads it (R28.1): what lets a burn be
+    // applied to the ladder exactly. Asked even with no ticks, so an empty
+    // ladder from such a source has gross too.
+    if let Some(both) = source.tick_liquidity(pool, &candidate_ticks, block).await? {
+        if both.len() != candidate_ticks.len() {
+            return Err(anyhow!(
+                "pool 0x{}: {} ticks answered for {} asked",
+                hex::encode(pool),
+                both.len(),
+                candidate_ticks.len()
+            ));
+        }
+        let ticks = candidate_ticks
+            .into_iter()
+            .zip(both)
+            .map(|(tick, b)| {
+                b.map(|(gross, net)| (tick, gross, net)).ok_or_else(|| {
+                    anyhow!("pool 0x{}: ticks({tick}) did not read", hex::encode(pool))
+                })
+            })
+            .collect::<Result<Vec<(i32, u128, i128)>>>()?;
+        return Ok(TickLadder::with_gross(ticks, lower_bound, upper_bound));
+    }
+
     if candidate_ticks.is_empty() {
         return Ok(TickLadder::new(Vec::new(), lower_bound, upper_bound));
     }
@@ -391,6 +428,20 @@ pub fn decode_liquidity_net(data: &[u8]) -> Option<i128> {
     let mut buf = [0u8; 16];
     buf.copy_from_slice(&word[16..32]);
     Some(i128::from_be_bytes(buf))
+}
+
+/// Decode `ticks()`'s first two fields, `liquidityGross` and `liquidityNet`
+/// (R28.1). Gross is a `uint128`, so a word with any of its high 16 bytes set is
+/// refused; net is read as [`decode_liquidity_net`] reads it.
+pub fn decode_tick_liquidity(data: &[u8]) -> Option<(u128, i128)> {
+    let net = decode_liquidity_net(data)?;
+    let word = &data[0..32];
+    if word[..16].iter().any(|b| *b != 0) {
+        return None;
+    }
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(&word[16..32]);
+    Some((u128::from_be_bytes(buf), net))
 }
 
 /// Tick data read from chain via Multicall3.
@@ -742,6 +793,88 @@ mod tests {
             let got = build_ladder(&src, Address::zero(), &state, U64::zero(), 1).await;
             assert!(got.is_err(), "{what} was built into a ladder: {:?}", got.map(|l| l.ticks().to_vec()));
         }
+    }
+
+    /// A source that also reads each tick's gross (R28.1): here, net's size plus
+    /// one, so a gross can never be mistaken for a net.
+    struct Gross {
+        inner: StaticTickSource,
+        hole: Option<i32>,
+        short: bool,
+    }
+
+    #[async_trait]
+    impl TickDataSource for Gross {
+        async fn tick_words(&self, pool: Address, words: &[i16], block: U64) -> Result<Vec<Option<U256>>> {
+            self.inner.tick_words(pool, words, block).await
+        }
+        async fn liquidity_net(&self, _: Address, _: &[i32], _: U64) -> Result<Vec<Option<i128>>> {
+            panic!("a source that reads gross is asked for it, not for net alone")
+        }
+        async fn tick_liquidity(&self, pool: Address, ticks: &[i32], block: U64) -> Result<Option<Vec<Option<(u128, i128)>>>> {
+            let nets = self.inner.liquidity_net(pool, ticks, block).await?;
+            let mut out: Vec<_> = ticks
+                .iter()
+                .zip(nets)
+                .map(|(t, n)| n.filter(|_| Some(*t) != self.hole).map(|n| (n.unsigned_abs() + 1, n)))
+                .collect();
+            if self.short {
+                out.pop();
+            }
+            Ok(Some(out))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_that_reads_gross_builds_a_ladder_with_it() {
+        let inner = StaticTickSource::new(Address::zero(), vec![(-120, 500), (60, -200), (120, -300)], 60);
+        let ladder = build_ladder(&Gross { inner, hole: None, short: false }, Address::zero(), &state_at_tick_zero(), U64::zero(), 1)
+            .await
+            .unwrap();
+        assert_eq!(ladder.ticks(), &[(-120, 500), (60, -200), (120, -300)]);
+        assert_eq!(ladder.gross(), Some(&[501u128, 201, 301][..]));
+    }
+
+    /// A tick whose gross did not read refuses the ladder, as one whose net did
+    /// not read does.
+    #[tokio::test]
+    async fn a_tick_whose_gross_did_not_read_refuses_the_ladder() {
+        let inner = StaticTickSource::new(Address::zero(), vec![(-120, 500), (60, -200), (120, -300)], 60);
+        let src = Gross { inner, hole: Some(60), short: false };
+        assert!(build_ladder(&src, Address::zero(), &state_at_tick_zero(), U64::zero(), 1).await.is_err());
+    }
+
+    /// An answer shorter than the question, likewise.
+    #[tokio::test]
+    async fn a_short_gross_answer_refuses_the_ladder() {
+        let inner = StaticTickSource::new(Address::zero(), vec![(-120, 500), (60, -200), (120, -300)], 60);
+        let src = Gross { inner, hole: None, short: true };
+        assert!(build_ladder(&src, Address::zero(), &state_at_tick_zero(), U64::zero(), 1).await.is_err());
+    }
+
+    /// An empty ladder from such a source still has gross: the first mint into
+    /// it starts a gross a later burn can be applied against exactly.
+    #[tokio::test]
+    async fn an_empty_ladder_read_with_gross_has_gross() {
+        let inner = StaticTickSource::new(Address::zero(), Vec::new(), 60);
+        let ladder = build_ladder(&Gross { inner, hole: None, short: false }, Address::zero(), &state_at_tick_zero(), U64::zero(), 1)
+            .await
+            .unwrap();
+        assert_eq!(ladder.gross(), Some(&[][..]));
+    }
+
+    /// `ticks()`'s first two words: gross unsigned, net signed. A gross wider
+    /// than 128 bits is not a `uint128` and is refused.
+    #[test]
+    fn tick_liquidity_decodes_gross_and_net() {
+        let mut data = vec![0u8; 256];
+        data[31] = 9;
+        data[32..64].copy_from_slice(&[0xff; 32]);
+        data[63] = 0xf9; // -7
+        assert_eq!(decode_tick_liquidity(&data), Some((9, -7)));
+        assert_eq!(decode_tick_liquidity(&data[..63]), None, "short");
+        data[15] = 1;
+        assert_eq!(decode_tick_liquidity(&data), None, "gross above 128 bits");
     }
 
     #[tokio::test]

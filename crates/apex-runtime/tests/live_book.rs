@@ -8,8 +8,11 @@
 
 use alloy_primitives::{address, hex, keccak256, Address, U256};
 use apex_chain::rpc::{RpcError, RpcTransport};
+use apex_math::cl_swap::TickLadder;
 use apex_runtime::live::abi::{self, selector, MULTICALL3};
-use apex_runtime::live::book::{DynamicFee, PoolBook, ReloadError, StateWrite, SwapApplied, SwapWrite, SyncWrite, Unloadable};
+use apex_runtime::live::book::{
+    DynamicFee, LiquidityWrite, PoolBook, PoolSnapshot, ReloadError, StateWrite, SwapApplied, SwapWrite, SyncWrite, Unloadable,
+};
 use apex_runtime::live::cp::Reserves;
 use apex_runtime::live::inventory::{self, PoolSpec, UniverseFilter, Venue};
 use apex_runtime::live::reads::ChainReads;
@@ -337,7 +340,9 @@ fn healthy_at(node: &Scripted, p: Address, factory: Address) {
         node.set(p, abi::call_signed(selector::TICK_BITMAP, wp), w(bits));
     }
     for t in [-197_350i64, -197_340] {
-        let mut ticks = w(U256::from(1_000u64)); // liquidityGross
+        // liquidityGross: one position spans the two ticks, so each tick's
+        // gross is its net's size.
+        let mut ticks = w(U256::from(5_000u64));
         ticks.extend(wi(if t < TICK { 5_000 } else { -5_000 }));
         node.set(p, abi::call_signed(selector::TICKS, t), ticks);
     }
@@ -358,6 +363,7 @@ async fn a_healthy_pool_loads_with_its_ladder() {
     assert_eq!(p.state.tick_spacing, SPACING as i32);
     assert_eq!(p.decimals, (18, 6));
     assert_eq!(p.ladder.len(), 2, "both initialized ticks");
+    assert_eq!(p.ladder.gross(), Some(&[5_000u128, 5_000][..]), "read with gross (R28.1)");
     assert!(p.ladder_covers_price());
     assert_eq!(book.status(), ReconstructionStatus::Verified);
 }
@@ -545,6 +551,217 @@ async fn a_reload_keeps_a_newer_swap_and_takes_the_fresh_read() {
 
     // Its confirmed copy is still not newer.
     assert_eq!(book.apply_swap(WETH_USDC, price, 7, -197_348, (121, 3)), SwapApplied::Stale);
+}
+
+// ------------------------------------------------------------------ R28.1: positions across a reload
+
+const LIQUIDITY: u128 = 1_405_406_481_779_019_804;
+
+/// A position over the healthy pool's two ticks, in range at its tick.
+fn position(delta: i128, at: (u64, u64)) -> StateWrite {
+    StateWrite::Liquidity(LiquidityWrite { pool: WETH_USDC, tick_lower: -197_350, tick_upper: -197_340, delta, at })
+}
+
+/// The chain's two ticks after a change of `delta` to the healthy pool's one
+/// position.
+fn ticks_after(node: &Scripted, delta: i64) {
+    for (t, net) in [(-197_350i64, 5_000 + delta), (-197_340, -5_000 - delta)] {
+        let mut ticks = w(U256::from(5_000 + delta));
+        ticks.extend(wi(net));
+        node.set(WETH_USDC, abi::call_signed(selector::TICKS, t), ticks);
+    }
+}
+
+/// **A read before a change the book applied does not undo it.** A reload
+/// reads at the latest sealed block; a preconfirmed mint from the block after
+/// is carried onto the fresh ladder, and onto the read's active liquidity where
+/// it is in range at the read's tick.
+#[tokio::test]
+async fn a_reload_read_before_an_applied_mint_carries_it_onto_the_read() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    assert_eq!(book.apply_writes(&[position(300, (121, 3))]), vec![SwapApplied::Updated]);
+
+    book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
+    let p = book.get(WETH_USDC).unwrap();
+    assert_eq!(p.ladder.ticks(), &[(-197_350, 5_300), (-197_340, -5_300)], "the mint was dropped");
+    assert_eq!(p.ladder.gross(), Some(&[5_300u128, 5_300][..]));
+    assert_eq!(p.state.liquidity, LIQUIDITY + 300);
+    assert!(book.positions_unconfirmed().is_empty());
+    assert_eq!(book.apply_writes(&[position(300, (121, 3))]), vec![SwapApplied::Stale], "its confirmed copy");
+}
+
+/// A change after the read that is out of range at the read's tick moves the
+/// ladder alone.
+#[tokio::test]
+async fn a_reload_read_before_an_out_of_range_mint_keeps_the_reads_liquidity() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    let above = StateWrite::Liquidity(LiquidityWrite { pool: WETH_USDC, tick_lower: -197_340, tick_upper: -197_330, delta: 300, at: (121, 3) });
+    assert_eq!(book.apply_writes(&[above]), vec![SwapApplied::Updated]);
+
+    book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
+    let p = book.get(WETH_USDC).unwrap();
+    assert_eq!(p.state.liquidity, LIQUIDITY, "an inactive position counted as active");
+    assert_eq!(p.ladder.ticks(), &[(-197_350, 5_000), (-197_340, -4_700), (-197_330, -300)]);
+}
+
+/// The same, where a swap from that block is kept too: the kept liquidity
+/// already counts the mint, and only the ladder takes it again.
+#[tokio::test]
+async fn a_reload_that_keeps_a_swap_carries_a_later_mint_onto_the_ladder_alone() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    let price = U256::from(4_100_000_000_000_000_000_000_000u128);
+    assert_eq!(book.apply_swap(WETH_USDC, price, 7, -197_348, (121, 1)), SwapApplied::Updated);
+    assert_eq!(book.apply_writes(&[position(300, (121, 3))]), vec![SwapApplied::Updated]);
+    assert_eq!(book.get(WETH_USDC).unwrap().state.liquidity, 307);
+
+    book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
+    let p = book.get(WETH_USDC).unwrap();
+    assert_eq!(p.state.liquidity, 307, "counted twice, or lost");
+    assert_eq!(p.ladder.ticks(), &[(-197_350, 5_300), (-197_340, -5_300)]);
+}
+
+/// A read at or after a change holds it: the read alone, the change not
+/// applied a second time.
+#[tokio::test]
+async fn a_reload_at_or_after_a_position_change_takes_the_read_alone() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    assert_eq!(book.apply_writes(&[position(300, (121, 3))]), vec![SwapApplied::Updated]);
+    ticks_after(&node, 300);
+    node.set(WETH_USDC, abi::call0(selector::LIQUIDITY), w(U256::from(LIQUIDITY + 300)));
+
+    book.reload(&reads, &[WETH_USDC], 121).await.unwrap();
+    let p = book.get(WETH_USDC).unwrap();
+    assert_eq!(p.ladder.ticks(), &[(-197_350, 5_300), (-197_340, -5_300)], "applied twice");
+    assert_eq!(p.state.liquidity, LIQUIDITY + 300);
+    assert_eq!(book.apply_writes(&[position(300, (121, 3))]), vec![SwapApplied::Stale]);
+}
+
+/// A change the ladder could not hold leaves the pool flagged until a read at
+/// or after it: one from before it cannot have it.
+#[tokio::test]
+async fn a_refused_change_is_read_again_until_a_read_holds_it() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    let burn = StateWrite::Liquidity(LiquidityWrite { pool: WETH_USDC, tick_lower: -197_360, tick_upper: -197_340, delta: -1, at: (121, 3) });
+    assert_eq!(book.apply_writes(&[burn]), vec![SwapApplied::NeedsReload], "a burn on a tick never initialized");
+    assert_eq!(book.positions_unconfirmed(), vec![WETH_USDC]);
+
+    book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
+    assert_eq!(book.positions_unconfirmed(), vec![WETH_USDC], "a read from before the change cleared it");
+    book.reload(&reads, &[WETH_USDC], 121).await.unwrap();
+    assert!(book.positions_unconfirmed().is_empty());
+}
+
+/// A burn applied without gross, its ticks left at a zero net in doubt, is
+/// settled exactly by the next read with gross, whichever block it is from.
+#[tokio::test]
+async fn a_burn_left_in_doubt_is_settled_by_the_next_read_with_gross() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let held = PoolBook::load(&reads, &[spec()], 100).await.unwrap().0.get(WETH_USDC).unwrap();
+    let (lo, hi) = (held.ladder.lower_bound(), held.ladder.upper_bound());
+    let net_only = PoolSnapshot { ladder: TickLadder::new(held.ladder.ticks().to_vec(), lo, hi), ..(*held).clone() };
+    let book = PoolBook::from_snapshots([net_only], ReconstructionStatus::Verified);
+
+    assert_eq!(book.apply_writes(&[position(-5_000, (121, 3))]), vec![SwapApplied::NeedsReload]);
+    assert_eq!(book.get(WETH_USDC).unwrap().ladder.ticks(), &[(-197_350, 0), (-197_340, 0)]);
+    assert_eq!(book.positions_unconfirmed(), vec![WETH_USDC]);
+
+    book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
+    let p = book.get(WETH_USDC).unwrap();
+    assert!(p.ladder.ticks().is_empty(), "the burn emptied both ticks: {:?}", p.ladder.ticks());
+    assert_eq!(p.state.liquidity, LIQUIDITY - 5_000);
+    assert!(book.positions_unconfirmed().is_empty());
+}
+
+/// A change a reorg removed is not carried onto a read from before it, and the
+/// pool is read again until a read at or after its block holds the chain
+/// without it.
+#[tokio::test]
+async fn a_retracted_position_change_is_not_carried_onto_a_read() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    book.apply_writes(&[position(300, (121, 3))]);
+    book.retract_position(WETH_USDC, (121, 3));
+    assert_eq!(book.positions_unconfirmed(), vec![WETH_USDC]);
+
+    book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
+    let p = book.get(WETH_USDC).unwrap();
+    assert_eq!(p.ladder.ticks(), &[(-197_350, 5_000), (-197_340, -5_000)], "the removed mint was carried");
+    assert_eq!(p.state.liquidity, LIQUIDITY);
+    assert_eq!(book.positions_unconfirmed(), vec![WETH_USDC], "a read from before the change cannot say");
+    book.reload(&reads, &[WETH_USDC], 121).await.unwrap();
+    assert!(book.positions_unconfirmed().is_empty());
+}
+
+/// A change the book's ladder took that a fresh read cannot hold (the book was
+/// not the chain's): the pool stays flagged until a read at or after it.
+#[tokio::test]
+async fn a_change_a_fresh_read_cannot_hold_keeps_the_pool_flagged() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let held = PoolBook::load(&reads, &[spec()], 100).await.unwrap().0.get(WETH_USDC).unwrap();
+    let (lo, hi) = (held.ladder.lower_bound(), held.ladder.upper_bound());
+    // A position of 1 over [-197_360, -197_340) the chain does not have.
+    let ladder = TickLadder::with_gross(vec![(-197_360, 1, 1), (-197_350, 5_000, 5_000), (-197_340, 5_001, -5_001)], lo, hi);
+    let book = PoolBook::from_snapshots([PoolSnapshot { ladder, ..(*held).clone() }], ReconstructionStatus::Verified);
+    let burn = StateWrite::Liquidity(LiquidityWrite { pool: WETH_USDC, tick_lower: -197_360, tick_upper: -197_340, delta: -1, at: (121, 3) });
+    assert_eq!(book.apply_writes(&[burn]), vec![SwapApplied::Updated]);
+    assert!(book.positions_unconfirmed().is_empty());
+
+    book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
+    assert_eq!(book.positions_unconfirmed(), vec![WETH_USDC]);
+}
+
+/// A read whose liquidity cannot take a burn applied after it: flagged too.
+#[tokio::test]
+async fn a_read_whose_liquidity_cannot_take_a_later_burn_keeps_the_pool_flagged() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    assert_eq!(book.apply_writes(&[position(-300, (121, 3))]), vec![SwapApplied::Updated]);
+    node.set(WETH_USDC, abi::call0(selector::LIQUIDITY), w(U256::from(100u64)));
+
+    book.reload(&reads, &[WETH_USDC], 120).await.unwrap();
+    assert_eq!(book.positions_unconfirmed(), vec![WETH_USDC]);
+}
+
+/// A pool a reload removes takes its position changes with it: a full reload
+/// that brings it back reads it whole.
+#[tokio::test]
+async fn a_pool_removed_on_reload_forgets_its_position_changes() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    let burn = StateWrite::Liquidity(LiquidityWrite { pool: WETH_USDC, tick_lower: -197_360, tick_upper: -197_340, delta: -1, at: (121, 3) });
+    book.apply_writes(&[burn, position(300, (121, 4))]);
+    node.set(WETH_USDC, abi::call0(selector::TOKEN0), wa(USDC));
+    assert_eq!(book.reload(&reads, &[WETH_USDC], 120).await.unwrap().len(), 1, "removed");
+    assert!(book.positions_unconfirmed().is_empty(), "a pool the book no longer holds");
+
+    healthy(&node, Venue::UniswapV3.factory());
+    book.reload(&reads, &[], 120).await.unwrap();
+    assert_eq!(book.get(WETH_USDC).unwrap().ladder.ticks(), &[(-197_350, 5_000), (-197_340, -5_000)], "a forgotten mint carried back");
 }
 
 /// A gap marked **while** a full reload is reading keeps the book `Rebuilding`:

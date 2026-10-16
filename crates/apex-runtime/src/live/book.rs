@@ -248,11 +248,32 @@ pub struct SyncWrite {
     pub at: LogPosition,
 }
 
-/// A log's post-trade state, of either kind.
+/// One `Mint` or `Burn` log's position change (R28.1): `delta` liquidity over
+/// `[tick_lower, tick_upper)`, negative for a burn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiquidityWrite {
+    pub pool: Address,
+    pub tick_lower: i32,
+    pub tick_upper: i32,
+    pub delta: i128,
+    pub at: LogPosition,
+}
+
+impl LiquidityWrite {
+    /// Whether the position is in range at `tick`, so counted in a pool's
+    /// active liquidity there: v3-core's `tickLower <= tick < tickUpper`.
+    pub const fn active_at(&self, tick: i32) -> bool {
+        self.tick_lower <= tick && tick < self.tick_upper
+    }
+}
+
+/// A log's state change: a swap's post-swap state, a volatile pool's reserves,
+/// or a position change (R28.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StateWrite {
     Swap(SwapWrite),
     Sync(SyncWrite),
+    Liquidity(LiquidityWrite),
 }
 
 pub struct PoolBook {
@@ -263,6 +284,33 @@ pub struct PoolBook {
     universe: Vec<PoolSpec>,
     /// R26: every applied Swap checked against the move model.
     moves: MoveChecks,
+    /// R28.1: position changes applied in place, and those read again.
+    position_counts: PositionCounts,
+}
+
+/// How the book fared with `Mint` and `Burn` (R28.1).
+#[derive(Debug, Default)]
+struct PositionCounts {
+    /// Applied exactly: the reload each would once have cost, saved.
+    exact: std::sync::atomic::AtomicU64,
+    /// Not exactly: the pool is read again.
+    read_again: std::sync::atomic::AtomicU64,
+}
+
+/// One pool's position changes since its ladder was read (R28.1).
+#[derive(Debug, Default)]
+struct Positions {
+    /// The block the pool's ladder was read at: it holds every change up to it.
+    read_at: u64,
+    /// Changes applied since, by log position: carried onto a ladder read
+    /// before them, and what tells a log's second copy from one never seen.
+    applied: BTreeMap<LogPosition, LiquidityWrite>,
+    /// The newest block of a change that could not be applied: the pool's
+    /// ladder is not the chain's until a read at or after it.
+    refused: Option<u64>,
+    /// The ladder holds a tick a burn left at a zero net, without the gross to
+    /// say whether it is still initialized: settled by the next read.
+    unsettled: bool,
 }
 
 /// How the move model fared against every applied Swap (R26).
@@ -285,6 +333,8 @@ struct WriterState {
     last_gap: u64,
     /// The newest block any read has stored.
     newest_read: u64,
+    /// R28.1: each pool's position changes since its read.
+    positions: BTreeMap<Address, Positions>,
 }
 
 /// Why a reload wrote nothing.
@@ -656,6 +706,7 @@ impl PoolBook {
         provenance: ReconstructionStatus,
     ) -> Self {
         let mut newest_read = 0;
+        let mut positions = BTreeMap::new();
         let pools = snapshots
             .into_iter()
             .map(|mut p| {
@@ -665,15 +716,17 @@ impl PoolBook {
                 // And a dynamic fee is the book's to state, from the tick.
                 p.fee_from_tick();
                 newest_read = newest_read.max(p.block);
+                positions.insert(p.spec.pool, Positions { read_at: p.block, ..Positions::default() });
                 (p.spec.pool, Arc::new(p))
             })
             .collect::<BTreeMap<_, _>>();
         let universe = pools.values().map(|p| p.spec.clone()).collect();
         Self {
             pools: Versioned::new(pools, provenance),
-            writer: Mutex::new(WriterState { seq: 0, last_gap: 0, newest_read }),
+            writer: Mutex::new(WriterState { seq: 0, last_gap: 0, newest_read, positions }),
             universe,
             moves: MoveChecks::default(),
+            position_counts: PositionCounts::default(),
         }
     }
 
@@ -863,6 +916,7 @@ impl PoolBook {
         use std::sync::atomic::Ordering::Relaxed;
         let (applied, checks) = self.write(|map, w, status| {
             let mut checks = (0u64, 0u64, 0u64);
+            let (mut exact, mut read_again) = (0u64, 0u64);
             let applied = writes
                 .iter()
                 .map(|s| match s {
@@ -894,13 +948,25 @@ impl PoolBook {
                                 }
                             }
                         }
-                        Self::swap_into(map, w.seq, s)
+                        Self::swap_into(map, w, s)
                     }
                     StateWrite::Sync(s) => Self::sync_into(map, w.seq, s),
+                    StateWrite::Liquidity(s) => {
+                        let r = Self::liquidity_into(map, w, s);
+                        match r {
+                            SwapApplied::Updated => exact += 1,
+                            SwapApplied::NeedsReload => read_again += 1,
+                            SwapApplied::Stale | SwapApplied::Unknown => {}
+                        }
+                        r
+                    }
                 })
                 .collect();
-            ((applied, checks), status)
+            ((applied, (checks, exact, read_again)), status)
         });
+        let (checks, exact, read_again) = checks;
+        self.position_counts.exact.fetch_add(exact, Relaxed);
+        self.position_counts.read_again.fetch_add(read_again, Relaxed);
         self.moves.checked.fetch_add(checks.0, Relaxed);
         self.moves.tick_mismatched.fetch_add(checks.1, Relaxed);
         self.moves.liquidity_changed.fetch_add(checks.2, Relaxed);
@@ -952,24 +1018,110 @@ impl PoolBook {
         SwapApplied::Updated
     }
 
-    fn swap_into(map: &mut BTreeMap<Address, Arc<PoolSnapshot>>, seq: u64, s: &SwapWrite) -> SwapApplied {
+    fn swap_into(map: &mut BTreeMap<Address, Arc<PoolSnapshot>>, w: &mut WriterState, s: &SwapWrite) -> SwapApplied {
         // A tick write is refused for a constant-product pool.
         let Some(old) = map.get(&s.pool).filter(|o| o.reserves.is_none()) else { return SwapApplied::Unknown };
         if !Self::is_newer(old, s.at) {
             return SwapApplied::Stale;
         }
+        // R28.1: a swap's liquidity counts every position change before it. One
+        // after it already applied (this swap's preconfirmed copy was missed)
+        // is added back where it is active at the swap's tick.
+        let mut liquidity = Some(s.liquidity);
+        let positions = w.positions.get_mut(&s.pool);
+        if let Some(p) = positions.as_deref() {
+            use std::ops::Bound::{Excluded, Unbounded};
+            for c in p.applied.range((Excluded(s.at), Unbounded)).map(|(_, c)| c).filter(|c| c.active_at(s.tick)) {
+                liquidity = liquidity.and_then(|l| l.checked_add_signed(c.delta));
+            }
+        }
         let mut next = (**old).clone();
         next.state.sqrt_price_x96 = u256_to_ethers(s.sqrt_price_x96);
-        next.state.liquidity = s.liquidity;
+        next.state.liquidity = liquidity.unwrap_or(s.liquidity);
         next.state.tick = s.tick;
         next.block = s.at.0;
         next.last_log = Some(s.at);
         // The swap moved the tick, and on Slipstream the fee with it.
         next.fee_from_tick();
-        next.seq = seq;
+        next.seq = w.seq;
         let covered = next.ladder_covers_price();
         map.insert(s.pool, Arc::new(next));
+        if liquidity.is_none() {
+            // The changes after the swap do not fit its liquidity: the book is
+            // not the chain's. The swap's own state stands until a read.
+            if let Some(p) = positions {
+                p.refused = p.refused.max(Some(s.at.0));
+            }
+            return SwapApplied::NeedsReload;
+        }
         if covered { SwapApplied::Updated } else { SwapApplied::NeedsReload }
+    }
+
+    /// A `Mint` or `Burn` (R28.1). The ladder takes it whenever it arrives:
+    /// net and gross only add. Active liquidity takes it only if no swap after
+    /// it has been applied — that swap's liquidity already counts it.
+    ///
+    /// `Stale` for a log the pool's read already holds or a copy of one already
+    /// applied. `NeedsReload` for a change that cannot be applied exactly: not
+    /// at all if the ladder cannot hold it, and kept, its tick at a zero net, on
+    /// a ladder without gross.
+    fn liquidity_into(map: &mut BTreeMap<Address, Arc<PoolSnapshot>>, w: &mut WriterState, s: &LiquidityWrite) -> SwapApplied {
+        let Some(old) = map.get(&s.pool).filter(|o| o.reserves.is_none()) else { return SwapApplied::Unknown };
+        let seq = w.seq;
+        let pos = w.positions.entry(s.pool).or_default();
+        if s.at.0 <= pos.read_at || pos.applied.contains_key(&s.at) {
+            return SwapApplied::Stale;
+        }
+        let refuse = |pos: &mut Positions| {
+            pos.refused = pos.refused.max(Some(s.at.0));
+            SwapApplied::NeedsReload
+        };
+        let Ok(applied) = old.ladder.apply_position(s.tick_lower, s.tick_upper, s.delta) else { return refuse(pos) };
+        let mut next = (**old).clone();
+        // The pool's state is the read's or the last swap's: one from before
+        // this change is moved by it.
+        if old.last_log.is_none_or(|last| s.at > last) && s.active_at(old.state.tick) {
+            match old.state.liquidity.checked_add_signed(s.delta) {
+                Some(l) => next.state.liquidity = l,
+                None => return refuse(pos),
+            }
+        }
+        next.ladder = applied.ladder;
+        next.seq = seq;
+        pos.applied.insert(s.at, *s);
+        map.insert(s.pool, Arc::new(next));
+        if applied.unconfirmed.is_some() {
+            pos.unsettled = true;
+            return SwapApplied::NeedsReload;
+        }
+        SwapApplied::Updated
+    }
+
+    /// Pools whose ladder may not be the chain's (R28.1): a position change
+    /// that could not be applied exactly, until a read at or after it. A reload
+    /// read before such a change leaves the pool here, to be read again at a
+    /// later block.
+    pub fn positions_unconfirmed(&self) -> Vec<Address> {
+        let w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        w.positions.iter().filter(|(_, p)| p.refused.is_some() || p.unsettled).map(|(a, _)| *a).collect()
+    }
+
+    /// A position change a reorg removed (R28.1): no longer carried onto a
+    /// later read, and the pool flagged until a read at or after its block —
+    /// the ladder holds it until then.
+    pub fn retract_position(&self, pool: Address, at: LogPosition) {
+        let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(pos) = w.positions.get_mut(&pool) {
+            pos.applied.remove(&at);
+            pos.refused = pos.refused.max(Some(at.0));
+        }
+    }
+
+    /// `Mint` and `Burn` so far (R28.1): applied exactly in place, and read
+    /// again.
+    pub fn position_counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.position_counts.exact.load(Relaxed), self.position_counts.read_again.load(Relaxed))
     }
 
     /// A feed gap: everything may have missed updates. `Rebuilding` until a
@@ -1024,9 +1176,18 @@ impl PoolBook {
                 return (Err(ReloadError::Older { block, newest: w.newest_read }), status);
             }
             w.newest_read = block;
+            let seq = w.seq;
             for (addr, mut snap) in fresh {
+                // R28.1: the read holds every position change up to its block;
+                // those after it are carried onto it.
+                let pos = w.positions.entry(addr).or_default();
+                pos.applied = pos.applied.split_off(&(block + 1, 0));
+                pos.read_at = block;
+                pos.refused = pos.refused.filter(|b| *b > block);
+                pos.unsettled = false;
                 if let Some(old) = map.get(&addr).filter(|o| o.last_log.is_some_and(|(b, _)| b > block)) {
                     snap.state.sqrt_price_x96 = old.state.sqrt_price_x96;
+                    // Counts the changes after the read already.
                     snap.state.liquidity = old.state.liquidity;
                     snap.state.tick = old.state.tick;
                     snap.block = old.block;
@@ -1034,14 +1195,32 @@ impl PoolBook {
                     snap.reserves = old.reserves;
                     // The fresh regime at the kept tick.
                     snap.fee_from_tick();
+                } else {
+                    // The read's liquidity, moved by each change after it that
+                    // is active at the read's tick.
+                    for c in pos.applied.values().filter(|c| c.active_at(snap.state.tick)) {
+                        match snap.state.liquidity.checked_add_signed(c.delta) {
+                            Some(l) => snap.state.liquidity = l,
+                            None => pos.refused = pos.refused.max(Some(c.at.0)),
+                        }
+                    }
                 }
-                snap.seq = w.seq;
+                // A read carries gross, so each change applies exactly or not
+                // at all: none is left in doubt.
+                for c in pos.applied.values() {
+                    match snap.ladder.apply_position(c.tick_lower, c.tick_upper, c.delta) {
+                        Ok(a) => snap.ladder = a.ladder,
+                        Err(_) => pos.refused = pos.refused.max(Some(c.at.0)),
+                    }
+                }
+                snap.seq = seq;
                 map.insert(addr, Arc::new(snap));
             }
             // A pool that can no longer be read is removed rather than kept at
             // a state nobody can confirm.
             for r in &refused {
                 map.remove(&r.pool);
+                w.positions.remove(&r.pool);
             }
             let status =
                 if full && w.last_gap <= started { ReconstructionStatus::Verified } else { status };

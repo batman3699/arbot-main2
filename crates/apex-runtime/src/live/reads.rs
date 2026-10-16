@@ -159,4 +159,27 @@ impl apex_venues::cl_ticks::TickDataSource for ChainReads {
             .map(|a| a.and_then(|d| apex_venues::cl_ticks::decode_liquidity_net(&d)))
             .collect())
     }
+
+    /// The same `ticks()` reads, gross kept (R28.1): the live book applies
+    /// `Mint` and `Burn` to its ladders, and gross is what makes a burn exact.
+    async fn tick_liquidity(
+        &self,
+        pool: ethers_core::types::Address,
+        ticks: &[i32],
+        block: ethers_core::types::U64,
+    ) -> anyhow::Result<Option<Vec<Option<(u128, i128)>>>> {
+        let pool = address_to_alloy(pool);
+        let calls: Vec<(Address, Vec<u8>)> = ticks
+            .iter()
+            .map(|t| (pool, abi::call_signed(selector::TICKS, i64::from(*t))))
+            .collect();
+        // No ticks, no round trip: `multicall` sends nothing for no calls.
+        let answers = self.multicall(&calls, block.as_u64()).await?;
+        Ok(Some(
+            answers
+                .into_iter()
+                .map(|a| a.and_then(|d| apex_venues::cl_ticks::decode_tick_liquidity(&d)))
+                .collect(),
+        ))
+    }
 }

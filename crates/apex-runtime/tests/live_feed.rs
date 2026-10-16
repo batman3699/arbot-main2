@@ -177,15 +177,160 @@ fn a_swap_off_the_ladder_reloads_and_publishes_nothing() {
     assert_eq!(effects, vec![Effect::Reload(vec![POOL])]);
 }
 
-/// A mint or burn changes a range's liquidity, which the ladder carries: reload.
+/// v3-core's `Mint`: owner and both ticks indexed; sender, amount, amount0 and
+/// amount1 in the data.
+fn mint(lower: i32, upper: i32, amount: u128, block: u64, index: u64, pending: bool) -> RawLog {
+    let mut data = vec![0u8; 32];
+    data.extend(U256::from(amount).to_be_bytes::<32>());
+    data.extend([0u8; 64]);
+    RawLog {
+        topics: vec![MINT, B256::repeat_byte(3), B256::from(word_i(lower.into())), B256::from(word_i(upper.into()))],
+        data,
+        ..swap(TICK, block, index, pending, 1, 1)
+    }
+}
+
+/// v3-core's `Burn`: owner and both ticks indexed; amount, amount0 and amount1
+/// in the data.
+fn burn(lower: i32, upper: i32, amount: u128, block: u64, index: u64, pending: bool) -> RawLog {
+    let mut data = U256::from(amount).to_be_bytes::<32>().to_vec();
+    data.extend([0u8; 64]);
+    RawLog {
+        topics: vec![BURN, B256::repeat_byte(3), B256::from(word_i(lower.into())), B256::from(word_i(upper.into()))],
+        data,
+        ..swap(TICK, block, index, pending, 1, 1)
+    }
+}
+
+/// R28.1: a position change's ticks from its topics, its liquidity from its
+/// data, a burn's negative. A log that is not a well-formed one is refused.
 #[test]
-fn liquidity_events_reload_the_pool() {
+fn a_mint_and_a_burn_decode_their_positions() {
+    let m = feed::decode_liquidity(&mint(-198_000, -197_000, 1_000, 101, 4, true)).unwrap();
+    assert_eq!((m.pool, m.tick_lower, m.tick_upper, m.delta), (POOL, -198_000, -197_000, 1_000));
+    assert_eq!((m.block, m.log_index, m.pending), (101, 4, true));
+    let b = feed::decode_liquidity(&burn(-198_000, -197_000, 1_000, 101, 5, false)).unwrap();
+    assert_eq!((b.tick_lower, b.tick_upper, b.delta, b.pending), (-198_000, -197_000, -1_000, false));
+
+    let short = RawLog { data: vec![0; 96], ..mint(-10, 10, 1, 101, 4, true) };
+    let unindexed = RawLog { topics: vec![BURN], ..burn(-10, 10, 1, 101, 4, true) };
+    let wide_tick = RawLog { topics: vec![MINT, B256::ZERO, B256::from(word_i(1 << 23)), B256::ZERO], ..mint(-10, 10, 1, 101, 4, true) };
+    let huge = mint(-10, 10, u128::MAX, 101, 4, true);
+    let unordered = RawLog { log_index: None, ..mint(-10, 10, 1, 101, 4, true) };
+    for (what, log) in [("short", short), ("unindexed", unindexed), ("wide tick", wide_tick), ("huge", huge), ("unordered", unordered)] {
+        assert_eq!(feed::decode_liquidity(&log), None, "{what}");
+    }
+    assert_eq!(feed::decode_liquidity(&swap(TICK, 101, 1, true, 1, 1)), None, "a swap");
+}
+
+/// A mint is applied to the book in place, and publishes nothing: no price
+/// moved. Its confirmed copy changes nothing.
+#[test]
+fn a_mint_is_applied_in_place_and_publishes_nothing() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    assert_eq!(settle(&mut h, &book, Notification::Log(mint(-198_000, -197_000, 1_000, 101, 4, true))), vec![]);
+    let p = book.get(POOL).unwrap();
+    assert_eq!(p.state.liquidity, 1_400_000_000_000_000_000 + 1_000);
+    assert!(p.ladder.ticks().contains(&(-198_000, 1_000)));
+    assert_eq!(settle(&mut h, &book, Notification::Log(mint(-198_000, -197_000, 1_000, 101, 4, false))), vec![]);
+    assert_eq!(book.get(POOL).unwrap().state.liquidity, 1_400_000_000_000_000_000 + 1_000, "applied once");
+}
+
+/// A burn of nothing (a fee poke) is not a change: the pool's version does not
+/// move, so no ticket over it is refused for it.
+#[test]
+fn a_burn_of_nothing_changes_nothing() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    let before = book.versions_for(&[POOL]);
+    assert_eq!(settle(&mut h, &book, Notification::Log(burn(-199_000, -196_000, 0, 101, 4, true))), vec![]);
+    assert_eq!(book.versions_for(&[POOL]), before);
+}
+
+/// A mint and a swap in one flashblock: one write, and one event, for the swap.
+#[test]
+fn a_mint_and_a_swap_in_one_burst_publish_the_swap() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    assert_eq!(h.handle(&book, Notification::Log(mint(-198_000, -197_000, 1_000, 101, 1, true)), NOW), vec![]);
+    assert_eq!(h.handle(&book, Notification::Log(swap(-197_360, 101, 2, true, 10i128.pow(18), 2_690_000_000)), NOW), vec![]);
+    let effects = h.flush(&book);
+    let e = event_of(&effects);
+    assert_eq!(e.at.log_index, 2, "the swap's position");
+    match &e.kind {
+        EventKind::PendingSwap { pools, notional_usd, .. } => {
+            assert_eq!(pools.len(), 1);
+            assert!(notional_usd.is_some(), "a mint, which has no size, made the burst unmeasured");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(book.get(POOL).unwrap().ladder.ticks().contains(&(-198_000, 1_000)));
+
+    // A mint after the swap does not take the event's position.
+    let book = self::book();
+    let mut h = FeedHandler::new(BASE);
+    h.handle(&book, Notification::Log(swap(-197_360, 101, 1, true, 10i128.pow(18), 2_690_000_000)), NOW);
+    h.handle(&book, Notification::Log(mint(-198_000, -197_000, 1_000, 101, 2, true)), NOW);
+    assert_eq!(event_of(&h.flush(&book)).at.log_index, 1);
+}
+
+/// A position change the book cannot apply exactly reloads the pool: here a
+/// burn to a zero net on a ladder without gross, and one on a tick never
+/// initialized.
+#[test]
+fn a_position_change_that_cannot_be_applied_exactly_reloads_the_pool() {
+    for log in [burn(-199_000, -196_000, 1, 101, 4, true), burn(-198_000, -196_000, 1, 101, 4, true)] {
+        let book = book();
+        let mut h = FeedHandler::new(BASE);
+        assert_eq!(settle(&mut h, &book, Notification::Log(log)), vec![Effect::Reload(vec![POOL])]);
+    }
+}
+
+/// A swap, then a position change the book cannot apply exactly, in one
+/// burst: the pool is reloaded and left out of the event.
+#[test]
+fn a_swap_then_a_change_that_cannot_be_applied_publishes_nothing() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    h.handle(&book, Notification::Log(swap(-197_360, 101, 1, true, 10i128.pow(18), 2_690_000_000)), NOW);
+    h.handle(&book, Notification::Log(burn(-199_000, -196_000, 1, 101, 2, true)), NOW);
+    assert_eq!(h.flush(&book), vec![Effect::Reload(vec![POOL])]);
+}
+
+/// A `Mint` or `Burn` that does not decode is still a change: reloaded, as
+/// every one was before R28.1.
+#[test]
+fn a_position_change_that_does_not_decode_reloads_the_pool() {
     let book = book();
     let mut h = FeedHandler::new(BASE);
     for topic in [MINT, BURN] {
         let log = RawLog { topics: vec![topic], ..swap(TICK, 103, 0, false, 1, 1) };
         assert_eq!(h.handle(&book, Notification::Log(log), NOW), vec![Effect::Reload(vec![POOL])]);
     }
+}
+
+/// A reorg that removes a mint the book applied: the pool is reloaded, and
+/// stays flagged until a read at or after the mint's block.
+#[test]
+fn a_removed_position_change_is_retracted_from_the_book() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    settle(&mut h, &book, Notification::Log(mint(-198_000, -197_000, 1_000, 101, 4, true)));
+    let removed = RawLog { removed: true, ..mint(-198_000, -197_000, 1_000, 101, 4, false) };
+    assert_eq!(h.handle(&book, Notification::Log(removed), NOW), vec![Effect::Reload(vec![POOL])]);
+    assert_eq!(book.positions_unconfirmed(), vec![POOL]);
+}
+
+/// A mint after a swap that left the ladder does not make the pool priceable
+/// again: only a swap can bring a price back.
+#[test]
+fn a_mint_after_a_swap_off_the_ladder_leaves_the_pool_unpriced() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE);
+    h.handle(&book, Notification::Log(swap(-194_000, 101, 1, true, 10i128.pow(18), 2_690_000_000)), NOW);
+    h.handle(&book, Notification::Log(mint(-198_000, -197_000, 1_000, 101, 2, true)), NOW);
+    assert_eq!(h.flush(&book), vec![Effect::Reload(vec![POOL])]);
 }
 
 /// A reorg retracts a log. What was applied may not have happened: reload.

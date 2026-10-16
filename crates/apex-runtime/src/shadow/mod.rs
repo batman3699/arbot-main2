@@ -83,7 +83,7 @@ use apex_chain::adapter::ReplacementPolicy;
 use apex_chain::base::flashblock::{sample, FlashblockRecorder};
 use apex_chain::base::flashblock_stream::{FlashblockIndexer, FlashblockStream, FlashblockStreamStats};
 use apex_chain::base::send::HttpSubmitter;
-use apex_chain::rpc::failover::{FailoverSettings, FailoverTransport};
+use apex_chain::rpc::failover::{FailoverSettings, FailoverTransport, MethodUsage};
 use apex_chain::rpc::ws::{Head, LogFilter, Notification, Subscription, WsFeed, WsSettings, WsStats};
 use apex_chain::rpc::RpcTransport;
 use apex_config::{Env, Secret};
@@ -209,6 +209,8 @@ impl Health {
 struct Shadow {
     config: ShadowConfig,
     reads: ChainReads,
+    /// The HTTP transport every read goes through, kept for its usage (R28.1).
+    http: Arc<FailoverTransport>,
     universe: Vec<Address>,
     /// The venues the executor could reach at boot.
     venues: Vec<Venue>,
@@ -404,11 +406,12 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
 
     // Every endpoint answers Base's chain id before anything reads.
     let urls: Vec<String> = config.rpc_http.iter().map(|u| u.expose().clone()).collect();
-    let rpc: Arc<dyn RpcTransport> = Arc::new(
+    let http = Arc::new(
         FailoverTransport::connect(&urls, config.chain_id, FailoverSettings::default())
             .await
             .map_err(|e| boot_err("the RPC transport", e))?,
     );
+    let rpc: Arc<dyn RpcTransport> = http.clone();
     drop(urls);
     let reads = ChainReads::new(Arc::clone(&rpc));
     let head = reads.head().await.map_err(|e| boot_err("the head", e))?;
@@ -755,6 +758,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         universe: specs.iter().map(|p| p.pool).collect(),
         venues,
         reads,
+        http,
         book,
         plane,
         search,
@@ -972,14 +976,17 @@ impl Shadow {
                         self.commitments.set_admissions(admitted);
                     }
                     // Read before a swap it already holds: off its fresh ladder
-                    // until a later block is read.
-                    let off: Vec<Address> = self
+                    // until a later block is read. And read before a position
+                    // change it could not apply exactly (R28.1): not the
+                    // chain's until a read at or after it.
+                    let mut off: Vec<Address> = self
                         .book
                         .snapshot()
                         .values()
                         .filter(|p| !p.ladder_covers_price())
                         .map(|p| p.spec.pool)
                         .collect();
+                    off.extend(self.book.positions_unconfirmed());
                     self.reloads.request(off);
                 }
                 Err(e) => {
@@ -1220,12 +1227,17 @@ impl Shadow {
                 status: format!("{:?}", self.book.status()),
                 admitted: self.commitments.admitted(),
             },
-            reloads: ReloadReport {
-                full: get(&self.stats.reloads_full),
-                partial: get(&self.stats.reloads_partial),
-                failed: get(&self.stats.reload_failures),
-                pools_refused: get(&self.stats.pools_refused),
-                pools_removed: get(&self.stats.pools_removed),
+            reloads: {
+                let (positions_in_place, positions_read_again) = self.book.position_counts();
+                ReloadReport {
+                    full: get(&self.stats.reloads_full),
+                    partial: get(&self.stats.reloads_partial),
+                    failed: get(&self.stats.reload_failures),
+                    pools_refused: get(&self.stats.pools_refused),
+                    pools_removed: get(&self.stats.pools_removed),
+                    positions_in_place,
+                    positions_read_again,
+                }
             },
             read_failures: ReadFailures {
                 view: get(&self.stats.view_failures),
@@ -1287,6 +1299,11 @@ impl Shadow {
                 }
             },
             canary: self.canary.as_ref().map(|c| c.report()),
+            rpc: {
+                let mut usage = self.http.usage();
+                usage.sort_by_key(|u| std::cmp::Reverse(u.bytes_in));
+                usage
+            },
         };
         info!(
             head = ?r.head,
@@ -1366,6 +1383,9 @@ pub struct Report {
     pub lenders: LendersReport,
     /// R28: the canary, when this run is one.
     pub canary: Option<CanaryReport>,
+    /// R28.1: the HTTP traffic since boot, by endpoint and method, the most
+    /// bytes received first: what the provider bills.
+    pub rpc: Vec<MethodUsage>,
 }
 
 /// What each flash lender holds, in wei (R27).
@@ -1460,6 +1480,11 @@ pub struct ReloadReport {
     pub pools_refused: u64,
     /// Of those, the ones the book held and dropped.
     pub pools_removed: u64,
+    /// R28.1: `Mint` and `Burn` applied to the book exactly, each a partial
+    /// reload saved.
+    pub positions_in_place: u64,
+    /// Those that could not be, and read the pool again.
+    pub positions_read_again: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]

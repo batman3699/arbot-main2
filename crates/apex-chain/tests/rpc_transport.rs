@@ -272,6 +272,51 @@ async fn requests_are_counted_per_call_not_per_attempt() {
     assert_eq!(rpc.requests() - before, 2);
 }
 
+/// R28.1: what each endpoint was asked, by method. Unlike `requests`, every
+/// attempt counts — each is an HTTP request the provider bills — with the
+/// bytes each way, which is what the provider's units follow. A fault is
+/// counted as one; a revert is an answer.
+#[tokio::test]
+async fn usage_is_counted_by_endpoint_and_method_per_attempt_and_byte() {
+    let wide = format!("0x{}", "ab".repeat(1_000));
+    let answer = wide.clone();
+    let bad = MockNode::base(|_, _| Reply::Http(503)).await;
+    let good = MockNode::base(move |m, p| match m {
+        "eth_call" => Reply::Result(json!(answer)),
+        _ => block(m, p),
+    })
+    .await;
+    let rpc = connect(vec![bad.url("/"), good.url("/")], fast()).await;
+    let data = format!("0x{}", "cd".repeat(500));
+    rpc.call("eth_call", json!([{ "to": "0x4200000000000000000000000000000000000006", "data": data }, "latest"]))
+        .await
+        .unwrap();
+    rpc.call("eth_blockNumber", json!([])).await.unwrap();
+
+    let usage = rpc.usage();
+    let of = |endpoint: &str, method: &str| {
+        usage.iter().find(|u| u.endpoint == endpoint && u.method == method).cloned().unwrap_or_else(|| {
+            panic!("no usage for {method} at {endpoint}: {usage:?}")
+        })
+    };
+    let (bad, good) = (endpoint_label(&bad.url("/")), endpoint_label(&good.url("/")));
+
+    let failed = of(&bad, "eth_call");
+    assert_eq!((failed.attempts, failed.faults, failed.bytes_in), (1, 1, 0), "a 503 is one billed attempt, no body");
+    assert!(failed.bytes_out > 1_000, "the request was sent: {failed:?}");
+
+    let call = of(&good, "eth_call");
+    assert_eq!((call.attempts, call.faults), (1, 0));
+    assert!((1_000..1_300).contains(&call.bytes_out), "{call:?}");
+    assert!((2_000..2_200).contains(&call.bytes_in), "{call:?}");
+
+    // eth_blockNumber went straight to the endpoint that answered last.
+    assert_eq!(of(&good, "eth_blockNumber").attempts, 1);
+    assert!(usage.iter().all(|u| !(u.endpoint == bad && u.method == "eth_blockNumber")));
+    // The boot's chain checks are asked too.
+    assert_eq!(of(&good, "eth_chainId").attempts, 1);
+}
+
 // ------------------------------------------------------------ which chain
 
 /// `wrong_chain_submission` is a hard-zero counter, and a read transport pointed

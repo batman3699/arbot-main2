@@ -61,7 +61,7 @@
 pub mod failover;
 pub mod ws;
 
-pub use failover::{ConnectError, FailoverSettings, FailoverTransport};
+pub use failover::{ConnectError, FailoverSettings, FailoverTransport, MethodUsage};
 
 use async_trait::async_trait;
 use serde_json::Value;
