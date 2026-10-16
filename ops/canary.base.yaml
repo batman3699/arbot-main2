@@ -88,12 +88,14 @@ policy:
   # executor's gross check) is open before any canary (PLAN.md, R6 finding).
   min_profit_wei: 1
   slippage_bps_per_hop: 30
-  # A full reload every 15 minutes refreshes the evidence; an hour's bound
-  # allows three to fail.
+  # A full reload every 30 minutes refreshes the evidence; an hour's bound
+  # allows one to fail, and a failed one is asked for again at the next head.
+  # Every 30 minutes, not 15, since R28.1: Mint and Burn are applied in place,
+  # and each full reload is ~12.5 MB of BlockPI traffic.
   max_evidence_age_blocks: 1800
   # Three blocks: a view the head task has stopped refreshing is not a reading.
   max_view_age_ms: 6000
-  full_reload_every_s: 900
+  full_reload_every_s: 1800
   report_every_s: 300
   # The L1 fee oracle moves with L1 blocks; once a minute.
   l1_every_blocks: 30
