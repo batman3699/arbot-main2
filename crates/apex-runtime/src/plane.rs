@@ -1392,10 +1392,13 @@ impl Plane {
         let realized = match self.ports.chain.reconcile_final_state(payload.hash).await {
             Ok(r) => r,
             // R28: included and reverted. The nonce is spent; the ticket closes
-            // as the revert it is, with what it cost.
+            // as the revert it is, with what it cost. The lane delivered it, so
+            // the lane succeeded (R28.2): a revert is the trade's failure, which
+            // the canary's halts govern. Counted as the lane's, two reverts took
+            // the one lane out of the hot pool and refused every candidate after.
             Err(apex_chain::adapter::AdapterError::Reverted { class, gas_used, spent_wei, .. }) => {
                 let _ = assignment.release_nonce(nonce, true);
-                self.ports.pool.record_outcome(assignment.lane(), false);
+                self.ports.pool.record_outcome(assignment.lane(), true);
                 return Err(Decline::SettlementReverted { class, gas_used, spent_wei });
             }
             Err(e) => return Err(Decline::ChainUnavailable { detail: e.to_string() }),

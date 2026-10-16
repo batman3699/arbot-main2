@@ -370,6 +370,29 @@ async fn the_signer_must_hold_its_reserve_and_the_most_the_trade_can_cost() {
     assert!(format!("{short:?}").contains("signer_balance"), "one wei short: {short:?}");
 }
 
+/// **R28.2: a revert is the trade's failure, not the lane's.** A transaction that
+/// was included and reverted was delivered: the lane worked. Counting it as a
+/// lane failure took the canary's one lane out of the hot pool after two
+/// reverts, and every candidate after was refused `SignerUnavailable` for 22
+/// hours (650 of them), with no send left to restore it. The canary's own
+/// halts govern reverts.
+#[tokio::test]
+async fn reverts_do_not_take_the_only_lane_out_of_the_pool() {
+    let pool = Arc::new(pool());
+    let plane = plane_over(&pool, DispatchLane::Live(Arc::new(NullDispatcher::new())), FakeChain::landing().reverting(), readings());
+    // Three distinct observations: the fixture also carries a redelivered copy.
+    let mut seen = std::collections::BTreeSet::new();
+    let stream: Vec<_> = recorded_stream().into_iter().filter(|e| seen.insert(e.at)).collect();
+    assert!(stream.len() >= 3, "the fixture has three distinct observations");
+    for (i, event) in stream.iter().take(3).enumerate() {
+        let outcome = only_outcome(&plane.on_event(event).await);
+        assert!(
+            matches!(&outcome, apex_types::ticket::TicketOutcome::ExplicitFailure { code: apex_types::ticket::TerminalFailure::Reverted { .. }, .. }),
+            "event {i} should reach the chain and revert, not be refused a lane: {outcome:?}"
+        );
+    }
+}
+
 /// **R28: a sending lane checks the signer can pay.** Gas limit times the max
 /// fee, plus the lane's reserve, against the balance the reader saw; a shadow
 /// lane, whose trader holds nothing, does not.
