@@ -43,7 +43,6 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32) -> PoolSnapshot {
 
 use apex_runtime::armed::plan::armed_call;
 use apex_runtime::armed::predicate::{band, expiry, layout, trigger, Predicate};
-use apex_runtime::live::calls::encode_step;
 use apex_runtime::live::frontier;
 use apex_types::compat::u256_to_alloy;
 use apex_types::ids::ChainId;
@@ -99,32 +98,28 @@ fn the_band_is_two_bounds_and_a_floor() {
     assert_eq!(v[2]["params"]["value"], format!("{:#x}", U256::from(L) * U256::from(9_800) / U256::from(10_000)));
 }
 
-/// Hop 1's floor is `mid`, hop 2's the loan plus one, the plan's profit floor 1.
+/// Hop 1's floor is `mid`, hop 2's the loan plus one, the plan's profit floor 1,
+/// as a lean plan (R29) from the chosen lender.
 #[test]
 fn the_armed_plan_carries_break_even_floors() {
+    use apex_exec::call::CallPlan;
+    use apex_exec::lean::{LeanLender, LeanPlan};
+    use apex_runtime::live::calls::lean_hop;
     let a = pool(UNI, Venue::UniswapV3, -197_350, 500);
     let b = pool(SLIP, Venue::Slipstream, -197_300, 400);
     let snap: BTreeMap<Address, Arc<PoolSnapshot>> = [(UNI, Arc::new(a.clone())), (SLIP, Arc::new(b.clone()))].into_iter().collect();
     let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
     let c = cycles.values().next().unwrap();
-    let (p0, p1) = if c.legs[0].pool == UNI { (&a, &b) } else { (&b, &a) };
     let (size, mid) = (U256::from(10u128.pow(18)), U256::from(3_000_000_000u64));
-    let call = armed_call(c, [p0, p1], size, mid, EXECUTOR, 8453, 1_791_800_000, &apex_runtime::live::lenders::BALANCER).unwrap();
-    let plan = v2(&call);
-    assert_eq!(plan.min_profit, alloy_primitives::U256::from(1));
-    assert_eq!(plan.deadline, 1_791_800_000);
-    assert_eq!(plan.chain_id, 8453);
-    assert_eq!(plan.loans[0].amount, u256_to_alloy(size));
+    let call = armed_call(c, size, mid, EXECUTOR, 8453, 1_791_800_000, &apex_runtime::live::lenders::MORPHO).unwrap();
     let (s, m) = (u256_to_alloy(size), u256_to_alloy(mid));
-    assert_eq!(plan.steps[0], encode_step(&c.legs[0], p0, s, m, EXECUTOR, 1_791_800_000).unwrap());
-    assert_eq!(plan.steps[1], encode_step(&c.legs[1], p1, m, s + alloy_primitives::U256::from(1), EXECUTOR, 1_791_800_000).unwrap());
-    assert_eq!(call.to(), EXECUTOR);
-}
-
-/// The Phase 5 plan a call carries (R29 adds the lean one).
-fn v2(call: &apex_exec::call::ExecutorCall) -> &apex_exec::commitment::PlanV2 {
-    match call.plan() {
-        apex_exec::call::CallPlan::V2(p) => p,
-        other => panic!("not a Phase 5 plan: {other:?}"),
-    }
+    let want = LeanPlan {
+        lender: LeanLender::Morpho,
+        amount: 10u128.pow(18),
+        deadline: 1_791_800_000,
+        min_profit: 1,
+        hops: vec![lean_hop(&c.legs[0], m).unwrap(), lean_hop(&c.legs[1], s + alloy_primitives::U256::from(1)).unwrap()],
+    };
+    assert_eq!(call.plan(), &CallPlan::Lean(want));
+    assert_eq!((call.to(), call.chain_id()), (EXECUTOR, 8453));
 }

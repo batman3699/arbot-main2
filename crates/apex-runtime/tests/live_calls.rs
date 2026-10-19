@@ -1,29 +1,24 @@
-//! Task 8.5 R6 — the production call builder (`apex_runtime::live::calls`).
+//! Task 8.5 R6, R29 — the production call builder (`apex_runtime::live::calls`).
 //!
 //! Pools are real Base shapes with a price gap between them, so which cycle
-//! pays is arithmetic the test can state. The encoders are held to `cast` in
-//! `apex-exec`; here the question is whether the builder composes them into the
-//! plan the candidate was priced as — the right venue's step in the right
-//! order, exact amounts, the floor, and one loan from the one wired lender.
+//! pays is arithmetic the test can state. The lean plan's encoder is held to
+//! the contract in `apex-exec`; here the question is whether the builder
+//! composes the plan the candidate was priced as — each hop's pool and kind in
+//! order, exact minimums, the floor, and the commitment's lender.
 
 mod support;
 
 use alloy_primitives::{address, Address, B256, U256};
-use apex_exec::commitment::{plan_commitment, LoanProvider, Op};
-use apex_exec::encode::{
-    aerodrome_swap_exact_tokens_for_tokens, generic_step, slipstream_exact_input_single, univ3_path, univ3_step,
-    v3_router_exact_input_single, AerodromeSwap, PathHop, SlipstreamSwap, V3RouterSwap,
-};
+use apex_exec::call::CallPlan;
+use apex_exec::lean::{lean_commitment, run_calldata, HopKind, LeanHop, LeanLender, LeanPlan};
 use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
-use apex_runtime::live::calls::LiveCallBuilder;
-use apex_runtime::live::frontier::{
-    self, Cycle, AERODROME_V2_ADAPTER, BALANCER_FLASH, BALANCER_VAULT, PANCAKE_ADAPTER, SLIPSTREAM_ADAPTER,
-    SLIPSTREAM_V3_ADAPTER, WETH,
-};
+use apex_runtime::live::calls::{lean_hop, LiveCallBuilder};
+use apex_runtime::live::frontier::{self, Cycle, Leg, BALANCER_FLASH, WETH};
 use apex_runtime::live::inventory::{PoolSpec, Venue};
+use apex_runtime::live::lenders::MORPHO_FLASH;
 use apex_runtime::live::pricing::LiveCycle;
 use apex_runtime::plane::{CallBuilder, Decline};
 use apex_types::candidate::{Candidate, DiscreteRefined, DiscreteSize};
@@ -120,151 +115,130 @@ fn commitment(c: &Candidate, min_profit: u64) -> ExecutionCommitment {
     }
 }
 
-/// What the builder must produce for one hop, from the encoders directly.
-fn expected_step(b: &PoolBook, pool: Address, token_in: Address, token_out: Address, amount_in: U256, min_out: U256) -> (Op, Vec<u8>) {
-    let p = b.get(pool).unwrap();
-    match p.spec.venue {
-        Venue::UniswapV3 => {
-            let path = univ3_path(&[PathHop { token_in, fee: p.state.fee_ppm }], token_out).unwrap();
-            (Op::UniV3, univ3_step(&path, amount_in, min_out).unwrap())
-        }
-        Venue::Slipstream => {
-            let call = slipstream_exact_input_single(&SlipstreamSwap {
-                token_in,
-                token_out,
-                tick_spacing: p.state.tick_spacing,
-                recipient: EXECUTOR,
-                deadline: DEADLINE,
-                amount_in,
-                min_out,
-            })
-            .unwrap();
-            (Op::Generic, generic_step(SLIPSTREAM_ADAPTER, token_in, amount_in, &call))
-        }
-        Venue::SlipstreamV3 => {
-            let call = slipstream_exact_input_single(&SlipstreamSwap {
-                token_in,
-                token_out,
-                tick_spacing: p.state.tick_spacing,
-                recipient: EXECUTOR,
-                deadline: DEADLINE,
-                amount_in,
-                min_out,
-            })
-            .unwrap();
-            (Op::Generic, generic_step(SLIPSTREAM_V3_ADAPTER, token_in, amount_in, &call))
-        }
-        Venue::PancakeV3 => {
-            let call = v3_router_exact_input_single(&V3RouterSwap {
-                token_in,
-                token_out,
-                fee: p.state.fee_ppm,
-                recipient: EXECUTOR,
-                amount_in,
-                min_out,
-            })
-            .unwrap();
-            (Op::Generic, generic_step(PANCAKE_ADAPTER, token_in, amount_in, &call))
-        }
-        Venue::AerodromeV2 => {
-            let call = aerodrome_swap_exact_tokens_for_tokens(&AerodromeSwap {
-                token_in,
-                token_out,
-                factory: Venue::AerodromeV2.factory(),
-                recipient: EXECUTOR,
-                deadline: DEADLINE,
-                amount_in,
-                min_out,
-            })
-            .unwrap();
-            (Op::Generic, generic_step(AERODROME_V2_ADAPTER, token_in, amount_in, &call))
-        }
+/// The second factory's $3.8M WETH/USDC pool (tick spacing 50), from
+/// `data/base/aerodrome_slipstream_v3/pools.jsonl`.
+const SLIP3: Address = address!("3FE04A59Ebd38cF06080a6F60a98D124eb59392A");
+
+const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
+
+fn aero(r1: u128) -> PoolSnapshot {
+    use apex_runtime::live::cp::{self, Loaded, Reserves};
+    let reserves = Reserves {
+        reserve0: ethers_core::types::U256::from(1_823_383_892_520_317_644_689u128),
+        reserve1: ethers_core::types::U256::from(r1),
+    };
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };
+    cp::snapshot(&spec, loaded, B256::ZERO, 100)
+}
+
+fn kind(v: Venue) -> HopKind {
+    match v {
+        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => HopKind::UniswapV3Style,
+        Venue::PancakeV3 => HopKind::PancakeV3,
+        Venue::AerodromeV2 => HopKind::AerodromeV2,
     }
 }
 
-/// **A priced cycle becomes one checked plan**, in both venue orders: one
-/// Balancer loan of the input in the start token, each hop as its venue's step,
-/// hop 2 spending exactly what hop 1 must return, hop 2 bounded by the larger
-/// of its slippage bound and the loan plus the minimum profit, and a commitment
-/// the executor will recompute.
+/// The plan the builder must produce: hop 0 at least its quote, hop 1 at
+/// least the larger of the loan plus the floor and its slippage bound.
+fn expected(b: &PoolBook, cycle: &Cycle, c: &Candidate, min_profit: u128, lender: LeanLender) -> LeanPlan {
+    let input = c.input_amount.get();
+    let mid = u256_to_alloy(LiveCycle::new(cycle, &b.snapshot()).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0]);
+    let floor = (input + U256::from(min_profit)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
+    let hop = |l: &Leg, min: U256| LeanHop {
+        kind: kind(b.get(l.pool).unwrap().spec.venue),
+        pool: l.pool,
+        token_out: l.token_out,
+        min_out: u128::try_from(min).unwrap(),
+    };
+    LeanPlan {
+        lender,
+        amount: u128::try_from(input).unwrap(),
+        deadline: DEADLINE,
+        min_profit,
+        hops: vec![hop(&cycle.legs[0], mid), hop(&cycle.legs[1], floor)],
+    }
+}
+
+/// The call carries exactly `want`: its calldata, its commitment, its plan.
+fn assert_builds(call: &apex_exec::call::ExecutorCall, want: &LeanPlan) {
+    assert_eq!((call.to(), call.chain_id()), (EXECUTOR, 8453));
+    assert_eq!(call.data(), &run_calldata(want).unwrap()[..]);
+    assert_eq!(call.commitment(), lean_commitment(want, 8453, EXECUTOR).unwrap());
+    assert_eq!(call.plan(), &CallPlan::Lean(want.clone()));
+}
+
+/// **A priced cycle becomes one `run` call**, in both venue orders: a Balancer
+/// loan of the input, each hop's pool and kind in order, hop 0 at least its
+/// quote, hop 1 at least the larger of its slippage bound and the loan plus the
+/// minimum profit, and the commitment the signer recomputes.
 #[test]
-fn a_priced_cycle_becomes_one_checked_plan_in_either_venue_order() {
+fn a_priced_cycle_becomes_one_run_call_in_either_venue_order() {
     // A lower tick is fewer USDC per WETH. The cycle starts in WETH, so it sells
     // WETH first where WETH is dear — the higher tick — and buys it back cheap.
     for (uni, slip, first) in [(-197_350, -197_300, Venue::Slipstream), (-197_300, -197_350, Venue::UniswapV3)] {
         let b = book(uni, slip);
         let (cycle, c) = priced(&b);
         assert_eq!(b.get(cycle.legs[0].pool).unwrap().spec.venue, first, "WETH is sold first where it is dear");
-        let k = commitment(&c, 1);
-        let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &k).expect("builds");
-
-        assert_eq!((call.to(), call.chain_id()), (EXECUTOR, 8453));
-        let plan = v2(&call);
-        assert_eq!(plan_commitment(plan, 8453, EXECUTOR), call.commitment());
-        assert_eq!((plan.min_profit, plan.chain_id, plan.deadline), (U256::from(1u64), 8453, DEADLINE));
-
-        let input = c.input_amount.get();
-        assert_eq!(plan.loans.len(), 1);
-        let loan = plan.loans[0];
-        assert_eq!((loan.token, loan.amount, loan.provider, loan.provider_addr), (WETH, input, LoanProvider::Balancer, BALANCER_VAULT));
-
-        let mid = u256_to_alloy(
-            LiveCycle::new(&cycle, &b.snapshot()).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
-        );
-        let floor = (input + U256::from(1u64)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
-        let [l0, l1] = &cycle.legs;
-        let want = [
-            expected_step(&b, l0.pool, l0.token_in, l0.token_out, input, mid),
-            expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, floor),
-        ];
-        assert_eq!(plan.steps.len(), 2);
-        for (got, (op, data)) in plan.steps.iter().zip(want) {
-            assert_eq!(got.op, op);
-            assert_eq!(got.data, data, "{op:?}");
-        }
-        assert_eq!(plan.cycle_slippage_bps, 0, "the hops' own bounds are the policy");
+        let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &commitment(&c, 1)).expect("builds");
+        assert_builds(&call, &expected(&b, &cycle, &c, 1, LeanLender::Balancer));
 
         // With a minimum profit of half the gain, what the cycle owes is above
-        // the slippage bound, and it is hop 2's minimum.
-        let owed = input + (c.expected_output - input) / U256::from(2u64);
-        assert!(owed > c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
-        let k = commitment(&c, u64::try_from((c.expected_output - input) / U256::from(2u64)).unwrap());
-        let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &k).expect("builds");
-        let want = expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, owed);
-        assert_eq!((v2(&call).steps[1].op, v2(&call).steps[1].data.clone()), want);
+        // the slippage bound, and it is hop 1's minimum.
+        let half = u128::try_from((c.expected_output - c.input_amount.get()) / U256::from(2u64)).unwrap();
+        let call = LiveCallBuilder::new(b.clone(), [cycle.clone()])
+            .build(&c, &commitment(&c, u64::try_from(half).unwrap()))
+            .expect("builds");
+        let want = expected(&b, &cycle, &c, half, LeanLender::Balancer);
+        assert_eq!(want.hops[1].min_out, u128::try_from(c.input_amount.get()).unwrap() + half);
+        assert_builds(&call, &want);
     }
 }
 
-/// **PancakeSwap's hop is adapter 2's call**: the `SmartRouter`'s
-/// `exactInputSingle` with the chain's fee — here 100 ppm where the inventory
-/// says 500 — paying the executor, in either order with Uniswap.
+/// Every venue's cycle builds, its hop of that venue's kind: PancakeSwap's
+/// pool pays through its own callback, both Slipstream factories through
+/// Uniswap's, Aerodrome v2 by the amount it is asked for.
 #[test]
-fn a_pancakeswap_hop_is_adapter_twos_router_call() {
-    for (uni, cake) in [(-197_350, -197_300), (-197_300, -197_350)] {
-        let mut p = pool(PANCAKE, Venue::PancakeV3, cake, 100, 1);
-        p.spec.fee_ppm = 500;
+fn every_venues_cycle_builds_its_hop_kind() {
+    let mut cake = pool(PANCAKE, Venue::PancakeV3, -197_300, 100, 1);
+    cake.spec.fee_ppm = 500;
+    for (uni, other) in [
+        (-197_350, cake.clone()),
+        (-197_350, pool(SLIP3, Venue::SlipstreamV3, -197_300, 400, 100)),
+        (-197_350, aero(4_541_987_609_188)),
+        (-199_000, aero(4_541_987_609_188)),
+    ] {
+        let venue = other.spec.venue;
         let b = Arc::new(PoolBook::from_snapshots(
-            [pool(UNI, Venue::UniswapV3, uni, 500, 10), p],
+            [pool(UNI, Venue::UniswapV3, uni, 500, 10), other],
             ReconstructionStatus::Verified,
         ));
         let (cycle, c) = priced(&b);
         let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &commitment(&c, 1)).expect("builds");
-        let input = c.input_amount.get();
-        let mid = u256_to_alloy(
-            LiveCycle::new(&cycle, &b.snapshot()).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
-        );
-        let floor = (input + U256::from(1u64)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
-        let [l0, l1] = &cycle.legs;
-        let want = [
-            expected_step(&b, l0.pool, l0.token_in, l0.token_out, input, mid),
-            expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, floor),
-        ];
-        for (got, (op, data)) in v2(&call).steps.iter().zip(want) {
-            assert_eq!((got.op, &got.data), (op, &data));
-        }
-        let cake_step = cycle.legs.iter().position(|l| l.pool == PANCAKE).unwrap();
-        assert_eq!(v2(&call).steps[cake_step].op, Op::Generic);
+        let want = expected(&b, &cycle, &c, 1, LeanLender::Balancer);
+        assert!(want.hops.iter().any(|h| h.kind == kind(venue)), "{venue:?}");
+        assert_builds(&call, &want);
     }
+}
+
+#[test]
+fn each_venue_maps_to_its_hop_kind() {
+    for (venue, want) in [
+        (Venue::UniswapV3, HopKind::UniswapV3Style),
+        (Venue::Slipstream, HopKind::UniswapV3Style),
+        (Venue::SlipstreamV3, HopKind::UniswapV3Style),
+        (Venue::PancakeV3, HopKind::PancakeV3),
+        (Venue::AerodromeV2, HopKind::AerodromeV2),
+    ] {
+        let leg = Leg { pool: UNI, venue, token_in: WETH, token_out: USDC, zero_for_one: true, fee_ppm: 500 };
+        assert_eq!(
+            lean_hop(&leg, U256::from(42u64)),
+            Ok(LeanHop { kind: want, pool: UNI, token_out: USDC, min_out: 42 })
+        );
+    }
+    let leg = Leg { pool: UNI, venue: Venue::UniswapV3, token_in: WETH, token_out: USDC, zero_for_one: true, fee_ppm: 500 };
+    assert!(lean_hop(&leg, U256::from(u128::MAX) + U256::from(1u64)).is_err(), "a minimum beyond 128 bits");
 }
 
 /// The book moved after pricing: the candidate's price is not the price of any
@@ -300,24 +274,18 @@ fn a_cycle_below_its_floor_is_refused() {
     assert!(matches!(&err, Decline::Uncommittable { detail } if detail.contains("minimum profit")), "{err:?}");
 }
 
-/// R27: the commitment's lender is the plan's. Balancer's vault; the Morpho
-/// lender, once it is configured, as an ERC-3156 loan from its address;
-/// nothing else.
+/// The commitment's lender is the plan's: Balancer's vault, or Morpho Blue
+/// directly (R29); nothing else.
 #[test]
 fn the_plan_borrows_from_the_commitments_lender() {
-    use apex_runtime::live::lenders::MORPHO_FLASH;
-    let lender = Address::repeat_byte(0xee);
     let b = book(-197_350, -197_300);
     let (cycle, c) = priced(&b);
-    let morpho_k = ExecutionCommitment { flash_source: MORPHO_FLASH, ..commitment(&c, 1) };
-    let err = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &morpho_k).unwrap_err();
-    assert!(matches!(&err, Decline::Uncommittable { detail } if detail.contains("Morpho")), "unconfigured: {err:?}");
-    let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).with_morpho(lender).build(&c, &morpho_k).expect("builds");
-    let loan = v2(&call).loans[0];
-    assert_eq!((loan.provider, loan.provider_addr, loan.amount), (LoanProvider::Erc3156, lender, c.input_amount.get()));
+    let k = ExecutionCommitment { flash_source: MORPHO_FLASH, ..commitment(&c, 1) };
+    let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &k).expect("builds");
+    assert_builds(&call, &expected(&b, &cycle, &c, 1, LeanLender::Morpho));
     for source in [FlashProviderId(0), FlashProviderId(3)] {
         let k = ExecutionCommitment { flash_source: source, ..commitment(&c, 1) };
-        let err = LiveCallBuilder::new(b.clone(), [cycle.clone()]).with_morpho(lender).build(&c, &k).unwrap_err();
+        let err = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &k).unwrap_err();
         assert!(matches!(err, Decline::Uncommittable { .. }), "{source:?}: {err:?}");
     }
 }
@@ -347,255 +315,4 @@ fn a_commitment_that_does_not_describe_this_cycle_is_refused() {
     // A route the builder holds no cycle for.
     let err = LiveCallBuilder::new(b, []).build(&c, &k).unwrap_err();
     assert!(matches!(&err, Decline::Uncommittable { detail } if detail.contains("no live cycle")), "{err:?}");
-}
-
-// ------------------------------------------------------------------ reachability
-
-use apex_chain::rpc::{RpcError, RpcTransport};
-use apex_runtime::live::abi::{self, selector, MULTICALL3};
-use apex_runtime::live::calls::{binding, reachable_venues};
-use apex_runtime::live::frontier::{PANCAKE_SMART_ROUTER, SLIPSTREAM_ROUTER, SLIPSTREAM_V3_ROUTER};
-use apex_runtime::live::reads::ChainReads;
-use serde_json::{json, Value};
-use std::sync::Mutex;
-
-fn word(v: U256) -> Vec<u8> {
-    v.to_be_bytes::<32>().to_vec()
-}
-
-fn address_word(a: Address) -> Vec<u8> {
-    [vec![0u8; 12], a.to_vec()].concat()
-}
-
-/// `aggregate3`'s answer: `(bool success, bytes returnData)[]`.
-fn encode_results(results: &[Option<Vec<u8>>]) -> Vec<u8> {
-    let w = |v: usize| word(U256::from(v));
-    let padded = |n: usize| n.div_ceil(32) * 32;
-    let mut out = [w(32), w(results.len())].concat();
-    let mut next = results.len() * 32;
-    for r in results {
-        out.extend(w(next));
-        next += 96 + padded(r.as_ref().map_or(0, Vec::len));
-    }
-    for r in results {
-        let d = r.clone().unwrap_or_default();
-        out.extend([w(usize::from(r.is_some())), w(64), w(d.len())].concat());
-        out.extend(&d);
-        out.extend(std::iter::repeat_n(0u8, padded(d.len()) - d.len()));
-    }
-    out
-}
-
-/// The sub-calls of one `aggregate3` request, in order.
-fn decode_request(data: &[u8]) -> Vec<(Address, Vec<u8>)> {
-    let body = &data[4..];
-    let at = |i: usize| U256::from_be_slice(&body[i..i + 32]).to::<usize>();
-    (0..at(32))
-        .map(|i| {
-            let t = 64 + at(64 + i * 32);
-            let len = at(t + 96);
-            (Address::from_slice(&body[t + 12..t + 32]), body[t + 128..t + 128 + len].to_vec())
-        })
-        .collect()
-}
-
-/// `(target, calldata) -> return data`.
-type Table = BTreeMap<(Address, Vec<u8>), Vec<u8>>;
-
-/// An executor's registry: answers what it was told, fails anything else.
-#[derive(Default)]
-struct Registry(Mutex<Table>);
-
-impl Registry {
-    fn holds(&self, id: u16, router: Address, sel: [u8; 4], allowed: bool) {
-        let mut m = self.0.lock().unwrap();
-        m.insert((EXECUTOR, abi::call_u16(selector::ADAPTER_OF, id)), address_word(router));
-        m.insert(
-            (EXECUTOR, abi::call_u16_bytes4(selector::IS_SELECTOR_ALLOWED, id, sel)),
-            word(U256::from(u8::from(allowed))),
-        );
-    }
-}
-
-#[async_trait::async_trait]
-impl RpcTransport for Registry {
-    async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
-        assert_eq!(method, "eth_call");
-        assert_eq!(params[0]["to"].as_str().unwrap().parse::<Address>().unwrap(), MULTICALL3);
-        let data = alloy_primitives::hex::decode(params[0]["data"].as_str().unwrap()).unwrap();
-        let m = self.0.lock().unwrap();
-        let answers: Vec<Option<Vec<u8>>> = decode_request(&data).into_iter().map(|k| m.get(&k).cloned()).collect();
-        Ok(json!(format!("0x{}", alloy_primitives::hex::encode(encode_results(&answers)))))
-    }
-}
-
-/// Slipstream as deployed, and PancakeSwap as the owner would register it.
-fn deployed(pancake: bool) -> Arc<Registry> {
-    let r = Arc::new(Registry::default());
-    let slip = binding(Venue::Slipstream).unwrap();
-    r.holds(slip.id, SLIPSTREAM_ROUTER, slip.selector, true);
-    if pancake {
-        let cake = binding(Venue::PancakeV3).unwrap();
-        r.holds(cake.id, PANCAKE_SMART_ROUTER, cake.selector, true);
-    }
-    r
-}
-
-async fn reach(r: Arc<Registry>) -> Vec<Venue> {
-    reachable_venues(&ChainReads::new(r), EXECUTOR, 100).await.unwrap()
-}
-
-/// **A venue is priced only once the executor can reach it.** Uniswap always —
-/// its op is built in; PancakeSwap once adapter 2 holds its `SmartRouter`.
-#[tokio::test]
-async fn a_venue_is_reachable_only_once_its_adapter_is_registered() {
-    assert_eq!(reach(deployed(false)).await, vec![Venue::UniswapV3, Venue::Slipstream]);
-    assert_eq!(reach(deployed(true)).await, vec![Venue::UniswapV3, Venue::Slipstream, Venue::PancakeV3]);
-}
-
-/// Registered is not enough: the adapter must be **this** router, with **this**
-/// selector allowed. Anything else would revert the hop.
-#[tokio::test]
-async fn an_adapter_that_is_not_this_router_or_this_selector_is_unreachable() {
-    let cake = binding(Venue::PancakeV3).unwrap();
-    let elsewhere = deployed(false);
-    elsewhere.holds(cake.id, Address::repeat_byte(0xee), cake.selector, true);
-    let disallowed = deployed(false);
-    disallowed.holds(cake.id, PANCAKE_SMART_ROUTER, cake.selector, false);
-    let other_selector = deployed(false);
-    other_selector.holds(cake.id, PANCAKE_SMART_ROUTER, [0x41, 0x4b, 0xf3, 0x89], true);
-    for r in [elsewhere, disallowed, other_selector] {
-        assert_eq!(reach(r).await, vec![Venue::UniswapV3, Venue::Slipstream]);
-    }
-}
-
-/// An executor that answers nothing about its registry — no code, or no
-/// registry — reaches Uniswap alone; a read that fails whole is an error, not
-/// an empty universe.
-#[tokio::test]
-async fn an_unanswered_registry_reaches_uniswap_alone() {
-    assert_eq!(reach(Arc::new(Registry::default())).await, vec![Venue::UniswapV3]);
-
-    struct Down;
-    #[async_trait::async_trait]
-    impl RpcTransport for Down {
-        async fn call(&self, method: &str, _: Value) -> Result<Value, RpcError> {
-            Err(RpcError::Exhausted { method: method.into(), endpoints: 1, last: "timed out".into() })
-        }
-    }
-    assert!(reachable_venues(&ChainReads::new(Arc::new(Down)), EXECUTOR, 100).await.is_err());
-}
-
-/// The registry calls as `cast calldata` writes them.
-#[test]
-fn the_registry_calls_encode_as_cast_does() {
-    assert_eq!(
-        alloy_primitives::hex::encode(abi::call_u16(selector::ADAPTER_OF, 2)),
-        "b969a5300000000000000000000000000000000000000000000000000000000000000002"
-    );
-    assert_eq!(
-        alloy_primitives::hex::encode(abi::call_u16_bytes4(selector::IS_SELECTOR_ALLOWED, 2, [0x04, 0xe4, 0x5a, 0xaf])),
-        "284aea3f000000000000000000000000000000000000000000000000000000000000000204e45aaf00000000000000000000000000000000000000000000000000000000"
-    );
-}
-
-/// The second factory's $3.8M WETH/USDC pool (tick spacing 50), from
-/// `data/base/aerodrome_slipstream_v3/pools.jsonl`.
-const SLIP3: Address = address!("3FE04A59Ebd38cF06080a6F60a98D124eb59392A");
-
-/// R22: a hop in the second Slipstream factory's pool is adapter 3's router
-/// call, the same `exactInputSingle` as the first factory's.
-#[test]
-fn a_second_slipstream_hop_is_adapter_threes_router_call() {
-    for (uni, slip) in [(-197_350, -197_300), (-197_300, -197_350)] {
-        let b = Arc::new(PoolBook::from_snapshots(
-            [pool(UNI, Venue::UniswapV3, uni, 500, 10), pool(SLIP3, Venue::SlipstreamV3, slip, 400, 100)],
-            ReconstructionStatus::Verified,
-        ));
-        let (cycle, c) = priced(&b);
-        let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &commitment(&c, 1)).expect("builds");
-        let input = c.input_amount.get();
-        let mid = u256_to_alloy(
-            LiveCycle::new(&cycle, &b.snapshot()).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
-        );
-        let floor = (input + U256::from(1u64)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
-        let [l0, l1] = &cycle.legs;
-        let want = [
-            expected_step(&b, l0.pool, l0.token_in, l0.token_out, input, mid),
-            expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, floor),
-        ];
-        for (got, (op, data)) in v2(&call).steps.iter().zip(want) {
-            assert_eq!((got.op, &got.data), (op, &data));
-        }
-    }
-}
-
-#[test]
-fn the_second_slipstream_factory_binds_adapter_three() {
-    let b = binding(Venue::SlipstreamV3).expect("an adapter venue");
-    assert_eq!((b.id, b.router), (SLIPSTREAM_V3_ADAPTER, SLIPSTREAM_V3_ROUTER));
-    assert_eq!(b.id, 3);
-    assert_eq!(b.selector, binding(Venue::Slipstream).unwrap().selector, "the same exactInputSingle");
-}
-
-#[tokio::test]
-async fn the_second_slipstream_factory_is_reachable_once_adapter_three_is_registered() {
-    assert!(!reach(deployed(true)).await.contains(&Venue::SlipstreamV3), "not before the owner registers it");
-    let r = deployed(true);
-    let v3 = binding(Venue::SlipstreamV3).unwrap();
-    r.holds(v3.id, SLIPSTREAM_V3_ROUTER, v3.selector, true);
-    assert_eq!(reach(r).await, vec![Venue::UniswapV3, Venue::Slipstream, Venue::PancakeV3, Venue::SlipstreamV3]);
-}
-
-// ------------------------------------------------------------------ Aerodrome v2 (R24)
-
-const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
-
-fn aero(r1: u128) -> PoolSnapshot {
-    use apex_runtime::live::cp::{self, Loaded, Reserves};
-    let reserves = Reserves {
-        reserve0: ethers_core::types::U256::from(1_823_383_892_520_317_644_689u128),
-        reserve1: ethers_core::types::U256::from(r1),
-    };
-    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
-    let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };
-    cp::snapshot(&spec, loaded, B256::ZERO, 100)
-}
-
-/// R24: a volatile hop is adapter 4's router call, in either venue order. The
-/// Aerodrome pool prices WETH at ~2,491 USDC (tick ≈ −198,118); Uniswap's is
-/// moved ~8% either side of it.
-#[test]
-fn an_aerodrome_hop_is_adapter_fours_router_call() {
-    for uni in [-197_350, -199_000] {
-        let b = Arc::new(PoolBook::from_snapshots(
-            [pool(UNI, Venue::UniswapV3, uni, 500, 10), aero(4_541_987_609_188)],
-            ReconstructionStatus::Verified,
-        ));
-        let (cycle, c) = priced(&b);
-        let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &commitment(&c, 1)).expect("builds");
-        let input = c.input_amount.get();
-        let mid = u256_to_alloy(
-            LiveCycle::new(&cycle, &b.snapshot()).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0],
-        );
-        let floor = (input + U256::from(1u64)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
-        let [l0, l1] = &cycle.legs;
-        let want = [
-            expected_step(&b, l0.pool, l0.token_in, l0.token_out, input, mid),
-            expected_step(&b, l1.pool, l1.token_in, l1.token_out, mid, floor),
-        ];
-        for (got, (op, data)) in v2(&call).steps.iter().zip(want) {
-            assert_eq!((got.op, &got.data), (op, &data));
-        }
-        let aero_step = cycle.legs.iter().position(|l| l.pool == AERO).unwrap();
-        assert_eq!(v2(&call).steps[aero_step].op, Op::Generic);
-    }
-}
-
-/// The Phase 5 plan a call carries (R29 adds the lean one).
-fn v2(call: &apex_exec::call::ExecutorCall) -> &apex_exec::commitment::PlanV2 {
-    match call.plan() {
-        apex_exec::call::CallPlan::V2(p) => p,
-        other => panic!("not a Phase 5 plan: {other:?}"),
-    }
 }

@@ -1,5 +1,5 @@
-//! The production `CallBuilder` (Task 8.5 R6): a live cycle as the one
-//! `startV2(PlanV2)` the plane simulates and signs.
+//! The production `CallBuilder` (Task 8.5 R6, R29): a live cycle as the one
+//! `run(plan)` the plane simulates and signs, for the lean executor.
 //!
 //! # A plan is built from the state it was priced against, or not at all
 //!
@@ -10,69 +10,42 @@
 //! now, so it is declined as stale rather than built against a different state —
 //! last-mile would refuse it in any case, because the route's pools moved.
 //!
-//! # Exact amounts, no dust
+//! # Exact minimums
 //!
-//! The executor's settlement check covers only the borrowed token, so a surplus
-//! of the middle token is dust left in the contract rather than a revert. A
-//! per-hop slippage allowance on the first hop would buy tolerance with dust
-//! worth the same basis points in the one world the trade is priced for — and
-//! at edges of 1–10 bps that is most of the profit. So:
+//! The lean executor spends each hop's whole output on the next, so nothing is
+//! left in the middle token, and each hop's minimum is a bound:
 //!
-//! - **hop 1** spends the input and must return at least its quote;
-//! - **hop 2** spends exactly that quote, and must return at least the larger
+//! - **hop 0** spends the loan and must return at least its quote;
+//! - **hop 1** spends what hop 0 returned and must return at least the larger
 //!   of its slippage bound and what the cycle owes: the loan plus the
 //!   commitment's minimum profit.
 //!
-//! In the priced state hop 1 returns its quote to the wei (the local pricer
-//! matches the venues' quoters exactly), so nothing is left over. In any other
-//! state the plan either still clears its floor or reverts; it cannot land at
-//! less.
+//! In the priced state each hop returns its quote to the wei (the local pricer
+//! matches the venues exactly), so the plan returns the candidate's output. In
+//! any other state it either still clears its floor or reverts.
 //!
-//! # Three venues and one lender, and anything else is refused
+//! # Every venue, by the callback its pools make
 //!
-//! - **Uniswap v3**: the `UNIV3` op, a one-hop path through the executor's
-//!   SwapRouter02. Tokens and fee identify the pool.
-//! - **Slipstream**: the `GENERIC` op through [`SLIPSTREAM_ADAPTER`], calling
-//!   the router's `exactInputSingle`. Tokens and **tick spacing** identify the
-//!   pool, and the swap pays the executor.
-//! - **PancakeSwap v3**: the `GENERIC` op through [`PANCAKE_ADAPTER`], calling
-//!   the `SmartRouter`'s `exactInputSingle` — `IV3SwapRouter`'s, with no
-//!   deadline of its own; the plan's covers it. Tokens and fee identify the
-//!   pool.
-//! - **Aerodrome v2** (R24): the `GENERIC` op through adapter 4, calling the
-//!   router's `swapExactTokensForTokens` with one volatile route. Tokens,
-//!   `stable` and factory identify the pool.
-//! - **The loan**: Balancer V2, the only lender wired. The executor takes
-//!   exactly one loan, so a commitment naming any other source — or none — is
-//!   refused rather than built into a plan that reverts.
+//! Uniswap v3 and both Slipstream factories pay through `uniswapV3SwapCallback`,
+//! PancakeSwap v3 through `pancakeV3SwapCallback`, and Aerodrome v2 is paid
+//! first and asked for exactly its quote. The lean executor supports all five
+//! by its code; there is no registry to read.
 //!
-//! # Only what the executor can reach
+//! # The lender is the commitment's
 //!
-//! An adapter venue's hop runs only while the executor's registry holds that
-//! venue's router under its id and allows its selector. [`reachable_venues`]
-//! reads both, so a venue whose adapter was never registered — or points
-//! somewhere else — is left out of the universe rather than priced into routes
-//! that would revert `UnknownAdapter`.
+//! Morpho Blue or Balancer's vault ([`crate::live::lenders`]); a commitment
+//! naming any other source — or none — is refused rather than built into a plan
+//! that reverts.
 
-use crate::live::abi::{self, selector};
-use crate::live::book::{PoolBook, PoolSnapshot};
-use crate::live::frontier::{
-    Cycle, Leg, AERODROME_V2_ADAPTER, AERODROME_V2_ROUTER, BALANCER_FLASH, PANCAKE_ADAPTER,
-    PANCAKE_SMART_ROUTER, SLIPSTREAM_ADAPTER, SLIPSTREAM_ROUTER, SLIPSTREAM_V3_ADAPTER, SLIPSTREAM_V3_ROUTER,
-};
+use crate::live::book::PoolBook;
+use crate::live::frontier::{Cycle, Leg};
 use crate::live::inventory::Venue;
 use crate::live::pricing::LiveCycle;
-use crate::live::reads::{ChainReads, ReadError};
 use crate::plane::{CallBuilder, Decline};
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{B256, U256};
 use apex_exec::call::ExecutorCall;
-use apex_exec::commitment::{plan_commitment, Op, Step};
-use apex_exec::encode::{
-    aerodrome_swap_exact_tokens_for_tokens, apply_slippage, generic_step, slipstream_exact_input_single, univ3_path,
-    univ3_step, v3_router_exact_input_single, AerodromeSwap, PathHop, PlanEncoder, SlipstreamSwap, V3RouterSwap,
-    AERODROME_SWAP_EXACT_TOKENS_FOR_TOKENS, SLIPSTREAM_EXACT_INPUT_SINGLE, V3_ROUTER_EXACT_INPUT_SINGLE,
-};
-use apex_exec::sign::SignedPlan;
+use apex_exec::encode::apply_slippage;
+use apex_exec::lean::{lean_commitment, HopKind, LeanHop, LeanPlan, SignedLeanPlan};
 use apex_types::candidate::Candidate;
 use apex_types::commitment::ExecutionCommitment;
 use apex_types::compat::{u256_to_alloy, u256_to_ethers};
@@ -84,21 +57,12 @@ pub struct LiveCallBuilder {
     book: Arc<PoolBook>,
     /// By route hash: a candidate carries a commitment, not an id.
     cycles: BTreeMap<B256, Cycle>,
-    /// The Morpho lender's address, when it is configured (R27).
-    morpho: Option<Address>,
 }
 
 impl LiveCallBuilder {
     pub fn new(book: Arc<PoolBook>, cycles: impl IntoIterator<Item = Cycle>) -> Self {
         let cycles = cycles.into_iter().map(|c| (c.commitment.route_hash, c)).collect();
-        Self { book, cycles, morpho: None }
-    }
-
-    /// Build loans from the Morpho lender at `lender` as well as Balancer's (R27).
-    #[must_use]
-    pub fn with_morpho(mut self, lender: Address) -> Self {
-        self.morpho = Some(lender);
-        self
+        Self { book, cycles }
     }
 }
 
@@ -110,21 +74,18 @@ fn stale() -> Decline {
     Decline::StaleState { age: DurationNanos(0) }
 }
 
+fn u128_of(v: U256, what: &str) -> Result<u128, Decline> {
+    u128::try_from(v).map_err(|_| refuse(format!("{what} {v} does not fit 128 bits")))
+}
+
 impl CallBuilder for LiveCallBuilder {
     fn build(&self, c: &Candidate, k: &ExecutionCommitment) -> Result<ExecutorCall, Decline> {
         if k.route_hash != c.route.route_hash {
             return Err(refuse("the commitment is for another route"));
         }
         let cycle = self.cycles.get(&k.route_hash).ok_or_else(|| refuse("no live cycle for this route"))?;
-        // The commitment's lender is the plan's (R27): Balancer's vault, or the
-        // Morpho lender once configured; never anything else.
-        let choice = match k.flash_source {
-            BALANCER_FLASH => crate::live::lenders::BALANCER,
-            crate::live::lenders::MORPHO_FLASH => crate::live::lenders::morpho(
-                self.morpho.ok_or_else(|| refuse("the Morpho lender is not configured"))?,
-            ),
-            other => return Err(refuse(format!("flash source {} is not wired", other.0))),
-        };
+        let lender = crate::live::lenders::by_id(k.flash_source)
+            .ok_or_else(|| refuse(format!("flash source {} is not wired", k.flash_source.0)))?;
         let [input] = k.exact_inputs[..] else {
             return Err(refuse(format!("a cycle has one exact input, not {}", k.exact_inputs.len())));
         };
@@ -150,161 +111,31 @@ impl CallBuilder for LiveCallBuilder {
         }
         let bound = apply_slippage(out, slippage_out).map_err(|e| refuse(e.to_string()))?;
 
-        let steps = vec![
-            self.step(&cycle.legs[0], input, mid, k)?,
-            self.step(&cycle.legs[1], mid, floor.max(bound), k)?,
-        ];
-        let loan = crate::live::lenders::loan(&choice, cycle.start, input).map_err(refuse)?;
-        // Zero: the hops' own bounds are the slippage policy, and the executor
-        // refuses a cycle-level figure above its configured maximum.
-        let plan = PlanEncoder::build(loan, steps, 0, k.min_profit, k.chain_id.0, k.deadline);
-        let declared = plan_commitment(&plan, k.chain_id.0, k.executor_address);
-        let checked = SignedPlan::check(plan, declared, k.chain_id.0, k.executor_address)
+        let plan = LeanPlan {
+            lender: lender.lender,
+            amount: u128_of(input, "the loan")?,
+            deadline: k.deadline,
+            min_profit: u128_of(k.min_profit, "the minimum profit")?,
+            hops: vec![
+                lean_hop(&cycle.legs[0], mid).map_err(refuse)?,
+                lean_hop(&cycle.legs[1], floor.max(bound)).map_err(refuse)?,
+            ],
+        };
+        let declared = lean_commitment(&plan, k.chain_id.0, k.executor_address).map_err(|e| refuse(e.to_string()))?;
+        let checked = SignedLeanPlan::check(plan, declared, k.chain_id.0, k.executor_address)
             .map_err(|e| refuse(e.to_string()))?;
-        Ok(ExecutorCall::from_checked(checked))
+        Ok(ExecutorCall::from_lean(checked))
     }
 }
 
-/// One hop as the executor's step for its venue: shared by the reactive plan
-/// and the armed one (R26). `pool` is the hop's pool as the book holds it, for
-/// its fee and tick spacing.
-pub fn encode_step(
-    leg: &Leg,
-    pool: &PoolSnapshot,
-    amount_in: U256,
-    min_out: U256,
-    executor: Address,
-    deadline: u64,
-) -> Result<Step, String> {
-    match leg.venue {
-        Venue::UniswapV3 => {
-            // The chain's fee, read with the pool's state: the router finds
-            // the pool by tokens and fee, and the inventory's figure is only
-            // what the pool was admitted under.
-            let hop = PathHop { token_in: leg.token_in, fee: pool.state.fee_ppm };
-            let path = univ3_path(&[hop], leg.token_out).map_err(|e| e.to_string())?;
-            let data = univ3_step(&path, amount_in, min_out).map_err(|e| e.to_string())?;
-            Ok(Step { op: Op::UniV3, data })
-        }
-        Venue::Slipstream | Venue::SlipstreamV3 => {
-            let call = slipstream_exact_input_single(&SlipstreamSwap {
-                token_in: leg.token_in,
-                token_out: leg.token_out,
-                tick_spacing: pool.state.tick_spacing,
-                recipient: executor,
-                deadline,
-                amount_in,
-                min_out,
-            })
-            .map_err(|e| e.to_string())?;
-            // Each factory's pools run through its own router's adapter.
-            let adapter = binding(leg.venue).ok_or("no adapter for a Slipstream hop")?.id;
-            Ok(Step { op: Op::Generic, data: generic_step(adapter, leg.token_in, amount_in, &call) })
-        }
-        Venue::PancakeV3 => {
-            let call = v3_router_exact_input_single(&V3RouterSwap {
-                token_in: leg.token_in,
-                token_out: leg.token_out,
-                // The chain's fee, as for Uniswap: the router finds the
-                // pool by tokens and fee.
-                fee: pool.state.fee_ppm,
-                recipient: executor,
-                amount_in,
-                min_out,
-            })
-            .map_err(|e| e.to_string())?;
-            Ok(Step {
-                op: Op::Generic,
-                data: generic_step(PANCAKE_ADAPTER, leg.token_in, amount_in, &call),
-            })
-        }
-        Venue::AerodromeV2 => {
-            let call = aerodrome_swap_exact_tokens_for_tokens(&AerodromeSwap {
-                token_in: leg.token_in,
-                token_out: leg.token_out,
-                factory: Venue::AerodromeV2.factory(),
-                recipient: executor,
-                deadline,
-                amount_in,
-                min_out,
-            })
-            .map_err(|e| e.to_string())?;
-            Ok(Step { op: Op::Generic, data: generic_step(AERODROME_V2_ADAPTER, leg.token_in, amount_in, &call) })
-        }
-    }
-}
-
-impl LiveCallBuilder {
-    /// One hop as the executor's step for its venue.
-    fn step(&self, leg: &Leg, amount_in: U256, min_out: U256, k: &ExecutionCommitment) -> Result<Step, Decline> {
-        let pool = self.book.get(leg.pool).ok_or_else(stale)?;
-        encode_step(leg, &pool, amount_in, min_out, k.executor_address, k.deadline).map_err(refuse)
-    }
-}
-
-/// What the executor's registry must hold for a venue's hops to run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AdapterBinding {
-    pub id: u16,
-    pub router: Address,
-    pub selector: [u8; 4],
-}
-
-/// `None` for Uniswap v3, which runs through the executor's own `UNIV3` op;
-/// for the others, the adapter their hops are encoded through.
-pub const fn binding(venue: Venue) -> Option<AdapterBinding> {
-    match venue {
-        Venue::UniswapV3 => None,
-        Venue::Slipstream => Some(AdapterBinding {
-            id: SLIPSTREAM_ADAPTER,
-            router: SLIPSTREAM_ROUTER,
-            selector: SLIPSTREAM_EXACT_INPUT_SINGLE,
-        }),
-        Venue::PancakeV3 => Some(AdapterBinding {
-            id: PANCAKE_ADAPTER,
-            router: PANCAKE_SMART_ROUTER,
-            selector: V3_ROUTER_EXACT_INPUT_SINGLE,
-        }),
-        Venue::SlipstreamV3 => Some(AdapterBinding {
-            id: SLIPSTREAM_V3_ADAPTER,
-            router: SLIPSTREAM_V3_ROUTER,
-            selector: SLIPSTREAM_EXACT_INPUT_SINGLE,
-        }),
-        Venue::AerodromeV2 => Some(AdapterBinding {
-            id: AERODROME_V2_ADAPTER,
-            router: AERODROME_V2_ROUTER,
-            selector: AERODROME_SWAP_EXACT_TOKENS_FOR_TOKENS,
-        }),
-    }
-}
-
-/// The venues `executor` can run a hop through at `block`, in `Venue::ALL`'s
-/// order: Uniswap always — its op is built in — and an adapter venue only while
-/// the registry holds its router under its id **and** allows its selector. A
-/// read that fails for one venue leaves that venue out; a read that fails
-/// whole is an error, not an empty universe.
-pub async fn reachable_venues(reads: &ChainReads, executor: Address, block: u64) -> Result<Vec<Venue>, ReadError> {
-    let bound: Vec<(Venue, AdapterBinding)> =
-        Venue::ALL.into_iter().filter_map(|v| binding(v).map(|b| (v, b))).collect();
-    let calls: Vec<(Address, Vec<u8>)> = bound
-        .iter()
-        .flat_map(|(_, b)| {
-            [
-                (executor, abi::call_u16(selector::ADAPTER_OF, b.id)),
-                (executor, abi::call_u16_bytes4(selector::IS_SELECTOR_ALLOWED, b.id, b.selector)),
-            ]
-        })
-        .collect();
-    let answers = reads.multicall(&calls, block).await?;
-    let reached: Vec<Venue> = bound
-        .iter()
-        .zip(answers.chunks(2))
-        .filter(|((_, b), a)| {
-            let router = a.first().cloned().flatten().and_then(|d| abi::word_address(&d, 0));
-            let allowed = a.get(1).cloned().flatten().and_then(|d| abi::word_uint(&d, 0, 1));
-            router == Some(b.router) && allowed == Some(1)
-        })
-        .map(|((v, _), _)| *v)
-        .collect();
-    Ok(Venue::ALL.into_iter().filter(|v| binding(*v).is_none() || reached.contains(v)).collect())
+/// One hop of a cycle as the lean executor's: shared by the reactive plan and
+/// the armed one (R26).
+pub fn lean_hop(leg: &Leg, min_out: U256) -> Result<LeanHop, String> {
+    let kind = match leg.venue {
+        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => HopKind::UniswapV3Style,
+        Venue::PancakeV3 => HopKind::PancakeV3,
+        Venue::AerodromeV2 => HopKind::AerodromeV2,
+    };
+    let min_out = u128::try_from(min_out).map_err(|_| format!("a hop's minimum {min_out} does not fit 128 bits"))?;
+    Ok(LeanHop { kind, pool: leg.pool, token_out: leg.token_out, min_out })
 }

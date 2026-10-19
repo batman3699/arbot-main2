@@ -218,7 +218,9 @@ pub fn template(chain: ChainId, c: &Cycle, snapshot: &BTreeMap<Address, Arc<Pool
             })
             .collect(),
         hook_fingerprint: None,
-        flash_source: BALANCER_FLASH,
+        // R29: Morpho Blue, the cheaper loan; the economics falls back to
+        // Balancer's vault for an amount Morpho does not cover.
+        flash_source: crate::live::lenders::MORPHO_FLASH,
         expected_gas_class: GasClass::TwoHopConcentrated,
         last_profitable: None,
     }

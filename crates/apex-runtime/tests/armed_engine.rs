@@ -139,7 +139,7 @@ fn px() -> Pricing {
     Pricing {
         costs: RouteCosts { other_wei: 20_000_000_000, wei_per_gas: 5_000_000 },
         gas: gas::MEASURED,
-        lenders: Some(apex_runtime::live::lenders::Lenders::balancer_only(U256::from(10u128.pow(21)))),
+        lenders: Some(apex_runtime::live::lenders::Lenders { balancer: U256::from(10u128.pow(21)), morpho: None }),
         margin_wei: U256::zero(),
     }
 }
@@ -176,13 +176,18 @@ fn the_engine_arms_its_best_slots_and_renews_them() {
     // transaction: its deadline runs from now, as the arm's did (0 + 10 + 1).
     let later = engine.tick(&snap, 1_005, 5_000_000, &px(), 12_000_000_000);
     assert_eq!(later.len(), 4);
-    let word = |d: u64| format!("{d:064x}");
+    // `run(bytes)`: the plan starts at byte 68, and its deadline is the five
+    // bytes at plan offset 17 (R29).
+    let deadline_of = |calldata: &str| {
+        let data = alloy_primitives::hex::decode(calldata.trim_start_matches("0x")).unwrap();
+        data[85..90].iter().fold(0u64, |acc, b| acc << 8 | u64::from(*b))
+    };
     for l in &later {
         let ArmedLine::Renew { arm_id, to_block: 1_010, deadline: Some(23), calldata: Some(c), .. } = l else { panic!("a renewal: {l:?}") };
         let a = arms.iter().find(|a| a.arm_id == *arm_id).unwrap();
         assert_eq!(a.deadline, 11);
-        assert!(a.calldata.contains(&word(11)) && !a.calldata.contains(&word(23)));
-        assert!(c.contains(&word(23)), "re-signed with the new deadline");
+        assert_eq!(deadline_of(&a.calldata), 11);
+        assert_eq!(deadline_of(c), 23, "re-signed with the new deadline");
     }
     let s = engine.stats();
     assert_eq!((s.arms, s.renewals), (4, 4));
@@ -352,27 +357,29 @@ fn a_changed_rung_waits_for_its_window() {
     assert!(rearmed >= 1, "a one-tick move changes some rung's plan");
 }
 
-/// R27: a rung sized past Balancer's holding borrows from the Morpho lender,
-/// and its calldata names that lender; one within it borrows from Balancer.
+/// R29: a rung borrows from Morpho Blue, the cheaper loan, while Morpho holds
+/// its size, and from Balancer's vault past it; the plan's lender byte says
+/// which.
 #[test]
-fn a_rung_past_balancers_holding_borrows_from_morpho() {
+fn a_rung_past_morphos_holding_borrows_from_balancer() {
     use apex_runtime::live::lenders::Lenders;
-    let lender = Address::repeat_byte(0xee);
     let (engine, snap) = setup(16);
     let small = U256::from(10u128.pow(17)); // 0.1 WETH
-    let lenders = Lenders { balancer: small, morpho: Some((lender, U256::from(10u128.pow(21)))), morpho_extra_gas: 122_000 };
+    let lenders = Lenders { balancer: U256::from(10u128.pow(21)), morpho: Some(small) };
     let px = Pricing { lenders: Some(lenders), ..px() };
     let arms: Vec<Arm> = engine
         .tick(&snap, 1_000, 5_000_000, &px, 1)
         .into_iter()
         .filter_map(|l| if let ArmedLine::Arm(a) = l { Some(*a) } else { None })
         .collect();
-    let needle = format!("{lender:#x}").trim_start_matches("0x").to_string();
-    assert!(arms.iter().any(|a| a.lender == "morpho"), "some rung sizes past 0.1 WETH");
+    assert!(arms.iter().any(|a| a.lender == "balancer"), "some rung sizes past 0.1 WETH");
     for a in &arms {
         let size = U256::from_dec_str(&a.size_wei).unwrap();
-        assert_eq!(a.lender, if size <= small { "balancer" } else { "morpho" }, "arm {} at {size}", a.arm_id);
-        assert_eq!(a.calldata.contains(&needle), a.lender == "morpho");
+        assert_eq!(a.lender, if size <= small { "morpho" } else { "balancer" }, "arm {} at {size}", a.arm_id);
+        // `run(bytes)`: the selector, the offset, the length, then the plan,
+        // whose first byte is its lender: 0 Balancer, 1 Morpho.
+        let data = alloy_primitives::hex::decode(a.calldata.trim_start_matches("0x")).unwrap();
+        assert_eq!(data[68], u8::from(a.lender == "morpho"), "arm {}", a.arm_id);
     }
 }
 

@@ -134,12 +134,3 @@ universe:
   max_fee_ppm: 3000
   min_depth_usd: 100000
 
-# R27: MorphoFlashLender, Morpho Blue's free flash loans as ERC-3156. Deployed
-# by the owner on 2026-10-13 (Base block 52,552,304, tx 0xebbaee8c...5334). The
-# code hash is keccak256 of its 2,090-byte runtime, read back from the chain and
-# equal to the build's; the shadow refuses to start if the code there differs.
-# Remove this section and every loan is Balancer's.
-lenders:
-  morpho:
-    address: "0xDF64CC1991899340edd2e1d870AC7F8c0a4D1A9c"
-    code_hash: "0x248bf9d05e91ff2e785fe73abbc4f2fb83ed9a533d0d0d93979c19720c6358b4"

@@ -7,7 +7,7 @@
 
 use apex_chain::base::adapter::gas_limit_over;
 use apex_runtime::econ::GasEstimate;
-use apex_runtime::live::gas::{HopSteps, PerVenue, SettlementGas, MEASURED, ZERO_SLOT_PREMIUM};
+use apex_runtime::live::gas::{HopSteps, PerVenue, SettlementGas, LEAN, MEASURED, ZERO_SLOT_PREMIUM};
 use apex_runtime::live::inventory::Venue;
 use apex_types::cost::GasUsed;
 use serde_json::Value;
@@ -23,12 +23,12 @@ fn hop(venue: Venue, zero_for_one: bool, crossed: u32, word_steps: u32) -> HopSt
 #[test]
 fn a_settlement_is_its_hops_and_what_they_cross() {
     let m = SettlementGas {
-        hop: PerVenue { uniswap_v3: 100_000, slipstream: 200_000, pancake_v3: 300_000, aerodrome_v2: 400_000 },
-        crossing_down: PerVenue { uniswap_v3: 1_000, slipstream: 2_000, pancake_v3: 3_000, aerodrome_v2: 4_000 },
-        crossing_up: PerVenue { uniswap_v3: 10_000, slipstream: 20_000, pancake_v3: 30_000, aerodrome_v2: 40_000 },
+        hop: PerVenue { uniswap_v3: 100_000, slipstream: 200_000, slipstream_v3: 200_000, pancake_v3: 300_000, aerodrome_v2: 400_000 },
+        crossing_down: PerVenue { uniswap_v3: 1_000, slipstream: 2_000, slipstream_v3: 2_000, pancake_v3: 3_000, aerodrome_v2: 4_000 },
+        crossing_up: PerVenue { uniswap_v3: 10_000, slipstream: 20_000, slipstream_v3: 20_000, pancake_v3: 30_000, aerodrome_v2: 40_000 },
         word: 7,
         hop_margin: 500,
-        crossing_ceiling: PerVenue { uniswap_v3: 40_000, slipstream: 50_000, pancake_v3: 60_000, aerodrome_v2: 70_000 },
+        crossing_ceiling: PerVenue { uniswap_v3: 40_000, slipstream: 50_000, slipstream_v3: 50_000, pancake_v3: 60_000, aerodrome_v2: 70_000 },
         word_ceiling: 900,
     };
     let got = m.estimate(&[hop(Venue::Slipstream, true, 3, 1), hop(Venue::PancakeV3, false, 2, 2)]);
@@ -48,7 +48,10 @@ fn a_settlement_is_its_hops_and_what_they_cross() {
 /// The ceiling is never below the expectation, whatever a model says.
 #[test]
 fn the_ceiling_is_never_below_the_expectation() {
-    let m = SettlementGas { crossing_ceiling: PerVenue { uniswap_v3: 0, slipstream: 0, pancake_v3: 0, aerodrome_v2: 0 }, ..MEASURED };
+    let m = SettlementGas {
+        crossing_ceiling: PerVenue { uniswap_v3: 0, slipstream: 0, slipstream_v3: 0, pancake_v3: 0, aerodrome_v2: 0 },
+        ..MEASURED
+    };
     let got = m.estimate(&[hop(Venue::UniswapV3, false, 5, 0), hop(Venue::PancakeV3, true, 5, 0)]);
     assert_eq!(got.ceiling, got.expected);
 }
@@ -144,4 +147,26 @@ fn the_expected_figure_is_the_recorded_mean() {
     }
     let drift = sum_actual.abs_diff(sum_expected) * 1_000 / sum_actual;
     assert!(drift < 5, "the expectation is {drift} per mille off the recorded total");
+}
+
+/// R29: the lean executor's model. Each hop is the fork's measurement (Base
+/// block 52,671,989: the hop inside a trade plus half the lean executor's
+/// fixed cost), rounded up to the nearest 100; what a hop crosses is the
+/// pool's own work, so it is the Phase 5 executor's fit unchanged.
+#[test]
+fn the_lean_model_is_the_fork_measurement() {
+    let hop = |v| LEAN.hop.of(v);
+    assert_eq!(
+        [hop(Venue::UniswapV3), hop(Venue::PancakeV3), hop(Venue::Slipstream), hop(Venue::SlipstreamV3), hop(Venue::AerodromeV2)],
+        [116_100, 126_400, 232_600, 256_100, 168_500]
+    );
+    for v in Venue::ALL {
+        assert!(LEAN.hop.of(v) < MEASURED.hop.of(v), "{v:?}: the lean hop costs less");
+        assert_eq!(LEAN.crossing_down.of(v), MEASURED.crossing_down.of(v), "{v:?}");
+        assert_eq!(LEAN.crossing_up.of(v), MEASURED.crossing_up.of(v), "{v:?}");
+        assert_eq!(LEAN.crossing_ceiling.of(v), MEASURED.crossing_ceiling.of(v), "{v:?}");
+    }
+    assert_eq!((LEAN.hop_margin, LEAN.word, LEAN.word_ceiling), (MEASURED.hop_margin, MEASURED.word, MEASURED.word_ceiling));
+    // Both Slipstream factories cross ticks as one; their hops now differ.
+    assert_eq!(MEASURED.hop.of(Venue::SlipstreamV3), MEASURED.hop.of(Venue::Slipstream));
 }

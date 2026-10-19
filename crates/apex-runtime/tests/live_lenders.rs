@@ -1,68 +1,55 @@
-//! R27: which lender a size borrows from.
+//! R27, R29: which lender a size borrows from.
+//!
+//! The lean executor borrows from Morpho Blue directly or from Balancer's
+//! vault. Measured on a fork of Base (R29, block 52,671,989), Morpho's loan is
+//! 12,647 gas cheaper, so a size borrows from the cheapest lender that holds
+//! enough of it.
 
-use alloy_primitives::{address, Address};
-use apex_exec::commitment::LoanProvider;
-use apex_runtime::live::frontier::{BALANCER_FLASH, BALANCER_VAULT, WETH};
-use apex_runtime::live::lenders::{
-    loan, morpho, morpho_extra_gas, Lenders, BALANCER, MORPHO_EXTRA_GAS, MORPHO_EXTRA_GAS_DUSTED, MORPHO_FLASH,
-};
+use apex_exec::lean::LeanLender;
+use apex_runtime::live::frontier::BALANCER_FLASH;
+use apex_runtime::live::lenders::{Lenders, BALANCER, BALANCER_EXTRA_GAS, MORPHO, MORPHO_FLASH};
 use ethers_core::types::U256;
-
-const LENDER: Address = address!("00000000000000000000000000000000000000ee");
 
 fn weth(n: u64) -> U256 {
     U256::from(n) * U256::exp10(18)
 }
 
 #[test]
-fn a_size_borrows_from_balancer_while_it_covers_it_then_from_morpho() {
-    let both = Lenders { balancer: weth(19), morpho: Some((LENDER, weth(82_679))), morpho_extra_gas: MORPHO_EXTRA_GAS };
-    assert_eq!(both.cap(), weth(82_679));
-    assert_eq!(both.for_size(weth(1)), Some(BALANCER));
-    assert_eq!(both.for_size(weth(19)), Some(BALANCER), "the whole holding is lendable");
-    assert_eq!(both.for_size(weth(19) + 1), Some(morpho(LENDER)));
-    assert_eq!(both.for_size(weth(82_679) + 1), None, "past both");
-    assert_eq!((both.extra_gas(weth(19)), both.extra_gas(weth(20))), (0, MORPHO_EXTRA_GAS));
-    assert_eq!((morpho(LENDER).id, morpho(LENDER).provider), (MORPHO_FLASH, LoanProvider::Erc3156));
-    assert_eq!((BALANCER.id, BALANCER.provider, BALANCER.address), (BALANCER_FLASH, LoanProvider::Balancer, BALANCER_VAULT));
-
-    let alone = Lenders::balancer_only(weth(19));
-    assert_eq!((alone.cap(), alone.for_size(weth(20))), (weth(19), None));
-    // Morpho holding less than Balancer still caps at the larger.
-    let thin = Lenders { balancer: weth(19), morpho: Some((LENDER, weth(5))), morpho_extra_gas: MORPHO_EXTRA_GAS };
-    assert_eq!((thin.cap(), thin.for_size(weth(10))), (weth(19), Some(BALANCER)));
+fn each_choice_names_its_lender_and_its_gas() {
+    assert_eq!((MORPHO.id, MORPHO.lender, MORPHO.extra_gas), (MORPHO_FLASH, LeanLender::Morpho, 0));
+    assert_eq!((BALANCER.id, BALANCER.lender, BALANCER.extra_gas), (BALANCER_FLASH, LeanLender::Balancer, BALANCER_EXTRA_GAS));
+    assert_eq!(BALANCER_EXTRA_GAS, 12_700, "the fork's 12,647, rounded up");
 }
 
-/// A Morpho loan costs less gas while the lender and the executor each hold
-/// some WETH: no balance is then written from zero. Measured on ticket 51's
-/// cycle at 15 WETH: 121,700 over Balancer with neither holding any, 82,900
-/// with 1 wei in each (the owner left it there on 2026-10-13, block
-/// 52,564,816). The shadow reads both balances at boot.
 #[test]
-fn a_morpho_loan_costs_less_gas_while_both_contracts_hold_weth() {
-    let (none, some) = (U256::zero(), U256::one());
-    assert_eq!((MORPHO_EXTRA_GAS, MORPHO_EXTRA_GAS_DUSTED), (122_000, 83_000));
-    assert_eq!(morpho_extra_gas(some, some), MORPHO_EXTRA_GAS_DUSTED);
-    assert_eq!(morpho_extra_gas(weth(3), weth(7)), MORPHO_EXTRA_GAS_DUSTED);
-    for (lender, executor) in [(none, none), (some, none), (none, some)] {
-        assert_eq!(morpho_extra_gas(lender, executor), MORPHO_EXTRA_GAS, "lender {lender}, executor {executor}");
+fn the_cheapest_lender_that_covers_the_size_is_chosen() {
+    let both = Lenders { balancer: weth(19), morpho: Some(weth(82_679)) };
+    for size in [U256::one(), weth(19), weth(19) + 1, weth(82_679)] {
+        assert_eq!(both.for_size(size), Some(MORPHO), "{size}: Morpho is the cheaper and holds enough");
     }
-    let dusted =
-        Lenders { balancer: weth(19), morpho: Some((LENDER, weth(82_679))), morpho_extra_gas: MORPHO_EXTRA_GAS_DUSTED };
-    assert_eq!((dusted.extra_gas(weth(19)), dusted.extra_gas(weth(20))), (0, 83_000));
-    let choice = dusted.for_size(weth(20)).unwrap();
-    assert_eq!((choice.extra_gas, choice.address, choice.id), (83_000, LENDER, MORPHO_FLASH));
+    assert_eq!(both.for_size(weth(82_679) + 1), None, "neither holds it");
+
+    let thin = Lenders { balancer: weth(19), morpho: Some(weth(5)) };
+    assert_eq!(thin.for_size(weth(5)), Some(MORPHO));
+    assert_eq!(thin.for_size(weth(5) + 1), Some(BALANCER), "Morpho cannot cover it; Balancer can");
+    assert_eq!(thin.for_size(weth(19) + 1), None);
+
+    let balancer_only = Lenders { balancer: weth(19), morpho: None };
+    assert_eq!(balancer_only.for_size(weth(19)), Some(BALANCER));
+    assert_eq!(balancer_only.for_size(weth(19) + 1), None);
 }
 
-/// The deployed executor counts Aave's later pull as profit (simulated
-/// 2026-10-13): no Aave loan is ever built.
 #[test]
-fn a_loan_names_its_lender_and_never_aave() {
-    let amount = alloy_primitives::U256::from(5u64);
-    let b = loan(&BALANCER, WETH, amount).unwrap();
-    assert_eq!((b.token, b.amount, b.provider, b.provider_addr), (WETH, amount, LoanProvider::Balancer, BALANCER_VAULT));
-    let m = loan(&morpho(LENDER), WETH, amount).unwrap();
-    assert_eq!((m.provider, m.provider_addr), (LoanProvider::Erc3156, LENDER));
-    let aave = apex_runtime::live::lenders::LenderChoice { provider: LoanProvider::Aave, ..BALANCER };
-    assert!(loan(&aave, WETH, amount).unwrap_err().contains("cannot settle"));
+fn the_cap_is_the_largest_holding() {
+    assert_eq!(Lenders { balancer: weth(19), morpho: Some(weth(82_679)) }.cap(), weth(82_679));
+    assert_eq!(Lenders { balancer: weth(19), morpho: Some(weth(5)) }.cap(), weth(19));
+    assert_eq!(Lenders { balancer: weth(19), morpho: None }.cap(), weth(19));
+}
+
+#[test]
+fn the_extra_gas_is_the_chosen_lenders() {
+    let thin = Lenders { balancer: weth(19), morpho: Some(weth(5)) };
+    assert_eq!(thin.extra_gas(weth(1)), 0);
+    assert_eq!(thin.extra_gas(weth(6)), BALANCER_EXTRA_GAS);
+    assert_eq!(thin.extra_gas(weth(20)), 0, "no lender: the size is refused elsewhere, not charged here");
 }

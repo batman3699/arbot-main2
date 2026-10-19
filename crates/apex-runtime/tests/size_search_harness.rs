@@ -53,7 +53,7 @@ use apex_runtime::live::book::PoolBook;
 use apex_runtime::live::frontier::{self, WETH};
 use apex_runtime::live::gas;
 use apex_runtime::live::inventory::Venue;
-use apex_runtime::live::lenders::{Lenders, MORPHO_EXTRA_GAS_DUSTED};
+use apex_runtime::live::lenders::Lenders;
 use apex_runtime::live::pricing::{CostedCycle, LiveCycle};
 use apex_runtime::live::reads::ChainReads;
 use apex_runtime::shadow::config::ShadowConfig;
@@ -175,12 +175,11 @@ async fn both_size_searches_over_the_live_universe() {
     let (_, cycles) = frontier::build(ChainId::BASE, WETH, &snap);
     println!("block {BLOCK}: {} pools held, {} not loaded, {} cycles", snap.len(), unloaded.len(), cycles.len());
 
-    // The host's cost model at that hour, and its lenders with the dust in place.
+    // The host's cost model at that hour, and its lenders.
     let costs = RouteCosts { other_wei: 113_024_129_341, wei_per_gas: 5_040_189 };
     let lenders = Lenders {
         balancer: U256::from(18_750_000_000_000_000_000u128),
-        morpho: Some((Address::repeat_byte(0xee), U256::from(82_689u64) * U256::exp10(18))),
-        morpho_extra_gas: MORPHO_EXTRA_GAS_DUSTED,
+        morpho: Some(U256::from(82_689u64) * U256::exp10(18)),
     };
     let budget = SearchBudget::default();
     let old_search = |route: &dyn SizedRoute| ternary::ternary_best_size(route, budget.max_evaluations, budget.min_input);

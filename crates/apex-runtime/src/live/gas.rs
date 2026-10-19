@@ -42,6 +42,10 @@ use apex_types::cost::GasUsed;
 pub struct PerVenue {
     pub uniswap_v3: u64,
     pub slipstream: u64,
+    /// The second Slipstream factory: its pools cross ticks as the first's do,
+    /// but read their fee module more, which the lean executor's hop shows
+    /// (R29).
+    pub slipstream_v3: u64,
     pub pancake_v3: u64,
     pub aerodrome_v2: u64,
 }
@@ -50,9 +54,8 @@ impl PerVenue {
     pub const fn of(&self, venue: Venue) -> u64 {
         match venue {
             Venue::UniswapV3 => self.uniswap_v3,
-            // The second factory's pools and router are the first's code, so
-            // its crossings cost the same (R22's router simulation).
-            Venue::Slipstream | Venue::SlipstreamV3 => self.slipstream,
+            Venue::Slipstream => self.slipstream,
+            Venue::SlipstreamV3 => self.slipstream_v3,
             Venue::PancakeV3 => self.pancake_v3,
             Venue::AerodromeV2 => self.aerodrome_v2,
         }
@@ -140,6 +143,9 @@ pub const MEASURED: SettlementGas = SettlementGas {
     hop: PerVenue {
         uniswap_v3: 225_700,
         slipstream: 303_000,
+        // The second factory's pools and router are the first's code, so they
+        // cost the same through this executor (R22's router simulation).
+        slipstream_v3: 303_000,
         pancake_v3: 236_000,
         // R24: PancakeSwap's measured hop (both through GENERIC adapters) plus
         // what Aerodrome's router swap used over PancakeSwap's SmartRouter's,
@@ -149,18 +155,56 @@ pub const MEASURED: SettlementGas = SettlementGas {
         aerodrome_v2: 266_500,
     },
     // Aerodrome v2 crosses no ticks.
-    crossing_down: PerVenue { uniswap_v3: 21_300, slipstream: 43_400, pancake_v3: 32_100, aerodrome_v2: 0 },
-    crossing_up: PerVenue { uniswap_v3: 27_200, slipstream: 48_300, pancake_v3: 36_300, aerodrome_v2: 0 },
+    crossing_down: PerVenue {
+        uniswap_v3: 21_300,
+        slipstream: 43_400,
+        slipstream_v3: 43_400,
+        pancake_v3: 32_100,
+        aerodrome_v2: 0,
+    },
+    crossing_up: PerVenue {
+        uniswap_v3: 27_200,
+        slipstream: 48_300,
+        slipstream_v3: 48_300,
+        pancake_v3: 36_300,
+        aerodrome_v2: 0,
+    },
     word: 0,
     // Twice the most any recorded trade needed (11,800).
     hop_margin: 30_000,
     crossing_ceiling: PerVenue {
         uniswap_v3: 21_300 + 2 * ZERO_SLOT_PREMIUM,
         slipstream: 43_400 + 3 * ZERO_SLOT_PREMIUM,
+        slipstream_v3: 43_400 + 3 * ZERO_SLOT_PREMIUM,
         pancake_v3: 32_100 + 3 * ZERO_SLOT_PREMIUM,
         // It crosses no ticks.
         aerodrome_v2: 0,
     },
     // A cold read of the next word (2,100) and a loop of the swap.
     word_ceiling: 10_000,
+};
+
+/// **The lean executor's model (R29)**, which the runtime prices with.
+///
+/// Each hop measured on a fork of Base at block 52,671,989
+/// (`test/fork/LeanExecutorFork.t.sol`, `testHopGasByVenue`): 0.1 WETH through
+/// each venue's pool inside one call, with the middle token's balance already
+/// non-zero, plus half the lean executor's fixed cost — the transaction, Morpho
+/// Blue's loan, the settlement: 56,848 gas, which is ticket 664's dusted trade
+/// (348,647) less its two hops measured the same way. Rounded up to the next
+/// 100. A tick crossed is the pool's own work, so every crossing figure is
+/// [`MEASURED`]'s.
+///
+/// Its check against real trades is still to come: [`MEASURED`] is held to
+/// 1,560 recorded settlements of the Phase 5 executor, and nothing has settled
+/// through this one yet.
+pub const LEAN: SettlementGas = SettlementGas {
+    hop: PerVenue {
+        uniswap_v3: 116_100,
+        slipstream: 232_600,
+        slipstream_v3: 256_100,
+        pancake_v3: 126_400,
+        aerodrome_v2: 168_500,
+    },
+    ..MEASURED
 };

@@ -72,6 +72,29 @@ contract LeanHopHarness is LeanExecutor {
     {
         return _hop(kind, pool, tokenIn, tokenOut, amountIn, minOut);
     }
+
+    /// The gas of one hop inside a call, as a hop inside a trade costs.
+    function hopGas(uint8 kind, address pool, address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut)
+        external
+        returns (uint256 out, uint256 used)
+    {
+        uint256 g = gasleft();
+        out = _hop(kind, pool, tokenIn, tokenOut, amountIn, minOut);
+        used = g - gasleft();
+    }
+
+    /// Two hops in one call, the second spending the first's output.
+    function twoHopGas(uint8[2] calldata kinds, address[2] calldata pools, address[3] calldata tokens, uint256 amountIn)
+        external
+        returns (uint256 g1, uint256 g2)
+    {
+        uint256 g = gasleft();
+        uint256 mid = _hop(kinds[0], pools[0], tokens[0], tokens[1], amountIn, 0);
+        g1 = g - gasleft();
+        g = gasleft();
+        _hop(kinds[1], pools[1], tokens[1], tokens[2], mid, 0);
+        g2 = g - gasleft();
+    }
 }
 
 /// Task 8.5 R29, on a fork of Base at block 52,671,989 (through
@@ -171,6 +194,42 @@ contract LeanExecutorForkTest is Test {
         vm.expectRevert();
         lean.run(p);
         console.log("expired run: used %s", vm.lastCallGas().gasTotalUsed);
+    }
+
+    /// Each venue's hop as the gas model prices it (`live::gas::MEASURED.hop`):
+    /// the hop's own gas inside a trade, plus half the lean executor's fixed
+    /// cost (the transaction, the loan, the settlement), which is ticket 664's
+    /// dusted Morpho trade less its two hops measured the same way.
+    function testHopGasByVenue() public {
+        uint256 snap = vm.snapshotState();
+        LeanHopHarness h = new LeanHopHarness(address(this));
+        deal(WETH, address(h), 1_937_500_000_000_000_000 + 1);
+        deal(CBBTC, address(h), 1);
+        (uint256 g1, uint256 g2) = h.twoHopGas(
+            [uint8(0), uint8(0)],
+            [address(0x7C7420DD105E2779316423Ba3E973f434315EFA9), address(0x8c7080564B5A792A33Ef2FD473fbA6364d5495e5)],
+            [WETH, CBBTC, WETH],
+            1_937_500_000_000_000_000
+        );
+        vm.revertToState(snap);
+        uint256 fixedCost = 348_647 - g1 - g2;
+        console.log("ticket 664's hops: %s and %s; fixed cost %s", g1, g2, fixedCost);
+        _hopGas("uniswap_v3", 0, 0xd0b53D9277642d899DF5C87A3966A349A798F224, USDC, fixedCost);
+        _hopGas("pancake_v3", 1, 0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38, USDC, fixedCost);
+        _hopGas("slipstream", 0, 0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59, USDC, fixedCost);
+        _hopGas("slipstream_v3", 0, 0x7C7420DD105E2779316423Ba3E973f434315EFA9, CBBTC, fixedCost);
+        _hopGas("aerodrome_v2", 2, 0xcDAC0d6c6C59727a65F871236188350531885C43, USDC, fixedCost);
+    }
+
+    function _hopGas(string memory name, uint8 kind, address pool, address tokenOut, uint256 fixedCost) internal {
+        uint256 snap = vm.snapshotState();
+        LeanHopHarness h = new LeanHopHarness(address(this));
+        deal(WETH, address(h), 1e17);
+        deal(tokenOut, address(h), 1);
+        uint256 minOut = kind == 2 ? IAeroPoolF(pool).getAmountOut(1e17, WETH) : 0;
+        (, uint256 used) = h.hopGas(kind, pool, WETH, tokenOut, 1e17, minOut);
+        console.log("%s: hop %s, base %s", name, used, used + fixedCost / 2);
+        vm.revertToState(snap);
     }
 
     /// Each hop kind, on a real pool, returns what the venue's own router does

@@ -355,7 +355,7 @@ impl LivePricer {
     fn live(&self, id: RouteId) -> Option<CostedCycle> {
         let cycle = LiveCycle::new(self.cycles.get(&id)?, &self.book.snapshot())?;
         // An unread holding sizes nothing, as an unread pool balance does.
-        let lenders = self.lender.as_ref().map(|l| (*l.borrow()).unwrap_or(Lenders::balancer_only(U256::zero())));
+        let lenders = self.lender.as_ref().map(|l| (*l.borrow()).unwrap_or(Lenders { balancer: U256::zero(), morpho: None }));
         Some(CostedCycle::new(cycle, self.costs(), self.gas).lent(lenders))
     }
 }

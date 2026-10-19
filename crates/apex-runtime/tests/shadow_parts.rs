@@ -247,7 +247,7 @@ fn the_shipped_canary_config_parses() {
     assert!(c.journal.to_str().unwrap().contains("canary"));
     // Everything else is the shadow's.
     let shadow = ShadowConfig::load(&path.replace("canary", "shadow"), &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap();
-    assert_eq!((c.executor, c.universe, c.lenders.clone()), (shadow.executor, shadow.universe, shadow.lenders));
+    assert_eq!((c.executor, c.universe), (shadow.executor, shadow.universe));
 }
 
 /// R28: a tip share above the whole net is refused.
@@ -282,10 +282,6 @@ fn the_shipped_config_parses() {
     // R27.3: the heavy flashblock subscription is sampled hourly. BlockPI
     // charges by the byte, and it was a sixth of the host's traffic.
     assert_eq!((c.capacity.boot_sample_s, c.capacity.sample_every_s, c.capacity.sample_for_s), (60, 3_600, 20));
-    // R27: the Morpho lender the owner deployed, pinned to the code it runs.
-    let m = c.lenders.morpho.expect("the Morpho lender is configured");
-    assert_eq!(m.address, address!("DF64CC1991899340edd2e1d870AC7F8c0a4D1A9c"));
-    assert_eq!(format!("{:#x}", m.code_hash), "0x248bf9d05e91ff2e785fe73abbc4f2fb83ed9a533d0d0d93979c19720c6358b4");
 }
 
 /// **The run sets its own universe filter (R20).** The shadow's config names
@@ -585,21 +581,14 @@ async fn the_miss_ledger_is_drained() {
     assert_eq!(plane.drain_misses().len(), 1, "the next period's alone");
 }
 
-/// R27: the Morpho lender is configured by address and the code it must run.
-/// Absent, the shadow borrows from Balancer alone. A wrong code hash refuses.
+/// R29: Morpho Blue is the lender itself, so there is nothing to configure. A
+/// configuration still naming R27's ERC-3156 wrapper is refused, not quietly
+/// read as if the wrapper were still in use.
 #[test]
-fn the_morpho_lender_is_named_with_its_code() {
-    use apex_runtime::shadow::config::{lender_code_ok, MorphoLenderConfig};
+fn a_lenders_section_is_refused() {
     let var = "APEX_SECRET_SHADOW_TEST_LENDER";
-    let plain = ShadowConfig::from_yaml_str(&yaml(var, "var/apex/shadow.journal"), &env(var, SECRET)).unwrap();
-    assert_eq!(plain.lenders.morpho, None);
+    assert!(ShadowConfig::from_yaml_str(&yaml(var, "var/apex/shadow.journal"), &env(var, SECRET)).is_ok());
     let text = yaml(var, "var/apex/shadow.journal")
         + "lenders:\n  morpho:\n    address: \"0x00000000000000000000000000000000000000ee\"\n    code_hash: \"0x1111111111111111111111111111111111111111111111111111111111111111\"\n";
-    let c = ShadowConfig::from_yaml_str(&text, &env(var, SECRET)).unwrap();
-    let m = c.lenders.morpho.clone().unwrap();
-    assert_eq!(m, MorphoLenderConfig { address: address!("00000000000000000000000000000000000000ee"), code_hash: B256::repeat_byte(0x11) });
-    assert!(lender_code_ok(B256::repeat_byte(0x11), &m).is_ok());
-    assert!(lender_code_ok(B256::repeat_byte(0x22), &m).unwrap_err().contains("code"));
-    let typo = text.replace("code_hash", "codehash");
-    assert!(ShadowConfig::from_yaml_str(&typo, &env(var, SECRET)).is_err(), "unknown fields refused");
+    assert!(ShadowConfig::from_yaml_str(&text, &env(var, SECRET)).is_err(), "an unknown section");
 }

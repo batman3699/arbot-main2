@@ -55,10 +55,11 @@ pub const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 /// classified, so it is `Unknown`.
 pub const STANDARD_TOKENS: [Address; 2] = [WETH, USDC];
 
-/// A share of the R6 fork run's 534,100 gas for a two-hop cycle with its flash
-/// loan — half of it, per hop. A share, not a per-hop measurement, which is why
-/// the profile says `measured: false`.
-pub const GAS_PER_HOP: GasLimit = GasLimit(267_050);
+/// A share of the lean executor's 348,647 gas for a two-hop cycle with Morpho
+/// Blue's loan (R29: ticket 664's route on a fork of Base at block 52,671,989)
+/// — half of it, per hop, rounded up. A share, not a per-hop measurement, which
+/// is why the profile says `measured: false`.
+pub const GAS_PER_HOP: GasLimit = GasLimit(174_400);
 
 /// The two venues the live book holds, each with the factory it deploys from.
 pub fn registry() -> VenueRegistry {

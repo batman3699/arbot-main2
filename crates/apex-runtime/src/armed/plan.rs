@@ -1,39 +1,36 @@
-//! An armed backrun's executor call (R26). Floors only stop a trade that
+//! An armed backrun's executor call (R26, R29). Floors only stop a trade that
 //! cannot repay its loan: once included, the fee is spent either way.
 
-use crate::live::book::PoolSnapshot;
-use crate::live::calls::encode_step;
+use crate::live::calls::lean_hop;
 use crate::live::frontier::Cycle;
+use crate::live::lenders::LenderChoice;
 use alloy_primitives::{Address, U256};
 use apex_exec::call::ExecutorCall;
-use apex_exec::commitment::plan_commitment;
-use apex_exec::encode::PlanEncoder;
-use apex_exec::sign::SignedPlan;
+use apex_exec::lean::{lean_commitment, LeanPlan, SignedLeanPlan};
 use apex_types::compat::u256_to_alloy;
 
-/// The cycle at `size`. Hop 1 must return `mid`, hop 2's fixed input: less,
-/// and hop 2 could not run anyway. Hop 2 must return the loan plus one, and
-/// the plan a profit of at least one.
-#[allow(clippy::too_many_arguments)]
+/// The cycle at `size`. Hop 0 must return `mid`, hop 1's input: less, and the
+/// cycle was not the one armed. Hop 1 must return the loan plus one, and the
+/// plan a profit of at least one.
 pub fn armed_call(
     cycle: &Cycle,
-    pools: [&PoolSnapshot; 2],
     size: ethers_core::types::U256,
     mid: ethers_core::types::U256,
     executor: Address,
     chain_id: u64,
     deadline: u64,
-    lender: &crate::live::lenders::LenderChoice,
+    lender: &LenderChoice,
 ) -> Result<ExecutorCall, String> {
     let (size, mid, one) = (u256_to_alloy(size), u256_to_alloy(mid), U256::from(1));
     let repay = size.checked_add(one).ok_or("the size overflows")?;
-    let steps = vec![
-        encode_step(&cycle.legs[0], pools[0], size, mid, executor, deadline)?,
-        encode_step(&cycle.legs[1], pools[1], mid, repay, executor, deadline)?,
-    ];
-    let loan = crate::live::lenders::loan(lender, cycle.start, size)?;
-    let plan = PlanEncoder::build(loan, steps, 0, one, chain_id, deadline);
-    let declared = plan_commitment(&plan, chain_id, executor);
-    let checked = SignedPlan::check(plan, declared, chain_id, executor).map_err(|e| e.to_string())?;
-    Ok(ExecutorCall::from_checked(checked))
+    let plan = LeanPlan {
+        lender: lender.lender,
+        amount: u128::try_from(size).map_err(|_| format!("the size {size} does not fit 128 bits"))?,
+        deadline,
+        min_profit: 1,
+        hops: vec![lean_hop(&cycle.legs[0], mid)?, lean_hop(&cycle.legs[1], repay)?],
+    };
+    let declared = lean_commitment(&plan, chain_id, executor).map_err(|e| e.to_string())?;
+    let checked = SignedLeanPlan::check(plan, declared, chain_id, executor).map_err(|e| e.to_string())?;
+    Ok(ExecutorCall::from_lean(checked))
 }

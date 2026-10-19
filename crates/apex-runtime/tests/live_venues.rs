@@ -2,9 +2,9 @@
 //! Aerodrome v2's volatile pools are another.
 
 use alloy_primitives::address;
-use apex_runtime::live::calls::binding;
+use apex_runtime::live::calls::lean_hop;
 use apex_runtime::live::feed::{swap_topic, SYNC};
-use apex_runtime::live::frontier::{AERODROME_V2_ADAPTER, AERODROME_V2_ROUTER};
+use apex_runtime::live::frontier::{Leg, WETH};
 use apex_runtime::live::gas::{self, HopSteps};
 use apex_runtime::live::inventory::{self, UniverseFilter, Venue};
 use apex_venues::adapter::venue_ids;
@@ -65,13 +65,15 @@ fn it_settles_at_one_figure_a_hop() {
     assert_eq!(e.ceiling.0, gas::MEASURED.hop.aerodrome_v2 + gas::MEASURED.hop_margin);
 }
 
+/// R29: the lean executor pays an Aerodrome v2 pool first and asks it for
+/// exactly the quote: hop kind 2.
 #[test]
-fn it_binds_adapter_four_at_aerodromes_router() {
-    let b = binding(Venue::AerodromeV2).expect("an adapter venue");
-    assert_eq!((b.id, b.router), (AERODROME_V2_ADAPTER, AERODROME_V2_ROUTER));
-    assert_eq!(b.id, 4);
-    assert_eq!(AERODROME_V2_ROUTER, address!("cF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43"));
-    assert_eq!(b.selector, [0xca, 0xc8, 0x8e, 0xa9]);
+fn an_aerodrome_hop_is_the_lean_executors_kind_two() {
+    let pool = address!("cDAC0d6c6C59727a65F871236188350531885C43");
+    let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    let leg = Leg { pool, venue: Venue::AerodromeV2, token_in: WETH, token_out: usdc, zero_for_one: true, fee_ppm: 3_000 };
+    let hop = lean_hop(&leg, alloy_primitives::U256::from(7u64)).unwrap();
+    assert_eq!((hop.kind as u8, hop.pool, hop.token_out, hop.min_out), (2, pool, usdc, 7));
 }
 
 /// Only volatile records load: a stable one, or one that does not say, is refused.

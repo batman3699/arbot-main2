@@ -1,113 +1,77 @@
-//! The flash lenders a cycle borrows from (Task 8.5 R27).
+//! The flash lenders a cycle borrows from (Task 8.5 R27, R29).
 //!
-//! - Balancer V2's vault: free, ~19 WETH on Base.
-//! - Morpho Blue through `MorphoFlashLender` (ERC-3156): free, ~82,679 WETH
-//!   (2026-10-13).
+//! The lean executor borrows WETH from either, with no fee:
 //!
-//! A size borrows from Balancer while Balancer covers it (no wrapper hops),
-//! and from Morpho above. Never from Aave: the deployed executor counts Aave's
-//! later pull as profit (simulated 2026-10-13).
+//! - Morpho Blue, called directly: ~82,679 WETH (2026-10-13);
+//! - Balancer V2's vault: ~19 WETH.
+//!
+//! Measured on a fork of Base (R29, block 52,671,989, ticket 664's route,
+//! dusted), Morpho's loan is the cheaper: 348,647 gas against Balancer's
+//! 361,294. So a size borrows from the cheapest lender that holds enough of it:
+//! Morpho at every size it covers, Balancer only if it does not.
 
-use crate::live::frontier::{BALANCER_FLASH, BALANCER_VAULT};
-use alloy_primitives::{address, Address};
-use apex_exec::commitment::{Loan, LoanProvider};
+use apex_exec::lean::LeanLender;
 use apex_types::ids::FlashProviderId;
+use alloy_primitives::{address, Address};
 use ethers_core::types::U256;
 
-/// The Morpho lender's loans: the next id after Balancer's.
+use crate::live::frontier::BALANCER_FLASH;
+
+/// Morpho Blue's loans: the next id after Balancer's.
 pub const MORPHO_FLASH: FlashProviderId = FlashProviderId(2);
 
-/// Morpho Blue on Base, whose holding is what the Morpho lender can lend.
+/// Morpho Blue on Base: the lender itself, since R29.
 pub const MORPHO_BLUE: Address = address!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb");
 
-/// What a loan through `MorphoFlashLender` costs over Balancer's.
-///
-/// Measured on Base on 2026-10-13, through the deployed executor, with the
-/// deployed lender's code (Morpho approved), on ticket 51's cycle at 15 WETH
-/// (block 52,526,060): Balancer 461,224 gas, Morpho 582,924, so 121,700 more,
-/// rounded up here.
-///
-/// The figure follows the lender's and executor's WETH balances: a balance
-/// written from zero costs ~20k gas more than one changed from non-zero, and
-/// the Morpho path's refunds are capped. The first injected runs, at an
-/// address holding dust, read 94,167.
-pub const MORPHO_EXTRA_GAS: u64 = 122_000;
-
-/// The same with some WETH in both the lender and the executor: 82,900 on that
-/// cycle with 1 wei in each, rounded up here. The owner left 1 wei in each on
-/// 2026-10-13 (`script/SeedWethDust.s.sol`, Base block 52,564,816). The
-/// executor counts profit from its starting balance and the lender pulls back
-/// exactly what it lent, so a trade leaves both where they were.
-pub const MORPHO_EXTRA_GAS_DUSTED: u64 = 83_000;
-
-/// What a Morpho loan costs over Balancer's, by what the lender and the
-/// executor hold of the loan token.
-pub fn morpho_extra_gas(lender_holds: U256, executor_holds: U256) -> u64 {
-    if lender_holds.is_zero() || executor_holds.is_zero() {
-        MORPHO_EXTRA_GAS
-    } else {
-        MORPHO_EXTRA_GAS_DUSTED
-    }
-}
+/// What a Balancer loan costs over Morpho's: the fork's 12,647, rounded up.
+/// The settlement gas model (`live::gas::LEAN`) is measured with Morpho's.
+pub const BALANCER_EXTRA_GAS: u64 = 12_700;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LenderChoice {
     pub id: FlashProviderId,
-    pub provider: LoanProvider,
-    /// The address the plan's loan names.
-    pub address: Address,
-    /// The gas this lender adds over Balancer's.
+    pub lender: LeanLender,
+    /// The gas this lender adds over the model's (Morpho's).
     pub extra_gas: u64,
 }
 
-pub const BALANCER: LenderChoice =
-    LenderChoice { id: BALANCER_FLASH, provider: LoanProvider::Balancer, address: BALANCER_VAULT, extra_gas: 0 };
+pub const MORPHO: LenderChoice = LenderChoice { id: MORPHO_FLASH, lender: LeanLender::Morpho, extra_gas: 0 };
 
-/// The Morpho lender deployed at `lender`.
-pub const fn morpho(lender: Address) -> LenderChoice {
-    LenderChoice { id: MORPHO_FLASH, provider: LoanProvider::Erc3156, address: lender, extra_gas: MORPHO_EXTRA_GAS }
+pub const BALANCER: LenderChoice =
+    LenderChoice { id: BALANCER_FLASH, lender: LeanLender::Balancer, extra_gas: BALANCER_EXTRA_GAS };
+
+/// The choice a commitment's flash source names; `None` for any other source.
+pub fn by_id(id: FlashProviderId) -> Option<LenderChoice> {
+    [MORPHO, BALANCER].into_iter().find(|c| c.id == id)
 }
 
 /// What each lender holds of the loan token, as last read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lenders {
     pub balancer: U256,
-    /// The Morpho lender's address and Morpho Blue's holding, when configured.
-    pub morpho: Option<(Address, U256)>,
-    /// What a Morpho loan costs over Balancer's ([`morpho_extra_gas`]).
-    pub morpho_extra_gas: u64,
+    /// Morpho Blue's holding, once read.
+    pub morpho: Option<U256>,
 }
 
 impl Lenders {
-    pub const fn balancer_only(holding: U256) -> Self {
-        Self { balancer: holding, morpho: None, morpho_extra_gas: MORPHO_EXTRA_GAS }
-    }
-
     /// The most any size may borrow.
     pub fn cap(&self) -> U256 {
-        self.morpho.map_or(self.balancer, |(_, m)| m.max(self.balancer))
+        self.morpho.map_or(self.balancer, |m| m.max(self.balancer))
     }
 
-    /// The lender `size` borrows from: Balancer while it covers it, then Morpho.
+    /// The cheapest lender holding at least `size`.
     pub fn for_size(&self, size: U256) -> Option<LenderChoice> {
-        if size <= self.balancer {
-            return Some(BALANCER);
-        }
-        self.morpho.filter(|(_, m)| size <= *m).map(|(a, _)| LenderChoice { extra_gas: self.morpho_extra_gas, ..morpho(a) })
+        let mut covering: Vec<LenderChoice> = [(MORPHO, self.morpho), (BALANCER, Some(self.balancer))]
+            .into_iter()
+            .filter(|(_, held)| held.is_some_and(|h| size <= h))
+            .map(|(c, _)| c)
+            .collect();
+        covering.sort_by_key(|c| c.extra_gas);
+        covering.first().copied()
     }
 
-    /// The gas `size`'s loan adds over Balancer's.
+    /// The gas `size`'s loan adds over the model's.
     pub fn extra_gas(&self, size: U256) -> u64 {
         self.for_size(size).map_or(0, |c| c.extra_gas)
-    }
-}
-
-/// The executor's loan of `amount` of `token` from `choice`.
-pub fn loan(choice: &LenderChoice, token: Address, amount: alloy_primitives::U256) -> Result<Loan, String> {
-    match choice.provider {
-        LoanProvider::Balancer | LoanProvider::Erc3156 => {
-            Ok(Loan { token, amount, provider: choice.provider, provider_addr: choice.address })
-        }
-        other => Err(format!("the deployed executor cannot settle a {other:?} loan (R27)")),
     }
 }

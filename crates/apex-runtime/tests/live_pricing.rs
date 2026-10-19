@@ -637,7 +637,7 @@ fn a_route_sizes_within_the_lenders_holding() {
         .find_map(|id| free.best_size(*id, &fp(), budget()).ok().map(|s| (*id, s.amount_in)))
         .expect("one direction pays");
     let cap = unbounded / 2;
-    let (_tx, rx) = tokio::sync::watch::channel(Some(apex_runtime::live::lenders::Lenders::balancer_only(cap)));
+    let (_tx, rx) = tokio::sync::watch::channel(Some(apex_runtime::live::lenders::Lenders { balancer: cap, morpho: None }));
     let capped = LivePricer::new(b, cycles, flat(3_000_000_000_000), gas::MEASURED).with_lender(rx);
     let sized = capped.best_size(id, &fp(), budget()).expect("still pays at half the size");
     assert!(sized.amount_in <= cap, "{} > {}", sized.amount_in, cap);
@@ -653,12 +653,12 @@ fn an_unread_lender_sizes_nothing() {
     assert!(cycles.keys().all(|id| pricer.best_size(*id, &fp(), budget()).is_err()));
 }
 
-/// R27: past Balancer's holding a route sizes on into Morpho's, and each size
-/// above it pays the Morpho lender's extra gas.
+/// R29: a route borrows from Morpho Blue, the cheaper loan, at no extra gas
+/// while Morpho holds the size; past Morpho's holding it sizes on into
+/// Balancer's, and each size there pays Balancer's extra gas.
 #[test]
-fn a_route_sizes_past_balancer_into_morpho_at_its_extra_gas() {
-    use apex_runtime::live::lenders::{Lenders, MORPHO_EXTRA_GAS};
-    use apex_math::finite_size::SizedRoute;
+fn a_route_sizes_past_morpho_into_balancer_at_its_extra_gas() {
+    use apex_runtime::live::lenders::{Lenders, BALANCER_EXTRA_GAS};
     let b = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L), pool(SLIP, Venue::Slipstream, -197_300, 80, L)]);
     let (_, cycles) = frontier::build(BASE, WETH, &b.snapshot());
     let free = LivePricer::new(b.clone(), cycles.clone(), flat(3_000_000_000_000), gas::MEASURED);
@@ -666,22 +666,23 @@ fn a_route_sizes_past_balancer_into_morpho_at_its_extra_gas() {
         .keys()
         .find_map(|id| free.best_size(*id, &fp(), budget()).ok().map(|s| (*id, s.amount_in)))
         .expect("one direction pays");
-    let balancer = unbounded / 4;
-    let lenders = Lenders { balancer, morpho: Some((Address::repeat_byte(0xee), unbounded * 2)), morpho_extra_gas: MORPHO_EXTRA_GAS };
+    let morpho = unbounded / 4;
+    let lenders = Lenders { balancer: unbounded * 2, morpho: Some(morpho) };
     let (_tx, rx) = tokio::sync::watch::channel(Some(lenders));
     let pricer = LivePricer::new(b.clone(), cycles.clone(), flat(3_000_000_000_000), gas::MEASURED).with_lender(rx);
     let sized = pricer.best_size(id, &fp(), budget()).expect("pays");
-    assert!(sized.amount_in > balancer, "sized past Balancer's {balancer}: {}", sized.amount_in);
+    assert!(sized.amount_in > morpho, "sized past Morpho's {morpho}: {}", sized.amount_in);
 
     let costs = RouteCosts { other_wei: 0, wei_per_gas: 1 };
     let live = || LiveCycle::new(&cycles[&id], &b.snapshot()).unwrap();
-    let above = balancer + 1;
+    let all_morpho = Lenders { balancer: U256::zero(), morpho: Some(unbounded * 2) };
+    let above = morpho + 1;
     let with = CostedCycle::new(live(), costs, gas::MEASURED).lent(Some(lenders)).priced(above).unwrap().cost;
-    let without = CostedCycle::new(live(), costs, gas::MEASURED).lent(Some(Lenders::balancer_only(unbounded * 2))).priced(above).unwrap().cost;
-    assert_eq!(with - without, U256::from(MORPHO_EXTRA_GAS), "one unit a gas: the difference is the extra gas");
-    let at = CostedCycle::new(live(), costs, gas::MEASURED).lent(Some(lenders)).priced(balancer).unwrap().cost;
-    let at_free = CostedCycle::new(live(), costs, gas::MEASURED).lent(Some(Lenders::balancer_only(unbounded * 2))).priced(balancer).unwrap().cost;
-    assert_eq!(at, at_free, "Balancer's whole holding borrows at no extra gas");
+    let without = CostedCycle::new(live(), costs, gas::MEASURED).lent(Some(all_morpho)).priced(above).unwrap().cost;
+    assert_eq!(with - without, U256::from(BALANCER_EXTRA_GAS), "one unit a gas: the difference is Balancer's extra gas");
+    let at = CostedCycle::new(live(), costs, gas::MEASURED).lent(Some(lenders)).priced(morpho).unwrap().cost;
+    let at_free = CostedCycle::new(live(), costs, gas::MEASURED).lent(Some(all_morpho)).priced(morpho).unwrap().cost;
+    assert_eq!(at, at_free, "Morpho's whole holding borrows at no extra gas");
 }
 
 // ------------------------------------------------------------------ Aerodrome v2 (R24)

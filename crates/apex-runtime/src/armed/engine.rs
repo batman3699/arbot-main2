@@ -477,9 +477,11 @@ impl Engine {
         px: &Pricing,
     ) -> Option<(String, String, String)> {
         let s = self.settings;
-        let pools = [&**snapshot.get(&c.legs[0].pool)?, &**snapshot.get(&c.legs[1].pool)?];
-        let choice = px.lenders.and_then(|l| l.for_size(band.point.size)).unwrap_or(crate::live::lenders::BALANCER);
-        let call = armed_call(c, pools, band.point.size, band.point.mid, s.executor, s.chain_id, deadline, &choice).ok()?;
+        // Both pools held: an arm on a cycle the book no longer has is not built.
+        snapshot.get(&c.legs[0].pool)?;
+        snapshot.get(&c.legs[1].pool)?;
+        let choice = px.lenders.and_then(|l| l.for_size(band.point.size)).unwrap_or(crate::live::lenders::MORPHO);
+        let call = armed_call(c, band.point.size, band.point.mid, s.executor, s.chain_id, deadline, &choice).ok()?;
         let data = call.data();
         let lender = if choice.id == crate::live::lenders::MORPHO_FLASH { "morpho" } else { "balancer" };
         Some((format!("0x{}", alloy_primitives::hex::encode(data)), format!("{:#x}", keccak256(data)), lender.into()))

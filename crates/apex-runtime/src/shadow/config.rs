@@ -75,9 +75,6 @@ struct Raw {
     costs: CostConfig,
     capacity: CapacityConfig,
     universe: UniverseConfig,
-    /// R27: the lenders beside Balancer's vault. Absent, every loan is Balancer's.
-    #[serde(default)]
-    lenders: LendersConfig,
     /// R28: the live canary. Only `apex canary` accepts it.
     #[serde(default)]
     canary: Option<CanaryConfig>,
@@ -88,33 +85,6 @@ struct Raw {
 struct RawRpc {
     http: Vec<String>,
     ws: String,
-}
-
-/// The flash lenders beside Balancer's vault (R27).
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LendersConfig {
-    #[serde(default)]
-    pub morpho: Option<MorphoLenderConfig>,
-}
-
-/// `MorphoFlashLender`: where it is deployed and the code it must run there.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MorphoLenderConfig {
-    pub address: Address,
-    /// keccak256 of its runtime code, read back from the chain after deploy.
-    pub code_hash: B256,
-}
-
-/// Whether the code found at the Morpho lender's address is the code it must
-/// run. Nothing is borrowed from an address whose code was not read.
-pub fn lender_code_ok(found: B256, config: &MorphoLenderConfig) -> Result<(), String> {
-    if found == config.code_hash {
-        Ok(())
-    } else {
-        Err(format!("the Morpho lender at {:#x} runs code {found:#x}, not {:#x}", config.address, config.code_hash))
-    }
 }
 
 /// R28: the live canary. Present only in a canary's configuration.
@@ -220,7 +190,7 @@ impl Policy {
 
 /// How a settlement fails, and what failing costs: what the chain does not
 /// say. What a success uses is each route's own gas at its size, measured per
-/// venue (`live::gas::MEASURED`), and its limit is built from that.
+/// venue (`live::gas::LEAN`), and its limit is built from that.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CostConfig {
@@ -295,8 +265,6 @@ pub struct ShadowConfig {
     pub capacity: CapacityConfig,
     /// Which pools the run prices.
     pub universe: UniverseConfig,
-    /// The flash lenders beside Balancer's vault (R27).
-    pub lenders: LendersConfig,
     /// R28: the live canary, when this is `apex canary`'s configuration.
     pub canary: Option<CanaryConfig>,
 }
@@ -430,7 +398,6 @@ impl ShadowConfig {
             costs: raw.costs,
             capacity: raw.capacity,
             universe: raw.universe,
-            lenders: raw.lenders,
             canary: raw.canary,
         })
     }

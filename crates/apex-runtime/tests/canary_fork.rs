@@ -9,17 +9,13 @@ use apex_chain::base::send::{HttpSubmitter, RawTransport};
 use apex_chain::rpc::failover::{FailoverSettings, FailoverTransport};
 use apex_chain::rpc::RpcTransport;
 use apex_config::Secret;
-use apex_exec::call::ExecutorCall;
-use apex_exec::commitment::{plan_commitment, Loan, LoanProvider};
-use apex_exec::encode::PlanEncoder;
-use apex_exec::sign::SignedPlan;
 use apex_runtime::canary::chain::{CanaryChain, ChainSettings};
 use apex_runtime::canary::limits::{Canary, Limits};
 use apex_runtime::canary::send::{CanaryDispatcher, InFlight};
 use apex_runtime::live::adapter::Attribution;
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
-use apex_runtime::live::calls::encode_step;
-use apex_runtime::live::frontier::{self, BALANCER_VAULT, WETH};
+use apex_runtime::armed::plan::armed_call;
+use apex_runtime::live::frontier::{self, WETH};
 use apex_runtime::live::inventory::{PoolSpec, Venue};
 use apex_runtime::live::pricing::LiveCycle;
 use apex_runtime::live::reads::ChainReads;
@@ -193,14 +189,8 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
     // 4. The call, built as the plane builds it, and signed by the dev key.
     let block = cast(&["block", "latest", "--field", "timestamp", "--rpc-url", LOCAL]).parse::<u64>().unwrap();
     let deadline = block + 120;
-    let steps = vec![
-        encode_step(&cycle.legs[0], &snap[&cycle.legs[0].pool], size, mid, EXECUTOR, deadline).unwrap(),
-        encode_step(&cycle.legs[1], &snap[&cycle.legs[1].pool], mid, size + U256::from(1), EXECUTOR, deadline).unwrap(),
-    ];
-    let loan = Loan { token: WETH, amount: size, provider: LoanProvider::Balancer, provider_addr: BALANCER_VAULT };
-    let plan = PlanEncoder::build(loan, steps, 0, U256::from(1), 8453, deadline);
-    let declared = plan_commitment(&plan, 8453, EXECUTOR);
-    let call = ExecutorCall::from_checked(SignedPlan::check(plan, declared, 8453, EXECUTOR).unwrap());
+    let lender = apex_runtime::live::lenders::BALANCER;
+    let call = armed_call(cycle, u256_to_ethers(size), u256_to_ethers(mid), EXECUTOR, 8453, deadline, &lender).unwrap();
     let key = LaneKey::from_hex(&Secret::new(DEV_KEY.to_string())).unwrap();
     let nonce = cast(&["nonce", &format!("{DEV:#x}"), "--rpc-url", LOCAL]).parse::<u64>().expect("a nonce");
     let signed = key
@@ -255,16 +245,7 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
     assert_eq!(canary.report().totals.landed, 1);
 
     // 6. A stale plan (deadline past) reverts early and is counted.
-    let stale_plan = PlanEncoder::build(
-        Loan { token: WETH, amount: size, provider: LoanProvider::Balancer, provider_addr: BALANCER_VAULT },
-        vec![],
-        0,
-        U256::from(1),
-        8453,
-        block - 1_000,
-    );
-    let d2 = plan_commitment(&stale_plan, 8453, EXECUTOR);
-    let stale = ExecutorCall::from_checked(SignedPlan::check(stale_plan, d2, 8453, EXECUTOR).unwrap());
+    let stale = armed_call(cycle, u256_to_ethers(size), u256_to_ethers(mid), EXECUTOR, 8453, block - 1_000, &lender).unwrap();
     let s2 = key.sign_eip1559(&Eip1559Tx { chain_id: 8453, nonce: nonce + 1, max_priority_fee_per_gas: 1_000_000, max_fee_per_gas: 2_000_000_000, gas_limit: 1_500_000, to: stale.to(), data: stale.data().to_vec() }).unwrap();
     let tx2 = sender.send_raw(2, nonce + 1, &s2.raw, &ctx).await.expect("sent");
     chain.observe(tx2).await.unwrap();
