@@ -49,7 +49,7 @@
 
 use crate::commitment::PlanV2;
 use crate::encode::start_v2_calldata;
-use crate::lean::{run_calldata, LeanPlan, SignedLeanPlan};
+use crate::lean::{LeanPlan, SignedLeanPlan};
 use crate::sign::SignedPlan;
 use alloy_primitives::{Address, B256};
 
@@ -88,13 +88,12 @@ impl ExecutorCall {
     /// The lean executor's call (R29), from a plan whose off-chain commitment
     /// was recomputed and matched.
     pub fn from_lean(checked: SignedLeanPlan) -> Self {
-        let data = run_calldata(checked.plan()).expect("a checked plan encodes: its commitment was computed from its bytes");
         Self {
             to: checked.executor(),
             chain_id: checked.block_chain_id(),
             commitment: checked.commitment(),
             plan: CallPlan::Lean(checked.plan().clone()),
-            data,
+            data: checked.calldata().to_vec(),
         }
     }
 

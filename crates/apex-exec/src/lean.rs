@@ -147,11 +147,13 @@ pub fn lean_commitment(plan: &LeanPlan, chain_id: u64, executor: Address) -> Res
 ///
 /// ```compile_fail
 /// use apex_exec::lean::SignedLeanPlan;
-/// let forged = SignedLeanPlan { plan: todo!(), commitment: todo!(), executor: todo!(), block_chain_id: todo!(), _sealed: () };
+/// let forged = SignedLeanPlan { plan: todo!(), calldata: todo!(), commitment: todo!(), executor: todo!(), block_chain_id: todo!(), _sealed: () };
 /// ```
 #[derive(Debug)]
 pub struct SignedLeanPlan {
     plan: LeanPlan,
+    /// `run(plan)`'s calldata, encoded as the check encoded it.
+    calldata: Vec<u8>,
     commitment: B256,
     executor: Address,
     block_chain_id: u64,
@@ -165,11 +167,16 @@ impl SignedLeanPlan {
         if recomputed != declared {
             return Err(LeanError::CommitmentMismatch { declared, recomputed });
         }
-        Ok(Self { plan, commitment: declared, executor, block_chain_id, _sealed: () })
+        let calldata = run_calldata(&plan)?;
+        Ok(Self { plan, calldata, commitment: declared, executor, block_chain_id, _sealed: () })
     }
 
     pub const fn plan(&self) -> &LeanPlan {
         &self.plan
+    }
+
+    pub fn calldata(&self) -> &[u8] {
+        &self.calldata
     }
 
     pub const fn commitment(&self) -> B256 {
