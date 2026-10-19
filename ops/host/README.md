@@ -404,7 +404,7 @@ $ cast send 0x4200000000000000000000000000000000000006 "withdraw(uint256)" <wei>
 `contracts/lean/LeanExecutor.sol` calls pools directly and keeps only the
 on-chain checks the operator kept (trader-only access, the plan's deadline, the
 profit floor, the circuit breaker): ~38% less gas on ticket 664's route
-(348,647 against 566,972), more on Uniswap and PancakeSwap routes. The spec is
+(348,462 against 566,972), more on Uniswap and PancakeSwap routes. The spec is
 `docs/superpowers/specs/2026-10-17-lean-executor-design.md`. Its owner is the
 owner EOA itself (`0x69D5…8A3`), not a router, so every owner call below goes
 to it directly. Every transaction is the owner's, typed at the prompt, and
@@ -424,7 +424,8 @@ $ cast call <executor> "profitRecipient()(address)" --rpc-url https://mainnet.ba
 
 The script logs `<executor>` and its runtime code hash, which go into the
 configuration (c). Dry-run on 2026-10-19 at the owner's nonce 15: the executor
-at `0xd25B…f2c5`, 1,540,019 gas, ~0.000016 ETH at 0.0104 gwei.
+at `0xd25B…f2c5` with runtime code hash `0xb513…336a`, 1,517,232 gas, ~0.000016
+ETH at 0.0103 gwei.
 
 ### b. Seed the dust
 

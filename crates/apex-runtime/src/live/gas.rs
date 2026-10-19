@@ -190,8 +190,8 @@ pub const MEASURED: SettlementGas = SettlementGas {
 /// (`test/fork/LeanExecutorFork.t.sol`, `testHopGasByVenue`): 0.1 WETH through
 /// each venue's pool inside one call, with the middle token's balance already
 /// non-zero, plus half the lean executor's fixed cost — the transaction, Morpho
-/// Blue's loan, the settlement: 56,848 gas, which is ticket 664's dusted trade
-/// (348,647) less its two hops measured the same way. Rounded up to the next
+/// Blue's loan, the settlement: 56,663 gas, which is ticket 664's dusted trade
+/// (348,462) less its two hops measured the same way. Rounded up to the next
 /// 100. A tick crossed is the pool's own work, so every crossing figure is
 /// [`MEASURED`]'s.
 ///
@@ -200,11 +200,11 @@ pub const MEASURED: SettlementGas = SettlementGas {
 /// through this one yet.
 pub const LEAN: SettlementGas = SettlementGas {
     hop: PerVenue {
-        uniswap_v3: 116_100,
-        slipstream: 232_600,
-        slipstream_v3: 256_100,
-        pancake_v3: 126_400,
-        aerodrome_v2: 168_500,
+        uniswap_v3: 116_000,
+        slipstream: 232_500,
+        slipstream_v3: 256_000,
+        pancake_v3: 126_300,
+        aerodrome_v2: 168_400,
     },
     ..MEASURED
 };

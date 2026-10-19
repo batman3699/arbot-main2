@@ -63,7 +63,7 @@ interface IAeroRouterS {
 /// R29: leave a few units of every middle token the canary trades through at
 /// the lean executor, 1 wei of WETH there, and 1 wei of WETH at the owner, so
 /// no trade pays to write a balance from zero (~17k gas a slot; the fork
-/// measured 361,294 gas dusted against 378,394 cold on ticket 664's route).
+/// measured 361,111 gas dusted against 378,211 cold on ticket 664's route).
 ///
 /// Each token is bought with 10^12 wei of WETH (~$0.003) through its pool's
 /// venue router: kind 0 Uniswap v3, 1 PancakeSwap v3, 2 Slipstream, 3

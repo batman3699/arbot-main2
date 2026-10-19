@@ -158,7 +158,7 @@ fn the_lean_model_is_the_fork_measurement() {
     let hop = |v| LEAN.hop.of(v);
     assert_eq!(
         [hop(Venue::UniswapV3), hop(Venue::PancakeV3), hop(Venue::Slipstream), hop(Venue::SlipstreamV3), hop(Venue::AerodromeV2)],
-        [116_100, 126_400, 232_600, 256_100, 168_500]
+        [116_000, 126_300, 232_500, 256_000, 168_400]
     );
     for v in Venue::ALL {
         assert!(LEAN.hop.of(v) < MEASURED.hop.of(v), "{v:?}: the lean hop costs less");

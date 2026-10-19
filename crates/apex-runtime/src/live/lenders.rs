@@ -6,8 +6,8 @@
 //! - Balancer V2's vault: ~19 WETH.
 //!
 //! Measured on a fork of Base (R29, block 52,671,989, ticket 664's route,
-//! dusted), Morpho's loan is the cheaper: 348,647 gas against Balancer's
-//! 361,294. So a size borrows from the cheapest lender that holds enough of it:
+//! dusted), Morpho's loan is the cheaper: 348,462 gas against Balancer's
+//! 361,111. So a size borrows from the cheapest lender that holds enough of it:
 //! Morpho at every size it covers, Balancer only if it does not.
 
 use apex_exec::lean::LeanLender;
@@ -23,7 +23,7 @@ pub const MORPHO_FLASH: FlashProviderId = FlashProviderId(2);
 /// Morpho Blue on Base: the lender itself, since R29.
 pub const MORPHO_BLUE: Address = address!("BBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb");
 
-/// What a Balancer loan costs over Morpho's: the fork's 12,647, rounded up.
+/// What a Balancer loan costs over Morpho's: the fork's 12,649, rounded up.
 /// The settlement gas model (`live::gas::LEAN`) is measured with Morpho's.
 pub const BALANCER_EXTRA_GAS: u64 = 12_700;
 

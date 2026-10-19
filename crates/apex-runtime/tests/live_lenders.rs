@@ -2,7 +2,7 @@
 //!
 //! The lean executor borrows from Morpho Blue directly or from Balancer's
 //! vault. Measured on a fork of Base (R29, block 52,671,989), Morpho's loan is
-//! 12,647 gas cheaper, so a size borrows from the cheapest lender that holds
+//! 12,649 gas cheaper, so a size borrows from the cheapest lender that holds
 //! enough of it.
 
 use apex_exec::lean::LeanLender;
@@ -18,7 +18,7 @@ fn weth(n: u64) -> U256 {
 fn each_choice_names_its_lender_and_its_gas() {
     assert_eq!((MORPHO.id, MORPHO.lender, MORPHO.extra_gas), (MORPHO_FLASH, LeanLender::Morpho, 0));
     assert_eq!((BALANCER.id, BALANCER.lender, BALANCER.extra_gas), (BALANCER_FLASH, LeanLender::Balancer, BALANCER_EXTRA_GAS));
-    assert_eq!(BALANCER_EXTRA_GAS, 12_700, "the fork's 12,647, rounded up");
+    assert_eq!(BALANCER_EXTRA_GAS, 12_700, "the fork's 12,649, rounded up");
 }
 
 #[test]

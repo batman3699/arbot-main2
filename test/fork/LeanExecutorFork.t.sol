@@ -199,7 +199,8 @@ contract LeanExecutorForkTest is Test {
     /// Each venue's hop as the gas model prices it (`live::gas::MEASURED.hop`):
     /// the hop's own gas inside a trade, plus half the lean executor's fixed
     /// cost (the transaction, the loan, the settlement), which is ticket 664's
-    /// dusted Morpho trade less its two hops measured the same way.
+    /// dusted Morpho trade, measured here, less its two hops measured the same
+    /// way.
     function testHopGasByVenue() public {
         uint256 snap = vm.snapshotState();
         LeanHopHarness h = new LeanHopHarness(address(this));
@@ -212,7 +213,10 @@ contract LeanExecutorForkTest is Test {
             1_937_500_000_000_000_000
         );
         vm.revertToState(snap);
-        uint256 fixedCost = 348_647 - g1 - g2;
+        uint256 trade = runLean(1, true).gasTotalUsed;
+        vm.revertToState(snap);
+        uint256 fixedCost = trade - g1 - g2;
+        console.log("ticket 664's dusted Morpho trade: %s", trade);
         console.log("ticket 664's hops: %s and %s; fixed cost %s", g1, g2, fixedCost);
         _hopGas("uniswap_v3", 0, 0xd0b53D9277642d899DF5C87A3966A349A798F224, USDC, fixedCost);
         _hopGas("pancake_v3", 1, 0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38, USDC, fixedCost);
