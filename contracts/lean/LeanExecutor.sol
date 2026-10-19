@@ -146,15 +146,17 @@ contract LeanExecutor {
         } else {
             IMorphoFlashLoan(MORPHO_BLUE).flashLoan(WETH, amount, plan);
         }
-        _tstore(T_LOAN, 0);
     }
 
     /// Balancer V2's flash loan callback. Anyone can ask the vault for a loan
-    /// naming this contract, so only the loan `run` started is served.
+    /// naming this contract, so only the loan `run` started is served. The
+    /// flag alone decides it: `run` sets it just before calling the lender, the
+    /// callback clears it first, and between the two only the lender's WETH
+    /// transfer runs, so no one else can call back while it is set.
     function receiveFlashLoan(address[] calldata, uint256[] calldata, uint256[] calldata fees, bytes calldata plan)
         external
     {
-        if (msg.sender != BALANCER_VAULT || _tload(T_LOAN) == 0) revert UnexpectedCallback();
+        if (_tload(T_LOAN) == 0) revert UnexpectedCallback();
         _tstore(T_LOAN, 0);
         _transfer(WETH, BALANCER_VAULT, _trade(plan, fees[0]));
     }
@@ -162,7 +164,7 @@ contract LeanExecutor {
     /// Morpho Blue's flash loan callback: no fee, and Morpho pulls its
     /// repayment after this returns (the constructor's approval).
     function onMorphoFlashLoan(uint256, bytes calldata plan) external {
-        if (msg.sender != MORPHO_BLUE || _tload(T_LOAN) == 0) revert UnexpectedCallback();
+        if (_tload(T_LOAN) == 0) revert UnexpectedCallback();
         _tstore(T_LOAN, 0);
         _trade(plan, 0);
     }

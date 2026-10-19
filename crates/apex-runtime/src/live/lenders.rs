@@ -59,15 +59,13 @@ impl Lenders {
         self.morpho.map_or(self.balancer, |m| m.max(self.balancer))
     }
 
-    /// The cheapest lender holding at least `size`.
+    /// The cheapest lender holding at least `size`: the candidates are listed
+    /// cheapest first.
     pub fn for_size(&self, size: U256) -> Option<LenderChoice> {
-        let mut covering: Vec<LenderChoice> = [(MORPHO, self.morpho), (BALANCER, Some(self.balancer))]
+        [(MORPHO, self.morpho), (BALANCER, Some(self.balancer))]
             .into_iter()
-            .filter(|(_, held)| held.is_some_and(|h| size <= h))
+            .find(|(_, held)| held.is_some_and(|h| size <= h))
             .map(|(c, _)| c)
-            .collect();
-        covering.sort_by_key(|c| c.extra_gas);
-        covering.first().copied()
     }
 
     /// The gas `size`'s loan adds over the model's.

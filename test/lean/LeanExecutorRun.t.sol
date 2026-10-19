@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {LeanExecutor} from "../../contracts/lean/LeanExecutor.sol";
 import {BadPlan} from "../../contracts/lean/LeanPlanCodec.sol";
-import {LeanToken, MockV3Pool, MockAeroPool, MockVault, Poker} from "./LeanMocks.sol";
+import {LeanToken, SilentToken, MockV3Pool, MockAeroPool, MockVault, Poker} from "./LeanMocks.sol";
 import {MockMorphoFlash} from "../../contracts/mocks/MockMorphoFlash.sol";
 
 /// Task 8.5 R29: the lean executor's run path, against venue doubles. A trade
@@ -254,6 +254,106 @@ contract LeanExecutorRunTest is Test {
         lean.run(p);
         assertEq(x.balanceOf(address(lean)), 5, "the dust is untouched");
         assertEq(weth.balanceOf(VAULT), 1000e18);
+    }
+
+    /// A plan is good through the second of its deadline.
+    function testAPlanRunsAtItsDeadline() public {
+        Hop[] memory hops = new Hop[](2);
+        hops[0] = Hop(0, address(wethToX), address(x), uint128(X_OUT));
+        hops[1] = Hop(1, address(xToWeth), WETH, LOAN + 1);
+        bytes memory p = plan(0, LOAN, uint40(block.timestamp + 60), 1, hops);
+        vm.warp(block.timestamp + 60);
+        vm.prank(trader);
+        lean.run(p);
+        assertEq(weth.balanceOf(recipient), WETH_OUT - LOAN);
+    }
+
+    /// A pool that, mid-trade, asks the vault for a loan naming the executor is
+    /// refused: the loan in flight was this trade's, and its callback has run.
+    function testANestedLoanMidTradeIsRefused() public {
+        wethToX.setNestedPlan(cycle(LOAN + 1, 1));
+        bytes memory p = cycle(LOAN + 1, 1);
+        vm.expectRevert(LeanExecutor.UnexpectedCallback.selector);
+        vm.prank(trader);
+        lean.run(p);
+    }
+
+    /// The same on Morpho's loan: Morpho's callback, too, clears the loan in
+    /// flight before the hops, so a Balancer loan a pool starts mid-trade is
+    /// refused.
+    function testANestedLoanMidMorphoTradeIsRefused() public {
+        vm.etch(MORPHO, address(new MockMorphoFlash()).code);
+        weth.mint(MORPHO, 1000e18);
+        wethToX.setNestedPlan(cycle(LOAN + 1, 1));
+        Hop[] memory hops = new Hop[](2);
+        hops[0] = Hop(0, address(wethToX), address(x), uint128(X_OUT));
+        hops[1] = Hop(1, address(xToWeth), WETH, LOAN + 1);
+        bytes memory p = plan(1, LOAN, uint40(block.timestamp + 60), 1, hops);
+        vm.expectRevert(LeanExecutor.UnexpectedCallback.selector);
+        vm.prank(trader);
+        lean.run(p);
+    }
+
+    /// A pool that pays out but never calls back is not a v3 pool: refused.
+    function testAPoolThatSkipsItsCallbackIsRefused() public {
+        wethToX.setSkipCallback(true);
+        bytes memory p = cycle(LOAN + 1, 1);
+        vm.expectRevert(LeanExecutor.UnexpectedCallback.selector);
+        vm.prank(trader);
+        lean.run(p);
+    }
+
+    /// Aerodrome v2 is asked for its token on the right side in either
+    /// direction: here selling WETH, where the other test buys it.
+    function testAerodromeV2HopSellingWeth() public {
+        MockAeroPool aero = new MockAeroPool(WETH, address(x), 2000, 1);
+        x.mint(address(aero), 1e30);
+        Hop[] memory hops = new Hop[](2);
+        hops[0] = Hop(2, address(aero), address(x), uint128(X_OUT));
+        hops[1] = Hop(1, address(xToWeth), WETH, LOAN + 1);
+        vm.prank(trader);
+        lean.run(plan(0, LOAN, uint40(block.timestamp + 60), 1, hops));
+        assertEq(weth.balanceOf(recipient), WETH_OUT - LOAN);
+    }
+
+    /// A token whose transfer returns false has not paid: refused.
+    function testATokenReturningFalseIsRefused() public {
+        x.mint(address(lean), X_OUT);
+        x.setRefuses(true);
+        bytes memory p = cycle(LOAN + 1, 1);
+        vm.expectRevert(LeanExecutor.TransferFailed.selector);
+        vm.prank(trader);
+        lean.run(p);
+    }
+
+    /// A token whose transfer returns nothing pays as any other.
+    function testATokenReturningNothingIsPaid() public {
+        SilentToken s = new SilentToken();
+        MockV3Pool toS = new MockV3Pool(WETH, address(s), 2000, 1, false);
+        MockV3Pool sToWeth = new MockV3Pool(address(s), WETH, 1, 1990, true);
+        s.mint(address(toS), 1e30);
+        weth.mint(address(sToWeth), 1000e18);
+        Hop[] memory hops = new Hop[](2);
+        hops[0] = Hop(0, address(toS), address(s), uint128(X_OUT));
+        hops[1] = Hop(1, address(sToWeth), WETH, LOAN + 1);
+        vm.prank(trader);
+        lean.run(plan(0, LOAN, uint40(block.timestamp + 60), 1, hops));
+        assertEq(weth.balanceOf(recipient), WETH_OUT - LOAN);
+    }
+
+    /// Shorter than its header, or with a byte past its last hop: refused as a
+    /// plan, not read past its end.
+    function testAPlanOfTheWrongLengthIsRefused() public {
+        bytes memory good = cycle(LOAN + 1, 1);
+        vm.expectRevert(BadPlan.selector);
+        vm.prank(trader);
+        lean.run(slice(good, 10));
+        Hop[] memory one = new Hop[](1);
+        one[0] = Hop(0, address(xToWeth), WETH, 1);
+        bytes memory trailing = abi.encodePacked(plan(0, LOAN, uint40(block.timestamp + 60), 1, one), bytes1(0));
+        vm.expectRevert(BadPlan.selector);
+        vm.prank(trader);
+        lean.run(trailing);
     }
 
     function slice(bytes memory b, uint256 n) internal pure returns (bytes memory out) {

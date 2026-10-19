@@ -12,9 +12,15 @@ contract LeanToken {
     mapping(address => mapping(address => uint256)) public allowance;
     /// Delivers one unit less than every transfer asks (a fee-on-transfer token).
     bool public short;
+    /// `transfer` returns false and moves nothing.
+    bool public refuses;
 
     function setShort(bool s) external {
         short = s;
+    }
+
+    function setRefuses(bool r) external {
+        refuses = r;
     }
 
     function mint(address to, uint256 amount) external {
@@ -27,6 +33,7 @@ contract LeanToken {
     }
 
     function transfer(address to, uint256 amount) external returns (bool) {
+        if (refuses) return false;
         _move(msg.sender, to, amount);
         return true;
     }
@@ -46,6 +53,31 @@ contract LeanToken {
         balanceOf[from] -= amount;
         balanceOf[to] += short && amount > 0 ? amount - 1 : amount;
     }
+}
+
+/// A token whose `transfer` and `transferFrom` return nothing, as older ones do.
+contract SilentToken {
+    mapping(address => uint256) public balanceOf;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address to, uint256 amount) external {
+        require(balanceOf[msg.sender] >= amount, "balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+    }
+}
+
+/// Pay out without trusting a return value: the token may return none.
+function pay(address token, address to, uint256 amount) {
+    (bool ok,) = token.call(abi.encodeWithSelector(LeanToken.transfer.selector, to, amount));
+    require(ok, "payout");
+}
+
+interface IVaultLoan {
+    function flashLoan(address recipient, address[] memory tokens, uint256[] memory amounts, bytes memory userData) external;
 }
 
 interface IV3Callback {
@@ -72,6 +104,10 @@ contract MockV3Pool {
 
     int256 public lastAmountSpecified;
     bool public callTwice;
+    /// Pays out and never calls back.
+    bool public skipCallback;
+    /// Before calling back, asks the vault for a loan naming its caller.
+    bytes public nestedPlan;
     /// When set, the callback comes from this contract instead of the pool.
     Poker public delegate;
 
@@ -88,6 +124,14 @@ contract MockV3Pool {
         delegate = p;
     }
 
+    function setSkipCallback(bool s) external {
+        skipCallback = s;
+    }
+
+    function setNestedPlan(bytes calldata p) external {
+        nestedPlan = p;
+    }
+
     function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160, bytes calldata)
         external
         returns (int256 amount0, int256 amount1)
@@ -97,8 +141,9 @@ contract MockV3Pool {
         lastAmountSpecified = amountSpecified;
         uint256 amountIn = uint256(amountSpecified);
         uint256 out = amountIn * num / den;
-        LeanToken(tokenOut).transfer(recipient, out);
+        pay(tokenOut, recipient, out);
         (amount0, amount1) = zeroForOne ? (amountSpecified, -int256(out)) : (-int256(out), amountSpecified);
+        if (skipCallback) return (amount0, amount1);
         uint256 before = LeanToken(tokenIn).balanceOf(address(this));
         if (address(delegate) != address(0)) {
             delegate.poke(msg.sender, amount0, amount1);
@@ -111,6 +156,18 @@ contract MockV3Pool {
             IV3Callback(msg.sender).uniswapV3SwapCallback(amount0, amount1, "");
         }
         require(LeanToken(tokenIn).balanceOf(address(this)) >= before + amountIn, "IIA");
+        // Paid, and before returning: the window the executor's loan flag must
+        // already be closed in.
+        if (nestedPlan.length != 0) {
+            // Once: the nested trade swaps on this pool too.
+            bytes memory nested = nestedPlan;
+            delete nestedPlan;
+            address[] memory tokens = new address[](1);
+            tokens[0] = 0x4200000000000000000000000000000000000006;
+            uint256[] memory amounts = new uint256[](1);
+            amounts[0] = 1;
+            IVaultLoan(0xBA12222222228d8Ba445958a75a0704d566BF2C8).flashLoan(msg.sender, tokens, amounts, nested);
+        }
     }
 }
 
@@ -135,7 +192,7 @@ contract MockAeroPool {
         uint256 received = LeanToken(tokenIn).balanceOf(address(this)) - seenIn;
         require(received * num / den >= out, "K");
         seenIn += received;
-        LeanToken(tokenOut).transfer(to, out);
+        pay(tokenOut, to, out);
     }
 }
 
