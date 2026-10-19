@@ -481,7 +481,7 @@ impl Engine {
         snapshot.get(&c.legs[0].pool)?;
         snapshot.get(&c.legs[1].pool)?;
         let choice = px.lenders.and_then(|l| l.for_size(band.point.size)).unwrap_or(crate::live::lenders::MORPHO);
-        let call = armed_call(c, band.point.size, band.point.mid, s.executor, s.chain_id, deadline, &choice).ok()?;
+        let call = armed_call(c, band.point.size, band.point.mid, band.point.output, s.executor, s.chain_id, deadline, &choice).ok()?;
         let data = call.data();
         let lender = if choice.id == crate::live::lenders::MORPHO_FLASH { "morpho" } else { "balancer" };
         Some((format!("0x{}", alloy_primitives::hex::encode(data)), format!("{:#x}", keccak256(data)), lender.into()))

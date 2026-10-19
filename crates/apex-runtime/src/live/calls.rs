@@ -18,7 +18,10 @@
 //! - **hop 0** spends the loan and must return at least its quote;
 //! - **hop 1** spends what hop 0 returned and must return at least the larger
 //!   of its slippage bound and what the cycle owes: the loan plus the
-//!   commitment's minimum profit.
+//!   commitment's minimum profit;
+//! - **an Aerodrome v2 hop**, at either place, is asked for exactly its quote.
+//!   The executor asks the pool for the hop's minimum and passes on what it is
+//!   paid, so a bound below the quote would leave the difference in the pool.
 //!
 //! In the priced state each hop returns its quote to the wei (the local pricer
 //! matches the venues exactly), so the plan returns the candidate's output. In
@@ -117,8 +120,8 @@ impl CallBuilder for LiveCallBuilder {
             deadline: k.deadline,
             min_profit: u128_of(k.min_profit, "the minimum profit")?,
             hops: vec![
-                lean_hop(&cycle.legs[0], mid).map_err(refuse)?,
-                lean_hop(&cycle.legs[1], floor.max(bound)).map_err(refuse)?,
+                lean_hop(&cycle.legs[0], mid, mid).map_err(refuse)?,
+                lean_hop(&cycle.legs[1], out, floor.max(bound)).map_err(refuse)?,
             ],
         };
         let declared = lean_commitment(&plan, k.chain_id.0, k.executor_address).map_err(|e| refuse(e.to_string()))?;
@@ -129,12 +132,14 @@ impl CallBuilder for LiveCallBuilder {
 }
 
 /// One hop of a cycle as the lean executor's: shared by the reactive plan and
-/// the armed one (R26).
-pub fn lean_hop(leg: &Leg, min_out: U256) -> Result<LeanHop, String> {
-    let kind = match leg.venue {
-        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => HopKind::UniswapV3Style,
-        Venue::PancakeV3 => HopKind::PancakeV3,
-        Venue::AerodromeV2 => HopKind::AerodromeV2,
+/// the armed one (R26). A v3 pool pays what the swap returns, held to
+/// `min_out`; an Aerodrome v2 pool pays exactly what it is asked for, so it is
+/// asked for the hop's `quote`.
+pub fn lean_hop(leg: &Leg, quote: U256, min_out: U256) -> Result<LeanHop, String> {
+    let (kind, min_out) = match leg.venue {
+        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => (HopKind::UniswapV3Style, min_out),
+        Venue::PancakeV3 => (HopKind::PancakeV3, min_out),
+        Venue::AerodromeV2 => (HopKind::AerodromeV2, quote),
     };
     let min_out = u128::try_from(min_out).map_err(|_| format!("a hop's minimum {min_out} does not fit 128 bits"))?;
     Ok(LeanHop { kind, pool: leg.pool, token_out: leg.token_out, min_out })

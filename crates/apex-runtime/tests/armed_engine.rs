@@ -462,3 +462,60 @@ fn a_pass_that_left_slots_waiting_is_followed_at_once() {
     assert_eq!(pause_after(0), IDLE_PAUSE);
     assert_eq!(IDLE_PAUSE, Duration::from_millis(50));
 }
+
+/// R29 review: an arm closing on an Aerodrome v2 pool asks it for the arm's
+/// output, and one closing on a v3 pool for the loan plus one. The lean
+/// executor asks an Aerodrome pool for exactly the hop's minimum.
+#[test]
+fn an_arm_closing_on_aerodrome_asks_for_its_output() {
+    use apex_runtime::live::cp::{self, Loaded, Reserves};
+    const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    // Uniswap's price at tick −197,350.
+    let reserves = Reserves {
+        reserve0: U256::from(1_823_383_892_520_317_644_689u128),
+        reserve1: U256::from(4_903_486_964_987u128),
+    };
+    let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> = [
+        (UNI, Arc::new(pool(UNI, Venue::UniswapV3, -197_350, 500))),
+        (AERO, Arc::new(cp::snapshot(&spec, loaded, Default::default(), 100))),
+    ]
+    .into_iter()
+    .collect();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let closes_on_aero: BTreeSet<String> =
+        cycles.values().filter(|c| c.legs[1].pool == AERO).map(|c| format!("{:#x}", c.commitment.route_hash)).collect();
+    let settings = EngineSettings {
+        max_arms: 256,
+        rungs: 6,
+        window_s: 10,
+        block_time_ms: 2_000,
+        band_cap_bps: 5,
+        liquidity_floor_bps: 9_800,
+        executor: EXECUTOR,
+        chain_id: 8453,
+        reprice_budget: REPRICE_BUDGET,
+        reprice_for: Duration::MAX,
+        workers: 1,
+    };
+    let engine = Engine::new(cycles, settings, BTreeSet::new());
+    let arms: Vec<Arm> = engine
+        .tick(&snap, 1_000, 5_000_000, &px(), 1)
+        .into_iter()
+        .filter_map(|l| if let ArmedLine::Arm(a) = l { Some(*a) } else { None })
+        .collect();
+    assert!(arms.iter().any(|a| closes_on_aero.contains(&a.route_hash)), "an arm closes on Aerodrome");
+    for a in &arms {
+        // `run(bytes)`: the plan at byte 68, its 38-byte header, hop 0's 57
+        // bytes, then hop 1, whose minimum is its last 16.
+        let data = alloy_primitives::hex::decode(a.calldata.trim_start_matches("0x")).unwrap();
+        let min = data[68 + 38 + 57 + 41..68 + 38 + 57 + 57].iter().fold(0u128, |acc, b| acc << 8 | u128::from(*b));
+        let want = if closes_on_aero.contains(&a.route_hash) {
+            a.output_wei.parse::<u128>().unwrap()
+        } else {
+            a.size_wei.parse::<u128>().unwrap() + 1
+        };
+        assert_eq!(min, want, "arm {} on {}", a.arm_id, a.route_hash);
+    }
+}

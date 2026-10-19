@@ -98,6 +98,33 @@ fn the_band_is_two_bounds_and_a_floor() {
     assert_eq!(v[2]["params"]["value"], format!("{:#x}", U256::from(L) * U256::from(9_800) / U256::from(10_000)));
 }
 
+/// An armed cycle closing on Aerodrome v2 asks the pool for the armed output,
+/// not the loan plus one (R29 review): the lean executor asks an Aerodrome
+/// pool for exactly the hop's minimum, so a break-even ask would leave all of
+/// the profit but a wei in the pool.
+#[test]
+fn an_armed_aerodrome_closing_hop_is_asked_for_the_armed_output() {
+    use apex_exec::call::CallPlan;
+    use apex_runtime::live::cp::{self, Loaded, Reserves};
+    const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let reserves = Reserves {
+        reserve0: U256::from(1_823_383_892_520_317_644_689u128),
+        reserve1: U256::from(4_541_987_609_188u128),
+    };
+    let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };
+    let a = pool(UNI, Venue::UniswapV3, -197_350, 500);
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> =
+        [(UNI, Arc::new(a)), (AERO, Arc::new(cp::snapshot(&spec, loaded, Default::default(), 100)))].into_iter().collect();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let c = cycles.values().find(|c| c.legs[1].pool == AERO).expect("a cycle closing on Aerodrome");
+    let (size, mid, output) = (U256::from(10u128.pow(18)), U256::from(3_000_000_000u64), U256::from(10u128.pow(18) + 5_000_000_000_000));
+    let call = armed_call(c, size, mid, output, EXECUTOR, 8453, 1_791_800_000, &apex_runtime::live::lenders::MORPHO).unwrap();
+    let CallPlan::Lean(plan) = call.plan() else { panic!("a lean plan") };
+    assert_eq!(plan.hops[1].min_out, 10u128.pow(18) + 5_000_000_000_000, "asked for the armed output");
+    assert_eq!(plan.hops[0].min_out, 3_000_000_000, "the v3 hop at its quote");
+}
+
 /// Hop 1's floor is `mid`, hop 2's the loan plus one, the plan's profit floor 1,
 /// as a lean plan (R29) from the chosen lender.
 #[test]
@@ -111,14 +138,18 @@ fn the_armed_plan_carries_break_even_floors() {
     let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
     let c = cycles.values().next().unwrap();
     let (size, mid) = (U256::from(10u128.pow(18)), U256::from(3_000_000_000u64));
-    let call = armed_call(c, size, mid, EXECUTOR, 8453, 1_791_800_000, &apex_runtime::live::lenders::MORPHO).unwrap();
+    let output = size + U256::from(7u64);
+    let call = armed_call(c, size, mid, output, EXECUTOR, 8453, 1_791_800_000, &apex_runtime::live::lenders::MORPHO).unwrap();
     let (s, m) = (u256_to_alloy(size), u256_to_alloy(mid));
     let want = LeanPlan {
         lender: LeanLender::Morpho,
         amount: 10u128.pow(18),
         deadline: 1_791_800_000,
         min_profit: 1,
-        hops: vec![lean_hop(&c.legs[0], m).unwrap(), lean_hop(&c.legs[1], s + alloy_primitives::U256::from(1)).unwrap()],
+        hops: vec![
+            lean_hop(&c.legs[0], m, m).unwrap(),
+            lean_hop(&c.legs[1], u256_to_alloy(output), s + alloy_primitives::U256::from(1)).unwrap(),
+        ],
     };
     assert_eq!(call.plan(), &CallPlan::Lean(want));
     assert_eq!((call.to(), call.chain_id()), (EXECUTOR, 8453));

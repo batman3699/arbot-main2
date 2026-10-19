@@ -141,23 +141,24 @@ fn kind(v: Venue) -> HopKind {
 }
 
 /// The plan the builder must produce: hop 0 at least its quote, hop 1 at
-/// least the larger of the loan plus the floor and its slippage bound.
+/// least the larger of the loan plus the floor and its slippage bound — and an
+/// Aerodrome v2 hop, at either place, its quote: the pool pays exactly what it
+/// is asked for.
 fn expected(b: &PoolBook, cycle: &Cycle, c: &Candidate, min_profit: u128, lender: LeanLender) -> LeanPlan {
     let input = c.input_amount.get();
     let mid = u256_to_alloy(LiveCycle::new(cycle, &b.snapshot()).unwrap().hop_outputs(u256_to_ethers(input)).unwrap()[0]);
     let floor = (input + U256::from(min_profit)).max(c.expected_output * U256::from(9_970u64) / U256::from(10_000u64));
-    let hop = |l: &Leg, min: U256| LeanHop {
-        kind: kind(b.get(l.pool).unwrap().spec.venue),
-        pool: l.pool,
-        token_out: l.token_out,
-        min_out: u128::try_from(min).unwrap(),
+    let hop = |l: &Leg, quote: U256, min: U256| {
+        let venue = b.get(l.pool).unwrap().spec.venue;
+        let min = if venue == Venue::AerodromeV2 { quote } else { min };
+        LeanHop { kind: kind(venue), pool: l.pool, token_out: l.token_out, min_out: u128::try_from(min).unwrap() }
     };
     LeanPlan {
         lender,
         amount: u128::try_from(input).unwrap(),
         deadline: DEADLINE,
         min_profit,
-        hops: vec![hop(&cycle.legs[0], mid), hop(&cycle.legs[1], floor)],
+        hops: vec![hop(&cycle.legs[0], mid, mid), hop(&cycle.legs[1], c.expected_output, floor)],
     }
 }
 
@@ -222,6 +223,34 @@ fn every_venues_cycle_builds_its_hop_kind() {
     }
 }
 
+/// **An Aerodrome v2 hop is asked for its whole quote** (R29 review). The lean
+/// executor asks an Aerodrome pool for exactly the hop's minimum and passes on
+/// what it is paid, so a closing hop asked for its slippage bound would leave
+/// the rest of the cycle's output in the pool — at the canary's 1-wei floor,
+/// all of the profit but that wei.
+#[test]
+fn an_aerodrome_hop_is_asked_for_its_whole_quote() {
+    let mut closing = 0;
+    for uni in [-197_350, -199_000] {
+        let b = Arc::new(PoolBook::from_snapshots(
+            [pool(UNI, Venue::UniswapV3, uni, 500, 10), aero(4_541_987_609_188)],
+            ReconstructionStatus::Verified,
+        ));
+        let (cycle, c) = priced(&b);
+        let call = LiveCallBuilder::new(b.clone(), [cycle.clone()]).build(&c, &commitment(&c, 1)).expect("builds");
+        let CallPlan::Lean(plan) = call.plan() else { panic!("a lean plan") };
+        let live = LiveCycle::new(&cycle, &b.snapshot()).unwrap();
+        let mid = u256_to_alloy(live.hop_outputs(u256_to_ethers(c.input_amount.get())).unwrap()[0]);
+        for (i, quote) in [mid, c.expected_output].into_iter().enumerate() {
+            if b.get(cycle.legs[i].pool).unwrap().spec.venue == Venue::AerodromeV2 {
+                assert_eq!(U256::from(plan.hops[i].min_out), quote, "hop {i} at {uni}");
+                closing += usize::from(i == 1);
+            }
+        }
+    }
+    assert_eq!(closing, 1, "one of the two books closes its cycle on Aerodrome");
+}
+
 #[test]
 fn each_venue_maps_to_its_hop_kind() {
     for (venue, want) in [
@@ -233,12 +262,12 @@ fn each_venue_maps_to_its_hop_kind() {
     ] {
         let leg = Leg { pool: UNI, venue, token_in: WETH, token_out: USDC, zero_for_one: true, fee_ppm: 500 };
         assert_eq!(
-            lean_hop(&leg, U256::from(42u64)),
-            Ok(LeanHop { kind: want, pool: UNI, token_out: USDC, min_out: 42 })
+            lean_hop(&leg, U256::from(43u64), U256::from(42u64)),
+            Ok(LeanHop { kind: want, pool: UNI, token_out: USDC, min_out: if venue == Venue::AerodromeV2 { 43 } else { 42 } })
         );
     }
     let leg = Leg { pool: UNI, venue: Venue::UniswapV3, token_in: WETH, token_out: USDC, zero_for_one: true, fee_ppm: 500 };
-    assert!(lean_hop(&leg, U256::from(u128::MAX) + U256::from(1u64)).is_err(), "a minimum beyond 128 bits");
+    assert!(lean_hop(&leg, U256::ZERO, U256::from(u128::MAX) + U256::from(1u64)).is_err(), "a minimum beyond 128 bits");
 }
 
 /// The book moved after pricing: the candidate's price is not the price of any

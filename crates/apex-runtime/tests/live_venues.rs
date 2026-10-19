@@ -66,13 +66,13 @@ fn it_settles_at_one_figure_a_hop() {
 }
 
 /// R29: the lean executor pays an Aerodrome v2 pool first and asks it for
-/// exactly the quote: hop kind 2.
+/// exactly the quote: hop kind 2, its minimum the quote.
 #[test]
 fn an_aerodrome_hop_is_the_lean_executors_kind_two() {
     let pool = address!("cDAC0d6c6C59727a65F871236188350531885C43");
     let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
     let leg = Leg { pool, venue: Venue::AerodromeV2, token_in: WETH, token_out: usdc, zero_for_one: true, fee_ppm: 3_000 };
-    let hop = lean_hop(&leg, alloy_primitives::U256::from(7u64)).unwrap();
+    let hop = lean_hop(&leg, alloy_primitives::U256::from(7u64), alloy_primitives::U256::from(5u64)).unwrap();
     assert_eq!((hop.kind as u8, hop.pool, hop.token_out, hop.min_out), (2, pool, usdc, 7));
 }
 

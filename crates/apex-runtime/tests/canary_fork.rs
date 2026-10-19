@@ -209,7 +209,7 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
     let deadline = block + 120;
     // Morpho Blue, the runtime's default lender.
     let lender = apex_runtime::live::lenders::MORPHO;
-    let call = armed_call(cycle, u256_to_ethers(size), u256_to_ethers(mid), executor, 8453, deadline, &lender).unwrap();
+    let call = armed_call(cycle, u256_to_ethers(size), u256_to_ethers(mid), u256_to_ethers(out), executor, 8453, deadline, &lender).unwrap();
     let key = LaneKey::from_hex(&Secret::new(DEV_KEY.to_string())).unwrap();
     let nonce = cast(&["nonce", &format!("{DEV:#x}"), "--rpc-url", LOCAL]).parse::<u64>().expect("a nonce");
     let signed = key
@@ -265,7 +265,7 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
     assert_eq!(canary.report().totals.landed, 1);
 
     // 6. A stale plan (deadline past) reverts early and is counted.
-    let stale = armed_call(cycle, u256_to_ethers(size), u256_to_ethers(mid), executor, 8453, block - 1_000, &lender).unwrap();
+    let stale = armed_call(cycle, u256_to_ethers(size), u256_to_ethers(mid), u256_to_ethers(out), executor, 8453, block - 1_000, &lender).unwrap();
     let s2 = key.sign_eip1559(&Eip1559Tx { chain_id: 8453, nonce: nonce + 1, max_priority_fee_per_gas: 1_000_000, max_fee_per_gas: 2_000_000_000, gas_limit: 1_500_000, to: stale.to(), data: stale.data().to_vec() }).unwrap();
     let tx2 = sender.send_raw(2, nonce + 1, &s2.raw, &ctx).await.expect("sent");
     chain.observe(tx2).await.unwrap();
