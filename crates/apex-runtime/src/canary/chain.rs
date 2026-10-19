@@ -21,9 +21,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const PROFIT_REALISED: &str = "0x230bad4a4399a7f96d7dc55ada0f3e590e98017ef0fb0ef2ae55914350e5d832";
+/// The lean executor's `Profit(uint256 gross)` (R29).
+const PROFIT: &str = "0x357d905f1831209797df4d55d79c5c5bf1d9f7311c976afd05e13d881eab9bc8";
 /// A revert under this much gas stopped before the swaps: the deadline, the
-/// commitment, the caller (spec §7).
+/// caller, the circuit (spec §7). The lean executor's expired run costs 24,399
+/// (R29's fork measurement).
 pub const EARLY_REVERT_GAS: u64 = 100_000;
 
 /// A receipt, and what the executor paid and said it realised.
@@ -32,7 +34,7 @@ pub struct Read {
     pub receipt: Receipt,
     /// WETH transferred from the executor to the recipients.
     pub paid_wei: u128,
-    /// `ProfitRealised`'s gross, when the executor emitted it.
+    /// `Profit`'s gross, when the executor emitted it.
     pub realised_wei: Option<u128>,
 }
 
@@ -82,8 +84,8 @@ pub fn read_receipt(v: &Value, weth: Address, executor: Address, recipients: &[A
         {
             paid_wei = paid_wei.saturating_add(data_word(log, 0).ok_or("a Transfer's amount did not decode")?);
         }
-        if address == Some(executor) && topic0.as_deref() == Some(PROFIT_REALISED) {
-            realised_wei = Some(data_word(log, 0).ok_or("ProfitRealised's gross did not decode")?);
+        if address == Some(executor) && topic0.as_deref() == Some(PROFIT) {
+            realised_wei = Some(data_word(log, 0).ok_or("Profit's gross did not decode")?);
         }
     }
     Ok(Read { receipt, paid_wei, realised_wei })
@@ -186,7 +188,7 @@ impl CanaryChain {
             return Err(AdapterError::Reverted { tx, class, gas_used: r.gas_used, spent_wei: cost });
         }
         if read.realised_wei != Some(read.paid_wei) {
-            let detail = format!("paid {} wei, and ProfitRealised says {:?}", read.paid_wei, read.realised_wei);
+            let detail = format!("paid {} wei, and Profit says {:?}", read.paid_wei, read.realised_wei);
             self.record(tx, Settled::Unexplained { detail: detail.clone() });
             self.in_flight.remove(&tx);
             return Err(AdapterError::Uninterpretable { detail });

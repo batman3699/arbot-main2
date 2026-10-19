@@ -592,3 +592,17 @@ fn a_lenders_section_is_refused() {
         + "lenders:\n  morpho:\n    address: \"0x00000000000000000000000000000000000000ee\"\n    code_hash: \"0x1111111111111111111111111111111111111111111111111111111111111111\"\n";
     assert!(ShadowConfig::from_yaml_str(&text, &env(var, SECRET)).is_err(), "an unknown section");
 }
+
+/// R29: the canary trades only once the executor pays its profit to the
+/// configured recipient. The lean executor has one recipient and no fee
+/// recipient, so the check is one read.
+#[test]
+fn the_canary_refuses_to_start_unless_profit_goes_to_its_recipient() {
+    use apex_runtime::shadow::recipient_check;
+    let owner = address!("69D54e5fC0b9325D7250f0D0A11690327A3dd8A3");
+    assert!(recipient_check(Some(owner), owner).is_ok());
+    for read in [None, Some(address!("CB436Ba3acb945b3fc8EE6345857262584356595"))] {
+        let err = recipient_check(read, owner).unwrap_err().to_string();
+        assert!(err.contains("recipient"), "{err}");
+    }
+}

@@ -251,6 +251,17 @@ struct Shadow {
     started: Instant,
 }
 
+/// R28, R29: the executor pays its profit to the canary's recipient, or the
+/// canary does not start.
+pub fn recipient_check(paid_to: Option<Address>, recipient: Address) -> Result<(), ShadowError> {
+    if paid_to == Some(recipient) {
+        return Ok(());
+    }
+    Err(ShadowError::Boot(format!(
+        "the executor pays profit to {paid_to:?}, not canary.profit_recipient {recipient}: the owner sets the recipient first"
+    )))
+}
+
 /// Whether the signer's nonce differs from its first reading. A shadow never
 /// broadcasts, so any move means the key was used elsewhere (R25).
 pub fn nonce_moved(boot: Option<u64>, now: u64) -> bool {
@@ -444,22 +455,14 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         );
     }
     // R28: a canary trades only once the executor pays its profit where the
-    // configuration says (the owner's recipient change, ops/host/README.md §10).
+    // configuration says. R29: the lean executor has one recipient.
     if let Some(k) = &config.canary {
         let e = config.executor.address;
         let read = reads
-            .multicall(&[(e, abi::call0(selector::PROFIT_RECIPIENT)), (e, abi::call0(selector::FEE_RECIPIENT))], head)
+            .multicall(&[(e, abi::call0(selector::PROFIT_RECIPIENT))], head)
             .await
-            .map_err(|e| boot_err("the executor's recipients", e))?;
-        let at = |i: usize| read.get(i).cloned().flatten().and_then(|d| abi::word_address(&d, 0));
-        if at(0) != Some(k.profit_recipient) || at(1) != Some(k.profit_recipient) {
-            return Err(ShadowError::Boot(format!(
-                "the executor pays profit to {:?} and fees to {:?}, not canary.profit_recipient {}: the owner's recipient change comes first",
-                at(0),
-                at(1),
-                k.profit_recipient
-            )));
-        }
+            .map_err(|e| boot_err("the executor's recipient", e))?;
+        recipient_check(read.first().cloned().flatten().and_then(|d| abi::word_address(&d, 0)), k.profit_recipient)?;
     }
 
     // Costs, from the chain now; the head task keeps them current.

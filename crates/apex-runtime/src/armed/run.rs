@@ -517,15 +517,21 @@ async fn simulate(
     let replay = replayed_logs(block, fire.tx_index, &calls[..calls.len() - 1], &pools);
     let ok = last.get("status").and_then(Value::as_str) == Some("0x1");
     let gas_used = last.get("gasUsed").and_then(hex_u128).map_or(0, |g| u64::try_from(g).unwrap_or(u64::MAX));
-    let topic = keccak256(b"ProfitRealised(address,uint256,uint256)");
-    let gross = last.get("logs").and_then(Value::as_array).and_then(|logs| {
+    let gross = simulated_gross(&last);
+    Some((SimCheck { ok, gross_wei: gross.map(|g| g.to_string()), gas_used, agrees: false, replay_diverged: false }, replay))
+}
+
+/// The gross a simulated call's executor reported: the lean executor's
+/// `Profit(uint256 gross)` (R29).
+pub fn simulated_gross(call: &Value) -> Option<U256> {
+    let topic = keccak256(b"Profit(uint256)");
+    call.get("logs").and_then(Value::as_array).and_then(|logs| {
         logs.iter().find_map(|l| {
             let t0: B256 = l.get("topics")?.get(0)?.as_str()?.parse().ok()?;
             let data = l.get("data")?.as_str()?;
             (t0 == topic).then(|| U256::from_str_radix(data.get(2..66)?, 16).ok()).flatten()
         })
-    });
-    Some((SimCheck { ok, gross_wei: gross.map(|g| g.to_string()), gas_used, agrees: false, replay_diverged: false }, replay))
+    })
 }
 
 /// What the replay itself wrote to `pools`, as the book applies it (R27):

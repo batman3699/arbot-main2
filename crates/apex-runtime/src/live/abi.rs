@@ -41,9 +41,9 @@ pub mod selector {
     pub const EXECUTORS: [u8; 4] = [0x9a, 0xc2, 0xa0, 0x11];
     /// `isCircuitOpen()`: the owner's on-chain stop (R28).
     pub const IS_CIRCUIT_OPEN: [u8; 4] = [0x1c, 0xb3, 0xbb, 0x96];
-    /// `profitRecipient()` and `feeRecipient()`: where the executor pays (R28).
+    /// `profitRecipient()`: where the executor pays (R28; the lean executor's
+    /// only recipient, R29).
     pub const PROFIT_RECIPIENT: [u8; 4] = [0x7e, 0x2b, 0xad, 0x1e];
-    pub const FEE_RECIPIENT: [u8; 4] = [0x46, 0x90, 0x48, 0x40];
     /// `tickBitmap(int16)`
     pub const TICK_BITMAP: [u8; 4] = [0x53, 0x39, 0xc2, 0x96];
     /// `ticks(int24)`

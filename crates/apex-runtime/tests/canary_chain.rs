@@ -22,6 +22,9 @@ const EXECUTOR: Address = address!("8940B565D050974b2b589B70De43bCb753b1F93B");
 const OWNER: Address = address!("69D54e5fC0b9325D7250f0D0A11690327A3dd8A3");
 const TRADER: Address = address!("CB436Ba3acb945b3fc8EE6345857262584356595");
 const TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+/// The lean executor's `Profit(uint256)` (R29).
+const PROFIT: &str = "0x357d905f1831209797df4d55d79c5c5bf1d9f7311c976afd05e13d881eab9bc8";
+/// The Phase 5 executor's `ProfitRealised(address,uint256,uint256)`.
 const REALISED: &str = "0x230bad4a4399a7f96d7dc55ada0f3e590e98017ef0fb0ef2ae55914350e5d832";
 
 fn word(v: u128) -> String {
@@ -32,7 +35,7 @@ fn topic_addr(a: Address) -> String {
 }
 
 /// A Base receipt for `tx`: the executor pays `fee` and `rest` WETH to the owner
-/// and says it realised `realised`.
+/// and says, in the lean executor's `Profit`, it realised `realised`.
 fn receipt(tx: B256, ok: bool, fee: u128, rest: u128, realised: u128) -> Value {
     let transfer = |amount: u128| json!({
         "address": format!("{WETH:#x}"),
@@ -43,7 +46,7 @@ fn receipt(tx: B256, ok: bool, fee: u128, rest: u128, realised: u128) -> Value {
         vec![
             transfer(fee),
             transfer(rest),
-            json!({ "address": format!("{EXECUTOR:#x}"), "topics": [REALISED, topic_addr(WETH)], "data": format!("0x{}{}", word(realised), word(fee)) }),
+            json!({ "address": format!("{EXECUTOR:#x}"), "topics": [PROFIT], "data": format!("0x{}", word(realised)) }),
         ]
     } else {
         vec![]
@@ -67,6 +70,27 @@ fn a_landed_trade_reads_its_gross_from_the_transfers() {
     assert_eq!((r.paid_wei, r.realised_wei), (1_000, Some(1_000)));
     assert_eq!(r.receipt.gas_used, 400_000);
     assert_eq!(r.receipt.l1_fee_wei, 1_000_000_000);
+}
+
+/// R29: the lean executor's event is what settlement reads, and its topic is
+/// `Profit(uint256)`'s.
+#[test]
+fn the_lean_executors_profit_event_is_what_settlement_reads() {
+    assert_eq!(PROFIT, format!("{:#x}", alloy_primitives::keccak256(b"Profit(uint256)")));
+    let r = read_receipt(&receipt(B256::repeat_byte(1), true, 0, 1_000, 1_000), WETH, EXECUTOR, &[OWNER]).unwrap();
+    assert_eq!((r.paid_wei, r.realised_wei), (1_000, Some(1_000)));
+}
+
+/// The Phase 5 executor's `ProfitRealised` is not the lean executor's word:
+/// a receipt carrying it has said nothing, and settles as unexplained.
+#[test]
+fn an_old_profit_realised_event_is_not_read() {
+    let mut v = receipt(B256::repeat_byte(1), true, 0, 1_000, 1_000);
+    let logs = v["logs"].as_array_mut().unwrap();
+    logs.pop();
+    logs.push(json!({ "address": format!("{EXECUTOR:#x}"), "topics": [REALISED, topic_addr(WETH)], "data": format!("0x{}{}", word(1_000), word(0)) }));
+    let r = read_receipt(&v, WETH, EXECUTOR, &[OWNER]).unwrap();
+    assert_eq!((r.paid_wei, r.realised_wei), (1_000, None));
 }
 
 /// Review focus 2: no `l1Fee`, no reconciliation. A zero would understate the
@@ -268,4 +292,13 @@ async fn a_sent_ticket_with_no_receipt_is_abandoned_and_halts() {
     let TicketOutcome::ExplicitFailure { cause, .. } = rec.resolve(&open_ticket(9)).unwrap() else { panic!() };
     assert!(cause.contains("unresolved at boot"), "{cause}");
     assert!(matches!(canary.halted(), Some(apex_runtime::canary::Halt::Unresolved { .. })));
+}
+
+/// R29: the lean executor's expired run, measured on a fork of Base at block
+/// 52,671,989 (`test/fork/LeanExecutorFork.t.sol`), costs 24,399 gas: the
+/// canary still files it as an early revert, one that stopped before the swaps.
+#[test]
+fn the_lean_executors_expired_run_is_an_early_revert() {
+    const LEAN_EXPIRED_RUN_GAS: u64 = 24_399;
+    const { assert!(LEAN_EXPIRED_RUN_GAS < apex_runtime::canary::chain::EARLY_REVERT_GAS) };
 }

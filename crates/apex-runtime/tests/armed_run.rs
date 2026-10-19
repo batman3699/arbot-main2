@@ -282,3 +282,17 @@ fn the_replays_own_logs_and_whether_they_diverge() {
     let later = vec![chain(&[1], 0), chain(&[3], 2), chain(&[7], 3)];
     assert!(!replay_diverged(&later, &replay, at, 2, &[POOL]));
 }
+
+/// R29: a simulated fire's gross is the lean executor's `Profit(uint256)`; the
+/// Phase 5 executor's `ProfitRealised` is not read as one.
+#[test]
+fn a_simulated_fires_gross_is_the_lean_executors_profit() {
+    use apex_runtime::armed::run::simulated_gross;
+    let profit = format!("{:#x}", alloy_primitives::keccak256(b"Profit(uint256)"));
+    let realised = format!("{:#x}", alloy_primitives::keccak256(b"ProfitRealised(address,uint256,uint256)"));
+    let word = format!("0x{:064x}", 180_256_364_565_428u128);
+    let call = |topic: &str| serde_json::json!({ "logs": [{ "topics": [topic], "data": word }] });
+    assert_eq!(simulated_gross(&call(&profit)), Some(ethers_core::types::U256::from(180_256_364_565_428u128)));
+    assert_eq!(simulated_gross(&call(&realised)), None);
+    assert_eq!(simulated_gross(&serde_json::json!({ "logs": [] })), None);
+}
