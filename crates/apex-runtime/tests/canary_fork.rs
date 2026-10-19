@@ -1,8 +1,10 @@
-//! R28's fork proof. Anvil forks Base's latest block from the public endpoint
-//! (never the shadow's BlockPI key); nothing touches mainnet.
+//! R28's fork proof, through the lean executor (R29). Anvil forks Base's latest
+//! block from the public endpoint (never the shadow's BlockPI key); the owner,
+//! impersonated, deploys `LeanExecutor` there from the Foundry build; nothing
+//! touches mainnet.
 //!
-//! Needs `anvil` and `cast` on PATH. In any tree:
-//!   cargo test -j 3 -p apex-runtime --test canary_fork -- --ignored --nocapture
+//! Needs `anvil`, `cast` and `forge build`'s `out/` (in any tree):
+//!   forge build && cargo test -j 3 -p apex-runtime --test canary_fork -- --ignored --nocapture
 
 use alloy_primitives::{address, Address, U256};
 use apex_chain::base::send::{HttpSubmitter, RawTransport};
@@ -32,8 +34,6 @@ use std::time::Duration;
 const FORK: &str = "https://mainnet.base.org";
 const PORT: &str = "8547";
 const LOCAL: &str = "http://127.0.0.1:8547";
-const EXECUTOR: Address = address!("8940B565D050974b2b589B70De43bCb753b1F93B");
-const ROUTER: Address = address!("9ecde68C269EbbaFD44bbB4DfC9D6716B47952C2");
 const OWNER: Address = address!("69D54e5fC0b9325D7250f0D0A11690327A3dd8A3");
 const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const UNI_500: Address = address!("d0b53D9277642d899DF5C87A3966A349A798F224");
@@ -110,20 +110,28 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
     }
     assert!(up, "anvil did not come up");
 
-    // 1. The owner, impersonated: authorize the dev key and point profit at the owner.
+    // 1. The owner, impersonated, deploys the lean executor from the Foundry
+    // build: the dev key its trader, profit to the owner.
     cast(&["rpc", "anvil_impersonateAccount", &format!("{OWNER:#x}"), "--rpc-url", LOCAL]);
     cast(&["rpc", "anvil_setBalance", &format!("{OWNER:#x}"), "0xde0b6b3a7640000", "--rpc-url", LOCAL]);
-    let e = format!("{EXECUTOR:#x}");
-    let calls = [
-        cast(&["calldata", "setExecutor(address,bool)", &format!("{DEV:#x}"), "true"]),
-        cast(&["calldata", "setProfitRecipient(address)", &format!("{OWNER:#x}")]),
-        cast(&["calldata", "setFeeRecipient(address)", &format!("{OWNER:#x}")]),
-    ];
-    send_as(OWNER, ROUTER, "multicall(address[],bytes[])", &[&format!("[{e},{e},{e}]"), &format!("[{}]", calls.join(","))], None);
+    let artifact: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../out/LeanExecutor.sol/LeanExecutor.json"))
+            .expect("run `forge build` first"),
+    )
+    .unwrap();
+    let args = cast(&["abi-encode", "constructor(address,address,address)", &format!("{OWNER:#x}"), &format!("{DEV:#x}"), &format!("{OWNER:#x}")]);
+    let code = format!("{}{}", artifact["bytecode"]["object"].as_str().unwrap(), args.trim_start_matches("0x"));
+    let deployed: serde_json::Value = serde_json::from_str(&cast(&[
+        "send", "--unlocked", "--from", &format!("{OWNER:#x}"), "--rpc-url", LOCAL, "--json", "--create", &code,
+    ]))
+    .unwrap();
+    let executor: Address = deployed["contractAddress"].as_str().expect("a contract was created").parse().unwrap();
+    let e = format!("{executor:#x}");
     assert_eq!(
         cast(&["call", &e, "profitRecipient()(address)", "--rpc-url", LOCAL]).to_lowercase(),
         format!("{OWNER:#x}").to_lowercase()
     );
+    assert_eq!(cast(&["call", &e, "executors(address)(bool)", &format!("{DEV:#x}"), "--rpc-url", LOCAL]), "true");
 
     // 2. Open a gap: the dev account sells 50 WETH into Uniswap's 0.05% pool.
     let w = format!("{WETH:#x}");
@@ -163,6 +171,16 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
     uni.state.tick = words.next().unwrap().parse().unwrap();
     uni.state.liquidity = first(cast(&["call", &u, "liquidity()(uint128)", "--rpc-url", LOCAL])).parse().unwrap();
     pools.insert(UNI_500, Arc::new(uni));
+    // Anvil mines every transaction in a block of its own, so the trade is the
+    // first swap on the Slipstream pool in its block and pays the first-swap
+    // fee, where the book prices the fee after it. The Phase 5 executor's hop 2
+    // spent its fixed quote and left the difference behind; the lean executor
+    // spends what hop 1 returned (R29), so the prediction must use the fee the
+    // trade pays.
+    let mut slip = (*pools[&SLIP_100]).clone();
+    let fee = slip.dynamic_fee.expect("Slipstream's fee regime was read").first_in_block(slip.state.tick);
+    slip.state.fee_ppm = fee;
+    pools.insert(SLIP_100, Arc::new(slip));
     let snap = Arc::new(pools);
     // The fork's own transport, for the trade's receipts.
     let rpc: Arc<dyn RpcTransport> = Arc::new(AnvilReceipts(Arc::new(
@@ -189,8 +207,9 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
     // 4. The call, built as the plane builds it, and signed by the dev key.
     let block = cast(&["block", "latest", "--field", "timestamp", "--rpc-url", LOCAL]).parse::<u64>().unwrap();
     let deadline = block + 120;
-    let lender = apex_runtime::live::lenders::BALANCER;
-    let call = armed_call(cycle, u256_to_ethers(size), u256_to_ethers(mid), EXECUTOR, 8453, deadline, &lender).unwrap();
+    // Morpho Blue, the runtime's default lender.
+    let lender = apex_runtime::live::lenders::MORPHO;
+    let call = armed_call(cycle, u256_to_ethers(size), u256_to_ethers(mid), executor, 8453, deadline, &lender).unwrap();
     let key = LaneKey::from_hex(&Secret::new(DEV_KEY.to_string())).unwrap();
     let nonce = cast(&["nonce", &format!("{DEV:#x}"), "--rpc-url", LOCAL]).parse::<u64>().expect("a nonce");
     let signed = key
@@ -231,7 +250,7 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
     assert_eq!(tx, signed.hash);
     let chain = CanaryChain::new(Arc::clone(&rpc), Arc::clone(&canary), Arc::clone(&in_flight), ChainSettings {
         weth: WETH,
-        executor: EXECUTOR,
+        executor,
         trader: DEV,
         recipients: vec![OWNER],
         poll: Duration::from_millis(200),
@@ -240,12 +259,13 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
     let seen = chain.observe(tx).await.unwrap();
     assert!(!seen.is_empty(), "included");
     let pnl = chain.attribute(tx).await.expect("reconciled");
-    println!("FORK PROOF: gross {} predicted {predicted_gross}, net {}", pnl.gross_profit, pnl.net_profit_token);
+    let gas = seen.iter().find_map(|o| o.receipt.as_ref()).map(|r| r.gas_used);
+    println!("FORK PROOF: gross {} predicted {predicted_gross}, net {}, gas used {gas:?}", pnl.gross_profit, pnl.net_profit_token);
     assert_eq!(U256::from(u128::try_from(pnl.gross_profit).unwrap()), predicted_gross, "realized gross = prediction, to the wei");
     assert_eq!(canary.report().totals.landed, 1);
 
     // 6. A stale plan (deadline past) reverts early and is counted.
-    let stale = armed_call(cycle, u256_to_ethers(size), u256_to_ethers(mid), EXECUTOR, 8453, block - 1_000, &lender).unwrap();
+    let stale = armed_call(cycle, u256_to_ethers(size), u256_to_ethers(mid), executor, 8453, block - 1_000, &lender).unwrap();
     let s2 = key.sign_eip1559(&Eip1559Tx { chain_id: 8453, nonce: nonce + 1, max_priority_fee_per_gas: 1_000_000, max_fee_per_gas: 2_000_000_000, gas_limit: 1_500_000, to: stale.to(), data: stale.data().to_vec() }).unwrap();
     let tx2 = sender.send_raw(2, nonce + 1, &s2.raw, &ctx).await.expect("sent");
     chain.observe(tx2).await.unwrap();
