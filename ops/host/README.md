@@ -398,3 +398,78 @@ protected endpoint refuses (`-32605`), so use another RPC:
 ```
 $ cast send 0x4200000000000000000000000000000000000006 "withdraw(uint256)" <wei> --rpc-url https://mainnet.base.org --interactive
 ```
+
+## 11. The lean executor (R29)
+
+`contracts/lean/LeanExecutor.sol` calls pools directly and keeps only the
+on-chain checks the operator kept (trader-only access, the plan's deadline, the
+profit floor, the circuit breaker): ~38% less gas on ticket 664's route
+(348,647 against 566,972), more on Uniswap and PancakeSwap routes. The spec is
+`docs/superpowers/specs/2026-10-17-lean-executor-design.md`. Its owner is the
+owner EOA itself (`0x69D5…8A3`), not a router, so every owner call below goes
+to it directly. Every transaction is the owner's, typed at the prompt, and
+dry-run first through `https://mainnet.base.org` (never BlockPI's key).
+
+### a. Deploy
+
+```
+$ forge script script/DeployLeanExecutor.s.sol --sig "run(address,address)" \
+    0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3 0xCB436Ba3acb945b3fc8EE6345857262584356595 \
+    --rpc-url https://mainnet.base.org --sender 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3
+$ (the same, with --broadcast --interactives 1)
+$ cast keccak $(cast code <executor> --rpc-url https://mainnet.base.org)   # the logged code hash
+$ cast call <executor> "executors(address)(bool)" 0xCB436Ba3acb945b3fc8EE6345857262584356595 --rpc-url https://mainnet.base.org   # true
+$ cast call <executor> "profitRecipient()(address)" --rpc-url https://mainnet.base.org   # 0x69D5…8A3
+```
+
+The script logs `<executor>` and its runtime code hash, which go into the
+configuration (c). Dry-run on 2026-10-19 at the owner's nonce 15: the executor
+at `0xd25B…f2c5`, 1,540,019 gas, ~0.000016 ETH at 0.0104 gwei.
+
+### b. Seed the dust
+
+A few units of each of the universe's 13 middle tokens at the executor, 1 wei
+of WETH there and 1 wei at the owner, so no trade writes a balance from zero
+(17,100 gas a slot). The arguments are in `test/fork/SeedLeanDust.t.sol`'s
+`universe()`, which proves every purchase on a fork:
+
+```
+$ forge script script/SeedLeanDust.s.sol --sig "run(address,address[],uint8[],address[])" \
+    <executor> "[<tokens>]" "[<kinds>]" "[<pools>]" \
+    --rpc-url https://mainnet.base.org --sender 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3
+$ (the same, with --broadcast --interactives 1)
+```
+
+Dry-run on 2026-10-19: all 13 seeded, 4,175,670 gas, ~0.0000445 ETH. With the
+deploy, ~0.00006 ETH of the owner's ~0.000164.
+
+### c. Switch the canary
+
+In `ops/canary.base.yaml` and `ops/shadow.base.yaml`: `executor.address` the
+deployed one, `executor.code_hash` its hash, `executor.plan_version: 3`. Deploy
+to the host as §7 and §10.b do. The boot refuses to start unless
+`profitRecipient()` reads `canary.profit_recipient`.
+
+### d. Retire the old executor
+
+The old executor stays deployed; the owner revokes the trader on it, through its
+router, so the trader key reaches only the lean one:
+
+```
+$ REVOKE=$(cast calldata "multicall(address[],bytes[])" "[0x8940B565D050974b2b589B70De43bCb753b1F93B]" "[$(cast calldata 'setExecutor(address,bool)' 0xCB436Ba3acb945b3fc8EE6345857262584356595 false)]")
+$ cast call --from 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3 0x9ecde68C269EbbaFD44bbB4DfC9D6716B47952C2 $REVOKE --rpc-url https://mainnet.base.org   # 0x
+$ cast send 0x9ecde68C269EbbaFD44bbB4DfC9D6716B47952C2 $REVOKE --rpc-url https://mainnet.base.org --interactive
+$ cast call 0x8940B565D050974b2b589B70De43bCb753b1F93B "executors(address)(bool)" 0xCB436Ba3acb945b3fc8EE6345857262584356595 --rpc-url https://mainnet.base.org   # false
+```
+
+The owner can still `sweep` it through the router.
+
+### e. The owner's stops on the lean executor
+
+The live reader reads `isCircuitOpen()` and `executors(trader)` every block, as
+it did for the old executor, and every trade checks both on chain:
+
+```
+$ cast send <executor> "tripCircuit()" --rpc-url https://mainnet.base.org --interactive    # resetCircuit() to close
+$ cast send <executor> "setExecutor(address,bool)" 0xCB436Ba3acb945b3fc8EE6345857262584356595 false --rpc-url https://mainnet.base.org --interactive
+```
