@@ -13,9 +13,10 @@ use apex_types::time::{DurationNanos, UnixNanos};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// How old a proposal may be and still be simulated: half its 2 s dispatch
-/// deadline. Older, it would reach Tier 2 too late to be sent in time. A route
-/// that still pays is proposed again by the next event that moves its pools.
+/// How old a proposal may be and still be simulated: a second, half a block.
+/// Older, its state is a block behind the one it would land in. A route that
+/// still pays is proposed again by the next event that moves its pools. (The
+/// deadline itself is `econ::DEADLINE_AFTER_SEEN`, 4 s since 2026-10-20.)
 pub const MAX_PROPOSAL_AGE: DurationNanos = DurationNanos(1_000_000_000);
 
 /// A proposal and the event that produced it.

@@ -334,6 +334,31 @@ async fn the_profit_probability_and_the_ev_share_one_distribution() {
     assert_eq!(c.certificate_status, CertificateStatus::Heuristic);
 }
 
+/// **The deadline covers the next block too** (operator, 2026-10-20). Base
+/// seals a block every 2 s; a deadline 2 s after the event was seen covers only
+/// the block being built then, and 4 of the canary's 10 sends landed one block
+/// later and reverted on it (`RouteExpired`, 1-2 s late). 4 s covers that block
+/// and the next, and its seconds are what the plan carries.
+#[tokio::test]
+async fn the_deadline_covers_the_block_after_the_one_being_built() {
+    use apex_runtime::commit::deadline_seconds;
+    let econ = econ_over(200, L1FeeModel::validated(12, 50));
+    let mut p = proposal(2);
+    p.found_at = UnixNanos(1_792_147_413_500_000_000);
+    let size = econ.size(&p).await.expect("sizable");
+    let refinement = Refinement {
+        expected_output: size.get() + AlloyU256::from(2_000_000_000_000_000u64),
+        input_amount: size,
+        robustness_margin: 0.3,
+        costs: econ.refresh_costs(&p).await.expect("costs"),
+    };
+    let c = econ.assemble(&p, refinement).expect("assembles");
+    assert_eq!(c.deadline, UnixNanos(1_792_147_417_500_000_000));
+    // Ticket 678: seen in the block sealed at 1,792,147,415, it landed in the
+    // one sealed at 1,792,147,417. Its deadline had been 1,792,147,415.
+    assert_eq!(deadline_seconds(c.deadline), 1_792_147_417);
+}
+
 /// **`Heuristic`, never `Proven`.** §16.2: never silently promote a heuristic
 /// allocation to optimal. Golden section plus a discrete climb is not a certified
 /// optimum — §16's `certify` produces `Proven` and arrives in Phase 12 — and

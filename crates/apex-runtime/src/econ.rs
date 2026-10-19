@@ -638,11 +638,18 @@ impl Economics for LiveEconomics {
             capture_probability: 0.0,
             robustness_margin: r.robustness_margin,
             probability_of_profit_ppm: pr_profit,
-            deadline: apex_types::time::UnixNanos(p.found_at.0.saturating_add(2_000_000_000)),
+            deadline: apex_types::time::UnixNanos(p.found_at.0.saturating_add(DEADLINE_AFTER_SEEN.0)),
             submission_policy: apex_types::ticket::SubmissionPolicy::Private,
         })
     }
 }
+
+/// How long after its event was seen a candidate may still be sent and land:
+/// the block being built then, and the next (Base seals one every 2 s).
+/// Operator, 2026-10-20: R28's 2 s covered only the first, and 4 of the
+/// canary's 10 sends landed in the next and reverted on the deadline
+/// (`RouteExpired`, 1-2 s late).
+pub const DEADLINE_AFTER_SEEN: apex_types::time::DurationNanos = apex_types::time::DurationNanos(4_000_000_000);
 
 /// R28: the priority fee, as a share of the expected net, in basis points. A
 /// net at or below zero pays nothing. Split so the product cannot overflow.
