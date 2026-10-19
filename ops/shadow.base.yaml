@@ -52,16 +52,16 @@ armed:
   liquidity_floor_bps: 9800
 
 executor:
-  # The Phase 5 executor, deployed 2026-10-03 by script/DeployAndConfigure.s.sol
-  # (Base blocks 52,105,407-8; docs/apex/DEPLOYED.md): an EIP-1167 clone of the
-  # implementation 0x5C48...5Cee, owned by its BatchRouter 0x9ecd...52C2. The
-  # code hash is keccak256 of the clone's 45-byte runtime code, read back from
-  # the chain; other code there reads as version 0, and last-mile check 2
-  # refuses every ticket.
-  address: "0x8940B565D050974b2b589B70De43bCb753b1F93B"
-  code_hash: "0x68ea95b65ff6d634c1e8e766cf66ecd3996eb0342cdc2f1179485ae03b7fa488"
-  # The plan version the call builder encodes (PLAN_VERSION_V2).
-  plan_version: 2
+  # R29: the lean executor, deployed 2026-10-19 by the owner with
+  # script/DeployLeanExecutor.s.sol (ops/host/README.md §11): owned by the owner
+  # EOA itself, no router, not upgradeable. The code hash is keccak256 of its
+  # runtime code, read back from the chain; other code there reads as version 0,
+  # and last-mile check 2 refuses every ticket. The Phase 5 clone
+  # 0x8940...F93B stays deployed, its trader revoked (README §11d).
+  address: "0xd25BD9A60113728a2ECb9FdC9392Cde8D906f2c5"
+  code_hash: "0xb513cb0f22d3bf302747f47a6dfb118b5d5f824bd1794925d481a28a8a46336a"
+  # The plan version the call builder encodes (LEAN_PLAN_VERSION).
+  plan_version: 3
 
 signer:
   lane: 1

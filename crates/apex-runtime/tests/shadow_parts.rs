@@ -4,7 +4,7 @@
 
 mod support;
 
-use alloy_primitives::{address, Address, B256};
+use alloy_primitives::{address, b256, Address, B256};
 use apex_capture::dispatch::NullDispatcher;
 use apex_capture::recover::{ChainOutcomeSource, DispatchGate};
 use apex_capture::registry::TicketRegistry;
@@ -269,7 +269,11 @@ fn the_shipped_config_parses() {
     assert_eq!(c.chain_id, 8453);
     assert_eq!(c.signer.key_env, "APEX_SECRET_TRADER_KEY");
     assert!(c.journal.to_str().unwrap().contains("shadow"));
-    assert_eq!(c.executor.plan_version, 2);
+    // R29: the lean executor, deployed by the owner 2026-10-19; the code hash
+    // read back from the chain. The canary's is the same (above).
+    assert_eq!(c.executor.address, address!("d25BD9A60113728a2ECb9FdC9392Cde8D906f2c5"));
+    assert_eq!(c.executor.code_hash, b256!("b513cb0f22d3bf302747f47a6dfb118b5d5f824bd1794925d481a28a8a46336a"));
+    assert_eq!(c.executor.plan_version, apex_exec::lean::LEAN_PLAN_VERSION);
     // Operator decision, 2026-10-06: the shadow refuses only a trade its
     // worst-case gas would leave unprofitable.
     assert_eq!(c.policy.max_cost_confidence_bps, 10_000);

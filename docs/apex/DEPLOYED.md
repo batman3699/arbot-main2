@@ -5,6 +5,25 @@ Amended 2026-09-29, when G-SEC-1 and R-03 closed. **Rewritten 2026-10-03, when
 the Phase 5 executor was deployed** — every address and role below was read back
 from Base the same day (block 52,105,860), not copied from the deploy's output.
 
+## The lean executor on Base (R29, 2026-10-19)
+
+Deployed by `script/DeployLeanExecutor.s.sol` in block 52,794,566 (transaction
+`0x0fad154c…6eb79`, 1,167,102 gas), sent by the owner `0x69D5…8A3`; its dust
+seeded by `script/SeedLeanDust.s.sol` in blocks 52,794,664–52,794,665 (28
+transactions, 2,957,211 gas). Read back from Base the same day:
+
+| Contract | Address | What it is |
+|---|---|---|
+| **`LeanExecutor`** | **`0xd25BD9A60113728a2ECb9FdC9392Cde8D906f2c5`** | The executor since R29: `run(bytes)`, pools called directly, a Morpho Blue or Balancer WETH loan. Not upgradeable. Runtime code hash `0xb513cb0f22d3bf302747f47a6dfb118b5d5f824bd1794925d481a28a8a46336a`. Every plan is sent here. |
+
+- `owner()` and `profitRecipient()` are `0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3`
+  itself (no router); `executors(...)` is true for the trading signer
+  `0xCB436Ba3acb945b3fc8EE6345857262584356595`; `isCircuitOpen()` is false.
+- It holds a few units of each of the universe's 13 middle tokens and 1 wei of
+  WETH, and the owner 1 wei of WETH, so no trade writes a balance from zero.
+- The Phase 5 executor below stays deployed; the owner revokes the trader on it
+  (`ops/host/README.md` §11d).
+
 ## The Phase 5 executor on Base
 
 Deployed by `script/DeployAndConfigure.s.sol` in one run: six transactions in
