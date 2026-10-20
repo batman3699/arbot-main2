@@ -17,7 +17,7 @@ use apex_runtime::live::admission::{self, LiveCommitments, GAS_PER_HOP};
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
 use apex_runtime::live::feed::{BURN, MINT, PANCAKE_SWAP, SWAP};
 use apex_runtime::live::frontier::WETH;
-use apex_runtime::live::inventory::{PoolSpec, Venue};
+use apex_runtime::live::inventory::{PoolSpec, UniverseFilter, Venue};
 use apex_runtime::plane::{Commitments, Decline};
 use apex_types::candidate::Candidate;
 use apex_types::ids::{ChainId, PoolId};
@@ -37,6 +37,8 @@ const SLIP: Address = address!("b2cc224c1c9feE385f8ad6a55b4d94E92359DC59");
 const BSD: Address = address!("2ae9df02539887d4ebce0230168a302d34784c82");
 const CODE: B256 = B256::repeat_byte(0xc0);
 const READ_AT: u64 = 100;
+/// R20's floor, the one these tests were written against.
+const FLOOR: UniverseFilter = UniverseFilter { max_fee_ppm: 3_000, min_depth_usd: 100_000.0 };
 
 fn pool(addr: Address, venue: Venue, token1: Address, depth_usd: f64) -> PoolSnapshot {
     PoolSnapshot {
@@ -76,7 +78,7 @@ fn book(pools: impl IntoIterator<Item = PoolSnapshot>) -> PoolBook {
 }
 
 fn admitted(pools: impl IntoIterator<Item = PoolSnapshot>, read_block: u64) -> Vec<PoolAdmission> {
-    let (admitted, refused) = admission::admit_book(&book(pools), ChainId::BASE, read_block);
+    let (admitted, refused) = admission::admit_book(&book(pools), ChainId::BASE, read_block, &FLOOR);
     assert!(refused.is_empty(), "{refused:?}");
     admitted
 }
@@ -142,7 +144,7 @@ fn a_refused_pool_is_reported_with_its_reason() {
         pool(negative, Venue::UniswapV3, USDC, -1e6),
         pool(at_floor, Venue::UniswapV3, USDC, 100_000.0),
     ];
-    let (admitted, refused) = admission::admit_book(&book(pools), ChainId::BASE, READ_AT);
+    let (admitted, refused) = admission::admit_book(&book(pools), ChainId::BASE, READ_AT, &FLOOR);
 
     assert_eq!(admitted.iter().map(|a| a.pool.address).collect::<Vec<_>>(), vec![at_floor]);
     let floor = 100_000 * 1_000_000;
@@ -204,6 +206,7 @@ fn a_pool_the_last_reload_refused_is_unverified() {
         &book([uni, PoolSnapshot { code_hash: B256::ZERO, ..slip }, bsd]),
         ChainId::BASE,
         READ_AT + 1,
+        &FLOOR,
     );
     assert_eq!(refused.len(), 1);
     commitments.set_admissions(a);
@@ -226,4 +229,22 @@ fn a_pancakeswap_pool_is_admitted_with_its_own_swap_topic() {
     assert_eq!(a[0].deployed_by, Venue::PancakeV3.factory());
     assert_eq!(a[0].fee_behavior, FeeBehavior::Static { ppm: 500 });
     assert_eq!(a[0].update_mapping, vec![PANCAKE_SWAP, MINT, BURN]);
+}
+
+/// **The universe's floor is admission's floor** (R30). The operator set
+/// `universe.min_depth_usd` to $50k; admission kept its own $100k default, so
+/// eleven pools between the two were loaded and priced, and no route through
+/// them could be committed. One floor, the configured one, decides both.
+#[test]
+fn the_universe_floor_is_the_admission_floor() {
+    let shallow = || pool(SLIP, Venue::Slipstream, USDC, 60_000.0);
+    let at = |min_depth_usd: f64| {
+        let filter = UniverseFilter { max_fee_ppm: 3_000, min_depth_usd };
+        admission::admit_book(&book([pool(UNI, Venue::UniswapV3, USDC, 5e6), shallow()]), ChainId::BASE, READ_AT, &filter)
+    };
+    let (admitted, refused) = at(50_000.0);
+    assert_eq!((admitted.len(), refused.len()), (2, 0), "{refused:?}");
+    let (admitted, refused) = at(100_000.0);
+    assert_eq!(admitted.len(), 1);
+    assert!(matches!(refused[..], [(p, AdmissionError::TooShallow { floor_micros: 100_000_000_000, .. })] if p == SLIP), "{refused:?}");
 }

@@ -31,7 +31,7 @@ use crate::commit::VenueCommitments;
 use crate::live::book::{PoolBook, PoolSnapshot};
 use crate::live::feed::{swap_topic, BURN, MINT, SYNC};
 use crate::live::frontier::WETH;
-use crate::live::inventory::Venue;
+use crate::live::inventory::{UniverseFilter, Venue};
 use crate::plane::{Commitments, Decline};
 use alloy_primitives::{address, Address, U256};
 use apex_capture::signer::ExecutorAuth;
@@ -61,11 +61,18 @@ pub const STANDARD_TOKENS: [Address; 2] = [WETH, USDC];
 /// is why the profile says `measured: false`.
 pub const GAS_PER_HOP: GasLimit = GasLimit(174_300);
 
-/// The two venues the live book holds, each with the factory it deploys from.
-pub fn registry() -> VenueRegistry {
-    Venue::ALL
-        .into_iter()
-        .fold(VenueRegistry::new(DepthPolicy::default()), |r, v| r.with_factory(v.id(), v.factory()))
+/// The venues the live book holds, each with the factory it deploys from, and
+/// the universe's depth floor. R30: admission kept `DepthPolicy::default()`'s
+/// $100k after the operator set the universe's to $50k, so pools between the
+/// two were loaded and priced but could never be committed. One floor, the
+/// configured one, decides both.
+pub fn registry(filter: &UniverseFilter) -> VenueRegistry {
+    let depth = DepthPolicy {
+        // Whole dollars, in micros, as `record` writes a pool's depth.
+        floor_usd_micros: (filter.min_depth_usd as u128).saturating_mul(1_000_000),
+        provenance: "the universe's min_depth_usd: the floor the inventory is filtered by (R20, R30)",
+    };
+    Venue::ALL.into_iter().fold(VenueRegistry::new(depth), |r, v| r.with_factory(v.id(), v.factory()))
 }
 
 fn semantics(token: Address) -> TransferSemantics {
@@ -120,8 +127,9 @@ pub fn admit_book(
     book: &PoolBook,
     chain: ChainId,
     read_block: u64,
+    filter: &UniverseFilter,
 ) -> (Vec<PoolAdmission>, Vec<(Address, AdmissionError)>) {
-    let registry = registry();
+    let registry = registry(filter);
     let (mut admitted, mut refused) = (Vec::new(), Vec::new());
     for p in book.snapshot().values() {
         match registry.admit(record(p, chain, read_block)) {

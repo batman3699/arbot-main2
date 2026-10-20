@@ -562,7 +562,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         crate::search::flashblock_engine(cycles.len()),
     ));
 
-    let (admitted, refused) = admission::admit_book(&book, base, head);
+    let (admitted, refused) = admission::admit_book(&book, base, head, &config.universe.filter());
     for (pool, why) in &refused {
         warn!(%pool, ?why, "not admitted: no route through it can be committed");
     }
@@ -925,7 +925,8 @@ impl Shadow {
                         }
                     }
                     if work == Work::Full {
-                        let (admitted, refused) = admission::admit_book(&self.book, ChainId::BASE, block);
+                        let (admitted, refused) =
+                            admission::admit_book(&self.book, ChainId::BASE, block, &self.config.universe.filter());
                         for (pool, why) in &refused {
                             warn!(%pool, ?why, block, "not admitted on reload");
                         }
