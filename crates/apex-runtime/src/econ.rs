@@ -278,9 +278,10 @@ pub struct LiveEconomics {
     /// The lenders a borrowing route may be quoted against; the first added
     /// that a route names is its own (R27).
     flash: Vec<FlashTerms>,
-    /// R28: the share of each candidate's expected net bid as its priority
-    /// fee, in bps. Zero until `with_tip_share`.
-    tip_share_bps: u32,
+    /// R31: what rivals bid per gas on our gaps; each candidate's priority
+    /// fee is the bid that maximises its expected profit against them. No
+    /// tip until `with_rival_bids`.
+    rival_bids: Option<std::sync::Arc<RivalBids>>,
 }
 
 impl LiveEconomics {
@@ -301,7 +302,7 @@ impl LiveEconomics {
             refine: RefineBudget::start_only(),
             strategy,
             flash: Vec::new(),
-            tip_share_bps: 0,
+            rival_bids: None,
         }
     }
 
@@ -319,11 +320,12 @@ impl LiveEconomics {
         self.costs.store(costs, apex_types::state::ReconstructionStatus::Verified);
     }
 
-    /// R28: bid this share of each candidate's expected net, in bps, as its
-    /// priority fee. The tip scales the net, so it does not move the size.
+    /// R31: bid each candidate's priority fee against `bids`, the rivals
+    /// measured on our gaps. The bid is chosen after the size, from the net it
+    /// leaves, so it does not move the size.
     #[must_use]
-    pub fn with_tip_share(mut self, share_bps: u32) -> Self {
-        self.tip_share_bps = share_bps;
+    pub fn with_rival_bids(mut self, bids: RivalBids) -> Self {
+        self.rival_bids = Some(std::sync::Arc::new(bids));
         self
     }
 
@@ -554,11 +556,17 @@ impl Economics for LiveEconomics {
         let gross = i128::try_from(to_u128(r.expected_output))
             .unwrap_or(i128::MAX)
             .saturating_sub(i128::try_from(to_u128(r.input_amount.get())).unwrap_or(i128::MAX));
-        // R28: the tip, a share of the net before it, charged as the priority
-        // fee. A revert also pays the tip on the gas it used, and the failure
-        // cost leaves that out: under 1% of the net at a 20% tip and a 5% prior.
+        // R31: the tip, the bid that maximises the expected profit against the
+        // rivals measured on our gaps, per unit of the p50 gas the signer
+        // divides it by (`plane::fee_caps`). A revert also pays the tip on the
+        // gas it used, and the failure cost leaves that out: R31's bids spent
+        // a fifth of R28's 20% share on the same gaps.
         let mut costs = r.costs;
-        costs.priority_fee = tip_for(gross.saturating_sub(cost_i128(&costs)), self.tip_share_bps);
+        let gas = costs.gas_used_distribution.p50.0;
+        costs.priority_fee = self
+            .rival_bids
+            .as_ref()
+            .map_or(0, |b| b.bid(gross.saturating_sub(cost_i128(&costs)), gas).saturating_mul(u128::from(gas)));
         let cost = cost_i128(&costs);
         let set = self.priors.scenario_set(gross, cost);
         let robust_ev = scenario_ev(&set, EthersU256::zero())
@@ -651,12 +659,111 @@ impl Economics for LiveEconomics {
 /// (`RouteExpired`, 1-2 s late).
 pub const DEADLINE_AFTER_SEEN: apex_types::time::DurationNanos = apex_types::time::DurationNanos(4_000_000_000);
 
-/// R28: the priority fee, as a share of the expected net, in basis points. A
-/// net at or below zero pays nothing. Split so the product cannot overflow.
-pub fn tip_for(net: i128, share_bps: u32) -> u128 {
-    let Ok(net) = u128::try_from(net) else { return 0 };
-    let share = u128::from(share_bps.min(10_000));
-    net / 10_000 * share + net % 10_000 * share / 10_000
+/// What rivals bid on our gaps, per gas, and the bid each trade makes against
+/// them (R31, operator 2026-10-21: maximise expected profit).
+///
+/// Base orders a flashblock's transactions by priority fee, so against a rival
+/// in our own flashblock the higher bid wins; a rival in an earlier flashblock
+/// wins at any price, and one in a later one loses to us at any price. A tip
+/// is paid in all three, on the revert too. So over bidding nothing, a bid `b`
+/// earns `P_same x F(b) x n - b x g` for a trade of net `n` (before the tip)
+/// and gas `g`: `F(b)` the share of measured rival bids below `b`, `P_same`
+/// the share of gaps contested in our own flashblock. Each measured bid plus
+/// one wei is a candidate; zero is the bid when none earns anything.
+///
+/// Measured by `scripts/data/rival_bids.py` over the gaps that passed our
+/// simulation and that a rival took. A first rule that charged the tip only
+/// on a win (`F(b) x (n - b x g)`) overbid: fitted on the earlier gaps, it
+/// kept less on the later ones than bidding nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RivalBids {
+    /// Wei per gas, ascending.
+    sorted: Vec<u128>,
+    /// `P_same` as a ratio: gaps contested in our own flashblock, of all.
+    same: u128,
+    total: u128,
+}
+
+impl RivalBids {
+    /// The measured bids, in any order, and `same` of `total` gaps contested
+    /// in our own flashblock. Refused with no bids or no gaps.
+    pub fn new(mut bids: Vec<u128>, same: u64, total: u64) -> Result<Self, String> {
+        if bids.is_empty() {
+            return Err("no rival bids measured".into());
+        }
+        if total == 0 || same > total {
+            return Err(format!("{same} of {total} gaps contested in our flashblock"));
+        }
+        bids.sort_unstable();
+        Ok(Self { sorted: bids, same: u128::from(same), total: u128::from(total) })
+    }
+
+    /// The bids in `path`, written by `scripts/data/rival_bids.py`: its
+    /// `bids_wei_per_gas`, and `measured.classes`' gaps by where our
+    /// transaction would land against the rival (`same`, `ahead`, `behind`).
+    pub fn load(path: &std::path::Path) -> Result<Self, String> {
+        let at = |e: String| format!("{}: {e}", path.display());
+        let text = std::fs::read_to_string(path).map_err(|e| at(e.to_string()))?;
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| at(e.to_string()))?;
+        let bids = v
+            .get("bids_wei_per_gas")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| at("no bids_wei_per_gas".into()))?
+            .iter()
+            .map(|b| b.as_u64().map(u128::from).ok_or_else(|| at("a bid is not a whole number of wei".into())))
+            .collect::<Result<Vec<_>, _>>()?;
+        let classes = v.pointer("/measured/classes").and_then(serde_json::Value::as_object).ok_or_else(|| at("no measured.classes".into()))?;
+        let count = |k: &str| classes.get(k).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let total = count("same") + count("ahead") + count("behind");
+        Self::new(bids, count("same"), total).map_err(at)
+    }
+
+    pub fn len(&self) -> usize {
+        self.sorted.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sorted.is_empty()
+    }
+
+    /// `P_same`, for the boot log.
+    pub fn contested_share(&self) -> f64 {
+        self.same as f64 / self.total as f64
+    }
+
+    /// The bid at quantile `q` (0..=1), for the boot log.
+    pub fn quantile(&self, q: f64) -> u128 {
+        let i = ((self.sorted.len() - 1) as f64 * q.clamp(0.0, 1.0)) as usize;
+        self.sorted[i]
+    }
+
+    /// The priority fee per gas a trade of net `net` wei (before the tip) and
+    /// `gas` bids: the one earning the most over bidding nothing, or nothing.
+    pub fn bid(&self, net: i128, gas: u64) -> u128 {
+        let (Ok(net), true) = (u128::try_from(net), gas > 0) else { return 0 };
+        let (gas, n) = (u128::from(gas), self.sorted.len() as u128);
+        // Scaled by n x total: rivals below b x same x net - n x total x b x gas.
+        let Some(gain_per_rival) = self.same.checked_mul(net) else { return 0 };
+        let Some(cost_per_wei) = n.checked_mul(self.total).and_then(|x| x.checked_mul(gas)) else { return 0 };
+        let (mut best_bid, mut best) = (0u128, 0u128);
+        let mut below = 0u128;
+        let mut i = 0;
+        while i < self.sorted.len() {
+            // Every rival at this bid is outbid by one wei more.
+            let v = self.sorted[i];
+            while i < self.sorted.len() && self.sorted[i] == v {
+                i += 1;
+                below += 1;
+            }
+            let Some(b) = v.checked_add(1) else { break };
+            let (Some(gain), Some(cost)) = (below.checked_mul(gain_per_rival), b.checked_mul(cost_per_wei)) else { break };
+            // A tie keeps the lower bid.
+            if gain > cost && gain - cost > best {
+                (best_bid, best) = (b, gain - cost);
+            }
+        }
+        best_bid
+    }
 }
 
 /// Everything spent, in wei.

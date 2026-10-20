@@ -101,10 +101,14 @@ policy:
   # refusing just a trade its worst-case gas would leave without profit. A live
   # run keeps the default.
   max_cost_confidence_bps: 10000
-  # R28: a fifth of each trade's expected net, bid as its priority fee. Rivals
-  # tipped 0.004 gwei at the median and 0.40 at the 90th percentile (R25's
-  # contest analysis); on a cents-sized trade this is ~0.005-0.01 gwei.
-  tip_share_bps: 2000
+  # R31 (operator, 2026-10-21: maximise expected profit): each trade's priority
+  # fee is the bid b per gas earning the most over bidding nothing,
+  # P_same x F(b) x net - b x gas: F the share of rivals' bids below b, P_same
+  # the share of gaps contested in our own flashblock, measured on 618 gaps we
+  # priced (scripts/data/rival_bids.py). Fitted on the earlier 432 and scored
+  # on the later 186, it kept 0.0138 ETH against R28's flat 20%'s 0.0035,
+  # level with bidding nothing, and won 110 gaps against 102.
+  rival_bids: ops/rival-bids.base.json
 
 # How a settlement fails, and what failing costs: what the chain does not say.
 # The costliest revert on the R6/R7 fork (hop 2's minimum) used 411,945 gas.

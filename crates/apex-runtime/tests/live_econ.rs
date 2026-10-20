@@ -670,36 +670,75 @@ async fn the_gross_is_what_the_cycle_returns_above_what_it_took() {
     assert!(c.expected_net_profit < i128::try_from(output - input).unwrap());
 }
 
-/// **R28: the tip is a share of the expected net, and a loss pays none.**
-#[test]
-fn the_tip_is_a_share_of_the_net() {
-    use apex_runtime::econ::tip_for;
-    assert_eq!(tip_for(1_000_000, 2_000), 200_000);
-    assert_eq!(tip_for(9_999, 2_000), 1_999, "rounded down");
-    assert_eq!(tip_for(0, 2_000), 0);
-    assert_eq!(tip_for(-5, 2_000), 0, "a loss pays no tip");
-    assert_eq!(tip_for(i128::MAX, 10_000), i128::MAX as u128, "no overflow at the extremes");
-    assert_eq!(tip_for(1_000, 20_000), 1_000, "a share above the whole is the whole: a tip never exceeds the net");
+/// Rivals' priority fees per gas on gaps we priced, as R31 measured them (here
+/// five, in no order: the constructor sorts), and the share of gaps that were a
+/// contest in our own flashblock (here 1 in 4).
+fn rivals() -> apex_runtime::econ::RivalBids {
+    apex_runtime::econ::RivalBids::new(vec![200_000_000, 0, 50_000_000, 1_000_000, 10_000_000], 1, 4).expect("bids")
 }
 
-/// **R28: the economics charges the tip, and the size does not move.** The tip
-/// scales the net, so the size that maximizes the net before it maximizes the
-/// net after.
+/// **R31: the tip is the bid that maximises the expected profit** (operator,
+/// 2026-10-21). A tip is paid whether the trade wins or not, and it buys only
+/// the gaps contested in our own flashblock, so a bid `b` earns
+/// `P_same x F(b) x net - b x gas` over bidding nothing. Worked by hand at
+/// 350,000 gas, `P_same` 1/4, five rivals.
+#[test]
+fn the_bid_maximises_the_expected_profit_against_measured_rivals() {
+    const GAS: u64 = 350_000;
+    let r = rivals();
+    // 0.001 ETH: 4/5 x 1e15 / 4 - 50M x 350k beats 5/5 x 1e15 / 4 - 200M x 350k.
+    assert_eq!(r.bid(1_000_000_000_000_000, GAS), 50_000_001);
+    // 0.00001 ETH: 2/5 x 1e13 / 4 - 1M x 350k; above 1 Mwei the tip costs more than it buys.
+    assert_eq!(r.bid(10_000_000_000_000, GAS), 1_000_001);
+    // 1e11 wei: only the rivals who bid nothing are worth outbidding.
+    assert_eq!(r.bid(100_000_000_000, GAS), 1);
+    // A trade whose share of a contest cannot pay a wei of gas bids nothing.
+    assert_eq!(r.bid(1_000_000, GAS), 0);
+    // Nothing to keep, nothing bid.
+    assert_eq!(r.bid(0, GAS), 0);
+    assert_eq!(r.bid(-5, GAS), 0, "a loss pays no tip");
+    assert_eq!(r.bid(1_000, 0), 0, "no gas, no bid");
+    // Every gap a contest: the same rivals, bid harder.
+    let all = apex_runtime::econ::RivalBids::new(vec![200_000_000, 0, 50_000_000, 1_000_000, 10_000_000], 1, 1).unwrap();
+    assert_eq!(all.bid(1_000_000_000_000_000, GAS), 200_000_001);
+    assert!(apex_runtime::econ::RivalBids::new(vec![1], 0, 0).is_err(), "no gaps, no share");
+    assert!(apex_runtime::econ::RivalBids::new(vec![1], 2, 1).is_err(), "a share above the whole");
+}
+
+/// A trade never bids more than its net, and a deeper trade never bids less:
+/// the share outbid is the slope, so the best bid only rises with the net.
+#[test]
+fn the_bid_never_exceeds_the_net_and_rises_with_it() {
+    let r = rivals();
+    let mut last = 0;
+    for k in 0..2_000u32 {
+        let net = i128::from(k) * 1_000_000_000_000 + 7;
+        let b = r.bid(net, 300_000);
+        assert!(b == 0 || i128::try_from(b * 300_000).unwrap() < net, "net {net} bid {b}");
+        assert!(b >= last, "net {net}: {b} after {last}");
+        last = b;
+    }
+    assert!(apex_runtime::econ::RivalBids::new(vec![], 1, 4).is_err(), "no measurement, no bid");
+}
+
+/// **R31: the economics charges the bid as the priority fee, per unit of the
+/// gas the signer divides it by, and the size does not move.**
 #[tokio::test]
-async fn the_tip_is_charged_and_the_size_is_unchanged() {
+async fn the_bid_is_charged_and_the_size_is_unchanged() {
     let plain = econ_over(200, L1FeeModel::unvalidated());
-    let tipped = econ_over(200, L1FeeModel::unvalidated()).with_tip_share(2_000);
+    let bidding = econ_over(200, L1FeeModel::unvalidated()).with_rival_bids(rivals());
     let p = proposal(2);
     let r0 = apex_runtime::workers::refine_concurrently(&plain, &p).await.expect("refines");
-    let r1 = apex_runtime::workers::refine_concurrently(&tipped, &p).await.expect("refines");
+    let r1 = apex_runtime::workers::refine_concurrently(&bidding, &p).await.expect("refines");
     assert_eq!(r0.input_amount, r1.input_amount, "the tip does not move the size");
     let c0 = plain.assemble(&p, r0).expect("assembles");
-    let c1 = tipped.assemble(&p, r1).expect("assembles");
-    assert_eq!(c0.total_execution_cost.priority_fee, 0);
-    let tip = apex_runtime::econ::tip_for(c0.expected_net_profit, 2_000);
-    assert!(tip > 0, "the fixture pays");
-    assert_eq!(c1.total_execution_cost.priority_fee, tip);
-    assert_eq!(c1.expected_net_profit, c0.expected_net_profit - i128::try_from(tip).unwrap());
+    let c1 = bidding.assemble(&p, r1).expect("assembles");
+    assert_eq!(c0.total_execution_cost.priority_fee, 0, "no rivals measured, no tip");
+    let gas = c0.total_execution_cost.gas_used_distribution.p50.0;
+    let bid = rivals().bid(c0.expected_net_profit, gas);
+    assert!(bid > 0, "the fixture pays");
+    assert_eq!(c1.total_execution_cost.priority_fee, bid * u128::from(gas));
+    assert_eq!(c1.expected_net_profit, c0.expected_net_profit - i128::try_from(bid * u128::from(gas)).unwrap());
 }
 
 /// **A route that borrows says so, on its lender's measured terms.** The first

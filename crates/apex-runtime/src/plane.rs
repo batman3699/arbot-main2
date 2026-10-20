@@ -526,9 +526,10 @@ pub struct FeeCaps {
 /// than failing on the first increase — and never above the policy ceiling,
 /// which is the same ceiling revalidation checks the observed fee against.
 ///
-/// **The tip** is the economics' `priority_fee` (R28: a share of the expected
-/// net), signed per unit of the expected gas, rounded down, and never above the
-/// max fee, which EIP-1559 requires.
+/// **The tip** is the economics' `priority_fee` (R31: the bid per gas that
+/// maximises the expected profit against measured rivals, times the p50 gas),
+/// signed per unit of that gas, so the bid itself, and never above the max
+/// fee, which EIP-1559 requires.
 pub fn fee_caps(r: &LiveReadings, c: &TotalExecutionCost) -> FeeCaps {
     let gas = u128::from(c.gas_used_distribution.p50.0).max(1);
     let tip = c.priority_fee / gas;

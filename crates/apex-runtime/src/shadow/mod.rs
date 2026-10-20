@@ -537,13 +537,25 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         },
         unarmable,
     ));
+    // R31: the rivals' bids each candidate's priority fee is chosen against.
+    let rival_bids = crate::econ::RivalBids::load(&config.policy.rival_bids)
+        .map_err(|e| ShadowError::Boot(format!("policy.rival_bids: {e}")))?;
+    info!(
+        bids = rival_bids.len(),
+        contested_share = rival_bids.contested_share(),
+        p25 = %rival_bids.quantile(0.25),
+        p50 = %rival_bids.quantile(0.5),
+        p75 = %rival_bids.quantile(0.75),
+        p90 = %rival_bids.quantile(0.9),
+        "the rivals' bids read, wei per gas"
+    );
     let pricer =
         Arc::new(LivePricer::new(Arc::clone(&book), cycles.clone(), unpriced, gas::LEAN).with_lender(lender_now));
     let pricer_near_misses = pricer.near_misses();
     let econ = Arc::new(
         {
             let e = LiveEconomics::new(pricer.clone(), ScenarioPriors::default(), chain_costs, StrategyId(1))
-                .with_tip_share(config.policy.tip_share_bps)
+                .with_rival_bids(rival_bids)
                 .with_flash(terms);
             // The terms' `available` is the boot read, a pricing hint for the
             // risk gate; last-mile check 9 reads the chosen lender live.

@@ -77,7 +77,7 @@ policy:
   report_every_s: 300
   l1_every_blocks: 30
   max_cost_confidence_bps: 10000
-  tip_share_bps: 2000
+  rival_bids: ops/rival-bids.base.json
 costs:
   gas_on_failure: 411945
   failure_ppm: 50000
@@ -243,18 +243,23 @@ fn the_shipped_canary_config_parses() {
     assert_eq!(k.profit_recipient, address!("69D54e5fC0b9325D7250f0D0A11690327A3dd8A3"));
     assert_eq!(c.signer.gas_reserve_wei, 100_000_000_000_000);
     assert_eq!(c.policy.max_cost_confidence_bps, 1_000, "a live run keeps the default");
-    assert_eq!(c.policy.tip_share_bps, 2_000);
+    // R31: the tip is bid against the rivals measured on our gaps, and the
+    // shipped measurement loads.
+    assert_eq!(c.policy.rival_bids, std::path::PathBuf::from("ops/rival-bids.base.json"));
+    let bids = apex_runtime::econ::RivalBids::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(&c.policy.rival_bids))
+        .expect("the shipped rival bids load");
+    assert!(bids.len() >= 100, "{} rival bids", bids.len());
     assert!(c.journal.to_str().unwrap().contains("canary"));
     // Everything else is the shadow's.
     let shadow = ShadowConfig::load(&path.replace("canary", "shadow"), &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap();
     assert_eq!((c.executor, c.universe), (shadow.executor, shadow.universe));
 }
 
-/// R28: a tip share above the whole net is refused.
+/// R31: a run that names no rival bids is refused: it would bid nothing.
 #[test]
-fn a_tip_share_above_the_net_is_refused() {
+fn a_run_without_rival_bids_is_refused() {
     let var = "APEX_SECRET_SHADOW_TEST_TIP";
-    let text = yaml(var, "var/apex/shadow.journal").replace("tip_share_bps: 2000", "tip_share_bps: 10001");
+    let text = yaml(var, "var/apex/shadow.journal").replace("rival_bids: ops/rival-bids.base.json", "rival_bids: \"\"");
     assert!(matches!(ShadowConfig::from_yaml_str(&text, &env(var, SECRET)), Err(ShadowConfigError::Invalid(_))));
 }
 
@@ -277,8 +282,8 @@ fn the_shipped_config_parses() {
     // Operator decision, 2026-10-06: the shadow refuses only a trade its
     // worst-case gas would leave unprofitable.
     assert_eq!(c.policy.max_cost_confidence_bps, 10_000);
-    // R28: a fifth of the expected net, bid as the priority fee.
-    assert_eq!(c.policy.tip_share_bps, 2_000);
+    // R31: the shadow bids as the canary does.
+    assert_eq!(c.policy.rival_bids, std::path::PathBuf::from("ops/rival-bids.base.json"));
     // R20: the shadow prices the deep pools the census's 500 ppm left out.
     // R30 (operator, 2026-10-20): a $50k floor on the refreshed inventories.
     assert_eq!(c.universe, UniverseConfig { max_fee_ppm: 3_000, min_depth_usd: 50_000 });
