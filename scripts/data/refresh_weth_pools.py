@@ -26,7 +26,9 @@ our venues, and every token already paired with WETH in the inventories in a
 pool that held $10k or more.
 
 Records already present keep their place and what they knew; one found again
-takes the new WETH-side depth and fee, whatever hub it named before. New records follow, deepest
+takes the new WETH-side depth and fee, whatever hub it named before. A pool
+holding under $1,000 of WETH is not kept: a new one is not added, and one
+found drained is removed. New records follow, deepest
 first. Each inventory is backed up before it is rewritten.
 
 The RPC endpoint comes from BASE_RPC_URL (comma-separated for several) and is
@@ -94,6 +96,12 @@ class Summary:
     added: int = 0
     updated: int = 0
     kept: int = 0
+    removed: int = 0
+
+
+# A WETH pool holding less than this is not inventoried: it cannot be admitted
+# at any floor in use, and the legacy ranker refuses a record under $1.
+MIN_RECORD_USD = 1_000.0
 
 
 def fee_blocks(block: int) -> list:
@@ -117,7 +125,9 @@ def record(f: Found, eth_usd: float, block: int) -> dict:
     if f.venue == "aerodrome_v2":
         return {"pool": f.pool, "token0": t0, "token1": t1, "stable": False, "fee": f.fee_ppm // 100,
                 "fee_ppm_onchain": f.fee_ppm, "created_block": None, "hub_usd_liquidity": usd, "hub_symbol": "WETH"}
-    r = {"pool": f.pool, "token0": t0, "token1": t1, "fee": f.tier, "created_block": None,
+    # created_block 0, "not read": the legacy loader (arb-exec-legacy
+    # pool_store) needs a number, and the runtime does not read it.
+    r = {"pool": f.pool, "token0": t0, "token1": t1, "fee": f.tier, "created_block": 0,
          "hub_usd_liquidity": usd, "hub_symbol": "WETH", "fee_ppm_onchain": f.fee_ppm}
     if VENUES[f.venue]["kind"] == "spacing":
         r["fee_measured_block"] = block
@@ -138,6 +148,9 @@ def merge(existing: list, found: list, eth_usd: float, block: int):
         f = by_pool.get(key)
         if f is not None:
             fresh = record(f, eth_usd, block)
+            if fresh["hub_usd_liquidity"] < MIN_RECORD_USD:
+                summary.removed += 1
+                continue
             r = dict(r, hub_usd_liquidity=fresh["hub_usd_liquidity"], hub_symbol="WETH",
                      fee_ppm_onchain=fresh["fee_ppm_onchain"])
             if "fee_measured_block" in fresh:
@@ -147,6 +160,7 @@ def merge(existing: list, found: list, eth_usd: float, block: int):
             summary.kept += 1
         out.append(r)
     new = [record(f, eth_usd, block) for key, f in by_pool.items() if key not in seen]
+    new = [r for r in new if r["hub_usd_liquidity"] >= MIN_RECORD_USD]
     new.sort(key=lambda r: -r["hub_usd_liquidity"])
     summary.added = len(new)
     return out + new, summary

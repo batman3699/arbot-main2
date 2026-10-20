@@ -24,7 +24,9 @@ def found(pool, venue, tier, fee_ppm, weth_wei, token=TOK):
 class Records(unittest.TestCase):
     def test_a_uniswap_record_carries_its_tier_and_the_weth_side(self):
         r = R.record(found(POOL_A, "uniswap_v3", 500, 500, 80 * 10**18), ETH_USD, block=52_800_000)
-        self.assertEqual(r, {"pool": POOL_A, "token0": WETH, "token1": TOK, "fee": 500, "created_block": None,
+        # created_block 0, "not read": the legacy loader needs a number there
+        # (arb-exec-legacy pool_store), and the runtime does not read it.
+        self.assertEqual(r, {"pool": POOL_A, "token0": WETH, "token1": TOK, "fee": 500, "created_block": 0,
                              "hub_usd_liquidity": 200000.0, "hub_symbol": "WETH", "fee_ppm_onchain": 500})
 
     def test_tokens_are_in_the_pools_order(self):
@@ -38,6 +40,7 @@ class Records(unittest.TestCase):
     def test_an_aerodrome_record_is_volatile_with_its_fee_in_basis_points(self):
         r = R.record(found(POOL_A, "aerodrome_v2", None, 3000, 10**18), ETH_USD, block=1)
         self.assertEqual((r["stable"], r["fee"], r["fee_ppm_onchain"]), (False, 30, 3000))
+        self.assertIsNone(r["created_block"], "as every Aerodrome v2 record has it")
 
 
 class DynamicFees(unittest.TestCase):
@@ -73,6 +76,16 @@ class Merge(unittest.TestCase):
         out, summary = R.merge(self.existing(), new, ETH_USD, block=5)
         self.assertEqual([r["pool"] for r in out[2:]], ["0x2222222222222222222222222222222222222222", POOL_B])
         self.assertEqual(summary.added, 2)
+
+    def test_a_pool_measured_under_1000_dollars_is_not_kept(self):
+        # 561 of the Uniswap pools found held no WETH at all; WETH/bsdETH was
+        # drained. Neither can be admitted at any floor in use, and the legacy
+        # ranker refuses a shipped record under $1.
+        new = [found(POOL_B, "uniswap_v3", 100, 100, 10**14)]  # $0.25
+        empty = [found(POOL_A, "uniswap_v3", 500, 500, 0)]
+        out, summary = R.merge(self.existing(), new + empty, ETH_USD, block=5)
+        self.assertEqual([r["pool"].lower() for r in out], ["0x1111111111111111111111111111111111111111"])
+        self.assertEqual((summary.added, summary.removed, summary.kept), (0, 1, 1))
 
     def test_a_weth_pool_found_again_is_measured_on_its_weth_side_whatever_hub_it_named(self):
         # 37 Slipstream WETH records named no hub (scraped depths), and some
