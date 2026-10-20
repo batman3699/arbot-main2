@@ -49,12 +49,13 @@ fn read(case: &str) -> apex_types::sim::SimulationResult {
 /// **A profitable plan simulates as a success, and leaves the executor flat.**
 /// The loan in and out, the first hop's output spent whole by the second, the
 /// profit paid to the recipient: every transfer the simulation traced nets to
-/// zero on the executor, so there is no delta and no residue. And the call
-/// returned the gross profit the book predicted, to the wei.
+/// zero on the executor, so there is no delta and no residue. And the executor
+/// said the gross profit the book predicted, to the wei.
 #[test]
 fn a_profitable_plan_simulates_as_a_success_and_leaves_the_executor_flat() {
     let f = fixture();
-    let r = read("success");
+    let (answer, exe) = lean_success();
+    let r = read_simulation(BASE, exe, &answer, DurationNanos(1)).unwrap();
     assert!(r.success && r.revert.is_none());
     assert!(r.loan_repaid && r.profit_invariant_held);
     assert_eq!(r.tier, SimulationTier::Tier2FullEvm);
@@ -63,10 +64,11 @@ fn a_profitable_plan_simulates_as_a_success_and_leaves_the_executor_flat() {
     assert!(r.token_residues.is_empty());
     assert_eq!(r.result_hash, r.canonical_hash());
 
-    let returned = hex::decode(f["cases"]["success"]["response"][0]["calls"][0]["returnData"].as_str().unwrap()).unwrap();
+    let logs = answer[0]["calls"][0]["logs"].as_array().unwrap();
+    let said = hex::decode(logs.last().unwrap()["data"].as_str().unwrap()).unwrap();
     let predicted: U256 = f["expected_output_success"].as_str().unwrap().parse::<U256>().unwrap()
         - f["input"].as_str().unwrap().parse::<U256>().unwrap();
-    assert_eq!(U256::from_be_slice(&returned), predicted);
+    assert_eq!(U256::from_be_slice(&said), predicted);
 
     // The state it ran against, and after: the simulated block and its parent.
     let block = &f["cases"]["success"]["response"][0];
@@ -74,6 +76,55 @@ fn a_profitable_plan_simulates_as_a_success_and_leaves_the_executor_flat() {
     assert_eq!(r.state_after.block_hash_if_available, Some(b256("hash")));
     assert_eq!(r.simulated_at_state.parent_block_hash, b256("parentHash"));
     assert_eq!(r.simulated_at_state.confirmed_block_number + 1, r.state_after.confirmed_block_number);
+}
+
+/// The lean executor's success (R29): `run` returns nothing and emits
+/// `Profit(uint256 gross)`. The answer is the recorded fork success with what
+/// differs: an empty return, and the executor's `Profit` log after its transfers.
+fn lean_success() -> (Value, Address) {
+    let f = fixture();
+    let exe = executor(&f);
+    let mut answer = f["cases"]["success"]["response"].clone();
+    let call = &mut answer[0]["calls"][0];
+    call["returnData"] = json!("0x");
+    let last = call["logs"].as_array().unwrap().last().unwrap().clone();
+    let mut profit = last;
+    profit["address"] = json!(format!("{exe:#x}"));
+    profit["topics"] = json!([format!("{:#x}", keccak256("Profit(uint256)"))]);
+    // The gross the recorded success returned: the book's prediction, to the wei.
+    let gross: U256 = f["expected_output_success"].as_str().unwrap().parse::<U256>().unwrap()
+        - f["input"].as_str().unwrap().parse::<U256>().unwrap();
+    profit["data"] = json!(format!("0x{}", hex::encode(gross.to_be_bytes::<32>())));
+    call["logs"].as_array_mut().unwrap().push(profit);
+    (answer, exe)
+}
+
+/// **R31.1: the lean executor's success is a success.** R29's `run` returns
+/// nothing, and this reader still asked for `startV2`'s one word: every
+/// simulation that passed from 2026-10-19 19:40 UTC to R31.1 — 312 tickets, all
+/// filed as reverts with no bytes — was thrown away, and the canary sent
+/// nothing. A success is a call that ran and whose executor said `Profit`.
+#[test]
+fn a_lean_run_that_emits_its_profit_is_a_success() {
+    let (answer, exe) = lean_success();
+    let r = read_simulation(BASE, exe, &answer, DurationNanos(1)).unwrap();
+    assert!(r.success && r.revert.is_none(), "{:?}", r.revert);
+    assert!(r.loan_repaid && r.profit_invariant_held);
+
+    // Without the executor's `Profit` it is not: an account with no code, or
+    // a call that returned without trading.
+    let mut silent = answer.clone();
+    silent[0]["calls"][0]["logs"].as_array_mut().unwrap().pop();
+    let r = read_simulation(BASE, exe, &silent, DurationNanos(1)).unwrap();
+    assert!(!r.success);
+    assert_eq!(r.revert, Some((RevertClass::Unknown, Vec::new())));
+
+    // Another contract's `Profit` is not the executor's.
+    let mut other = answer;
+    let logs = other[0]["calls"][0]["logs"].as_array_mut().unwrap();
+    let n = logs.len() - 1;
+    logs[n]["address"] = json!("0x00000000000000000000000000000000000000aa");
+    assert!(!read_simulation(BASE, exe, &other, DurationNanos(1)).unwrap().success);
 }
 
 /// **Each recorded revert, by its cause.** A failure repays nothing and holds
@@ -138,13 +189,14 @@ fn an_error_whose_data_does_not_decode_is_refused() {
     assert!(read_simulation(BASE, Address::repeat_byte(1), &answer, DurationNanos(1)).is_none());
 }
 
-/// **The trap.** Before the Phase 5 executor exists at the committed address, a
-/// call to it is a call to an account with no code — status 1, nothing returned,
-/// recorded. That is not a `startV2` and not a success. Nor is any other return
-/// that is not one word — and since it is not a revert either, its bytes are not
-/// read as a revert's, however they begin.
+/// **The trap.** A call to an address with no code is status 1, nothing
+/// returned, recorded. Without the executor's `Profit` that is not a success,
+/// whatever it returned — and since it is not a revert either, its bytes are
+/// not read as a revert's, however they begin. (The recorded Phase 5 success,
+/// one word and no `Profit`, is not a lean success either.)
 #[test]
-fn a_success_that_is_not_a_start_v2_is_a_failure() {
+fn a_success_without_the_executors_profit_is_a_failure() {
+    assert!(!read("success").success, "startV2's word is not the lean executor's Profit");
     let r = read("no_executor");
     assert!(!r.success);
     assert_eq!(r.revert, Some((RevertClass::Unknown, Vec::new())));
@@ -232,9 +284,12 @@ fn deltas_are_the_executors_net_transfers() {
     let (a, b) = ("0x00000000000000000000000000000000000000aa", "0x00000000000000000000000000000000000000bb");
     let answer = |logs: Vec<Value>| json!([{
         "number": "0x10", "hash": format!("0x{}", "11".repeat(32)), "parentHash": format!("0x{}", "22".repeat(32)),
-        "calls": [{ "status": "0x1", "returnData": format!("0x{}", "00".repeat(32)), "gasUsed": "0x5208", "logs": logs }],
+        "calls": [{ "status": "0x1", "returnData": "0x", "gasUsed": "0x5208", "logs": logs }],
     }]);
+    // The lean executor's success: its `Profit` among the logs (R31.1).
+    let profit = json!({"address": e, "topics": [format!("{:#x}", keccak256("Profit(uint256)"))], "data": format!("0x{}", "00".repeat(32))});
     let r = read_simulation(BASE, exe, &answer(vec![
+        profit.clone(),
         transfer(weth, a, e, 100),
         transfer(weth, e, b, 60),
         transfer(usdc, a, e, 7),
@@ -253,7 +308,7 @@ fn deltas_are_the_executors_net_transfers() {
 
     let mut bad = transfer(weth, a, e, 1);
     bad["data"] = json!("0xzz");
-    assert!(read_simulation(BASE, exe, &answer(vec![bad]), DurationNanos(1)).is_none());
+    assert!(read_simulation(BASE, exe, &answer(vec![profit, bad]), DurationNanos(1)).is_none());
 
     // A reverted call moved nothing, whatever a node lists beside it.
     let mut reverted = answer(vec![transfer(weth, a, e, 100)]);
@@ -337,7 +392,8 @@ fn call_to(to: Address) -> ExecutorCall {
 async fn the_simulator_asks_one_call_as_the_lane_with_the_gas_limit() {
     let f = fixture();
     let exe = executor(&f);
-    let answer = f["cases"]["success"]["response"].clone();
+    // The lean executor's success (R31.1).
+    let answer = lean_success().0;
     let at = building_for(&answer);
     let rpc = Arc::new(Recording::new(Ok(answer)));
     let sim = LiveSimulator::new(rpc.clone(), BASE, building(Some(at)), before_any_block());
@@ -389,7 +445,8 @@ fn an_answer_is_read_from_its_last_block() {
 #[tokio::test]
 async fn a_simulation_in_another_blocks_context_is_refused() {
     let f = fixture();
-    let answer = f["cases"]["success"]["response"].clone();
+    // The lean executor's success (R31.1).
+    let answer = lean_success().0;
     let mut at = building_for(&answer);
     at.number += 1;
     let c = support::candidate(1, 100, 1);
@@ -458,7 +515,8 @@ fn a_block_whose_time_has_passed_is_the_next_one() {
 #[tokio::test]
 async fn the_simulator_simulates_in_the_block_being_built_now() {
     let f = fixture();
-    let answer = f["cases"]["success"]["response"].clone();
+    // The lean executor's success (R31.1).
+    let answer = lean_success().0;
     let now_built = building_for(&answer);
     let feed_said = BlockContext { number: now_built.number - 1, timestamp: now_built.timestamp - 2, ..now_built };
     let clock = Arc::new(ManualClock::at(feed_said.timestamp * 1_000_000_000 + 300_000_000));

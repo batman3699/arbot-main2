@@ -34,15 +34,16 @@
 //! Before the feed has seen a head there is nothing to read, and nothing is
 //! simulated.
 //!
-//! # A success that is not a `startV2` is a failure
+//! # A success is the executor saying `Profit`
 //!
-//! Until the Phase 5 executor is deployed at the committed address, a call to
-//! that address is a call to an account with no code — and the EVM runs that
-//! successfully and returns nothing. Recorded on a fork: status 1, empty return
-//! data. `startV2` returns its gross profit, one word, so a success that returns
-//! anything else is refused here as a failure, rather than reported as the one
-//! thing it is not. Until the deploy lands, every simulation is filed this way —
-//! as a failure with a reason, never hidden.
+//! A call to an address with no code runs successfully and returns nothing
+//! (recorded on a fork: status 1, empty return data), so a status of 1 alone
+//! is not a trade. The lean executor's `run` (R29) returns nothing either, and
+//! emits `Profit(uint256 gross)` only once the profit floor has cleared, so a
+//! success is a call that ran and whose executor emitted `Profit`; anything
+//! else is refused here as a failure, rather than reported as the one thing it
+//! is not. R29 left this reading `startV2`'s one-word return, and every lean
+//! simulation that passed was filed as an empty revert until R31.1.
 //!
 //! # What a revert is
 //!
@@ -197,6 +198,9 @@ fn deltas(chain: ChainId, executor: Address, logs: &[Value]) -> Option<BTreeMap<
     Some(out)
 }
 
+/// The lean executor's `Profit(uint256 gross)` (R29).
+pub const PROFIT_TOPIC: B256 = b256!("357d905f1831209797df4d55d79c5c5bf1d9f7311c976afd05e13d881eab9bc8");
+
 /// A `SimulationResult` from one `eth_simulateV1` answer for one call. Pure, so
 /// the answers recorded on the fork test it; `None` for an answer that is not
 /// one simulated block with one call.
@@ -224,8 +228,16 @@ pub fn read_simulation(
         None => Vec::new(),
     };
 
-    // One word is a `startV2`; an empty success is an account with no code.
-    let success = status == 1 && data.len() == 32;
+    // The executor's `Profit`: an empty success without it is an account with
+    // no code, or a call that did not trade.
+    let said_profit = call.get("logs").and_then(Value::as_array).is_some_and(|logs| {
+        logs.iter().any(|l| {
+            l.get("address").and_then(Value::as_str).and_then(|a| a.parse::<Address>().ok()) == Some(executor)
+                && l.get("topics").and_then(|t| t.get(0)).and_then(Value::as_str).and_then(|t| t.parse::<B256>().ok())
+                    == Some(PROFIT_TOPIC)
+        })
+    });
+    let success = status == 1 && said_profit;
     let revert = (!success).then(|| {
         let message = error.and_then(|e| e.get("message")).and_then(Value::as_str);
         if status == 1 {
