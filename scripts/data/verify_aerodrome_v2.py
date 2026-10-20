@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check Aerodrome v2's filtered inventory against the chain (R24 spec checks 1, 2, 3, 5).
 
-For every record the shadow's filter admits (volatile, <= 3,000 ppm, >= $100k),
+For every record the shadow's filter admits (volatile, <= 3,000 ppm, >= $50k),
 at one pinned block:
   1. inventory truth: the pool's factory() is the factory, isPool(pool) is
      true, stable() is false, and token0()/token1() are the record's;
@@ -14,9 +14,10 @@ and over the last 200 blocks:
      block.
 Exits non-zero on any failure.
 
-Run from scripts/data: python3 verify_aerodrome_v2.py
+Run from scripts/data: [BASE_RPC_URL=...] python3 verify_aerodrome_v2.py
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -24,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from arb_census.rpc import Rpc  # noqa: E402
 
 FACTORY = "0x420dd381b31aef6683db6b902084cb0ffece40da"
+MIN_DEPTH_USD = 50_000
 WETH = "0x4200000000000000000000000000000000000006"
 SYNC = "0xcf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a"
 INV = Path(__file__).resolve().parents[2] / "data" / "base" / "aerodrome_v2" / "pools.jsonl"
@@ -40,7 +42,8 @@ def quote(a, fee_ppm, r_in, r_out):
 
 
 def main():
-    rpc = Rpc(max_per_second=8)
+    # BASE_RPC_URL for a public endpoint: the default is the canary's key.
+    rpc = Rpc(url=os.environ.get("BASE_RPC_URL") or None, max_per_second=8)
     head = int(rpc.call("eth_blockNumber", []), 16)
     b = hex(head - 2)
 
@@ -48,7 +51,8 @@ def main():
         return rpc.call("eth_call", [{"to": to, "data": data}, blk])
 
     recs = [json.loads(line) for line in INV.read_text().splitlines() if line.strip()]
-    recs = [r for r in recs if not r["stable"] and r["fee_ppm_onchain"] <= 3000 and r["hub_usd_liquidity"] >= 100_000]
+    # The shipped floor: $50k since R30 (ops/*.base.yaml `min_depth_usd`).
+    recs = [r for r in recs if not r["stable"] and r["fee_ppm_onchain"] <= 3000 and r["hub_usd_liquidity"] >= MIN_DEPTH_USD]
     bad = 0
     for r in recs:
         p = r["pool"]
