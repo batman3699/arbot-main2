@@ -89,6 +89,9 @@ async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("probe") {
         return probe().await;
     }
+    if std::env::args().nth(1).as_deref() == Some("send-probe") {
+        return send_probe().await;
+    }
     if std::env::args().nth(1).as_deref() == Some("shadow") {
         return shadow().await;
     }
@@ -208,6 +211,59 @@ async fn probe() -> ExitCode {
         }
         Err(e) => {
             error!(error = %e, "the probe's report did not serialize");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `apex send-probe [--config <path>] [--count N]` (Task 8.5 R32): N zero-value
+/// self-transfers from the canary's trader, alternating BlockPI's keyed
+/// endpoint and Base's sequencer, each timed to the flashblock that carried it.
+/// Stop the canary first: the trader's nonce moves.
+async fn send_probe() -> ExitCode {
+    use apex_config::Secret;
+    use apex_runtime::send_probe::{run, SEQUENCER};
+    let (mut config, mut count) = ("ops/canary.base.yaml".to_string(), 10usize);
+    let mut argv = std::env::args().skip(2);
+    while let Some(flag) = argv.next() {
+        match (flag.as_str(), argv.next()) {
+            ("--config", Some(p)) => config = p,
+            ("--count", Some(n)) => match n.parse::<usize>() {
+                // A probe costs ~0.00000013 ETH; twenty is enough to compare.
+                Ok(n) if (1..=20).contains(&n) => count = n,
+                _ => {
+                    error!("--count is 1 to 20");
+                    return ExitCode::FAILURE;
+                }
+            },
+            _ => {
+                error!("usage: apex send-probe [--config ops/canary.base.yaml] [--count N]");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let env = Env::secrets_only();
+    let c = match apex_runtime::shadow::config::ShadowConfig::load_canary(&config, &env) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "the configuration did not load");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(key) = env.get(&c.signer.key_env).and_then(|k| apex_runtime::sign::LaneKey::from_hex(&Secret::new(k)).ok()) else {
+        error!(key_env = %c.signer.key_env, "the trader's key is not set or not a key");
+        return ExitCode::FAILURE;
+    };
+    let reads = c.rpc_http[0].expose().to_string();
+    let routes = [("blockpi", reads.clone()), ("sequencer", SEQUENCER.to_string())];
+    let report = run(&key, c.chain_id, &reads, &routes, count, 1_000_000).await;
+    match serde_json::to_string_pretty(&report) {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!(error = %e, "the report did not serialize");
             ExitCode::FAILURE
         }
     }

@@ -43,6 +43,7 @@ pub mod plane;
 pub mod probe;
 pub mod risk;
 pub mod search;
+pub mod send_probe;
 pub mod shadow;
 pub mod shutdown;
 pub mod sign;
