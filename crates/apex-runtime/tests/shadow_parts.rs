@@ -241,6 +241,9 @@ fn the_shipped_canary_config_parses() {
     assert_eq!((k.max_consecutive_reverts, k.max_consecutive_refusals, k.max_landed), (5, 2, 100));
     assert_eq!((k.receipt_poll_ms, k.settle_timeout_ms), (250, 10_000));
     assert_eq!(k.profit_recipient, address!("69D54e5fC0b9325D7250f0D0A11690327A3dd8A3"));
+    // R32.1 (operator, 2026-10-21): sends go to Base's sequencer, BlockPI when
+    // the sequencer has not taken them.
+    assert_eq!(k.send_url.as_deref(), Some("https://mainnet-sequencer.base.org"));
     assert_eq!(c.signer.gas_reserve_wei, 100_000_000_000_000);
     assert_eq!(c.policy.max_cost_confidence_bps, 1_000, "a live run keeps the default");
     // R31: the tip is bid against the rivals measured on our gaps, and the

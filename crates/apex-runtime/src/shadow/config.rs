@@ -96,6 +96,12 @@ pub struct CanaryConfig {
     pub stop_file: PathBuf,
     /// The executor must pay here, or the canary refuses to start.
     pub profit_recipient: Address,
+    /// R32.1: where sends go first: Base's sequencer, whose answer and
+    /// inclusion took 18-38 ms and 70-254 ms against BlockPI's protected
+    /// endpoint's 0.7-1.5 s and 0.6-1.7 s (`apex send-probe`, 2026-10-21).
+    /// `rpc_http[0]` takes whatever this has not. Absent: `rpc_http[0]` alone.
+    #[serde(default)]
+    pub send_url: Option<String>,
     /// Losses on losing trades; wins do not offset them.
     pub loss_cap_wei: u128,
     pub max_consecutive_reverts: u32,

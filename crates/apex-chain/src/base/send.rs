@@ -109,6 +109,39 @@ impl RawTransport for HttpSubmitter {
     }
 }
 
+/// Send through `primary`, and through `fallback` whenever `primary` has not
+/// taken it (Task 8.5 R32.1: Base's sequencer, then BlockPI's keyed endpoint,
+/// whose MEV protection held sends 0.6-1.7 s). The same signed bytes, so they
+/// land at most once whichever endpoint delivers them.
+///
+/// Either acceptance is an acceptance. `Refused` promises nothing was sent,
+/// so it is kept only when both refused; any silence may have sent it.
+pub struct FallbackTransport {
+    primary: std::sync::Arc<dyn RawTransport>,
+    fallback: std::sync::Arc<dyn RawTransport>,
+}
+
+impl FallbackTransport {
+    pub fn new(primary: std::sync::Arc<dyn RawTransport>, fallback: std::sync::Arc<dyn RawTransport>) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+#[async_trait::async_trait]
+impl RawTransport for FallbackTransport {
+    async fn send_raw(&self, raw: &[u8]) -> SendAnswer {
+        let first = self.primary.send_raw(raw).await;
+        if let SendAnswer::Accepted(h) = first {
+            return SendAnswer::Accepted(h);
+        }
+        match (first, self.fallback.send_raw(raw).await) {
+            (_, SendAnswer::Accepted(h)) => SendAnswer::Accepted(h),
+            (SendAnswer::Refused(a), SendAnswer::Refused(b)) => SendAnswer::Refused(format!("{a}; then {b}")),
+            (a, b) => SendAnswer::Silent(format!("{a:?}; then {b:?}")),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

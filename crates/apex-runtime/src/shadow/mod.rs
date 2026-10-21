@@ -82,7 +82,7 @@ use apex_capture::signer::{ExecutorAuth, LaneConfig, SignerPool};
 use apex_chain::adapter::ReplacementPolicy;
 use apex_chain::base::flashblock::{sample, FlashblockRecorder};
 use apex_chain::base::flashblock_stream::{FlashblockIndexer, FlashblockStream, FlashblockStreamStats};
-use apex_chain::base::send::HttpSubmitter;
+use apex_chain::base::send::{FallbackTransport, HttpSubmitter, RawTransport};
 use apex_chain::rpc::failover::{FailoverSettings, FailoverTransport, MethodUsage};
 use apex_chain::rpc::ws::{Head, LogFilter, Notification, Subscription, WsFeed, WsSettings, WsStats};
 use apex_chain::rpc::RpcTransport;
@@ -641,10 +641,23 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
                     timeout: Duration::from_millis(k.settle_timeout_ms),
                 },
             ));
-            let submitter = HttpSubmitter::new(config.rpc_http[0].expose(), Duration::from_secs(3))
-                .map_err(|e| ShadowError::Boot(format!("the canary's submitter: {e}")))?;
-            info!(endpoint = submitter.label(), "the canary sends through this endpoint");
-            let dispatcher = Arc::new(CanaryDispatcher::new(Arc::clone(&c), Arc::new(submitter), in_flight));
+            let submitter = |url: &str| {
+                HttpSubmitter::new(url, Duration::from_secs(3)).map_err(|e| ShadowError::Boot(format!("the canary's submitter: {e}")))
+            };
+            let blockpi = submitter(config.rpc_http[0].expose())?;
+            // R32.1: the sequencer first, BlockPI whenever it has not taken it.
+            let transport: Arc<dyn RawTransport> = match &k.send_url {
+                Some(url) => {
+                    let first = submitter(url)?;
+                    info!(first = first.label(), then = blockpi.label(), "the canary sends through these endpoints");
+                    Arc::new(FallbackTransport::new(Arc::new(first), Arc::new(blockpi)))
+                }
+                None => {
+                    info!(endpoint = blockpi.label(), "the canary sends through this endpoint");
+                    Arc::new(blockpi)
+                }
+            };
+            let dispatcher = Arc::new(CanaryDispatcher::new(Arc::clone(&c), transport, in_flight));
             Some((c, chain, dispatcher))
         }
     };

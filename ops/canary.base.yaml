@@ -157,6 +157,14 @@ canary:
   # The executor must pay profit and fees here, or the canary refuses to start
   # (the owner's recipient change, ops/host/README.md §10).
   profit_recipient: "0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3"
+  # R32.1 (operator, 2026-10-21): sends go to Base's sequencer first, and to
+  # BlockPI (rpc_http[0]) whenever the sequencer has not taken them.
+  # `apex send-probe` measured inclusion 70-254 ms after the send through the
+  # sequencer (median 145) and 624-1,679 ms through BlockPI's protected
+  # endpoint (median 877), which every one of the canary's 15 sends to date
+  # went through, each 3-7 flashblocks late. Base runs no public mempool, and
+  # a trade beaten to its gap reverts on its hop minimums.
+  send_url: https://mainnet-sequencer.base.org
   # 0.001 ETH lost on losing trades; wins do not offset it. A full-cost revert
   # is ~0.0000024 ETH, so ~400 of them.
   loss_cap_wei: 1000000000000000
