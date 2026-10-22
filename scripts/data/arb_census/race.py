@@ -34,6 +34,7 @@ import os
 import statistics
 import time
 from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from arb_census import detect
@@ -121,9 +122,19 @@ def by_offset(arbs):
 
 # ---- the host run ---------------------------------------------------------
 
+def transient(message):
+    """A failure another endpoint, or a later try, may not have: the
+    transport's, or a limit's. An error the chain gave (a revert) is the same
+    everywhere."""
+    m = message.lower()
+    return m.startswith("transport failed") or any(w in m for w in ("rate", "limit", "timeout", "too many", "exceed"))
+
+
 class Public:
     """The census client over public endpoints: calls in turn across them,
-    the next one tried when one fails; batches to the one that takes them."""
+    the next one tried on a transient failure; a batch as single calls, six
+    at a time (from AWS, 1rpc answers a batch with nothing and drpc refuses
+    one)."""
 
     def __init__(self, rate=4.0):
         self.rpcs, self.i = [Rpc(url=u, max_per_second=rate) for u in ENDPOINTS], 0
@@ -137,12 +148,34 @@ class Public:
                 self.i = (j + 1) % len(self.rpcs)
                 return out
             except RpcError as e:  # the endpoint is never printed
+                if not transient(str(e)):
+                    raise
                 err = e
                 time.sleep(min(2 ** (k // len(self.rpcs)), 8))
         raise err
 
     def batch(self, calls, size=50):
-        return self.rpcs[BATCHES].batch(calls, size)
+        def one(c):
+            try:
+                return self.call(*c)
+            except RpcError:
+                return None
+        with ThreadPoolExecutor(6) as ex:
+            return list(ex.map(one, calls))
+
+
+class Resolving(Resolver):
+    """The census's resolver, asking once about a pool it could not resolve."""
+
+    def __init__(self, rpc, cache_path):
+        super().__init__(rpc, cache_path)
+        self.failed = set()
+
+    def meta_for_logs(self, logs):
+        logs = [l for l in logs if V.pool_key(l) not in self.failed]
+        out = super().meta_for_logs(logs)
+        self.failed |= {k for k in map(V.pool_key, logs) if k is not None and k not in self.meta}
+        return out
 
 
 def category(venues):
@@ -162,6 +195,14 @@ def race_day(rpc, resolver, ledger, lo, hi, say=print):
         save()
 
 
+def _decoded(entries, meta):
+    """A pool's history as (position, leg), each raw log decoded once."""
+    for e in entries:
+        if e[2] is None:
+            e[2] = V.decode(e[1], meta) or False
+    return [(e[0], e[2]) for e in entries if e[2]]
+
+
 def _race_day(rpc, resolver, ledger, lo, hi, say):
     history, arbs, legs_kept = defaultdict(deque), [], []
     b, step = lo, STEP
@@ -174,24 +215,28 @@ def _race_day(rpc, resolver, ledger, lo, hi, say):
                 step //= 2
                 continue
             raise
-        meta = resolver.meta_for_logs(logs)
         by_tx = {}
         for l in logs:
-            lg = V.decode(l, meta)
-            if lg:
-                pos = (int(l["blockNumber"], 16), int(l["transactionIndex"], 16), int(l["logIndex"], 16))
-                by_tx.setdefault((pos[0], pos[1], l["transactionHash"]), []).append((pos, lg))
+            pos = (int(l["blockNumber"], 16), int(l["transactionIndex"], 16), int(l["logIndex"], 16))
+            by_tx.setdefault((pos[0], pos[1], l["transactionHash"]), []).append((pos, l))
+        # Only a transaction of two trades or more can be an arbitrage: its
+        # pools are resolved; a lone trade waits in the history, raw, and is
+        # decoded if an arbitrage on its pool comes.
+        meta = resolver.meta_for_logs([l for items in by_tx.values() if len(items) >= 2 for _, l in items])
         for (blk, txi, tx), items in sorted(by_tx.items()):
-            legs = [lg for _, lg in items]
-            if len(legs) >= 2:
+            if len(items) >= 2:
+                legs = [x for x in (V.decode(l, meta) for _, l in items) if x]
                 legs_kept.extend(legs)
-                if detect.is_arbitrage(legs):
+                if len(legs) >= 2 and detect.is_arbitrage(legs):
                     venues = sorted({x.venue for x in legs})
+                    past = {g.pool: _decoded(history.get(g.pool, ()), resolver.meta) for g in legs}
                     arbs.append({"tx": tx, "block": blk, "txi": txi, "venues": venues, "category": category(venues),
                                  "hops": len(legs), "change": {k: x for k, x in detect.trader_change(legs).items() if x > 0},
-                                 "trigger": trigger(history, legs)})
-            for pos, lg in items:
-                history[lg.pool].append((pos, lg))
+                                 "trigger": trigger(past, legs)})
+            for pos, l in items:
+                k = V.pool_key(l)
+                if k is not None:
+                    history[k].append([pos, l, None])
         for p in list(history):
             q = history[p]
             while q and q[0][0][0] < e - BACK_BLOCKS:
@@ -220,7 +265,7 @@ def _race_day(rpc, resolver, ledger, lo, hi, say):
             a["prio"] = max(0, int(r["effectiveGasPrice"], 16) - base[a["block"]])
             a["base_fee"], a["gas"] = base[a["block"]], int(r["gasUsed"], 16)
             a["sender"], a["to"] = r["from"].lower(), (r.get("to") or "").lower()
-    return {"lo": lo, "hi": hi, "eth_usd": usd.get(V.WETH, 0.0),
+    return {"lo": lo, "hi": hi, "eth_usd": usd.get(V.WETH, 0.0), "unresolved_pools": len(getattr(resolver, "failed", ())),
             "base_fee_median": statistics.median(base.values()) if base else None, "arbs": arbs}
 
 
@@ -286,10 +331,10 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--meta", required=True, help="the census's pool metadata cache (data/census/meta.json)")
     ap.add_argument("--gaps", required=True, help="R33's measured gaps (rival_bids.py --rows), for our landings")
-    ap.add_argument("--rate", type=float, default=4.0, help="requests a second, each endpoint")
+    ap.add_argument("--rate", type=float, default=6.0, help="requests a second, each endpoint")
     a = ap.parse_args()
     rpc = Public(a.rate)
-    resolver = Resolver(rpc, a.meta)
+    resolver = Resolving(rpc, a.meta)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     days = []

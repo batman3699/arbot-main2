@@ -76,6 +76,15 @@ class Captured(unittest.TestCase):
         self.assertIsNone(race.captured(10.0, 0.02, 0, None, self.LAND, eth_usd=3000.0))
 
 
+class Endpoints(unittest.TestCase):
+    def test_only_a_transport_failure_or_a_limit_moves_to_the_next_endpoint(self):
+        self.assertTrue(race.transient("transport failed: HTTPError"))
+        self.assertTrue(race.transient("Rate limit exceeded"))
+        self.assertTrue(race.transient("request timeout"))
+        self.assertFalse(race.transient("execution reverted"), "the same on every endpoint")
+        self.assertFalse(race.transient("invalid opcode"))
+
+
 class Shares(unittest.TestCase):
     def test_value_by_flashblocks_after_the_trigger(self):
         arbs = [{"usd": 6.0, "offset": 0}, {"usd": 2.0, "offset": 1}, {"usd": 1.0, "offset": 3}, {"usd": 1.0, "offset": None}]
