@@ -53,7 +53,8 @@ fire on ordinary moves, and bid against what the winners measurably pay.
 
 - **Pilot:** seven days live with realized net positive after every fee,
   included-revert fees under 20% of gross, and no tripwire events (R26's
-  gate B).
+  gate B). Phase 1's shape carried $2,461 in the two measured days (one a
+  spike), so the pilot proves the lane, not the target.
 - **The target:** $25k a month is ~$830 a day: roughly 5–10% of the
   trigger-block value our venues and v4 carry on a typical mix of calm and
   spike days. That is a mid-tier bot's share (the leading validity bots take
@@ -107,14 +108,27 @@ priority share of value, and their gas.
 
 The arming universe is the routes our executor can run: two hops, WETH start,
 both pools on our five venues. They are ranked by trailing value; the top
-**K = 200 routes** are armed **(my call; K tunes with the sender count)**. Their
+**K = 50 routes** are armed **(my call; K tunes with the sender count)**. Their
 pools join the book; pools outside them leave it, except the current 52,
 which stay.
 
-**Gap to fill before planning:** how much of the R35 value has that shape,
-and how many routes carry it. The script is written (`/root/r35/shape.py`);
-it needs an AWS sign-in to run. If the WETH-start two-hop share is small,
-phase 2's executor work moves ahead of the pilot.
+**How much that is** (R35's arbitrages taken in their trigger's flashblock,
+10-20/21, by the shape of the route, measured 2026-10-23):
+
+| Shape | Value, 2 days | Share | Arbitrages | By validity transactions |
+|---|---|---|---|---|
+| **2 hops, WETH start, our venues (phase 1)** | **$2,461** | 7.3% | 81 | $2,328 |
+| 2 hops, USDC start, v4 with our venues | $10,061 | 30.0% | 1,442 | $5,369 |
+| 3+ hops, USDC start, v4 with our venues | $5,664 | 16.9% | 319 | $3,939 |
+| 3+ hops, WETH start, v4 with our venues | $3,806 | 11.3% | 424 | $2,004 |
+| 3+ hops, WETH start, our venues | $2,178 | 6.5% | 148 | $1,895 |
+| everything else | $9,376 | 28.0% | | |
+
+Phase 1's $2,461 sits on **43 routes over 59 pools; the top 10 routes carry
+93%**, so 50 routes cover all of it. 95% of it was taken by validity
+transactions: phase 1 meets the winners head on, about 40 contests a day,
+which is what a pilot has to measure. The bulk (v4, USDC starts, 3 hops) is
+phase 2's.
 
 ### 2. The book and feed at that scale, Denim-first
 
@@ -173,8 +187,9 @@ model's base case.
 - **N senders**, one pending arm each (a pending transaction at nonce n
   blocks every later nonce from that address). Start with **N = 16**,
   R26's figure, and scale with gate B **(my call)**. N bounds coverage: with
-  200 routes, two slots and six rungs there are ~2,400 candidate arms, and
-  16 senders hold the best 16 of them at a time. The winners sign from 50–194
+  50 routes, two slots and six rungs there are ~600 candidate arms, and 16
+  senders hold the best 16 of them at a time; the top 10 routes carry 93% of
+  the value. The winners sign from 50–194
   addresses. Each sender costs the operator one `setExecutor` broadcast and
   a funding transfer, which is why N grows only after gate B.
 - Keys generated on the host (`apex keys new --count N` into
@@ -265,6 +280,8 @@ and the bid rule.
    budget for a second provider or an own node if the RU count says so.
 4. **Shadow length:** a one-day exactness gate (proposed), or R26's three
    days.
-5. **Phase order:** pilot on our venues first (proposed), or executor work for
-   v4 and USDC first if the shape numbers show phase 1 is too small to prove
-   anything.
+5. **Phase order:** pilot on our venues first (proposed: ~40 contests a day
+   against the same validity bots, enough to learn whether we win at a
+   profit, with no contract change), or start phase 2's executor work (v4
+   hops, USDC start: 30% of the value in 2-hop routes alone) in parallel or
+   first.
