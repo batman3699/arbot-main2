@@ -3,7 +3,7 @@
 //! A slot is a cycle and the pool whose move opens its gap. The move goes
 //! against the cycle's own swap on that pool. Profit at the best size grows
 //! with the move, so the smallest move that clears the margin is found by
-//! doubling and then bisecting. Rungs sit 5 and 20 steps past it: additive,
+//! doubling and then bisecting. Rungs sit a few steps past it (R36): additive,
 //! because a threshold that is large only because the pools already sit
 //! apart says nothing about how far triggers move (the smoke run's 62-tick
 //! threshold put a multiplied rung 3 at 248).
@@ -25,13 +25,13 @@ pub const MAX_STEP: u32 = 2_000;
 
 /// Each rung's move past the threshold, in ticks or bps.
 ///
-/// Spaced about two apart from +20, so a move between two rungs still pays the
-/// lower one at least ~75% of its best. The larger rungs are for spikes (R26.3):
-/// over 10.6 hours on 38 pools (2026-10-12/13), 89 single transactions moved a
-/// price 20 ticks or more, 9 moved it 50, and 2 moved it 200. The 21:00 UTC
-/// spike, $80 of gaps the reactive lane saw, was a 43-tick jump that the rungs
-/// up to +20 could take only a corner of.
-pub const RUNG_OFFSETS: [u32; 6] = [0, 5, 20, 50, 100, 200];
+/// R36: where ordinary moves land. R26's `0, 5, 20, 50, 100, 200` waited for
+/// spikes: over 10.6 hours on 38 pools (2026-10-12/13) only 89 transactions
+/// moved a price 20 ticks or more, and the canary period saw 8 fires. The
+/// bots that take trigger-block arbitrage (R35) fire on ordinary moves, so
+/// the rungs start at the threshold and double: a move between two still pays
+/// the lower one.
+pub const RUNG_OFFSETS: [u32; 6] = [0, 1, 2, 4, 8, 16];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Pricing {

@@ -72,6 +72,17 @@ fn pair(c: &Cycle, snap: &BTreeMap<Address, Arc<PoolSnapshot>>) -> [Arc<PoolSnap
 }
 
 /// Two pools at the same price pay nothing; moving the trigger opens the gap
+/// R36: the rungs sit where ordinary moves land, 1, 2, 4, 8 and 16 steps past
+/// the threshold, not R26's 5 to 200 that only spikes reached.
+#[test]
+fn rungs_step_one_two_four_eight_sixteen_past_the_threshold() {
+    let (cycles, snap) = pair_and_cycles();
+    let c = &cycles[0];
+    let found = rungs(c, &pair(c, &snap), 0, &px(0), 6);
+    let h = found[0].step;
+    assert_eq!(found.iter().map(|r| r.step).collect::<Vec<_>>(), vec![h, h + 1, h + 2, h + 4, h + 8, h + 16]);
+}
+
 /// at a threshold, and one step less does not clear it.
 #[test]
 fn the_threshold_is_the_smallest_move_that_clears_the_margin() {
@@ -85,9 +96,9 @@ fn the_threshold_is_the_smallest_move_that_clears_the_margin() {
             let up = trigger_up(c, leg);
             let one_less = pair[leg].moved(move_of(&pair[leg], up, first.step - 1)).unwrap();
             assert!(best_at(c, &pair, leg, one_less, &px(0)).is_none(), "minimal at step {}", first.step);
-            // Rungs: the threshold, then 5, 20, 50, 100 and 200 steps past it,
-            // each paying more: a spike pays the rungs it reaches (R26.3).
-            assert_eq!(RUNG_OFFSETS, [0, 5, 20, 50, 100, 200]);
+            // Rungs: the threshold, then 1, 2, 4, 8 and 16 steps past it, each
+            // paying more: ordinary moves land there (R36).
+            assert_eq!(RUNG_OFFSETS, [0, 1, 2, 4, 8, 16]);
             assert_eq!(found.iter().map(|r| r.step).collect::<Vec<_>>(), RUNG_OFFSETS.map(|o| first.step + o).to_vec());
             assert!(found.windows(2).all(|w| w[1].point.surplus > w[0].point.surplus));
             assert_eq!(found.iter().map(|r| r.index).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
