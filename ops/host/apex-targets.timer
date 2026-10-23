@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily APEX Armed Lane v2 route-target census
+
+[Timer]
+OnCalendar=*-*-* 00:20:00 UTC
+Persistent=true
+RandomizedDelaySec=0
+Unit=apex-targets.service
+
+[Install]
+WantedBy=timers.target
