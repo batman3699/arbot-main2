@@ -84,6 +84,21 @@ def trigger(history, arb_legs, share=SHARE):
     return best
 
 
+def route_of(legs):
+    """(the pool that took WETH, when exactly one did; every leg's pool, in log
+    order; the tokens the trader gained, sorted). R36 keys routes on the first:
+    a flash swap's callback can log its second leg before its first."""
+    took = [l.pool for l in legs if l.deltas.get(V.WETH, 0) > 0]
+    gain = sorted(k for k, x in detect.trader_change(legs).items() if x > 0)
+    return (took[0] if len(took) == 1 else None), [l.pool for l in legs], gain
+
+
+def block_offset(arb_block, trigger_block):
+    """Blocks from the trigger's to the arbitrage's: the offset once Denim's
+    200 ms blocks replace flashblocks, and there is no flashblock ledger."""
+    return arb_block - trigger_block
+
+
 def landing_distribution(gaps):
     """Where we land, flashblocks after the trigger's: R33's landings."""
     c = Counter(o for g in gaps for o in g["landing_offsets"] if o is not None)
@@ -230,8 +245,10 @@ def _race_day(rpc, resolver, ledger, lo, hi, say):
                 if len(legs) >= 2 and detect.is_arbitrage(legs):
                     venues = sorted({x.venue for x in legs})
                     past = {g.pool: _decoded(history.get(g.pool, ()), resolver.meta) for g in legs}
+                    weth_in, pools, gain = route_of(legs)
                     arbs.append({"tx": tx, "block": blk, "txi": txi, "venues": venues, "category": category(venues),
                                  "hops": len(legs), "change": {k: x for k, x in detect.trader_change(legs).items() if x > 0},
+                                 "pools": pools, "weth_in": weth_in, "gain": gain,
                                  "trigger": trigger(past, legs)})
             for pos, l in items:
                 k = V.pool_key(l)
@@ -248,6 +265,8 @@ def _race_day(rpc, resolver, ledger, lo, hi, say):
         b, step = e + 1, min(step * 2, STEP)
     usd, dec = _prices(rpc, legs_kept)
     del legs_kept
+    # After Denim there is no flashblock ledger: a 200 ms block is the unit.
+    unledgered = not any(lo <= blk <= hi for blk in ledger.by_block)
     for a in arbs:
         a["usd"], _ = _usd(a.pop("change"), usd, dec)
         f = ledger.locate(a["block"], a["txi"])
@@ -255,6 +274,8 @@ def _race_day(rpc, resolver, ledger, lo, hi, say):
         tf = ledger.locate(t[0], t[1]) if t else None
         a["fb"] = [f["block"], f["index"]] if f else None
         a["offset"] = ledger.offset((tf["block"], tf["index"]), (f["block"], f["index"])) if f and tf else None
+        if unledgered and t and a["offset"] is None:
+            a["offset"] = block_offset(a["block"], t[0])
         a["timing"] = "no_trigger" if not t else "unseen" if a["offset"] is None else "ok"
     want = [a for a in arbs if a["usd"] >= VALUED_USD and a["category"] in ("v4_with_ours", "ours")]
     blocks = sorted({a["block"] for a in want})

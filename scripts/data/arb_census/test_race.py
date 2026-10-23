@@ -46,6 +46,26 @@ class Trigger(unittest.TestCase):
         self.assertEqual(race.flow(leg("p", -7)), (T, -7))
 
 
+class Route(unittest.TestCase):
+    """R36: each arbitrage's route, keyed WETH-in pool first downstream."""
+
+    def test_the_weth_in_pool_is_the_one_that_took_weth(self):
+        a = Leg("0xh", 1, "uniswap_v3", "pa", {WETH: 100, T: -50})
+        b = Leg("0xh", 1, "slipstream_5e7b", "pb", {T: 50, WETH: -103})
+        self.assertEqual(race.route_of([b, a]), ("pa", ["pb", "pa"], [WETH]))
+
+    def test_no_weth_in_without_exactly_one_pool_taking_weth(self):
+        a = Leg("0xh", 1, "v", "pa", {U: 100, T: -50})
+        b = Leg("0xh", 1, "v", "pb", {T: 50, U: -103})
+        self.assertEqual(race.route_of([a, b])[0], None)
+
+
+class Denim(unittest.TestCase):
+    def test_without_a_flashblock_ledger_the_offset_is_counted_in_blocks(self):
+        self.assertEqual(race.block_offset(500, 500), 0)
+        self.assertEqual(race.block_offset(502, 500), 2)
+
+
 class Landing(unittest.TestCase):
     def test_our_landings_are_r33s(self):
         gaps = [{"landing_offsets": [1, 2, 2, None]}, {"landing_offsets": [2]}]
