@@ -6,6 +6,7 @@
 pub mod bid;
 pub mod engine;
 pub mod eval;
+pub mod keys;
 pub mod lines;
 pub mod moves;
 pub mod plan;

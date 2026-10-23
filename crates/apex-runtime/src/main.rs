@@ -98,6 +98,9 @@ async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("canary") {
         return canary().await;
     }
+    if std::env::args().nth(1).as_deref() == Some("keys") {
+        return keys();
+    }
 
     match run().await {
         Ok(report) => {
@@ -119,6 +122,32 @@ async fn main() -> ExitCode {
         }
         Err(e) => {
             error!(error = %e, "apex refused to start");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `apex keys new --count N --out PATH`: N armed senders' keys (R36), in a new
+/// file written 0400. Prints their addresses, one a line, and nothing else:
+/// no key leaves the file.
+fn keys() -> ExitCode {
+    const USAGE: &str = "usage: apex keys new --count N --out PATH (N from 1 to 256; PATH must not exist)";
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let count = flag("--count").and_then(|c| c.parse::<usize>().ok()).filter(|c| (1..=256).contains(c));
+    let (Some("new"), Some(count), Some(out)) = (args.first().map(String::as_str), count, flag("--out")) else {
+        eprintln!("{USAGE}");
+        return ExitCode::FAILURE;
+    };
+    match apex_runtime::armed::keys::generate(count, std::path::Path::new(&out)) {
+        Ok(addresses) => {
+            for a in addresses {
+                println!("{a}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("apex keys: {e}");
             ExitCode::FAILURE
         }
     }
