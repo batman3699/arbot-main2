@@ -1,8 +1,9 @@
 # Armed lane v2: validity transactions where the arbitrage is (Task 8.5 R36)
 
-Draft, 2026-10-23. Asked for by the operator ("check Denim and draft the
-design") after R33–R35. Nothing here is approved; the decisions that are the
-operator's are listed at the end, and every call I made is marked **(my call)**.
+2026-10-23. Asked for by the operator ("check Denim and draft the design")
+after R33–R35. **Approved 2026-10-23: "go with your proposals, write the
+implementation plan"** — the five decisions at the end are settled as
+proposed (see there). Every call I made is marked **(my call)**.
 
 ## Why
 
@@ -270,18 +271,13 @@ exactness, threshold monotonicity, golden predicate JSON, storage-word
 checks, evaluator cases, mutations) carries over and extends to the new rungs
 and the bid rule.
 
-## Decisions that are the operator's
+## Decisions that are the operator's (settled 2026-10-23: as proposed)
 
-1. **Pilot risk:** the daily loss cap (R26 set $25) and the ETH spread across
-   senders (16 × 0.002 = 0.032 ETH).
-2. **Senders and keys:** N to start, and keys generated on the host as R26
-   planned.
-3. **Infrastructure:** stay on BlockPI for a few-hundred-pool `logs` feed, or
-   budget for a second provider or an own node if the RU count says so.
-4. **Shadow length:** a one-day exactness gate (proposed), or R26's three
-   days.
-5. **Phase order:** pilot on our venues first (proposed: ~40 contests a day
-   against the same validity bots, enough to learn whether we win at a
-   profit, with no contract change), or start phase 2's executor work (v4
-   hops, USDC start: 30% of the value in 2-hop routes alone) in parallel or
-   first.
+1. **Pilot risk:** a daily loss cap of **US$25** (R26's), and 16 × 0.002 =
+   **0.032 ETH** across the senders.
+2. **Senders and keys:** **N = 16**, generated on the host as R26 planned.
+3. **Infrastructure:** **stay on BlockPI**; the report's request-unit count
+   decides later whether a second provider or an own node is needed.
+4. **Shadow length:** **the one-day exactness gate (A′)**.
+5. **Phase order:** **the pilot on our venues first**; phase 2's executor work
+   (v4 hops, USDC start) waits for gate B.
