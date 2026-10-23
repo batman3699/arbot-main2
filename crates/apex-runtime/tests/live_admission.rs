@@ -78,7 +78,7 @@ fn book(pools: impl IntoIterator<Item = PoolSnapshot>) -> PoolBook {
 }
 
 fn admitted(pools: impl IntoIterator<Item = PoolSnapshot>, read_block: u64) -> Vec<PoolAdmission> {
-    let (admitted, refused) = admission::admit_book(&book(pools), ChainId::BASE, read_block, &FLOOR);
+    let (admitted, refused) = admission::admit_book(&book(pools), ChainId::BASE, read_block, &FLOOR, &std::collections::BTreeSet::new());
     assert!(refused.is_empty(), "{refused:?}");
     admitted
 }
@@ -144,7 +144,7 @@ fn a_refused_pool_is_reported_with_its_reason() {
         pool(negative, Venue::UniswapV3, USDC, -1e6),
         pool(at_floor, Venue::UniswapV3, USDC, 100_000.0),
     ];
-    let (admitted, refused) = admission::admit_book(&book(pools), ChainId::BASE, READ_AT, &FLOOR);
+    let (admitted, refused) = admission::admit_book(&book(pools), ChainId::BASE, READ_AT, &FLOOR, &std::collections::BTreeSet::new());
 
     assert_eq!(admitted.iter().map(|a| a.pool.address).collect::<Vec<_>>(), vec![at_floor]);
     let floor = 100_000 * 1_000_000;
@@ -207,6 +207,7 @@ fn a_pool_the_last_reload_refused_is_unverified() {
         ChainId::BASE,
         READ_AT + 1,
         &FLOOR,
+        &std::collections::BTreeSet::new(),
     );
     assert_eq!(refused.len(), 1);
     commitments.set_admissions(a);
@@ -231,6 +232,20 @@ fn a_pancakeswap_pool_is_admitted_with_its_own_swap_topic() {
     assert_eq!(a[0].update_mapping, vec![PANCAKE_SWAP, MINT, BURN]);
 }
 
+/// **A targeted pool is admitted below the floor** (R36): the census armed it
+/// because its arbitrage happens, and admission still checks its factory and
+/// tokens. Only the pools named are let under the floor.
+#[test]
+fn a_targeted_shallow_pool_is_admitted_below_the_floor() {
+    let shallow = || pool(SLIP, Venue::Slipstream, USDC, 60_000.0);
+    let pools = || book([pool(UNI, Venue::UniswapV3, USDC, 5e6), shallow()]);
+    let (admitted, refused) = admission::admit_book(&pools(), ChainId::BASE, READ_AT, &FLOOR, &std::collections::BTreeSet::new());
+    assert_eq!((admitted.len(), refused.len()), (1, 1));
+    let (admitted, refused) =
+        admission::admit_book(&pools(), ChainId::BASE, READ_AT, &FLOOR, &std::collections::BTreeSet::from([SLIP]));
+    assert_eq!((admitted.len(), refused.len()), (2, 0), "{refused:?}");
+}
+
 /// **The universe's floor is admission's floor** (R30). The operator set
 /// `universe.min_depth_usd` to $50k; admission kept its own $100k default, so
 /// eleven pools between the two were loaded and priced, and no route through
@@ -240,7 +255,7 @@ fn the_universe_floor_is_the_admission_floor() {
     let shallow = || pool(SLIP, Venue::Slipstream, USDC, 60_000.0);
     let at = |min_depth_usd: f64| {
         let filter = UniverseFilter { max_fee_ppm: 3_000, min_depth_usd };
-        admission::admit_book(&book([pool(UNI, Venue::UniswapV3, USDC, 5e6), shallow()]), ChainId::BASE, READ_AT, &filter)
+        admission::admit_book(&book([pool(UNI, Venue::UniswapV3, USDC, 5e6), shallow()]), ChainId::BASE, READ_AT, &filter, &std::collections::BTreeSet::new())
     };
     let (admitted, refused) = at(50_000.0);
     assert_eq!((admitted.len(), refused.len()), (2, 0), "{refused:?}");

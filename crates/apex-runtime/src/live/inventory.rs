@@ -186,7 +186,14 @@ struct Record {
 /// `fee` field is the tick spacing, and reading it as a fee would admit a
 /// 200-spacing pool as a 200 ppm one. Uniswap's and PancakeSwap's `fee` is the
 /// fee tier, so it may stand in — the census's own rule.
-pub fn load(data_dir: &Path, filter: UniverseFilter) -> Result<Vec<PoolSpec>, InventoryError> {
+///
+/// A pool in `include` (R36: a pool the census targets) passes the depth
+/// floor; the fee ceiling and the venue's own rules still hold for it.
+pub fn load(
+    data_dir: &Path,
+    filter: UniverseFilter,
+    include: &std::collections::BTreeSet<Address>,
+) -> Result<Vec<PoolSpec>, InventoryError> {
     let mut out = Vec::new();
     for venue in Venue::ALL {
         let path = data_dir.join(venue.dir()).join("pools.jsonl");
@@ -220,7 +227,7 @@ pub fn load(data_dir: &Path, filter: UniverseFilter) -> Result<Vec<PoolSpec>, In
             };
             let Ok(fee) = u32::try_from(fee) else { continue };
             let depth = r.hub_usd_liquidity.unwrap_or(0.0);
-            if fee == 0 || fee > filter.max_fee_ppm || depth < filter.min_depth_usd {
+            if fee == 0 || fee > filter.max_fee_ppm || (depth < filter.min_depth_usd && !include.contains(&r.pool)) {
                 continue;
             }
             out.push(PoolSpec {

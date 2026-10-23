@@ -171,7 +171,7 @@ fn the_inventory_applies_the_census_filters() {
         json!({"pool":"0x0000000000000000000000000000000000000009","token0":a,"token1":b,"fee":200,"hub_usd_liquidity":3e6}),
     ]);
     write_inventory(dir.path(), "aerodrome_v2", &[]);
-    let specs = inventory::load(dir.path(), UniverseFilter::default()).unwrap();
+    let specs = inventory::load(dir.path(), UniverseFilter::default(), &std::collections::BTreeSet::new()).unwrap();
     let pools: Vec<u8> = specs.iter().map(|s| s.pool.as_slice()[19]).collect();
     assert_eq!(
         pools,
@@ -193,7 +193,7 @@ fn a_missing_inventory_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     write_inventory(dir.path(), "uniswap_v3", &[]);
     write_inventory(dir.path(), "aerodrome_slipstream", &[]);
-    assert!(matches!(inventory::load(dir.path(), UniverseFilter::default()), Err(inventory::InventoryError::Io { .. })));
+    assert!(matches!(inventory::load(dir.path(), UniverseFilter::default(), &std::collections::BTreeSet::new()), Err(inventory::InventoryError::Io { .. })));
 }
 
 // ------------------------------------------------------------------ the book

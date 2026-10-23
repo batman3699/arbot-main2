@@ -100,6 +100,10 @@ use apex_types::ids::{ChainId, SignerLaneId, StrategyId, SubmissionLaneId, Token
 use apex_types::state::ReconstructionStatus;
 use apex_types::ticket::TicketOutcome;
 use config::ShadowConfig;
+use crate::armed::targets::Targets;
+use crate::live::frontier::Cycle;
+use apex_search::frontier::RouteId;
+use std::collections::BTreeMap;
 use funnel::{Counts, Funnel};
 use nothing_sent::NothingSent;
 use queue::{pools_of, PendingQueue};
@@ -247,6 +251,13 @@ struct Shadow {
     canary: Option<Arc<Canary>>,
     /// R26: the arming engine (armed-shadow).
     armed: Arc<crate::armed::engine::Engine>,
+    /// R36: the census's targeted pools, admitted below the floor on every
+    /// reload too; whether targets were read, their routes, and their pools
+    /// with no inventory record.
+    target_pools: std::collections::BTreeSet<Address>,
+    targets_loaded: bool,
+    targeted_routes: u64,
+    targets_missing: u64,
     stats: Stats,
     started: Instant,
 }
@@ -279,8 +290,16 @@ pub fn nonce_beyond_ours(boot: u64, now: u64, sent: u64) -> bool {
 /// with WETH on one side and at least two pools, **counting only `venues`** —
 /// the ones the executor can reach. Filtered before pairing, so a pool on an
 /// unreachable venue cannot make up a pair's two.
-pub fn universe(dir: &Path, venues: &[Venue], filter: UniverseFilter) -> Result<Vec<PoolSpec>, inventory::InventoryError> {
-    let specs: Vec<PoolSpec> = inventory::load(dir, filter)?
+///
+/// R36: the census's targeted pools (`include`) are loaded below the depth
+/// floor.
+pub fn universe(
+    dir: &Path,
+    venues: &[Venue],
+    filter: UniverseFilter,
+    include: &std::collections::BTreeSet<Address>,
+) -> Result<Vec<PoolSpec>, inventory::InventoryError> {
+    let specs: Vec<PoolSpec> = inventory::load(dir, filter, include)?
         .into_iter()
         .filter(|s| venues.contains(&s.venue))
         .collect();
@@ -289,6 +308,44 @@ pub fn universe(dir: &Path, venues: &[Venue], filter: UniverseFilter) -> Result<
         .filter(|((a, b), _)| *a == WETH || *b == WETH)
         .flat_map(|(_, pools)| pools)
         .collect())
+}
+
+/// R36: the census's targets the arming engine arms from. In live mode a
+/// missing, stale or unfit file stops the boot; armed-shadow arms R26's
+/// universe instead, and says why.
+pub fn load_targets(armed: &config::ArmedConfig, now_unix: u64) -> Result<Option<Targets>, String> {
+    let live = armed.mode == config::ArmedMode::Live;
+    let refuse = |why: String| {
+        if live {
+            Err(why)
+        } else {
+            warn!(%why, "armed-shadow arms R26's universe: no targets");
+            Ok(None)
+        }
+    };
+    let Some(path) = &armed.targets else {
+        return refuse("armed.targets is not configured".into());
+    };
+    match Targets::load(path, now_unix, armed.targets_max_age_s) {
+        Ok(t) if t.live_ready() => Ok(Some(t)),
+        Ok(t) => refuse(format!("{}: not fit to arm (ok {}, {} routes)", path.display(), t.ok, t.routes.len())),
+        Err(e) => refuse(e),
+    }
+}
+
+/// R36: the cycles the arming engine arms: the targeted routes', WETH-in pool
+/// first; every cycle without targets (R26).
+pub fn armed_cycles(targets: Option<&Targets>, all: &BTreeMap<RouteId, Cycle>) -> BTreeMap<RouteId, Cycle> {
+    match targets {
+        None => all.clone(),
+        Some(t) => all.iter().filter(|(_, c)| t.has(c.legs[0].pool, c.legs[1].pool)).map(|(k, c)| (*k, c.clone())).collect(),
+    }
+}
+
+/// R36: the targeted pools with no inventory record: never loaded, so never
+/// armed. The census can see a pool the factory refresh has not recorded.
+pub fn targets_missing(targets: &Targets, specs: &[PoolSpec]) -> usize {
+    targets.pools().iter().filter(|p| !specs.iter().any(|s| s.pool == **p)).count()
 }
 
 async fn base_fee_at(rpc: &dyn RpcTransport, block: u64) -> Result<u128, ShadowError> {
@@ -428,7 +485,17 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     // R29: the lean executor swaps on every venue's pools by its own code; there
     // is no adapter registry to read.
     let venues: Vec<Venue> = Venue::ALL.to_vec();
-    let specs = universe(&config.inventory, &venues, config.universe.filter()).map_err(|e| boot_err("the inventory", e))?;
+    // R36: the census's targets, before the inventory: their pools load below
+    // the floor.
+    let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let targets = load_targets(&config.armed, now_unix).map_err(ShadowError::Boot)?;
+    let target_pools = targets.as_ref().map(Targets::pools).unwrap_or_default();
+    let specs = universe(&config.inventory, &venues, config.universe.filter(), &target_pools)
+        .map_err(|e| boot_err("the inventory", e))?;
+    let missing = targets.as_ref().map_or(0, |t| targets_missing(t, &specs));
+    if let Some(t) = &targets {
+        info!(routes = t.routes.len(), pools = target_pools.len(), missing, generated_at = %t.generated_at, "the census's targets read");
+    }
     let (book, unloaded) = PoolBook::load(&reads, &specs, head).await.map_err(|e| boot_err("the pool book", e))?;
     for u in &unloaded {
         warn!(pool = %u.pool, why = ?u.why, "not loaded at boot; the first full reload reads it again");
@@ -439,7 +506,17 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     for pool in &unarmable {
         warn!(%pool, "its watched storage words did not read back as loaded: never armed");
     }
-    let (frontier, cycles) = frontier::build(base, WETH, &book.snapshot());
+    // The reactive lane prices the pools over the floor, as before R36; the
+    // targeted pools below it are the arming engine's.
+    let everything = book.snapshot();
+    let floor = config.universe.min_depth_usd as f64;
+    let over_floor: BTreeMap<Address, Arc<crate::live::book::PoolSnapshot>> =
+        everything.iter().filter(|(_, p)| p.spec.depth_usd >= floor).map(|(a, p)| (*a, Arc::clone(p))).collect();
+    let (frontier, cycles) = frontier::build(base, WETH, &over_floor);
+    let armed_set = armed_cycles(targets.as_ref(), &frontier::build(base, WETH, &everything).1);
+    if targets.is_some() {
+        info!(cycles = armed_set.len(), "the arming engine arms the targeted routes' cycles");
+    }
     if cycles.is_empty() {
         return Err(ShadowError::Boot("the book holds no WETH cycle; nothing to search".into()));
     }
@@ -521,7 +598,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         morpho: Some(ethers_core::types::U256::from(morpho_held)),
     }));
     let armed = Arc::new(crate::armed::engine::Engine::new(
-        cycles.clone(),
+        armed_set.clone(),
         crate::armed::engine::EngineSettings {
             max_arms: config.armed.max_arms,
             rungs: config.armed.rungs,
@@ -574,7 +651,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         crate::search::flashblock_engine(cycles.len()),
     ));
 
-    let (admitted, refused) = admission::admit_book(&book, base, head, &config.universe.filter());
+    let (admitted, refused) = admission::admit_book(&book, base, head, &config.universe.filter(), &target_pools);
     for (pool, why) in &refused {
         warn!(%pool, ?why, "not admitted: no route through it can be committed");
     }
@@ -766,6 +843,10 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         nonce_moved: AtomicBool::new(false),
         canary: canary.map(|(c, _, _)| c),
         armed,
+        targets_loaded: targets.is_some(),
+        targeted_routes: targets.as_ref().map_or(0, |t| t.routes.len() as u64),
+        targets_missing: missing as u64,
+        target_pools,
         stats: Stats::default(),
         started,
         config,
@@ -951,7 +1032,7 @@ impl Shadow {
                     }
                     if work == Work::Full {
                         let (admitted, refused) =
-                            admission::admit_book(&self.book, ChainId::BASE, block, &self.config.universe.filter());
+                            admission::admit_book(&self.book, ChainId::BASE, block, &self.config.universe.filter(), &self.target_pools);
                         for (pool, why) in &refused {
                             warn!(%pool, ?why, block, "not admitted on reload");
                         }
@@ -1262,6 +1343,9 @@ impl Shadow {
                     move_checks,
                     move_tick_mismatches,
                     move_liquidity_changes,
+                    targets_loaded: self.targets_loaded,
+                    targeted_routes: self.targeted_routes,
+                    targets_missing: self.targets_missing,
                 }
             },
             lenders: {
@@ -1380,6 +1464,11 @@ pub struct ArmedReport {
     pub move_tick_mismatches: u64,
     /// The tick agreed, the liquidity did not: an unapplied mint or burn.
     pub move_liquidity_changes: u64,
+    /// R36: whether the census's targets were read; their routes; their pools
+    /// with no inventory record.
+    pub targets_loaded: bool,
+    pub targeted_routes: u64,
+    pub targets_missing: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]

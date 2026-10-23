@@ -245,6 +245,17 @@ pub struct ArmedConfig {
     pub margin_wei: u64,
     pub band_cap_bps: u32,
     pub liquidity_floor_bps: u32,
+    /// R36: the census's `targets.json`. Without it (or with one not fit to
+    /// arm) armed-shadow arms R26's universe and live mode does not boot.
+    #[serde(default)]
+    pub targets: Option<PathBuf>,
+    /// R36: the oldest `targets.json` armed from, in seconds.
+    #[serde(default = "two_days_s")]
+    pub targets_max_age_s: u64,
+}
+
+const fn two_days_s() -> u64 {
+    172_800
 }
 
 /// A resolved shadow configuration. `Debug` shows no secret.

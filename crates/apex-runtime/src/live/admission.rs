@@ -123,16 +123,22 @@ pub fn record(p: &PoolSnapshot, chain: ChainId, read_block: u64) -> PoolAdmissio
 /// full reload that has just succeeded, when every pool the book holds had its
 /// code read at that block. Not a snapshot's own `block`, which a newer swap
 /// moves. A refusal is reported with its reason, never dropped silently.
+///
+/// A pool in `include` (R36: a pool the census targets) is held to no depth
+/// floor; its factory and tokens are checked as every other pool's are.
 pub fn admit_book(
     book: &PoolBook,
     chain: ChainId,
     read_block: u64,
     filter: &UniverseFilter,
+    include: &std::collections::BTreeSet<Address>,
 ) -> (Vec<PoolAdmission>, Vec<(Address, AdmissionError)>) {
-    let registry = registry(filter);
+    let floored = registry(filter);
+    let targeted = registry(&UniverseFilter { min_depth_usd: 0.0, ..*filter });
     let (mut admitted, mut refused) = (Vec::new(), Vec::new());
     for p in book.snapshot().values() {
-        match registry.admit(record(p, chain, read_block)) {
+        let by = if include.contains(&p.spec.pool) { &targeted } else { &floored };
+        match by.admit(record(p, chain, read_block)) {
             Ok(a) => admitted.push(a),
             Err(e) => refused.push((p.spec.pool, e)),
         }

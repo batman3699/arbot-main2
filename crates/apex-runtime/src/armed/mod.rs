@@ -10,4 +10,5 @@ pub mod moves;
 pub mod plan;
 pub mod predicate;
 pub mod run;
+pub mod targets;
 pub mod threshold;

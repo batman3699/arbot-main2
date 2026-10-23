@@ -501,7 +501,7 @@ fn the_universe_is_the_reachable_weth_pairs_with_two_pools() {
         std::fs::write(dir.path().join(venue).join("pools.jsonl"), lines.join("\n")).unwrap();
     }
     let universe = |venues: &[Venue]| {
-        let mut got: Vec<u8> = apex_runtime::shadow::universe(dir.path(), venues, UniverseFilter::default())
+        let mut got: Vec<u8> = apex_runtime::shadow::universe(dir.path(), venues, UniverseFilter::default(), &std::collections::BTreeSet::new())
             .unwrap()
             .iter()
             .map(|s| s.pool.as_slice()[19])
@@ -538,7 +538,7 @@ fn the_universe_follows_its_filter() {
         std::fs::write(dir.path().join(v).join("pools.jsonl"), "").unwrap();
     }
     let at = |filter| {
-        let mut got: Vec<u8> = apex_runtime::shadow::universe(dir.path(), &[Venue::UniswapV3], filter)
+        let mut got: Vec<u8> = apex_runtime::shadow::universe(dir.path(), &[Venue::UniswapV3], filter, &std::collections::BTreeSet::new())
             .unwrap()
             .iter()
             .map(|s| s.pool.as_slice()[19])
