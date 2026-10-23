@@ -5,7 +5,7 @@
 use super::predicate::Predicate;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ArmedLine {
     Arm(Box<Arm>),
@@ -41,7 +41,7 @@ pub struct Word {
     pub value: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Arm {
     pub arm_id: u64,
     pub at_ns: u64,
@@ -77,6 +77,12 @@ pub struct Arm {
     /// borrowed from Balancer.
     #[serde(default = "balancer")]
     pub lender: String,
+    /// R36: the priority fee per gas the arm bids, and the share of the
+    /// route's measured winners it outbids. Absent from earlier ledgers.
+    #[serde(default)]
+    pub bid_wei_per_gas: String,
+    #[serde(default)]
+    pub p_win: f64,
     /// Folded in by `merge_renewals`; never written with the arm.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renewals: Vec<Renewal>,

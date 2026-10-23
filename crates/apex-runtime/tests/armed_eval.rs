@@ -54,6 +54,8 @@ fn arm() -> Arm {
         calldata_hash: "0x".into(),
         sender_slot: 0,
         lender: "balancer".into(),
+        bid_wei_per_gas: String::new(),
+        p_win: 0.0,
         renewals: Vec::new(),
     }
 }

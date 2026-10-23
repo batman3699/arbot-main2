@@ -252,6 +252,13 @@ pub struct ArmedConfig {
     /// R36: the oldest `targets.json` armed from, in seconds.
     #[serde(default = "two_days_s")]
     pub targets_max_age_s: u64,
+    /// R36: the most an arm bids, in wei per gas over the base fee.
+    #[serde(default = "twenty_gwei")]
+    pub max_priority_wei_per_gas: u128,
+}
+
+const fn twenty_gwei() -> u128 {
+    20_000_000_000
 }
 
 const fn two_days_s() -> u64 {

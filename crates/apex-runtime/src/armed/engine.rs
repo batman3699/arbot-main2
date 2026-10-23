@@ -3,11 +3,12 @@
 //! sender each; a line per arm and per renewal. Pure: the shadow worker calls
 //! [`Engine::tick`] and writes what it returns.
 
+use super::bid::{best_bid, rank_value, Bid};
 use super::lines::{Arm, ArmedLine, Word};
 use super::moves::MoveStats;
 use super::plan::armed_call;
 use super::predicate::{self, layout};
-use super::threshold::{band, rungs, trigger_up, Band, Pricing, Rung};
+use super::threshold::{band_paying, rungs, trigger_up, Band, Pricing, Rung};
 use crate::live::book::PoolSnapshot;
 use crate::live::frontier::Cycle;
 use crate::live::reads::ChainReads;
@@ -70,6 +71,8 @@ pub struct EngineSettings {
     pub reprice_for: Duration,
     /// The threads a pass prices its slots on.
     pub workers: usize,
+    /// R36: the most an arm bids, in wei per gas over the base fee.
+    pub max_priority_wei_per_gas: u128,
 }
 
 impl EngineSettings {
@@ -85,7 +88,8 @@ type Key = (RouteId, u8, u8); // cycle, trigger leg, rung
 struct Computed {
     seqs: [u64; 2],
     at_ns: u64,
-    rungs: Vec<(Rung, Band)>,
+    /// Each rung with its band and its bid (R36): the band pays the bid's tip.
+    rungs: Vec<(Rung, Band, Bid)>,
 }
 
 struct Live {
@@ -126,8 +130,12 @@ pub struct EngineStats {
     pub current_total: u64,
 }
 
+/// The measured winners' bids per gas on a route, WETH-in pool first (R36).
+pub type RouteBids = Arc<dyn Fn(Address, Address) -> Vec<u128> + Send + Sync>;
+
 pub struct Engine {
     cycles: BTreeMap<RouteId, Cycle>,
+    bids: RouteBids,
     settings: EngineSettings,
     unarmable: BTreeSet<Address>,
     state: Mutex<State>,
@@ -179,6 +187,7 @@ impl Engine {
         let slots = 2 * cycles.values().filter(|c| !c.legs.iter().any(|l| unarmable.contains(&l.pool))).count() as u64;
         Self {
             cycles,
+            bids: Arc::new(|_, _| Vec::new()),
             settings,
             unarmable,
             state: Mutex::new(state),
@@ -195,6 +204,14 @@ impl Engine {
             waiting_total: AtomicU64::new(0),
             current_total: AtomicU64::new(0),
         }
+    }
+
+    /// R36: the winners' bids each route's arms bid against. Without them an
+    /// arm bids nothing and ranks as R26's did.
+    #[must_use]
+    pub fn with_bids(mut self, bids: RouteBids) -> Self {
+        self.bids = bids;
+        self
     }
 
     pub fn stats(&self) -> EngineStats {
@@ -276,9 +293,16 @@ impl Engine {
             }
             current += 1;
             let pool = c.legs[usize::from(*leg)].pool;
-            for (r, b) in &k.rungs {
+            for (r, b, bid) in &k.rungs {
                 let p = moves.p_at_least(pool, trigger_up(c, usize::from(*leg)), r.step);
-                ranked.push((p * b.point.surplus.as_u128() as f64, (*id, *leg, r.index)));
+                // R36: the chance of a move past the rung, of the bid winning,
+                // and what a win keeps after its tip (the band already pays the
+                // tip). A rung whose bid outbids no one takes no sender. A
+                // move's chance may be 0 for a pool not yet seen moving: it
+                // orders the arms, as in R26, and excludes none.
+                if bid.p_win > 0.0 {
+                    ranked.push((rank_value(p, bid, b.point.surplus, b.point.gas.expected.0), (*id, *leg, r.index)));
+                }
             }
         }
         ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -296,7 +320,7 @@ impl Engine {
         for (_, key) in ranked.into_iter().take(s.max_arms) {
             let (id, leg, index) = key;
             let c = &self.cycles[&id];
-            let Some((rung, band)) = st.computed[&(id, leg)].rungs.iter().find(|(r, _)| r.index == index) else { continue };
+            let Some((rung, band, bid)) = st.computed[&(id, leg)].rungs.iter().find(|(r, _, _)| r.index == index) else { continue };
             let fingerprint = format!(
                 "{}:{:#x}:{:#x}:{:#x}:{:#x}",
                 rung.step,
@@ -333,7 +357,7 @@ impl Engine {
                 }
             }
             let Some(sender) = st.senders.iter().position(|b| *b == 0) else { break };
-            let Some(arm) = self.arm(c, leg, rung, band, snapshot, (head, to_block), base_fee_wei, px, now_ns, sender, st.next_arm_id) else {
+            let Some(arm) = self.arm(c, leg, (rung, band, bid), snapshot, (head, to_block), base_fee_wei, px, now_ns, sender, st.next_arm_id) else {
                 continue;
             };
             st.next_arm_id += 1;
@@ -376,9 +400,10 @@ impl Engine {
                 let (id, leg) = work[i];
                 let c = &self.cycles[&id];
                 let pair = [Arc::clone(&snapshot[&c.legs[0].pool]), Arc::clone(&snapshot[&c.legs[1].pool])];
-                let found: Vec<(Rung, Band)> = rungs(c, &pair, usize::from(leg), px, s.rungs)
+                let bids = (self.bids)(c.legs[0].pool, c.legs[1].pool);
+                let found: Vec<(Rung, Band, Bid)> = rungs(c, &pair, usize::from(leg), px, s.rungs)
                     .into_iter()
-                    .filter_map(|r| band(c, &pair, usize::from(leg), &r, px, s.band_cap_bps).map(|b| (r, b)))
+                    .filter_map(|r| bid_and_band(c, &pair, usize::from(leg), &r, px, &s, &bids).map(|(b, bid)| (r, b, bid)))
                     .collect();
                 out.push(((id, leg), Computed { seqs: [pair[0].seq, pair[1].seq], at_ns: now_ns, rungs: found }));
             }
@@ -399,8 +424,7 @@ impl Engine {
         &self,
         c: &Cycle,
         leg: u8,
-        rung: &Rung,
-        band: &Band,
+        (rung, band, bid): (&Rung, &Band, &Bid),
         snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>,
         (head, to_block): (u64, u64),
         base_fee_wei: u128,
@@ -456,6 +480,8 @@ impl Engine {
             calldata_hash,
             sender_slot: u16::try_from(sender).unwrap_or(u16::MAX),
             lender,
+            bid_wei_per_gas: bid.per_gas.to_string(),
+            p_win: bid.p_win,
             renewals: Vec::new(),
         })
     }
@@ -486,6 +512,28 @@ impl Engine {
         let lender = if choice.id == crate::live::lenders::MORPHO_FLASH { "morpho" } else { "balancer" };
         Some((format!("0x{}", alloy_primitives::hex::encode(data)), format!("{:#x}", keccak256(data)), lender.into()))
     }
+}
+
+/// R36: a rung's bid against the route's measured winners (`bids`; none
+/// measured bids nothing and ranks as R26's did), and its band paying that
+/// bid's tip at both edges.
+pub fn bid_and_band(
+    cycle: &Cycle,
+    pair: &[Arc<PoolSnapshot>; 2],
+    leg: usize,
+    rung: &Rung,
+    px: &Pricing,
+    s: &EngineSettings,
+    bids: &[u128],
+) -> Option<(Band, Bid)> {
+    let gas = rung.point.gas.expected.0;
+    let bid = if bids.is_empty() {
+        Bid { per_gas: 0, p_win: 1.0 }
+    } else {
+        best_bid(bids, rung.point.surplus, gas, s.max_priority_wei_per_gas)
+    };
+    let tip = U256::from(bid.per_gas).saturating_mul(U256::from(gas));
+    band_paying(cycle, pair, leg, rung, px, s.band_cap_bps, tip).map(|b| (b, bid))
 }
 
 /// Every pool whose watched words do not read back, at `block`, as the book

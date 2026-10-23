@@ -137,6 +137,7 @@ fn armed(mode: ArmedMode, targets: Option<&Path>) -> ArmedConfig {
         liquidity_floor_bps: 9800,
         targets: targets.map(Path::to_path_buf),
         targets_max_age_s: DAY2,
+        max_priority_wei_per_gas: 20_000_000_000,
     }
 }
 

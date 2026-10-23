@@ -3,6 +3,7 @@
 //! built and recorded, never sent; `apex armed-eval` judges them against the
 //! chain.
 
+pub mod bid;
 pub mod engine;
 pub mod eval;
 pub mod lines;

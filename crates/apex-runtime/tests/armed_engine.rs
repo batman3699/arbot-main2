@@ -79,6 +79,7 @@ fn setup_with(max_arms: usize, reprice_budget: usize, rungs: u8) -> (Engine, BTr
         reprice_budget,
         reprice_for: Duration::MAX,
         workers: 1,
+        max_priority_wei_per_gas: 20_000_000_000,
     };
     (Engine::new(cycles, settings, BTreeSet::new()), snap)
 }
@@ -108,6 +109,7 @@ fn setup_three(reprice_budget: usize, reprice_for: Duration, workers: usize) -> 
         reprice_budget,
         reprice_for,
         workers,
+        max_priority_wei_per_gas: 20_000_000_000,
     };
     (Engine::new(cycles, settings, BTreeSet::new()), snap)
 }
@@ -212,7 +214,7 @@ fn an_unarmable_pool_arms_nothing() {
     let settings = EngineSettings {
         max_arms: 4, rungs: 3, window_s: 10, block_time_ms: 2_000, band_cap_bps: 5,
         liquidity_floor_bps: 9_800, executor: EXECUTOR, chain_id: 8453, reprice_budget: REPRICE_BUDGET,
-        reprice_for: Duration::MAX, workers: 1,
+        reprice_for: Duration::MAX, workers: 1, max_priority_wei_per_gas: 20_000_000_000,
     };
     let engine = Engine::new(cycles, settings, [SLIP].into_iter().collect());
     assert!(engine.tick(&snap, 1_000, 5_000_000, &px(), 1).is_empty());
@@ -498,6 +500,7 @@ fn an_arm_closing_on_aerodrome_asks_for_its_output() {
         reprice_budget: REPRICE_BUDGET,
         reprice_for: Duration::MAX,
         workers: 1,
+        max_priority_wei_per_gas: 20_000_000_000,
     };
     let engine = Engine::new(cycles, settings, BTreeSet::new());
     let arms: Vec<Arm> = engine

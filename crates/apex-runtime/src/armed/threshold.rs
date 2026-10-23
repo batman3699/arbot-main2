@@ -194,6 +194,21 @@ pub fn band(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, rung: &Run
     None
 }
 
+/// The rung's band when it must pay `tip_wei` on top of the margin (R36):
+/// a fire anywhere inside it nets at least nothing after its own tip.
+pub fn band_paying(
+    cycle: &Cycle,
+    pair: &[Arc<PoolSnapshot>; 2],
+    leg: usize,
+    rung: &Rung,
+    px: &Pricing,
+    cap_steps: u32,
+    tip_wei: U256,
+) -> Option<Band> {
+    let paying = Pricing { margin_wei: px.margin_wei.saturating_add(tip_wei), ..*px };
+    band(cycle, pair, leg, rung, &paying, cap_steps)
+}
+
 /// The plan at `size` and `mid` with the trigger and the other pool as given,
 /// if it clears the margin: strictly, as `best_at` requires.
 #[allow(clippy::too_many_arguments)]

@@ -611,9 +611,14 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
             reprice_budget: crate::armed::engine::REPRICE_BUDGET,
             reprice_for: crate::armed::engine::REPRICE_FOR,
             workers: crate::armed::engine::workers(),
+            max_priority_wei_per_gas: config.armed.max_priority_wei_per_gas,
         },
         unarmable,
-    ));
+    )
+    .with_bids({
+        let t = targets.clone();
+        Arc::new(move |weth_in, other| t.as_ref().map_or_else(Vec::new, |t| t.bids_for(weth_in, other).to_vec()))
+    }));
     // R31: the rivals' bids each candidate's priority fee is chosen against.
     let rival_bids = crate::econ::RivalBids::load(&config.policy.rival_bids)
         .map_err(|e| ShadowError::Boot(format!("policy.rival_bids: {e}")))?;
