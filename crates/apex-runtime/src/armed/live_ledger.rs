@@ -58,11 +58,13 @@ pub enum LiveRecord {
         net_wei: i128,
         at_ms: u64,
     },
-    /// All hashes tracked at this sender/nonce have passed their bounds, and
-    /// the sender nonce did not advance.
+    /// `tx`'s bound has passed with the sender's nonce unmoved, so it can no
+    /// longer land; with no `tx`, every hash at this sender/nonce has.
     Expired {
         sender: Address,
         nonce: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tx: Option<B256>,
         at_ms: u64,
     },
     Skipped {
@@ -194,8 +196,21 @@ impl LiveState {
                     }
                 }
             }
-            LiveRecord::Expired { sender, nonce, .. } => {
-                self.pending.remove(&(*sender, *nonce));
+            LiveRecord::Expired { sender, nonce, tx, .. } => {
+                let key = (*sender, *nonce);
+                match tx {
+                    None => {
+                        self.pending.remove(&key);
+                    }
+                    Some(tx) => {
+                        if let Some(pending) = self.pending.get_mut(&key) {
+                            pending.retain(|p| p.tx != *tx);
+                            if pending.is_empty() {
+                                self.pending.remove(&key);
+                            }
+                        }
+                    }
+                }
             }
             LiveRecord::Skipped { .. } => {}
             LiveRecord::Halted { reason, .. } => match reason {

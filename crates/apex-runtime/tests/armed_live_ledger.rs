@@ -88,12 +88,38 @@ fn a_landing_or_expiry_ends_every_submission_at_that_nonce() {
         submitting(addr(1), 7, tx(2), 5, OCT_24_UTC + 1),
         landed(addr(1), 7, tx(1), 2, OCT_24_UTC + 2),
         submitting(addr(2), 8, tx(3), 4, OCT_24_UTC + 3),
-        LiveRecord::Expired { sender: addr(2), nonce: 8, at_ms: OCT_24_UTC + 4 },
+        LiveRecord::Expired { sender: addr(2), nonce: 8, tx: None, at_ms: OCT_24_UTC + 4 },
     ];
     let state = LiveState::from_records(&records, OCT_24_UTC + 5, 100);
     assert!(state.pending.is_empty());
     assert_eq!(state.reserved_wei, 0);
     assert_eq!(state.day_net, 2);
+}
+
+/// A renewal at a nonce whose earlier transaction's bound has passed: the
+/// earlier one can no longer land, and goes alone.
+#[test]
+fn an_expiry_of_one_hash_keeps_the_rest_of_its_nonce() {
+    let records = vec![
+        submitting(addr(1), 7, tx(1), 5, OCT_24_UTC),
+        submitting(addr(1), 7, tx(2), 3, OCT_24_UTC + 1),
+        LiveRecord::Expired { sender: addr(1), nonce: 7, tx: Some(tx(1)), at_ms: OCT_24_UTC + 2 },
+    ];
+    let state = LiveState::from_records(&records, OCT_24_UTC + 3, 100);
+    assert_eq!(state.pending[&(addr(1), 7)].iter().map(|p| p.tx).collect::<Vec<_>>(), vec![tx(2)]);
+    assert_eq!(state.reserved_wei, 3);
+
+    let mut all = records;
+    all.push(LiveRecord::Expired { sender: addr(1), nonce: 7, tx: Some(tx(2)), at_ms: OCT_24_UTC + 4 });
+    assert!(LiveState::from_records(&all, OCT_24_UTC + 5, 100).pending.is_empty(), "the last one empties the nonce");
+}
+
+/// Lines written before per-hash expiry name no hash, and end the nonce.
+#[test]
+fn an_expiry_without_a_hash_reads_as_the_whole_nonce() {
+    let line = r#"{"kind":"expired","sender":"0x0101010101010101010101010101010101010101","nonce":8,"at_ms":1}"#;
+    let record: LiveRecord = serde_json::from_str(line).unwrap();
+    assert_eq!(record, LiveRecord::Expired { sender: addr(1), nonce: 8, tx: None, at_ms: 1 });
 }
 
 #[test]
@@ -231,7 +257,7 @@ fn all_record_variants_round_trip_and_wei_are_decimal_strings() {
         },
         answered(tx(1), None, "network timeout", OCT_24_UTC + 1),
         landed(addr(1), 7, tx(1), -123, OCT_24_UTC + 2),
-        LiveRecord::Expired { sender: addr(2), nonce: 8, at_ms: OCT_24_UTC + 3 },
+        LiveRecord::Expired { sender: addr(2), nonce: 8, tx: None, at_ms: OCT_24_UTC + 3 },
         LiveRecord::Skipped { arm_id: 10, sender: addr(2), reason: "budget".into(), at_ms: OCT_24_UTC + 4 },
         LiveRecord::Halted {
             reason: Halt::Tripwire { sender: addr(2), detail: "unexpected nonce".into() },
