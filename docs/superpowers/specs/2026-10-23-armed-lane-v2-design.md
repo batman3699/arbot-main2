@@ -5,6 +5,32 @@ after R33–R35. **Approved 2026-10-23: "go with your proposals, write the
 implementation plan"** — the five decisions at the end are settled as
 proposed (see there). Every call I made is marked **(my call)**.
 
+## Revision, 2026-10-24 (after the operator's profit review)
+
+The operator supplied `APEX_Armed_Lane_V2_Profit_Review_2026-10-23.md`. Adopted, superseding the sections named:
+
+- **§4, the bid, is per gas.** Base orders eligible transactions by priority fee per gas, and a share of value mixes in gas: a 190k-gas rival paying 22% bids far more per gas than we would at the same share on 500k. The census records each winner's effective priority per gas. Each arm bids the `b` maximising `F(b) × (net − b × gas)`; a validity loser is never included, so the tip is paid only on a win. Arms rank by `P(trigger) × F(b) × (surplus − b × gas)`. The census reports a held-out calibration of `F`.
+- **Fires pay their own tip.** Every band and threshold clears the hurdle plus the arm's own tip, so a fire inside the predicates nets ≥ 0 after it.
+- **The loss cap bounds exposure, not only realized loss.** Every submission is written to the ledger and synced before it is sent. It reserves its worst case (`gas_limit × max_fee + an L1 bound`) until its bound passes and its nonce is reconciled. Nothing is sent unless realized loss plus everything reserved plus the new worst case fits the daily budget. A sender is used only when it can pay its worst case plus a reserve.
+- **The budget is ETH-denominated: 0.01 ETH a day** (≈US$24 at $2,450), rather than US$25 through a daily price oracle.
+- **Ambiguity is a possible send.** A silent answer stays reserved. A refused replacement leaves the earlier transaction tracked. Fee bumps are integer and never cross a cap.
+- **Restarts reconcile first.** Boot rebuilds pending submissions, reservations and the day's net from the ledger, waits out their bounds, settles receipts and nonces, and only then sends. An unexplained nonce move trips the halt.
+- **Expiry and cadence are runtime state.** Each bound is set from the freshest head at send. Live sends stop while the measured block cadence is off `block_time_ms` by more than half.
+- **Housekeeping:**
+  - one policy section for every cap;
+  - `targets.json` is usable live only when it is fit: at least 3 days, at least one route, finite values;
+  - gate B needs at least 30 landings beside its 7 days, with net reported by day and by route;
+  - gate A′ reports disagreement weighted by value and by route;
+  - the probe's never-true predicate is an impossible balance, and every probe action must reach a reconciled end.
+
+Not adopted, with reasons:
+
+- **Per-pool overlap caps and re-arm hysteresis.** Rungs on one slot complement each other (the largest eligible executes, the rest become ineligible). An arm is replaced only after its window, so churn is bounded by W. Churn is logged instead.
+- **Stale arms "firing on old state".** A slot whose pools changed is not renewed, so its arm lives at most W = 10 s. Its predicates still hold the band, and its fire now clears its own tip.
+- **Bootstrap confidence intervals for gate B.** Too much for phase 1's sample sizes; the minimum count and the per-day and per-route net serve instead.
+
+Open for the operator (see the plan's revision note): the budget's effect on concurrency, sender funding, and phase-2 measurement in parallel.
+
 ## Why
 
 Three measurements in two days changed what the reactive lane is worth:
