@@ -84,28 +84,37 @@ impl RawTransport for HttpSubmitter {
             Err(e) if e.is_connect() => return SendAnswer::Refused(format!("connect: {}", e.without_url())),
             Err(e) => return SendAnswer::Silent(e.without_url().to_string()),
         };
-        let status = response.status();
-        if status.is_client_error() {
-            return SendAnswer::Refused(format!("http {status}"));
-        }
-        if !status.is_success() {
-            return SendAnswer::Silent(format!("http {status}"));
-        }
-        let answer: Value = match response.json().await {
-            Ok(v) => v,
-            Err(e) => return SendAnswer::Silent(format!("not JSON-RPC: {}", e.without_url())),
-        };
-        if let Some(err) = answer.get("error") {
-            let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
-            let message = err.get("message").and_then(Value::as_str).unwrap_or("");
-            return SendAnswer::Refused(format!("{code}: {message}"));
-        }
-        let ours = keccak256(raw);
-        match answer.get("result").and_then(Value::as_str).and_then(|s| s.parse::<B256>().ok()) {
-            Some(h) if h == ours => SendAnswer::Accepted(h),
-            Some(h) => SendAnswer::Silent(format!("the endpoint named {h:#x}, and ours is {ours:#x}")),
-            None => SendAnswer::Silent(format!("no transaction hash in {answer}")),
-        }
+        let status = response.status().as_u16();
+        let body = if (200..300).contains(&status) { response.json().await.ok() } else { None };
+        read_answer(raw, status, body)
+    }
+}
+
+/// What a send's HTTP status and JSON-RPC body mean (see the module's head):
+/// a client error or an error object sent nothing; a server error, no body,
+/// or a hash not ours may have sent something.
+pub fn read_answer(raw: &[u8], status: u16, body: Option<Value>) -> SendAnswer {
+    // As reqwest shows a status: "429 Too Many Requests".
+    let shown = reqwest::StatusCode::from_u16(status).map_or_else(|_| status.to_string(), |s| s.to_string());
+    if (400..500).contains(&status) {
+        return SendAnswer::Refused(format!("http {shown}"));
+    }
+    if !(200..300).contains(&status) {
+        return SendAnswer::Silent(format!("http {shown}"));
+    }
+    let Some(answer) = body else {
+        return SendAnswer::Silent("not JSON-RPC".into());
+    };
+    if let Some(err) = answer.get("error") {
+        let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let message = err.get("message").and_then(Value::as_str).unwrap_or("");
+        return SendAnswer::Refused(format!("{code}: {message}"));
+    }
+    let ours = keccak256(raw);
+    match answer.get("result").and_then(Value::as_str).and_then(|s| s.parse::<B256>().ok()) {
+        Some(h) if h == ours => SendAnswer::Accepted(h),
+        Some(h) => SendAnswer::Silent(format!("the endpoint named {h:#x}, and ours is {ours:#x}")),
+        None => SendAnswer::Silent(format!("no transaction hash in {answer}")),
     }
 }
 
