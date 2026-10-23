@@ -103,9 +103,25 @@ pub struct LiveState {
     pub day_net: i128,
     pub reserved_wei: u128,
     pub halted: Option<Halt>,
+    loss_capped: bool,
+    /// The last tripwire not yet reset: it outlives the day.
+    tripwire: Option<Halt>,
 }
 
 impl LiveState {
+    /// Nothing pending, nothing halted, on `now_ms`'s UTC day.
+    pub fn new(now_ms: u64) -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            day: utc_day(now_ms),
+            day_net: 0,
+            reserved_wei: 0,
+            halted: None,
+            loss_capped: false,
+            tripwire: None,
+        }
+    }
+
     /// Replay the ledger as of `now_ms`.
     ///
     /// A nonce may have multiple submitted hashes due to validity transaction
@@ -113,94 +129,106 @@ impl LiveState {
     /// largest still-possible worst case per `(sender, nonce)`. A refused hash
     /// is removed independently; silence remains uncertain and stays pending.
     pub fn from_records(records: &[LiveRecord], now_ms: u64, budget_wei: u128) -> Self {
-        let day = utc_day(now_ms);
-        let mut state = Self {
-            pending: BTreeMap::new(),
-            day: day.clone(),
-            day_net: 0,
-            reserved_wei: 0,
-            halted: None,
-        };
-        let mut loss_cap_halted = false;
-        let mut tripwire_halted: Option<Halt> = None;
-
+        let mut state = Self::new(now_ms);
         for record in records {
-            match record {
-                LiveRecord::Submitting {
-                    arm_id,
-                    pools,
-                    sender,
-                    nonce,
-                    tx,
-                    to_block,
-                    worst_case_wei,
-                    ..
-                } => {
-                    let pending = state.pending.entry((*sender, *nonce)).or_default();
-                    // Idempotence protects replay from a duplicate append/record.
-                    if !pending.iter().any(|p| p.tx == *tx) {
-                        pending.push(PendingTx {
-                            arm_id: *arm_id,
-                            pools: *pools,
-                            tx: *tx,
-                            to_block: *to_block,
-                            worst_case_wei: *worst_case_wei,
-                            accepted: None,
-                        });
-                    }
-                }
-                LiveRecord::Answered { tx, accepted, .. } => {
-                    let mut empty_key = None;
-                    for (key, pending) in state.pending.iter_mut() {
-                        if let Some(index) = pending.iter().position(|p| p.tx == *tx) {
-                            if *accepted == Some(false) {
-                                pending.remove(index);
-                            } else {
-                                pending[index].accepted = *accepted;
-                            }
-                            if pending.is_empty() {
-                                empty_key = Some(*key);
-                            }
-                            break;
-                        }
-                    }
-                    if let Some(key) = empty_key {
-                        state.pending.remove(&key);
-                    }
-                }
-                LiveRecord::Landed { sender, nonce, net_wei, at_ms, .. } => {
-                    // A landed hash resolves every replacement sharing its nonce.
-                    state.pending.remove(&(*sender, *nonce));
-                    if utc_day(*at_ms) == day {
-                        state.day_net = state.day_net.saturating_add(*net_wei);
-                        // Infer a missing Halted append after a crash between a
-                        // synced Landed record and the explicit Halted record.
-                        if state.day_net < 0 && state.day_net.unsigned_abs() >= budget_wei {
-                            loss_cap_halted = true;
-                        }
-                    }
-                }
-                LiveRecord::Expired { sender, nonce, .. } => {
-                    state.pending.remove(&(*sender, *nonce));
-                }
-                LiveRecord::Skipped { .. } => {}
-                LiveRecord::Halted { reason, .. } => match reason {
-                    Halt::LossCap { day: halted_day } if halted_day == &day => {
-                        loss_cap_halted = true;
-                    }
-                    Halt::LossCap { .. } => {}
-                    Halt::Tripwire { .. } => {
-                        tripwire_halted = Some((*reason).clone());
-                    }
-                },
-                LiveRecord::Reset { .. } => {
-                    // LossCap deliberately survives Reset until UTC day rollover.
-                    tripwire_halted = None;
+            state.apply(record, budget_wei);
+        }
+        state
+    }
+
+    /// Fold one more record in, on the state's day: the live worker applies
+    /// each record as it appends it.
+    pub fn apply(&mut self, record: &LiveRecord, budget_wei: u128) {
+        match record {
+            LiveRecord::Submitting {
+                arm_id,
+                pools,
+                sender,
+                nonce,
+                tx,
+                to_block,
+                worst_case_wei,
+                ..
+            } => {
+                let pending = self.pending.entry((*sender, *nonce)).or_default();
+                // Idempotence protects replay from a duplicate append/record.
+                if !pending.iter().any(|p| p.tx == *tx) {
+                    pending.push(PendingTx {
+                        arm_id: *arm_id,
+                        pools: *pools,
+                        tx: *tx,
+                        to_block: *to_block,
+                        worst_case_wei: *worst_case_wei,
+                        accepted: None,
+                    });
                 }
             }
+            LiveRecord::Answered { tx, accepted, .. } => {
+                let mut empty_key = None;
+                for (key, pending) in self.pending.iter_mut() {
+                    if let Some(index) = pending.iter().position(|p| p.tx == *tx) {
+                        if *accepted == Some(false) {
+                            pending.remove(index);
+                        } else {
+                            pending[index].accepted = *accepted;
+                        }
+                        if pending.is_empty() {
+                            empty_key = Some(*key);
+                        }
+                        break;
+                    }
+                }
+                if let Some(key) = empty_key {
+                    self.pending.remove(&key);
+                }
+            }
+            LiveRecord::Landed { sender, nonce, net_wei, at_ms, .. } => {
+                // A landed hash resolves every replacement sharing its nonce.
+                self.pending.remove(&(*sender, *nonce));
+                if utc_day(*at_ms) == self.day {
+                    self.day_net = self.day_net.saturating_add(*net_wei);
+                    // Infer a missing Halted append after a crash between a
+                    // synced Landed record and the explicit Halted record.
+                    if self.day_net < 0 && self.day_net.unsigned_abs() >= budget_wei {
+                        self.loss_capped = true;
+                    }
+                }
+            }
+            LiveRecord::Expired { sender, nonce, .. } => {
+                self.pending.remove(&(*sender, *nonce));
+            }
+            LiveRecord::Skipped { .. } => {}
+            LiveRecord::Halted { reason, .. } => match reason {
+                Halt::LossCap { day: halted_day } if *halted_day == self.day => {
+                    self.loss_capped = true;
+                }
+                Halt::LossCap { .. } => {}
+                Halt::Tripwire { .. } => {
+                    self.tripwire = Some(reason.clone());
+                }
+            },
+            LiveRecord::Reset { .. } => {
+                // LossCap deliberately survives Reset until UTC day rollover.
+                self.tripwire = None;
+            }
         }
+        self.settle();
+    }
 
-        state.reserved_wei = state
+    /// Move to `now_ms`'s UTC day. A new day starts with no net and no loss
+    /// cap; pending nonces and a tripwire carry over.
+    pub fn roll(&mut self, now_ms: u64) {
+        let day = utc_day(now_ms);
+        if day != self.day {
+            self.day = day;
+            self.day_net = 0;
+            self.loss_capped = false;
+            self.settle();
+        }
+    }
+
+    fn settle(&mut self) {
+        self.reserved_wei = self
             .pending
             .values()
             .map(|pending| {
@@ -215,12 +243,11 @@ impl LiveState {
 
         // A same-day loss cap has priority in the report; a tripwire remains
         // sticky across day rollover until Reset.
-        state.halted = if loss_cap_halted {
-            Some(Halt::LossCap { day })
+        self.halted = if self.loss_capped {
+            Some(Halt::LossCap { day: self.day.clone() })
         } else {
-            tripwire_halted
+            self.tripwire.clone()
         };
-        state
     }
 
     /// Whether another worst-case exposure can be reserved without exceeding

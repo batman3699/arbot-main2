@@ -141,6 +141,32 @@ fn a_tripwire_holds_until_reset() {
     assert_eq!(LiveState::from_records(&reset, OCT_24_UTC + 3, 10).halted, None);
 }
 
+/// The live worker keeps its state by applying each record as it writes it,
+/// and moving to the next UTC day as the clock does: the same state a replay
+/// at that moment would build.
+#[test]
+fn applying_records_one_at_a_time_matches_the_replay_across_midnight() {
+    let records = vec![
+        submitting(addr(1), 7, tx(1), 3, OCT_24_UTC),
+        answered(tx(1), Some(true), "accepted", OCT_24_UTC + 1),
+        submitting(addr(2), 8, tx(2), 4, OCT_24_UTC + 2),
+        landed(addr(2), 8, tx(2), -11, OCT_24_UTC + 3),
+        LiveRecord::Halted { reason: Halt::LossCap { day: "2026-10-24".into() }, at_ms: OCT_24_UTC + 4 },
+        LiveRecord::Halted { reason: Halt::Tripwire { sender: addr(3), detail: "x".into() }, at_ms: OCT_24_UTC + 5 },
+    ];
+    let mut state = LiveState::new(OCT_24_UTC);
+    for record in &records {
+        state.apply(record, 10);
+    }
+    assert_eq!(state, LiveState::from_records(&records, OCT_24_UTC + 6, 10));
+    assert_eq!(state.halted, Some(Halt::LossCap { day: "2026-10-24".into() }));
+
+    state.roll(OCT_25_UTC);
+    assert_eq!(state, LiveState::from_records(&records, OCT_25_UTC, 10));
+    assert!(matches!(state.halted, Some(Halt::Tripwire { .. })), "the tripwire outlives the day");
+    assert_eq!((state.day_net, state.reserved_wei), (0, 3), "the day's net restarts; the pending nonce is still held");
+}
+
 #[test]
 fn a_crash_after_landed_but_before_halted_still_reconstructs_the_loss_cap() {
     // Task 10 syncs Landed before appending Halted. Replay must conservatively
