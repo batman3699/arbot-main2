@@ -21,7 +21,8 @@ remappings = [
 # this contract; `apex-exec` asserts its Rust encoder reproduces the same file.
 # Neither side may write it -- a test that regenerated the fixture would make the
 # two agree by construction, which is the one thing a differential must not do.
-fs_permissions = [{ access = "read", path = "./crates/apex-exec/tests/fixtures" }]
+# R36: the owner scripts read ops/armed-senders.json (addresses only).
+fs_permissions = [{ access = "read", path = "./crates/apex-exec/tests/fixtures" }, { access = "read", path = "./ops" }]
 
 # Fork tests read Base over the network (Task 8.5 R29): never in the everyday
 # run or CI, only under `FOUNDRY_PROFILE=fork`, each top-level call its own
