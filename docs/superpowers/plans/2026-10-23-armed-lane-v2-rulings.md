@@ -1,6 +1,8 @@
 # Armed lane v2 (R36): the executor's rulings
 
-Every decision taken on the operator's behalf while executing `2026-10-23-armed-lane-v2.md`, each with what it costs if wrong, copied from the execution ledger in the order made. Then the minors deferred at the final review.
+Every decision taken on the operator's behalf while executing `2026-10-23-armed-lane-v2.md`, each with what it costs if wrong, copied from the execution ledger in the order made. Then what the final reviews fixed, and the minors they deferred.
+
+The final reviews were a self-review, then an independent review (a fresh reviewer on Opus, 2026-10-24) at the operator's request.
 
 ## Rulings
 
@@ -50,12 +52,30 @@ Every decision taken on the operator's behalf while executing `2026-10-23-armed-
 - Task 13: Ruling: ops/host/remote.sh gains a read-only `live` (the last report's armed section without the engine stats) — the page's "reading armed.live" is one command from the operator's machine — cost if wrong: none.
 - Task 14: Ruling: subscriptions() lives in shadow/mod.rs beside the feed; armed-eval reads no flashblocks when the section is absent — cost if wrong: none.
 - Task 15: Ruling: Steps 1-2 only (gates, clean-worktree build, PLAN.md, the ask); Steps 3-6 touch the host and mainnet and wait for the operator's approval at the time — the brief says so — cost if wrong: none.
+- Final: Ruling: the frozen head feed (reviewer Minor) is closed by (5): stops are read on each head and sends need a fresh read — cost if wrong: none.
+- Final: Ruling: compact()'s replay-equivalence check survives mutation by design (a correct filter never trips it); kept as the money ledger's safety net — cost if wrong: one extra replay at boot.
+- Final: Ruling: the stale-read guard also skips a read below the worker's known nonce with nothing pending — the race the reviewer confirmed; a read that low is a node behind, never a theft — cost if wrong: a theft's tripwire waits for a read at or past the known nonce.
+- Final: Ruling: settle marks a sender's balance stale only when its nonce moved (a landing spends; an expiry does not) — fewer balance reads — cost if wrong: none.
+- Final: Ruling: the gate A′ figure weighted by value and by route (plan Task 15 Step 4) has no code; it is computed when gate A′ is run, from the armed-eval verdicts, before live — cost if wrong: one more step at gate A′.
+- Final: Ruling: the review's plan-level points go to the operator: 0.002 ETH a sender caps a bid near 2.3 gwei/gas at a 750k limit against winners' 1.1–8.1 gwei; the budget nets wins against losses (max(0, −day_net)) — both approved decisions to confirm.
+
+## Fixed at the final reviews
+
+- (Important, docs) ARMED.md called revocation a stop; a revoked sender's armed transactions still land, revert at NotTrader and pay gas, and armed-live reads executors only at boot — now: stop first, then revoke (c17c534). A runbook change, no test.
+- (1) Reset cannot clear a tripwire — a_reset_after_a_tripwire_lets_the_lane_resume, a_boot_after_a_reset_takes_an_idle_sender_at_the_chain_s_nonce, an_unreadable_receipt_abandons_its_nonce_at_its_worst_case, a_reset_re_baselines_every_nonce_view, an_abandoned_nonce_is_charged_its_worst_case, the_probe_refuses_a_sender_the_live_ledger_knows RED→GREEN; mutants killed.
+- (2) stale nonce expiry — a_hash_expires_only_on_a_nonce_read_at_the_block_it_judges, a_read_the_state_has_outrun_is_not_judged RED→GREEN; mutants killed.
+- (3)+(4) keys unreadable / archive moves the ledger — the_armed_live_files_live_outside_the_archived_run_directory RED→GREEN (var/armed).
+- (5) owner's stops after boot — an_open_circuit_stops_every_send, a_revoked_sender_is_skipped, stops_not_read_lately_stop_sends RED→GREEN; mutants killed.
+- (6) ledger growth — compaction_keeps_the_state_and_the_nonce_views, a_long_ledger_is_compacted_and_the_original_kept RED→GREEN.
+- roll backwards — the_day_never_rolls_back RED→GREEN; mutant killed. Fixed refusal allowlist — an_answer_that_is_not_a_known_refusal_keeps_its_reservation RED→GREEN; mutant killed. Fixed census overwrite — test_an_unfit_file_never_replaces_the_good_one RED→GREEN.
 
 ## Deferred minors
 
-- targets.py _load_landings raises on an unterminated last line of armed-live.jsonl (a crash mid-append), failing the daily census until the canary's restart truncates it.
+- targets.py _load_landings raises on an unterminated last line of armed-live.jsonl (a crash mid-append); the targets are already published by then, but the job fails, so the canary is not restarted and the new targets do not load until the next run (corrected per the independent review).
 - the engine does not skip rungs over max_size_wei; the worker skips them (Skipped{"size"}), idling that slot for one window. Watch skipped.size in gate A'.
-- armed-live.jsonl grows ~100 MB/day at the full renewal rate and the boot replays all of it; no rotation (and a rotation must carry the nonce views).
 - after a "nonce too low" landing the renewal that found it is not re-sent at the next nonce; the slot idles until the engine's next window.
 - on_head reads due senders' nonces one after another (no futures crate); settlement, not sending, waits on them.
-- armed-live does not watch executors(sender) after boot (the canary's reactive lane does, every block); a revocation is not noticed until restart.
+- a bumped replacement can pay up to 1.27× the tip the band priced; whether bumps happen at all depends on the probe's case 4 (does the builder hold an expired transaction?). Revisit with the probe's answer.
+- the budget's upper bound (0.1 ETH) admits a one-zero slip of the approved 0.01; the senders' float (16 × 0.002) also bounds loss. Tighten after the pilot sizes it.
+- owner scripts take the executor from the JSON (no pin, no owner check), refuse no known address, and cap no sender count; the dry run shows each call before broadcast.
+- the smaller gaps — zero armable targeted cycles accepted at a live boot; bids_wei_per_gas not checked ascending; sequencer URL unchecked; stale queued lines each cost an eth_blockNumber; bumped(0) == 0; days_left counts spend since boot; the probe does not measure the total re-arm rate.
