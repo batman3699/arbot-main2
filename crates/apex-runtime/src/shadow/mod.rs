@@ -317,6 +317,16 @@ pub fn universe(
         .collect())
 }
 
+/// R36: the capture feed's subscriptions: heads, `pendingLogs` until Denim
+/// ends it, and canonical logs.
+pub fn subscriptions(feed: &config::FeedConfig, filter: LogFilter) -> Vec<Subscription> {
+    if feed.pending_logs {
+        vec![Subscription::NewHeads, Subscription::PendingLogs(filter.clone()), Subscription::Logs(filter)]
+    } else {
+        vec![Subscription::NewHeads, Subscription::Logs(filter)]
+    }
+}
+
 /// R36: the census's targets the arming engine arms from. In live mode a
 /// missing, stale or unfit file stops the boot; armed-shadow arms R26's
 /// universe instead, and says why.
@@ -393,7 +403,8 @@ pub async fn run(config: ShadowConfig, env: &Env, stop: impl Future<Output = ()>
             Box::pin(async move { s.capture(&mut *capture.lock().await).await })
         }));
     }
-    {
+    // R36: no stream to open once Denim has ended flashblocks.
+    if shadow.config.flashblocks.is_some() {
         let (s, stopped) = (Arc::clone(&shadow), feed_stopped.clone());
         spawn("flashblocks", Box::new(move || {
             let (s, stopped) = (Arc::clone(&s), stopped.clone());
@@ -938,7 +949,7 @@ impl Shadow {
     /// The capture feed: notifications → the book → effects.
     async fn feed(&self, bus: &EventBus, stopped: watch::Receiver<bool>) {
         let filter = LogFilter { addresses: self.universe.clone(), topics0: vec![SWAP, PANCAKE_SWAP, MINT, BURN, SYNC] };
-        let subs = vec![Subscription::NewHeads, Subscription::PendingLogs(filter.clone()), Subscription::Logs(filter)];
+        let subs = subscriptions(&self.config.feed, filter);
         let feed = match WsFeed::new(self.config.rpc_ws.expose(), subs, WsSettings::default()) {
             Ok(f) => f,
             Err(e) => {
@@ -1297,13 +1308,14 @@ impl Shadow {
     /// Base's public flashblock stream, as it reached this host, to its ledger:
     /// the clock the race ledger is measured against (R25). Measurement only.
     async fn flashblock_ledger(&self, stop: watch::Receiver<bool>) {
-        let stream = FlashblockStream::new(&self.config.flashblocks.stream);
+        let Some(fb) = &self.config.flashblocks else { return };
+        let stream = FlashblockStream::new(&fb.stream);
         self.flashblock_stats.store(Some(stream.stats()), ReconstructionStatus::Verified);
         let (task, mut rx) = stream.spawn(stop);
         let mut ix = FlashblockIndexer::new();
         while let Some((f, at)) = rx.recv().await {
             if let Some(seen) = ix.observe(&f, at) {
-                if ledger::append_line(&self.config.flashblocks.ledger, at, &seen).is_err() {
+                if ledger::append_line(&fb.ledger, at, &seen).is_err() {
                     bump(&self.stats.ledger_failures);
                 }
             }

@@ -248,7 +248,7 @@ pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
     let to = due.iter().map(|a| a.to_block).max().unwrap_or(head);
     let logs = get_logs(&*rpc, &pools, from, to).await?;
     let effects = effects_of(&logs, &venues);
-    let flashblocks: Vec<FlashblockSeen> = read_lines(&config.flashblocks.ledger, now, 2);
+    let flashblocks: Vec<FlashblockSeen> = config.flashblocks.as_ref().map(|f| read_lines(&f.ledger, now, 2)).unwrap_or_default();
     let weth_usd = weth_usd(&reads, head).await.unwrap_or(0.0);
 
     let mut judged: Vec<(Arm, eval::Judged)> = Vec::new();

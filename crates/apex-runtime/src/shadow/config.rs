@@ -67,7 +67,11 @@ struct Raw {
     report: PathBuf,
     misses: PathBuf,
     race: PathBuf,
-    flashblocks: FlashblocksConfig,
+    /// R36: absent once Denim ends flashblocks.
+    #[serde(default)]
+    flashblocks: Option<FlashblocksConfig>,
+    #[serde(default)]
+    feed: FeedConfig,
     armed: ArmedConfig,
     executor: ExecutorConfig,
     signer: SignerConfig,
@@ -223,6 +227,25 @@ pub struct FlashblocksConfig {
     pub ledger: PathBuf,
 }
 
+/// R36: what the capture feed subscribes to. Denim ends `pendingLogs`: on
+/// that day `pending_logs: false` leaves heads and canonical logs.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedConfig {
+    #[serde(default = "yes")]
+    pub pending_logs: bool,
+}
+
+impl Default for FeedConfig {
+    fn default() -> Self {
+        Self { pending_logs: true }
+    }
+}
+
+const fn yes() -> bool {
+    true
+}
+
 /// R26: armed backruns. `shadow` arms and records; `live` (R36) also sends,
 /// and runs only under `apex canary`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -344,7 +367,10 @@ pub struct ShadowConfig {
     pub misses: PathBuf,
     /// The race ledger: one line per handled proposal, a file per UTC day (R25).
     pub race: PathBuf,
-    pub flashblocks: FlashblocksConfig,
+    /// Base's flashblock stream and its ledger (R25); none after Denim.
+    pub flashblocks: Option<FlashblocksConfig>,
+    /// R36: the capture feed's subscriptions.
+    pub feed: FeedConfig,
     /// Armed backruns, R26.
     pub armed: ArmedConfig,
     pub executor: ExecutorConfig,
@@ -490,6 +516,7 @@ impl ShadowConfig {
             misses: raw.misses,
             race: raw.race,
             flashblocks: raw.flashblocks,
+            feed: raw.feed,
             armed: raw.armed,
             executor: raw.executor,
             signer: raw.signer,

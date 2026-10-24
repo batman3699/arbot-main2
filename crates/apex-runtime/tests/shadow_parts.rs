@@ -110,10 +110,41 @@ fn a_resolved_key_is_held_as_a_secret() {
     assert_eq!(c.signer.key_env, "APEX_SECRET_SHADOW_TEST_TRADER");
     assert_eq!(c.executor.plan_version, 2);
     assert_eq!(c.race, std::path::PathBuf::from("var/r.jsonl"));
-    assert_eq!(c.flashblocks.stream, "wss://mainnet.flashblocks.base.org/ws");
-    assert_eq!(c.flashblocks.ledger, std::path::PathBuf::from("var/f.jsonl"));
+    let flashblocks = c.flashblocks.as_ref().expect("the flashblocks section");
+    assert_eq!(flashblocks.stream, "wss://mainnet.flashblocks.base.org/ws");
+    assert_eq!(flashblocks.ledger, std::path::PathBuf::from("var/f.jsonl"));
+    assert!(c.feed.pending_logs, "before Denim, the feed takes pendingLogs");
     assert_eq!((c.armed.max_arms, c.armed.rungs, c.armed.window_s), (16, 3, 10));
     assert_eq!(c.armed.ledger, std::path::PathBuf::from("var/a.jsonl"));
+}
+
+/// R36, Denim: `pendingLogs` ends, so the feed is heads and canonical logs.
+#[test]
+fn after_denim_the_feed_is_heads_and_canonical_logs() {
+    use apex_chain::rpc::ws::{LogFilter, Subscription};
+    use apex_runtime::shadow::config::FeedConfig;
+    use apex_runtime::shadow::subscriptions;
+    let f = LogFilter { addresses: vec![address!("00000000000000000000000000000000000000a1")], topics0: vec![B256::repeat_byte(1)] };
+    assert_eq!(
+        subscriptions(&FeedConfig { pending_logs: true }, f.clone()),
+        vec![Subscription::NewHeads, Subscription::PendingLogs(f.clone()), Subscription::Logs(f.clone())]
+    );
+    assert_eq!(subscriptions(&FeedConfig { pending_logs: false }, f.clone()), vec![Subscription::NewHeads, Subscription::Logs(f)]);
+
+    let var = "APEX_SECRET_SHADOW_TEST_DENIM";
+    let denim = yaml(var, "var/apex/shadow.journal").replace("armed:\n", "feed:\n  pending_logs: false\narmed:\n");
+    let c = ShadowConfig::from_yaml_str(&denim, &env(var, SECRET)).unwrap();
+    assert!(!c.feed.pending_logs);
+}
+
+/// R36, Denim: flashblocks end, and with them the stream and its ledger.
+#[test]
+fn without_a_flashblocks_section_no_stream_is_opened() {
+    let var = "APEX_SECRET_SHADOW_TEST_DENIM";
+    let text = yaml(var, "var/apex/shadow.journal")
+        .replace("flashblocks:\n  stream: wss://mainnet.flashblocks.base.org/ws\n  ledger: var/f.jsonl\n", "");
+    let c = ShadowConfig::from_yaml_str(&text, &env(var, SECRET)).unwrap();
+    assert!(c.flashblocks.is_none());
 }
 
 /// R26: the engine's settings are bounded.

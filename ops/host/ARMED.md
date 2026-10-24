@@ -186,10 +186,15 @@ targets load.
 
 ### The Denim day
 
-Denim (Base mainnet, ~November 2026) makes blocks 200 ms. On that day, set
-`block_time_ms: 200` in `ops/canary.base.yaml` and restart. W stays 10 s, now
-50 blocks, inside Base's 60 s bound limit.
+Denim (Base mainnet, ~November 2026) makes blocks 200 ms and ends
+`pendingLogs` and flashblocks. On that day, make three edits in both
+`ops/canary.base.yaml` and `ops/shadow.base.yaml`, then restart:
+
+- add `feed:` with `pending_logs: false`, so the feed is heads and canonical logs;
+- remove the `flashblocks:` section, so no stream is opened and no ledger written;
+- set `armed.block_time_ms: 200`.
+
+W stays 10 s, now 50 blocks, inside Base's 60 s bound limit.
 
 Until the configuration matches, the cadence guard stops every send by
-itself: the measured cadence would be 200 ms against a configured 2,000. The
-feed's move off `pendingLogs` is Task 14's switch.
+itself: the measured cadence would be 200 ms against a configured 2,000.
