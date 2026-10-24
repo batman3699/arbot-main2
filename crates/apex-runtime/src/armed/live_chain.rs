@@ -2,7 +2,9 @@
 //! run's read-only transport, and the boot's check that the executor lets
 //! every sender trade.
 
-use super::live::LiveChain;
+use super::live::{LiveChain, Stops};
+use crate::live::abi::{self, selector};
+use crate::live::reads::ChainReads;
 use alloy_primitives::{keccak256, Address, B256, U256};
 use apex_chain::rpc::RpcTransport;
 use serde_json::{json, Value};
@@ -12,11 +14,12 @@ use std::sync::Arc;
 /// builder, so only a landing moves a sender's nonce.
 pub struct RpcChain {
     rpc: Arc<dyn RpcTransport>,
+    reads: ChainReads,
 }
 
 impl RpcChain {
     pub fn new(rpc: Arc<dyn RpcTransport>) -> Self {
-        Self { rpc }
+        Self { reads: ChainReads::new(Arc::clone(&rpc)), rpc }
     }
 
     async fn quantity(&self, method: &str, params: Value) -> Result<U256, String> {
@@ -35,6 +38,21 @@ impl LiveChain for RpcChain {
     async fn nonce(&self, a: Address) -> Result<u64, String> {
         let n = self.quantity("eth_getTransactionCount", json!([format!("{a:#x}"), "latest"])).await?;
         u64::try_from(n).map_err(|e| e.to_string())
+    }
+
+    async fn nonce_at(&self, a: Address, block: u64) -> Result<u64, String> {
+        let n = self.quantity("eth_getTransactionCount", json!([format!("{a:#x}"), format!("{block:#x}")])).await?;
+        u64::try_from(n).map_err(|e| e.to_string())
+    }
+
+    /// One aggregated `eth_call`: `isCircuitOpen()`, then `executors(s)` for
+    /// each sender. An answer that does not decode reads as a stop.
+    async fn stops(&self, executor: Address, senders: &[Address], block: u64) -> Result<Stops, String> {
+        let mut calls = vec![(executor, abi::call0(selector::IS_CIRCUIT_OPEN))];
+        calls.extend(senders.iter().map(|s| (executor, abi::call_address(selector::EXECUTORS, *s))));
+        let answers = self.reads.multicall(&calls, block).await.map_err(|e| e.to_string())?;
+        let yes = |i: usize| answers.get(i).and_then(Option::as_deref).and_then(|d| abi::word_u256(d, 0)).map(|w| w == U256::from(1));
+        Ok(Stops { circuit_open: yes(0) != Some(false), allowed: (1..=senders.len()).map(|i| yes(i) == Some(true)).collect() })
     }
 
     async fn balance(&self, a: Address) -> Result<u128, String> {

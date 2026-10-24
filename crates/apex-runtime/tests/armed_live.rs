@@ -12,7 +12,7 @@ use apex_chain::base::send::SendAnswer;
 use apex_config::Secret;
 use apex_runtime::armed::lines::{Arm, ArmedLine};
 use apex_chain::rpc::{RpcError, RpcTransport};
-use apex_runtime::armed::live::{ArmedLive, LiveChain, LivePolicy, ValiditySend};
+use apex_runtime::armed::live::{ArmedLive, LiveChain, LivePolicy, Stops, ValiditySend};
 use apex_runtime::armed::live_chain::{check_executors, executors_call};
 use apex_runtime::armed::live_ledger::{Halt, LiveLedger, LiveRecord};
 use apex_runtime::armed::predicate::{expiry, Op, Predicate};
@@ -21,7 +21,7 @@ use ethers_core::types::transaction::eip2718::TypedTransaction;
 use ethers_core::types::U256;
 use ethers_core::utils::rlp::Rlp;
 use serde_json::Value;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,6 +47,11 @@ struct Chain {
     receipts: Mutex<BTreeMap<B256, Value>>,
     receipt_asks: AtomicUsize,
     receipts_fail: AtomicBool,
+    /// The read node's own head: a nonce asked at a later block errs.
+    node_head: Mutex<u64>,
+    nonce_blocks: Mutex<Vec<u64>>,
+    circuit_open: AtomicBool,
+    revoked: Mutex<BTreeSet<Address>>,
 }
 
 impl Chain {
@@ -61,6 +66,10 @@ impl Chain {
             receipts: Mutex::new(BTreeMap::new()),
             receipt_asks: AtomicUsize::new(0),
             receipts_fail: AtomicBool::new(false),
+            node_head: Mutex::new(u64::MAX),
+            nonce_blocks: Mutex::new(Vec::new()),
+            circuit_open: AtomicBool::new(false),
+            revoked: Mutex::new(BTreeSet::new()),
         })
     }
 }
@@ -72,6 +81,17 @@ impl LiveChain for Chain {
     }
     async fn nonce(&self, a: Address) -> Result<u64, String> {
         self.nonces.lock().unwrap().get(&a).copied().ok_or_else(|| "unknown".into())
+    }
+    async fn nonce_at(&self, a: Address, block: u64) -> Result<u64, String> {
+        self.nonce_blocks.lock().unwrap().push(block);
+        if block > *self.node_head.lock().unwrap() {
+            return Err("header not found".into());
+        }
+        self.nonce(a).await
+    }
+    async fn stops(&self, _: Address, senders: &[Address], _: u64) -> Result<Stops, String> {
+        let revoked = self.revoked.lock().unwrap();
+        Ok(Stops { circuit_open: self.circuit_open.load(Ordering::Relaxed), allowed: senders.iter().map(|s| !revoked.contains(s)).collect() })
     }
     async fn balance(&self, _: Address) -> Result<u128, String> {
         self.balance_asks.fetch_add(1, Ordering::Relaxed);
@@ -371,8 +391,10 @@ async fn a_balance_is_read_at_most_once_a_minute() {
     start(&f).await;
     let renew = |calldata: &str| ArmedLine::Renew { arm_id: 1, to_block: 110, at_ns: 0, deadline: None, calldata: Some(calldata.into()) };
     f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
+    f.live.on_head(130, NOW + 59_999, NOW + 59_999).await;
     f.live.on_lines(&[renew("0xabce")], 0, NOW + 59_999).await;
-    assert_eq!(f.chain.balance_asks.load(Ordering::Relaxed), 1);
+    assert_eq!(f.chain.balance_asks.load(Ordering::Relaxed), 1, "an expiry spent nothing");
+    f.live.on_head(131, NOW + 60_000, NOW + 60_000).await;
     f.live.on_lines(&[renew("0xabcf")], 0, NOW + 60_000).await;
     assert_eq!(f.chain.balance_asks.load(Ordering::Relaxed), 2);
 }
@@ -694,7 +716,7 @@ async fn a_key_the_executor_does_not_know_stops_the_boot() {
 
 #[tokio::test]
 async fn the_report_carries_the_live_section() {
-    let answers = vec![SendAnswer::Accepted(B256::ZERO), SendAnswer::Silent("timeout".into()), SendAnswer::Refused("-32000: no".into())];
+    let answers = vec![SendAnswer::Accepted(B256::ZERO), SendAnswer::Silent("timeout".into()), SendAnswer::Refused("-32000: insufficient funds".into())];
     let f = fixture(policy(ETH / 100, u128::MAX), answers, vec![]);
     start(&f).await;
     let big = Arm { size_wei: (11 * ETH).to_string(), ..arm(4, 3, 1_000_000_000, 600_000) };
@@ -728,4 +750,147 @@ async fn the_report_carries_the_live_section() {
     let days = r.senders[0].days_left.expect("a day's spend");
     assert!((days - 1.0 / 0.0003).abs() < 1e-6, "1 ETH over 0.0003 ETH a day: {days}");
     assert!(serde_json::to_value(&r).unwrap()["senders"].is_array());
+}
+
+/// The tripwire fired on a nonce that moved by two; the operator found why
+/// and appended a reset. The lane resumes from the chain's nonce, the
+/// abandoned transaction's worst case counted against the day.
+#[tokio::test]
+async fn a_reset_after_a_tripwire_lets_the_lane_resume() {
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
+    f.chain.nonces.lock().unwrap().insert(key(1).address(), 9);
+    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    assert!(matches!(f.live.state(NOW + 10_000).halted, Some(Halt::Tripwire { .. })));
+    let mut ledger = records(&f.ledger);
+    assert!(ledger.iter().any(|r| matches!(r, LiveRecord::Abandoned { nonce: 7, worst_case_wei: 600_000_000_000, .. })), "{ledger:?}");
+
+    ledger.push(LiveRecord::Reset { at_ms: NOW + 20_000 });
+    let g = fixture(policy(ETH, u128::MAX), vec![], ledger);
+    g.chain.nonces.lock().unwrap().insert(key(1).address(), 9);
+    start(&g).await;
+    assert!(g.live.ready());
+    let state = g.live.state(NOW);
+    assert_eq!((state.halted, state.day_net), (None, -600_000_000_000));
+    g.live.on_lines(&[ArmedLine::Arm(Box::new(arm(2, 0, 1_000_000, 600_000)))], 0, NOW).await;
+    let sent = g.script.sent.lock().unwrap().clone();
+    assert_eq!(fees(&sent[0].0).2, 9, "the chain's nonce");
+}
+
+#[tokio::test]
+async fn a_boot_after_a_reset_takes_an_idle_sender_at_the_chain_s_nonce() {
+    let sender = key(1).address();
+    let open = B256::repeat_byte(0x11);
+    let tripped = LiveRecord::Halted { reason: Halt::Tripwire { sender, detail: "x".into() }, at_ms: NOW - 40_000 };
+    let records = vec![
+        open_submission(sender, 7, open, 103),
+        LiveRecord::Expired { sender, nonce: 7, tx: Some(open), at_ms: NOW - 50_000 },
+        tripped,
+        LiveRecord::Reset { at_ms: NOW - 30_000 },
+    ];
+    let f = fixture(policy(ETH, u128::MAX), vec![], records);
+    f.chain.nonces.lock().unwrap().insert(sender, 8);
+    f.live.begin(NOW).await.unwrap();
+    assert_eq!(f.live.state(NOW).halted, None);
+}
+
+#[tokio::test]
+async fn an_unreadable_receipt_abandons_its_nonce_at_its_worst_case() {
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
+    let sent = keccak256(&f.script.sent.lock().unwrap()[0].0);
+    f.chain.nonces.lock().unwrap().insert(key(1).address(), 8);
+    let mut unreadable = receipt(sent, true, 300_000, 1_000_000, 0, 1, 1);
+    unreadable.as_object_mut().unwrap().remove("l1Fee");
+    f.chain.receipts.lock().unwrap().insert(sent, unreadable);
+    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    let state = f.live.state(NOW + 10_000);
+    assert!(matches!(state.halted, Some(Halt::Tripwire { .. })));
+    assert!(state.pending.is_empty(), "nothing left to trip the next boot");
+    assert_eq!(state.day_net, -600_000_000_000);
+}
+
+/// A landing moved the sender to nonce 8 and a new arm went out there; a
+/// node still at 7 answers next. It is behind us, not a theft.
+#[tokio::test]
+async fn a_read_the_state_has_outrun_is_not_judged() {
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    f.chain.nonces.lock().unwrap().insert(key(1).address(), 8);
+    start(&f).await;
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
+    f.chain.nonces.lock().unwrap().insert(key(1).address(), 7);
+    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    let state = f.live.state(NOW + 10_000);
+    assert_eq!(state.halted, None);
+    assert!(state.pending.contains_key(&(key(1).address(), 8)));
+}
+
+/// The bound is 104. At head 105 the read node has only 103: nothing is
+/// judged. Then it has 105, and the nonce at block 105 says 7: expired.
+#[tokio::test]
+async fn a_hash_expires_only_on_a_nonce_read_at_the_block_it_judges() {
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
+    f.chain.nonce_blocks.lock().unwrap().clear();
+    *f.chain.node_head.lock().unwrap() = 103;
+    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    assert_eq!(f.live.state(NOW + 10_000).pending.len(), 1, "a node behind the head judges nothing");
+    *f.chain.node_head.lock().unwrap() = u64::MAX;
+    f.live.on_head(106, NOW + 12_000, NOW + 12_000).await;
+    assert!(f.live.state(NOW + 12_000).pending.is_empty());
+    assert_eq!(*f.chain.nonce_blocks.lock().unwrap(), vec![104, 105], "each head is judged at the block before it");
+}
+
+/// Only an answer that says what was refused releases a reservation; any
+/// other error may have sent it.
+#[tokio::test]
+async fn an_answer_that_is_not_a_known_refusal_keeps_its_reservation() {
+    let answers = vec![
+        SendAnswer::Refused("-32603: internal error".into()),
+        SendAnswer::Refused("-32000: insufficient funds for gas * price + value".into()),
+        SendAnswer::Refused("connect: connection refused".into()),
+    ];
+    let f = fixture(policy(ETH, u128::MAX), answers, vec![]);
+    start(&f).await;
+    let lines = [arm(1, 0, 1_000_000, 600_000), arm(2, 1, 1_000_000, 600_000), arm(3, 2, 1_000_000, 600_000)].map(|a| ArmedLine::Arm(Box::new(a)));
+    f.live.on_lines(&lines, 0, NOW).await;
+    let state = f.live.state(NOW);
+    assert_eq!(state.pending.keys().map(|(s, _)| *s).collect::<Vec<_>>(), vec![key(1).address()]);
+    assert_eq!(state.reserved_wei, 600_000_000_000);
+}
+
+#[tokio::test]
+async fn an_open_circuit_stops_every_send() {
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    f.chain.circuit_open.store(true, Ordering::Relaxed);
+    start(&f).await;
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
+    assert!(f.script.sent.lock().unwrap().is_empty());
+    f.chain.circuit_open.store(false, Ordering::Relaxed);
+    f.live.on_head(101, NOW + 2_000, NOW + 2_000).await;
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW + 2_000).await;
+    assert_eq!(f.script.sent.lock().unwrap().len(), 1, "closed again");
+}
+
+#[tokio::test]
+async fn a_revoked_sender_is_skipped() {
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    f.chain.revoked.lock().unwrap().insert(key(1).address());
+    start(&f).await;
+    let lines = [arm(1, 0, 1_000_000, 600_000), arm(2, 1, 1_000_000, 600_000)].map(|a| ArmedLine::Arm(Box::new(a)));
+    f.live.on_lines(&lines, 0, NOW).await;
+    assert_eq!(f.script.sent.lock().unwrap().len(), 1);
+    assert_eq!(skipped(&f.ledger), vec!["revoked".to_string()]);
+}
+
+/// The head feed froze: neither the stops nor the settlements are current.
+#[tokio::test]
+async fn stops_not_read_lately_stop_sends() {
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW + 6_001).await;
+    assert!(f.script.sent.lock().unwrap().is_empty(), "three block times without a head");
 }

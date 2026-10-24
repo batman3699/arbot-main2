@@ -47,12 +47,14 @@ flashblocks:
 # `apex armed-eval` (a timer on the host) judges every arm against the chain.
 # R36: the census's targets (apex-targets.timer) choose the routes; armed-live
 # also sends, from the senders in live.keys_file (ops/host/ARMED.md). Every
-# cap is here, read by the engine and the live worker alike.
+# cap is here, read by the engine and the live worker alike. Armed-live's files
+# are in var/armed: the unit can write there, and a new revision's archive of
+# var/apex leaves them in place.
 armed:
   mode: shadow
   ledger: var/apex/armed.jsonl
   verdicts: var/apex/armed-verdicts.jsonl
-  targets: var/apex/targets.json
+  targets: var/armed/targets.json
   targets_max_age_s: 172800
   max_arms: 16
   rungs: 6
@@ -67,10 +69,10 @@ armed:
   l1_fee_bound_wei: 50000000000000           # 0.00005 ETH
   sender_reserve_wei: 200000000000000        # 0.0002 ETH
   live:
-    keys_file: /etc/apex/armed.keys
+    keys_file: var/armed/armed.keys
     sequencer: https://mainnet-sequencer.base.org
-    ledger: var/apex/armed-live.jsonl
-    kill_file: var/apex/armed.disable
+    ledger: var/armed/armed-live.jsonl
+    kill_file: var/armed/armed.disable
 
 executor:
   # R29: the lean executor, deployed 2026-10-19 by the owner with

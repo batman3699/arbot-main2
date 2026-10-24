@@ -1,8 +1,10 @@
 //! The armed lane's live worker (Task 8.5 R36): each arm the engine writes
 //! becomes a validity transaction from its slot's own sender.
 //!
-//! **Before a send.** The worker checks four things:
+//! **Before a send.** The worker checks five things:
 //! - the lane is ready, and heads keep the configured cadence;
+//! - the owner's stops, read on the last head: the executor's circuit is
+//!   closed and still lets the sender trade;
 //! - no kill file exists;
 //! - the ledger holds no halt;
 //! - the arm's worst case fits both the sender's balance and the day's
@@ -32,7 +34,7 @@
 //! settled this way.
 
 use super::lines::{Arm, ArmedLine};
-use super::live_ledger::{Halt, LiveLedger, LiveRecord, LiveState, PendingTx};
+use super::live_ledger::{nonce_views, Halt, LiveLedger, LiveRecord, LiveState, PendingTx};
 use super::predicate::{self, Op, Predicate};
 use crate::canary::chain::read_receipt;
 use crate::live::frontier::WETH;
@@ -74,8 +76,21 @@ impl ValiditySend for ValiditySubmitter {
 pub trait LiveChain: Send + Sync {
     async fn head(&self) -> Result<u64, String>;
     async fn nonce(&self, a: Address) -> Result<u64, String>;
+    /// The nonce as of `block`'s end. A node without that block errs, which
+    /// is what settlement wants from one behind the head.
+    async fn nonce_at(&self, a: Address, block: u64) -> Result<u64, String>;
     async fn balance(&self, a: Address) -> Result<u128, String>;
     async fn receipt(&self, tx: B256) -> Result<Option<Value>, String>;
+    /// The owner's stops on `executor` as of `block`, one answer per sender.
+    async fn stops(&self, executor: Address, senders: &[Address], block: u64) -> Result<Stops, String>;
+}
+
+/// The owner's two stops on the executor: its circuit, and which senders it
+/// lets trade (in the order asked).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stops {
+    pub circuit_open: bool,
+    pub allowed: Vec<bool>,
 }
 
 /// The caps the worker holds every submission to, all in wei.
@@ -125,6 +140,8 @@ struct Inner {
     balances: BTreeMap<Address, Balance>,
     /// Each slot's arm, as last armed or renewed.
     arms: BTreeMap<u16, Arm>,
+    /// The owner's stops, and when they were read.
+    stops: Option<(Stops, u64)>,
     /// The last head and when it was seen, and the per-block intervals before it.
     last_head: Option<(u64, u64)>,
     intervals: VecDeque<u64>,
@@ -261,6 +278,7 @@ impl ArmedLive {
             nonces: BTreeMap::new(),
             balances: BTreeMap::new(),
             arms: BTreeMap::new(),
+            stops: None,
             last_head: None,
             intervals: VecDeque::with_capacity(CADENCE_SAMPLES),
             counts: Counts::default(),
@@ -442,9 +460,15 @@ impl ArmedLive {
             inner.state.roll(now_ms);
             due(&inner.state, head)
         };
+        let senders: Vec<Address> = self.keys.iter().map(LaneKey::address).collect();
+        match self.chain.stops(self.executor, &senders, head.saturating_sub(1)).await {
+            Ok(stops) if stops.allowed.len() == senders.len() => self.inner().stops = Some((stops, now_ms)),
+            Ok(_) => warn!("armed live: the stops answered for the wrong number of senders"),
+            Err(e) => warn!(error = %e, "armed live: the owner's stops did not read"),
+        }
         let mut reads = Vec::with_capacity(due.len());
         for sender in due {
-            reads.push((sender, self.read_nonce(sender).await));
+            reads.push((sender, self.read_nonce(sender, head).await));
         }
         let _turn = self.turn.lock().await;
         for (sender, read) in reads {
@@ -459,10 +483,14 @@ impl ArmedLive {
         if !self.ready() || !self.cadence_ok() || self.policy.kill_file.exists() || self.state(now_ms).halted.is_some() {
             return;
         }
+        let Some(allowed) = self.stops_allow(now_ms) else { return };
         let Some(key) = self.keys.get(usize::from(arm.sender_slot)) else {
             return self.skip(arm, Address::ZERO, "slot", now_ms);
         };
         let sender = key.address();
+        if !allowed.get(usize::from(arm.sender_slot)).copied().unwrap_or(false) {
+            return self.skip(arm, sender, "revoked", now_ms);
+        }
         let Some(read) = readable(arm) else {
             return self.skip(arm, sender, "unreadable", now_ms);
         };
@@ -535,18 +563,21 @@ impl ArmedLive {
             }
             self.apply(&submitting, now_ms);
             let answer = self.submit.send(&signed.raw, &validity).await;
+            // Only a refusal that says what was refused sent nothing; any other
+            // error may have, and keeps its reservation.
             let (said, accepted) = match &answer {
                 SendAnswer::Accepted(_) => ("accepted".to_string(), Some(true)),
-                SendAnswer::Refused(why) => (why.clone(), Some(false)),
-                SendAnswer::Silent(why) => (why.clone(), None),
+                SendAnswer::Refused(why) if refused_for_certain(why) => (why.clone(), Some(false)),
+                SendAnswer::Refused(why) | SendAnswer::Silent(why) => (why.clone(), None),
             };
-            self.record(LiveRecord::Answered { tx: signed.hash, answer: said, accepted, at_ms: now_ms }, now_ms);
-            let SendAnswer::Refused(why) = answer else {
+            self.record(LiveRecord::Answered { tx: signed.hash, answer: said.clone(), accepted, at_ms: now_ms }, now_ms);
+            if accepted != Some(false) {
                 if accepted.is_none() {
-                    warn!(arm = arm.arm_id, tx = %signed.hash, "armed live: no answer, so it may have been sent");
+                    warn!(arm = arm.arm_id, tx = %signed.hash, answer = %said, "armed live: no clear answer, so it may have been sent");
                 }
                 return;
-            };
+            }
+            let why = said;
             let why = why.to_ascii_lowercase();
             if why.contains("nonce too low") {
                 return self.landing_check(sender, head, now_ms).await;
@@ -565,12 +596,14 @@ impl ArmedLive {
     /// A refusal said `sender`'s nonce is used: find out by what, at once.
     /// Under the turn.
     async fn landing_check(&self, sender: Address, head: u64, now_ms: u64) {
-        let read = self.read_nonce(sender).await;
+        let read = self.read_nonce(sender, head).await;
         self.settle(sender, read, head, now_ms);
     }
 
-    async fn read_nonce(&self, sender: Address) -> Option<NonceRead> {
-        let nonce = match self.chain.nonce(sender).await {
+    /// The nonce as of the block before `head`, which every read node within a
+    /// block of the head's feed has.
+    async fn read_nonce(&self, sender: Address, head: u64) -> Option<NonceRead> {
+        let nonce = match self.chain.nonce_at(sender, head.saturating_sub(1)).await {
             Ok(nonce) => nonce,
             Err(e) => {
                 warn!(error = %e, %sender, "armed live: no nonce read");
@@ -600,7 +633,8 @@ impl ArmedLive {
     }
 
     /// Judge what was read of `sender` against its pending nonces, under the
-    /// turn. With no read, the next head asks again.
+    /// turn. With no read, the next head asks again. A read behind what this
+    /// worker has already seen is a node behind the chain, and is not judged.
     fn settle(&self, sender: Address, read: Option<NonceRead>, head: u64, now_ms: u64) {
         let Some(read) = read else { return };
         let (pending, known) = {
@@ -609,12 +643,17 @@ impl ArmedLive {
                 inner.state.pending.iter().filter(|((s, _), _)| *s == sender).map(|((_, n), txs)| (*n, txs.clone())).collect();
             (pending, inner.nonces.get(&sender).copied())
         };
+        let lowest = pending.first().map(|(n, _)| *n).or(known);
+        if lowest.is_some_and(|n| read.nonce < n) {
+            return;
+        }
         if pending.is_empty() {
             if let Some(known) = known.filter(|k| *k != read.nonce) {
                 return self.trip(sender, format!("the nonce is {}, with nothing of ours pending at {known}", read.nonce), now_ms);
             }
         }
-        for (nonce, txs) in pending {
+        for (nonce, txs) in &pending {
+            let nonce = *nonce;
             if read.nonce == nonce {
                 for t in txs.iter().filter(|t| t.to_block < head) {
                     self.record(LiveRecord::Expired { sender, nonce, tx: Some(t.tx), at_ms: now_ms }, now_ms);
@@ -622,30 +661,53 @@ impl ArmedLive {
             } else if read.nonce == nonce.saturating_add(1) {
                 let ours = read.landed.as_ref().and_then(|(tx, receipt)| txs.iter().find(|t| t.tx == *tx).map(|t| (t, receipt)));
                 match ours {
-                    Some((sent, receipt)) => self.land(sender, nonce, sent, receipt, now_ms),
+                    Some((sent, receipt)) => {
+                        if !self.land(sender, nonce, sent, receipt, now_ms) {
+                            return self.abandon(sender, &pending, read.nonce, "a receipt of ours did not read", now_ms);
+                        }
+                    }
                     None if read.unsure => return,
                     None => {
                         let detail = format!("the nonce passed {nonce} with no receipt among our {} transactions at it", txs.len());
-                        return self.trip(sender, detail, now_ms);
+                        return self.abandon(sender, &pending, read.nonce, &detail, now_ms);
                     }
                 }
             } else {
-                return self.trip(sender, format!("the nonce is {}, and ours are pending at {nonce}", read.nonce), now_ms);
+                let detail = format!("the nonce is {}, and ours are pending at {nonce}", read.nonce);
+                return self.abandon(sender, &pending, read.nonce, &detail, now_ms);
             }
         }
         let mut inner = self.inner();
         inner.nonces.insert(sender, read.nonce);
-        if let Some(b) = inner.balances.get_mut(&sender) {
-            b.stale = true;
+        if known != Some(read.nonce) {
+            // A landing spent from the balance.
+            if let Some(b) = inner.balances.get_mut(&sender) {
+                b.stale = true;
+            }
         }
     }
 
+    /// The chain passed `sender`'s pending nonces below `chain_nonce` in a
+    /// way this worker cannot account for: each is abandoned at its worst
+    /// case, so the state holds nothing a boot would trip on again, and the
+    /// lane trips until an operator resets it.
+    fn abandon(&self, sender: Address, pending: &[(u64, Vec<PendingTx>)], chain_nonce: u64, detail: &str, now_ms: u64) {
+        for (nonce, txs) in pending.iter().filter(|(n, _)| *n < chain_nonce) {
+            let worst_case_wei = txs.iter().map(|t| t.worst_case_wei).max().unwrap_or(0);
+            self.record(LiveRecord::Abandoned { sender, nonce: *nonce, worst_case_wei, at_ms: now_ms }, now_ms);
+        }
+        self.trip(sender, detail.to_string(), now_ms);
+    }
+
     /// Account a landing from its receipt, and halt the day if it spent the
-    /// budget.
-    fn land(&self, sender: Address, nonce: u64, sent: &PendingTx, receipt: &Value, now_ms: u64) {
+    /// budget. False when the receipt does not read.
+    fn land(&self, sender: Address, nonce: u64, sent: &PendingTx, receipt: &Value, now_ms: u64) -> bool {
         let read = match read_receipt(receipt, WETH, self.executor, &[self.recipient]) {
             Ok(read) => read,
-            Err(e) => return self.trip(sender, format!("the receipt of {:#x} did not read: {e}", sent.tx), now_ms),
+            Err(e) => {
+                error!(%sender, tx = %sent.tx, error = %e, "armed live: a receipt of ours did not read");
+                return false;
+            }
         };
         let r = &read.receipt;
         let cost = u128::from(r.gas_used).saturating_mul(r.effective_gas_price_wei).saturating_add(r.l1_fee_wei);
@@ -672,6 +734,7 @@ impl ArmedLive {
             error!(%day, day_net, budget_wei = self.policy.budget_wei, "armed live: the day's loss reached its budget; nothing more is sent today");
             self.record(LiveRecord::Halted { reason: Halt::LossCap { day }, at_ms: now_ms }, now_ms);
         }
+        true
     }
 
     fn trip(&self, sender: Address, detail: String, now_ms: u64) {
@@ -684,6 +747,16 @@ impl ArmedLive {
         if inner.begun && inner.state.pending.is_empty() {
             self.ready.store(true, Ordering::Release);
         }
+    }
+
+    /// Which senders may send, from the owner's stops: none while they were
+    /// last read more than three block times ago (the head feed has gone
+    /// quiet, and settlement with it) or the circuit is open.
+    fn stops_allow(&self, now_ms: u64) -> Option<Vec<bool>> {
+        let inner = self.inner();
+        let (stops, read_ms) = inner.stops.as_ref()?;
+        let fresh = now_ms.saturating_sub(*read_ms) <= self.policy.block_time_ms.saturating_mul(3);
+        (fresh && !stops.circuit_open).then(|| stops.allowed.clone())
     }
 
     /// Heads keep the configured cadence, within half of it either way.
@@ -778,20 +851,11 @@ fn due(state: &LiveState, head: u64) -> Vec<Address> {
     due
 }
 
-/// Each sender's next nonce as the ledger left it: a submission's own, one
-/// past a landing's, an expiry's own.
-fn nonce_views(records: &[LiveRecord]) -> BTreeMap<Address, u64> {
-    let mut views = BTreeMap::new();
-    for record in records {
-        match record {
-            LiveRecord::Submitting { sender, nonce, .. } | LiveRecord::Expired { sender, nonce, .. } => {
-                views.insert(*sender, *nonce);
-            }
-            LiveRecord::Landed { sender, nonce, .. } => {
-                views.insert(*sender, nonce.saturating_add(1));
-            }
-            _ => {}
-        }
-    }
-    views
+/// A refusal that says what was refused, so nothing was sent: never
+/// connected, an HTTP 4xx, or a reason the node names.
+fn refused_for_certain(why: &str) -> bool {
+    let why = why.to_ascii_lowercase();
+    why.starts_with("connect:")
+        || why.starts_with("http 4")
+        || ["nonce too low", "underpriced", "insufficient funds", "invalid"].iter().any(|k| why.contains(k))
 }

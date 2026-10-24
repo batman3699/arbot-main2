@@ -17,8 +17,9 @@
 //!    an eighth more each.
 //!
 //! Base takes a bound at most 60 s out, so `held` is 25 blocks, not 30.
-//! The sender's nonce moves: run it with the armed lane in shadow, and before
-//! armed-live's ledger has a record for that sender.
+//! The sender's nonce moves: run it with the armed lane in shadow, on a
+//! sender armed-live's ledger has no record of (`apex validity-probe`
+//! refuses one it has).
 
 use crate::armed::live::LiveChain;
 use crate::armed::predicate::{expiry, liquidity_mask, price_mask, Op, Predicate};
@@ -73,6 +74,27 @@ pub fn probe_predicates(head: u64, sender: Address) -> Vec<(String, Value)> {
         ("held".into(), json!([never, bound(25)])),
         ("eight".into(), Value::Array(eight)),
     ]
+}
+
+/// Whether armed-live's ledger at `path` has a record from `sender`. Read
+/// only: the live ledger is never opened for writing here. A missing file
+/// knows no one; a line that does not parse (a torn last one) is passed over.
+pub fn ledger_knows(path: &std::path::Path, sender: Address) -> Result<bool, String> {
+    use crate::armed::live_ledger::LiveRecord;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    Ok(text.lines().filter_map(|l| serde_json::from_str::<LiveRecord>(l).ok()).any(|r| match r {
+        LiveRecord::Submitting { sender: s, .. }
+        | LiveRecord::Landed { sender: s, .. }
+        | LiveRecord::Expired { sender: s, .. }
+        | LiveRecord::Abandoned { sender: s, .. }
+        | LiveRecord::Skipped { sender: s, .. } => s == sender,
+        LiveRecord::Halted { reason: crate::armed::live_ledger::Halt::Tripwire { sender: s, .. }, .. } => s == sender,
+        _ => false,
+    }))
 }
 
 /// One send: its hash, nonce and tip, the endpoint's answer and how long it took.

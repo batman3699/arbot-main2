@@ -7,7 +7,7 @@
 
 use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -65,6 +65,16 @@ pub enum LiveRecord {
         nonce: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tx: Option<B256>,
+        at_ms: u64,
+    },
+    /// The chain passed this nonce with no receipt among ours, or with one
+    /// that could not be read: what came of our transactions there is
+    /// unknown, so the largest worst case pending at it is counted as spent.
+    Abandoned {
+        sender: Address,
+        nonce: u64,
+        #[serde(serialize_with = "dec::serialize", deserialize_with = "dec::deserialize")]
+        worst_case_wei: u128,
         at_ms: u64,
     },
     Skipped {
@@ -212,6 +222,15 @@ impl LiveState {
                     }
                 }
             }
+            LiveRecord::Abandoned { sender, nonce, worst_case_wei, at_ms } => {
+                self.pending.remove(&(*sender, *nonce));
+                if utc_day(*at_ms) == self.day {
+                    self.day_net = self.day_net.saturating_sub(i128::try_from(*worst_case_wei).unwrap_or(i128::MAX));
+                    if self.day_net < 0 && self.day_net.unsigned_abs() >= budget_wei {
+                        self.loss_capped = true;
+                    }
+                }
+            }
             LiveRecord::Skipped { .. } => {}
             LiveRecord::Halted { reason, .. } => match reason {
                 Halt::LossCap { day: halted_day } if *halted_day == self.day => {
@@ -230,11 +249,12 @@ impl LiveState {
         self.settle();
     }
 
-    /// Move to `now_ms`'s UTC day. A new day starts with no net and no loss
-    /// cap; pending nonces and a tripwire carry over.
+    /// Move on to `now_ms`'s UTC day. A new day starts with no net and no loss
+    /// cap; pending nonces and a tripwire carry over. Never back: a time from
+    /// before the last roll leaves the day as it is.
     pub fn roll(&mut self, now_ms: u64) {
         let day = utc_day(now_ms);
-        if day != self.day {
+        if day > self.day {
             self.day = day;
             self.day_net = 0;
             self.loss_capped = false;
@@ -326,7 +346,10 @@ impl LiveLedger {
     pub fn append(&self, record: &LiveRecord) -> io::Result<()> {
         let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
         line.push(b'\n');
-        let critical = matches!(record, LiveRecord::Submitting { .. } | LiveRecord::Landed { .. } | LiveRecord::Expired { .. } | LiveRecord::Halted { .. });
+        let critical = matches!(
+            record,
+            LiveRecord::Submitting { .. } | LiveRecord::Landed { .. } | LiveRecord::Expired { .. } | LiveRecord::Abandoned { .. } | LiveRecord::Halted { .. }
+        );
         let mut file = self.file.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let start = file.metadata()?.len();
         let result = file.write_all(&line).and_then(|()| if critical { file.sync_data() } else { Ok(()) });
@@ -340,6 +363,106 @@ impl LiveLedger {
         }
         Ok(())
     }
+}
+
+impl LiveLedger {
+    /// Compact the ledger at `path` when it holds more than `above` records:
+    /// the original is kept beside it, byte for byte, as
+    /// `<stem>.<now_ms>.<ext>`, and its path returned. A hard link keeps the
+    /// original first; the rename that puts the compacted file in its place is
+    /// atomic, so a crash leaves one or the other at `path`, never neither.
+    pub fn compact_file(path: &Path, now_ms: u64, budget_wei: u128, above: usize) -> io::Result<Option<std::path::PathBuf>> {
+        let (ledger, records) = Self::open(path)?;
+        drop(ledger);
+        if records.len() <= above {
+            return Ok(None);
+        }
+        let Some(kept) = compact(&records, now_ms, budget_wei) else {
+            return Err(io::Error::other("the compacted ledger would not replay the same; left as it is"));
+        };
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("armed-live");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("jsonl");
+        let archive = path.with_file_name(format!("{stem}.{now_ms}.{ext}"));
+        let staged = path.with_file_name(format!("{stem}.compacting"));
+        let mut text = Vec::new();
+        for r in &kept {
+            serde_json::to_writer(&mut text, r).map_err(io::Error::other)?;
+            text.push(b'\n');
+        }
+        let mut f = File::create(&staged)?;
+        f.write_all(&text)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::hard_link(path, &archive)?;
+        std::fs::rename(&staged, path)?;
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            File::open(dir)?.sync_all()?;
+        }
+        Ok(Some(archive))
+    }
+}
+
+/// Each sender's next nonce as the ledger left it: a submission's own, one
+/// past a landing's, an expiry's own. An abandoned nonce leaves its sender
+/// none, and a reset leaves none at all: the chain's nonce is taken then.
+pub fn nonce_views(records: &[LiveRecord]) -> BTreeMap<Address, u64> {
+    let mut views = BTreeMap::new();
+    for record in records {
+        match record {
+            LiveRecord::Submitting { sender, nonce, .. } | LiveRecord::Expired { sender, nonce, .. } => {
+                views.insert(*sender, *nonce);
+            }
+            LiveRecord::Landed { sender, nonce, .. } => {
+                views.insert(*sender, nonce.saturating_add(1));
+            }
+            LiveRecord::Abandoned { sender, .. } => {
+                views.remove(sender);
+            }
+            LiveRecord::Reset { .. } => views.clear(),
+            _ => {}
+        }
+    }
+    views
+}
+
+/// The records a replay needs to rebuild both `LiveState::from_records` (as
+/// of `now_ms`) and `nonce_views` exactly. Kept:
+/// - every landing, abandonment, halt and reset, which are few, and which
+///   the census reads too;
+/// - every record of a hash still pending;
+/// - for each sender, the record that sets its nonce view, with the
+///   submission and answer of its hash.
+///
+/// Skips and settled renewals go. `None` when the result would not replay
+/// the same, which is checked, not assumed.
+pub fn compact(records: &[LiveRecord], now_ms: u64, budget_wei: u128) -> Option<Vec<LiveRecord>> {
+    let state = LiveState::from_records(records, now_ms, budget_wei);
+    let mut keep_tx: BTreeSet<B256> = state.pending.values().flatten().map(|p| p.tx).collect();
+    let mut view_at: BTreeMap<Address, usize> = BTreeMap::new();
+    for (i, r) in records.iter().enumerate() {
+        if let LiveRecord::Submitting { sender, .. } | LiveRecord::Expired { sender, .. } | LiveRecord::Landed { sender, .. } = r {
+            view_at.insert(*sender, i);
+        }
+    }
+    let pins: BTreeSet<usize> = view_at.values().copied().collect();
+    for &i in &pins {
+        if let LiveRecord::Submitting { tx, .. } | LiveRecord::Expired { tx: Some(tx), .. } = &records[i] {
+            keep_tx.insert(*tx);
+        }
+    }
+    let kept: Vec<LiveRecord> = records
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| match r {
+            LiveRecord::Landed { .. } | LiveRecord::Abandoned { .. } | LiveRecord::Halted { .. } | LiveRecord::Reset { .. } => true,
+            LiveRecord::Submitting { tx, .. } | LiveRecord::Answered { tx, .. } => keep_tx.contains(tx),
+            LiveRecord::Expired { .. } => pins.contains(i),
+            LiveRecord::Skipped { .. } => false,
+        })
+        .map(|(_, r)| r.clone())
+        .collect();
+    let same = LiveState::from_records(&kept, now_ms, budget_wei) == state && nonce_views(&kept) == nonce_views(records);
+    same.then_some(kept)
 }
 
 /// JSON numbers cannot exactly represent all u128/i128 wei values. Store them

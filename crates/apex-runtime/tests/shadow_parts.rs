@@ -319,6 +319,22 @@ fn the_canary_tripwire_fires_only_beyond_our_sends() {
     assert!(nonce_beyond_ours(10, 12, 1));
 }
 
+/// R36: armed-live's files are where the service can read them and where a
+/// new revision's archive of `var/apex` does not move them. A boot without
+/// the live ledger would forget the day's spend and every pending nonce.
+#[test]
+fn the_armed_live_files_live_outside_the_archived_run_directory() {
+    let path = format!("{}/../../ops/canary.base.yaml", env!("CARGO_MANIFEST_DIR"));
+    let c = ShadowConfig::load_canary(&path, &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap();
+    let live = c.armed.live.expect("armed.live");
+    for p in [c.armed.targets.expect("targets"), live.keys_file, live.ledger, live.kill_file] {
+        assert!(p.starts_with("var/armed"), "{} must be under var/armed (the unit's ReadWritePaths, outside var/apex)", p.display());
+    }
+    let unit = std::fs::read_to_string(format!("{}/../../ops/host/apex-targets.service", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    assert!(unit.contains("--out /opt/apex/var/armed/targets.json"), "the census writes where the canary reads");
+    assert!(unit.contains("--live-ledger /opt/apex/var/armed/armed-live.jsonl"));
+}
+
 /// R28: the shipped canary configuration, as the host will run it.
 #[test]
 fn the_shipped_canary_config_parses() {
@@ -344,12 +360,12 @@ fn the_shipped_canary_config_parses() {
     // R36: armed-shadow until gate A', its live parts staged, every cap here.
     let a = &c.armed;
     assert_eq!(a.mode, apex_runtime::shadow::config::ArmedMode::Shadow);
-    assert_eq!(a.targets.as_deref(), Some(std::path::Path::new("var/apex/targets.json")));
+    assert_eq!(a.targets.as_deref(), Some(std::path::Path::new("var/armed/targets.json")));
     assert_eq!((a.daily_loss_budget_wei, a.max_priority_wei_per_gas), (10_000_000_000_000_000, 20_000_000_000));
     assert_eq!((a.max_size_wei, a.l1_fee_bound_wei, a.sender_reserve_wei), (5_000_000_000_000_000_000, 50_000_000_000_000, 200_000_000_000_000));
     let live = a.live.as_ref().expect("armed.live");
     assert_eq!(live.sequencer, "https://mainnet-sequencer.base.org");
-    assert_eq!(live.keys_file, std::path::PathBuf::from("/etc/apex/armed.keys"));
+    assert_eq!(live.keys_file, std::path::PathBuf::from("var/armed/armed.keys"));
     // Everything else is the shadow's.
     let shadow = ShadowConfig::load(&path.replace("canary", "shadow"), &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap();
     assert_eq!((c.executor, c.universe), (shadow.executor, shadow.universe));

@@ -1,7 +1,7 @@
 //! Task 8.5 R36: replay, worst-case reservations, UTC loss cap, and write-ahead JSONL.
 
 use alloy_primitives::{Address, B256};
-use apex_runtime::armed::live_ledger::{Halt, LiveLedger, LiveRecord, LiveState};
+use apex_runtime::armed::live_ledger::{compact, nonce_views, Halt, LiveLedger, LiveRecord, LiveState};
 use std::fs::OpenOptions;
 use std::io::Write;
 use tempfile::tempdir;
@@ -264,6 +264,7 @@ fn all_record_variants_round_trip_and_wei_are_decimal_strings() {
             at_ms: OCT_24_UTC + 5,
         },
         LiveRecord::Reset { at_ms: OCT_24_UTC + 6 },
+        LiveRecord::Abandoned { sender: addr(3), nonce: 9, worst_case_wei: 5, at_ms: OCT_24_UTC + 7 },
     ];
     for record in records {
         let json = serde_json::to_value(&record).unwrap();
@@ -274,4 +275,111 @@ fn all_record_variants_round_trip_and_wei_are_decimal_strings() {
             assert_eq!(json["max_fee_per_gas"], serde_json::Value::String(max_fee_per_gas.to_string()));
         }
     }
+}
+
+/// A batch stamped before midnight, applied after a head rolled the day
+/// over, must not take the state back to a day with no loss on it.
+#[test]
+fn the_day_never_rolls_back() {
+    let records = vec![landed(addr(1), 7, tx(1), -11, OCT_25_UTC + 1)];
+    let mut state = LiveState::from_records(&records, OCT_25_UTC + 2, 10);
+    state.roll(OCT_25_UTC - 1);
+    assert_eq!((state.day.as_str(), state.day_net), ("2026-10-25", -11));
+    assert_eq!(state.halted, Some(Halt::LossCap { day: "2026-10-25".into() }));
+}
+
+/// A nonce the chain passed without a receipt among ours: what happened to
+/// our transaction is unknown, so its worst case is counted as spent.
+#[test]
+fn an_abandoned_nonce_is_charged_its_worst_case() {
+    let records = vec![
+        submitting(addr(1), 7, tx(1), 4, OCT_24_UTC),
+        LiveRecord::Abandoned { sender: addr(1), nonce: 7, worst_case_wei: 4, at_ms: OCT_24_UTC + 1 },
+    ];
+    let state = LiveState::from_records(&records, OCT_24_UTC + 2, 10);
+    assert!(state.pending.is_empty());
+    assert_eq!((state.reserved_wei, state.day_net), (0, -4));
+}
+
+#[test]
+fn a_reset_re_baselines_every_nonce_view() {
+    let mut records = vec![
+        submitting(addr(1), 7, tx(1), 4, OCT_24_UTC),
+        LiveRecord::Expired { sender: addr(1), nonce: 7, tx: Some(tx(1)), at_ms: OCT_24_UTC + 1 },
+        landed(addr(2), 3, tx(2), 1, OCT_24_UTC + 2),
+    ];
+    assert_eq!(nonce_views(&records), [(addr(1), 7), (addr(2), 4)].into_iter().collect());
+    records.push(LiveRecord::Abandoned { sender: addr(2), nonce: 4, worst_case_wei: 1, at_ms: OCT_24_UTC + 3 });
+    assert_eq!(nonce_views(&records), [(addr(1), 7)].into_iter().collect(), "an abandoned nonce leaves no view");
+    records.push(LiveRecord::Reset { at_ms: OCT_24_UTC + 4 });
+    assert!(nonce_views(&records).is_empty(), "after a reset every idle sender is taken at the chain's nonce");
+}
+
+/// A day of renewals: what a replay needs is a few records a sender, the
+/// pending hashes', and every landing and halt.
+fn a_busy_day() -> Vec<LiveRecord> {
+    // addr 1, nonce 7: a renewal expired by hash, one refused, one pending.
+    let mut r = vec![
+        submitting(addr(1), 7, tx(1), 3, OCT_24_UTC),
+        answered(tx(1), Some(true), "accepted", OCT_24_UTC + 1),
+        LiveRecord::Expired { sender: addr(1), nonce: 7, tx: Some(tx(1)), at_ms: OCT_24_UTC + 2 },
+        submitting(addr(1), 7, tx(2), 3, OCT_24_UTC + 3),
+        answered(tx(2), Some(false), "underpriced", OCT_24_UTC + 4),
+    ];
+    r.extend((0..40u8).map(|i| LiveRecord::Skipped { arm_id: u64::from(i), sender: addr(1), reason: "budget".into(), at_ms: OCT_24_UTC + 5 }));
+    r.extend([
+        submitting(addr(1), 7, tx(3), 5, OCT_24_UTC + 6),
+        answered(tx(3), Some(true), "accepted", OCT_24_UTC + 7),
+        // addr 2: landed yesterday, then landed today at the next nonce.
+        submitting(addr(2), 3, tx(4), 2, OCT_24_UTC + 8),
+        landed(addr(2), 3, tx(4), -2, OCT_24_UTC + 9),
+        submitting(addr(2), 4, tx(5), 2, OCT_25_UTC + 1),
+        landed(addr(2), 4, tx(5), 6, OCT_25_UTC + 2),
+        // addr 3: expired whole; addr 4: refused; addr 5: silent, pending.
+        submitting(addr(3), 9, tx(6), 1, OCT_25_UTC + 3),
+        LiveRecord::Expired { sender: addr(3), nonce: 9, tx: None, at_ms: OCT_25_UTC + 4 },
+        submitting(addr(4), 2, tx(7), 1, OCT_25_UTC + 5),
+        answered(tx(7), Some(false), "insufficient funds", OCT_25_UTC + 6),
+        submitting(addr(5), 1, tx(8), 4, OCT_25_UTC + 7),
+        answered(tx(8), None, "timeout", OCT_25_UTC + 8),
+        // A tripwire and its reset, then a new tripwire still standing.
+        LiveRecord::Halted { reason: Halt::Tripwire { sender: addr(6), detail: "x".into() }, at_ms: OCT_25_UTC + 9 },
+        LiveRecord::Reset { at_ms: OCT_25_UTC + 10 },
+        submitting(addr(6), 5, tx(9), 1, OCT_25_UTC + 11),
+        LiveRecord::Abandoned { sender: addr(6), nonce: 5, worst_case_wei: 1, at_ms: OCT_25_UTC + 12 },
+        LiveRecord::Halted { reason: Halt::Tripwire { sender: addr(6), detail: "y".into() }, at_ms: OCT_25_UTC + 13 },
+    ]);
+    r
+}
+
+#[test]
+fn compaction_keeps_the_state_and_the_nonce_views() {
+    let all = a_busy_day();
+    let now = OCT_25_UTC + 20;
+    let kept = compact(&all, now, 100).expect("a compaction that replays the same");
+    assert!(kept.len() < all.len() / 2, "{} of {}", kept.len(), all.len());
+    assert!(!kept.iter().any(|r| matches!(r, LiveRecord::Skipped { .. })));
+    assert_eq!(LiveState::from_records(&kept, now, 100), LiveState::from_records(&all, now, 100));
+    assert_eq!(nonce_views(&kept), nonce_views(&all));
+    assert_eq!(kept.iter().filter(|r| matches!(r, LiveRecord::Landed { .. })).count(), 2, "every landing stays: the census reads them");
+}
+
+/// The daily restart compacts a ledger past its threshold, and keeps the
+/// original beside it, byte for byte.
+#[test]
+fn a_long_ledger_is_compacted_and_the_original_kept() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("armed-live.jsonl");
+    let (ledger, _) = LiveLedger::open(&path).unwrap();
+    for r in a_busy_day() {
+        ledger.append(&r).unwrap();
+    }
+    drop(ledger);
+    let before = std::fs::read(&path).unwrap();
+    let now = OCT_25_UTC + 20;
+    assert_eq!(LiveLedger::compact_file(&path, now, 100, 10_000).unwrap(), None, "under the threshold: untouched");
+    let archive = LiveLedger::compact_file(&path, now, 100, 10).unwrap().expect("compacted");
+    assert_eq!(std::fs::read(&archive).unwrap(), before);
+    let (_, records) = LiveLedger::open(&path).unwrap();
+    assert_eq!(records, compact(&a_busy_day(), now, 100).unwrap());
 }

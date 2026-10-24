@@ -357,6 +357,17 @@ async fn validity_probe() -> ExitCode {
         error!(keys = keys.len(), "--sender {sender} is not in the keys file");
         return ExitCode::FAILURE;
     };
+    match apex_runtime::validity_probe::ledger_knows(&live.ledger, key.address()) {
+        Ok(false) => {}
+        Ok(true) => {
+            error!(sender = %key.address(), "armed-live's ledger knows this sender: the probe would move its nonce from where the ledger left it, and the next boot would trip. Pick one it has never used");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            error!(error = %e, "armed-live's ledger did not read");
+            return ExitCode::FAILURE;
+        }
+    }
     let urls: Vec<String> = c.rpc_http.iter().map(|u| u.expose().clone()).collect();
     let rpc = match apex_chain::rpc::failover::FailoverTransport::connect(&urls, c.chain_id, Default::default()).await {
         Ok(t) => std::sync::Arc::new(t),

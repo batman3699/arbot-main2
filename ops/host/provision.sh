@@ -16,6 +16,9 @@ if ! swapon --show | grep -q /swapfile; then
 fi
 id apex >/dev/null 2>&1 || useradd --system --create-home --home-dir /home/apex --shell /usr/sbin/nologin apex
 install -d -o apex -g apex /opt/apex /opt/apex/var /opt/apex/var/apex
+# R36: armed-live's keys, ledger, targets and kill file: the service's own,
+# and outside var/apex, which a new revision archives.
+install -d -o apex -g apex -m 0700 /opt/apex/var/armed
 # The binary is root's: the service user runs it and cannot replace it.
 install -d -o root -g root -m 0755 /opt/apex/bin
 install -d -o root -g root -m 0700 /etc/apex

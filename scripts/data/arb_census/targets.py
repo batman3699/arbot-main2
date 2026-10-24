@@ -620,6 +620,18 @@ def _complete_utc_days(count: int, now: datetime | None = None) -> list[str]:
     return [(current - timedelta(days=delta)).isoformat() for delta in range(count, 0, -1)]
 
 
+def publish(targets: Mapping[str, Any], out: Path) -> bool:
+    """Write fit targets to ``out``. An unfit file goes beside it, as
+    ``<stem>.unfit.json``, and never replaces the last good one: the job then
+    fails, so its ExecStartPost does not restart the canary into a live boot
+    that would refuse it."""
+    if targets.get("ok") is True:
+        _atomic_json(out, targets)
+        return True
+    _atomic_json(out.with_name(f"{out.stem}.unfit.json"), targets)
+    return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build Armed Lane v2 route targets")
     parser.add_argument("--race", required=True, help="directory holding race-YYYY-MM-DD.json.gz")
@@ -656,18 +668,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         days.append(data)
 
     targets = build(days, args.top)
-    # Keep an explicit ok:false file for operators and the runtime to reject
-    # safely; readiness must never be inferred merely from successful JSON IO.
-    _atomic_json(Path(args.out), targets)
-    print(f"wrote {len(targets['routes'])} routes / {len(targets['bids_wei_per_gas'])} bid observations; "
-          f"ok={str(targets['ok']).lower()} to {args.out}", flush=True)
+    # Readiness is the file's own ok, never merely successful JSON IO; an
+    # unfit file is kept for the operator beside the last good one.
+    published = publish(targets, Path(args.out))
+    print(f"{'wrote' if published else 'NOT published (unfit)'}: {len(targets['routes'])} routes / "
+          f"{len(targets['bids_wei_per_gas'])} bid observations; ok={str(targets['ok']).lower()}", flush=True)
 
     if args.share_out:
         landings = _load_landings(Path(args.live_ledger))
         comparison = ours_vs_market(days, landings)
         _atomic_json(Path(args.share_out), comparison)
         print(f"wrote {len(comparison)} per-day/per-route market comparisons to {args.share_out}", flush=True)
-    return 0
+    return 0 if published else 1
 
 
 if __name__ == "__main__":

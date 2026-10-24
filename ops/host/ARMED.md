@@ -15,19 +15,29 @@ things are.
 Paths below are the host's. `#` is root on the host, `$` the operator's
 machine.
 
+Armed-live's own files are in `/opt/apex/var/armed/`: the senders' keys,
+the live ledger, the census's targets and the kill file.
+- It is the only place the unit, which runs as `apex` under
+  `ProtectSystem=strict`, can both read and write.
+- A new revision's archive of `/opt/apex/var/apex` (README §7) leaves it in
+  place.
+
 ## 1. Before the first live boot, in this order
 
 ### a. The senders' keys (the host)
 
 ```
-# /opt/apex/bin/apex keys new --count 16 --out /etc/apex/armed.keys && chown apex:apex /etc/apex/armed.keys
+# install -d -o apex -g apex -m 0700 /opt/apex/var/armed
+# sudo -u apex /opt/apex/bin/apex keys new --count 16 --out /opt/apex/var/armed/armed.keys
 ```
 
-It prints the 16 addresses and nothing else. The file is created 0400 and
-never overwritten (a second run refuses); `apex canary` refuses a keys file
-anyone but its owner can read, and one whose count is not `armed.max_arms`.
-Back it up the way `/etc/apex/shadow.env` is backed up. Never copy it off the
-host.
+It prints the 16 addresses and nothing else.
+- The file is created 0400, owned by `apex`, and never overwritten: a second
+  run refuses.
+- `apex canary` refuses a keys file anyone but its owner can read, and one
+  whose count is not `armed.max_arms`.
+- Back it up the way `/etc/apex/shadow.env` is backed up. Never copy it off
+  the host.
 
 ### b. `ops/armed-senders.json` (the operator)
 
@@ -58,20 +68,20 @@ $ forge script script/FundArmedSenders.s.sol --rpc-url https://mainnet.base.org 
   needs 16 × 0.002 = 0.032 ETH, plus gas, on Base. On 2026-10-24 it held
   0.000119 ETH, so the dry run stopped at the first transfer (`OutOfFunds`).
   `test/ArmedSenders.t.sol` covers the top-up.
-- **Revocation:** set `"allowed": false` and run Authorize again. From the
-  next block the executor refuses every sender.
-  - That is not a clean stop on its own. A revoked sender's transactions
-    still land when their predicates hold, then revert at the executor's
-    `NotTrader` check and pay gas.
-  - armed-live reads `executors` only at boot, so it keeps sending.
-  - Stop it first (§2's kill file, or `armed.mode: shadow`), wait for the
-    10 s window to pass, then revoke.
+- **Revocation:** set `"allowed": false` and run Authorize again.
+  - Armed-live reads `executors(sender)` and the executor's circuit on every
+    head, and stops sending from a revoked sender at the next one
+    (`skipped.revoked`).
+  - A transaction already in the builder can still land in its window (up
+    to 10 s), revert at `NotTrader` and pay gas. Touch the kill file first,
+    and revoke once the window has passed.
 
 ### d. The API probe (the host)
 
-Run it once, with the armed lane in shadow, before armed-live's ledger has a
-record for the sender it uses. Its nonce moves, and the boot trips on a
-sender whose nonce the ledger did not leave there.
+Run it once, with the armed lane in shadow, on a sender armed-live's ledger
+has no record of. Its nonce moves, and the boot trips on a sender whose
+nonce the ledger did not leave there; the probe refuses a sender the ledger
+knows.
 
 ```
 # sudo -u apex bash -c 'set -a; . /etc/apex/shadow.env; set +a; cd /opt/apex && bin/apex validity-probe --config ops/canary.base.yaml --sender 15'
@@ -148,47 +158,68 @@ reserve: run Fund again. `skipped.size` counts arms over `max_size_wei`.
 
 ### Stopping it
 
-- **Soft:** `touch /opt/apex/var/apex/armed.disable`. Nothing new is sent
+- **Soft:** `touch /opt/apex/var/armed/armed.disable`. Nothing new is sent
   while the file exists; pending transactions still settle. Remove the file
   to resume. It is not a halt.
-- **Halts** are written to `/opt/apex/var/apex/armed-live.jsonl` and survive
+- **By itself:** nothing is sent while the owner's stops were last read more
+  than three block times ago, which is what a frozen head feed looks like.
+- **Halts** are written to `/opt/apex/var/armed/armed-live.jsonl` and survive
   a restart. `halted` names the reason.
   - *The loss cap:* the day's realized loss reached the budget. It ends at
     the next UTC midnight, and a reset does not clear it.
   - *The tripwire:* a sender's nonce moved with no receipt among our
-    transactions, moved by more than one, or a receipt did not read. It holds
-    until reset, after you have found what moved the nonce:
+    transactions, moved by more than one, or a receipt did not read.
+    - The nonces it cannot account for are written off at their worst case,
+      which counts against the day's budget (`abandoned` in the ledger).
+    - It holds until reset, after you have found what moved the nonce. A
+      reset takes every idle sender at the chain's nonce from then on:
 
 ```
 # systemctl stop apex-canary
-# sudo -u apex bash -c 'printf "{\"kind\":\"reset\",\"at_ms\":%s}\n" "$(date +%s%3N)" >> /opt/apex/var/apex/armed-live.jsonl'
+# sudo -u apex bash -c 'printf "{\"kind\":\"reset\",\"at_ms\":%s}\n" "$(date +%s%3N)" >> /opt/apex/var/armed/armed-live.jsonl'
 # systemctl start apex-canary
 ```
 
-- **Hard, the owner's own, on chain:** the revocation in §1c, after the kill
-  file: a revoked sender's landings revert and still pay gas.
+- **Hard, the owner's own, on chain:** the executor's circuit
+  (`tripCircuit()`), or the revocation in §1c.
+  - Either stops every send from the next head.
+  - Touch the kill file first: a transaction already waiting can still land
+    in its window, revert and pay gas.
 - **Off:** set `armed.mode: shadow` and restart.
 
 ### The live ledger
 
 `armed-live.jsonl` is the record of every send, and the boot replays it.
 
-- Never move, truncate or archive it while armed-live is on. README §7's
-  archive of `/opt/apex/var/apex` must carry it into the new directory.
-- Without it, the boot cannot settle what was pending, and a landing would go
-  unaccounted against the day's budget.
-- At the full renewal rate it grows by about 100 MB a day. Watch its size;
-  rotation is not built yet.
+- Never move, truncate or edit it while armed-live is on, except to append a
+  reset. Without it, the boot cannot settle what was pending, and a landing
+  would go unaccounted against the day's budget.
+- It lives in `var/armed`, so README §7's archive of `var/apex` leaves it
+  where it is.
+- It grows by about 100 MB a day at the full renewal rate. The boot compacts
+  it once it passes 10,000 records:
+  - every landing, abandonment, halt and reset stays, with every record a
+    pending transaction or a nonce view needs;
+  - skips and settled renewals go;
+  - the original is kept beside it as `armed-live.<ms>.jsonl`;
+  - the compaction is used only if it replays to the same state.
+- The daily restart therefore keeps it to about a day's worth.
 
 ### The daily census
 
 `apex-targets.timer` runs `arb_census.targets` once a day. It writes
-`/opt/apex/var/apex/targets.json` and restarts `apex-canary`, so the new
+`/opt/apex/var/armed/targets.json` and restarts `apex-canary`, so the new
 targets load.
+
+A file that is not fit to arm (`ok: false`) goes beside it as
+`targets.unfit.json`, never over the last good one. The job then fails, so
+the canary is not restarted into a live boot that would refuse it.
 
 - Each restart settles the pending transactions and waits for the cadence
   again: about 40 s without sends.
 - The census reads the live ledger for "ours vs the market".
+- It reads the flashblock ledgers in `var/apex`. A new revision's archive
+  moves those, so until a day passes it falls back to block offsets.
 - Targets older than `targets_max_age_s` (2 days) stop a live boot.
 
 ### The Denim day

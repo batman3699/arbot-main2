@@ -920,6 +920,13 @@ async fn boot_armed_live(
     }
     let senders: Vec<Address> = keys.iter().map(LaneKey::address).collect();
     crate::armed::live_chain::check_executors(&**rpc, config.executor.address, &senders).await.map_err(ShadowError::Boot)?;
+    // The daily restart compacts a long ledger first: the boot replays all of
+    // it, and renewals add ~200 records a minute.
+    match crate::armed::live_ledger::LiveLedger::compact_file(&live.ledger, now_ms(), a.daily_loss_budget_wei, ARMED_LEDGER_COMPACT_ABOVE) {
+        Ok(Some(archive)) => info!(archive = %archive.display(), "armed-live's ledger compacted; the original is kept beside it"),
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, "armed-live's ledger was not compacted; it is read whole"),
+    }
     let (ledger, records) = crate::armed::live_ledger::LiveLedger::open(&live.ledger).map_err(|e| boot_err("the armed live ledger", e))?;
     let submit = apex_chain::base::validity::ValiditySubmitter::new(&live.sequencer, Duration::from_secs(3))
         .map_err(|e| ShadowError::Boot(format!("armed-live's submitter: {e}")))?;
@@ -940,6 +947,9 @@ async fn boot_armed_live(
     info!(ready = worker.ready(), halted = ?worker.state(now_ms()).halted, "armed-live's ledger is read");
     Ok(worker)
 }
+
+/// R36: the live ledger's length past which the boot compacts it.
+const ARMED_LEDGER_COMPACT_ABOVE: usize = 10_000;
 
 fn now_ms() -> u64 {
     SystemClock.now().0 / 1_000_000

@@ -2,6 +2,7 @@
 
 Run from scripts/data: python3 -m unittest arb_census.test_targets
 """
+import json
 import math
 import os
 import tempfile
@@ -75,6 +76,14 @@ class Build(unittest.TestCase):
                          "a target file with no eligible route is not live-ready")
         with self.assertRaises(ValueError):
             T.write({"x": float("nan")}, os.path.join(tempfile.mkdtemp(), "t.json"))
+
+    def test_an_unfit_file_never_replaces_the_good_one(self):
+        out = Path(tempfile.mkdtemp()) / "targets.json"
+        good = T.build([{"eth_usd": 2500.0, "arbs": [arb()]}] * 3, top=50)
+        self.assertTrue(T.publish(good, out))
+        self.assertFalse(T.publish(T.build([], top=50), out), "unfit: the job fails, so the canary is not restarted")
+        self.assertTrue(json.loads(out.read_text())["ok"], "the last good targets stay")
+        self.assertFalse(json.loads((out.parent / "targets.unfit.json").read_text())["ok"])
 
     def test_bad_value_cannot_be_marked_live_ready(self):
         days = [{"arbs": [arb(usd=math.nan)]} for _ in range(3)]

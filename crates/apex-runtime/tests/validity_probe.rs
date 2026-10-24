@@ -49,3 +49,20 @@ fn the_probe_s_predicates_are_the_cases() {
     assert_eq!(all.len(), 8);
     assert_eq!(all.iter().filter(|p| p["type"] == "block_number").count(), 1);
 }
+
+/// The probe moves its sender's nonce. A sender armed-live's ledger already
+/// knows would then sit where the ledger did not leave it, and the next boot
+/// would trip on it.
+#[test]
+fn the_probe_refuses_a_sender_the_live_ledger_knows() {
+    use apex_runtime::armed::live_ledger::{LiveLedger, LiveRecord};
+    use apex_runtime::validity_probe::ledger_knows;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("armed-live.jsonl");
+    assert!(!ledger_knows(&path, Address::repeat_byte(0xa1)).unwrap(), "no ledger yet");
+    let (ledger, _) = LiveLedger::open(&path).unwrap();
+    let skipped = LiveRecord::Skipped { arm_id: 1, sender: Address::repeat_byte(0xa1), reason: "budget".into(), at_ms: 1 };
+    ledger.append(&skipped).unwrap();
+    assert!(ledger_knows(&path, Address::repeat_byte(0xa1)).unwrap());
+    assert!(!ledger_knows(&path, Address::repeat_byte(0xa2)).unwrap());
+}

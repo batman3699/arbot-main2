@@ -7,7 +7,7 @@ After=network-online.target
 Type=oneshot
 User=root
 WorkingDirectory=/opt/apex/scripts/data
-ExecStart=/usr/sbin/runuser -u apex -- /usr/bin/nice -n 19 /usr/bin/python3 -m arb_census.targets --race /opt/apex/var/census --days 7 --top 50 --out /opt/apex/var/apex/targets.json --share-out /opt/apex/var/apex/armed-share.json --var /opt/apex/var/apex --meta /opt/apex/var/census/meta.json --gaps /opt/apex/var/census/r33-gaps.json --live-ledger /opt/apex/var/apex/armed-live.jsonl
+ExecStart=/usr/sbin/runuser -u apex -- /usr/bin/nice -n 19 /usr/bin/python3 -m arb_census.targets --race /opt/apex/var/census --days 7 --top 50 --out /opt/apex/var/armed/targets.json --share-out /opt/apex/var/apex/armed-share.json --var /opt/apex/var/apex --meta /opt/apex/var/census/meta.json --gaps /opt/apex/var/census/r33-gaps.json --live-ledger /opt/apex/var/armed/armed-live.jsonl
 ExecStartPost=/bin/systemctl restart apex-canary
 
 # The census can scan multiple days through RPC when a day cache is missing:
