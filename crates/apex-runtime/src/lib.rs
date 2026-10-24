@@ -48,6 +48,7 @@ pub mod shadow;
 pub mod shutdown;
 pub mod sign;
 pub mod supervise;
+pub mod validity_probe;
 pub mod workers;
 
 /// Crate version, exposed so workspace wiring is testable.

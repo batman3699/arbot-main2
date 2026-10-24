@@ -92,6 +92,9 @@ async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("send-probe") {
         return send_probe().await;
     }
+    if std::env::args().nth(1).as_deref() == Some("validity-probe") {
+        return validity_probe().await;
+    }
     if std::env::args().nth(1).as_deref() == Some("shadow") {
         return shadow().await;
     }
@@ -295,6 +298,94 @@ async fn send_probe() -> ExitCode {
             error!(error = %e, "the report did not serialize");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `apex validity-probe [--config <path>] --sender I` (Task 8.5 R36): six
+/// cases of `base_sendRawTransactionValidity` from armed sender `I`, each
+/// printed as a line once the chain has settled it. The armed lane stays in
+/// shadow: the sender's nonce moves.
+async fn validity_probe() -> ExitCode {
+    use apex_runtime::validity_probe::Probe;
+    let usage = "usage: apex validity-probe [--config ops/canary.base.yaml] --sender I";
+    let (mut config, mut sender) = (DEFAULT_CANARY_CONFIG.to_string(), None);
+    let mut argv = std::env::args().skip(2);
+    while let Some(flag) = argv.next() {
+        match (flag.as_str(), argv.next()) {
+            ("--config", Some(p)) => config = p,
+            ("--sender", Some(i)) => match i.parse::<usize>() {
+                Ok(i) => sender = Some(i),
+                Err(_) => {
+                    error!("--sender is a key's index in armed.live.keys_file");
+                    return ExitCode::FAILURE;
+                }
+            },
+            _ => {
+                error!("{usage}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let Some(sender) = sender else {
+        error!("{usage}");
+        return ExitCode::FAILURE;
+    };
+    let env = Env::secrets_only();
+    let c = match apex_runtime::shadow::config::ShadowConfig::load_canary(&config, &env) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "the configuration did not load");
+            return ExitCode::FAILURE;
+        }
+    };
+    if c.armed.mode != apex_runtime::shadow::config::ArmedMode::Shadow {
+        error!("armed.mode is live: the probe moves a sender's nonce, so it runs with the armed lane in shadow");
+        return ExitCode::FAILURE;
+    }
+    let Some(live) = &c.armed.live else {
+        error!("the configuration has no armed.live: its keys file and sequencer");
+        return ExitCode::FAILURE;
+    };
+    let keys = match apex_runtime::armed::keys::load(&live.keys_file) {
+        Ok(k) => k,
+        Err(e) => {
+            error!(error = %e, "the armed keys did not load");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(key) = keys.get(sender) else {
+        error!(keys = keys.len(), "--sender {sender} is not in the keys file");
+        return ExitCode::FAILURE;
+    };
+    let urls: Vec<String> = c.rpc_http.iter().map(|u| u.expose().clone()).collect();
+    let rpc = match apex_chain::rpc::failover::FailoverTransport::connect(&urls, c.chain_id, Default::default()).await {
+        Ok(t) => std::sync::Arc::new(t),
+        Err(e) => {
+            error!(error = %e, "the RPC transport did not connect");
+            return ExitCode::FAILURE;
+        }
+    };
+    drop(urls);
+    let submit = match apex_chain::base::validity::ValiditySubmitter::new(&live.sequencer, std::time::Duration::from_secs(3)) {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "the validity submitter did not start");
+            return ExitCode::FAILURE;
+        }
+    };
+    let chain = apex_runtime::armed::live_chain::RpcChain::new(rpc.clone());
+    info!(sender = %key.address(), endpoint = submit.label(), "the validity probe starts");
+    let probe = Probe { key, chain_id: c.chain_id, rpc: &*rpc, chain: &chain, submit: &submit };
+    let all = probe
+        .run(|a| match serde_json::to_string(a) {
+            Ok(line) => println!("{line}"),
+            Err(e) => error!(error = %e, "a case did not serialize"),
+        })
+        .await;
+    if all {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
