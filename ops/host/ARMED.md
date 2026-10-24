@@ -58,8 +58,14 @@ $ forge script script/FundArmedSenders.s.sol --rpc-url https://mainnet.base.org 
   needs 16 × 0.002 = 0.032 ETH, plus gas, on Base. On 2026-10-24 it held
   0.000119 ETH, so the dry run stopped at the first transfer (`OutOfFunds`).
   `test/ArmedSenders.t.sol` covers the top-up.
-- **Revocation:** set `"allowed": false` and run Authorize again. Every
-  sender is refused by the executor from the next block.
+- **Revocation:** set `"allowed": false` and run Authorize again. From the
+  next block the executor refuses every sender.
+  - That is not a clean stop on its own. A revoked sender's transactions
+    still land when their predicates hold, then revert at the executor's
+    `NotTrader` check and pay gas.
+  - armed-live reads `executors` only at boot, so it keeps sending.
+  - Stop it first (§2's kill file, or `armed.mode: shadow`), wait for the
+    10 s window to pass, then revoke.
 
 ### d. The API probe (the host)
 
@@ -159,7 +165,8 @@ reserve: run Fund again. `skipped.size` counts arms over `max_size_wei`.
 # systemctl start apex-canary
 ```
 
-- **Hard, the owner's own, on chain:** the revocation in §1c.
+- **Hard, the owner's own, on chain:** the revocation in §1c, after the kill
+  file: a revoked sender's landings revert and still pay gas.
 - **Off:** set `armed.mode: shadow` and restart.
 
 ### The live ledger
