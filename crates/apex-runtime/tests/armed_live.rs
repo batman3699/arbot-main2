@@ -11,7 +11,9 @@ use alloy_primitives::{keccak256, Address, B256};
 use apex_chain::base::send::SendAnswer;
 use apex_config::Secret;
 use apex_runtime::armed::lines::{Arm, ArmedLine};
+use apex_chain::rpc::{RpcError, RpcTransport};
 use apex_runtime::armed::live::{ArmedLive, LiveChain, LivePolicy, ValiditySend};
+use apex_runtime::armed::live_chain::{check_executors, executors_call};
 use apex_runtime::armed::live_ledger::{Halt, LiveLedger, LiveRecord};
 use apex_runtime::armed::predicate::{expiry, Op, Predicate};
 use apex_runtime::sign::LaneKey;
@@ -654,4 +656,76 @@ async fn a_used_nonce_with_nothing_of_ours_pending_trips() {
     f.chain.nonces.lock().unwrap().insert(key(1).address(), 8);
     f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
     assert!(matches!(f.live.state(NOW).halted, Some(Halt::Tripwire { .. })));
+}
+
+#[test]
+fn the_executors_call_reads_the_mapping() {
+    let account = key(1).address();
+    let call = executors_call(EXECUTOR, account);
+    assert_eq!(call[0]["to"], format!("{EXECUTOR:#x}"));
+    let data = alloy_primitives::hex::decode(call[0]["data"].as_str().unwrap()).unwrap();
+    assert_eq!(&data[..4], &keccak256(b"executors(address)")[..4]);
+    assert_eq!(&data[4..], B256::left_padding_from(account.as_slice()).as_slice());
+    assert_eq!(call[1], "latest");
+}
+
+/// `executors(account)` as the executor would answer it.
+struct Executors(BTreeMap<Address, bool>);
+
+#[async_trait::async_trait]
+impl RpcTransport for Executors {
+    async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        assert_eq!(method, "eth_call");
+        let data = params[0]["data"].as_str().unwrap();
+        let account: Address = format!("0x{}", &data[34..74]).parse().unwrap();
+        Ok(Value::String(word(u128::from(self.0[&account]))))
+    }
+}
+
+#[tokio::test]
+async fn a_key_the_executor_does_not_know_stops_the_boot() {
+    let (known, unknown) = (key(1).address(), key(2).address());
+    let rpc = Executors(BTreeMap::from([(known, true), (unknown, false)]));
+    assert!(check_executors(&rpc, EXECUTOR, &[known]).await.is_ok());
+    let err = check_executors(&rpc, EXECUTOR, &[known, unknown]).await.unwrap_err();
+    assert!(err.contains(&format!("{unknown:#x}")), "{err}");
+    assert!(!err.contains(&format!("{known:#x}")), "{err}");
+}
+
+#[tokio::test]
+async fn the_report_carries_the_live_section() {
+    let answers = vec![SendAnswer::Accepted(B256::ZERO), SendAnswer::Silent("timeout".into()), SendAnswer::Refused("-32000: no".into())];
+    let f = fixture(policy(ETH / 100, u128::MAX), answers, vec![]);
+    start(&f).await;
+    let big = Arm { size_wei: (11 * ETH).to_string(), ..arm(4, 3, 1_000_000_000, 600_000) };
+    let lines = [arm(1, 0, 1_000_000_000, 600_000), arm(2, 1, 1_000_000_000, 600_000), arm(3, 2, 1_000_000_000, 600_000), big]
+        .map(|a| ArmedLine::Arm(Box::new(a)));
+    f.live.on_lines(&lines, 0, NOW).await;
+
+    // 600k gas at 1 gwei: 0.0006 ETH at worst, the accepted one and the silent one.
+    let r = f.live.report(NOW);
+    assert_eq!((r.submitted, r.accepted, r.silent, r.refused, r.landed, r.won), (3, 1, 1, 1, 0, 0));
+    assert_eq!(r.skipped, BTreeMap::from([("size".to_string(), 1)]));
+    assert_eq!((r.reserved_wei.as_str(), r.budget_wei.as_str()), ("1200000000000000", "10000000000000000"));
+    assert_eq!(r.expiry_horizon_blocks, Some(4), "bound 104, head 100");
+    assert_eq!((r.cadence_ms_measured, r.cadence_ms_configured), (Some(2_000), 2_000));
+    assert_eq!(r.halted, None);
+    assert_eq!(r.senders.len(), 16);
+    assert_eq!(r.senders[0].address, key(1).address());
+    assert_eq!((r.senders[0].nonce, r.senders[0].worst_case_wei.as_str()), (Some(7), "600000000000000"));
+    assert_eq!(r.senders[0].days_left, None, "nothing spent yet");
+
+    let first = keccak256(&f.script.sent.lock().unwrap()[0].0);
+    f.chain.nonces.lock().unwrap().insert(key(1).address(), 8);
+    // 300k gas at 1 gwei: 0.0003 ETH spent, against 0.002 ETH paid.
+    let landed = receipt(first, true, 300_000, 1_000_000_000, 0, 2_000_000_000_000_000, 2_100_000_000_000_000);
+    f.chain.receipts.lock().unwrap().insert(first, landed);
+    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    let r = f.live.report(NOW + 10_000);
+    assert_eq!((r.landed, r.won), (1, 1));
+    assert_eq!((r.gross_wei.as_str(), r.cost_wei.as_str(), r.net_today_wei.as_str()), ("2100000000000000", "300000000000000", "1700000000000000"));
+    assert_eq!(r.senders[0].nonce, Some(8));
+    let days = r.senders[0].days_left.expect("a day's spend");
+    assert!((days - 1.0 / 0.0003).abs() < 1e-6, "1 ETH over 0.0003 ETH a day: {days}");
+    assert!(serde_json::to_value(&r).unwrap()["senders"].is_array());
 }

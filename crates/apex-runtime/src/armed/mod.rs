@@ -9,6 +9,7 @@ pub mod eval;
 pub mod keys;
 pub mod lines;
 pub mod live;
+pub mod live_chain;
 pub mod live_ledger;
 pub mod moves;
 pub mod plan;

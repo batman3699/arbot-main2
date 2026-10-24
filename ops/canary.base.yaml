@@ -45,17 +45,32 @@ flashblocks:
 # R26: armed backruns. armed-shadow arms each top route's gap as a validity
 # transaction would wait in Base's builder: built and recorded, never sent.
 # `apex armed-eval` (a timer on the host) judges every arm against the chain.
+# R36: the census's targets (apex-targets.timer) choose the routes; armed-live
+# also sends, from the senders in live.keys_file (ops/host/ARMED.md). Every
+# cap is here, read by the engine and the live worker alike.
 armed:
   mode: shadow
   ledger: var/apex/armed.jsonl
   verdicts: var/apex/armed-verdicts.jsonl
+  targets: var/apex/targets.json
+  targets_max_age_s: 172800
   max_arms: 16
   rungs: 6
   window_s: 10
-  block_time_ms: 2000
+  block_time_ms: 2000            # 200 on the Denim day (ops/host/ARMED.md)
   margin_wei: 0
   band_cap_bps: 5
   liquidity_floor_bps: 9800
+  max_priority_wei_per_gas: 20000000000
+  daily_loss_budget_wei: 10000000000000000   # 0.01 ETH: realized loss plus everything pending
+  max_size_wei: 5000000000000000000          # 5 WETH
+  l1_fee_bound_wei: 50000000000000           # 0.00005 ETH
+  sender_reserve_wei: 200000000000000        # 0.0002 ETH
+  live:
+    keys_file: /etc/apex/armed.keys
+    sequencer: https://mainnet-sequencer.base.org
+    ledger: var/apex/armed-live.jsonl
+    kill_file: var/apex/armed.disable
 
 executor:
   # R29: the lean executor, deployed 2026-10-19 by the owner with

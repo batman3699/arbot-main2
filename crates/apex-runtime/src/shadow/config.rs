@@ -223,7 +223,8 @@ pub struct FlashblocksConfig {
     pub ledger: PathBuf,
 }
 
-/// R26: armed backruns. Only `shadow` is built; `live` is the pilot's plan.
+/// R26: armed backruns. `shadow` arms and records; `live` (R36) also sends,
+/// and runs only under `apex canary`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArmedMode {
@@ -255,10 +256,73 @@ pub struct ArmedConfig {
     /// R36: the most an arm bids, in wei per gas over the base fee.
     #[serde(default = "twenty_gwei")]
     pub max_priority_wei_per_gas: u128,
+    /// R36: the day's loss budget: realised losses and every pending
+    /// transaction's worst case share it.
+    #[serde(default = "a_hundredth_eth")]
+    pub daily_loss_budget_wei: u128,
+    /// R36: the largest size an arm is sent at.
+    #[serde(default = "five_weth")]
+    pub max_size_wei: u128,
+    /// R36: a bound on one transaction's L1 data fee, in its worst case.
+    #[serde(default = "fifty_microeth")]
+    pub l1_fee_bound_wei: u128,
+    /// R36: left in every sender after its worst case.
+    #[serde(default = "two_hundred_microeth")]
+    pub sender_reserve_wei: u128,
+    /// R36: where armed-live's parts are. Its caps are the ones above.
+    #[serde(default)]
+    pub live: Option<ArmedLiveConfig>,
+}
+
+/// R36: where armed-live's parts are, and nothing else: every cap is
+/// `armed:`'s, read by the engine and the live worker alike.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArmedLiveConfig {
+    /// The senders' keys, one per slot (`apex keys new`), mode 0400.
+    pub keys_file: PathBuf,
+    /// Where `base_sendRawTransactionValidity` goes.
+    pub sequencer: String,
+    /// The write-ahead live ledger.
+    pub ledger: PathBuf,
+    /// `touch` it to stop new sends; remove it to resume. Not a halt.
+    pub kill_file: PathBuf,
 }
 
 const fn twenty_gwei() -> u128 {
     20_000_000_000
+}
+
+const fn a_hundredth_eth() -> u128 {
+    10_000_000_000_000_000
+}
+
+const fn five_weth() -> u128 {
+    5_000_000_000_000_000_000
+}
+
+const fn fifty_microeth() -> u128 {
+    50_000_000_000_000
+}
+
+const fn two_hundred_microeth() -> u128 {
+    200_000_000_000_000
+}
+
+/// R36: each money cap's range, in wei: none may be zero, and none may be a
+/// slip of the decimal point beyond what the pilot was approved at.
+const ARMED_CAPS: [(&str, u128); 5] = [
+    ("daily_loss_budget_wei", 100_000_000_000_000_000),   // 0.1 ETH
+    ("max_priority_wei_per_gas", 1_000_000_000_000),      // 1,000 gwei
+    ("max_size_wei", 100_000_000_000_000_000_000),        // 100 WETH
+    ("l1_fee_bound_wei", 10_000_000_000_000_000),         // 0.01 ETH
+    ("sender_reserve_wei", 100_000_000_000_000_000),      // 0.1 ETH
+];
+
+impl ArmedConfig {
+    fn caps(&self) -> [u128; 5] {
+        [self.daily_loss_budget_wei, self.max_priority_wei_per_gas, self.max_size_wei, self.l1_fee_bound_wei, self.sender_reserve_wei]
+    }
 }
 
 const fn two_days_s() -> u64 {
@@ -392,7 +456,17 @@ impl ShadowConfig {
         }
         let a = &raw.armed;
         if a.mode == ArmedMode::Live {
-            return Err(invalid("armed.mode live is not built yet: the pilot is R26's second plan, after gate A"));
+            if command == Command::Shadow {
+                return Err(invalid("armed.mode live sends: it runs under `apex canary`, never `apex shadow`"));
+            }
+            if a.live.is_none() {
+                return Err(invalid("armed.mode live needs armed.live: its keys, sequencer, ledger and kill file"));
+            }
+        }
+        for ((name, most), value) in ARMED_CAPS.iter().zip(a.caps()) {
+            if value == 0 || value > *most {
+                return Err(invalid(format!("armed.{name} {value} is outside 1..={most} wei")));
+            }
         }
         if !(1..=64).contains(&a.max_arms)
             || !(1..=crate::armed::threshold::RUNG_OFFSETS.len()).contains(&usize::from(a.rungs))

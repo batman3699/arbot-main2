@@ -173,6 +173,8 @@ struct Stats {
     ledger_failures: AtomicU64,
     /// R26: armed-ledger lines that could not be written.
     armed_write_failures: AtomicU64,
+    /// R36: passes whose lines found armed-live's queue full: never sent.
+    armed_live_dropped: AtomicU64,
 }
 
 fn bump(c: &AtomicU64) {
@@ -251,6 +253,11 @@ struct Shadow {
     canary: Option<Arc<Canary>>,
     /// R26: the arming engine (armed-shadow).
     armed: Arc<crate::armed::engine::Engine>,
+    /// R36: armed-live's worker, in armed-live; and each pass's lines on their
+    /// way to it, with the pass's base fee, in the order they were armed.
+    armed_live: Option<Arc<crate::armed::live::ArmedLive>>,
+    armed_lines: tokio::sync::mpsc::Sender<(Vec<crate::armed::lines::ArmedLine>, u128)>,
+    armed_lines_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Vec<crate::armed::lines::ArmedLine>, u128)>>,
     /// R36: the census's targeted pools, admitted below the floor on every
     /// reload too; whether targets were read, their routes, and their pools
     /// with no inventory record.
@@ -407,6 +414,16 @@ pub async fn run(config: ShadowConfig, env: &Env, stop: impl Future<Output = ()>
             Box::pin(async move { s.task(task).await })
         }));
     }
+    // R36: armed-live's sender and its head hook, in armed-live only.
+    if shadow.armed_live.is_some() {
+        for (name, task) in [("armed-live", Task::ArmedLive), ("armed-heads", Task::ArmedHeads)] {
+            let s = Arc::clone(&shadow);
+            spawn(name, Box::new(move || {
+                let s = Arc::clone(&s);
+                Box::pin(async move { s.task(task).await })
+            }));
+        }
+    }
     {
         let (s, bus) = (Arc::clone(&shadow), Arc::clone(&bus));
         spawn("report", Box::new(move || {
@@ -440,6 +457,8 @@ enum Task {
     FullReload,
     Race,
     Armed,
+    ArmedLive,
+    ArmedHeads,
 }
 
 async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
@@ -597,9 +616,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         balancer: ethers_core::types::U256::from(holding),
         morpho: Some(ethers_core::types::U256::from(morpho_held)),
     }));
-    let armed = Arc::new(crate::armed::engine::Engine::new(
-        armed_set.clone(),
-        crate::armed::engine::EngineSettings {
+    let engine_settings = crate::armed::engine::EngineSettings {
             max_arms: config.armed.max_arms,
             rungs: config.armed.rungs,
             window_s: config.armed.window_s,
@@ -612,9 +629,9 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
             reprice_for: crate::armed::engine::REPRICE_FOR,
             workers: crate::armed::engine::workers(),
             max_priority_wei_per_gas: config.armed.max_priority_wei_per_gas,
-        },
-        unarmable,
-    )
+    };
+    let window_blocks = engine_settings.window_blocks();
+    let armed = Arc::new(crate::armed::engine::Engine::new(armed_set.clone(), engine_settings, unarmable)
     .with_bids({
         let t = targets.clone();
         Arc::new(move |weth_in, other| t.as_ref().map_or_else(Vec::new, |t| t.bids_for(weth_in, other).to_vec()))
@@ -801,6 +818,15 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     if let Some((c, _, _)) = &canary {
         info!(halted = ?c.halted(), open = c.open_sends().len(), "the canary's ledger is read");
     }
+    // R36: armed-live's worker. The configuration allows the mode only under
+    // `apex canary`, with its section; the executor pays the canary's recipient.
+    let armed_live = match (config.armed.mode, &config.armed.live, &config.canary) {
+        (config::ArmedMode::Live, Some(live), Some(k)) => {
+            Some(Arc::new(boot_armed_live(&config, live, k.profit_recipient, &rpc, window_blocks).await?))
+        }
+        _ => None,
+    };
+    let (armed_lines, armed_lines_rx) = tokio::sync::mpsc::channel(1_024);
 
     info!(
         config = %config.version,
@@ -848,6 +874,9 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         nonce_moved: AtomicBool::new(false),
         canary: canary.map(|(c, _, _)| c),
         armed,
+        armed_live,
+        armed_lines,
+        armed_lines_rx: tokio::sync::Mutex::new(armed_lines_rx),
         targets_loaded: targets.is_some(),
         targeted_routes: targets.as_ref().map_or(0, |t| t.routes.len() as u64),
         targets_missing: missing as u64,
@@ -856,6 +885,53 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         started,
         config,
     })
+}
+
+/// R36: armed-live's worker: one sender a slot, each one the executor lets
+/// trade, its ledger replayed and every nonce read before the first send.
+async fn boot_armed_live(
+    config: &ShadowConfig,
+    live: &config::ArmedLiveConfig,
+    recipient: Address,
+    rpc: &Arc<dyn RpcTransport>,
+    window_blocks: u64,
+) -> Result<crate::armed::live::ArmedLive, ShadowError> {
+    use crate::armed::live::{ArmedLive, LivePolicy};
+    let keys = crate::armed::keys::load(&live.keys_file).map_err(ShadowError::Boot)?;
+    let a = &config.armed;
+    if keys.len() != a.max_arms {
+        return Err(ShadowError::Boot(format!(
+            "{} holds {} keys for {} slots (armed.max_arms): one sender a slot",
+            live.keys_file.display(),
+            keys.len(),
+            a.max_arms
+        )));
+    }
+    let senders: Vec<Address> = keys.iter().map(LaneKey::address).collect();
+    crate::armed::live_chain::check_executors(&**rpc, config.executor.address, &senders).await.map_err(ShadowError::Boot)?;
+    let (ledger, records) = crate::armed::live_ledger::LiveLedger::open(&live.ledger).map_err(|e| boot_err("the armed live ledger", e))?;
+    let submit = apex_chain::base::validity::ValiditySubmitter::new(&live.sequencer, Duration::from_secs(3))
+        .map_err(|e| ShadowError::Boot(format!("armed-live's submitter: {e}")))?;
+    info!(endpoint = submit.label(), senders = senders.len(), records = records.len(), "armed-live sends validity transactions through this endpoint");
+    let policy = LivePolicy {
+        budget_wei: a.daily_loss_budget_wei,
+        max_priority_wei_per_gas: a.max_priority_wei_per_gas,
+        max_size_wei: ethers_core::types::U256::from(a.max_size_wei),
+        l1_fee_bound_wei: a.l1_fee_bound_wei,
+        sender_reserve_wei: a.sender_reserve_wei,
+        window_blocks,
+        block_time_ms: a.block_time_ms,
+        kill_file: live.kill_file.clone(),
+    };
+    let chain = Arc::new(crate::armed::live_chain::RpcChain::new(Arc::clone(rpc)));
+    let worker = ArmedLive::new(keys, chain, Arc::new(submit), ledger, records, policy, config.executor.address, recipient, config.chain_id);
+    worker.begin(now_ms()).await.map_err(|e| ShadowError::Boot(format!("armed-live: {e}")))?;
+    info!(ready = worker.ready(), halted = ?worker.state(now_ms()).halted, "armed-live's ledger is read");
+    Ok(worker)
+}
+
+fn now_ms() -> u64 {
+    SystemClock.now().0 / 1_000_000
 }
 
 impl Shadow {
@@ -988,6 +1064,8 @@ impl Shadow {
             Task::Capacity => self.capacity_loop().await,
             Task::Race => self.race_writer().await,
             Task::Armed => self.armed_loop().await,
+            Task::ArmedLive => self.armed_live_loop().await,
+            Task::ArmedHeads => self.armed_head_loop().await,
             Task::FullReload => {
                 let mut every = tokio::time::interval(Duration::from_secs(self.config.policy.full_reload_every_s));
                 every.tick().await;
@@ -1162,6 +1240,33 @@ impl Shadow {
                 if ledger::append_line(&self.config.armed.ledger, now, line).is_err() {
                     bump(&self.stats.armed_write_failures);
                 }
+            }
+            if self.armed_live.is_some() && !lines.is_empty() && self.armed_lines.try_send((lines, base_fee)).is_err() {
+                bump(&self.stats.armed_live_dropped);
+            }
+        }
+    }
+
+    /// R36: armed-live's sender: each pass's lines, in order, to the worker,
+    /// off the engine's loop so a pass never waits on a send.
+    async fn armed_live_loop(&self) {
+        let Some(live) = &self.armed_live else { return };
+        let mut rx = self.armed_lines_rx.lock().await;
+        while let Some((lines, base_fee)) = rx.recv().await {
+            live.on_lines(&lines, base_fee, now_ms()).await;
+        }
+    }
+
+    /// R36: armed-live's head hook: the cadence, and what came of every
+    /// pending transaction whose bound a head has passed.
+    async fn armed_head_loop(&self) {
+        let Some(live) = &self.armed_live else { return };
+        let mut heads = self.heads.subscribe();
+        while heads.changed().await.is_ok() {
+            let number = heads.borrow_and_update().as_ref().map(|h| h.number);
+            if let Some(number) = number {
+                let now = now_ms();
+                live.on_head(number, now, now).await;
             }
         }
     }
@@ -1342,9 +1447,11 @@ impl Shadow {
             armed: {
                 let (move_checks, move_tick_mismatches, move_liquidity_changes) = self.book.move_checks();
                 ArmedReport {
-                    mode: "shadow",
+                    mode: if self.armed_live.is_some() { "live" } else { "shadow" },
                     engine: self.armed.stats(),
                     write_failures: get(&self.stats.armed_write_failures),
+                    live: self.armed_live.as_ref().map(|l| l.report(now_ms())),
+                    live_dropped: get(&self.stats.armed_live_dropped),
                     move_checks,
                     move_tick_mismatches,
                     move_liquidity_changes,
@@ -1474,6 +1581,9 @@ pub struct ArmedReport {
     pub targets_loaded: bool,
     pub targeted_routes: u64,
     pub targets_missing: u64,
+    /// R36: armed-live, when this run sends; passes its queue had no room for.
+    pub live: Option<crate::armed::live::LiveReport>,
+    pub live_dropped: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]

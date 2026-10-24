@@ -122,7 +122,7 @@ fn a_stale_or_malformed_file_is_refused() {
 }
 
 /// The arming engine's settings in `mode`. Built directly: the config file
-/// refuses `mode: live` until the live worker is wired (Task 11).
+/// takes `mode: live` only under `apex canary`, with its section.
 fn armed(mode: ArmedMode, targets: Option<&Path>) -> ArmedConfig {
     ArmedConfig {
         mode,
@@ -138,6 +138,11 @@ fn armed(mode: ArmedMode, targets: Option<&Path>) -> ArmedConfig {
         targets: targets.map(Path::to_path_buf),
         targets_max_age_s: DAY2,
         max_priority_wei_per_gas: 20_000_000_000,
+        daily_loss_budget_wei: 10_000_000_000_000_000,
+        max_size_wei: 5_000_000_000_000_000_000,
+        l1_fee_bound_wei: 50_000_000_000_000,
+        sender_reserve_wei: 200_000_000_000_000,
+        live: None,
     }
 }
 

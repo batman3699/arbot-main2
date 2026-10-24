@@ -116,13 +116,10 @@ fn a_resolved_key_is_held_as_a_secret() {
     assert_eq!(c.armed.ledger, std::path::PathBuf::from("var/a.jsonl"));
 }
 
-/// R26: only armed-shadow is built; armed-live waits for the pilot's plan.
+/// R26: the engine's settings are bounded.
 #[test]
-fn armed_live_is_refused_until_the_pilot_is_built() {
+fn the_armed_settings_are_bounded() {
     let var = "APEX_SECRET_SHADOW_TEST_LIVE";
-    let text = yaml(var, "var/apex/shadow.journal").replace("mode: shadow", "mode: live");
-    let err = ShadowConfig::from_yaml_str(&text, &env(var, SECRET)).unwrap_err();
-    assert!(err.to_string().contains("armed.mode live"), "{err}");
     let text = yaml(var, "var/apex/shadow.journal").replace("max_arms: 16", "max_arms: 0");
     let err = ShadowConfig::from_yaml_str(&text, &env(var, SECRET)).unwrap_err();
     assert!(err.to_string().contains("max_arms 1-64"), "no senders: {err}");
@@ -132,6 +129,66 @@ fn armed_live_is_refused_until_the_pilot_is_built() {
     let err = ShadowConfig::from_yaml_str(&seven, &env(var, SECRET)).unwrap_err();
     assert!(err.to_string().contains("rungs 1-6"), "{err}");
     assert!(ShadowConfig::from_yaml_str(&yaml(var, "var/apex/shadow.journal"), &env(var, SECRET)).is_ok());
+}
+
+const ARMED_LIVE: &str = "  liquidity_floor_bps: 9800
+  live:
+    keys_file: /etc/apex/armed.keys
+    sequencer: https://mainnet-sequencer.base.org
+    ledger: var/apex/armed-live.jsonl
+    kill_file: var/apex/armed.disable";
+
+/// A canary's configuration in armed-live mode, with `section` as its
+/// `armed.live`.
+fn armed_live(var: &str, section: &str) -> String {
+    format!("{}{}", yaml(var, "var/apex/canary.journal"), canary_section())
+        .replace("mode: shadow", "mode: live")
+        .replace("  liquidity_floor_bps: 9800", section)
+}
+
+/// R36: armed-live sends, so it runs only under `apex canary`, and only with
+/// its section.
+#[test]
+fn live_mode_without_its_section_does_not_boot() {
+    let var = "APEX_SECRET_SHADOW_TEST_LIVE";
+    let e = env(var, SECRET);
+    let c = ShadowConfig::canary_from_yaml_str(&armed_live(var, ARMED_LIVE), &e).expect("armed-live under the canary");
+    let live = c.armed.live.expect("its section");
+    assert_eq!(live.keys_file, std::path::PathBuf::from("/etc/apex/armed.keys"));
+    assert_eq!(live.sequencer, "https://mainnet-sequencer.base.org");
+
+    let err = ShadowConfig::canary_from_yaml_str(&armed_live(var, "  liquidity_floor_bps: 9800"), &e).unwrap_err();
+    assert!(err.to_string().contains("armed.live"), "{err}");
+    let shadow = yaml(var, "var/apex/shadow.journal").replace("mode: shadow", "mode: live").replace("  liquidity_floor_bps: 9800", ARMED_LIVE);
+    let err = ShadowConfig::from_yaml_str(&shadow, &e).unwrap_err();
+    assert!(err.to_string().contains("apex canary"), "`apex shadow` never sends: {err}");
+}
+
+/// One policy: every cap is `armed:`'s, and `armed.live` says only where
+/// things are.
+#[test]
+fn a_cap_in_the_live_section_is_refused() {
+    let var = "APEX_SECRET_SHADOW_TEST_LIVE";
+    let section = format!("{ARMED_LIVE}\n    max_priority_wei_per_gas: 1");
+    let err = ShadowConfig::canary_from_yaml_str(&armed_live(var, &section), &env(var, SECRET)).unwrap_err();
+    assert!(matches!(err, ShadowConfigError::Parse(_)), "{err}");
+}
+
+#[test]
+fn a_money_cap_of_zero_or_out_of_range_is_refused() {
+    let var = "APEX_SECRET_SHADOW_TEST_LIVE";
+    let e = env(var, SECRET);
+    let with = |field: &str, value: &str| {
+        armed_live(var, &format!("{ARMED_LIVE}\n  {field}: {value}"))
+    };
+    for field in ["daily_loss_budget_wei", "max_priority_wei_per_gas", "max_size_wei", "l1_fee_bound_wei", "sender_reserve_wei"] {
+        let err = ShadowConfig::canary_from_yaml_str(&with(field, "0"), &e).unwrap_err();
+        assert!(err.to_string().contains(field), "{field} 0: {err}");
+    }
+    let err = ShadowConfig::canary_from_yaml_str(&with("daily_loss_budget_wei", "1000000000000000000"), &e).unwrap_err();
+    assert!(err.to_string().contains("daily_loss_budget_wei"), "a whole ETH a day: {err}");
+    let c = ShadowConfig::canary_from_yaml_str(&with("daily_loss_budget_wei", "20000000000000000"), &e).unwrap();
+    assert_eq!(c.armed.daily_loss_budget_wei, 20_000_000_000_000_000);
 }
 
 /// An unset placeholder refuses to start, naming the variable — and only
@@ -253,6 +310,15 @@ fn the_shipped_canary_config_parses() {
         .expect("the shipped rival bids load");
     assert!(bids.len() >= 100, "{} rival bids", bids.len());
     assert!(c.journal.to_str().unwrap().contains("canary"));
+    // R36: armed-shadow until gate A', its live parts staged, every cap here.
+    let a = &c.armed;
+    assert_eq!(a.mode, apex_runtime::shadow::config::ArmedMode::Shadow);
+    assert_eq!(a.targets.as_deref(), Some(std::path::Path::new("var/apex/targets.json")));
+    assert_eq!((a.daily_loss_budget_wei, a.max_priority_wei_per_gas), (10_000_000_000_000_000, 20_000_000_000));
+    assert_eq!((a.max_size_wei, a.l1_fee_bound_wei, a.sender_reserve_wei), (5_000_000_000_000_000_000, 50_000_000_000_000, 200_000_000_000_000));
+    let live = a.live.as_ref().expect("armed.live");
+    assert_eq!(live.sequencer, "https://mainnet-sequencer.base.org");
+    assert_eq!(live.keys_file, std::path::PathBuf::from("/etc/apex/armed.keys"));
     // Everything else is the shadow's.
     let shadow = ShadowConfig::load(&path.replace("canary", "shadow"), &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap();
     assert_eq!((c.executor, c.universe), (shadow.executor, shadow.universe));

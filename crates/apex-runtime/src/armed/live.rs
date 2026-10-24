@@ -41,6 +41,7 @@ use alloy_primitives::{Address, B256};
 use apex_chain::base::send::SendAnswer;
 use apex_chain::base::validity::ValiditySubmitter;
 use ethers_core::types::U256;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -54,6 +55,7 @@ const BALANCE_TTL_MS: u64 = 60_000;
 const MAX_BUMPS: usize = 2;
 /// Head intervals the cadence guard takes the median of.
 const CADENCE_SAMPLES: usize = 20;
+const DAY_MS: u64 = 86_400_000;
 
 #[async_trait::async_trait]
 pub trait ValiditySend: Send + Sync {
@@ -119,13 +121,94 @@ struct Inner {
     state: LiveState,
     /// Each sender's next nonce, as the chain last said.
     nonces: BTreeMap<Address, u64>,
-    /// Each sender's balance, and when it was read.
-    balances: BTreeMap<Address, (u128, u64)>,
+    /// Each sender's balance as last read.
+    balances: BTreeMap<Address, Balance>,
     /// Each slot's arm, as last armed or renewed.
     arms: BTreeMap<u16, Arm>,
     /// The last head and when it was seen, and the per-block intervals before it.
     last_head: Option<(u64, u64)>,
     intervals: VecDeque<u64>,
+    /// What this process has recorded since boot.
+    counts: Counts,
+    /// Each landing's cost, by sender, over the last day.
+    spends: VecDeque<(u64, Address, u128)>,
+}
+
+struct Balance {
+    wei: u128,
+    read_ms: u64,
+    /// A landing has spent from it since.
+    stale: bool,
+}
+
+#[derive(Default)]
+struct Counts {
+    submitted: u64,
+    accepted: u64,
+    refused: u64,
+    silent: u64,
+    skipped: BTreeMap<String, u64>,
+    landed: u64,
+    won: u64,
+    gross_wei: u128,
+    cost_wei: u128,
+}
+
+impl Inner {
+    fn count(&mut self, record: &LiveRecord) {
+        let c = &mut self.counts;
+        match record {
+            LiveRecord::Submitting { .. } => c.submitted += 1,
+            LiveRecord::Answered { accepted: Some(true), .. } => c.accepted += 1,
+            LiveRecord::Answered { accepted: Some(false), .. } => c.refused += 1,
+            LiveRecord::Answered { accepted: None, .. } => c.silent += 1,
+            LiveRecord::Skipped { reason, .. } => *c.skipped.entry(reason.clone()).or_default() += 1,
+            LiveRecord::Landed { sender, gross_wei, paid_wei, cost_wei, at_ms, .. } => {
+                c.landed += 1;
+                c.won += u64::from(*paid_wei > 0);
+                c.gross_wei = c.gross_wei.saturating_add(*gross_wei);
+                c.cost_wei = c.cost_wei.saturating_add(*cost_wei);
+                self.spends.push_back((*at_ms, *sender, *cost_wei));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Armed-live in the run's report (R36).
+#[derive(Clone, Debug, Serialize)]
+pub struct LiveReport {
+    pub submitted: u64,
+    pub accepted: u64,
+    pub refused: u64,
+    pub silent: u64,
+    pub skipped: BTreeMap<String, u64>,
+    pub landed: u64,
+    /// Landings that paid the recipient.
+    pub won: u64,
+    pub gross_wei: String,
+    pub cost_wei: String,
+    pub net_today_wei: String,
+    pub reserved_wei: String,
+    pub budget_wei: String,
+    pub halted: Option<String>,
+    pub cadence_ms_measured: Option<u64>,
+    pub cadence_ms_configured: u64,
+    /// The furthest pending bound past the last head.
+    pub expiry_horizon_blocks: Option<u64>,
+    pub senders: Vec<SenderReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SenderReport {
+    pub address: Address,
+    /// As last read; none before the first.
+    pub balance_wei: Option<String>,
+    pub nonce: Option<u64>,
+    /// The largest worst case pending at the sender.
+    pub worst_case_wei: String,
+    /// The balance over the last day's landing costs; none with no spend.
+    pub days_left: Option<f64>,
 }
 
 impl std::fmt::Debug for ArmedLive {
@@ -180,6 +263,8 @@ impl ArmedLive {
             arms: BTreeMap::new(),
             last_head: None,
             intervals: VecDeque::with_capacity(CADENCE_SAMPLES),
+            counts: Counts::default(),
+            spends: VecDeque::new(),
         };
         Self {
             keys,
@@ -244,12 +329,68 @@ impl ArmedLive {
     /// The median per-block interval of the last twenty heads, once there are
     /// twenty.
     pub fn cadence_ms(&self) -> Option<u64> {
-        let inner = self.inner();
-        (inner.intervals.len() == CADENCE_SAMPLES).then(|| {
-            let mut sorted: Vec<u64> = inner.intervals.iter().copied().collect();
-            sorted.sort_unstable();
-            sorted[CADENCE_SAMPLES / 2]
-        })
+        median(&self.inner().intervals)
+    }
+
+    /// What armed-live has done since boot, and where it stands, as of `now_ms`.
+    pub fn report(&self, now_ms: u64) -> LiveReport {
+        let mut inner = self.inner();
+        inner.state.roll(now_ms);
+        while inner.spends.front().is_some_and(|(at, _, _)| now_ms.saturating_sub(*at) > DAY_MS) {
+            inner.spends.pop_front();
+        }
+        let inner = &*inner;
+        let senders = self
+            .keys
+            .iter()
+            .map(|key| {
+                let address = key.address();
+                let balance = inner.balances.get(&address).map(|b| b.wei);
+                let spent: u128 = inner.spends.iter().filter(|(_, s, _)| *s == address).map(|(_, _, cost)| cost).sum();
+                let worst = inner
+                    .state
+                    .pending
+                    .iter()
+                    .filter(|((s, _), _)| *s == address)
+                    .flat_map(|(_, txs)| txs.iter().map(|t| t.worst_case_wei))
+                    .max()
+                    .unwrap_or(0);
+                SenderReport {
+                    address,
+                    balance_wei: balance.map(|b| b.to_string()),
+                    nonce: inner.nonces.get(&address).copied(),
+                    worst_case_wei: worst.to_string(),
+                    #[allow(clippy::cast_precision_loss)]
+                    days_left: balance.filter(|_| spent > 0).map(|b| b as f64 / spent as f64),
+                }
+            })
+            .collect();
+        let horizon = inner.last_head.and_then(|(head, _)| {
+            inner.state.pending.values().flatten().map(|t| t.to_block).max().map(|bound| bound.saturating_sub(head))
+        });
+        let c = &inner.counts;
+        LiveReport {
+            submitted: c.submitted,
+            accepted: c.accepted,
+            refused: c.refused,
+            silent: c.silent,
+            skipped: c.skipped.clone(),
+            landed: c.landed,
+            won: c.won,
+            gross_wei: c.gross_wei.to_string(),
+            cost_wei: c.cost_wei.to_string(),
+            net_today_wei: inner.state.day_net.to_string(),
+            reserved_wei: inner.state.reserved_wei.to_string(),
+            budget_wei: self.policy.budget_wei.to_string(),
+            halted: inner.state.halted.as_ref().map(|h| match h {
+                Halt::LossCap { day } => format!("the loss cap, for {day}"),
+                Halt::Tripwire { sender, detail } => format!("the tripwire, on {sender:#x}: {detail}"),
+            }),
+            cadence_ms_measured: median(&inner.intervals),
+            cadence_ms_configured: self.policy.block_time_ms,
+            expiry_horizon_blocks: horizon,
+            senders,
+        }
     }
 
     /// Submit each arm and renewal, in order.
@@ -494,7 +635,9 @@ impl ArmedLive {
         }
         let mut inner = self.inner();
         inner.nonces.insert(sender, read.nonce);
-        inner.balances.remove(&sender);
+        if let Some(b) = inner.balances.get_mut(&sender) {
+            b.stale = true;
+        }
     }
 
     /// Account a landing from its receipt, and halt the day if it spent the
@@ -560,15 +703,13 @@ impl ArmedLive {
     }
 
     async fn balance(&self, sender: Address, now_ms: u64) -> Result<u128, String> {
-        let cached = self.inner().balances.get(&sender).copied();
-        if let Some((balance, at)) = cached {
-            if now_ms.saturating_sub(at) < BALANCE_TTL_MS {
-                return Ok(balance);
-            }
+        let cached = self.inner().balances.get(&sender).filter(|b| !b.stale && now_ms.saturating_sub(b.read_ms) < BALANCE_TTL_MS).map(|b| b.wei);
+        if let Some(wei) = cached {
+            return Ok(wei);
         }
-        let balance = self.chain.balance(sender).await?;
-        self.inner().balances.insert(sender, (balance, now_ms));
-        Ok(balance)
+        let wei = self.chain.balance(sender).await?;
+        self.inner().balances.insert(sender, Balance { wei, read_ms: now_ms, stale: false });
+        Ok(wei)
     }
 
     fn skip(&self, arm: &Arm, sender: Address, reason: &str, now_ms: u64) {
@@ -588,6 +729,7 @@ impl ArmedLive {
         let mut inner = self.inner();
         inner.state.roll(now_ms);
         inner.state.apply(record, self.policy.budget_wei);
+        inner.count(record);
     }
 
     fn inner(&self) -> MutexGuard<'_, Inner> {
@@ -612,6 +754,15 @@ fn is_bound(p: &Predicate) -> bool {
 /// The arm's predicates, bounded at `to_block`.
 fn bounded(predicates: &[Predicate], to_block: u64) -> Vec<Predicate> {
     predicates.iter().filter(|p| !is_bound(p)).cloned().chain([predicate::expiry(to_block)]).collect()
+}
+
+/// The upper median of a full window of head intervals.
+fn median(intervals: &VecDeque<u64>) -> Option<u64> {
+    (intervals.len() == CADENCE_SAMPLES).then(|| {
+        let mut sorted: Vec<u64> = intervals.iter().copied().collect();
+        sorted.sort_unstable();
+        sorted[CADENCE_SAMPLES / 2]
+    })
 }
 
 /// An eighth more, rounded up.
