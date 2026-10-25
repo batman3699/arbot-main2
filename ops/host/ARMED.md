@@ -84,8 +84,11 @@ nonce the ledger did not leave there; the probe refuses a sender the ledger
 knows.
 
 ```
-# sudo -u apex bash -c 'set -a; . /etc/apex/shadow.env; set +a; cd /opt/apex && bin/apex validity-probe --config ops/canary.base.yaml --sender 15'
+# bash -c 'set -a; . /etc/apex/shadow.env; set +a; cd /opt/apex && bin/apex validity-probe --config ops/canary.base.yaml --sender 15'
 ```
+
+As root: `/etc/apex` is root's alone, and root reads the 0400 keys file.
+The environment file is sourced into the process, never printed.
 
 It prints one JSON line per case, each ending in `"pass": true` or `false`;
 the exit status is 0 only if all six pass. The cases:
@@ -99,6 +102,18 @@ the exit status is 0 only if all six pass. The cases:
 6. Five back-to-back bumps of an eighth each expire.
 
 It costs about two 21,000-gas transactions from sender 15.
+
+**The run on 2026-10-25** (sender 15, from the host) passed all six cases.
+The sequencer answered every send in 12–24 ms. Three findings for live:
+- *Replacement:* a held transaction is replaced only at higher fees
+  (case 3's same-fee replacement: `replacement transaction underpriced`).
+  The worker's eighth-higher bumps were all accepted (case 6).
+- *After its bound,* a transaction's nonce takes the same fees again
+  (case 4). A renewal begins where the engine's window ends, so it normally
+  needs no bump.
+- *An expired hash* can be sent again with new predicates, and lands when
+  they hold (cases 2 and 5 re-sent identical bytes). Armed-live never
+  repeats a hash: each renewal carries a fresh deadline.
 
 ### e. Gate A′: one day of armed-shadow on the targets
 
