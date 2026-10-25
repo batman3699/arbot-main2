@@ -19,13 +19,13 @@ contract FundArmedSendersTest is Test {
     function test_tops_every_sender_up_to_the_amount_and_no_further() public {
         vm.deal(A, 16_000_000_000_001); // dust already there, as on Base
         FundArmedSenders script = new FundArmedSenders();
-        script.run(SENDERS);
+        script.runFrom(SENDERS);
         assertEq(A.balance, 2e15);
         assertEq(B.balance, 2e15);
         assertEq(DEFAULT_SENDER.balance, 1 ether - (2e15 - 16_000_000_000_001) - 2e15, "only the shortfall");
 
         uint256 left = DEFAULT_SENDER.balance;
-        script.run(SENDERS);
+        script.runFrom(SENDERS);
         assertEq(DEFAULT_SENDER.balance, left, "a second run sends nothing");
     }
 }

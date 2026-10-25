@@ -11,7 +11,8 @@ import {Script, console2} from "forge-std/Script.sol";
 ///   forge script script/FundArmedSenders.s.sol --rpc-url https://mainnet.base.org --sender <owner>   # dry run
 ///   (the same, with --broadcast --interactive)                                                        # the owner
 ///
-/// `--sig "run(string)" <path>` reads another file.
+/// `--sig "runFrom(string)" <path>` reads another file. (One name each:
+/// `forge script` refuses an overloaded `run`.)
 contract FundArmedSenders is Script {
     /// A slipped decimal point stops here: no sender holds more.
     uint256 constant MOST = 0.01 ether;
@@ -20,7 +21,7 @@ contract FundArmedSenders is Script {
         _run("ops/armed-senders.json");
     }
 
-    function run(string calldata path) external {
+    function runFrom(string calldata path) external {
         _run(path);
     }
 

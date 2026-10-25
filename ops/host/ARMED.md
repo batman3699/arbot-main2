@@ -61,12 +61,12 @@ $ forge script script/FundArmedSenders.s.sol --rpc-url https://mainnet.base.org 
 - Ignore the 21 "failed to parse" warnings: they are known and harmless.
 - **Authorize** calls `setExecutor(sender, true)` on the lean executor for
   each sender, then checks `executors(sender)` reads true for every one. The
-  dry run on 2026-10-24, with the example file's two throwaway senders,
-  showed 2 calls and 127,046 gas for the script.
+  dry run on 2026-10-25, with the 16 senders made on the host, showed 16
+  calls, every sender reading true afterwards.
 - **Fund** tops each sender up to `amount_wei`. A sender already at or over
   it is sent nothing, so a second run refills rather than doubles. The owner
-  needs 16 × 0.002 = 0.032 ETH, plus gas, on Base. On 2026-10-24 it held
-  0.000119 ETH, so the dry run stopped at the first transfer (`OutOfFunds`).
+  needs 16 × 0.002 = 0.032 ETH, plus gas, on Base. The dry run on
+  2026-10-25 showed 16 transfers, 0.032 ETH in all.
   `test/ArmedSenders.t.sol` covers the top-up.
 - **Revocation:** set `"allowed": false` and run Authorize again.
   - Armed-live reads `executors(sender)` and the executor's circuit on every

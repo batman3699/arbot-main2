@@ -17,13 +17,14 @@ interface ILeanExecutorA {
 ///   forge script script/AuthorizeArmedSenders.s.sol --rpc-url https://mainnet.base.org --sender <owner>   # dry run
 ///   (the same, with --broadcast --interactive)                                                             # the owner
 ///
-/// `--sig "run(string)" <path>` reads another file.
+/// `--sig "runFrom(string)" <path>` reads another file. (One name each:
+/// `forge script` refuses an overloaded `run`.)
 contract AuthorizeArmedSenders is Script {
     function run() external {
         _run("ops/armed-senders.json");
     }
 
-    function run(string calldata path) external {
+    function runFrom(string calldata path) external {
         _run(path);
     }
 
