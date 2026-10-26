@@ -49,7 +49,15 @@ STEP = 50              # blocks a getLogs (1rpc's limit)
 VALUED_USD = 1.0       # arbitrages from here have their receipts read: the priority fee
 OURS = frozenset({"uniswap_v3", "pancakeswap_v3", "slipstream_5e7b", "slipstream_f8f2", "aerodrome_v2"})
 V4 = "uniswap_v4"
-ENDPOINTS = ("https://base.gateway.tenderly.co", "https://base.drpc.org", "https://1rpc.io/base")
+ENDPOINTS = (
+    "https://base.gateway.tenderly.co",
+    "https://base.drpc.org",
+    "https://1rpc.io/base",
+    # R36: answers getLogs, receipts and blocks from the AWS host.
+    "https://base-mainnet.public.blastapi.io",
+)
+# R36: how long an endpoint that failed transiently sits out.
+COOL_DOWN_S = 300.0
 BATCHES = 2            # 1rpc answers a batch of 50; drpc refuses one (500) and tenderly rate-limits it
 
 
@@ -149,15 +157,26 @@ class Public:
     """The census client over public endpoints: calls in turn across them,
     the next one tried on a transient failure; a batch as single calls, six
     at a time (from AWS, 1rpc answers a batch with nothing and drpc refuses
-    one)."""
+    one). An endpoint that failed transiently sits out `COOL_DOWN_S`, so a
+    spent free tier costs one try in five minutes, not every other call."""
 
-    def __init__(self, rate=4.0):
-        self.rpcs, self.i = [Rpc(url=u, max_per_second=rate) for u in ENDPOINTS], 0
+    def __init__(self, rate=4.0, rpcs=None):
+        self.rpcs = rpcs if rpcs is not None else [Rpc(url=u, max_per_second=rate) for u in ENDPOINTS]
+        self.i = 0
+        self.benched = [0.0] * len(self.rpcs)
+
+    def _next(self):
+        """The next endpoint in turn that is not sitting out; with all of
+        them out, the one back soonest."""
+        now, n = time.monotonic(), len(self.rpcs)
+        turn = [(self.i + k) % n for k in range(n)]
+        ready = [j for j in turn if self.benched[j] <= now]
+        return ready[0] if ready else min(turn, key=lambda j: self.benched[j])
 
     def call(self, method, params):
         err = None
         for k in range(3 * len(self.rpcs)):
-            j = (self.i + k) % len(self.rpcs)
+            j = self._next()
             try:
                 out = self.rpcs[j].call(method, params)
                 self.i = (j + 1) % len(self.rpcs)
@@ -166,7 +185,10 @@ class Public:
                 if not transient(str(e)):
                     raise
                 err = e
-                time.sleep(min(2 ** (k // len(self.rpcs)), 8))
+                now = time.monotonic()
+                self.benched[j] = now + COOL_DOWN_S
+                if not any(b <= now for b in self.benched):
+                    time.sleep(min(2 ** (k // len(self.rpcs)), 8))
         raise err
 
     def batch(self, calls, size=50):

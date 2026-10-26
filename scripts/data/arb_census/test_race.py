@@ -5,6 +5,7 @@ would have kept.
 Run from scripts/data: python3 -m unittest arb_census.test_race
 """
 import unittest
+from unittest import mock
 
 from arb_census import race
 from arb_census.venues import Leg, WETH
@@ -103,6 +104,49 @@ class Endpoints(unittest.TestCase):
         self.assertTrue(race.transient("request timeout"))
         self.assertFalse(race.transient("execution reverted"), "the same on every endpoint")
         self.assertFalse(race.transient("invalid opcode"))
+
+
+class Fake:
+    """An endpoint that answers its name, or fails as a spent free tier does."""
+
+    def __init__(self, name, calls, fail=False):
+        self.name, self.calls, self.fail = name, calls, fail
+
+    def call(self, method, params):
+        self.calls.append(self.name)
+        if self.fail:
+            raise race.RpcError("You've reached the usage limit for your current plan")
+        return self.name
+
+
+class Bench(unittest.TestCase):
+    """R36: 32 h of census spent two of three free tiers, and every other call
+    still started on a spent one and paid its retries: a crawl."""
+
+    def test_an_endpoint_that_failed_sits_out_its_cool_down(self):
+        calls, clock = [], [1000.0]
+        dead, live = Fake("dead", calls, fail=True), Fake("live", calls)
+        with mock.patch.object(race.time, "monotonic", lambda: clock[0]), mock.patch.object(race.time, "sleep") as sleep:
+            p = race.Public(rpcs=[dead, live])
+            self.assertEqual(p.call("eth_blockNumber", []), "live")
+            for _ in range(5):
+                p.call("eth_blockNumber", [])
+            self.assertEqual(calls, ["dead"] + ["live"] * 6, "benched after one failure")
+            sleep.assert_not_called()
+            clock[0] += race.COOL_DOWN_S + 1
+            calls.clear()
+            p.call("eth_blockNumber", [])
+            p.call("eth_blockNumber", [])
+            self.assertEqual(calls.count("dead"), 1, "tried again once its cool-down ends")
+
+    def test_with_every_endpoint_benched_it_backs_off_and_still_answers_the_error(self):
+        calls, clock = [], [1000.0]
+        with mock.patch.object(race.time, "monotonic", lambda: clock[0]), mock.patch.object(race.time, "sleep") as sleep:
+            p = race.Public(rpcs=[Fake("a", calls, fail=True), Fake("b", calls, fail=True)])
+            with self.assertRaises(race.RpcError):
+                p.call("eth_blockNumber", [])
+            self.assertEqual(len(calls), 6, "three rounds, as before")
+            self.assertTrue(sleep.called, "nothing ready: back off")
 
 
 class Shares(unittest.TestCase):
