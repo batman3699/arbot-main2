@@ -108,6 +108,9 @@ fn a_pool_s_logs_read_as_the_engine_s_positions() {
 /// (a jump on an edge opens the next window already moved, as live).
 struct Node {
     asked: std::sync::Mutex<Vec<(u64, u64)>>,
+    /// The widest range this node answers; wider is refused (drpc's free plan
+    /// takes 100 blocks, Blast's 10).
+    widest: u64,
 }
 
 #[async_trait::async_trait]
@@ -121,6 +124,9 @@ impl apex_chain::rpc::RpcTransport for Node {
             }
             "eth_getLogs" => {
                 let (from, to) = (hex(&params[0]["fromBlock"]), hex(&params[0]["toBlock"]));
+                if to - from + 1 > self.widest {
+                    return Err(apex_chain::rpc::RpcError::Exhausted { method: method.into(), endpoints: 1, last: "http 400 Bad Request".into() });
+                }
                 self.asked.lock().unwrap().push((from, to));
                 let b = from + from / 100;
                 let tick = U256::from(b);
@@ -145,11 +151,26 @@ impl apex_chain::rpc::RpcTransport for Node {
 #[tokio::test]
 async fn the_seed_reads_the_window_in_chunks_and_times_each_log_by_its_block() {
     use apex_runtime::armed::moves::seed_from_logs;
-    let node = Node { asked: std::sync::Mutex::new(Vec::new()) };
+    let node = Node { asked: std::sync::Mutex::new(Vec::new()), widest: u64::MAX };
     let (m, read) = seed_from_logs(&node, &[UNI], 100, 349, 100, W, 2 * S).await.unwrap();
     assert_eq!(*node.asked.lock().unwrap(), vec![(100, 199), (200, 299), (300, 349)]);
     assert_eq!(read.logs, 3);
     // Ticks 101, 202 and 303: two moves of 101, each inside one window.
     assert_eq!(m.p_at_least(UNI, true, 100), (2.0 + 1.0) / (m.snapshot(0).pools[&UNI].len() as f64 + 2.0));
+    assert_eq!(read.until_ns, (1_000 + 2 * 349) * S);
+}
+
+/// A range the endpoint refuses is halved until it answers, then grown back:
+/// every block is still read, once.
+#[tokio::test]
+async fn a_range_the_endpoint_refuses_is_halved_and_every_block_still_read() {
+    use apex_runtime::armed::moves::seed_from_logs;
+    let node = Node { asked: std::sync::Mutex::new(Vec::new()), widest: 50 };
+    let (_, read) = seed_from_logs(&node, &[UNI], 100, 349, 100, W, 2 * S).await.unwrap();
+    let asked = node.asked.lock().unwrap().clone();
+    assert!(asked.iter().all(|(a, b)| b - a < 50), "{asked:?}");
+    assert_eq!(asked.first().unwrap().0, 100);
+    assert_eq!(asked.last().unwrap().1, 349);
+    assert!(asked.windows(2).all(|w| w[1].0 == w[0].1 + 1), "contiguous, no block twice: {asked:?}");
     assert_eq!(read.until_ns, (1_000 + 2 * 349) * S);
 }

@@ -498,7 +498,7 @@ async fn armed_moves_seed() -> ExitCode {
     let from = head.saturating_sub(blocks);
     info!(pools = pools.len(), from, to = head, "seeding the move statistics from the pools' logs");
     let step_ns = a.block_time_ms.saturating_mul(1_000_000);
-    let (moves, read) = match seed_from_logs(&*rpc, &pools, from, head, 2_000, a.window_s * 1_000_000_000, step_ns).await {
+    let (moves, read) = match seed_from_logs(&*rpc, &pools, from, head, 100, a.window_s * 1_000_000_000, step_ns).await {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "the seed did not read");

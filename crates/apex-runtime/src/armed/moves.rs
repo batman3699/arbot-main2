@@ -196,6 +196,9 @@ pub fn seed(window_ns: u64, observations: &[Observation], step_ns: u64, until_ns
     m
 }
 
+/// The narrowest range a seed asks for before it gives up on one.
+pub const SMALLEST_RANGE: u64 = 10;
+
 /// What a seed read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeedRead {
@@ -206,8 +209,11 @@ pub struct SeedRead {
 }
 
 /// Statistics seeded from blocks `from..=to` of `pools`' state logs (each
-/// venue's `Swap`, or Aerodrome v2's `Sync`), read `chunk` blocks at a time,
-/// each log timed between its chunk's first and last blocks' timestamps.
+/// venue's `Swap`, or Aerodrome v2's `Sync`), read up to `chunk` blocks at a
+/// time, each log timed between its chunk's first and last blocks'
+/// timestamps. A range the endpoint refuses (free plans cap it: drpc's at
+/// 100 blocks, Blast's at 10) is halved, down to [`SMALLEST_RANGE`], and
+/// grown back after each answer.
 pub async fn seed_from_logs(
     rpc: &dyn RpcTransport,
     pools: &[Address],
@@ -219,12 +225,20 @@ pub async fn seed_from_logs(
 ) -> Result<(MoveStats, SeedRead), String> {
     let addresses: Vec<String> = pools.iter().map(|p| format!("{p:#x}")).collect();
     let topics: Vec<String> = [SWAP, PANCAKE_SWAP, SYNC].iter().map(|t| format!("{t:#x}")).collect();
-    let (mut obs, mut logs, mut until_ns, mut lo) = (Vec::new(), 0usize, 0u64, from);
+    let chunk = chunk.max(1);
+    let (mut obs, mut logs, mut until_ns, mut lo, mut size) = (Vec::new(), 0usize, 0u64, from, chunk);
     while lo <= to {
-        let hi = lo.saturating_add(chunk.max(1) - 1).min(to);
-        let (t_lo, t_hi) = (block_time_s(rpc, lo).await?, block_time_s(rpc, hi).await?);
+        let hi = lo.saturating_add(size - 1).min(to);
         let filter = json!([{ "fromBlock": format!("{lo:#x}"), "toBlock": format!("{hi:#x}"), "address": addresses, "topics": [topics] }]);
-        let answer = rpc.call("eth_getLogs", filter).await.map_err(|e| format!("eth_getLogs {lo}..{hi}: {e}"))?;
+        let answer = match rpc.call("eth_getLogs", filter).await {
+            Ok(a) => a,
+            Err(_) if size > SMALLEST_RANGE => {
+                size = (size / 2).max(SMALLEST_RANGE);
+                continue;
+            }
+            Err(e) => return Err(format!("eth_getLogs {lo}..{hi}: {e}")),
+        };
+        let (t_lo, t_hi) = (block_time_s(rpc, lo).await?, block_time_s(rpc, hi).await?);
         for v in answer.as_array().ok_or_else(|| format!("eth_getLogs {lo}..{hi} answered no list"))? {
             let Some(log) = parse_log(v, false).filter(|l| !l.removed) else { continue };
             logs += 1;
@@ -236,6 +250,7 @@ pub async fn seed_from_logs(
         }
         until_ns = t_hi.saturating_mul(1_000_000_000);
         lo = hi + 1;
+        size = size.saturating_mul(2).min(chunk);
     }
     let m = seed(window_ns, &obs, step_ns, until_ns);
     Ok((m, SeedRead { logs, observations: obs.len(), until_ns }))
