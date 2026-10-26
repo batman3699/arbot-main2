@@ -111,6 +111,8 @@ struct Node {
     /// The widest range this node answers; wider is refused (drpc's free plan
     /// takes 100 blocks, Blast's 10).
     widest: u64,
+    /// The most addresses a call may name (PublicNode's: 10).
+    most_addresses: usize,
 }
 
 #[async_trait::async_trait]
@@ -124,10 +126,13 @@ impl apex_chain::rpc::RpcTransport for Node {
             }
             "eth_getLogs" => {
                 let (from, to) = (hex(&params[0]["fromBlock"]), hex(&params[0]["toBlock"]));
-                if to - from + 1 > self.widest {
+                if to - from + 1 > self.widest || params[0]["address"].as_array().unwrap().len() > self.most_addresses {
                     return Err(apex_chain::rpc::RpcError::Exhausted { method: method.into(), endpoints: 1, last: "http 400 Bad Request".into() });
                 }
                 self.asked.lock().unwrap().push((from, to));
+                if !params[0]["address"].as_array().unwrap().iter().any(|a| a == &serde_json::json!(format!("{UNI:#x}"))) {
+                    return Ok(serde_json::json!([]));
+                }
                 let b = from + from / 100;
                 let tick = U256::from(b);
                 let data: Vec<u8> =
@@ -151,8 +156,8 @@ impl apex_chain::rpc::RpcTransport for Node {
 #[tokio::test]
 async fn the_seed_reads_the_window_in_chunks_and_times_each_log_by_its_block() {
     use apex_runtime::armed::moves::seed_from_logs;
-    let node = Node { asked: std::sync::Mutex::new(Vec::new()), widest: u64::MAX };
-    let (m, read) = seed_from_logs(&node, &[UNI], 100, 349, 100, W, 2 * S).await.unwrap();
+    let node = Node { asked: std::sync::Mutex::new(Vec::new()), widest: u64::MAX, most_addresses: usize::MAX };
+    let (m, read) = seed_from_logs(&node, &[UNI], 100, 349, 100, 10, W, 2 * S).await.unwrap();
     assert_eq!(*node.asked.lock().unwrap(), vec![(100, 199), (200, 299), (300, 349)]);
     assert_eq!(read.logs, 3);
     // Ticks 101, 202 and 303: two moves of 101, each inside one window.
@@ -165,12 +170,25 @@ async fn the_seed_reads_the_window_in_chunks_and_times_each_log_by_its_block() {
 #[tokio::test]
 async fn a_range_the_endpoint_refuses_is_halved_and_every_block_still_read() {
     use apex_runtime::armed::moves::seed_from_logs;
-    let node = Node { asked: std::sync::Mutex::new(Vec::new()), widest: 50 };
-    let (_, read) = seed_from_logs(&node, &[UNI], 100, 349, 100, W, 2 * S).await.unwrap();
+    let node = Node { asked: std::sync::Mutex::new(Vec::new()), widest: 50, most_addresses: usize::MAX };
+    let (_, read) = seed_from_logs(&node, &[UNI], 100, 349, 100, 10, W, 2 * S).await.unwrap();
     let asked = node.asked.lock().unwrap().clone();
     assert!(asked.iter().all(|(a, b)| b - a < 50), "{asked:?}");
     assert_eq!(asked.first().unwrap().0, 100);
     assert_eq!(asked.last().unwrap().1, 349);
     assert!(asked.windows(2).all(|w| w[1].0 == w[0].1 + 1), "contiguous, no block twice: {asked:?}");
     assert_eq!(read.until_ns, (1_000 + 2 * 349) * S);
+}
+
+/// PublicNode names at most ten addresses a call: the pools go ten at a time,
+/// each range asked once for each ten.
+#[tokio::test]
+async fn the_pools_are_asked_ten_at_a_time() {
+    use apex_runtime::armed::moves::seed_from_logs;
+    let node = Node { asked: std::sync::Mutex::new(Vec::new()), widest: u64::MAX, most_addresses: 10 };
+    let pools: Vec<Address> = std::iter::once(UNI).chain((1..25u8).map(Address::repeat_byte)).collect();
+    let (m, read) = seed_from_logs(&node, &pools, 100, 349, 100, 10, W, 2 * S).await.unwrap();
+    assert_eq!(node.asked.lock().unwrap().len(), 3 * 3, "three ranges, three tens each");
+    assert_eq!(read.logs, 3, "UNI's, once a range");
+    assert_eq!(m.snapshot(0).pools.len(), 1);
 }
