@@ -173,6 +173,8 @@ struct Stats {
     ledger_failures: AtomicU64,
     /// R26: armed-ledger lines that could not be written.
     armed_write_failures: AtomicU64,
+    /// R36: move-statistics saves that failed.
+    armed_moves_failures: AtomicU64,
     /// R36: passes whose lines found armed-live's queue full: never sent.
     armed_live_dropped: AtomicU64,
 }
@@ -425,6 +427,14 @@ pub async fn run(config: ShadowConfig, env: &Env, stop: impl Future<Output = ()>
             Box::pin(async move { s.task(task).await })
         }));
     }
+    // R36: the ranking's move statistics, saved every five minutes.
+    if shadow.config.armed.moves.is_some() {
+        let s = Arc::clone(&shadow);
+        spawn("armed-moves", Box::new(move || {
+            let s = Arc::clone(&s);
+            Box::pin(async move { s.task(Task::ArmedMoves).await })
+        }));
+    }
     // R36: armed-live's sender and its head hook, in armed-live only.
     if shadow.armed_live.is_some() {
         for (name, task) in [("armed-live", Task::ArmedLive), ("armed-heads", Task::ArmedHeads)] {
@@ -454,6 +464,7 @@ pub async fn run(config: ShadowConfig, env: &Env, stop: impl Future<Output = ()>
     info!("stopping: the feed first, then every worker");
     let _ = feed_stop.send(true);
     shutdown.stop_workers(&mut workers).await;
+    shadow.save_moves();
     // The race writer was stopped between lines: what it had not reached
     // still goes to the ledger.
     shadow.drain_race_lines();
@@ -470,6 +481,7 @@ enum Task {
     Armed,
     ArmedLive,
     ArmedHeads,
+    ArmedMoves,
 }
 
 async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
@@ -647,6 +659,18 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         let t = targets.clone();
         Arc::new(move |weth_in, other| t.as_ref().map_or_else(Vec::new, |t| t.bids_for(weth_in, other).to_vec()))
     }));
+    // R36: the move statistics an earlier run saved (or a seed wrote), so the
+    // ranking does not begin again at every restart.
+    if let Some(path) = &config.armed.moves {
+        match crate::armed::moves::MovesSnapshot::load(path) {
+            Ok(snap) => match armed.restore_moves(&snap) {
+                Ok(pools) => info!(pools, saved_at_ns = snap.saved_at_ns, "the arming engine's move statistics restored"),
+                Err(e) => warn!(error = %e, "the saved move statistics were not restored; learning from now"),
+            },
+            Err(_) if !path.exists() => info!(path = %path.display(), "no saved move statistics yet; learning from now"),
+            Err(e) => warn!(error = %e, "the saved move statistics did not read; learning from now"),
+        }
+    }
     // R31: the rivals' bids each candidate's priority fee is chosen against.
     let rival_bids = crate::econ::RivalBids::load(&config.policy.rival_bids)
         .map_err(|e| ShadowError::Boot(format!("policy.rival_bids: {e}")))?;
@@ -948,6 +972,9 @@ async fn boot_armed_live(
     Ok(worker)
 }
 
+/// R36: how often the move statistics are saved.
+const ARMED_MOVES_SAVE_S: u64 = 300;
+
 /// R36: the live ledger's length past which the boot compacts it.
 const ARMED_LEDGER_COMPACT_ABOVE: usize = 10_000;
 
@@ -1087,6 +1114,7 @@ impl Shadow {
             Task::Armed => self.armed_loop().await,
             Task::ArmedLive => self.armed_live_loop().await,
             Task::ArmedHeads => self.armed_head_loop().await,
+            Task::ArmedMoves => self.armed_moves_loop().await,
             Task::FullReload => {
                 let mut every = tokio::time::interval(Duration::from_secs(self.config.policy.full_reload_every_s));
                 every.tick().await;
@@ -1264,6 +1292,34 @@ impl Shadow {
             }
             if self.armed_live.is_some() && !lines.is_empty() && self.armed_lines.try_send((lines, base_fee)).is_err() {
                 bump(&self.stats.armed_live_dropped);
+            }
+        }
+    }
+
+    /// R36: the ranking's move statistics to `armed.moves`, every five
+    /// minutes, off the async threads.
+    async fn armed_moves_loop(&self) {
+        let mut every = tokio::time::interval(Duration::from_secs(ARMED_MOVES_SAVE_S));
+        every.tick().await;
+        loop {
+            every.tick().await;
+            let (engine, path) = (Arc::clone(&self.armed), self.config.armed.moves.clone());
+            let saved = tokio::task::spawn_blocking(move || path.map(|p| engine.moves_snapshot(SystemClock.now().0).save(&p)))
+                .await
+                .unwrap_or(None);
+            if let Some(Err(e)) = saved {
+                warn!(error = %e, "the move statistics were not saved");
+                bump(&self.stats.armed_moves_failures);
+            }
+        }
+    }
+
+    /// R36: the move statistics saved once more, at shutdown.
+    fn save_moves(&self) {
+        if let Some(path) = &self.config.armed.moves {
+            match self.armed.moves_snapshot(SystemClock.now().0).save(path) {
+                Ok(()) => info!(path = %path.display(), "the move statistics saved"),
+                Err(e) => warn!(error = %e, "the move statistics were not saved"),
             }
         }
     }

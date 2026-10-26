@@ -143,6 +143,7 @@ fn armed(mode: ArmedMode, targets: Option<&Path>) -> ArmedConfig {
         l1_fee_bound_wei: 50_000_000_000_000,
         sender_reserve_wei: 200_000_000_000_000,
         live: None,
+        moves: None,
     }
 }
 

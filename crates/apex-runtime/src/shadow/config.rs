@@ -295,6 +295,10 @@ pub struct ArmedConfig {
     /// R36: where armed-live's parts are. Its caps are the ones above.
     #[serde(default)]
     pub live: Option<ArmedLiveConfig>,
+    /// R36: where the ranking's move statistics are saved and reloaded, so a
+    /// restart does not begin them again. None: learned in memory alone.
+    #[serde(default)]
+    pub moves: Option<PathBuf>,
 }
 
 /// R36: where armed-live's parts are, and nothing else: every cap is

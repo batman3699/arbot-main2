@@ -68,6 +68,7 @@ armed:
   max_size_wei: 5000000000000000000          # 5 WETH
   l1_fee_bound_wei: 50000000000000           # 0.00005 ETH
   sender_reserve_wei: 200000000000000        # 0.0002 ETH
+  moves: var/armed/moves.json                # the ranking's move statistics, kept across restarts
   live:
     keys_file: var/armed/armed.keys
     sequencer: https://mainnet-sequencer.base.org

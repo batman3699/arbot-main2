@@ -214,6 +214,16 @@ impl Engine {
         self
     }
 
+    /// R36: the move statistics the ranking has learned, to save.
+    pub fn moves_snapshot(&self, now_ns: u64) -> super::moves::MovesSnapshot {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).moves.snapshot(now_ns)
+    }
+
+    /// R36: move statistics saved by an earlier run, or seeded from logs.
+    pub fn restore_moves(&self, snapshot: &super::moves::MovesSnapshot) -> Result<usize, String> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).moves.restore(snapshot)
+    }
+
     pub fn stats(&self) -> EngineStats {
         EngineStats {
             arms: self.arms.load(Relaxed),

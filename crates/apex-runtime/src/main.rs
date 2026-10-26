@@ -95,6 +95,9 @@ async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("validity-probe") {
         return validity_probe().await;
     }
+    if std::env::args().nth(1).as_deref() == Some("armed-moves-seed") {
+        return armed_moves_seed().await;
+    }
     if std::env::args().nth(1).as_deref() == Some("shadow") {
         return shadow().await;
     }
@@ -398,6 +401,126 @@ async fn validity_probe() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// `apex armed-moves-seed [--config <path>] --rpc <url> [--hours N] [--force]`
+/// (Task 8.5 R36): the ranking's move statistics seeded from the last `N`
+/// hours (24) of the canary's pools' own logs, read through `--rpc` (a public
+/// endpoint: not the run's keyed one), written to `armed.moves` for the next
+/// boot. Refuses to replace a saved file without `--force`.
+async fn armed_moves_seed() -> ExitCode {
+    use apex_runtime::armed::moves::seed_from_logs;
+    let usage = "usage: apex armed-moves-seed [--config ops/canary.base.yaml] --rpc <url> [--hours 24] [--force]";
+    let (mut config, mut rpc_url, mut hours, mut force) = (DEFAULT_CANARY_CONFIG.to_string(), None, 24u64, false);
+    let mut argv = std::env::args().skip(2);
+    while let Some(flag) = argv.next() {
+        match flag.as_str() {
+            "--force" => force = true,
+            "--config" | "--rpc" | "--hours" => {
+                let Some(v) = argv.next() else {
+                    error!("{usage}");
+                    return ExitCode::FAILURE;
+                };
+                match flag.as_str() {
+                    "--config" => config = v,
+                    "--rpc" => rpc_url = Some(v),
+                    _ => match v.parse::<u64>() {
+                        Ok(h) if (1..=24).contains(&h) => hours = h,
+                        _ => {
+                            error!("--hours is 1 to 24: the statistics keep a day");
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                }
+            }
+            _ => {
+                error!("{usage}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let Some(rpc_url) = rpc_url else {
+        error!("{usage}");
+        return ExitCode::FAILURE;
+    };
+    let env = Env::secrets_only();
+    let c = match apex_runtime::shadow::config::ShadowConfig::load_canary(&config, &env) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "the configuration did not load");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(path) = c.armed.moves.clone() else {
+        error!("the configuration has no armed.moves to write");
+        return ExitCode::FAILURE;
+    };
+    if path.exists() && !force {
+        error!(path = %path.display(), "saved move statistics exist: --force replaces them");
+        return ExitCode::FAILURE;
+    }
+    // The canary's pools: its universe, with the census's targets below the floor.
+    let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let include = match apex_runtime::shadow::load_targets(&c.armed, now_unix) {
+        Ok(t) => t.as_ref().map(apex_runtime::armed::targets::Targets::pools).unwrap_or_default(),
+        Err(e) => {
+            error!(error = %e, "the census's targets did not load");
+            return ExitCode::FAILURE;
+        }
+    };
+    let venues = apex_runtime::live::inventory::Venue::ALL.to_vec();
+    let pools: Vec<alloy_primitives::Address> = match apex_runtime::shadow::universe(&c.inventory, &venues, c.universe.filter(), &include) {
+        Ok(specs) => specs.iter().map(|s| s.pool).collect(),
+        Err(e) => {
+            error!(error = %e, "the inventory did not load");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rpc = match apex_chain::rpc::failover::FailoverTransport::connect(std::slice::from_ref(&rpc_url), c.chain_id, Default::default()).await {
+        Ok(t) => std::sync::Arc::new(t),
+        Err(e) => {
+            error!(error = %e, "the RPC transport did not connect");
+            return ExitCode::FAILURE;
+        }
+    };
+    let head = {
+        use apex_runtime::armed::live::LiveChain;
+        match apex_runtime::armed::live_chain::RpcChain::new(rpc.clone()).head().await {
+            Ok(h) => h,
+            Err(e) => {
+                error!(error = %e, "no head");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+    let a = &c.armed;
+    let blocks = hours * 3_600_000 / a.block_time_ms.max(1);
+    let from = head.saturating_sub(blocks);
+    info!(pools = pools.len(), from, to = head, "seeding the move statistics from the pools' logs");
+    let step_ns = a.block_time_ms.saturating_mul(1_000_000);
+    let (moves, read) = match seed_from_logs(&*rpc, &pools, from, head, 2_000, a.window_s * 1_000_000_000, step_ns).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "the seed did not read");
+            return ExitCode::FAILURE;
+        }
+    };
+    let snap = moves.snapshot(read.until_ns);
+    let mut windows: Vec<usize> = snap.pools.values().map(Vec::len).collect();
+    windows.sort_unstable();
+    if let Err(e) = snap.save(&path) {
+        error!(error = %e, path = %path.display(), "the seed was not saved");
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "path": path.display().to_string(), "blocks": [from, head], "logs": read.logs, "observations": read.observations,
+            "pools_asked": pools.len(), "pools_seeded": snap.pools.len(),
+            "windows_per_pool_median": windows.get(windows.len() / 2), "windows_per_pool_max": windows.last(),
+        })
+    );
+    ExitCode::SUCCESS
 }
 
 /// `apex shadow [--config <path>]`. Runs until SIGINT or SIGTERM.

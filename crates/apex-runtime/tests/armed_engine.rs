@@ -522,3 +522,16 @@ fn an_arm_closing_on_aerodrome_asks_for_its_output() {
         assert_eq!(min, want, "arm {} on {}", a.arm_id, a.route_hash);
     }
 }
+
+/// R36: what the ranking learned of each pool's moves is the engine's to give
+/// and take back, so a restart does not begin it again.
+#[test]
+fn the_engine_hands_over_its_moves_and_takes_them_back() {
+    use apex_runtime::armed::moves::MovesSnapshot;
+    let (engine, _) = setup(2);
+    let snap = MovesSnapshot { window_ns: 10_000_000_000, saved_at_ns: 5, pools: [(UNI, vec![(12.0, 0.0), (0.0, 3.0)])].into_iter().collect() };
+    assert_eq!(engine.restore_moves(&snap), Ok(1));
+    assert_eq!(engine.moves_snapshot(5), snap);
+    let other = MovesSnapshot { window_ns: 1, ..snap };
+    assert!(engine.restore_moves(&other).is_err(), "another window length");
+}

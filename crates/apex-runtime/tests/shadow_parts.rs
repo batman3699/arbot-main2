@@ -327,7 +327,7 @@ fn the_armed_live_files_live_outside_the_archived_run_directory() {
     let path = format!("{}/../../ops/canary.base.yaml", env!("CARGO_MANIFEST_DIR"));
     let c = ShadowConfig::load_canary(&path, &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap();
     let live = c.armed.live.expect("armed.live");
-    for p in [c.armed.targets.expect("targets"), live.keys_file, live.ledger, live.kill_file] {
+    for p in [c.armed.targets.expect("targets"), c.armed.moves.expect("moves"), live.keys_file, live.ledger, live.kill_file] {
         assert!(p.starts_with("var/armed"), "{} must be under var/armed (the unit's ReadWritePaths, outside var/apex)", p.display());
     }
     let unit = std::fs::read_to_string(format!("{}/../../ops/host/apex-targets.service", env!("CARGO_MANIFEST_DIR"))).unwrap();
