@@ -1,9 +1,12 @@
 # Armed lane v3: Uniswap v4 pools and USDC routes (Task 8.5 R37)
 
 2026-10-28. Asked for by the operator: "whichever lever captures the most,
-scope that first", then "looks right, write the design doc". Status: design
-only, nothing built. Every call I made is marked **(my call)**. The
-operator's decisions are listed at the end.
+scope that first", then "looks right, write the design doc". **Approved
+2026-10-28: "yes push it and write the implementation plan".** Planning it
+now settles decision 1 (build before gate B). Decisions 2–4 are needed
+before phase 5's live pilot, and decision 5 stands as my call. Every call I
+made is marked **(my call)**. The operator's decisions are listed at the
+end.
 
 ## Why
 
