@@ -6,23 +6,23 @@
 //! 1. rebuilds the watched words from one `eth_getLogs` over the run's pools;
 //! 2. finds the fire point and the rival (`eval::judge`);
 //! 3. quotes the fire exactly: both pools loaded at the fire block's parent,
-//!    that block's writes replayed up to the trigger, then `quote_fixed`;
+//!    that block's writes replayed up to the trigger, then the armed plan's
+//!    hops as the lean executor runs them (`plan::armed_gross`);
 //! 4. checks the quote with `eth_simulateV1`: the fire block's earlier
 //!    transactions on those pools, then the armed call from the trader;
 //! 5. places both in their flashblocks (the flashblock ledger) and judges the
 //!    landing for every bid fraction.
 //!
-//! WETH gross and the intermediate residue (what overshoot past the threshold
-//! leaves in the executor) are reported apart.
+//! The lean executor sells all hop 1 returns, so a fire leaves no intermediate
+//! residue: `residue` is absent from verdicts since R36's lean quote.
 
 use super::eval::{self, bid_wei_per_gas, judge, landing, merge_renewals, net_wei, Landing, Point, TxEffect, Write, F_PERMILLE};
 use super::lines::{Arm, ArmedLine};
 use super::predicate::{layout, price_mask};
-use crate::live::book::{PoolBook, StateWrite, SwapWrite, SyncWrite};
-use crate::live::feed::{decode_swap, decode_sync, BURN, MINT, PANCAKE_SWAP, SWAP, SYNC};
-use crate::live::frontier::{self, WETH};
+use crate::live::book::{LiquidityWrite, PoolBook, StateWrite, SwapApplied, SwapWrite, SyncWrite};
+use crate::live::feed::{decode_liquidity, decode_swap, decode_sync, BURN, MINT, PANCAKE_SWAP, SWAP, SYNC};
+use crate::live::frontier::{self, Cycle, WETH};
 use crate::live::inventory::{self, PoolSpec, Venue};
-use crate::live::pricing::LiveCycle;
 use crate::live::reads::ChainReads;
 use crate::shadow::config::ShadowConfig;
 use crate::shadow::ledger;
@@ -31,6 +31,7 @@ use apex_chain::base::flashblock_stream::FlashblockSeen;
 use apex_chain::rpc::failover::{FailoverSettings, FailoverTransport};
 use apex_chain::rpc::ws::{parse_log, RawLog};
 use apex_chain::rpc::RpcTransport;
+use apex_search::frontier::RouteId;
 use apex_types::compat::u256_to_ethers;
 use apex_types::ids::ChainId;
 use ethers_core::types::U256;
@@ -170,7 +171,8 @@ pub struct Verdict {
     pub rival_priority_wei: Option<String>,
     /// WETH gross of the fire (hop 2's output less the loan).
     pub gross_wei: Option<String>,
-    /// Hop 1's output beyond `mid`: intermediate token left in the executor.
+    /// Hop 1's output beyond `mid`, left in the R26 executor. The lean
+    /// executor (R29) sells it in hop 2: absent since R36's lean quote.
     pub residue: Option<String>,
     pub quote_error: Option<String>,
     pub sim: Option<SimCheck>,
@@ -332,10 +334,9 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
 
     // The exact quote at the fire.
     match quote_at_fire(ctx.reads, ctx.specs, arm, fire, ctx.logs).await {
-        Ok((gross, residue)) => {
+        Ok(gross) => {
             report.quoted += 1;
             v.gross_wei = Some(gross.to_string());
-            v.residue = Some(residue.to_string());
         }
         Err(e) => v.quote_error = Some(e),
     }
@@ -349,7 +350,7 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
             let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
             let diverged = replay_diverged(ctx.logs, &replay, fire.block, fire.tx_index, &pools);
             let expected = if diverged {
-                quote_at_fire(ctx.reads, ctx.specs, arm, fire, &replay).await.ok().map(|(g, _)| g.to_string())
+                quote_at_fire(ctx.reads, ctx.specs, arm, fire, &replay).await.ok().map(|g| g.to_string())
             } else {
                 v.gross_wei.clone()
             };
@@ -389,8 +390,7 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
 
 /// The book of `pools` as it stood after transaction `tx_index` of `block`: the
 /// pools at `block`'s parent, then that block's writes to them through that
-/// transaction. A Mint or Burn among them refuses, because the book would need
-/// a reload to apply it.
+/// transaction ([`apply_through`]).
 pub async fn book_after(
     reads: &ChainReads,
     specs: &[PoolSpec],
@@ -404,6 +404,15 @@ pub async fn book_after(
     if !unloaded.is_empty() {
         return Err("a pool did not load at the block's parent".into());
     }
+    apply_through(&book, pools, block, tx_index, logs)?;
+    Ok(book.snapshot())
+}
+
+/// `block`'s writes to `pools` through transaction `tx_index`, applied to
+/// `book`: swaps, syncs, and Mints and Burns as the live book applies them
+/// (R28.1). A position change the book cannot apply exactly refuses, because
+/// the book would need a read at the block to price it.
+pub fn apply_through(book: &PoolBook, pools: &[Address], block: u64, tx_index: u64, logs: &[RawLog]) -> Result<(), String> {
     let mut writes = Vec::new();
     for l in logs.iter().filter(|l| {
         !l.removed && l.block_number == Some(block) && pools.contains(&l.address) && l.transaction_index.is_some_and(|i| i <= tx_index)
@@ -418,39 +427,44 @@ pub async fn book_after(
                 let s = decode_sync(l).ok_or("an undecodable sync")?;
                 writes.push(StateWrite::Sync(SyncWrite { pool: s.pool, reserve0: s.reserve0, reserve1: s.reserve1, at }));
             }
-            Some(t) if *t == MINT || *t == BURN => return Err("a mint or burn before the trigger in its block".into()),
+            Some(t) if *t == MINT || *t == BURN => {
+                let p = decode_liquidity(l).ok_or("an undecodable mint or burn")?;
+                writes.push(StateWrite::Liquidity(LiquidityWrite {
+                    pool: p.pool,
+                    tick_lower: p.tick_lower,
+                    tick_upper: p.tick_upper,
+                    delta: p.delta,
+                    at,
+                }));
+            }
             _ => {}
         }
     }
-    book.apply_writes(&writes);
-    Ok(book.snapshot())
+    let applied = book.apply_writes(&writes);
+    if writes.iter().zip(&applied).any(|(w, a)| matches!(w, StateWrite::Liquidity(_)) && *a == SwapApplied::NeedsReload) {
+        return Err("a mint or burn before the trigger the book cannot apply exactly".into());
+    }
+    Ok(())
 }
 
 /// The fire, quoted exactly: both pools at the fire block's parent, that
 /// block's writes to them up to and including the trigger, then the armed
-/// plan's hops. `(WETH gross, intermediate residue)`.
-async fn quote_at_fire(
-    reads: &ChainReads,
-    specs: &[PoolSpec],
-    arm: &Arm,
-    fire: &Point,
-    logs: &[RawLog],
-) -> Result<(U256, U256), String> {
+/// plan's hops. The WETH gross.
+async fn quote_at_fire(reads: &ChainReads, specs: &[PoolSpec], arm: &Arm, fire: &Point, logs: &[RawLog]) -> Result<U256, String> {
     let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
     let snap = book_after(reads, specs, &pools, fire.block, fire.tx_index, logs).await?;
     let (_, cycles) = frontier::build(ChainId::BASE, WETH, &snap);
-    let cycle = cycles
-        .values()
-        .find(|c| format!("{:#x}", c.commitment.route_hash) == arm.route_hash)
-        .ok_or("the route is not in the reloaded pools")?;
-    let live = LiveCycle::new(cycle, &snap).ok_or("a pool left its ladder")?;
-    let size = U256::from_dec_str(&arm.size_wei).map_err(|e| e.to_string())?;
-    let mid = U256::from_dec_str(&arm.mid).map_err(|e| e.to_string())?;
-    let q = live.quote_fixed(size, mid).ok_or("hop 1 returns less than mid: it would revert")?;
-    if q.outputs[1] <= size {
-        return Err("below the loan plus one: it would revert".into());
-    }
-    Ok((q.outputs[1] - size, q.outputs[0] - mid))
+    let cycle = cycle_through(&cycles, &arm.pools).ok_or("the route is not in the reloaded pools")?;
+    let wei = |s: &str| U256::from_dec_str(s).map_err(|e| e.to_string());
+    super::plan::armed_gross(cycle, &snap, wei(&arm.size_wei)?, wei(&arm.mid)?, wei(&arm.output_wei)?)
+}
+
+/// The cycle through `pools` in leg order. Not by route hash: that carries
+/// each pool's fee, and a Slipstream fee moves with the tick, while the armed
+/// plan names only the pools.
+pub fn cycle_through<'a>(cycles: &'a BTreeMap<RouteId, Cycle>, pools: &[String; 2]) -> Option<&'a Cycle> {
+    let pools: Vec<Address> = pools.iter().map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    cycles.values().find(|c| c.legs[0].pool == pools[0] && c.legs[1].pool == pools[1])
 }
 
 /// The armed call simulated where it would have run: the fire block's earlier

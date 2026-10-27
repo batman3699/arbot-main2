@@ -154,3 +154,66 @@ fn the_armed_plan_carries_break_even_floors() {
     assert_eq!(call.plan(), &CallPlan::Lean(want));
     assert_eq!((call.to(), call.chain_id()), (EXECUTOR, 8453));
 }
+
+/// A fire's gross is what the armed plan returns on the fire's book, as the
+/// lean executor runs it (R36): hop 2 sells all hop 1 returns, so a trigger
+/// overshot past the threshold is sold too, not left as residue. The
+/// evaluator priced hop 2 at `mid` and fell short of every simulation since
+/// the lean deploy.
+#[test]
+fn a_fire_s_gross_is_what_the_armed_plan_returns_on_the_fire_s_book() {
+    use apex_runtime::armed::plan::armed_gross;
+    use apex_runtime::live::pricing::LiveCycle;
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> = [
+        (UNI, Arc::new(pool(UNI, Venue::UniswapV3, -197_350, 500))),
+        (SLIP, Arc::new(pool(SLIP, Venue::Slipstream, -197_300, 400))),
+    ]
+    .into_iter()
+    .collect();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let size = U256::from(10u128.pow(18));
+    let (c, live) = cycles
+        .values()
+        .map(|c| (c, LiveCycle::new(c, &snap).unwrap()))
+        .find(|(_, l)| l.quote(size).unwrap().outputs[1] > size)
+        .expect("one direction pays");
+    let chained = live.quote(size).unwrap();
+    let mid = chained.outputs[0] * 99 / 100;
+    let at_mid = live.quote_fixed(size, mid).unwrap().outputs[1];
+    assert_eq!(armed_gross(c, &snap, size, mid, at_mid).unwrap(), chained.outputs[1] - size);
+    assert!(chained.outputs[1] > at_mid, "the overshoot pays");
+    let err = armed_gross(c, &snap, size, chained.outputs[0] + 1, at_mid).unwrap_err();
+    assert!(err.contains("minimum"), "{err}");
+    // A book where the cycle cannot repay the loan: hop 2 is short of its floor.
+    let short = cycles.values().find(|o| o.commitment.route_hash != c.commitment.route_hash).unwrap();
+    let back = LiveCycle::new(short, &snap).unwrap().quote(size).unwrap();
+    assert!(armed_gross(short, &snap, size, back.outputs[0], back.outputs[1]).is_err(), "it would revert");
+}
+
+/// Closing on Aerodrome v2, the plan's WETH is exactly the armed output the
+/// pool is asked for, whatever hop 1 overshoots by.
+#[test]
+fn a_fire_closing_on_aerodrome_grosses_exactly_the_armed_output() {
+    use apex_runtime::armed::plan::armed_gross;
+    use apex_runtime::live::cp::{self, Loaded, Reserves};
+    use apex_runtime::live::pricing::LiveCycle;
+    const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    // Reserves pricing WETH ~1% above the Uniswap pool: buying it back pays.
+    let reserves = Reserves { reserve0: U256::from(1_823_383_892_520_317_644_689u128), reserve1: U256::from(4_600_000_000_000u128) };
+    let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> = [
+        (UNI, Arc::new(pool(UNI, Venue::UniswapV3, -197_350, 500))),
+        (AERO, Arc::new(cp::snapshot(&spec, loaded, Default::default(), 100))),
+    ]
+    .into_iter()
+    .collect();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let c = cycles.values().find(|c| c.legs[1].pool == AERO).unwrap();
+    let size = U256::from(10u128.pow(17));
+    let chained = LiveCycle::new(c, &snap).unwrap().quote(size).unwrap();
+    let output = size + (chained.outputs[1] - size) / 2;
+    let mid = chained.outputs[0] * 99 / 100;
+    assert_eq!(armed_gross(c, &snap, size, mid, output).unwrap(), output - size);
+    assert!(armed_gross(c, &snap, size, mid, size).is_err(), "no profit: the executor's floor reverts");
+}

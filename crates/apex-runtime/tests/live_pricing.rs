@@ -797,3 +797,51 @@ fn gas_never_falls_as_crossings_or_words_rise() {
         }
     }
 }
+
+// ------------------------------------------------------------------ the lean plan (R36)
+
+/// The lean executor sells each hop's whole output into the next (R29). An
+/// armed plan's `mid` is hop 1's minimum, not hop 2's input: what a fire
+/// overshoots it by is sold too, and was the gap between the evaluator's quote
+/// and every simulation since the lean deploy.
+#[test]
+fn the_lean_plan_sells_hop_1_s_whole_output_into_hop_2() {
+    let b = book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500, L), pool(SLIP, Venue::Slipstream, -197_300, 80, L)]);
+    let snap = b.snapshot();
+    let cycle = frontier::cycles(BASE, WETH, &snap).into_iter().next().unwrap();
+    let live = LiveCycle::new(&cycle, &snap).unwrap();
+    let size = U256::from(10u128.pow(18));
+    let chained = live.quote(size).unwrap();
+    let mid = chained.outputs[0] * 99 / 100;
+    let lean = live.quote_lean(size, [mid, U256::one()]).expect("hop 1 covers its minimum");
+    assert_eq!(lean.outputs, chained.outputs, "hop 2 sells all of hop 1's output");
+    assert!(lean.outputs[1] > live.quote_fixed(size, mid).unwrap().outputs[1], "more than selling mid alone");
+    assert_eq!(live.quote_lean(size, [chained.outputs[0] + 1, U256::one()]), None, "hop 1 short of its minimum reverts");
+    assert_eq!(live.quote_lean(size, [mid, chained.outputs[1] + 1]), None, "hop 2 short of its minimum reverts");
+}
+
+/// An Aerodrome v2 hop is paid first and asked for exactly its minimum: it
+/// returns that, never more, and reverts when its pool cannot cover it.
+#[test]
+fn a_lean_aerodrome_hop_returns_exactly_its_minimum() {
+    let b = mixed(-197_350, 4_541_987_609_188);
+    let snap = b.snapshot();
+    let input = U256::from(10u128.pow(17));
+    // Aerodrome first: hop 2 sells exactly hop 1's minimum.
+    let first = frontier::cycles(BASE, WETH, &snap).into_iter().find(|c| c.legs[0].pool == AERO).unwrap();
+    let live = LiveCycle::new(&first, &snap).unwrap();
+    let pays = live.quote(input).unwrap().outputs[0];
+    let mid = pays * 99 / 100;
+    let lean = live.quote_lean(input, [mid, U256::one()]).unwrap();
+    assert_eq!(lean.outputs[0], mid);
+    assert_eq!(lean.outputs[1], live.quote_fixed(input, mid).unwrap().outputs[1], "hop 2 sells mid, all it was paid");
+    assert_eq!(live.quote_lean(input, [pays + 1, U256::one()]), None, "more than the pool pays: it reverts");
+    // Aerodrome second: the plan's WETH is exactly the minimum asked.
+    let second = frontier::cycles(BASE, WETH, &snap).into_iter().find(|c| c.legs[1].pool == AERO).unwrap();
+    let live = LiveCycle::new(&second, &snap).unwrap();
+    let chained = live.quote(input).unwrap();
+    let asked = chained.outputs[1] * 99 / 100;
+    let lean = live.quote_lean(input, [U256::one(), asked]).unwrap();
+    assert_eq!(lean.outputs, [chained.outputs[0], asked]);
+    assert_eq!(live.quote_lean(input, [U256::one(), chained.outputs[1] + 1]), None);
+}

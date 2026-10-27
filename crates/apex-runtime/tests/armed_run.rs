@@ -296,3 +296,104 @@ fn a_simulated_fires_gross_is_the_lean_executors_profit() {
     assert_eq!(simulated_gross(&call(&realised)), None);
     assert_eq!(simulated_gross(&serde_json::json!({ "logs": [] })), None);
 }
+
+const L: u128 = 1_400_000_000_000_000_000;
+
+/// A WETH/USDC Uniswap pool read at block 99, liquidity `L` over ±2,000 ticks.
+fn read_pool() -> apex_runtime::live::book::PoolSnapshot {
+    use apex_math::cl_math::get_sqrt_ratio_at_tick;
+    use apex_math::cl_state::ClPoolState;
+    use apex_math::cl_swap::TickLadder;
+    let (tick, lower, upper) = (-197_350, -199_350, -195_350);
+    apex_runtime::live::book::PoolSnapshot {
+        spec: apex_runtime::live::inventory::PoolSpec {
+            pool: POOL,
+            venue: Venue::UniswapV3,
+            token0: apex_runtime::live::frontier::WETH,
+            token1: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+            fee_ppm: 500,
+            depth_usd: 5_000_000.0,
+        },
+        state: ClPoolState {
+            sqrt_price_x96: get_sqrt_ratio_at_tick(tick).unwrap(),
+            liquidity: L,
+            tick,
+            tick_spacing: 10,
+            fee_ppm: 500,
+            balance0: Some(U256::from(10u128.pow(21))),
+            balance1: Some(U256::from(3_000_000_000_000u128)),
+        },
+        ladder: TickLadder::new(vec![(lower, L as i128), (upper, -(L as i128))], lower - 5_000, upper + 5_000),
+        decimals: (18, 6),
+        factory: Venue::UniswapV3.factory(),
+        code_hash: Default::default(),
+        block: 99,
+        last_log: None,
+        dynamic_fee: None,
+        seq: 0,
+        reserves: None,
+    }
+}
+
+/// A Mint or Burn in the fire's block before the trigger is applied to the
+/// book the fire is quoted on, as the live book applies it (R28.1); one after
+/// the trigger is not. The evaluator refused every fire with one, two of the
+/// seventeen since the lean deploy.
+#[test]
+fn a_position_change_before_the_trigger_is_applied_to_the_fire_s_book() {
+    use apex_runtime::armed::run::apply_through;
+    use apex_runtime::live::book::PoolBook;
+    use apex_types::state::ReconstructionStatus;
+    let tick = |t: i32| B256::from(word(i128::from(t)));
+    let book = PoolBook::from_snapshots([read_pool()], ReconstructionStatus::Verified);
+    let mint = log(POOL, vec![MINT, B256::ZERO, tick(-197_400), tick(-197_300)], vec![word(0), word(500), word(1), word(1)], 3, 1);
+    let after = log(POOL, vec![BURN, B256::ZERO, tick(-197_400), tick(-197_300)], vec![word(200), word(1), word(1)], 6, 2);
+    apply_through(&book, &[POOL], 100, 5, &[mint, after]).unwrap();
+    assert_eq!(book.get(POOL).unwrap().state.liquidity, L + 500, "the mint, in range; not the burn after the trigger");
+}
+
+/// A position change the book cannot apply exactly would leave it needing a
+/// read at the block: no quote, rather than one on the wrong liquidity.
+#[test]
+fn a_position_change_the_book_cannot_apply_refuses_the_quote() {
+    use apex_runtime::armed::run::apply_through;
+    use apex_runtime::live::book::PoolBook;
+    use apex_types::state::ReconstructionStatus;
+    let tick = |t: i32| B256::from(word(i128::from(t)));
+    let book = PoolBook::from_snapshots([read_pool()], ReconstructionStatus::Verified);
+    let over = log(POOL, vec![BURN, B256::ZERO, tick(-197_400), tick(-197_300)], vec![word(L as i128 + 1), word(1), word(1)], 3, 1);
+    let err = apply_through(&book, &[POOL], 100, 5, &[over]).unwrap_err();
+    assert!(err.contains("mint or burn"), "{err}");
+}
+
+/// The fire's route is the cycle through the arm's two pools in its leg order.
+/// Its route hash carries each pool's fee, and a Slipstream fee moves with the
+/// tick: reloaded at the fire, the route can hash differently from when it
+/// armed, though the plan, which names only pools, is the same.
+#[test]
+fn a_fire_s_route_is_found_by_its_pools_whatever_its_fee() {
+    use apex_runtime::armed::run::cycle_through;
+    use apex_runtime::live::frontier;
+    use apex_types::ids::ChainId;
+    use std::sync::Arc;
+    const SLIP: Address = address!("3fe04a59ebd38cf06080a6f60a98d124eb59392a");
+    let slip = |fee| {
+        let mut p = read_pool();
+        p.spec.pool = SLIP;
+        p.spec.venue = Venue::SlipstreamV3;
+        p.factory = Venue::SlipstreamV3.factory();
+        p.state.fee_ppm = fee;
+        p
+    };
+    let book = |fee| [(POOL, Arc::new(read_pool())), (SLIP, Arc::new(slip(fee)))].into_iter().collect::<BTreeMap<_, _>>();
+    let (_, armed) = frontier::build(ChainId(8453), frontier::WETH, &book(400));
+    let (_, fired) = frontier::build(ChainId(8453), frontier::WETH, &book(1_234));
+    let route = armed.values().find(|c| c.legs[0].pool == POOL).unwrap().commitment.route_hash;
+    assert!(fired.values().all(|c| c.commitment.route_hash != route), "the fee moved the hash");
+    let pools = [format!("{POOL:#x}"), format!("{SLIP:#x}")];
+    let c = cycle_through(&fired, &pools).expect("found by its pools");
+    assert_eq!((c.legs[0].pool, c.legs[1].pool, c.legs[1].fee_ppm), (POOL, SLIP, 1_234));
+    let back = cycle_through(&fired, &[pools[1].clone(), pools[0].clone()]).unwrap();
+    assert_eq!((back.legs[0].pool, back.legs[1].pool), (SLIP, POOL), "the other direction is the other cycle");
+    assert!(cycle_through(&fired, &[pools[0].clone(), format!("{AERO:#x}")]).is_none());
+}

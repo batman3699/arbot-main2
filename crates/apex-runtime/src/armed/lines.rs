@@ -60,7 +60,8 @@ pub struct Arm {
     /// The concentrated pools' ticks when armed, for Mint and Burn ranges.
     pub start_ticks: Vec<(String, i32)>,
     pub size_wei: String,
-    /// Hop 1's output at the threshold: hop 2's fixed input.
+    /// Hop 1's output at the threshold: its minimum. Hop 2's fixed input
+    /// under the R26 executor; the lean executor (R29) sells all hop 1 returns.
     pub mid: String,
     pub output_wei: String,
     pub surplus_wei: String,

@@ -123,6 +123,26 @@ impl LiveCycle {
         Some(CycleQuote { outputs: [first, second], hops: [a, b] })
     }
 
+    /// The hops as the lean executor runs a plan with these minimums (R29):
+    /// each sells the whole of the one before. A concentrated hop returns what
+    /// its pool pays, at least its minimum; an Aerodrome v2 hop is asked for
+    /// exactly its minimum, and returns that. `None` when a hop would revert or
+    /// cannot fill.
+    pub fn quote_lean(&self, amount_in: U256, min_outs: [U256; 2]) -> Option<CycleQuote> {
+        let (first, a) = self.lean_hop(0, amount_in, min_outs[0])?;
+        let (second, b) = self.lean_hop(1, first, min_outs[1])?;
+        Some(CycleQuote { outputs: [first, second], hops: [a, b] })
+    }
+
+    fn lean_hop(&self, i: usize, amount: U256, min_out: U256) -> Option<(U256, HopSteps)> {
+        let (pays, steps) = self.hop(i, amount)?;
+        if pays < min_out {
+            return None;
+        }
+        let exact = self.legs[i].0.spec.venue == crate::live::inventory::Venue::AerodromeV2;
+        Some((if exact { min_out } else { pays }, steps))
+    }
+
     /// What each hop returns for `amount_in`, in order: the figures a plan's
     /// steps are built from, by the same arithmetic the cycle is priced by.
     /// `None` exactly when [`Self::output`] is.
