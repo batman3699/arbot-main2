@@ -535,3 +535,36 @@ fn the_engine_hands_over_its_moves_and_takes_them_back() {
     let other = MovesSnapshot { window_ns: 1, ..snap };
     assert!(engine.restore_moves(&other).is_err(), "another window length");
 }
+
+/// R36: a fire is a gap between the route's pools, not the trigger pool's
+/// move: the market moves both. Two engines with the same pools' history (100
+/// ticks a window): one whose spreads never moved, so no rung can fire (all
+/// tie, the first armable one is armed), and one whose spreads moved 100,
+/// where the surplus decides. Read from the pool, both would be the second.
+#[test]
+fn the_ranking_reads_the_route_s_spread_not_its_pool() {
+    use apex_runtime::armed::moves::{spread_key, MovesSnapshot};
+    let armed_rung = |spread_move: f64| {
+        let (engine, snap) = setup_with(1, REPRICE_BUDGET, 6);
+        let big = vec![(100.0, 100.0); 400];
+        let small = vec![(spread_move, spread_move); 400];
+        let pools = [(UNI, big.clone()), (SLIP, big), (spread_key(UNI, SLIP), small.clone()), (spread_key(SLIP, UNI), small)];
+        let history = MovesSnapshot { window_ns: 10_000_000_000, saved_at_ns: 0, pools: pools.into_iter().collect() };
+        engine.restore_moves(&history).unwrap();
+        let lines = engine.tick(&snap, 1_000, 5_000_000, &px(), 1);
+        let rungs: Vec<(u8, u32)> = lines.iter().filter_map(|l| if let ArmedLine::Arm(a) = l { Some((a.rung, a.step)) } else { None }).collect();
+        assert_eq!(rungs.len(), 1, "one sender");
+        rungs[0]
+    };
+    let (still, moving) = (armed_rung(0.0), armed_rung(100.0));
+    assert!(still.0 < moving.0, "a spread that never moved arms {still:?}; one of 100, {moving:?}");
+}
+
+#[test]
+fn the_engine_watches_each_armed_route_s_spread() {
+    use apex_runtime::armed::moves::spread_key;
+    let (engine, snap) = setup(1);
+    engine.tick(&snap, 1_000, 5_000_000, &px(), 1);
+    let seen = engine.moves_snapshot(1).pools;
+    assert!(seen.contains_key(&spread_key(UNI, SLIP)) && seen.contains_key(&spread_key(SLIP, UNI)), "{:?}", seen.keys());
+}

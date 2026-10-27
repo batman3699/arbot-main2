@@ -5,7 +5,7 @@
 
 use super::bid::{best_bid, rank_value, Bid};
 use super::lines::{Arm, ArmedLine, Word};
-use super::moves::MoveStats;
+use super::moves::{spread_key, MoveStats};
 use super::plan::armed_call;
 use super::predicate::{self, layout};
 use super::threshold::{band_paying, rungs, trigger_up, Band, Pricing, Rung};
@@ -260,6 +260,13 @@ impl Engine {
         for p in snapshot.values() {
             st.moves.observe(p.spec.pool, position(p), now_ns);
         }
+        // R36: each armed route's spread, both ways: what a fire needs to move.
+        for c in self.cycles.values() {
+            let (Some(a), Some(b)) = (snapshot.get(&c.legs[0].pool), snapshot.get(&c.legs[1].pool)) else { continue };
+            let (x, y) = (position(a), position(b));
+            st.moves.observe(spread_key(a.spec.pool, b.spec.pool), x - y, now_ns);
+            st.moves.observe(spread_key(b.spec.pool, a.spec.pool), y - x, now_ns);
+        }
 
         // Reprice stale slots within the budget. A slot is stale when either
         // pool changed or its window has passed. One whose pool changed is not
@@ -288,8 +295,8 @@ impl Engine {
         st.computed.extend(done);
         self.armable.store(st.computed.values().filter(|k| !k.rungs.is_empty()).count() as u64, Relaxed);
 
-        // Rank every rung priced at this book: P(move ≥ step within the
-        // window) × the surplus its plan expects. A rung priced before either
+        // Rank every rung priced at this book: P(the route's spread moves ≥
+        // step within the window) × the surplus its plan expects. A rung priced before either
         // pool changed is left out until it is repriced: its trigger and band
         // are prices the pools may have left, so it is neither armed nor renewed.
         let moves = &st.moves;
@@ -302,9 +309,11 @@ impl Engine {
                 continue;
             }
             current += 1;
-            let pool = c.legs[usize::from(*leg)].pool;
+            let (pool, other) = (c.legs[usize::from(*leg)].pool, c.legs[1 - usize::from(*leg)].pool);
             for (r, b, bid) in &k.rungs {
-                let p = moves.p_at_least(pool, trigger_up(c, usize::from(*leg)), r.step);
+                // R36: the chance the route's spread moves past the rung, not the
+                // trigger pool alone: the market moving both pools fires nothing.
+                let p = moves.p_at_least(spread_key(pool, other), trigger_up(c, usize::from(*leg)), r.step);
                 // R36: the chance of a move past the rung, of the bid winning,
                 // and what a win keeps after its tip (the band already pays the
                 // tip). A rung whose bid outbids no one takes no sender. A

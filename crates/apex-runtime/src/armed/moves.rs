@@ -10,7 +10,7 @@
 //! while young the floor of 1/(windows + 2) gave the far rungs every sender.
 
 use crate::live::feed::{decode_swap, decode_sync, PANCAKE_SWAP, SWAP, SYNC};
-use alloy_primitives::Address;
+use alloy_primitives::{keccak256, Address};
 use apex_chain::rpc::ws::{parse_log, RawLog};
 use apex_chain::rpc::RpcTransport;
 use serde_json::{json, Value};
@@ -171,26 +171,50 @@ pub fn observation_of(log: &RawLog, at_ns: u64) -> Option<Observation> {
     Some(Observation { pool: s.pool, at_ns, position: (r1 / r0).ln() * 10_000.0 })
 }
 
+/// The series of a route's spread with `trigger` as its trigger pool: the
+/// trigger's position less the other's (R36). A fire is this gap opening;
+/// the market moving both pools moves neither it nor a fire.
+pub fn spread_key(trigger: Address, other: Address) -> Address {
+    let mut bytes = b"apex-spread".to_vec();
+    bytes.extend_from_slice(trigger.as_slice());
+    bytes.extend_from_slice(other.as_slice());
+    Address::from_slice(&keccak256(bytes)[12..])
+}
+
 /// Statistics replayed from logs, as the engine would have learned them by
 /// watching: each pool observed at every `step_ns` (a block) from its first
 /// log to `until_ns`, holding its last position between logs, so a quiet
-/// window counts as one with no move.
-pub fn seed(window_ns: u64, observations: &[Observation], step_ns: u64, until_ns: u64) -> MoveStats {
+/// window counts as one with no move. Each of `pairs` (trigger, other) is
+/// observed as its spread, after all the logs of a moment: one transaction
+/// moving both pools leaves no gap to fire on.
+pub fn seed(window_ns: u64, observations: &[Observation], pairs: &[(Address, Address)], step_ns: u64, until_ns: u64) -> MoveStats {
     let mut obs = observations.to_vec();
     obs.sort_by_key(|o| o.at_ns);
     let mut m = MoveStats::new(window_ns);
     let Some(first) = obs.first() else { return m };
     let mut last: BTreeMap<Address, f64> = BTreeMap::new();
+    let spreads = |m: &mut MoveStats, last: &BTreeMap<Address, f64>, at: u64| {
+        for (a, b) in pairs {
+            if let (Some(x), Some(y)) = (last.get(a), last.get(b)) {
+                m.observe(spread_key(*a, *b), x - y, at);
+            }
+        }
+    };
     let (mut i, mut t) = (0, first.at_ns);
     while t <= until_ns {
         while i < obs.len() && obs[i].at_ns <= t {
-            m.observe(obs[i].pool, obs[i].position, obs[i].at_ns);
-            last.insert(obs[i].pool, obs[i].position);
-            i += 1;
+            let at = obs[i].at_ns;
+            while i < obs.len() && obs[i].at_ns == at {
+                m.observe(obs[i].pool, obs[i].position, at);
+                last.insert(obs[i].pool, obs[i].position);
+                i += 1;
+            }
+            spreads(&mut m, &last, at);
         }
         for (pool, position) in &last {
             m.observe(*pool, *position, t);
         }
+        spreads(&mut m, &last, t);
         t = t.saturating_add(step_ns.max(1));
     }
     m
@@ -219,6 +243,7 @@ pub struct SeedRead {
 pub async fn seed_from_logs(
     rpc: &dyn RpcTransport,
     pools: &[Address],
+    pairs: &[(Address, Address)],
     from: u64,
     to: u64,
     chunk: u64,
@@ -271,7 +296,7 @@ pub async fn seed_from_logs(
         lo = hi + 1;
         size = size.saturating_mul(2).min(chunk);
     }
-    let m = seed(window_ns, &obs, step_ns, until_ns);
+    let m = seed(window_ns, &obs, pairs, step_ns, until_ns);
     Ok((m, SeedRead { logs, observations: obs.len(), until_ns }))
 }
 

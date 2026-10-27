@@ -5,7 +5,7 @@
 
 use alloy_primitives::{address, Address, B256, U256};
 use apex_chain::rpc::ws::RawLog;
-use apex_runtime::armed::moves::{observation_of, seed, MoveStats, MovesSnapshot, Observation};
+use apex_runtime::armed::moves::{observation_of, seed, spread_key, MoveStats, MovesSnapshot, Observation};
 use apex_runtime::live::feed::{SWAP, SYNC};
 
 const UNI: Address = address!("00000000000000000000000000000000000000a1");
@@ -73,7 +73,7 @@ fn a_snapshot_saves_and_loads() {
 #[test]
 fn seeding_from_logs_counts_the_quiet_windows() {
     let obs = [Observation { pool: UNI, at_ns: 0, position: 0.0 }, Observation { pool: UNI, at_ns: 4 * S, position: 25.0 }];
-    let m = seed(W, &obs, 2 * S, 64 * S);
+    let m = seed(W, &obs, &[], 2 * S, 64 * S);
     // Closed at 10, 20, 30, 40, 50 and 60 s: one up 25, five quiet.
     assert_eq!(m.p_at_least(UNI, true, 25), (1.0 + 1.0) / (6.0 + 2.0));
     assert_eq!(m.snapshot(64 * S).pools[&UNI].len(), 6);
@@ -157,7 +157,7 @@ impl apex_chain::rpc::RpcTransport for Node {
 async fn the_seed_reads_the_window_in_chunks_and_times_each_log_by_its_block() {
     use apex_runtime::armed::moves::seed_from_logs;
     let node = Node { asked: std::sync::Mutex::new(Vec::new()), widest: u64::MAX, most_addresses: usize::MAX };
-    let (m, read) = seed_from_logs(&node, &[UNI], 100, 349, 100, 10, W, 2 * S).await.unwrap();
+    let (m, read) = seed_from_logs(&node, &[UNI], &[], 100, 349, 100, 10, W, 2 * S).await.unwrap();
     assert_eq!(*node.asked.lock().unwrap(), vec![(100, 199), (200, 299), (300, 349)]);
     assert_eq!(read.logs, 3);
     // Ticks 101, 202 and 303: two moves of 101, each inside one window.
@@ -171,7 +171,7 @@ async fn the_seed_reads_the_window_in_chunks_and_times_each_log_by_its_block() {
 async fn a_range_the_endpoint_refuses_is_halved_and_every_block_still_read() {
     use apex_runtime::armed::moves::seed_from_logs;
     let node = Node { asked: std::sync::Mutex::new(Vec::new()), widest: 50, most_addresses: usize::MAX };
-    let (_, read) = seed_from_logs(&node, &[UNI], 100, 349, 100, 10, W, 2 * S).await.unwrap();
+    let (_, read) = seed_from_logs(&node, &[UNI], &[], 100, 349, 100, 10, W, 2 * S).await.unwrap();
     let asked = node.asked.lock().unwrap().clone();
     assert!(asked.iter().all(|(a, b)| b - a < 50), "{asked:?}");
     assert_eq!(asked.first().unwrap().0, 100);
@@ -187,8 +187,30 @@ async fn the_pools_are_asked_ten_at_a_time() {
     use apex_runtime::armed::moves::seed_from_logs;
     let node = Node { asked: std::sync::Mutex::new(Vec::new()), widest: u64::MAX, most_addresses: 10 };
     let pools: Vec<Address> = std::iter::once(UNI).chain((1..25u8).map(Address::repeat_byte)).collect();
-    let (m, read) = seed_from_logs(&node, &pools, 100, 349, 100, 10, W, 2 * S).await.unwrap();
+    let (m, read) = seed_from_logs(&node, &pools, &[], 100, 349, 100, 10, W, 2 * S).await.unwrap();
     assert_eq!(node.asked.lock().unwrap().len(), 3 * 3, "three ranges, three tens each");
     assert_eq!(read.logs, 3, "UNI's, once a range");
     assert_eq!(m.snapshot(0).pools.len(), 1);
+}
+
+#[test]
+fn a_spread_is_its_own_series_and_knows_which_pool_triggers() {
+    assert_ne!(spread_key(UNI, AERO), spread_key(AERO, UNI));
+    assert_ne!(spread_key(UNI, AERO), UNI);
+    assert_eq!(spread_key(UNI, AERO), spread_key(UNI, AERO));
+}
+
+/// A fire is a gap: the trigger pool moving away from the other. Two pools
+/// moving together (the market moving) are no spread move; one alone is.
+#[test]
+fn the_seed_replays_each_pair_s_spread() {
+    let at = |pool, t: u64, position| Observation { pool, at_ns: t * S, position };
+    // Window one: both up 25 together. Window two: UNI up 25 alone.
+    let obs = [at(UNI, 0, 0.0), at(AERO, 0, 0.0), at(UNI, 4, 25.0), at(AERO, 4, 25.0), at(UNI, 14, 50.0)];
+    let m = seed(W, &obs, &[(UNI, AERO), (AERO, UNI)], 2 * S, 64 * S);
+    let spread = m.snapshot(64 * S).pools[&spread_key(UNI, AERO)].clone();
+    assert_eq!(spread[0], (0.0, 0.0), "together: no gap");
+    assert_eq!(spread[1], (25.0, 0.0), "UNI alone: a gap of 25");
+    assert_eq!(m.snapshot(64 * S).pools[&spread_key(AERO, UNI)][1], (0.0, 25.0), "the other way round, the same gap downward");
+    assert_eq!(m.snapshot(64 * S).pools[&UNI][0], (25.0, 0.0), "the pools' own series as before");
 }

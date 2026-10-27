@@ -461,13 +461,17 @@ async fn armed_moves_seed() -> ExitCode {
     }
     // The canary's pools: its universe, with the census's targets below the floor.
     let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    let include = match apex_runtime::shadow::load_targets(&c.armed, now_unix) {
-        Ok(t) => t.as_ref().map(apex_runtime::armed::targets::Targets::pools).unwrap_or_default(),
+    let targets = match apex_runtime::shadow::load_targets(&c.armed, now_unix) {
+        Ok(t) => t,
         Err(e) => {
             error!(error = %e, "the census's targets did not load");
             return ExitCode::FAILURE;
         }
     };
+    let include = targets.as_ref().map(apex_runtime::armed::targets::Targets::pools).unwrap_or_default();
+    // Each targeted route's spread, either pool its trigger: what a fire moves.
+    let pairs: Vec<(alloy_primitives::Address, alloy_primitives::Address)> =
+        targets.iter().flat_map(|t| t.routes.iter()).flat_map(|r| [(r.pools[0], r.pools[1]), (r.pools[1], r.pools[0])]).collect();
     let venues = apex_runtime::live::inventory::Venue::ALL.to_vec();
     let pools: Vec<alloy_primitives::Address> = match apex_runtime::shadow::universe(&c.inventory, &venues, c.universe.filter(), &include) {
         Ok(specs) => specs.iter().map(|s| s.pool).collect(),
@@ -496,9 +500,9 @@ async fn armed_moves_seed() -> ExitCode {
     let a = &c.armed;
     let blocks = hours * 3_600_000 / a.block_time_ms.max(1);
     let from = head.saturating_sub(blocks);
-    info!(pools = pools.len(), from, to = head, "seeding the move statistics from the pools' logs");
+    info!(pools = pools.len(), spreads = pairs.len(), from, to = head, "seeding the move statistics from the pools' logs");
     let step_ns = a.block_time_ms.saturating_mul(1_000_000);
-    let (moves, read) = match seed_from_logs(&*rpc, &pools, from, head, 2_000, 10, a.window_s * 1_000_000_000, step_ns).await {
+    let (moves, read) = match seed_from_logs(&*rpc, &pools, &pairs, from, head, 2_000, 10, a.window_s * 1_000_000_000, step_ns).await {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "the seed did not read");
@@ -516,7 +520,7 @@ async fn armed_moves_seed() -> ExitCode {
         "{}",
         serde_json::json!({
             "path": path.display().to_string(), "blocks": [from, head], "logs": read.logs, "observations": read.observations,
-            "pools_asked": pools.len(), "pools_seeded": snap.pools.len(),
+            "pools_asked": pools.len(), "spreads": pairs.len(), "series_seeded": snap.pools.len(),
             "windows_per_pool_median": windows.get(windows.len() / 2), "windows_per_pool_max": windows.last(),
         })
     );
