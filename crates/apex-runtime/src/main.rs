@@ -86,6 +86,9 @@ async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("armed-eval") {
         return armed_eval().await;
     }
+    if std::env::args().nth(1).as_deref() == Some("armed-replay") {
+        return armed_replay().await;
+    }
     if std::env::args().nth(1).as_deref() == Some("probe") {
         return probe().await;
     }
@@ -154,6 +157,44 @@ fn keys() -> ExitCode {
         }
         Err(e) => {
             eprintln!("apex keys: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `apex armed-replay [--config PATH] DIR...`: each fire in `DIR` quoted on
+/// its own book at other sizes (R36, lever 1); one JSON line a fire. Reads the
+/// chain only.
+async fn armed_replay() -> ExitCode {
+    let mut args: Vec<String> = std::env::args().skip(2).collect();
+    let config = if args.first().map(String::as_str) == Some("--config") && args.len() > 1 {
+        args.remove(0);
+        args.remove(0)
+    } else {
+        DEFAULT_SHADOW_CONFIG.to_string()
+    };
+    if args.is_empty() || args.iter().any(|a| a.starts_with("--")) {
+        error!("usage: apex armed-replay [--config PATH] DIR...");
+        return ExitCode::FAILURE;
+    }
+    let env = Env::secrets_only();
+    let loaded = match apex_runtime::shadow::config::ShadowConfig::load(&config, &env) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "armed-replay: the config did not load");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dirs: Vec<std::path::PathBuf> = args.into_iter().map(Into::into).collect();
+    match apex_runtime::armed::replay::replay(&loaded, &dirs).await {
+        Ok(fires) => {
+            for f in fires {
+                println!("{f}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!(error = %e, "armed-replay failed");
             ExitCode::FAILURE
         }
     }

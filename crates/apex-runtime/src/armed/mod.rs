@@ -14,6 +14,7 @@ pub mod live_ledger;
 pub mod moves;
 pub mod plan;
 pub mod predicate;
+pub mod replay;
 pub mod run;
 pub mod targets;
 pub mod threshold;
