@@ -60,6 +60,8 @@ pub struct LogFilter {
     pub addresses: Vec<Address>,
     /// Any of these as `topic0`.
     pub topics0: Vec<B256>,
+    /// R37: any of these as `topic1` (a v4 pool's ID); empty, any topic1.
+    pub topics1: Vec<B256>,
 }
 
 /// The four reads a feed can subscribe to. Nothing else is expressible.
@@ -106,7 +108,11 @@ pub fn subscribe_request(id: u64, s: &Subscription) -> Value {
 }
 
 fn filter_json(f: &LogFilter) -> Value {
-    json!({ "address": f.addresses, "topics": [f.topics0] })
+    if f.topics1.is_empty() {
+        json!({ "address": f.addresses, "topics": [f.topics0] })
+    } else {
+        json!({ "address": f.addresses, "topics": [f.topics0, f.topics1] })
+    }
 }
 
 /// A sealed block's header, as much of it as the plane reads.

@@ -71,7 +71,7 @@ use crate::search::FrontierSearch;
 use crate::shutdown::Shutdown;
 use crate::sign::{LaneKey, LocalSigner};
 use crate::supervise::{spawn_supervised, SupervisedHandle};
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use apex_capture::clock::{Clock, SystemClock};
 use apex_capture::dispatch::NullDispatcher;
 use apex_capture::journal::FileJournal;
@@ -322,12 +322,15 @@ pub fn universe(
 
 /// R36: the capture feed's subscriptions: heads, `pendingLogs` until Denim
 /// ends it, and canonical logs.
-pub fn subscriptions(feed: &config::FeedConfig, filter: LogFilter) -> Vec<Subscription> {
-    if feed.pending_logs {
-        vec![Subscription::NewHeads, Subscription::PendingLogs(filter.clone()), Subscription::Logs(filter)]
-    } else {
-        vec![Subscription::NewHeads, Subscription::Logs(filter)]
+pub fn subscriptions(feed: &config::FeedConfig, filters: Vec<LogFilter>) -> Vec<Subscription> {
+    let mut subs = vec![Subscription::NewHeads];
+    for filter in filters {
+        if feed.pending_logs {
+            subs.push(Subscription::PendingLogs(filter.clone()));
+        }
+        subs.push(Subscription::Logs(filter));
     }
+    subs
 }
 
 /// R36: the census's targets the arming engine arms from. In live mode a
@@ -987,8 +990,10 @@ fn now_ms() -> u64 {
 impl Shadow {
     /// The capture feed: notifications → the book → effects.
     async fn feed(&self, bus: &EventBus, stopped: watch::Receiver<bool>) {
-        let filter = LogFilter { addresses: self.universe.clone(), topics0: vec![SWAP, PANCAKE_SWAP, MINT, BURN, SYNC] };
-        let subs = subscriptions(&self.config.feed, filter);
+        let filter = LogFilter { addresses: self.universe.clone(), topics0: vec![SWAP, PANCAKE_SWAP, MINT, BURN, SYNC], topics1: Vec::new() };
+        // R37: the v4 pools' own subscription, filtered to their IDs.
+        let v4_ids: Vec<B256> = self.book.snapshot().values().filter_map(|p| Some(p.spec.v4?.pool_id)).collect();
+        let subs = subscriptions(&self.config.feed, std::iter::once(filter).chain(crate::live::feed::v4_filter(&v4_ids)).collect());
         let feed = match WsFeed::new(self.config.rpc_ws.expose(), subs, WsSettings::default()) {
             Ok(f) => f,
             Err(e) => {

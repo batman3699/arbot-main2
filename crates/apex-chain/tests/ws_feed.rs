@@ -20,7 +20,7 @@ const POOL: Address = address!("d0b53D9277642d899DF5C87A3966A349A798F224");
 const SWAP: B256 = b256!("c42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
 
 fn filter() -> LogFilter {
-    LogFilter { addresses: vec![POOL], topics0: vec![SWAP] }
+    LogFilter { addresses: vec![POOL], topics0: vec![SWAP], topics1: Vec::new() }
 }
 
 fn subs() -> Vec<Subscription> {
@@ -314,3 +314,16 @@ fn a_log_object_from_get_logs_parses_like_a_notification() {
     assert!(!l.pending && !l.removed);
     assert!(apex_chain::rpc::ws::parse_log(&serde_json::json!({"topics": []}), false).is_none());
 }
+
+/// R37: a filter on PoolManager's logs names its pools in topic 1. With no
+/// topic-1 list, the filter is topic 0 alone, as before.
+#[test]
+fn a_filter_with_topic_one_lists_both_positions() {
+    let ids = vec![B256::repeat_byte(0xc1), B256::repeat_byte(0x69)];
+    let f = LogFilter { addresses: vec![POOL], topics0: vec![SWAP], topics1: ids.clone() };
+    let r = subscribe_request(3, &Subscription::Logs(f));
+    assert_eq!(r["params"][1]["topics"], json!([[SWAP], ids]));
+    let r = subscribe_request(4, &Subscription::PendingLogs(filter()));
+    assert_eq!(r["params"][1]["topics"], json!([[SWAP]]));
+}
+

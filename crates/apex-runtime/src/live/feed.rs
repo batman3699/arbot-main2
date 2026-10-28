@@ -85,6 +85,9 @@ pub const BURN: B256 = b256!("0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e02
 /// Uniswap v4's `Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)`,
 /// from PoolManager, the pool ID in topic 1 (R37).
 pub const V4_SWAP: B256 = b256!("40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f");
+/// Uniswap v4's `ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)`,
+/// from PoolManager, the pool ID in topic 1 (R37).
+pub const MODIFY_LIQUIDITY: B256 = b256!("f208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec");
 /// Aerodrome v2's `Sync(uint256,uint256)`: a volatile pool's reserves after
 /// every swap, mint and burn — its whole state (R24).
 pub const SYNC: B256 = b256!("cf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a");
@@ -219,6 +222,62 @@ pub fn decode_liquidity(l: &RawLog) -> Option<LiquidityLog> {
         log_index: l.log_index?,
         tx: l.transaction_hash?,
         pending: l.pending,
+    })
+}
+
+/// R37: a v4 log's pool: its ID's key address, from topic 1.
+fn v4_pool(l: &RawLog) -> Option<Address> {
+    (l.address == crate::live::v4::POOL_MANAGER).then(|| l.topics.get(1).map(|id| crate::live::v4::key_address(*id)))?
+}
+
+/// R37: PoolManager's `Swap` as the pool's: keyed by its key address, its
+/// amounts turned to the pool's side (v4 logs the swapper's deltas, the
+/// negative of v3's), then the post-swap price, liquidity and tick.
+pub fn decode_v4_swap(l: &RawLog) -> Option<SwapLog> {
+    if l.topics.first() != Some(&V4_SWAP) || l.data.len() != 6 * 32 {
+        return None;
+    }
+    Some(SwapLog {
+        pool: v4_pool(l)?,
+        amount0: abi::word_int(&l.data, 0, 128)?.checked_neg()?,
+        amount1: abi::word_int(&l.data, 1, 128)?.checked_neg()?,
+        sqrt_price_x96: abi::word_u256(&l.data, 2)?,
+        liquidity: abi::word_uint(&l.data, 3, 128)?,
+        tick: i32::try_from(abi::word_int(&l.data, 4, 24)?).ok()?,
+        block: l.block_number?,
+        log_index: l.log_index?,
+        tx: l.transaction_hash?,
+        pending: l.pending,
+    })
+}
+
+/// R37: PoolManager's `ModifyLiquidity` as a position change. `None` when its
+/// `int256` delta does not fit `i128`: the pool is then read again.
+pub fn decode_modify_liquidity(l: &RawLog) -> Option<LiquidityLog> {
+    if l.topics.first() != Some(&MODIFY_LIQUIDITY) || l.data.len() != 4 * 32 {
+        return None;
+    }
+    let tick = |w: usize| abi::word_int(&l.data, w, 24).and_then(|v| i32::try_from(v).ok());
+    Some(LiquidityLog {
+        pool: v4_pool(l)?,
+        tick_lower: tick(0)?,
+        tick_upper: tick(1)?,
+        delta: abi::word_int(&l.data, 2, 128)?,
+        block: l.block_number?,
+        log_index: l.log_index?,
+        tx: l.transaction_hash?,
+        pending: l.pending,
+    })
+}
+
+/// R37: the v4 pools' subscription, PoolManager's Swap and ModifyLiquidity
+/// filtered to `pool_ids`. None for no pools: an unfiltered subscription
+/// would carry every v4 swap on Base.
+pub fn v4_filter(pool_ids: &[B256]) -> Option<apex_chain::rpc::ws::LogFilter> {
+    (!pool_ids.is_empty()).then(|| apex_chain::rpc::ws::LogFilter {
+        addresses: vec![crate::live::v4::POOL_MANAGER],
+        topics0: vec![V4_SWAP, MODIFY_LIQUIDITY],
+        topics1: pool_ids.to_vec(),
     })
 }
 
@@ -450,10 +509,11 @@ impl FeedHandler {
             Notification::Log(l) if l.removed => {
                 // R28.1: a position change applied in place is taken back too,
                 // or a read from before it would have it carried on again.
-                if let Some(p) = decode_liquidity(&l) {
+                if let Some(p) = decode_liquidity(&l).or_else(|| decode_modify_liquidity(&l)) {
                     book.retract_position(p.pool, (p.block, p.log_index));
                 }
-                vec![Effect::Reload(vec![l.address])]
+                // R37: a v4 log names its pool in topic 1, not its address.
+                vec![Effect::Reload(vec![v4_pool(&l).unwrap_or(l.address)])]
             }
             Notification::Log(l) => match l.topics.first() {
                 // R28.1: applied in place with the burst. A burn of nothing (a
@@ -471,6 +531,16 @@ impl FeedHandler {
                 Some(t) if *t == SYNC => match decode_sync(&l) {
                     Some(s) => self.hold(book, Held::Sync(s), now),
                     None => Vec::new(),
+                },
+                // R37: v4, as v3 but from PoolManager.
+                Some(t) if *t == V4_SWAP => match decode_v4_swap(&l) {
+                    Some(s) => self.hold(book, Held::Swap(s), now),
+                    None => Vec::new(),
+                },
+                Some(t) if *t == MODIFY_LIQUIDITY => match decode_modify_liquidity(&l) {
+                    Some(p) if p.delta == 0 => Vec::new(),
+                    Some(p) => self.hold(book, Held::Liquidity(p), now),
+                    None => v4_pool(&l).map_or_else(Vec::new, |pool| vec![Effect::Reload(vec![pool])]),
                 },
                 _ => Vec::new(),
             },

@@ -116,6 +116,7 @@ pub async fn run(minutes: u64, env: &Env) -> ProbeReport {
         let filter = LogFilter {
             addresses: PROBE_POOLS.iter().filter_map(|a| a.parse().ok()).collect(),
             topics0: vec![SWAP, PANCAKE_SWAP],
+            topics1: Vec::new(),
         };
         WsFeed::new(&format!("wss://base.blockpi.network/v1/ws/{k}"), vec![Subscription::PendingLogs(filter)], WsSettings::default())
             .ok()

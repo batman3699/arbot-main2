@@ -124,12 +124,29 @@ fn after_denim_the_feed_is_heads_and_canonical_logs() {
     use apex_chain::rpc::ws::{LogFilter, Subscription};
     use apex_runtime::shadow::config::FeedConfig;
     use apex_runtime::shadow::subscriptions;
-    let f = LogFilter { addresses: vec![address!("00000000000000000000000000000000000000a1")], topics0: vec![B256::repeat_byte(1)] };
+    let f = LogFilter { addresses: vec![address!("00000000000000000000000000000000000000a1")], topics0: vec![B256::repeat_byte(1)], topics1: Vec::new() };
     assert_eq!(
-        subscriptions(&FeedConfig { pending_logs: true }, f.clone()),
+        subscriptions(&FeedConfig { pending_logs: true }, vec![f.clone()]),
         vec![Subscription::NewHeads, Subscription::PendingLogs(f.clone()), Subscription::Logs(f.clone())]
     );
-    assert_eq!(subscriptions(&FeedConfig { pending_logs: false }, f.clone()), vec![Subscription::NewHeads, Subscription::Logs(f)]);
+    assert_eq!(subscriptions(&FeedConfig { pending_logs: false }, vec![f.clone()]), vec![Subscription::NewHeads, Subscription::Logs(f.clone())]);
+    // R37: the v4 pools' filter is a second pair, and after Denim a second
+    // canonical subscription alone.
+    let g = apex_runtime::live::feed::v4_filter(&[B256::repeat_byte(0xc1)]).unwrap();
+    assert_eq!(
+        subscriptions(&FeedConfig { pending_logs: true }, vec![f.clone(), g.clone()]),
+        vec![
+            Subscription::NewHeads,
+            Subscription::PendingLogs(f.clone()),
+            Subscription::Logs(f.clone()),
+            Subscription::PendingLogs(g.clone()),
+            Subscription::Logs(g.clone())
+        ]
+    );
+    assert_eq!(
+        subscriptions(&FeedConfig { pending_logs: false }, vec![f.clone(), g.clone()]),
+        vec![Subscription::NewHeads, Subscription::Logs(f), Subscription::Logs(g)]
+    );
 
     let var = "APEX_SECRET_SHADOW_TEST_DENIM";
     let denim = yaml(var, "var/apex/shadow.journal").replace("armed:\n", "feed:\n  pending_logs: false\narmed:\n");
