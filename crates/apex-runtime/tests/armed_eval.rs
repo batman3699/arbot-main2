@@ -57,6 +57,7 @@ fn arm() -> Arm {
         bid_wei_per_gas: String::new(),
         p_win: 0.0,
         renewals: Vec::new(),
+        start: None,
     }
 }
 

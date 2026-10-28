@@ -94,9 +94,15 @@ impl RpcTransport for Node {
                 U256::from(u8::from(*self.allowed.lock().unwrap())),
                 U256::from(u8::from(*self.open.lock().unwrap())),
             ]))),
-            // Morpho Blue's WETH when the request names it (R27): 82,679 WETH.
+            // Morpho Blue's WETH when the request names it (R27): 82,679 WETH;
+            // then (R37) its USDC, and PoolManager's WETH and USDC.
             "eth_call" if params.to_string().to_lowercase().contains("bbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb") => {
-                Ok(json!(aggregate3_answer(U256::from(82_679u128 * 10u128.pow(18)))))
+                Ok(json!(aggregate3_answers(&[
+                    U256::from(82_679u128 * 10u128.pow(18)),
+                    U256::from(41_250_000_000_000u128),
+                    U256::from(1_517u128 * 10u128.pow(18)),
+                    U256::from(6_480_000_000_000u128),
+                ])))
             }
             // The lender's WETH: 29.08 WETH, as Balancer's vault held on Base.
             "eth_call" => Ok(json!(aggregate3_answer(U256::from(29_082_963_936_604_904_861u128)))),
@@ -289,6 +295,9 @@ async fn a_ticket_borrowing_from_morpho_is_checked_against_morphos_holding() {
     let r = ChainReader::new(n.clone(), book(), ReaderConfig { morpho: Some(MORPHO_BLUE), ..config(Duration::from_secs(60)) });
     r.refresh(&head(101), 30_000_000).await.unwrap();
     assert_eq!(n.calls.swap(0, Ordering::SeqCst), 6, "Morpho's holding is a sixth read (R28 added the executor's switches)");
+    let v = r.view().unwrap();
+    assert_eq!(v.morpho_usdc_holding, 41_250_000_000_000, "R37: Morpho's USDC, in the same read");
+    assert_eq!(v.pool_manager_holdings, (1_517 * 10u128.pow(18), 6_480_000_000_000), "R37: PoolManager's WETH and USDC");
     let mut t = ticket();
     assert_eq!(r.read(&t).await.unwrap().flash_available, 29_082_963_936_604_904_861, "no lender named: Balancer's");
     t.flash_source = Some(apex_types::flash::FlashSourceQuote {

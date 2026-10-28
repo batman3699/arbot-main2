@@ -33,6 +33,9 @@ pub enum LiveRecord {
         #[serde(serialize_with = "dec::serialize", deserialize_with = "dec::deserialize")]
         worst_case_wei: u128,
         at_ms: u64,
+        /// R37: the arm's start token when not WETH. Absent: WETH.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<Address>,
     },
     /// `accepted = None` means the endpoint was silent: this submission may
     /// have reached the sequencer and must retain its reservation.
@@ -57,6 +60,12 @@ pub enum LiveRecord {
         #[serde(serialize_with = "dec::serialize", deserialize_with = "dec::deserialize")]
         net_wei: i128,
         at_ms: u64,
+        /// R37: a USDC trade's start token, and what it paid in it. The ETH
+        /// budget counts only its gas; `gross_wei` and `paid_wei` are then 0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start: Option<Address>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paid_start: Option<String>,
     },
     /// `tx`'s bound has passed with the sender's nonce unmoved, so it can no
     /// longer land; with no `tx`, every hash at this sender/nonce has.
@@ -105,6 +114,8 @@ pub struct PendingTx {
     pub to_block: u64,
     pub worst_case_wei: u128,
     pub accepted: Option<bool>,
+    /// R37: the start token when not WETH.
+    pub start: Option<Address>,
 }
 
 /// The risk state reconstructed from the append-only live ledger.
@@ -160,6 +171,7 @@ impl LiveState {
                 tx,
                 to_block,
                 worst_case_wei,
+                start,
                 ..
             } => {
                 let pending = self.pending.entry((*sender, *nonce)).or_default();
@@ -172,6 +184,7 @@ impl LiveState {
                         to_block: *to_block,
                         worst_case_wei: *worst_case_wei,
                         accepted: None,
+                        start: *start,
                     });
                 }
             }

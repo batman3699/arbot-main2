@@ -40,8 +40,86 @@ pub struct Pricing {
     /// What the lenders hold: the most any size may borrow, and from whom
     /// (R21, R27).
     pub lenders: Option<crate::live::lenders::Lenders>,
-    /// What the surplus over base costs must exceed (`armed.margin_wei`).
+    /// What the surplus over base costs must exceed (`armed.margin_wei`);
+    /// after [`Pricing::for_cycle`], in the cycle's start token.
     pub margin_wei: U256,
+    /// R37: the book's USDC units a wei ([`start_per_eth`]); a USDC cycle is
+    /// not priced without it.
+    pub start_per_eth: Option<(U256, U256)>,
+    /// R37: set by [`Pricing::for_cycle`] for a USDC cycle: its costs are
+    /// converted at this rate.
+    pub rate: Option<(U256, U256)>,
+    /// R37: Morpho's USDC, a USDC cycle's lender.
+    pub usdc_lenders: Option<crate::live::lenders::Lenders>,
+    /// R37: PoolManager's WETH and USDC, a v4 route's lender.
+    pub pool_manager: Option<(U256, U256)>,
+}
+
+impl Pricing {
+    /// This pricing, for one cycle (R37). A USDC cycle is costed in USDC at
+    /// the book's rate, its margin converted, Morpho's USDC its lender; a
+    /// route with a v4 hop borrows from PoolManager, as `LeanExecutor2`
+    /// does, up to its holding (the v4 hop's base gas carries the loan). None
+    /// for a USDC cycle when the book has no rate.
+    pub fn for_cycle(&self, cycle: &Cycle) -> Option<Self> {
+        let usdc = cycle.start == apex_exec::lean2::USDC;
+        let v4 = cycle.legs.iter().any(|l| l.venue == crate::live::inventory::Venue::UniswapV4);
+        let rate = if usdc { Some(self.start_per_eth?) } else { None };
+        let lenders = if v4 {
+            self.pool_manager.map(|(weth, usdc_held)| crate::live::lenders::Lenders {
+                balancer: U256::zero(),
+                morpho: Some(if usdc { usdc_held } else { weth }),
+            })
+        } else if usdc {
+            self.usdc_lenders
+        } else {
+            self.lenders
+        };
+        let margin_wei = rate.map_or(self.margin_wei, |r| to_start(self.margin_wei, r));
+        Some(Self { rate, lenders, margin_wei, ..*self })
+    }
+
+    /// A cost or tip in wei, in the start token (rounded up).
+    pub fn in_start(&self, wei: U256) -> U256 {
+        self.rate.map_or(wei, |r| to_start(wei, r))
+    }
+
+    /// A surplus in the start token, in wei (rounded down): what a bid per
+    /// gas is measured against.
+    pub fn in_wei(&self, start: U256) -> U256 {
+        self.rate.map_or(start, |r| to_wei(start, r))
+    }
+}
+
+/// R37: USDC units a wei, as `(sqrtP², 2^192)` (or its inverse when USDC is
+/// token0), from the WETH/USDC pool with the most liquidity the book holds.
+/// None when it holds none.
+pub fn start_per_eth(snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>) -> Option<(U256, U256)> {
+    let usdc = apex_exec::lean2::USDC;
+    let p = snapshot
+        .values()
+        .filter(|p| p.reserves.is_none() && p.spec.pair() == (crate::live::frontier::WETH.min(usdc), crate::live::frontier::WETH.max(usdc)))
+        .max_by_key(|p| p.state.liquidity)?;
+    // Exact: sqrtP² fits 256 bits for any price below 2^64 a unit, and a
+    // rate that would not fit is no rate.
+    let sq = U256::try_from(p.state.sqrt_price_x96.full_mul(p.state.sqrt_price_x96)).ok()?;
+    let two_192 = U256::one() << 192;
+    if p.spec.token0 == crate::live::frontier::WETH { Some((sq, two_192)) } else { Some((two_192, sq)) }
+}
+
+/// A wei amount in the start token, rounded up: a cost.
+pub fn to_start(wei: U256, (num, den): (U256, U256)) -> U256 {
+    let v = wei.full_mul(num);
+    let d = ethers_core::types::U512::from(den);
+    U256::try_from((v + d - 1) / d).unwrap_or(U256::MAX)
+}
+
+/// A start-token amount in wei, rounded down: a surplus.
+pub fn to_wei(start: U256, (num, den): (U256, U256)) -> U256 {
+    if num.is_zero() {
+        return U256::zero();
+    }
+    U256::try_from(start.full_mul(den) / ethers_core::types::U512::from(num)).unwrap_or(U256::MAX)
 }
 
 /// The best size at one state, and what it would settle for.
@@ -95,7 +173,7 @@ pub fn best_at(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, trigger
     let mut pools = pair.clone();
     pools[leg] = Arc::new(trigger);
     let live = LiveCycle::new(cycle, &map_of(cycle, pools))?;
-    let route = CostedCycle::new(live, px.costs, px.gas).lent(px.lenders);
+    let route = CostedCycle::new(live, px.costs, px.gas).lent(px.lenders).in_start(px.rate);
     let best = best_size(&route, SearchBudget::default()).ok()?;
     let Surplus::Gain(surplus) = best.net else { return None };
     if surplus <= px.margin_wei {
@@ -103,7 +181,7 @@ pub fn best_at(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, trigger
     }
     let gas = route.gas_at(best.amount_in)?;
     let [mid, output] = route.cycle().hop_outputs(best.amount_in)?;
-    let cost = U256::from(px.costs.with_gas(gas.expected));
+    let cost = px.in_start(U256::from(px.costs.with_gas(gas.expected)));
     Some(Point { size: best.amount_in, mid, output, cost, surplus, gas })
 }
 
@@ -225,7 +303,7 @@ pub fn fixed(
     let live = LiveCycle::new(cycle, &map_of(cycle, with(pair, leg, trigger, other)))?;
     let q = live.quote_fixed(size, mid)?;
     let gas = px.gas.estimate(&q.hops);
-    let cost = U256::from(px.costs.with_gas(gas.expected));
+    let cost = px.in_start(U256::from(px.costs.with_gas(gas.expected)));
     let surplus = q.outputs[1].checked_sub(size)?.checked_sub(cost)?;
     (surplus > px.margin_wei).then_some(Point { size, mid, output: q.outputs[1], cost, surplus, gas })
 }

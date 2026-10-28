@@ -213,6 +213,9 @@ impl Health {
     }
 }
 
+/// R37: Morpho's USDC, and PoolManager's WETH and USDC.
+type ArmedHoldings = (Option<crate::live::lenders::Lenders>, Option<(ethers_core::types::U256, ethers_core::types::U256)>);
+
 /// Everything the tasks share.
 struct Shadow {
     config: ShadowConfig,
@@ -240,6 +243,9 @@ struct Shadow {
     building: watch::Sender<Option<BlockContext>>,
     /// What the lender holds, for sizing (R21); read with the reader's view.
     lender: watch::Sender<Option<crate::live::lenders::Lenders>>,
+    /// R37: Morpho's USDC and PoolManager's WETH and USDC, the armed lane's
+    /// USDC and v4 lenders; replaced with `lender`.
+    armed_holdings: watch::Sender<ArmedHoldings>,
     largest_window: AtomicU64,
     recorder: tokio::sync::Mutex<FlashblockRecorder>,
     feed_stats: Versioned<Option<Arc<WsStats>>>,
@@ -313,9 +319,11 @@ pub fn universe(
         .into_iter()
         .filter(|s| venues.contains(&s.venue))
         .collect();
+    // R37: pairs a cycle can start in: WETH's, and USDC's.
+    let usdc = apex_exec::lean2::USDC;
     Ok(inventory::pairs(&specs)
         .into_iter()
-        .filter(|((a, b), _)| *a == WETH || *b == WETH)
+        .filter(|((a, b), _)| [*a, *b].iter().any(|t| *t == WETH || *t == usdc))
         .flat_map(|(_, pools)| pools)
         .collect())
 }
@@ -543,7 +551,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     if let Some(t) = &targets {
         info!(routes = t.routes.len(), pools = target_pools.len(), missing, generated_at = %t.generated_at, "the census's targets read");
     }
-    let (book, unloaded) = PoolBook::load(&reads, &specs, head).await.map_err(|e| boot_err("the pool book", e))?;
+    let (book, unloaded) = PoolBook::load_with_hooks(&reads, &specs, head, &hooks).await.map_err(|e| boot_err("the pool book", e))?;
     for u in &unloaded {
         warn!(pool = %u.pool, why = ?u.why, "not loaded at boot; the first full reload reads it again");
     }
@@ -557,10 +565,15 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     // targeted pools below it are the arming engine's.
     let everything = book.snapshot();
     let floor = config.universe.min_depth_usd as f64;
-    let over_floor: BTreeMap<Address, Arc<crate::live::book::PoolSnapshot>> =
-        everything.iter().filter(|(_, p)| p.spec.depth_usd >= floor).map(|(a, p)| (*a, Arc::clone(p))).collect();
+    // R37: the reactive lane trades WETH cycles through the v1 executor,
+    // which has no v4 hop: v4 pools are the arming engine's alone.
+    let over_floor: BTreeMap<Address, Arc<crate::live::book::PoolSnapshot>> = everything
+        .iter()
+        .filter(|(_, p)| p.spec.depth_usd >= floor && p.spec.venue != Venue::UniswapV4)
+        .map(|(a, p)| (*a, Arc::clone(p)))
+        .collect();
     let (frontier, cycles) = frontier::build(base, WETH, &over_floor);
-    let armed_set = armed_cycles(targets.as_ref(), &frontier::build(base, WETH, &everything).1);
+    let armed_set = armed_cycles(targets.as_ref(), &frontier::build_starts(base, &[WETH, apex_exec::lean2::USDC], &everything).1);
     if targets.is_some() {
         info!(cycles = armed_set.len(), "the arming engine arms the targeted routes' cycles");
     }
@@ -904,6 +917,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         heads,
         building,
         lender,
+        armed_holdings: watch::channel((None, None)).0,
         largest_window: AtomicU64::new(0),
         recorder: tokio::sync::Mutex::new(FlashblockRecorder::new(FlashblockRecorder::DEFAULT_WINDOW)),
         feed_stats: Versioned::new(None, ReconstructionStatus::Rebuilding),
@@ -964,6 +978,7 @@ async fn boot_armed_live(
         budget_wei: a.daily_loss_budget_wei,
         max_priority_wei_per_gas: a.max_priority_wei_per_gas,
         max_size_wei: ethers_core::types::U256::from(a.max_size_wei),
+        max_size_usdc: ethers_core::types::U256::from(a.max_size_usdc),
         l1_fee_bound_wei: a.l1_fee_bound_wei,
         sender_reserve_wei: a.sender_reserve_wei,
         window_blocks,
@@ -1243,6 +1258,15 @@ impl Shadow {
                     *now = held;
                     moved
                 });
+                let usdc = Some(crate::live::lenders::Lenders {
+                    balancer: ethers_core::types::U256::zero(),
+                    morpho: Some(ethers_core::types::U256::from(v.morpho_usdc_holding)),
+                });
+                let pm = Some((
+                    ethers_core::types::U256::from(v.pool_manager_holdings.0),
+                    ethers_core::types::U256::from(v.pool_manager_holdings.1),
+                ));
+                self.armed_holdings.send_replace((usdc, pm));
             }
             twap.note("Slipstream's TWAPs", self.book.refresh_twaps(&self.reads, h.number).await.map(|_| ()), &self.stats.twap_failures);
             fees.note(
@@ -1276,13 +1300,19 @@ impl Shadow {
                 continue;
             }
             let Some(head) = self.heads.borrow().clone() else { continue };
+            let (engine, snapshot) = (Arc::clone(&self.armed), self.book.snapshot());
+            let (usdc_lenders, pool_manager) = *self.armed_holdings.borrow();
             let px = crate::armed::threshold::Pricing {
                 costs: self.costs.route_costs(),
                 gas: gas::LEAN,
                 lenders: *self.lender.borrow(),
                 margin_wei: ethers_core::types::U256::from(self.config.armed.margin_wei),
+                // R37: USDC cycles at the book's own WETH/USDC price.
+                start_per_eth: crate::armed::threshold::start_per_eth(&snapshot),
+                rate: None,
+                usdc_lenders,
+                pool_manager,
             };
-            let (engine, snapshot) = (Arc::clone(&self.armed), self.book.snapshot());
             let base_fee = head.base_fee_per_gas.unwrap_or(0);
             let now = SystemClock.now().0;
             let (lines, left) = tokio::task::spawn_blocking(move || {

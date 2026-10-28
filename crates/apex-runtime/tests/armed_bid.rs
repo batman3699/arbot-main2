@@ -112,6 +112,10 @@ fn px() -> Pricing {
         gas: gas::MEASURED,
         lenders: Some(apex_runtime::live::lenders::Lenders { balancer: U256::from(10u128.pow(21)), morpho: None }),
         margin_wei: U256::zero(),
+        start_per_eth: None,
+        rate: None,
+        usdc_lenders: None,
+        pool_manager: None,
     }
 }
 

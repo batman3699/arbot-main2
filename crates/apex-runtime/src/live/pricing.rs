@@ -209,11 +209,22 @@ pub struct CostedCycle {
     /// What the lenders hold: a bound on the input beside the paying pool's
     /// holding, and the gas each size's loan adds (R21, R27).
     lenders: Option<Lenders>,
+    /// R37: a cycle that starts in USDC is costed in USDC: each size's cost
+    /// in wei, times `num / den` (USDC units a wei), rounded up.
+    rate: Option<(U256, U256)>,
 }
 
 impl CostedCycle {
     pub const fn new(cycle: LiveCycle, costs: RouteCosts, gas: SettlementGas) -> Self {
-        Self { cycle, costs, gas, lenders: None }
+        Self { cycle, costs, gas, lenders: None, rate: None }
+    }
+
+    /// Cost every size in the start token at `rate` (start units a wei, as
+    /// `(num, den)`); `None` keeps wei (R37).
+    #[must_use]
+    pub const fn in_start(mut self, rate: Option<(U256, U256)>) -> Self {
+        self.rate = rate;
+        self
     }
 
     /// Bound every size at what the lenders hold, as well as at the paying
@@ -239,7 +250,8 @@ impl CostedCycle {
     }
 
     fn cost_of(&self, gas: GasEstimate) -> U256 {
-        U256::from(self.costs.with_gas(gas.expected))
+        let wei = U256::from(self.costs.with_gas(gas.expected));
+        self.rate.map_or(wei, |(num, den)| (wei * num + den - 1) / den)
     }
 
     /// The route's best net over [`LADDER_WEI`], each size at its own cost, in

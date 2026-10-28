@@ -232,9 +232,19 @@ pub fn build(
     start: Address,
     snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>,
 ) -> (Frontier, BTreeMap<RouteId, Cycle>) {
+    build_starts(chain, &[start], snapshot)
+}
+
+/// R37: [`build`] from each of `starts` (WETH and USDC), one frontier over all
+/// of their cycles. A cycle's `start` says which it begins and ends in.
+pub fn build_starts(
+    chain: ChainId,
+    starts: &[Address],
+    snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>,
+) -> (Frontier, BTreeMap<RouteId, Cycle>) {
     let mut frontier = Frontier::new();
     let mut by_id = BTreeMap::new();
-    for c in cycles(chain, start, snapshot) {
+    for c in starts.iter().flat_map(|start| cycles(chain, *start, snapshot)) {
         // A template the frontier refuses as inconsistent is not priced either.
         if frontier.insert(template(chain, &c, snapshot)).is_ok() {
             by_id.insert(c.id, c);

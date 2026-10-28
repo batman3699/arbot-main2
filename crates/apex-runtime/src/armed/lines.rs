@@ -87,6 +87,10 @@ pub struct Arm {
     /// Folded in by `merge_renewals`; never written with the arm.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub renewals: Vec<Renewal>,
+    /// R37: the cycle's start token when it is not WETH (USDC): its size,
+    /// mid, output, surplus and cost are in that token's units. Absent: WETH.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<alloy_primitives::Address>,
 }
 
 fn balancer() -> String {

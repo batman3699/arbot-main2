@@ -100,6 +100,8 @@ pub struct LivePolicy {
     pub budget_wei: u128,
     pub max_priority_wei_per_gas: u128,
     pub max_size_wei: U256,
+    /// R37: the largest USDC arm sent, in USDC's units.
+    pub max_size_usdc: U256,
     /// A bound on one transaction's L1 data fee.
     pub l1_fee_bound_wei: u128,
     /// Left in every sender after its worst case.
@@ -180,9 +182,9 @@ impl Inner {
             LiveRecord::Answered { accepted: Some(false), .. } => c.refused += 1,
             LiveRecord::Answered { accepted: None, .. } => c.silent += 1,
             LiveRecord::Skipped { reason, .. } => *c.skipped.entry(reason.clone()).or_default() += 1,
-            LiveRecord::Landed { sender, gross_wei, paid_wei, cost_wei, at_ms, .. } => {
+            LiveRecord::Landed { sender, gross_wei, paid_wei, cost_wei, at_ms, paid_start, .. } => {
                 c.landed += 1;
-                c.won += u64::from(*paid_wei > 0);
+                c.won += u64::from(*paid_wei > 0 || paid_start.as_deref().is_some_and(|p| p != "0"));
                 c.gross_wei = c.gross_wei.saturating_add(*gross_wei);
                 c.cost_wei = c.cost_wei.saturating_add(*cost_wei);
                 self.spends.push_back((*at_ms, *sender, *cost_wei));
@@ -243,6 +245,8 @@ impl std::fmt::Debug for ArmedLive {
 struct Readable {
     pools: [Address; 2],
     size: U256,
+    /// R37: the start token when not WETH.
+    start: Option<Address>,
     bid: u128,
     data: Vec<u8>,
 }
@@ -498,7 +502,9 @@ impl ArmedLive {
         if arm.predicates.iter().all(is_bound) {
             return self.skip(arm, sender, "unconditional", now_ms);
         }
-        if read.size > self.policy.max_size_wei {
+        // R37: a USDC arm's size is USDC's units, held to USDC's cap.
+        let cap = if read.start == Some(apex_exec::lean2::USDC) { self.policy.max_size_usdc } else { self.policy.max_size_wei };
+        if read.size > cap {
             return self.skip(arm, sender, "size", now_ms);
         }
         let head = match self.chain.head().await {
@@ -556,6 +562,7 @@ impl ArmedLive {
                 max_priority_fee_per_gas: priority,
                 worst_case_wei: worst,
                 at_ms: now_ms,
+                start: read.start,
             };
             if let Err(e) = self.ledger.append(&submitting) {
                 error!(error = %e, arm = arm.arm_id, "armed live: the submission could not be recorded, so it was not sent");
@@ -702,7 +709,9 @@ impl ArmedLive {
     /// Account a landing from its receipt, and halt the day if it spent the
     /// budget. False when the receipt does not read.
     fn land(&self, sender: Address, nonce: u64, sent: &PendingTx, receipt: &Value, now_ms: u64) -> bool {
-        let read = match read_receipt(receipt, WETH, self.executor, &[self.recipient]) {
+        // R37: a USDC trade pays USDC; the ETH budget nets only its gas.
+        let token = sent.start.unwrap_or(WETH);
+        let read = match read_receipt(receipt, token, self.executor, &[self.recipient]) {
             Ok(read) => read,
             Err(e) => {
                 error!(%sender, tx = %sent.tx, error = %e, "armed live: a receipt of ours did not read");
@@ -711,7 +720,9 @@ impl ArmedLive {
         };
         let r = &read.receipt;
         let cost = u128::from(r.gas_used).saturating_mul(r.effective_gas_price_wei).saturating_add(r.l1_fee_wei);
-        let net = i128::try_from(read.paid_wei).unwrap_or(i128::MAX).saturating_sub(i128::try_from(cost).unwrap_or(i128::MAX));
+        let in_weth = token == WETH;
+        let paid_wei = if in_weth { read.paid_wei } else { 0 };
+        let net = i128::try_from(paid_wei).unwrap_or(i128::MAX).saturating_sub(i128::try_from(cost).unwrap_or(i128::MAX));
         info!(%sender, nonce, tx = %sent.tx, success = r.success, net_wei = net, "armed live: landed");
         let landed = LiveRecord::Landed {
             arm_id: sent.arm_id,
@@ -719,11 +730,13 @@ impl ArmedLive {
             sender,
             nonce,
             tx: sent.tx,
-            gross_wei: read.realised_wei.unwrap_or(0),
-            paid_wei: read.paid_wei,
+            gross_wei: if in_weth { read.realised_wei.unwrap_or(0) } else { 0 },
+            paid_wei,
             cost_wei: cost,
             net_wei: net,
             at_ms: now_ms,
+            start: sent.start,
+            paid_start: (!in_weth).then(|| read.paid_wei.to_string()),
         };
         self.record(landed, now_ms);
         let (day, day_net) = {
@@ -814,6 +827,7 @@ fn readable(arm: &Arm) -> Option<Readable> {
     Some(Readable {
         pools: [arm.pools[0].parse().ok()?, arm.pools[1].parse().ok()?],
         size: U256::from_dec_str(&arm.size_wei).ok()?,
+        start: arm.start,
         bid: arm.bid_wei_per_gas.parse().ok()?,
         data: alloy_primitives::hex::decode(&arm.calldata).ok()?,
     })

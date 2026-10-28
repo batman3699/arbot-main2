@@ -319,8 +319,10 @@ impl Engine {
                 // tip). A rung whose bid outbids no one takes no sender. A
                 // move's chance may be 0 for a pool not yet seen moving: it
                 // orders the arms, as in R26, and excludes none.
+                // R37: ranked in wei, whatever the cycle's start token.
+                let Some(pxc) = px.for_cycle(c) else { continue };
                 if bid.p_win > 0.0 {
-                    ranked.push((rank_value(p, bid, b.point.surplus, b.point.gas.expected.0), (*id, *leg, r.index)));
+                    ranked.push((rank_value(p, bid, pxc.in_wei(b.point.surplus), b.point.gas.expected.0), (*id, *leg, r.index)));
                 }
             }
         }
@@ -420,10 +422,15 @@ impl Engine {
                 let c = &self.cycles[&id];
                 let pair = [Arc::clone(&snapshot[&c.legs[0].pool]), Arc::clone(&snapshot[&c.legs[1].pool])];
                 let bids = (self.bids)(c.legs[0].pool, c.legs[1].pool);
-                let found: Vec<(Rung, Band, Bid)> = rungs(c, &pair, usize::from(leg), px, s.rungs)
-                    .into_iter()
-                    .filter_map(|r| bid_and_band(c, &pair, usize::from(leg), &r, px, &s, &bids).map(|(b, bid)| (r, b, bid)))
-                    .collect();
+                // R37: priced in the cycle's own start token; a USDC cycle
+                // without a rate is priced at nothing.
+                let found: Vec<(Rung, Band, Bid)> = match px.for_cycle(c) {
+                    Some(pxc) => rungs(c, &pair, usize::from(leg), &pxc, s.rungs)
+                        .into_iter()
+                        .filter_map(|r| bid_and_band(c, &pair, usize::from(leg), &r, &pxc, &s, &bids).map(|(b, bid)| (r, b, bid)))
+                        .collect(),
+                    None => Vec::new(),
+                };
                 out.push(((id, leg), Computed { seqs: [pair[0].seq, pair[1].seq], at_ns: now_ns, rungs: found }));
             }
         };
@@ -461,6 +468,7 @@ impl Engine {
         predicates.push(predicate::expiry(to_block));
         let deadline = self.deadline(now_ns);
         let point = &band.point;
+        let px = &px.for_cycle(c)?;
         let (calldata, calldata_hash, lender) = self.calldata(c, band, snapshot, deadline, px)?;
         let start_ticks = [trigger_pool, other_pool]
             .iter()
@@ -502,6 +510,7 @@ impl Engine {
             bid_wei_per_gas: bid.per_gas.to_string(),
             p_win: bid.p_win,
             renewals: Vec::new(),
+            start: (c.start != crate::live::frontier::WETH).then_some(c.start),
         })
     }
 
@@ -549,9 +558,11 @@ pub fn bid_and_band(
     let bid = if bids.is_empty() {
         Bid { per_gas: 0, p_win: 1.0 }
     } else {
-        best_bid(bids, rung.point.surplus, gas, s.max_priority_wei_per_gas)
+        // R37: winners bid wei a gas, so the surplus is measured in wei.
+        best_bid(bids, px.in_wei(rung.point.surplus), gas, s.max_priority_wei_per_gas)
     };
-    let tip = U256::from(bid.per_gas).saturating_mul(U256::from(gas));
+    // And the band pays the tip in the cycle's start token.
+    let tip = px.in_start(U256::from(bid.per_gas).saturating_mul(U256::from(gas)));
     band_paying(cycle, pair, leg, rung, px, s.band_cap_bps, tip).map(|b| (b, bid))
 }
 

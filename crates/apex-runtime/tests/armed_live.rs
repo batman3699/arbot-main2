@@ -166,6 +166,7 @@ fn arm(arm_id: u64, slot: u16, bid: u128, gas_limit: u64) -> Arm {
         bid_wei_per_gas: bid.to_string(),
         p_win: 0.5,
         renewals: Vec::new(),
+        start: None,
     }
 }
 
@@ -174,6 +175,7 @@ fn policy(budget_wei: u128, cap: u128) -> LivePolicy {
         budget_wei,
         max_priority_wei_per_gas: cap,
         max_size_wei: U256::from(10u128 * ETH),
+        max_size_usdc: U256::from(12_000_000_000u64),
         l1_fee_bound_wei: 0,
         sender_reserve_wei: 0,
         window_blocks: 5,
@@ -233,7 +235,12 @@ fn topic(a: Address) -> String {
 /// A Base receipt for `tx`: `paid` WETH from the executor to the recipient
 /// and `Profit(gross)`, unless it reverted.
 fn receipt(tx: B256, success: bool, gas_used: u64, price: u128, l1_fee: u128, paid: u128, gross: u128) -> Value {
-    let weth: Address = "0x4200000000000000000000000000000000000006".parse().unwrap();
+    receipt_in("0x4200000000000000000000000000000000000006".parse().unwrap(), tx, success, gas_used, price, l1_fee, paid, gross)
+}
+
+/// R37: a receipt paying the recipient in `token`.
+#[allow(clippy::too_many_arguments)]
+fn receipt_in(weth: Address, tx: B256, success: bool, gas_used: u64, price: u128, l1_fee: u128, paid: u128, gross: u128) -> Value {
     let logs = if success {
         serde_json::json!([
             {
@@ -275,6 +282,7 @@ fn open_submission(sender: Address, nonce: u64, tx: B256, to_block: u64) -> Live
         max_priority_fee_per_gas: 1_000_000,
         worst_case_wei: 600_000_000_000,
         at_ms: NOW - 60_000,
+        start: None,
     }
 }
 
@@ -894,3 +902,41 @@ async fn stops_not_read_lately_stop_sends() {
     f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW + 6_001).await;
     assert!(f.script.sent.lock().unwrap().is_empty(), "three block times without a head");
 }
+
+const USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+
+/// R37: a USDC arm is held to the USDC size cap, not the WETH one.
+#[tokio::test]
+async fn a_usdc_arm_over_the_usdc_size_cap_is_skipped() {
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    start(&f).await;
+    let over = Arm { size_wei: "12000000001".into(), start: Some(USDC.parse().unwrap()), ..arm(1, 0, 1_000_000, 600_000) };
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(over))], 0, NOW).await;
+    assert!(f.script.sent.lock().unwrap().is_empty());
+    assert_eq!(skipped(&f.ledger), vec!["size".to_string()]);
+    let under = Arm { size_wei: "12000000000".into(), start: Some(USDC.parse().unwrap()), ..arm(2, 0, 1_000_000, 600_000) };
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(under))], 0, NOW).await;
+    assert_eq!(f.script.sent.lock().unwrap().len(), 1, "at the cap: sent");
+}
+
+/// R37: a USDC landing pays USDC, which the ETH loss budget does not net:
+/// only its gas counts against the day, and the USDC paid is recorded apart.
+#[tokio::test]
+async fn a_usdc_landing_counts_only_its_gas_against_the_budget() {
+    let usdc: Address = USDC.parse().unwrap();
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    start(&f).await;
+    let a = Arm { size_wei: "2000000000".into(), start: Some(usdc), ..arm(1, 0, 1_000_000_000, 600_000) };
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(a))], 0, NOW).await;
+    let sent = keccak256(&f.script.sent.lock().unwrap()[0].0);
+    f.chain.nonces.lock().unwrap().insert(key(1).address(), 8);
+    let landed = receipt_in(usdc, sent, true, 300_000, 1_000_000_000, 50_000_000_000_000, 151_259_004, 151_259_004);
+    f.chain.receipts.lock().unwrap().insert(sent, landed);
+    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    let landed: Vec<_> = records(&f.ledger).into_iter().filter(|r| matches!(r, LiveRecord::Landed { .. })).collect();
+    let [LiveRecord::Landed { gross_wei, paid_wei, cost_wei, net_wei, start, paid_start, .. }] = &landed[..] else { panic!("{landed:?}") };
+    assert_eq!((*gross_wei, *paid_wei, *cost_wei), (0, 0, 350_000_000_000_000), "no wei paid; the gas spent");
+    assert_eq!(*net_wei, -350_000_000_000_000, "only the gas against the ETH budget");
+    assert_eq!((*start, paid_start.as_deref()), (Some(usdc), Some("151259004")), "the USDC paid, apart");
+}
+

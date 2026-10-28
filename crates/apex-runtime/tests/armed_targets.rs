@@ -140,6 +140,7 @@ fn armed(mode: ArmedMode, targets: Option<&Path>) -> ArmedConfig {
         max_priority_wei_per_gas: 20_000_000_000,
         daily_loss_budget_wei: 10_000_000_000_000_000,
         max_size_wei: 5_000_000_000_000_000_000,
+        max_size_usdc: 12_000_000_000,
         l1_fee_bound_wei: 50_000_000_000_000,
         sender_reserve_wei: 200_000_000_000_000,
         live: None,

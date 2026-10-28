@@ -298,6 +298,10 @@ pub struct ArmedConfig {
     /// R36: the largest size an arm is sent at.
     #[serde(default = "five_weth")]
     pub max_size_wei: u128,
+    /// R37: the largest USDC arm sent, in USDC's six-decimal units; about
+    /// `max_size_wei`'s 5 WETH.
+    #[serde(default = "twelve_thousand_usdc")]
+    pub max_size_usdc: u128,
     /// R36: a bound on one transaction's L1 data fee, in its worst case.
     #[serde(default = "fifty_microeth")]
     pub l1_fee_bound_wei: u128,
@@ -339,6 +343,13 @@ const fn a_hundredth_eth() -> u128 {
 const fn five_weth() -> u128 {
     5_000_000_000_000_000_000
 }
+
+const fn twelve_thousand_usdc() -> u128 {
+    12_000_000_000
+}
+
+/// R37: `max_size_usdc`'s ceiling, as `ARMED_CAPS` holds the wei caps.
+pub const MAX_SIZE_USDC_CEILING: u128 = 100_000_000_000;
 
 const fn fifty_microeth() -> u128 {
     50_000_000_000_000
@@ -509,6 +520,9 @@ impl ShadowConfig {
             if value == 0 || value > *most {
                 return Err(invalid(format!("armed.{name} {value} is outside 1..={most} wei")));
             }
+        }
+        if a.max_size_usdc == 0 || a.max_size_usdc > MAX_SIZE_USDC_CEILING {
+            return Err(invalid(format!("armed.max_size_usdc {} is outside 1..={MAX_SIZE_USDC_CEILING} USDC units", a.max_size_usdc)));
         }
         if !(1..=64).contains(&a.max_arms)
             || !(1..=crate::armed::threshold::RUNG_OFFSETS.len()).contains(&usize::from(a.rungs))

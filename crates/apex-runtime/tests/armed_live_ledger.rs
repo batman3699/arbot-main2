@@ -30,6 +30,7 @@ fn submitting(sender: Address, nonce: u64, hash: B256, worst_case_wei: u128, at_
         max_priority_fee_per_gas: 1_000_000_000,
         worst_case_wei,
         at_ms,
+        start: None,
     }
 }
 
@@ -49,6 +50,8 @@ fn landed(sender: Address, nonce: u64, hash: B256, net_wei: i128, at_ms: u64) ->
         cost_wei: if net_wei < 0 { net_wei.unsigned_abs() } else { 0 },
         net_wei,
         at_ms,
+        start: None,
+        paid_start: None,
     }
 }
 
@@ -254,6 +257,7 @@ fn all_record_variants_round_trip_and_wei_are_decimal_strings() {
             max_priority_fee_per_gas: 20_000_000_000,
             worst_case_wei: u128::MAX,
             at_ms: OCT_24_UTC,
+            start: None,
         },
         answered(tx(1), None, "network timeout", OCT_24_UTC + 1),
         landed(addr(1), 7, tx(1), -123, OCT_24_UTC + 2),

@@ -59,6 +59,11 @@ pub struct ChainView {
     /// Morpho Blue's holding of the loan token, which the Morpho lender lends
     /// (R27); 0 when the Morpho lender is not configured.
     pub morpho_holding: u128,
+    /// R37: Morpho Blue's USDC, and PoolManager's WETH and USDC: the armed
+    /// lane's USDC and v4 lenders. 0 when unread; nothing else depends on
+    /// them.
+    pub morpho_usdc_holding: u128,
+    pub pool_manager_holdings: (u128, u128),
     /// The capacity model's largest measured window; 0 while it is `Unknown`.
     pub block_gas: u64,
     /// R28: `executors(signer)` and `isCircuitOpen()`, the owner's two stops.
@@ -140,16 +145,25 @@ impl ChainReader {
                 .map(|v| v != 0)
                 .ok_or_else(|| malformed(what))
         };
-        let morpho_holding = match c.morpho {
-            None => 0,
-            Some(m) => reads
-                .multicall(&[(c.loan_token, abi::call_address(selector::BALANCE_OF, m))], head.number)
-                .await?
-                .first()
-                .cloned()
-                .flatten()
-                .and_then(|d| abi::word_uint(&d, 0, 128))
-                .ok_or_else(|| malformed("Morpho's balance"))?,
+        let (morpho_holding, morpho_usdc_holding, pool_manager_holdings) = match c.morpho {
+            None => (0, 0, (0, 0)),
+            Some(m) => {
+                let pm = crate::live::v4::POOL_MANAGER;
+                let usdc = apex_exec::lean2::USDC;
+                let got = reads
+                    .multicall(
+                        &[
+                            (c.loan_token, abi::call_address(selector::BALANCE_OF, m)),
+                            (usdc, abi::call_address(selector::BALANCE_OF, m)),
+                            (crate::live::frontier::WETH, abi::call_address(selector::BALANCE_OF, pm)),
+                            (usdc, abi::call_address(selector::BALANCE_OF, pm)),
+                        ],
+                        head.number,
+                    )
+                    .await?;
+                let at = |i: usize| got.get(i).cloned().flatten().and_then(|d| abi::word_uint(&d, 0, 128));
+                (at(0).ok_or_else(|| malformed("Morpho's balance"))?, at(1).unwrap_or(0), (at(2).unwrap_or(0), at(3).unwrap_or(0)))
+            }
         };
         let view = ChainView {
             block: head.number,
@@ -167,6 +181,8 @@ impl ChainReader {
                 .and_then(|d| abi::word_uint(&d, 0, 128))
                 .ok_or_else(|| malformed("the lender's balance"))?,
             morpho_holding,
+            morpho_usdc_holding,
+            pool_manager_holdings,
             block_gas,
             executor_allows_signer: flag(0, "executors(signer)")?,
             circuit_open: flag(1, "isCircuitOpen()")?,
