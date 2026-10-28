@@ -166,6 +166,9 @@ capacity:
 universe:
   max_fee_ppm: 3000
   min_depth_usd: 50000
+  # R37: the reviewed Uniswap v4 hooks; a hooked v4 pool off this list is
+  # refused (ops/host/ARMED.md §3).
+  v4_hooks: ops/v4-hooks.base.json
 
 # R28: the canary (docs/superpowers/specs/2026-10-15-live-canary-design.md §8).
 canary:

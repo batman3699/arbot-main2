@@ -48,11 +48,14 @@ pub enum Venue {
     /// Aerodrome v2's volatile (x·y=k) pools, factory `0x420D…` (R24). Stable
     /// pools are refused.
     AerodromeV2,
+    /// Uniswap v4 (R37): every pool inside one PoolManager, keyed in the book
+    /// by its pool ID's first 20 bytes (`live::v4`).
+    UniswapV4,
 }
 
 impl Venue {
-    pub const ALL: [Self; 5] =
-        [Self::UniswapV3, Self::Slipstream, Self::PancakeV3, Self::SlipstreamV3, Self::AerodromeV2];
+    pub const ALL: [Self; 6] =
+        [Self::UniswapV3, Self::Slipstream, Self::PancakeV3, Self::SlipstreamV3, Self::AerodromeV2, Self::UniswapV4];
 
     pub const fn id(self) -> VenueId {
         match self {
@@ -61,6 +64,7 @@ impl Venue {
             Self::PancakeV3 => venue_ids::PANCAKESWAP_V3,
             Self::SlipstreamV3 => venue_ids::AERODROME_SLIPSTREAM_V3,
             Self::AerodromeV2 => venue_ids::AERODROME_VOLATILE,
+            Self::UniswapV4 => venue_ids::UNISWAP_V4,
         }
     }
 
@@ -72,6 +76,7 @@ impl Venue {
             Self::PancakeV3 => "pancakeswap_v3",
             Self::SlipstreamV3 => "aerodrome_slipstream_v3",
             Self::AerodromeV2 => "aerodrome_v2",
+            Self::UniswapV4 => "uniswap_v4",
         }
     }
 
@@ -88,6 +93,8 @@ impl Venue {
             Self::PancakeV3 => address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"),
             Self::SlipstreamV3 => address!("f8f2eB4940CFE7d13603DDDD87f123820Fc061Ef"),
             Self::AerodromeV2 => address!("420DD381b31aEf6683db6B902084cB0FFECe40Da"),
+            // v4 has no factory: its pools live in PoolManager.
+            Self::UniswapV4 => crate::live::v4::POOL_MANAGER,
         }
     }
 
@@ -96,8 +103,9 @@ impl Venue {
     /// 212 and 2,500 ppm — so its fee is read with the rest of the state, every
     /// time. Aerodrome v2's factory sets a pool's fee, which no swap moves; the
     /// book re-reads it each head (R24).
+    /// A v4 pool's fee is static once admitted: a dynamic one is refused.
     pub const fn fee_is_static(self) -> bool {
-        matches!(self, Self::UniswapV3 | Self::PancakeV3 | Self::AerodromeV2)
+        matches!(self, Self::UniswapV3 | Self::PancakeV3 | Self::AerodromeV2 | Self::UniswapV4)
     }
 
     /// A constant-product venue: reserves and a fee, no ticks (R24).
@@ -117,6 +125,8 @@ pub struct PoolSpec {
     pub fee_ppm: u32,
     /// From a third-party feed: ranks and filters, never sizes (§18.5).
     pub depth_usd: f64,
+    /// A v4 pool's key (R37); `pool` is then its key address.
+    pub v4: Option<crate::live::v4::V4Key>,
 }
 
 impl PoolSpec {
@@ -189,13 +199,21 @@ struct Record {
 ///
 /// A pool in `include` (R36: a pool the census targets) passes the depth
 /// floor; the fee ceiling and the venue's own rules still hold for it.
+///
+/// v4 pools (R37) come from `uniswap_v4/pools.jsonl`, which may be absent: no
+/// file, no v4 pools. A record [`crate::live::v4::refusal`] refuses, or whose
+/// key address is another pool's, is dropped and said why.
 pub fn load(
     data_dir: &Path,
     filter: UniverseFilter,
     include: &std::collections::BTreeSet<Address>,
+    hooks: &crate::live::v4::HookAllowlist,
 ) -> Result<Vec<PoolSpec>, InventoryError> {
     let mut out = Vec::new();
     for venue in Venue::ALL {
+        if venue == Venue::UniswapV4 {
+            continue;
+        }
         let path = data_dir.join(venue.dir()).join("pools.jsonl");
         let shown = path.display().to_string();
         let text = std::fs::read_to_string(&path)
@@ -237,8 +255,83 @@ pub fn load(
                 token1: r.token1,
                 fee_ppm: fee,
                 depth_usd: depth,
+                v4: None,
             });
         }
+    }
+    let v4 = load_v4(data_dir, filter, include, hooks)?;
+    for spec in v4 {
+        if out.iter().any(|s| s.pool == spec.pool) {
+            tracing::warn!(pool = %spec.pool, "a v4 pool's key address is another pool's: dropped");
+            continue;
+        }
+        out.push(spec);
+    }
+    Ok(out)
+}
+
+/// One v4 pool, as the inventory records it.
+#[derive(Deserialize)]
+struct V4Record {
+    pool_id: alloy_primitives::B256,
+    currency0: Address,
+    currency1: Address,
+    fee: u32,
+    tick_spacing: i32,
+    hooks: Address,
+    #[serde(default)]
+    #[allow(dead_code)]
+    init_block: Option<u64>,
+    #[serde(default)]
+    hub_usd_liquidity: Option<f64>,
+}
+
+fn load_v4(
+    data_dir: &Path,
+    filter: UniverseFilter,
+    include: &std::collections::BTreeSet<Address>,
+    hooks: &crate::live::v4::HookAllowlist,
+) -> Result<Vec<PoolSpec>, InventoryError> {
+    use crate::live::v4::{key_address, refusal, V4Key};
+    let path = data_dir.join(Venue::UniswapV4.dir()).join("pools.jsonl");
+    let shown = path.display().to_string();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(InventoryError::Io { path: shown, detail: e.to_string() }),
+    };
+    let allowed = hooks.addresses();
+    let mut out: Vec<PoolSpec> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let r: V4Record = serde_json::from_str(line)
+            .map_err(|e| InventoryError::Parse { path: shown.clone(), line: i + 1, detail: e.to_string() })?;
+        let key = V4Key { pool_id: r.pool_id, fee: r.fee, tick_spacing: r.tick_spacing, hooks: r.hooks };
+        let pool = key_address(r.pool_id);
+        if let Some(why) = refusal(&key, r.currency0, r.currency1, &allowed) {
+            tracing::warn!(pool_id = %r.pool_id, why, "a v4 pool refused");
+            continue;
+        }
+        let depth = r.hub_usd_liquidity.unwrap_or(0.0);
+        if r.fee > filter.max_fee_ppm || (depth < filter.min_depth_usd && !include.contains(&pool)) {
+            continue;
+        }
+        if out.iter().any(|s| s.pool == pool) {
+            tracing::warn!(pool_id = %r.pool_id, "two v4 pools share a key address: dropped");
+            continue;
+        }
+        out.push(PoolSpec {
+            pool,
+            venue: Venue::UniswapV4,
+            token0: r.currency0,
+            token1: r.currency1,
+            fee_ppm: r.fee,
+            depth_usd: depth,
+            v4: Some(key),
+        });
     }
     Ok(out)
 }

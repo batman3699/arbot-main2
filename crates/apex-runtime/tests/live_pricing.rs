@@ -44,6 +44,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, l: u128) -> PoolSn
             token1: USDC,
             fee_ppm,
             depth_usd: 5_000_000.0,
+            v4: None,
         },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(tick).unwrap(),
@@ -694,7 +695,7 @@ const AERO_R0: u128 = 1_823_383_892_520_317_644_689;
 fn mixed(uni_tick: i32, r1: u128) -> PoolBook {
     use apex_runtime::live::cp::{self, Loaded, Reserves};
     let reserves = Reserves { reserve0: U256::from(AERO_R0), reserve1: U256::from(r1) };
-    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6, v4: None };
     let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };
     let aero = cp::snapshot(&spec, loaded, alloy_primitives::B256::ZERO, 100);
     PoolBook::from_snapshots(

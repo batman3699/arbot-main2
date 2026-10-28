@@ -514,7 +514,14 @@ async fn armed_moves_seed() -> ExitCode {
     let pairs: Vec<(alloy_primitives::Address, alloy_primitives::Address)> =
         targets.iter().flat_map(|t| t.routes.iter()).flat_map(|r| [(r.pools[0], r.pools[1]), (r.pools[1], r.pools[0])]).collect();
     let venues = apex_runtime::live::inventory::Venue::ALL.to_vec();
-    let pools: Vec<alloy_primitives::Address> = match apex_runtime::shadow::universe(&c.inventory, &venues, c.universe.filter(), &include) {
+    let hooks = match c.universe.hooks() {
+        Ok(h) => h,
+        Err(e) => {
+            error!(error = %e, "the v4 hook allowlist did not load");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pools: Vec<alloy_primitives::Address> = match apex_runtime::shadow::universe(&c.inventory, &venues, c.universe.filter(), &include, &hooks) {
         Ok(specs) => specs.iter().map(|s| s.pool).collect(),
         Err(e) => {
             error!(error = %e, "the inventory did not load");

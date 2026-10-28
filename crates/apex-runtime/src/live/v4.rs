@@ -16,7 +16,9 @@
 //! so every address-keyed map holds it as it holds any other pool.
 
 use alloy_primitives::{address, keccak256, Address, B256, U256};
-use std::collections::BTreeSet;
+use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 /// Uniswap v4's PoolManager on Base.
 pub const POOL_MANAGER: Address = address!("498581fF718922c3f8e6A244956aF099B2652b2b");
@@ -128,3 +130,43 @@ pub fn refusal(key: &V4Key, currency0: Address, currency1: Address, allowed_hook
     }
     None
 }
+
+/// The hooks a v4 pool may carry: each reviewed by hand, and its code hash at
+/// review, so a hook whose code changes is refused until reviewed again
+/// (`ops/v4-hooks.base.json`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HookAllowlist {
+    pub hooks: BTreeMap<Address, B256>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookFile {
+    hooks: Vec<HookEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookEntry {
+    address: Address,
+    code_hash: B256,
+    #[allow(dead_code)]
+    name: String,
+    #[allow(dead_code)]
+    reason: String,
+    #[allow(dead_code)]
+    reviewed: String,
+}
+
+impl HookAllowlist {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let file: HookFile = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Self { hooks: file.hooks.into_iter().map(|h| (h.address, h.code_hash)).collect() })
+    }
+
+    pub fn addresses(&self) -> BTreeSet<Address> {
+        self.hooks.keys().copied().collect()
+    }
+}
+

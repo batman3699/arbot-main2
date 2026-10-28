@@ -39,7 +39,7 @@ const L: u128 = 1_400_000_000_000_000_000;
 /// One position of 7 over `[-199_000, -196_000)`, read with gross at block 100.
 fn snapshot() -> PoolSnapshot {
     PoolSnapshot {
-        spec: PoolSpec { pool: POOL, venue: Venue::UniswapV3, token0: WETH, token1: USDC, fee_ppm: 500, depth_usd: 5_800_000.0 },
+        spec: PoolSpec { pool: POOL, venue: Venue::UniswapV3, token0: WETH, token1: USDC, fee_ppm: 500, depth_usd: 5_800_000.0, v4: None },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(TICK).unwrap(),
             liquidity: L,
@@ -329,7 +329,7 @@ async fn applied_in_place_the_book_matches_a_fresh_read() {
     // A few blocks back: a load-balanced public endpoint's nodes lag each other.
     let head = reads.head().await.unwrap() - 5;
     let from = head - 1_800;
-    let weth_usdc = |pool, venue, fee_ppm| PoolSpec { pool, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 0.0 };
+    let weth_usdc = |pool, venue, fee_ppm| PoolSpec { pool, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 0.0, v4: None };
     let mut positions = 0;
     for spec in [
         weth_usdc(POOL, Venue::UniswapV3, 500),

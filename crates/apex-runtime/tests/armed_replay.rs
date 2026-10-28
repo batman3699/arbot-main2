@@ -32,7 +32,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, every: i32) -> Poo
         t += every;
     }
     PoolSnapshot {
-        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 5_000_000.0 },
+        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 5_000_000.0, v4: None },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(tick).unwrap(),
             liquidity: L,

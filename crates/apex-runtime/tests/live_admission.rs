@@ -43,7 +43,7 @@ const FLOOR: UniverseFilter = UniverseFilter { max_fee_ppm: 3_000, min_depth_usd
 fn pool(addr: Address, venue: Venue, token1: Address, depth_usd: f64) -> PoolSnapshot {
     PoolSnapshot {
         // The inventory's fee is not the chain's: the record must take the chain's.
-        spec: PoolSpec { pool: addr, venue, token0: WETH, token1, fee_ppm: 3_000, depth_usd },
+        spec: PoolSpec { pool: addr, venue, token0: WETH, token1, fee_ppm: 3_000, depth_usd, v4: None },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(-197_350).unwrap(),
             liquidity: 1_400_000_000_000_000_000,

@@ -41,7 +41,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, spacing: i32) -> P
     let lower = (tick - 2_000) / spacing * spacing;
     let upper = (tick + 2_000) / spacing * spacing;
     PoolSnapshot {
-        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 5e6 },
+        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 5e6, v4: None },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(tick).unwrap(),
             liquidity: L,
@@ -127,7 +127,7 @@ fn aero(r1: u128) -> PoolSnapshot {
         reserve0: ethers_core::types::U256::from(1_823_383_892_520_317_644_689u128),
         reserve1: ethers_core::types::U256::from(r1),
     };
-    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6, v4: None };
     let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };
     cp::snapshot(&spec, loaded, B256::ZERO, 100)
 }
@@ -137,6 +137,7 @@ fn kind(v: Venue) -> HopKind {
         Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => HopKind::UniswapV3Style,
         Venue::PancakeV3 => HopKind::PancakeV3,
         Venue::AerodromeV2 => HopKind::AerodromeV2,
+        Venue::UniswapV4 => unreachable!("v1's plan has no v4 hop"),
     }
 }
 

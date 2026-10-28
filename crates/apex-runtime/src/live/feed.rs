@@ -82,6 +82,9 @@ pub const PANCAKE_SWAP: B256 = b256!("19b47279256b2a23a1665c810c8d55a1758940ee09
 pub const MINT: B256 = b256!("7a53080ba414158be7ec69b987b5fb7d07dee101fe85488f0853ae16239d0bde");
 /// `Burn(address,int24,int24,uint128,uint256,uint256)`
 pub const BURN: B256 = b256!("0c396cd989a39f4459b5fa1aed6a9a8dcdbc45908acfd67e028cd568da98982c");
+/// Uniswap v4's `Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)`,
+/// from PoolManager, the pool ID in topic 1 (R37).
+pub const V4_SWAP: B256 = b256!("40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f");
 /// Aerodrome v2's `Sync(uint256,uint256)`: a volatile pool's reserves after
 /// every swap, mint and burn — its whole state (R24).
 pub const SYNC: B256 = b256!("cf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a");
@@ -119,6 +122,7 @@ pub const fn swap_topic(venue: Venue) -> B256 {
         Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => SWAP,
         Venue::PancakeV3 => PANCAKE_SWAP,
         Venue::AerodromeV2 => SYNC,
+        Venue::UniswapV4 => V4_SWAP,
     }
 }
 

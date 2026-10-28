@@ -109,7 +109,7 @@ async fn replay_one(reads: &ChainReads, rpc: &dyn RpcTransport, config: &ShadowC
     let fire = verdict.fire.as_ref().ok_or("the verdict has no fire")?;
     let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
     let set: BTreeSet<Address> = pools.iter().copied().collect();
-    let specs = inventory::load(&config.inventory, config.universe.filter(), &set).map_err(|e| e.to_string())?;
+    let specs = inventory::load(&config.inventory, config.universe.filter(), &set, &config.universe.hooks()?).map_err(|e| e.to_string())?;
     let logs = get_logs(rpc, &set, fire.block, fire.block).await?;
     let snap = book_after(reads, &specs, &pools, fire.block, fire.tx_index, &logs).await?;
     let (_, cycles) = frontier::build(ChainId::BASE, WETH, &snap);

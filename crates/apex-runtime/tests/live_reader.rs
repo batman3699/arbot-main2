@@ -111,7 +111,7 @@ fn node() -> Arc<Node> {
 
 fn pool(addr: Address, venue: Venue, tick: i32) -> PoolSnapshot {
     PoolSnapshot {
-        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), fee_ppm: 500, depth_usd: 5e6 },
+        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), fee_ppm: 500, depth_usd: 5e6, v4: None },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(tick).unwrap(),
             liquidity: 1_400_000_000_000_000_000,

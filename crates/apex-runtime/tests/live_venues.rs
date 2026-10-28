@@ -96,6 +96,6 @@ fn the_inventory_takes_volatile_aerodrome_records_only() {
     let lines = [rec(1, Some(false)), rec(2, Some(true)), rec(3, None)];
     std::fs::write(dir.path().join("aerodrome_v2").join("pools.jsonl"), lines.join("\n")).unwrap();
     let filter = UniverseFilter { max_fee_ppm: 3_000, min_depth_usd: 100_000.0 };
-    let got: Vec<u8> = inventory::load(dir.path(), filter, &std::collections::BTreeSet::new()).unwrap().iter().map(|s| s.pool.as_slice()[19]).collect();
+    let got: Vec<u8> = inventory::load(dir.path(), filter, &std::collections::BTreeSet::new(), &apex_runtime::live::v4::HookAllowlist::default()).unwrap().iter().map(|s| s.pool.as_slice()[19]).collect();
     assert_eq!(got, vec![1]);
 }

@@ -244,7 +244,7 @@ pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
     let pools: BTreeSet<Address> = due.iter().flat_map(|a| a.pools.iter().filter_map(|p| p.parse().ok())).collect();
     // R36: an armed pool may sit below the floor (a census target): every pool
     // that was armed is read whatever its depth.
-    let specs = inventory::load(&config.inventory, config.universe.filter(), &pools).map_err(|e| e.to_string())?;
+    let specs = inventory::load(&config.inventory, config.universe.filter(), &pools, &config.universe.hooks()?).map_err(|e| e.to_string())?;
     let venues: BTreeMap<Address, Venue> = specs.iter().map(|s| (s.pool, s.venue)).collect();
     let from = due.iter().map(|a| a.armed_block + 1).min().unwrap_or(head);
     let to = due.iter().map(|a| a.to_block).max().unwrap_or(head);

@@ -19,7 +19,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32) -> PoolSnapshot {
     let lower = (tick - 2_000) / spacing * spacing;
     let upper = (tick + 2_000) / spacing * spacing;
     PoolSnapshot {
-        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 5_000_000.0 },
+        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 5_000_000.0, v4: None },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(tick).unwrap(),
             liquidity: L,
@@ -472,7 +472,7 @@ fn a_pass_that_left_slots_waiting_is_followed_at_once() {
 fn an_arm_closing_on_aerodrome_asks_for_its_output() {
     use apex_runtime::live::cp::{self, Loaded, Reserves};
     const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
-    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6, v4: None };
     // Uniswap's price at tick −197,350.
     let reserves = Reserves {
         reserve0: U256::from(1_823_383_892_520_317_644_689u128),

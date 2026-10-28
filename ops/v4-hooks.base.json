@@ -1,0 +1,11 @@
+{
+  "hooks": [
+    {
+      "address": "0xB0b24B89dB0dafbE43C5b40226b63A179f592880",
+      "code_hash": "0xdb992c225ee2523445c10a64cf01daa3bd6800d97abd94752be7ab2328aff659",
+      "name": "V4AlphaHook",
+      "reason": "beforeSwap is a view that reverts until the pool has started; no delta, no fee override (verified source on Basescan; permission bits 0x2880: before-initialize, before-add-liquidity, before-swap)",
+      "reviewed": "2026-10-28, Task 8.5 R37"
+    }
+  ]
+}

@@ -48,6 +48,8 @@ pub struct PerVenue {
     pub slipstream_v3: u64,
     pub pancake_v3: u64,
     pub aerodrome_v2: u64,
+    /// Uniswap v4 (R37), inside PoolManager's unlock.
+    pub uniswap_v4: u64,
 }
 
 impl PerVenue {
@@ -58,6 +60,7 @@ impl PerVenue {
             Venue::SlipstreamV3 => self.slipstream_v3,
             Venue::PancakeV3 => self.pancake_v3,
             Venue::AerodromeV2 => self.aerodrome_v2,
+            Venue::UniswapV4 => self.uniswap_v4,
         }
     }
 }
@@ -153,6 +156,9 @@ pub const MEASURED: SettlementGas = SettlementGas {
         // override-funded account, 2026-10-09. Verification check 4 re-measures
         // it through the executor.
         aerodrome_v2: 266_500,
+        // R37: v4 runs only through LeanExecutor2, so it has no Phase 5
+        // figure; LEAN's stands in.
+        uniswap_v4: 287_500,
     },
     // Aerodrome v2 crosses no ticks.
     crossing_down: PerVenue {
@@ -161,6 +167,8 @@ pub const MEASURED: SettlementGas = SettlementGas {
         slipstream_v3: 43_400,
         pancake_v3: 32_100,
         aerodrome_v2: 0,
+        // R37: v4's swap loop is v3's; its crossings are taken as v3's.
+        uniswap_v4: 21_300,
     },
     crossing_up: PerVenue {
         uniswap_v3: 27_200,
@@ -168,6 +176,7 @@ pub const MEASURED: SettlementGas = SettlementGas {
         slipstream_v3: 48_300,
         pancake_v3: 36_300,
         aerodrome_v2: 0,
+        uniswap_v4: 27_200,
     },
     word: 0,
     // Twice the most any recorded trade needed (11,800).
@@ -179,6 +188,7 @@ pub const MEASURED: SettlementGas = SettlementGas {
         pancake_v3: 32_100 + 3 * ZERO_SLOT_PREMIUM,
         // It crosses no ticks.
         aerodrome_v2: 0,
+        uniswap_v4: 21_300 + 2 * ZERO_SLOT_PREMIUM,
     },
     // A cold read of the next word (2,100) and a loop of the swap.
     word_ceiling: 10_000,
@@ -205,6 +215,10 @@ pub const LEAN: SettlementGas = SettlementGas {
         slipstream_v3: 256_000,
         pancake_v3: 126_300,
         aerodrome_v2: 168_400,
+        // R37, `test/fork/LeanExecutor2Fork.t.sol` at block 53,155,787: AXIS's
+        // hooked pool then v3 under PoolManager's loan, 403,479 gas, less v3's
+        // 116,000. Provisional: Task 8 of the R37 plan settles it.
+        uniswap_v4: 287_500,
     },
     ..MEASURED
 };

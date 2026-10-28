@@ -26,6 +26,9 @@ pub const fn layout(v: Venue) -> Layout {
             Layout { price_slot: Some(6), liquidity_slot: Some(16), reserve_slots: None }
         }
         Venue::AerodromeV2 => Layout { price_slot: None, liquidity_slot: None, reserve_slots: Some((20, 21)) },
+        // A v4 pool's words are PoolManager's, at slots of its own (R37,
+        // Task 12): until then none, so `verify_layouts` leaves it unarmed.
+        Venue::UniswapV4 => Layout { price_slot: None, liquidity_slot: None, reserve_slots: None },
     }
 }
 

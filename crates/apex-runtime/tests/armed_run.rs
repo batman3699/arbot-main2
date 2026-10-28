@@ -313,6 +313,7 @@ fn read_pool() -> apex_runtime::live::book::PoolSnapshot {
             token1: address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
             fee_ppm: 500,
             depth_usd: 5_000_000.0,
+            v4: None,
         },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(tick).unwrap(),

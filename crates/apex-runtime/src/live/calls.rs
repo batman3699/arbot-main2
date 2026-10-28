@@ -140,6 +140,8 @@ pub fn lean_hop(leg: &Leg, quote: U256, min_out: U256) -> Result<LeanHop, String
         Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => (HopKind::UniswapV3Style, min_out),
         Venue::PancakeV3 => (HopKind::PancakeV3, min_out),
         Venue::AerodromeV2 => (HopKind::AerodromeV2, quote),
+        // v1's plan has no v4 hop: only LeanExecutor2 runs one (R37).
+        Venue::UniswapV4 => return Err("a v4 hop needs LeanExecutor2's plan".into()),
     };
     let min_out = u128::try_from(min_out).map_err(|_| format!("a hop's minimum {min_out} does not fit 128 bits"))?;
     Ok(LeanHop { kind, pool: leg.pool, token_out: leg.token_out, min_out })

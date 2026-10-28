@@ -163,7 +163,7 @@ fn the_twap_divides_as_solidity_does() {
 
 fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, dynamic_fee: Option<DynamicFee>) -> PoolSnapshot {
     PoolSnapshot {
-        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 5e6 },
+        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 5e6, v4: None },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(tick).unwrap(),
             liquidity: 1_400_000_000_000_000_000,

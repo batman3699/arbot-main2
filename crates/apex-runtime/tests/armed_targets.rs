@@ -69,7 +69,7 @@ fn inventory_dir(records: &[(u8, f64)]) -> tempfile::TempDir {
 
 fn loaded(dir: &Path, include: &BTreeSet<Address>) -> Vec<u8> {
     let mut got: Vec<u8> =
-        inventory::load(dir, UniverseFilter::default(), include).unwrap().iter().map(|s| s.pool.as_slice()[19]).collect();
+        inventory::load(dir, UniverseFilter::default(), include, &apex_runtime::live::v4::HookAllowlist::default()).unwrap().iter().map(|s| s.pool.as_slice()[19]).collect();
     got.sort();
     got
 }
@@ -86,7 +86,7 @@ fn a_target_pool_below_the_floor_is_admitted_and_others_are_not() {
 fn a_target_pool_without_an_inventory_record_is_counted_not_admitted() {
     let dir = inventory_dir(&[(1, 5e3), (3, 1e6)]);
     let t = load(&targets_json("2026-10-24T01:10:00Z", true, &route(p(1), p(9), None), "1"), GENERATED).unwrap();
-    let specs = inventory::load(dir.path(), UniverseFilter::default(), &t.pools()).unwrap();
+    let specs = inventory::load(dir.path(), UniverseFilter::default(), &t.pools(), &apex_runtime::live::v4::HookAllowlist::default()).unwrap();
     assert_eq!(specs.iter().map(|s| s.pool.as_slice()[19]).collect::<BTreeSet<_>>(), BTreeSet::from([1, 3]));
     assert_eq!(apex_runtime::shadow::targets_missing(&t, &specs), 1, "pool 9 has no record");
 }
@@ -149,7 +149,7 @@ fn armed(mode: ArmedMode, targets: Option<&Path>) -> ArmedConfig {
 
 fn snapshot(addr: Address, venue: Venue) -> PoolSnapshot {
     PoolSnapshot {
-        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm: 500, depth_usd: 5e6 },
+        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm: 500, depth_usd: 5e6, v4: None },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(-197_350).unwrap(),
             liquidity: 1_400_000_000_000_000_000,

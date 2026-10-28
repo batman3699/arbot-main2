@@ -38,6 +38,7 @@ fn book() -> PoolBook {
             token1: USDC,
             fee_ppm: 500,
             depth_usd: 5_800_000.0,
+            v4: None,
         },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(TICK).unwrap(),
@@ -806,7 +807,7 @@ fn sync_log(r0: u128, r1: u128, block: u64, index: u64) -> RawLog {
 /// One volatile WETH/USDC pool: 1,000 WETH against 2,500,000 USDC.
 fn aero_book() -> PoolBook {
     use apex_runtime::live::cp::{self, Loaded, Reserves};
-    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6, v4: None };
     let reserves = Reserves {
         reserve0: EU256::from(1_000u128 * 10u128.pow(18)),
         reserve1: EU256::from(2_500_000u128 * 10u128.pow(6)),

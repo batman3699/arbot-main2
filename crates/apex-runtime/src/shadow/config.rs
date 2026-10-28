@@ -150,18 +150,30 @@ pub struct SignerConfig {
 /// Which pools the run may price, by the inventory's measured fee and depth
 /// (R20). The census's 500 ppm left out Base's deepest WETH/USDC and
 /// WETH/cbBTC pools, where the large swaps behind every real gap land.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UniverseConfig {
     /// The highest fee a pool may charge, in ppm.
     pub max_fee_ppm: u32,
     /// The least a pool must hold, in whole US dollars.
     pub min_depth_usd: u64,
+    /// R37: the reviewed v4 hooks (`ops/v4-hooks.base.json`). None: no hooked
+    /// v4 pool is admitted.
+    #[serde(default)]
+    pub v4_hooks: Option<std::path::PathBuf>,
 }
 
 impl UniverseConfig {
     pub fn filter(&self) -> UniverseFilter {
         UniverseFilter { max_fee_ppm: self.max_fee_ppm, min_depth_usd: self.min_depth_usd as f64 }
+    }
+
+    /// The v4 hooks allowed: the file's, or none.
+    pub fn hooks(&self) -> Result<crate::live::v4::HookAllowlist, String> {
+        match &self.v4_hooks {
+            Some(path) => crate::live::v4::HookAllowlist::load(path),
+            None => Ok(crate::live::v4::HookAllowlist::default()),
+        }
     }
 }
 

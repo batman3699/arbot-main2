@@ -171,7 +171,7 @@ fn the_inventory_applies_the_census_filters() {
         json!({"pool":"0x0000000000000000000000000000000000000009","token0":a,"token1":b,"fee":200,"hub_usd_liquidity":3e6}),
     ]);
     write_inventory(dir.path(), "aerodrome_v2", &[]);
-    let specs = inventory::load(dir.path(), UniverseFilter::default(), &std::collections::BTreeSet::new()).unwrap();
+    let specs = inventory::load(dir.path(), UniverseFilter::default(), &std::collections::BTreeSet::new(), &apex_runtime::live::v4::HookAllowlist::default()).unwrap();
     let pools: Vec<u8> = specs.iter().map(|s| s.pool.as_slice()[19]).collect();
     assert_eq!(
         pools,
@@ -193,7 +193,7 @@ fn a_missing_inventory_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     write_inventory(dir.path(), "uniswap_v3", &[]);
     write_inventory(dir.path(), "aerodrome_slipstream", &[]);
-    assert!(matches!(inventory::load(dir.path(), UniverseFilter::default(), &std::collections::BTreeSet::new()), Err(inventory::InventoryError::Io { .. })));
+    assert!(matches!(inventory::load(dir.path(), UniverseFilter::default(), &std::collections::BTreeSet::new(), &apex_runtime::live::v4::HookAllowlist::default()), Err(inventory::InventoryError::Io { .. })));
 }
 
 // ------------------------------------------------------------------ the book
@@ -301,6 +301,7 @@ fn spec() -> PoolSpec {
         token1: USDC,
         fee_ppm: 500,
         depth_usd: 5_800_000.0,
+        v4: None,
     }
 }
 
@@ -1069,7 +1070,7 @@ fn get_fee_encodes_as_cast_does() {
 }
 
 fn aero_spec() -> PoolSpec {
-    PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4_900_000.0 }
+    PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4_900_000.0, v4: None }
 }
 
 fn aero_healthy(node: &Scripted) {

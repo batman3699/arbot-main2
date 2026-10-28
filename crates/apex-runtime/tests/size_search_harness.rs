@@ -167,7 +167,7 @@ async fn both_size_searches_over_the_live_universe() {
     let reads = ChainReads::new(Arc::clone(&rpc));
     std::env::set_current_dir(&root).unwrap();
     let venues = [Venue::UniswapV3, Venue::Slipstream, Venue::PancakeV3, Venue::SlipstreamV3, Venue::AerodromeV2];
-    let specs = apex_runtime::shadow::universe(&config.inventory, &venues, config.universe.filter(), &std::collections::BTreeSet::new()).unwrap();
+    let specs = apex_runtime::shadow::universe(&config.inventory, &venues, config.universe.filter(), &std::collections::BTreeSet::new(), &apex_runtime::live::v4::HookAllowlist::default()).unwrap();
     let (book, unloaded) = PoolBook::load(&reads, &specs, BLOCK).await.unwrap();
     book.refresh_twaps(&reads, BLOCK).await.unwrap();
     book.refresh_cp_fees(&reads, BLOCK).await.unwrap();

@@ -307,8 +307,9 @@ pub fn universe(
     venues: &[Venue],
     filter: UniverseFilter,
     include: &std::collections::BTreeSet<Address>,
+    hooks: &crate::live::v4::HookAllowlist,
 ) -> Result<Vec<PoolSpec>, inventory::InventoryError> {
-    let specs: Vec<PoolSpec> = inventory::load(dir, filter, include)?
+    let specs: Vec<PoolSpec> = inventory::load(dir, filter, include, hooks)?
         .into_iter()
         .filter(|s| venues.contains(&s.venue))
         .collect();
@@ -532,7 +533,8 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     let now_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     let targets = load_targets(&config.armed, now_unix).map_err(ShadowError::Boot)?;
     let target_pools = targets.as_ref().map(Targets::pools).unwrap_or_default();
-    let specs = universe(&config.inventory, &venues, config.universe.filter(), &target_pools)
+    let hooks = config.universe.hooks().map_err(|e| ShadowError::Boot(format!("the v4 hook allowlist: {e}")))?;
+    let specs = universe(&config.inventory, &venues, config.universe.filter(), &target_pools, &hooks)
         .map_err(|e| boot_err("the inventory", e))?;
     let missing = targets.as_ref().map_or(0, |t| targets_missing(t, &specs));
     if let Some(t) = &targets {

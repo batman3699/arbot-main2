@@ -19,7 +19,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32) -> PoolSnapshot {
     let lower = (tick - 2_000) / spacing * spacing;
     let upper = (tick + 2_000) / spacing * spacing;
     PoolSnapshot {
-        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 5_000_000.0 },
+        spec: PoolSpec { pool: addr, venue, token0: WETH, token1: USDC, fee_ppm, depth_usd: 5_000_000.0, v4: None },
         state: ClPoolState {
             sqrt_price_x96: get_sqrt_ratio_at_tick(tick).unwrap(),
             liquidity: L,
@@ -107,7 +107,7 @@ fn an_armed_aerodrome_closing_hop_is_asked_for_the_armed_output() {
     use apex_exec::call::CallPlan;
     use apex_runtime::live::cp::{self, Loaded, Reserves};
     const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
-    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6, v4: None };
     let reserves = Reserves {
         reserve0: U256::from(1_823_383_892_520_317_644_689u128),
         reserve1: U256::from(4_541_987_609_188u128),
@@ -198,7 +198,7 @@ fn a_fire_closing_on_aerodrome_grosses_exactly_the_armed_output() {
     use apex_runtime::live::cp::{self, Loaded, Reserves};
     use apex_runtime::live::pricing::LiveCycle;
     const AERO: Address = address!("cDAC0d6c6C59727a65F871236188350531885C43");
-    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6 };
+    let spec = PoolSpec { pool: AERO, venue: Venue::AerodromeV2, token0: WETH, token1: USDC, fee_ppm: 3_000, depth_usd: 4.9e6, v4: None };
     // Reserves pricing WETH ~1% above the Uniswap pool: buying it back pays.
     let reserves = Reserves { reserve0: U256::from(1_823_383_892_520_317_644_689u128), reserve1: U256::from(4_600_000_000_000u128) };
     let loaded = Loaded { reserves, fee_ppm: 3_000, decimals: (18, 6), factory: Venue::AerodromeV2.factory() };

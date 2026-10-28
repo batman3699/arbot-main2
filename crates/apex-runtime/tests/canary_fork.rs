@@ -156,8 +156,8 @@ async fn a_real_trade_is_sent_settled_and_reconciled_to_the_wei() {
             .unwrap(),
     );
     let specs = vec![
-        PoolSpec { pool: UNI_500, venue: Venue::UniswapV3, token0: WETH, token1: USDC, fee_ppm: 500, depth_usd: 1e7 },
-        PoolSpec { pool: SLIP_100, venue: Venue::Slipstream, token0: WETH, token1: USDC, fee_ppm: 600, depth_usd: 1e7 },
+        PoolSpec { pool: UNI_500, venue: Venue::UniswapV3, token0: WETH, token1: USDC, fee_ppm: 500, depth_usd: 1e7, v4: None },
+        PoolSpec { pool: SLIP_100, venue: Venue::Slipstream, token0: WETH, token1: USDC, fee_ppm: 600, depth_usd: 1e7, v4: None },
     ];
     let (book, unloaded) = PoolBook::load(&ChainReads::new(Arc::clone(&public)), &specs, fork_block).await.unwrap();
     assert!(unloaded.is_empty(), "{unloaded:?}");
