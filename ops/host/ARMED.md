@@ -251,3 +251,53 @@ W stays 10 s, now 50 blocks, inside Base's 60 s bound limit.
 
 Until the configuration matches, the cadence guard stops every send by
 itself: the measured cadence would be 200 ms against a configured 2,000.
+
+## 3. R37: the second executor (`LeanExecutor2`)
+
+`LeanExecutor2` adds a start token (WETH or USDC), Uniswap v4 hops, and
+PoolManager's flash accounting as a lender. The design is
+`docs/superpowers/specs/2026-10-28-v4-usdc-armed-lane-design.md`. It is
+deployed once, by the owner. Then every arm uses it, and the current
+executor keeps only the halted reactive lane.
+
+Nothing here happens before gate A″ passes and the operator approves the
+deploy (the spec's phase 5).
+
+### a. Deploy (the owner)
+
+```
+$ forge clean
+$ forge script script/DeployLeanExecutor2.s.sol --sig "run(address,address)" 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3 0xCB436Ba3acb945b3fc8EE6345857262584356595 --rpc-url https://mainnet.base.org --sender 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3
+$ (the same, with --broadcast --interactive)
+```
+
+- It prints the address and the runtime code hash, which become
+  `armed.executor2.address` and `.code_hash`.
+- The script refuses another chain. It checks the roles and Morpho's USDC
+  approval before anything is broadcast.
+- The dry run on 2026-10-29 simulated about 2.53M gas, roughly 0.000027 ETH,
+  and code hash `0xb67e7dd2…c7e`. A rebuilt contract changes the hash: use
+  the broadcast's own.
+
+### b. Authorize the 16 senders on it (the owner)
+
+Set `executor` in `ops/armed-senders.json` to the new address. Then dry-run
+and broadcast `AuthorizeArmedSenders.s.sol` exactly as in §1c, and check that
+every sender reads true. The senders are the same 16, so no new keys are
+needed. Funding them past 0.002 ETH is the operator's decision 2.
+
+### c. Point the runtime at it (the host)
+
+- In both `ops/canary.base.yaml` and `ops/shadow.base.yaml`:
+  - set `armed.executor2.address` and `armed.executor2.code_hash`;
+  - remove `armed.executor2.runtime_code`, the pre-deploy simulation's state
+    override.
+- Deploy those (README §7) and restart.
+- The boot checks the code hash. A mismatch arms nothing.
+
+### d. Stopping it
+
+As in §2:
+- touch the kill file first;
+- trip the circuit or revoke on `LeanExecutor2` itself;
+- revoke on the old executor too, if a sender is still allowed there.
