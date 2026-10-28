@@ -50,6 +50,7 @@
 use crate::commitment::PlanV2;
 use crate::encode::start_v2_calldata;
 use crate::lean::{LeanPlan, SignedLeanPlan};
+use crate::lean2::{Lean2Plan, SignedLean2Plan};
 use crate::sign::SignedPlan;
 use alloy_primitives::{Address, B256};
 
@@ -59,6 +60,8 @@ use alloy_primitives::{Address, B256};
 pub enum CallPlan {
     V2(PlanV2),
     Lean(LeanPlan),
+    /// R37: the second lean executor's plan.
+    Lean2(Lean2Plan),
 }
 
 /// One executor call on one chain: `startV2(plan)` or `run(plan)`.
@@ -93,6 +96,18 @@ impl ExecutorCall {
             chain_id: checked.block_chain_id(),
             commitment: checked.commitment(),
             plan: CallPlan::Lean(checked.plan().clone()),
+            data: checked.calldata().to_vec(),
+        }
+    }
+
+    /// The second lean executor's call (R37), from a plan whose off-chain
+    /// commitment was recomputed and matched.
+    pub fn from_lean2(checked: SignedLean2Plan) -> Self {
+        Self {
+            to: checked.executor(),
+            chain_id: checked.block_chain_id(),
+            commitment: checked.commitment(),
+            plan: CallPlan::Lean2(checked.plan().clone()),
             data: checked.calldata().to_vec(),
         }
     }

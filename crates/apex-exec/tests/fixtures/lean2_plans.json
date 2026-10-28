@@ -1,0 +1,154 @@
+{
+  "_provenance": "Task 8.5 R37. Written 2026-10-28 by an independent packer (Python int.to_bytes, big-endian) from the fields below, per the byte table in the R37 plan (header: lender, start, amount 16, deadline 5, min_profit 16; hop: kind, pool or hook 20, token_out 20, min_out 16, then for kind 3 fee 3 and tick_spacing 3, two's complement). apex_exec::lean2 (crates/apex-exec/tests/lean2_plan.rs) and LeanPlan2Codec (test/lean/Lean2PlanFixture.t.sol) are both held to it and NEITHER writes it. spacing_sign exists only to pin int24's sign: no v4 pool has a negative spacing.",
+  "names": [
+    "weth_morpho_v3_pancake",
+    "usdc_morpho_pancake_v3",
+    "usdc_pool_manager_v4_v3",
+    "usdc_pool_manager_v3_v4",
+    "weth_balancer_aerodrome",
+    "spacing_sign"
+  ],
+  "cases": {
+    "weth_morpho_v3_pancake": {
+      "lender": 1,
+      "start": 0,
+      "amount": "1500000000000000000",
+      "deadline": "1792133385",
+      "min_profit": "1",
+      "hops": [
+        {
+          "kind": 0,
+          "pool": "0xd0b53D9277642d899DF5C87A3966A349A798F224",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "min_out": "4031000000"
+        },
+        {
+          "kind": 1,
+          "pool": "0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38",
+          "token_out": "0x4200000000000000000000000000000000000006",
+          "min_out": "1500000000000000001"
+        }
+      ],
+      "hop_count": 2,
+      "encoded": "0x0100000000000000000014d1120d7b160000006ad1c9090000000000000000000000000000000100d0b53d9277642d899df5c87a3966a349a798f224833589fcd6edb6e08f4c7c32d4f71b54bda02913000000000000000000000000f0442dc00172ab388e2e2f6facef59e3c3fa2c4e29011c2d384200000000000000000000000000000000000006000000000000000014d1120d7b160001"
+    },
+    "usdc_morpho_pancake_v3": {
+      "lender": 1,
+      "start": 1,
+      "amount": "5000000000",
+      "deadline": "1792133400",
+      "min_profit": "1",
+      "hops": [
+        {
+          "kind": 1,
+          "pool": "0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38",
+          "token_out": "0x4200000000000000000000000000000000000006",
+          "min_out": "1860000000000000000"
+        },
+        {
+          "kind": 0,
+          "pool": "0xd0b53D9277642d899DF5C87A3966A349A798F224",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "min_out": "5000000001"
+        }
+      ],
+      "hop_count": 2,
+      "encoded": "0x01010000000000000000000000012a05f200006ad1c918000000000000000000000000000000010172ab388e2e2f6facef59e3c3fa2c4e29011c2d384200000000000000000000000000000000000006000000000000000019d00c25323a000000d0b53d9277642d899df5c87a3966a349a798f224833589fcd6edb6e08f4c7c32d4f71b54bda029130000000000000000000000012a05f201"
+    },
+    "usdc_pool_manager_v4_v3": {
+      "lender": 2,
+      "start": 1,
+      "amount": "1000000000",
+      "deadline": "1792133500",
+      "min_profit": "1",
+      "hops": [
+        {
+          "kind": 3,
+          "pool": "0xb0b24b89DB0DafbE43c5B40226B63a179F592880",
+          "token_out": "0x5be75e3B0aFF5d1a042A5363Ae36acB1d6D755Ea",
+          "min_out": "3990000000000000000000",
+          "hooks": "0xb0b24b89DB0DafbE43c5B40226B63a179F592880",
+          "fee": 100,
+          "tick_spacing": 1
+        },
+        {
+          "kind": 0,
+          "pool": "0xe1bfc5ada1125718b53b2affc638ba9981f6070f",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "min_out": "1000000001"
+        }
+      ],
+      "hop_count": 2,
+      "encoded": "0x02010000000000000000000000003b9aca00006ad1c97c0000000000000000000000000000000103b0b24b89db0dafbe43c5b40226b63a179f5928805be75e3b0aff5d1a042a5363ae36acb1d6d755ea00000000000000d84c5f9412f098000000006400000100e1bfc5ada1125718b53b2affc638ba9981f6070f833589fcd6edb6e08f4c7c32d4f71b54bda029130000000000000000000000003b9aca01"
+    },
+    "usdc_pool_manager_v3_v4": {
+      "lender": 2,
+      "start": 1,
+      "amount": "250000000",
+      "deadline": "1792133600",
+      "min_profit": "7",
+      "hops": [
+        {
+          "kind": 0,
+          "pool": "0xe381d2ec7996d9fa1a72e461fb4470db9230f37a",
+          "token_out": "0x5be75e3B0aFF5d1a042A5363Ae36acB1d6D755Ea",
+          "min_out": "997000000000000000000"
+        },
+        {
+          "kind": 3,
+          "pool": "0x0000000000000000000000000000000000000000",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "min_out": "250000008",
+          "hooks": "0x0000000000000000000000000000000000000000",
+          "fee": 8200,
+          "tick_spacing": 82
+        }
+      ],
+      "hop_count": 2,
+      "encoded": "0x02010000000000000000000000000ee6b280006ad1c9e00000000000000000000000000000000700e381d2ec7996d9fa1a72e461fb4470db9230f37a5be75e3b0aff5d1a042a5363ae36acb1d6d755ea00000000000000360c2789aae8740000030000000000000000000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda029130000000000000000000000000ee6b288002008000052"
+    },
+    "weth_balancer_aerodrome": {
+      "lender": 0,
+      "start": 0,
+      "amount": "100000000000000000",
+      "deadline": "1792133700",
+      "min_profit": "1",
+      "hops": [
+        {
+          "kind": 0,
+          "pool": "0xd0b53D9277642d899DF5C87A3966A349A798F224",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "min_out": "268000000"
+        },
+        {
+          "kind": 2,
+          "pool": "0xcDAC0d6c6C59727a65F871236188350531885C43",
+          "token_out": "0x4200000000000000000000000000000000000006",
+          "min_out": "100000000000000001"
+        }
+      ],
+      "hop_count": 2,
+      "encoded": "0x00000000000000000000016345785d8a0000006ad1ca440000000000000000000000000000000100d0b53d9277642d899df5c87a3966a349a798f224833589fcd6edb6e08f4c7c32d4f71b54bda029130000000000000000000000000ff95b0002cdac0d6c6c59727a65f871236188350531885c4342000000000000000000000000000000000000060000000000000000016345785d8a0001"
+    },
+    "spacing_sign": {
+      "lender": 2,
+      "start": 1,
+      "amount": "1",
+      "deadline": "1",
+      "min_profit": "0",
+      "hops": [
+        {
+          "kind": 3,
+          "pool": "0xb0b24b89DB0DafbE43c5B40226B63a179F592880",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "min_out": "2",
+          "hooks": "0xb0b24b89DB0DafbE43c5B40226B63a179F592880",
+          "fee": 3000,
+          "tick_spacing": -1
+        }
+      ],
+      "hop_count": 1,
+      "encoded": "0x02010000000000000000000000000000000100000000010000000000000000000000000000000003b0b24b89db0dafbe43c5b40226b63a179f592880833589fcd6edb6e08f4c7c32d4f71b54bda0291300000000000000000000000000000002000bb8ffffff"
+    }
+  }
+}
