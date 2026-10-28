@@ -227,3 +227,114 @@ contract MockVault {
         require(LeanToken(tokens[0]).balanceOf(address(this)) >= before + fee, "not repaid");
     }
 }
+
+/// Uniswap v4's PoolKey and SwapParams, as PoolManager takes them.
+struct MockPoolKey {
+    address currency0;
+    address currency1;
+    uint24 fee;
+    int24 tickSpacing;
+    address hooks;
+}
+
+struct MockSwapParams {
+    bool zeroForOne;
+    int256 amountSpecified;
+    uint160 sqrtPriceLimitX96;
+}
+
+interface IUnlockCallbackMock {
+    function unlockCallback(bytes calldata data) external returns (bytes memory);
+}
+
+/// Task 8.5 R37: Uniswap v4's PoolManager, as its flash accounting behaves.
+/// Deltas are the caller's: `take` owes, `settle` pays what arrived since
+/// `sync`, `swap` owes its input and credits its output; `unlock` reverts
+/// unless every delta is back to zero. Storage only, so `vm.etch` can put it
+/// at PoolManager's address. Exact input only, at a fixed rate a direction.
+contract MockPoolManager {
+    error CurrencyNotSettled();
+    error ManagerLocked();
+
+    bool public unlocked;
+    mapping(address => int256) public delta;
+    uint256 public nonzeroDeltas;
+    address public synced;
+    uint256 public syncedReserves;
+    /// `tokenIn => tokenOut => (num, den)`.
+    mapping(address => mapping(address => uint256[2])) public rate;
+    MockPoolKey public lastKey;
+    uint256 public swaps;
+    /// A swap that reports its input as owed to the caller: a delta of the
+    /// wrong sign, which the executor must refuse.
+    bool public flipDelta;
+    /// A swap that reports its output as owed by the caller.
+    bool public negativeOut;
+
+    function setNegativeOut(bool n) external {
+        negativeOut = n;
+    }
+
+    function setRate(address tokenIn, address tokenOut, uint256 num, uint256 den) external {
+        rate[tokenIn][tokenOut] = [num, den];
+    }
+
+    function setFlipDelta(bool f) external {
+        flipDelta = f;
+    }
+
+    function unlock(bytes calldata data) external returns (bytes memory result) {
+        if (unlocked) revert ManagerLocked();
+        unlocked = true;
+        result = IUnlockCallbackMock(msg.sender).unlockCallback(data);
+        if (nonzeroDeltas != 0) revert CurrencyNotSettled();
+        unlocked = false;
+    }
+
+    function swap(MockPoolKey memory key, MockSwapParams memory params, bytes calldata) external returns (int256) {
+        if (!unlocked) revert ManagerLocked();
+        require(key.currency0 < key.currency1, "unsorted key");
+        require(params.amountSpecified < 0, "exact input only");
+        (address tokenIn, address tokenOut) =
+            params.zeroForOne ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
+        uint256[2] memory r = rate[tokenIn][tokenOut];
+        require(r[1] != 0, "no such pool");
+        lastKey = key;
+        swaps++;
+        uint256 amountIn = uint256(-params.amountSpecified);
+        uint256 out = amountIn * r[0] / r[1];
+        int128 owedIn = flipDelta ? int128(int256(amountIn)) : -int128(int256(amountIn));
+        _account(tokenIn, owedIn);
+        int128 credited = negativeOut ? -int128(int256(out)) : int128(int256(out));
+        _account(tokenOut, credited);
+        (int128 a0, int128 a1) = params.zeroForOne ? (owedIn, credited) : (credited, owedIn);
+        return (int256(a0) << 128) | int256(uint256(uint128(a1)));
+    }
+
+    function sync(address currency) external {
+        synced = currency;
+        syncedReserves = LeanToken(currency).balanceOf(address(this));
+    }
+
+    function settle() external payable returns (uint256 paid) {
+        if (!unlocked) revert ManagerLocked();
+        paid = LeanToken(synced).balanceOf(address(this)) - syncedReserves;
+        _account(synced, int128(int256(paid)));
+        synced = address(0);
+    }
+
+    function take(address currency, address to, uint256 amount) external {
+        if (!unlocked) revert ManagerLocked();
+        _account(currency, -int128(int256(amount)));
+        pay(currency, to, amount);
+    }
+
+    function _account(address currency, int128 d) private {
+        if (d == 0) return;
+        int256 before = delta[currency];
+        int256 next = before + d;
+        if (before == 0) nonzeroDeltas++;
+        if (next == 0) nonzeroDeltas--;
+        delta[currency] = next;
+    }
+}
