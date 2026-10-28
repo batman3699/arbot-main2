@@ -158,7 +158,7 @@ pub const MEASURED: SettlementGas = SettlementGas {
         aerodrome_v2: 266_500,
         // R37: v4 runs only through LeanExecutor2, so it has no Phase 5
         // figure; LEAN's stands in.
-        uniswap_v4: 287_500,
+        uniswap_v4: 175_200,
     },
     // Aerodrome v2 crosses no ticks.
     crossing_down: PerVenue {
@@ -215,10 +215,12 @@ pub const LEAN: SettlementGas = SettlementGas {
         slipstream_v3: 256_000,
         pancake_v3: 126_300,
         aerodrome_v2: 168_400,
-        // R37, `test/fork/LeanExecutor2Fork.t.sol` at block 53,155,787: AXIS's
-        // hooked pool then v3 under PoolManager's loan, 403,479 gas, less v3's
-        // 116,000. Provisional: Task 8 of the R37 plan settles it.
-        uniswap_v4: 287_500,
+        // R37, `test/fork/LeanExecutor2Fork.t.sol` at block 53,155,787, AXIS's
+        // hooked pool then v3 under PoolManager's loan (403,479 gas): the v4
+        // hop (swap 141,429 with the hook's 3,469, settle 11,012, take 39,014)
+        // plus half the trade's fixed cost (76,119), less the two ticks it
+        // crossed (`tests/live_v4_quote.rs`), rounded up to the next 100.
+        uniswap_v4: 175_200,
     },
     ..MEASURED
 };
