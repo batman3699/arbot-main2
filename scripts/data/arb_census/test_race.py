@@ -53,12 +53,26 @@ class Route(unittest.TestCase):
     def test_the_weth_in_pool_is_the_one_that_took_weth(self):
         a = Leg("0xh", 1, "uniswap_v3", "pa", {WETH: 100, T: -50})
         b = Leg("0xh", 1, "slipstream_5e7b", "pb", {T: 50, WETH: -103})
-        self.assertEqual(race.route_of([b, a]), ("pa", ["pb", "pa"], [WETH]))
+        self.assertEqual(race.route_of([b, a]), ("pa", ["pb", "pa"], [WETH], "pa"))
 
     def test_no_weth_in_without_exactly_one_pool_taking_weth(self):
         a = Leg("0xh", 1, "v", "pa", {U: 100, T: -50})
         b = Leg("0xh", 1, "v", "pb", {T: 50, U: -103})
         self.assertEqual(race.route_of([a, b])[0], None)
+
+    def test_route_of_names_the_pool_that_took_the_gain_token(self):
+        # R37: USDC into a v4 pool (keyed by its ID), T out; T into a v3
+        # pool, more USDC out. The start-in pool is the one that took USDC.
+        v4 = "0x" + "c1" * 32
+        a = Leg("0xh", 1, "uniswap_v4", v4, {U: 1_000, T: -50})
+        b = Leg("0xh", 1, "uniswap_v3", "pb", {T: 50, U: -1_003})
+        self.assertEqual(race.route_of([b, a]), (None, ["pb", v4], [U], v4))
+        # Two gain tokens, or two pools taking the one: no start-in pool.
+        c = Leg("0xh", 1, "uniswap_v3", "pc", {T: 50, U: -1_003, WETH: -1})
+        self.assertIsNone(race.route_of([a, c])[3])
+        d = Leg("0xh", 1, "uniswap_v3", "pd", {U: 10, T: -1})
+        e = Leg("0xh", 1, "uniswap_v3", "pe", {T: 51, U: -1_013})
+        self.assertIsNone(race.route_of([a, d, e])[3])
 
 
 class Denim(unittest.TestCase):

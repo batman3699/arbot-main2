@@ -364,12 +364,13 @@ pub fn load_targets(armed: &config::ArmedConfig, now_unix: u64) -> Result<Option
     }
 }
 
-/// R36: the cycles the arming engine arms: the targeted routes', WETH-in pool
-/// first; every cycle without targets (R26).
+/// R36: the cycles the arming engine arms: the targeted routes', start-in
+/// pool first, in each route's start token (R37); every cycle without targets
+/// (R26).
 pub fn armed_cycles(targets: Option<&Targets>, all: &BTreeMap<RouteId, Cycle>) -> BTreeMap<RouteId, Cycle> {
     match targets {
         None => all.clone(),
-        Some(t) => all.iter().filter(|(_, c)| t.has(c.legs[0].pool, c.legs[1].pool)).map(|(k, c)| (*k, c.clone())).collect(),
+        Some(t) => all.iter().filter(|(_, c)| t.has_route(c.start, c.legs[0].pool, c.legs[1].pool)).map(|(k, c)| (*k, c.clone())).collect(),
     }
 }
 

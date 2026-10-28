@@ -94,11 +94,15 @@ def trigger(history, arb_legs, share=SHARE):
 
 def route_of(legs):
     """(the pool that took WETH, when exactly one did; every leg's pool, in log
-    order; the tokens the trader gained, sorted). R36 keys routes on the first:
-    a flash swap's callback can log its second leg before its first."""
-    took = [l.pool for l in legs if l.deltas.get(V.WETH, 0) > 0]
+    order; the tokens the trader gained, sorted; the pool that took the sole
+    gain token, when there is one and exactly one pool took it). R36 keys
+    routes on the first, R37 on the last: a flash swap's callback can log its
+    second leg before its first."""
+    def took(token):
+        pools = [l.pool for l in legs if l.deltas.get(token, 0) > 0]
+        return pools[0] if len(pools) == 1 else None
     gain = sorted(k for k, x in detect.trader_change(legs).items() if x > 0)
-    return (took[0] if len(took) == 1 else None), [l.pool for l in legs], gain
+    return took(V.WETH), [l.pool for l in legs], gain, (took(gain[0]) if len(gain) == 1 else None)
 
 
 def block_offset(arb_block, trigger_block):
@@ -267,10 +271,10 @@ def _race_day(rpc, resolver, ledger, lo, hi, say):
                 if len(legs) >= 2 and detect.is_arbitrage(legs):
                     venues = sorted({x.venue for x in legs})
                     past = {g.pool: _decoded(history.get(g.pool, ()), resolver.meta) for g in legs}
-                    weth_in, pools, gain = route_of(legs)
+                    weth_in, pools, gain, start_in = route_of(legs)
                     arbs.append({"tx": tx, "block": blk, "txi": txi, "venues": venues, "category": category(venues),
                                  "hops": len(legs), "change": {k: x for k, x in detect.trader_change(legs).items() if x > 0},
-                                 "pools": pools, "weth_in": weth_in, "gain": gain,
+                                 "pools": pools, "weth_in": weth_in, "gain": gain, "start_in": start_in,
                                  "trigger": trigger(past, legs)})
             for pos, l in items:
                 k = V.pool_key(l)

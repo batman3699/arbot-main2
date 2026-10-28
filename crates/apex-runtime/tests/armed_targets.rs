@@ -202,3 +202,39 @@ fn targets_absent_or_unfit_is_fatal_live_and_falls_back_in_shadow() {
     let c = armed.values().next().unwrap();
     assert_eq!((c.legs[0].pool, c.legs[1].pool), (UNI, SLIP), "WETH goes into UNI first");
 }
+
+/// R37: a v4 pool is named by its 32-byte ID and parsed to the address the
+/// book keys it by; a route says its start token, WETH when it does not.
+#[test]
+fn a_v4_route_parses_to_its_key_address_and_start() {
+    use apex_runtime::live::v4::key_address;
+    let id = B256::repeat_byte(0xc1);
+    let v4 = format!(r#"{{"pools":["{id:#x}","{:#x}"],"usd":30.0,"arbs":3,"start":"{USDC:#x}"}}"#, p(2));
+    let routes = [v4, route(p(1), p(2), None)].join(",");
+    let t = load(&targets_json("2026-10-24T01:10:00Z", true, &routes, "1"), GENERATED).unwrap();
+    assert_eq!(t.routes[0].pools, [key_address(id), p(2)]);
+    assert_eq!(t.routes[0].v4_ids, vec![id]);
+    assert_eq!(t.routes[0].start, USDC);
+    assert!(t.has(key_address(id), p(2)));
+    assert_eq!((t.routes[1].start, t.routes[1].v4_ids.is_empty()), (WETH, true), "no start: R36's WETH");
+    assert_eq!(t.pools(), BTreeSet::from([key_address(id), p(1), p(2)]));
+    let bad = format!(r#"{{"pools":["0x{}","{:#x}"],"usd":1.0,"arbs":1}}"#, "c1".repeat(31), p(2));
+    assert!(load(&targets_json("2026-10-24T01:10:00Z", true, &bad, "1"), GENERATED).is_err(), "neither an address nor an ID");
+}
+
+/// R37: a route arms the cycles in its own start token: WETH into a
+/// WETH/USDC pool and USDC into it are opposite trades.
+#[test]
+fn a_route_arms_only_its_start_token_s_cycles() {
+    use apex_runtime::shadow::armed_cycles;
+    let book: BTreeMap<Address, Arc<PoolSnapshot>> =
+        [snapshot(UNI, Venue::UniswapV3), snapshot(SLIP, Venue::Slipstream)].into_iter().map(|s| (s.spec.pool, Arc::new(s))).collect();
+    let (_, all) = frontier::build_starts(ChainId::BASE, &[WETH, USDC], &book);
+    assert_eq!(all.len(), 4, "two directions, two start tokens");
+    let usdc = format!(r#"{{"pools":["{UNI:#x}","{SLIP:#x}"],"usd":3.0,"arbs":1,"start":"{USDC:#x}"}}"#);
+    let t = load(&targets_json("2026-10-24T01:10:00Z", true, &usdc, "1"), GENERATED).unwrap();
+    let armed = armed_cycles(Some(&t), &all);
+    assert_eq!(armed.len(), 1);
+    let c = armed.values().next().unwrap();
+    assert_eq!((c.start, c.legs[0].pool, c.legs[1].pool), (USDC, UNI, SLIP));
+}

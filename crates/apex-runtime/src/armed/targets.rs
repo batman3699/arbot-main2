@@ -1,22 +1,71 @@
 //! The census's targets (R36): the routes where trigger-block arbitrage our
-//! executor can run happens, WETH-in pool first, and what their winners paid
-//! per gas, as `scripts/data/arb_census/targets.py` writes them each day.
+//! executor can run happens, start-in pool first, and what their winners
+//! paid per gas, as `scripts/data/arb_census/targets.py` writes them each
+//! day. R37: a route starts in WETH or USDC, and a v4 pool is named by its
+//! 32-byte pool ID.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(try_from = "RawRoute")]
 pub struct TargetRoute {
-    /// WETH-in pool first: the first leg of the cycle the route arms.
+    /// Start-in pool first: the first leg of the cycle the route arms. A v4
+    /// pool is its key address, as the book holds it.
     pub pools: [Address; 2],
     pub usd: f64,
     pub arbs: u32,
     /// The route's own winners' effective priority fees per gas, when it has
     /// twenty or more.
-    #[serde(default)]
     pub bids_wei_per_gas: Option<Vec<u128>>,
+    /// R37: the token the route starts in and gains; WETH when unnamed.
+    pub start: Address,
+    /// R37: the route's v4 pools' IDs, as the census named them.
+    pub v4_ids: Vec<B256>,
+}
+
+/// A route as the file holds it: pools as 20-byte addresses or 32-byte v4
+/// pool IDs.
+#[derive(Deserialize)]
+struct RawRoute {
+    pools: [String; 2],
+    usd: f64,
+    arbs: u32,
+    #[serde(default)]
+    bids_wei_per_gas: Option<Vec<u128>>,
+    #[serde(default)]
+    start: Option<Address>,
+}
+
+impl TryFrom<RawRoute> for TargetRoute {
+    type Error = String;
+
+    fn try_from(r: RawRoute) -> Result<Self, String> {
+        let mut v4_ids = Vec::new();
+        let mut pool = |s: &str| -> Result<Address, String> {
+            let hex = s.strip_prefix("0x").unwrap_or(s);
+            match hex.len() {
+                40 => s.parse().map_err(|e| format!("pool {s:?}: {e}")),
+                64 => {
+                    let id: B256 = s.parse().map_err(|e| format!("pool {s:?}: {e}"))?;
+                    v4_ids.push(id);
+                    Ok(crate::live::v4::key_address(id))
+                }
+                _ => Err(format!("pool {s:?} is neither an address nor a v4 pool ID")),
+            }
+        };
+        let pools = [pool(&r.pools[0])?, pool(&r.pools[1])?];
+        Ok(Self {
+            pools,
+            usd: r.usd,
+            arbs: r.arbs,
+            bids_wei_per_gas: r.bids_wei_per_gas,
+            start: r.start.unwrap_or(crate::live::frontier::WETH),
+            v4_ids,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -62,9 +111,16 @@ impl Targets {
         self.routes.iter().flat_map(|r| r.pools).collect()
     }
 
-    /// Whether the route WETH-in `weth_in`, then `other`, is targeted.
-    pub fn has(&self, weth_in: Address, other: Address) -> bool {
-        self.routes.iter().any(|r| r.pools == [weth_in, other])
+    /// Whether the route `start_in`, then `other`, is targeted, in any start
+    /// token.
+    pub fn has(&self, start_in: Address, other: Address) -> bool {
+        self.routes.iter().any(|r| r.pools == [start_in, other])
+    }
+
+    /// Whether the route `start_in`, then `other`, is targeted in `start`
+    /// (R37): WETH into a WETH/USDC pool and USDC into it are opposite trades.
+    pub fn has_route(&self, start: Address, start_in: Address, other: Address) -> bool {
+        self.routes.iter().any(|r| r.start == start && r.pools == [start_in, other])
     }
 
     /// The winners' bids an arm on that route bids against: its own when it

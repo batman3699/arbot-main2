@@ -14,17 +14,26 @@ from arb_census.venues import USDC, WETH
 
 
 def arb(pools=("pa", "pb"), weth_in="pa", venues=("uniswap_v3", "aerodrome_v2"),
-        gain=(WETH,), offset=0, usd=10.0, prio=None, gas=None, hops=2):
-    return {"pools": list(pools), "weth_in": weth_in, "venues": list(venues), "gain": list(gain),
-            "offset": offset, "usd": usd, "prio": prio, "gas": gas, "hops": hops}
+        gain=(WETH,), offset=0, usd=10.0, prio=None, gas=None, hops=2, start_in=None):
+    """A race record; `start_in` is left out unless given, as in the caches
+    written before R37."""
+    out = {"pools": list(pools), "weth_in": weth_in, "venues": list(venues), "gain": list(gain),
+           "offset": offset, "usd": usd, "prio": prio, "gas": gas, "hops": hops}
+    if start_in is not None:
+        out["start_in"] = start_in
+    return out
+
+
+V4_ID = "0x" + "c1" * 32
 
 
 class Select(unittest.TestCase):
     def test_only_two_hop_weth_routes_on_our_venues_taken_in_the_trigger_block(self):
         self.assertTrue(T.select(arb()))
         self.assertFalse(T.select(arb(offset=1)))
-        self.assertFalse(T.select(arb(venues=("uniswap_v3", "uniswap_v4"))))
-        self.assertFalse(T.select(arb(gain=(USDC,))))
+        self.assertFalse(T.select(arb(venues=("uniswap_v3", "balancer_v2"))))
+        self.assertFalse(T.select(arb(gain=("0x" + "33" * 20,))))
+        self.assertFalse(T.select(arb(gain=(USDC, WETH))))
         self.assertFalse(T.select(arb(hops=3)))
         self.assertFalse(T.select(arb(weth_in=None)))
 
@@ -36,7 +45,44 @@ class Select(unittest.TestCase):
         self.assertIsNone(T.route_key(arb(pools=("pa", "pb"), weth_in="pc")))
 
 
+    def test_two_hop_v4_and_usdc_routes_are_selected(self):
+        # R37: v4 is one of our venues, and USDC a start token.
+        self.assertTrue(T.select(arb(venues=("uniswap_v3", "uniswap_v4"))))
+        usdc = arb(pools=("pb", V4_ID), weth_in=None, venues=("uniswap_v4", "uniswap_v3"),
+                   gain=(USDC,), start_in=V4_ID)
+        self.assertTrue(T.select(usdc))
+        self.assertEqual(T.route_key(usdc), (V4_ID, "pb"))
+        self.assertEqual(T.route_start(usdc), USDC)
+        self.assertEqual(T.route_start(arb()), WETH)
+
+    def test_a_usdc_route_without_start_in_is_skipped(self):
+        # A cache from before R37: a WETH route falls back to `weth_in`; a
+        # USDC route has nothing to fall back to, so it waits, unguessed.
+        self.assertTrue(T.select(arb()))
+        self.assertEqual(T.route_key(arb()), ("pa", "pb"))
+        self.assertFalse(T.select(arb(weth_in=None, gain=(USDC,))))
+        self.assertIsNone(T.route_key(arb(weth_in=None, gain=(USDC,))))
+        # And a start-in pool that is not one of the route's is no route.
+        self.assertIsNone(T.route_key(arb(weth_in=None, gain=(USDC,), start_in="pc")))
+
+
 class Build(unittest.TestCase):
+    def test_route_json_carries_start_and_v4_ids(self):
+        usdc = arb(pools=("pb", V4_ID), weth_in=None, venues=("uniswap_v4", "uniswap_v3"),
+                   gain=(USDC,), start_in=V4_ID, usd=30.0)
+        # A WETH route on the same two pools, the other way round, is
+        # another route.
+        weth = arb(pools=("pb", V4_ID), weth_in="pb", venues=("uniswap_v4", "uniswap_v3"), usd=5.0)
+        out = T.build([{"arbs": [usdc, weth]}] * 3, top=50)
+        self.assertEqual([(r["pools"], r["start"], r["usd"]) for r in out["routes"]],
+                         [([V4_ID, "pb"], USDC, 90.0), (["pb", V4_ID], WETH, 15.0)])
+        self.assertTrue(out["ok"])
+
+    def test_one_pool_order_in_two_start_tokens_is_two_routes(self):
+        # WETH into pa, or USDC into pa: opposite trades on a WETH/USDC pair.
+        out = T.build([{"arbs": [arb(usd=2.0), arb(weth_in=None, gain=(USDC,), start_in="pa", usd=3.0)]}] * 3)
+        self.assertEqual(sorted((r["start"], r["usd"]) for r in out["routes"]), [(WETH, 6.0), (USDC, 9.0)])
+
     def test_routes_keyed_weth_in_first_whatever_the_log_order(self):
         day = {"eth_usd": 2500.0, "arbs": [
             arb(usd=5.0),

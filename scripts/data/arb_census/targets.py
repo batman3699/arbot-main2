@@ -12,8 +12,9 @@ Run from ``scripts/data`` so the existing ``arb_census`` package and
       --gaps /opt/apex/var/census/r33-gaps.json \
       --live-ledger /opt/apex/var/apex/armed-live.jsonl
 
-The target universe is deliberately strict: two-hop, WETH-gain, WETH-start
-routes over ``race.OURS`` whose arbitrage was taken in its trigger block.
+The target universe is deliberately strict: two-hop routes over
+``race.OURS`` and Uniswap v4 that start in, and gain only, WETH or USDC
+(R37), whose arbitrage was taken in its trigger block.
 The script never guesses missing route fields. If Task 1's route-aware census
 schema is unavailable, it fails rather than silently writing an empty target
 set.
@@ -32,12 +33,15 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from arb_census import race
-from arb_census.venues import WETH
+from arb_census.venues import USDC, WETH
 
 UTC = timezone.utc
 CACHE_SCHEMA_VERSION = 1
 MIN_ROUTE_BIDS = 20
 MAX_U128 = (1 << 128) - 1
+# R37: the tokens a route may start in, and gain.
+STARTS = frozenset({WETH, USDC})
+VENUES = race.OURS | {race.V4}
 
 
 def _normalise(value: Any) -> str | None:
@@ -76,19 +80,40 @@ def _integer(value: Any) -> int | None:
     return converted if converted == value else None
 
 
+def route_start(arb: Mapping[str, Any]) -> str | None:
+    """The token a route starts in: its sole gain token (R37)."""
+    gains = arb.get("gain")
+    if not isinstance(gains, (list, tuple)) or len(gains) != 1:
+        return None
+    return _normalise(gains[0])
+
+
 def route_key(arb: Mapping[str, Any]) -> tuple[str, str] | None:
-    """Return (WETH-in pool, other pool), preserving route direction."""
+    """Return (start-in pool, other pool), preserving route direction.
+
+    The start-in pool took the start token (R37's ``start_in``). A cache
+    written before R37 has none: a WETH route falls back to ``weth_in``,
+    and any other route is skipped, never guessed."""
     pools = arb.get("pools")
-    weth_in = _normalise(arb.get("weth_in"))
-    if not isinstance(pools, (list, tuple)) or len(pools) != 2 or weth_in is None:
+    start_in = _normalise(arb.get("start_in"))
+    if start_in is None and "start_in" not in arb and route_start(arb) == _normalise(WETH):
+        start_in = _normalise(arb.get("weth_in"))
+    if not isinstance(pools, (list, tuple)) or len(pools) != 2 or start_in is None:
         return None
     normalised = [_normalise(pool) for pool in pools]
     if any(pool is None for pool in normalised):
         return None
-    if normalised[0] == normalised[1] or normalised.count(weth_in) != 1:
+    if normalised[0] == normalised[1] or normalised.count(start_in) != 1:
         return None
-    other = normalised[1] if normalised[0] == weth_in else normalised[0]
-    return (weth_in, other)
+    other = normalised[1] if normalised[0] == start_in else normalised[0]
+    return (start_in, other)
+
+
+def _build_key(arb: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    """(start-in pool, other pool, start token): one pool order in two start
+    tokens is two opposite trades."""
+    key, start = route_key(arb), route_start(arb)
+    return None if key is None or start is None else (key[0], key[1], start)
 
 
 def _route_key(arb: Mapping[str, Any]) -> tuple[str, str] | None:
@@ -99,9 +124,10 @@ def _route_key(arb: Mapping[str, Any]) -> tuple[str, str] | None:
 def select(arb: Mapping[str, Any]) -> bool:
     """Whether an observed arbitrage belongs in the phase-1 target universe.
 
-    Eligibility matches the R36 implementation-plan contract: exactly two
-    hops, both venues in ``race.OURS``, WETH as the sole positive gain token,
-    a known WETH-in pool, and offset zero (the trigger block itself).
+    Eligibility matches the R36 implementation-plan contract, as R37
+    widened it: exactly two hops, both venues in ``race.OURS`` or Uniswap
+    v4, WETH or USDC as the sole positive gain token, a known start-in pool,
+    and offset zero (the trigger block itself).
     """
     if not isinstance(arb, Mapping):
         return False
@@ -116,12 +142,11 @@ def select(arb: Mapping[str, Any]) -> bool:
     venues = arb.get("venues")
     if not isinstance(venues, (list, tuple)) or not venues:
         return False
-    our_venues = {str(venue).lower() for venue in race.OURS}
+    our_venues = {str(venue).lower() for venue in VENUES}
     if any(not isinstance(venue, str) or venue.lower() not in our_venues for venue in venues):
         return False
 
-    gains = arb.get("gain")
-    if not isinstance(gains, (list, tuple)) or [_normalise(token) for token in gains] != [_normalise(WETH)]:
+    if route_start(arb) not in {_normalise(token) for token in STARTS}:
         return False
 
     if _integer(arb.get("offset")) != 0:
@@ -183,18 +208,18 @@ def calibration(fit_bids: Sequence[int], held_out_bids: Sequence[int]) -> list[d
 
 
 def _selected_route_observations(
-    days: Sequence[Mapping[str, Any]], selected_routes: set[tuple[str, str]],
-) -> tuple[list[int], dict[tuple[str, str], list[int]], list[list[int]]]:
+    days: Sequence[Mapping[str, Any]], selected_routes: set[tuple[str, str, str]],
+) -> tuple[list[int], dict[tuple[str, str, str], list[int]], list[list[int]]]:
     """Return bids for the selected route universe, with one list per day."""
     all_bids: list[int] = []
-    by_route: dict[tuple[str, str], list[int]] = defaultdict(list)
+    by_route: dict[tuple[str, str, str], list[int]] = defaultdict(list)
     by_day: list[list[int]] = []
     for day in days:
         daily: list[int] = []
         for arb in day.get("arbs", []):
             if not select(arb):
                 continue
-            key = route_key(arb)
+            key = _build_key(arb)
             if key not in selected_routes:
                 continue
             # Keep calibration and the aggregate bid CDF consistent with the
@@ -233,7 +258,7 @@ def build(days: Sequence[Mapping[str, Any]], top: int = 50) -> dict[str, Any]:
     if isinstance(top, bool) or not isinstance(top, int) or top < 0:
         raise ValueError("top must be a non-negative integer")
 
-    by_route: dict[tuple[str, str], dict[str, Any]] = {}
+    by_route: dict[tuple[str, str, str], dict[str, Any]] = {}
     day_labels: list[str] = []
     finite_source_data = True
 
@@ -248,7 +273,7 @@ def build(days: Sequence[Mapping[str, Any]], top: int = 50) -> dict[str, Any]:
         for arb in arbs:
             if not select(arb):
                 continue
-            key = route_key(arb)
+            key = _build_key(arb)
             if key is None:
                 continue
             raw_usd = arb.get("usd")
@@ -273,7 +298,7 @@ def build(days: Sequence[Mapping[str, Any]], top: int = 50) -> dict[str, Any]:
                 if parsed_gas is None or parsed_gas <= 0:
                     finite_source_data = False
 
-            item = by_route.setdefault(key, {"pools": [key[0], key[1]], "usd": 0.0,
+            item = by_route.setdefault(key, {"pools": [key[0], key[1]], "start": key[2], "usd": 0.0,
                                              "arbs": 0, "_bids": []})
             item["usd"] += usd
             item["arbs"] += 1
@@ -283,13 +308,13 @@ def build(days: Sequence[Mapping[str, Any]], top: int = 50) -> dict[str, Any]:
             if not math.isfinite(item["usd"]):
                 finite_source_data = False
 
-    ordered = sorted(by_route.items(), key=lambda pair: (-pair[1]["usd"], pair[0][0], pair[0][1]))
+    ordered = sorted(by_route.items(), key=lambda pair: (-pair[1]["usd"], pair[0]))
     selected_pairs = ordered[:top]
     selected_keys = {key for key, _ in selected_pairs}
 
     routes: list[dict[str, Any]] = []
     for key, item in selected_pairs:
-        row: dict[str, Any] = {"pools": item["pools"], "usd": item["usd"], "arbs": item["arbs"]}
+        row: dict[str, Any] = {"pools": item["pools"], "start": item["start"], "usd": item["usd"], "arbs": item["arbs"]}
         if len(item["_bids"]) >= MIN_ROUTE_BIDS:
             row["bids_wei_per_gas"] = sorted(item["_bids"])
         routes.append(row)
