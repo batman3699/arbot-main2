@@ -45,7 +45,7 @@ use apex_runtime::armed::engine::{Engine, EngineSettings, REPRICE_BUDGET};
 use apex_runtime::armed::eval::Words;
 use apex_runtime::armed::lines::{Arm, ArmedLine, Word};
 use apex_runtime::armed::moves::MoveStats;
-use apex_runtime::armed::predicate::{layout, Predicate};
+use apex_runtime::armed::predicate::{layout_of, Predicate};
 use apex_runtime::live::book::Move;
 use apex_runtime::armed::threshold::Pricing;
 use apex_runtime::econ::RouteCosts;
@@ -255,9 +255,9 @@ fn words_now(arm: &Arm, snap: &BTreeMap<Address, Arc<PoolSnapshot>>) -> Words {
         .iter()
         .flat_map(|a| {
             let p = &snap[&a.parse::<Address>().unwrap()];
-            let l = layout(p.spec.venue);
+            let l = layout_of(p);
             [(l.price_slot.unwrap(), p.state.sqrt_price_x96), (l.liquidity_slot.unwrap(), U256::from(p.state.liquidity))]
-                .map(|(slot, v)| Word { address: a.clone(), slot: format!("{slot:#x}"), value: format!("{v:#x}") })
+                .map(|(slot, v)| Word { address: format!("{:#x}", l.address), slot: format!("{slot:#x}"), value: format!("{v:#x}") })
         })
         .collect();
     Words::from_arm(&now).unwrap()

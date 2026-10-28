@@ -57,7 +57,7 @@ impl ChainReads {
     }
 
     /// One storage word of `a` at `block` (R26: the armed layouts' check).
-    pub async fn storage_at(&self, a: Address, slot: u64, block: u64) -> Result<ethers_core::types::U256, ReadError> {
+    pub async fn storage_at(&self, a: Address, slot: ethers_core::types::U256, block: u64) -> Result<ethers_core::types::U256, ReadError> {
         let v = self
             .rpc
             .call("eth_getStorageAt", json!([format!("{a:#x}"), format!("{slot:#x}"), format!("{block:#x}")]))

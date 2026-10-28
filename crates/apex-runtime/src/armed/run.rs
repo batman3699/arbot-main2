@@ -68,7 +68,7 @@ pub fn effects_of(logs: &[RawLog], venues: &BTreeMap<Address, Venue>) -> Vec<TxE
         else {
             continue;
         };
-        let lay = layout(*venue);
+        let lay = layout(*venue, l.address);
         let a = format!("{:#x}", l.address);
         let mut writes = Vec::new();
         match l.topics.first() {
@@ -686,7 +686,7 @@ fn locate(fbs: &[FlashblockSeen], block: u64, tx_index: u64) -> Option<u32> {
 /// WETH in USD from the deep Uniswap WETH/USDC pool's price at `head`.
 async fn weth_usd(reads: &ChainReads, head: u64) -> Option<f64> {
     let pool: Address = "0xd0b53D9277642d899DF5C87A3966A349A798F224".parse().ok()?;
-    let w = reads.storage_at(pool, 0, head).await.ok()?;
+    let w = reads.storage_at(pool, U256::zero(), head).await.ok()?;
     let sqrt = (w & price_mask()).as_u128() as f64 / 2f64.powi(96);
     Some(sqrt * sqrt * 1e12)
 }

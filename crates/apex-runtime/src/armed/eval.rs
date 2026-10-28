@@ -19,9 +19,9 @@ const LAST_INDEX: u32 = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Write {
-    Set { address: String, slot: u64, value: U256 },
+    Set { address: String, slot: U256, value: U256 },
     Tick { address: String, tick: i32 },
-    Liquidity { address: String, slot: u64, lower: i32, upper: i32, delta: i128 },
+    Liquidity { address: String, slot: U256, lower: i32, upper: i32, delta: i128 },
 }
 
 /// One transaction's writes to the watched pools, in chain order.
@@ -35,7 +35,8 @@ pub struct TxEffect {
 
 #[derive(Clone, Debug, Default)]
 pub struct Words {
-    values: BTreeMap<(String, u64), U256>,
+    /// Keyed by whole 256-bit slots: a v4 pool's are keccak hashes (R37).
+    values: BTreeMap<(String, U256), U256>,
     ticks: BTreeMap<String, i32>,
 }
 
@@ -43,8 +44,8 @@ fn parse_hex(s: &str) -> Option<U256> {
     U256::from_str_radix(s.trim_start_matches("0x"), 16).ok()
 }
 
-fn parse_slot(s: &str) -> Option<u64> {
-    u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+fn parse_slot(s: &str) -> Option<U256> {
+    parse_hex(s)
 }
 
 impl Words {

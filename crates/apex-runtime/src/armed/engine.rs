@@ -7,7 +7,7 @@ use super::bid::{best_bid, rank_value, Bid};
 use super::lines::{Arm, ArmedLine, Word};
 use super::moves::{spread_key, MoveStats};
 use super::plan::armed_call;
-use super::predicate::{self, layout};
+use super::predicate::{self, layout_of};
 use super::threshold::{band_paying, rungs, trigger_up, Band, Pricing, Rung};
 use crate::live::book::PoolSnapshot;
 use crate::live::frontier::Cycle;
@@ -163,9 +163,9 @@ fn position(p: &PoolSnapshot) -> f64 {
 
 /// The words an arm's predicates watch, as `p` holds them now.
 fn words_of(p: &PoolSnapshot) -> Vec<Word> {
-    let l = layout(p.spec.venue);
-    let a = format!("{:#x}", p.spec.pool);
-    let w = |slot: u64, v: U256| Word { address: a.clone(), slot: format!("{slot:#x}"), value: format!("{v:#x}") };
+    let l = layout_of(p);
+    let a = format!("{:#x}", l.address);
+    let w = |slot: U256, v: U256| Word { address: a.clone(), slot: format!("{slot:#x}"), value: format!("{v:#x}") };
     match (&p.reserves, l.reserve_slots) {
         (Some(r), Some((s0, s1))) => vec![w(s0, r.reserve0), w(s1, r.reserve1)],
         _ => [l.price_slot.map(|s| w(s, p.state.sqrt_price_x96)), l.liquidity_slot.map(|s| w(s, U256::from(p.state.liquidity)))]
@@ -576,8 +576,8 @@ pub async fn verify_layouts(
 ) -> BTreeSet<Address> {
     let mut bad = BTreeSet::new();
     for p in snapshot.values() {
-        let l = layout(p.spec.venue);
-        let a = p.spec.pool;
+        let l = layout_of(p);
+        let a = l.address;
         let ok = match (&p.reserves, l.reserve_slots, l.price_slot, l.liquidity_slot) {
             (Some(r), Some((s0, s1)), _, _) => matches!(
                 (reads.storage_at(a, s0, block).await, reads.storage_at(a, s1, block).await),
@@ -591,7 +591,7 @@ pub async fn verify_layouts(
             _ => false,
         };
         if !ok {
-            bad.insert(a);
+            bad.insert(p.spec.pool);
         }
     }
     bad

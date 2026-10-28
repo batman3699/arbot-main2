@@ -62,7 +62,7 @@ fn arm() -> Arm {
 }
 
 fn set(addr: &str, slot: u64, v: u64) -> Write {
-    Write::Set { address: addr.into(), slot, value: U256::from(v) }
+    Write::Set { address: addr.into(), slot: U256::from(slot), value: U256::from(v) }
 }
 
 fn tx(block: u64, i: u64, writes: Vec<Write>) -> TxEffect {
@@ -92,7 +92,7 @@ fn the_other_pools_band_and_liquidity_gate_the_fire() {
     assert!(j.trigger_met, "A reached its trigger: the band, not the trigger, missed");
     // A burn in range takes B's liquidity under its floor.
     let effects = vec![
-        tx(101, 1, vec![Write::Liquidity { address: B.into(), slot: 4, lower: -10, upper: 10, delta: -200 }]),
+        tx(101, 1, vec![Write::Liquidity { address: B.into(), slot: U256::from(4), lower: -10, upper: 10, delta: -200 }]),
         tx(101, 2, vec![set(A, 0, 55)]),
     ];
     assert_eq!(judge(&arm(), &effects).unwrap().fire, None, "1000 − 200 < 900");
@@ -100,14 +100,14 @@ fn the_other_pools_band_and_liquidity_gate_the_fire() {
     // position holds [lower, upper)).
     for (lower, upper) in [(20, 30), (-10, 0)] {
         let effects = vec![
-            tx(101, 1, vec![Write::Liquidity { address: B.into(), slot: 4, lower, upper, delta: -200 }]),
+            tx(101, 1, vec![Write::Liquidity { address: B.into(), slot: U256::from(4), lower, upper, delta: -200 }]),
             tx(101, 2, vec![set(A, 0, 55)]),
         ];
         assert!(judge(&arm(), &effects).unwrap().fire.is_some(), "[{lower}, {upper}) does not hold tick 0");
     }
     // Starting at it, it does.
     let effects = vec![
-        tx(101, 1, vec![Write::Liquidity { address: B.into(), slot: 4, lower: 0, upper: 10, delta: -200 }]),
+        tx(101, 1, vec![Write::Liquidity { address: B.into(), slot: U256::from(4), lower: 0, upper: 10, delta: -200 }]),
         tx(101, 2, vec![set(A, 0, 55)]),
     ];
     assert_eq!(judge(&arm(), &effects).unwrap().fire, None, "[0, 10) holds tick 0");

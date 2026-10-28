@@ -74,13 +74,18 @@ fn predicates_encode_as_the_rpc_takes_them() {
 
 #[test]
 fn each_venue_watches_its_verified_slots() {
-    assert_eq!((layout(Venue::UniswapV3).price_slot, layout(Venue::UniswapV3).liquidity_slot), (Some(0), Some(4)));
-    assert_eq!((layout(Venue::PancakeV3).price_slot, layout(Venue::PancakeV3).liquidity_slot), (Some(0), Some(5)));
+    let slots = |v: Venue| {
+        let l = layout(v, UNI);
+        (l.price_slot.map(|s| s.as_u64()), l.liquidity_slot.map(|s| s.as_u64()))
+    };
+    assert_eq!(slots(Venue::UniswapV3), (Some(0), Some(4)));
+    assert_eq!(slots(Venue::PancakeV3), (Some(0), Some(5)));
     for v in [Venue::Slipstream, Venue::SlipstreamV3] {
-        assert_eq!((layout(v).price_slot, layout(v).liquidity_slot), (Some(6), Some(16)));
+        assert_eq!(slots(v), (Some(6), Some(16)));
     }
-    assert_eq!(layout(Venue::AerodromeV2).reserve_slots, Some((20, 21)));
-    assert_eq!(layout(Venue::AerodromeV2).price_slot, None);
+    assert_eq!(layout(Venue::AerodromeV2, UNI).reserve_slots, Some((U256::from(20), U256::from(21))));
+    assert_eq!(slots(Venue::AerodromeV2), (None, None));
+    assert_eq!(layout(Venue::UniswapV3, UNI).address, UNI, "a pool's own storage");
 }
 
 /// The other pool: a price band and a liquidity floor.
@@ -216,4 +221,93 @@ fn a_fire_closing_on_aerodrome_grosses_exactly_the_armed_output() {
     let mid = chained.outputs[0] * 99 / 100;
     assert_eq!(armed_gross(c, &snap, size, mid, output).unwrap(), output - size);
     assert!(armed_gross(c, &snap, size, mid, size).is_err(), "no profit: the executor's floor reverts");
+}
+
+// ------------------------------------------------------------------ R37: v4
+
+const AXIS: Address = address!("5be75e3b0aff5d1a042a5363ae36acb1d6d755ea");
+const AXIS_POOL: alloy_primitives::B256 =
+    alloy_primitives::b256!("c19d91d99afc0332e5013a569c9721cd9ecb51a14c851f7a189a140950a627fa");
+
+/// The AXIS/USDC v4 pool: keyed in the book by its key address, its words
+/// PoolManager's.
+fn v4_pool(tick: i32) -> PoolSnapshot {
+    use apex_runtime::live::v4::{key_address, V4Key, POOL_MANAGER};
+    let mut p = pool(key_address(AXIS_POOL), Venue::UniswapV4, tick, 100);
+    p.spec.token0 = AXIS;
+    // AXIS is worth ~5e-7 USDC a unit: a few ticks move ~1e21 of it.
+    p.state.balance0 = Some(U256::exp10(30));
+    p.spec.v4 = Some(V4Key { pool_id: AXIS_POOL, fee: 100, tick_spacing: 1, hooks: address!("b0b24b89db0dafbe43c5b40226b63a179f592880") });
+    p.factory = POOL_MANAGER;
+    p
+}
+
+#[test]
+fn a_v4_trigger_watches_pool_manager_storage() {
+    use apex_runtime::armed::predicate::layout_of;
+    use apex_runtime::live::v4::POOL_MANAGER;
+    let p = v4_pool(-289_960);
+    let at = p.moved(Move::Tick(-289_950)).unwrap();
+    let v = serde_json::to_value(trigger(&p, &at, true).unwrap()).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0]["params"]["address"], "0x498581ff718922c3f8e6a244956af099b2652b2b", "PoolManager, not the key address");
+    assert_eq!(v[0]["params"]["slot"], "0xa446a125276052ec378b11eacacc4812f36f5e00ab66ee87cd802ad56ce21aa5");
+    assert_eq!(v[0]["params"]["mask"], "0xffffffffffffffffffffffffffffffffffffffff", "slot0's low 160 bits: the price");
+    assert_eq!(v[0]["params"]["value"], format!("{:#x}", at.state.sqrt_price_x96));
+    assert_eq!(layout_of(&p).address, POOL_MANAGER);
+    let uni = pool(UNI, Venue::UniswapV3, -197_350, 500);
+    assert_eq!((layout_of(&uni).address, layout_of(&uni).price_slot, layout_of(&uni).liquidity_slot), (UNI, Some(U256::zero()), Some(U256::from(4))));
+    let mut keyless = v4_pool(-289_960);
+    keyless.spec.v4 = None;
+    assert_eq!(trigger(&keyless, &at, true), None, "a v4 pool without its key watches nothing");
+}
+
+#[test]
+fn a_v4_band_s_liquidity_word_is_state_plus_three() {
+    let p = v4_pool(-289_960);
+    let edges = [p.moved(Move::Tick(-289_965)).unwrap(), p.moved(Move::Tick(-289_955)).unwrap()];
+    let v = serde_json::to_value(band(&p, &edges, 9_800).unwrap()).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 3);
+    for i in 0..3 {
+        assert_eq!(v[i]["params"]["address"], "0x498581ff718922c3f8e6a244956af099b2652b2b");
+    }
+    assert_eq!(v[0]["params"]["slot"], "0xa446a125276052ec378b11eacacc4812f36f5e00ab66ee87cd802ad56ce21aa5");
+    assert_eq!(v[2]["params"]["slot"], "0xa446a125276052ec378b11eacacc4812f36f5e00ab66ee87cd802ad56ce21aa8");
+    assert_eq!(v[2]["params"]["mask"], "0xffffffffffffffffffffffffffffffff");
+}
+
+/// A node holding storage words by `(address, slot)`; any other word is 0.
+struct Storage(BTreeMap<(Address, U256), U256>);
+
+#[async_trait::async_trait]
+impl apex_chain::rpc::RpcTransport for Storage {
+    async fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value, apex_chain::rpc::RpcError> {
+        assert_eq!(method, "eth_getStorageAt");
+        let a: Address = params[0].as_str().unwrap().parse().unwrap();
+        let slot = U256::from_str_radix(params[1].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+        Ok(serde_json::json!(format!("{:#x}", self.0.get(&(a, slot)).copied().unwrap_or_default())))
+    }
+}
+
+#[tokio::test]
+async fn verify_layouts_reads_v4_words_from_pool_manager() {
+    use apex_runtime::armed::engine::verify_layouts;
+    use apex_runtime::live::reads::ChainReads;
+    use apex_runtime::live::v4::{liquidity_slot, state_slot, POOL_MANAGER};
+    let p = v4_pool(-289_960);
+    let word = |b: alloy_primitives::B256| U256::from_big_endian(b.as_slice());
+    // slot0 with fees above the price: masked off, as the predicate masks it.
+    let slot0 = p.state.sqrt_price_x96 | (U256::from(100u64) << 208);
+    let at_pm = |liquidity: u128| {
+        Storage(
+            [((POOL_MANAGER, word(state_slot(AXIS_POOL))), slot0), ((POOL_MANAGER, word(liquidity_slot(AXIS_POOL))), U256::from(liquidity))]
+                .into_iter()
+                .collect(),
+        )
+    };
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> = [(p.spec.pool, Arc::new(p.clone()))].into_iter().collect();
+    let reads = ChainReads::new(Arc::new(at_pm(L)));
+    assert!(verify_layouts(&reads, &snap, 100).await.is_empty(), "PoolManager's words are the book's");
+    let reads = ChainReads::new(Arc::new(at_pm(L - 1)));
+    assert_eq!(verify_layouts(&reads, &snap, 100).await, [p.spec.pool].into_iter().collect(), "a word the book does not hold");
 }

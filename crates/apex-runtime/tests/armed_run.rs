@@ -53,15 +53,15 @@ fn logs_become_ordered_effects_on_the_watched_words() {
     let a = format!("{POOL:#x}");
     let b = format!("{AERO:#x}");
     assert_eq!(effects[0].writes, vec![
-        Write::Set { address: a.clone(), slot: 0, value: U256::one() << 96 },
-        Write::Set { address: a.clone(), slot: 4, value: U256::from(1_000u64) },
+        Write::Set { address: a.clone(), slot: U256::from(0), value: U256::one() << 96 },
+        Write::Set { address: a.clone(), slot: U256::from(4), value: U256::from(1_000u64) },
         Write::Tick { address: a.clone(), tick: -12 },
-        Write::Liquidity { address: a.clone(), slot: 4, lower: -60, upper: 60, delta: 500 },
+        Write::Liquidity { address: a.clone(), slot: U256::from(4), lower: -60, upper: 60, delta: 500 },
     ]);
     assert_eq!(effects[1].writes, vec![
-        Write::Liquidity { address: a, slot: 4, lower: -60, upper: 60, delta: -200 },
-        Write::Set { address: b.clone(), slot: 20, value: U256::from(11u64) },
-        Write::Set { address: b, slot: 21, value: U256::from(22u64) },
+        Write::Liquidity { address: a, slot: U256::from(4), lower: -60, upper: 60, delta: -200 },
+        Write::Set { address: b.clone(), slot: U256::from(20), value: U256::from(11u64) },
+        Write::Set { address: b, slot: U256::from(21), value: U256::from(22u64) },
     ], "the removed log is ignored");
 }
 
@@ -397,4 +397,26 @@ fn a_fire_s_route_is_found_by_its_pools_whatever_its_fee() {
     let back = cycle_through(&fired, &[pools[1].clone(), pools[0].clone()]).unwrap();
     assert_eq!((back.legs[0].pool, back.legs[1].pool), (SLIP, POOL), "the other direction is the other cycle");
     assert!(cycle_through(&fired, &[pools[0].clone(), format!("{AERO:#x}")]).is_none());
+}
+
+/// R37: a v4 pool's words are PoolManager's, at 256-bit slots; a write there
+/// is judged at its whole slot, never its low 64 bits.
+#[test]
+fn a_v4_write_lands_on_its_256_bit_slot() {
+    use apex_runtime::armed::eval::Words;
+    use apex_runtime::armed::predicate::{Op, Predicate};
+    use apex_runtime::live::v4::{liquidity_slot, state_slot, POOL_MANAGER};
+    let id = alloy_primitives::b256!("c19d91d99afc0332e5013a569c9721cd9ecb51a14c851f7a189a140950a627fa");
+    let pm = format!("{POOL_MANAGER:#x}");
+    let price = U256::from_big_endian(state_slot(id).as_slice());
+    let liquidity = U256::from_big_endian(liquidity_slot(id).as_slice());
+    let at = |slot: U256, op: Op, v: u64| Predicate::Storage { address: pm.clone(), slot: format!("{slot:#x}"), mask: None, op, value: format!("{v:#x}") };
+    let mut w = Words::default();
+    w.apply(&Write::Set { address: pm.clone(), slot: price, value: U256::from(5u64) });
+    w.apply(&Write::Set { address: pm.clone(), slot: liquidity, value: U256::from(900u64) });
+    assert!(w.holds(&[at(price, Op::AtLeast, 5), at(liquidity, Op::AtLeast, 900)], 1));
+    assert!(!w.holds(&[at(U256::from(price.low_u64()), Op::AtLeast, 5)], 1), "the low 64 bits are another slot");
+    w.apply(&Write::Tick { address: pm.clone(), tick: 0 });
+    w.apply(&Write::Liquidity { address: pm.clone(), slot: liquidity, lower: -10, upper: 10, delta: -100 });
+    assert!(w.holds(&[at(liquidity, Op::AtMost, 800)], 1), "in range: the liquidity word moves");
 }

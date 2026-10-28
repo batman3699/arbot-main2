@@ -10,25 +10,52 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
+    /// Whose storage the words are: the pool's, or PoolManager's for a v4
+    /// pool (R37).
+    pub address: Address,
     /// The word whose low 160 bits are sqrtPriceX96.
-    pub price_slot: Option<u64>,
+    pub price_slot: Option<U256>,
     /// The word whose low 128 bits are the in-range liquidity.
-    pub liquidity_slot: Option<u64>,
+    pub liquidity_slot: Option<U256>,
     /// reserve0's and reserve1's words.
-    pub reserve_slots: Option<(u64, u64)>,
+    pub reserve_slots: Option<(U256, U256)>,
 }
 
-pub const fn layout(v: Venue) -> Layout {
+/// The words of the pool at `address` on venue `v`. A v4 pool's words are
+/// PoolManager's, found by its pool ID: none here, see [`layout_of`].
+pub fn layout(v: Venue, address: Address) -> Layout {
+    let cl = |price: u64, liquidity: u64| Layout {
+        address,
+        price_slot: Some(U256::from(price)),
+        liquidity_slot: Some(U256::from(liquidity)),
+        reserve_slots: None,
+    };
     match v {
-        Venue::UniswapV3 => Layout { price_slot: Some(0), liquidity_slot: Some(4), reserve_slots: None },
-        Venue::PancakeV3 => Layout { price_slot: Some(0), liquidity_slot: Some(5), reserve_slots: None },
-        Venue::Slipstream | Venue::SlipstreamV3 => {
-            Layout { price_slot: Some(6), liquidity_slot: Some(16), reserve_slots: None }
+        Venue::UniswapV3 => cl(0, 4),
+        Venue::PancakeV3 => cl(0, 5),
+        Venue::Slipstream | Venue::SlipstreamV3 => cl(6, 16),
+        Venue::AerodromeV2 => {
+            Layout { address, price_slot: None, liquidity_slot: None, reserve_slots: Some((U256::from(20), U256::from(21))) }
         }
-        Venue::AerodromeV2 => Layout { price_slot: None, liquidity_slot: None, reserve_slots: Some((20, 21)) },
-        // A v4 pool's words are PoolManager's, at slots of its own (R37,
-        // Task 12): until then none, so `verify_layouts` leaves it unarmed.
-        Venue::UniswapV4 => Layout { price_slot: None, liquidity_slot: None, reserve_slots: None },
+        Venue::UniswapV4 => Layout { address, price_slot: None, liquidity_slot: None, reserve_slots: None },
+    }
+}
+
+/// The words `p`'s predicates watch (R37): a v4 pool's slot0 and liquidity
+/// in PoolManager's storage, at its state slot and three past it; without
+/// its key, none, and it is left unarmed.
+pub fn layout_of(p: &PoolSnapshot) -> Layout {
+    match (p.spec.venue, p.spec.v4) {
+        (Venue::UniswapV4, Some(k)) => {
+            let word = |b: alloy_primitives::B256| U256::from_big_endian(b.as_slice());
+            Layout {
+                address: crate::live::v4::POOL_MANAGER,
+                price_slot: Some(word(crate::live::v4::state_slot(k.pool_id))),
+                liquidity_slot: Some(word(crate::live::v4::liquidity_slot(k.pool_id))),
+                reserve_slots: None,
+            }
+        }
+        (v, _) => layout(v, p.spec.pool),
     }
 }
 
@@ -69,16 +96,16 @@ fn hex(v: U256) -> String {
     format!("{v:#x}")
 }
 
-fn storage(pool: Address, slot: u64, mask: Option<U256>, op: Op, value: U256) -> Predicate {
-    Predicate::Storage { address: format!("{pool:#x}"), slot: format!("{slot:#x}"), mask: mask.map(hex), op, value: hex(value) }
+fn storage(address: Address, slot: U256, mask: Option<U256>, op: Op, value: U256) -> Predicate {
+    Predicate::Storage { address: format!("{address:#x}"), slot: hex(slot), mask: mask.map(hex), op, value: hex(value) }
 }
 
 /// The trigger past its threshold: `at` is the trigger pool at the threshold.
 /// A constant-product pool needs both reserves bounded, so a mint (both rise)
 /// cannot fire it.
 pub fn trigger(p: &PoolSnapshot, at: &PoolSnapshot, up: bool) -> Option<Vec<Predicate>> {
-    let l = layout(p.spec.venue);
-    let pool = p.spec.pool;
+    let l = layout_of(p);
+    let pool = l.address;
     match (&at.reserves, l.reserve_slots, l.price_slot) {
         // token0's price in token1 up: reserve0 falls, reserve1 rises.
         (Some(r), Some((s0, s1)), _) if up => Some(vec![
@@ -103,8 +130,8 @@ pub fn trigger(p: &PoolSnapshot, at: &PoolSnapshot, up: bool) -> Option<Vec<Pred
 /// The other pool between `edges` (`[lower, upper]` in price), and its
 /// liquidity at least `floor_bps` of what it holds.
 pub fn band(p: &PoolSnapshot, edges: &[PoolSnapshot; 2], floor_bps: u32) -> Option<Vec<Predicate>> {
-    let l = layout(p.spec.venue);
-    let pool = p.spec.pool;
+    let l = layout_of(p);
+    let pool = l.address;
     let [lo, hi] = edges;
     match (&p.reserves, l.reserve_slots, l.price_slot, l.liquidity_slot) {
         (Some(_), Some((s0, s1)), _, _) => {
