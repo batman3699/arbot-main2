@@ -23,3 +23,4 @@ pub mod pricing;
 pub mod reader;
 pub mod reads;
 pub mod sim;
+pub mod v4;
