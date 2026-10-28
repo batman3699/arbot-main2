@@ -89,3 +89,14 @@ fn refusals() {
     assert_eq!(refusal(&key(100, returns), AXIS, USDC, &[returns].into_iter().collect()), Some("hook returns a delta"));
     assert_eq!(refusal(&key(100, ALPHA_HOOK), AXIS, USDC, &none), Some("hook not allowlisted"));
 }
+
+/// A pool's ID is `keccak256(abi.encode(PoolKey))`: AXIS's leading pool's key
+/// hashes to the ID its `Initialize` event named.
+#[test]
+fn the_axis_pool_id_is_its_key_s_hash() {
+    use apex_runtime::live::v4::pool_id_of;
+    let k = V4Key { pool_id: B256::ZERO, fee: 100, tick_spacing: 1, hooks: ALPHA_HOOK };
+    assert_eq!(pool_id_of(AXIS, USDC, &k), AXIS_POOL);
+    let wider = V4Key { tick_spacing: 10, ..k };
+    assert_ne!(pool_id_of(AXIS, USDC, &wider), AXIS_POOL);
+}

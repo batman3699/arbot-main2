@@ -107,6 +107,19 @@ pub fn decode_slot0(word: U256) -> Slot0 {
     }
 }
 
+/// A pool's ID: `keccak256(abi.encode(currency0, currency1, fee, tickSpacing,
+/// hooks))`, the key PoolManager hashes. A record whose key does not hash to
+/// its ID names another pool, or none.
+pub fn pool_id_of(currency0: Address, currency1: Address, key: &V4Key) -> B256 {
+    let mut buf = [0u8; 160];
+    buf[12..32].copy_from_slice(currency0.as_slice());
+    buf[44..64].copy_from_slice(currency1.as_slice());
+    buf[64..96].copy_from_slice(&U256::from(key.fee).to_be_bytes::<32>());
+    buf[96..128].copy_from_slice(&signed_word(i64::from(key.tick_spacing)));
+    buf[140..160].copy_from_slice(key.hooks.as_slice());
+    keccak256(buf)
+}
+
 /// A hook's permissions: the low 14 bits of its address.
 pub fn hook_flags(hooks: Address) -> u16 {
     u16::from_be_bytes([hooks[18], hooks[19]]) & 0x3fff
@@ -167,6 +180,73 @@ impl HookAllowlist {
 
     pub fn addresses(&self) -> BTreeSet<Address> {
         self.hooks.keys().copied().collect()
+    }
+}
+
+/// The tick ladder's reads for v4 pools: PoolManager's bitmap words and
+/// ticks, by `extsload`, for the pools named by their key addresses.
+pub struct V4TickSource<'a> {
+    reads: &'a crate::live::reads::ChainReads,
+    ids: BTreeMap<Address, B256>,
+}
+
+impl<'a> V4TickSource<'a> {
+    pub fn new(reads: &'a crate::live::reads::ChainReads, specs: &[crate::live::inventory::PoolSpec]) -> Self {
+        Self { reads, ids: specs.iter().filter_map(|s| Some((s.pool, s.v4?.pool_id))).collect() }
+    }
+
+    fn id(&self, pool: ethers_core::types::Address) -> anyhow::Result<B256> {
+        let a = apex_types::compat::address_to_alloy(pool);
+        self.ids.get(&a).copied().ok_or_else(|| anyhow::anyhow!("{a} is not a v4 pool this source reads"))
+    }
+
+    async fn words(&self, slots: &[B256], block: u64) -> anyhow::Result<Vec<U256>> {
+        Ok(self.reads.extsload(slots, block).await?)
+    }
+}
+
+/// A tick's first word: liquidityGross (low 128 bits), liquidityNet (high
+/// 128, signed).
+fn gross_net(w: U256) -> (u128, i128) {
+    let gross = (w & U256::from(u128::MAX)).to::<u128>();
+    let net = (w >> 128usize).to::<u128>() as i128;
+    (gross, net)
+}
+
+#[async_trait::async_trait]
+impl apex_venues::cl_ticks::TickDataSource for V4TickSource<'_> {
+    async fn tick_words(
+        &self,
+        pool: ethers_core::types::Address,
+        word_positions: &[i16],
+        block: ethers_core::types::U64,
+    ) -> anyhow::Result<Vec<Option<ethers_core::types::U256>>> {
+        let id = self.id(pool)?;
+        let slots: Vec<B256> = word_positions.iter().map(|w| bitmap_slot(id, *w)).collect();
+        let words = self.words(&slots, block.as_u64()).await?;
+        Ok(words.into_iter().map(|w| Some(apex_types::compat::u256_to_ethers(w))).collect())
+    }
+
+    async fn liquidity_net(
+        &self,
+        pool: ethers_core::types::Address,
+        ticks: &[i32],
+        block: ethers_core::types::U64,
+    ) -> anyhow::Result<Vec<Option<i128>>> {
+        let id = self.id(pool)?;
+        let slots: Vec<B256> = ticks.iter().map(|t| tick_slot(id, *t)).collect();
+        Ok(self.words(&slots, block.as_u64()).await?.into_iter().map(|w| Some(gross_net(w).1)).collect())
+    }
+
+    async fn tick_liquidity(
+        &self,
+        pool: ethers_core::types::Address,
+        ticks: &[i32],
+        block: ethers_core::types::U64,
+    ) -> anyhow::Result<Option<Vec<Option<(u128, i128)>>>> {
+        let id = self.id(pool)?;
+        let slots: Vec<B256> = ticks.iter().map(|t| tick_slot(id, *t)).collect();
+        Ok(Some(self.words(&slots, block.as_u64()).await?.into_iter().map(|w| Some(gross_net(w))).collect()))
     }
 }
 

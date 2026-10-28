@@ -209,6 +209,9 @@ pub enum Unloadable {
     FeeUnreadable { read: &'static str },
     /// An Aerodrome v2 pool on the stable curve, which is not the one priced.
     NotVolatile,
+    /// R37: a v4 pool refused: its key does not hash to its ID, its hook is
+    /// off the allowlist or its code changed, or a protocol fee is on.
+    V4Refused { why: &'static str },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -286,6 +289,9 @@ pub struct PoolBook {
     moves: MoveChecks,
     /// R28.1: position changes applied in place, and those read again.
     position_counts: PositionCounts,
+    /// R37: the v4 hooks allowed, which every read, a reload's too, holds the
+    /// book's v4 pools to.
+    hooks: crate::live::v4::HookAllowlist,
 }
 
 /// How the book fared with `Mint` and `Burn` (R28.1).
@@ -576,6 +582,136 @@ async fn read_dynamic_fees(
         .collect())
 }
 
+/// What a v4 pool's read returned (R37): its two storage words, PoolManager's
+/// holdings of its currencies (the most it can pay: an outer cap, the ladder
+/// the binding one), their decimals, and its hook's code hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V4Read {
+    pub slot0: U256,
+    pub liquidity: U256,
+    pub balance0: Option<ethers_core::types::U256>,
+    pub balance1: Option<ethers_core::types::U256>,
+    pub decimals: (u8, u8),
+    pub hook_code_hash: B256,
+}
+
+/// keccak256 of no code: what a hookless pool's "hook" hashes to.
+const EMPTY_CODE_HASH: B256 = alloy_primitives::b256!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
+
+/// A v4 pool's snapshot from its read, its ladder through `ticks` (R37). The
+/// inventory is not trusted: the key must hash to the pool's ID, its hook must
+/// be on the allowlist with the code it was reviewed at, and no protocol fee
+/// may be on (the R37 plan's ruling: exact over composed).
+pub async fn v4_snapshot<S: apex_venues::cl_ticks::TickDataSource + ?Sized>(
+    spec: &PoolSpec,
+    read: &V4Read,
+    ticks: &S,
+    block: u64,
+    hooks: &crate::live::v4::HookAllowlist,
+) -> Result<PoolSnapshot, Unloadable> {
+    use crate::live::v4::{decode_slot0, pool_id_of, POOL_MANAGER};
+    let refuse = |why| Err(Unloadable::V4Refused { why });
+    let Some(key) = spec.v4 else { return refuse("no v4 key") };
+    if pool_id_of(spec.token0, spec.token1, &key) != key.pool_id {
+        return refuse("pool id is not its key's");
+    }
+    if key.hooks != Address::ZERO {
+        match hooks.hooks.get(&key.hooks) {
+            None => return refuse("hook not allowlisted"),
+            Some(h) if *h != read.hook_code_hash => return refuse("hook code changed"),
+            Some(_) => {}
+        }
+    }
+    let s0 = decode_slot0(read.slot0);
+    if s0.protocol_fee != 0 {
+        return refuse("protocol fee");
+    }
+    let liquidity = u128::try_from(read.liquidity).map_err(|_| Unloadable::Unreadable { read: "liquidity" })?;
+    if liquidity == 0 || s0.sqrt_price_x96.is_zero() {
+        return Err(Unloadable::NoLiquidity);
+    }
+    let state = ClPoolState {
+        sqrt_price_x96: u256_to_ethers(s0.sqrt_price_x96),
+        liquidity,
+        tick: s0.tick,
+        tick_spacing: key.tick_spacing,
+        fee_ppm: s0.lp_fee,
+        balance0: read.balance0,
+        balance1: read.balance1,
+    };
+    let ladder = apex_venues::cl_ticks::build_ladder(
+        ticks,
+        address_to_ethers(spec.pool),
+        &state,
+        ethers_core::types::U64::from(block),
+        WORDS_PER_SIDE,
+    )
+    .await
+    .map_err(|e| Unloadable::LadderUnreadable { detail: e.to_string() })?;
+    Ok(PoolSnapshot {
+        spec: spec.clone(),
+        state,
+        ladder,
+        decimals: read.decimals,
+        factory: POOL_MANAGER,
+        code_hash: read.hook_code_hash,
+        block,
+        last_log: None,
+        dynamic_fee: None,
+        seq: 0,
+        reserves: None,
+    })
+}
+
+/// Every v4 pool in `specs` at `block`: slot0 and liquidity by `extsload`,
+/// holdings and decimals by Multicall3, each hook's code, then the ladder.
+async fn read_v4(
+    reads: &ChainReads,
+    specs: &[PoolSpec],
+    block: u64,
+    hooks: &crate::live::v4::HookAllowlist,
+) -> Result<Vec<(Address, Result<PoolSnapshot, Unloadable>)>, ReadError> {
+    use crate::live::v4::{liquidity_slot, state_slot, V4TickSource, POOL_MANAGER};
+    let ids: Vec<B256> = specs.iter().map(|s| s.v4.map_or(B256::ZERO, |k| k.pool_id)).collect();
+    let slots: Vec<B256> = ids.iter().flat_map(|id| [state_slot(*id), liquidity_slot(*id)]).collect();
+    let words = reads.extsload(&slots, block).await?;
+    let calls: Vec<(Address, Vec<u8>)> = specs
+        .iter()
+        .flat_map(|s| {
+            [
+                (s.token0, abi::call_address(selector::BALANCE_OF, POOL_MANAGER)),
+                (s.token1, abi::call_address(selector::BALANCE_OF, POOL_MANAGER)),
+                (s.token0, abi::call0(selector::DECIMALS)),
+                (s.token1, abi::call0(selector::DECIMALS)),
+            ]
+        })
+        .collect();
+    let answers = reads.multicall(&calls, block).await?;
+    let source = V4TickSource::new(reads, specs);
+    let mut out = Vec::with_capacity(specs.len());
+    for (i, spec) in specs.iter().enumerate() {
+        let a = &answers[4 * i..4 * i + 4];
+        let balance = |j: usize| a[j].as_deref().and_then(|d| abi::word_u256(d, 0)).map(u256_to_ethers);
+        let decimal = |j: usize| a[j].as_deref().and_then(|d| abi::word_uint(d, 0, 8)).map(|d| d as u8);
+        let (Some(d0), Some(d1)) = (decimal(2), decimal(3)) else {
+            out.push((spec.pool, Err(Unloadable::Unreadable { read: "decimals" })));
+            continue;
+        };
+        let hooks_at = spec.v4.map_or(Address::ZERO, |k| k.hooks);
+        let hook_code_hash = if hooks_at == Address::ZERO { EMPTY_CODE_HASH } else { reads.code_hash(hooks_at, block).await? };
+        let read = V4Read {
+            slot0: words[2 * i],
+            liquidity: words[2 * i + 1],
+            balance0: balance(0),
+            balance1: balance(1),
+            decimals: (d0, d1),
+            hook_code_hash,
+        };
+        out.push((spec.pool, v4_snapshot(spec, &read, &source, block, hooks).await));
+    }
+    Ok(out)
+}
+
 impl PoolBook {
     /// Read every proposed pool at `block`. Pools that disagree with the chain
     /// are refused and reported, never loaded.
@@ -584,18 +720,33 @@ impl PoolBook {
         specs: &[PoolSpec],
         block: u64,
     ) -> Result<(Self, Vec<Unloaded>), ReadError> {
-        let (pools, refused) = Self::read(reads, specs, block).await?;
+        Self::load_with_hooks(reads, specs, block, &crate::live::v4::HookAllowlist::default()).await
+    }
+
+    /// [`Self::load`], holding v4 pools to `hooks` now and at every reload
+    /// (R37).
+    pub async fn load_with_hooks(
+        reads: &ChainReads,
+        specs: &[PoolSpec],
+        block: u64,
+        hooks: &crate::live::v4::HookAllowlist,
+    ) -> Result<(Self, Vec<Unloaded>), ReadError> {
+        let (pools, refused) = Self::read(reads, specs, block, hooks).await?;
         let book = Self::from_snapshots(pools.into_values(), ReconstructionStatus::Verified);
         // The refused as well: a pool that failed to read at boot is read again
         // by the first full reload.
-        Ok((Self { universe: specs.to_vec(), ..book }, refused))
+        Ok((Self { universe: specs.to_vec(), hooks: hooks.clone(), ..book }, refused))
     }
 
     async fn read(
         reads: &ChainReads,
         specs: &[PoolSpec],
         block: u64,
+        hooks: &crate::live::v4::HookAllowlist,
     ) -> Result<(BTreeMap<Address, PoolSnapshot>, Vec<Unloaded>), ReadError> {
+        // v4 pools are PoolManager's storage, read on their own (R37).
+        let (v4_specs, specs): (Vec<PoolSpec>, Vec<PoolSpec>) =
+            specs.iter().cloned().partition(|s| s.venue == crate::live::inventory::Venue::UniswapV4);
         // Constant-product pools are read on their own below (R24).
         let (cp_specs, specs): (Vec<PoolSpec>, Vec<PoolSpec>) =
             specs.iter().cloned().partition(|s| s.venue.is_constant_product());
@@ -692,6 +843,16 @@ impl PoolBook {
                 }
             }
         }
+        if !v4_specs.is_empty() {
+            for (pool, read) in read_v4(reads, &v4_specs, block, hooks).await? {
+                match read {
+                    Ok(snap) => {
+                        pools.insert(pool, snap);
+                    }
+                    Err(why) => refused.push(Unloaded { pool, why }),
+                }
+            }
+        }
         Ok((pools, refused))
     }
 
@@ -727,6 +888,7 @@ impl PoolBook {
             universe,
             moves: MoveChecks::default(),
             position_counts: PositionCounts::default(),
+            hooks: crate::live::v4::HookAllowlist::default(),
         }
     }
 
@@ -1170,7 +1332,7 @@ impl PoolBook {
         } else {
             self.snapshot().values().filter(|p| pools.contains(&p.spec.pool)).map(|p| p.spec.clone()).collect()
         };
-        let (fresh, refused) = Self::read(reads, &specs, block).await?;
+        let (fresh, refused) = Self::read(reads, &specs, block, &self.hooks).await?;
         self.write(|map, w, status| {
             if block < w.newest_read {
                 return (Err(ReloadError::Older { block, newest: w.newest_read }), status);

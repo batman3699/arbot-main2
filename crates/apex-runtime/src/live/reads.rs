@@ -67,6 +67,37 @@ impl ChainReads {
             .ok_or_else(|| ReadError::Malformed(format!("eth_getStorageAt: {v}")))
     }
 
+    /// R37: PoolManager's storage words at `block`, by `extsload(bytes32[])`,
+    /// 256 slots a call, in order.
+    pub async fn extsload(&self, slots: &[alloy_primitives::B256], block: u64) -> Result<Vec<alloy_primitives::U256>, ReadError> {
+        use alloy_primitives::U256 as A;
+        let word = |v: usize| A::from(v).to_be_bytes::<32>();
+        let mut out = Vec::with_capacity(slots.len());
+        for chunk in slots.chunks(256) {
+            let mut data = vec![0xdb, 0xd0, 0x35, 0xff];
+            data.extend_from_slice(&word(32));
+            data.extend_from_slice(&word(chunk.len()));
+            for s in chunk {
+                data.extend_from_slice(s.as_slice());
+            }
+            let pm = crate::live::v4::POOL_MANAGER;
+            let v = self
+                .rpc
+                .call("eth_call", json!([{ "to": format!("{pm:#x}"), "data": format!("0x{}", alloy_primitives::hex::encode(&data)) }, format!("0x{block:x}")]))
+                .await?;
+            let bytes = v
+                .as_str()
+                .and_then(|s| alloy_primitives::hex::decode(s).ok())
+                .ok_or_else(|| ReadError::Malformed(format!("extsload: {v}")))?;
+            // bytes32[]: offset, length, the words.
+            if bytes.len() != 64 + 32 * chunk.len() || A::from_be_slice(&bytes[32..64]) != A::from(chunk.len()) {
+                return Err(ReadError::Malformed(format!("extsload answered {} bytes for {} slots", bytes.len(), chunk.len())));
+            }
+            out.extend(bytes[64..].chunks(32).map(A::from_be_slice));
+        }
+        Ok(out)
+    }
+
     /// Every call, at `block`. `None` for a call that failed — reverted, or a
     /// selector the target does not have — which is an answer about that call
     /// and not a reason to lose the others.
