@@ -142,6 +142,9 @@ The boot refuses, naming the cause, when any of these holds:
 - the targets are missing, stale or not `ok`;
 - `armed.live` is absent.
 
+Switched on 2026-10-29 (UTC), the operator's decision, after gate A″ (§3g),
+the owner's deploy (§3a–c) and six of six real-contract simulations agreeing.
+
 Nothing is sent until three things are done:
 
 - every transaction the ledger left pending is settled (landed or expired);

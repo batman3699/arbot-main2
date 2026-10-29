@@ -50,8 +50,11 @@ flashblocks:
 # cap is here, read by the engine and the live worker alike. Armed-live's files
 # are in var/armed: the unit can write there, and a new revision's archive of
 # var/apex leaves them in place.
+# Live since 2026-10-29, the operator's switch (ARMED.md §1f), after gate A''
+# and real-contract simulations of LeanExecutor2 agreeing. Off: `mode: shadow`
+# and a restart; soft stop: touch live.kill_file.
 armed:
-  mode: shadow
+  mode: live
   ledger: var/apex/armed.jsonl
   verdicts: var/apex/armed-verdicts.jsonl
   targets: var/armed/targets.json
