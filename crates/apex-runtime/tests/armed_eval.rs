@@ -60,6 +60,10 @@ fn arm() -> Arm {
         start: None,
         executor: None,
         start_per_eth: None,
+        bid_model: None,
+        alt_bid_wei_per_gas: None,
+        alt_p_win: None,
+        model_version: None,
     }
 }
 

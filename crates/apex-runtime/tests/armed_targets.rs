@@ -147,6 +147,7 @@ fn armed(mode: ArmedMode, targets: Option<&Path>) -> ArmedConfig {
         moves: None,
         executor2: None,
         eval_simulations_per_run: 2,
+        bid_model: Default::default(),
     }
 }
 

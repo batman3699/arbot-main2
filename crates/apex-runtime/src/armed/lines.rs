@@ -100,6 +100,18 @@ pub struct Arm {
     /// its landing is valued at. Absent for WETH, and before decision 4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_per_eth: Option<[String; 2]>,
+    /// R38: the rule the bid came from: `best_bid`, `best_share`, or
+    /// `best_bid (fallback: why)`. Absent before R38.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bid_model: Option<String>,
+    /// R38: the other rule's bid and its chance, judged beside the sent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_bid_wei_per_gas: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_p_win: Option<f64>,
+    /// R38: the census's contest sample the arm was priced with, when loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<String>,
 }
 
 fn balancer() -> String {

@@ -732,11 +732,31 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
             max_priority_wei_per_gas: config.armed.max_priority_wei_per_gas,
     };
     let window_blocks = engine_settings.window_blocks();
+    // R38: the census's contest sample, which `best_share` bids against and
+    // which every arm's other bid is judged on. Without one, `best_bid` alone.
+    let contest = match targets.as_ref().map(crate::armed::targets::Targets::share_sample) {
+        Some(Ok(s)) => {
+            info!(
+                model_version = %s.model_version,
+                effective = s.effective,
+                fit_ok = s.fit_ok,
+                bid_model = ?config.armed.bid_model,
+                "the arms bid with the census's contest sample"
+            );
+            Some(Arc::new(s))
+        }
+        Some(Err(why)) => {
+            warn!(%why, bid_model = ?config.armed.bid_model, "no contest sample: the arms bid best_bid alone");
+            None
+        }
+        None => None,
+    };
     let armed = Arc::new(crate::armed::engine::Engine::new(armed_set.clone(), engine_settings, unarmable)
     .with_bids({
         let t = targets.clone();
         Arc::new(move |weth_in, other| t.as_ref().map_or_else(Vec::new, |t| t.bids_for(weth_in, other).to_vec()))
-    }));
+    })
+    .with_contest(contest, config.armed.bid_model));
     // R36: the move statistics an earlier run saved (or a seed wrote), so the
     // ranking does not begin again at every restart.
     if let Some(path) = &config.armed.moves {

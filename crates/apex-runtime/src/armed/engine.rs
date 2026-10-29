@@ -3,7 +3,7 @@
 //! sender each; a line per arm and per renewal. Pure: the shadow worker calls
 //! [`Engine::tick`] and writes what it returns.
 
-use super::bid::{best_bid, rank_value, Bid};
+use super::bid::{arm_bid, rank_value, ArmBid, BidModel, ShareSample};
 use super::lines::{Arm, ArmedLine, Word};
 use super::moves::{spread_key, MoveStats};
 use super::plan::{armed_call, armed_call2};
@@ -93,7 +93,7 @@ struct Computed {
     seqs: [u64; 2],
     at_ns: u64,
     /// Each rung with its band and its bid (R36): the band pays the bid's tip.
-    rungs: Vec<(Rung, Band, Bid)>,
+    rungs: Vec<(Rung, Band, ArmBid)>,
 }
 
 struct Live {
@@ -140,6 +140,9 @@ pub type RouteBids = Arc<dyn Fn(Address, Address) -> Vec<u128> + Send + Sync>;
 pub struct Engine {
     cycles: BTreeMap<RouteId, Cycle>,
     bids: RouteBids,
+    /// R38: the census's contest sample, and which rule's bid is sent.
+    contest: Option<Arc<ShareSample>>,
+    bid_model: BidModel,
     settings: EngineSettings,
     unarmable: BTreeSet<Address>,
     state: Mutex<State>,
@@ -192,6 +195,8 @@ impl Engine {
         Self {
             cycles,
             bids: Arc::new(|_, _| Vec::new()),
+            contest: None,
+            bid_model: BidModel::BestBid,
             settings,
             unarmable,
             state: Mutex::new(state),
@@ -215,6 +220,15 @@ impl Engine {
     #[must_use]
     pub fn with_bids(mut self, bids: RouteBids) -> Self {
         self.bids = bids;
+        self
+    }
+
+    /// R38: the census's contest sample, and the rule whose bid is sent; the
+    /// other rule's bid rides along on every arm.
+    #[must_use]
+    pub fn with_contest(mut self, contest: Option<Arc<ShareSample>>, model: BidModel) -> Self {
+        self.contest = contest;
+        self.bid_model = model;
         self
     }
 
@@ -325,8 +339,8 @@ impl Engine {
                 // orders the arms, as in R26, and excludes none.
                 // R37: ranked in wei, whatever the cycle's start token.
                 let Some(pxc) = px.for_cycle(c) else { continue };
-                if bid.p_win > 0.0 {
-                    ranked.push((rank_value(p, bid, pxc.in_wei(b.point.surplus), b.point.gas.expected.0), (*id, *leg, r.index)));
+                if bid.sent.p_win > 0.0 {
+                    ranked.push((rank_value(p, &bid.sent, pxc.in_wei(b.point.surplus), b.point.gas.expected.0), (*id, *leg, r.index)));
                 }
             }
         }
@@ -429,12 +443,13 @@ impl Engine {
                 let c = &self.cycles[&id];
                 let pair = [Arc::clone(&snapshot[&c.legs[0].pool]), Arc::clone(&snapshot[&c.legs[1].pool])];
                 let bids = (self.bids)(c.legs[0].pool, c.legs[1].pool);
+                let inputs = BidInputs { winners: &bids, sample: self.contest.as_deref(), model: self.bid_model };
                 // R37: priced in the cycle's own start token; a USDC cycle
                 // without a rate is priced at nothing.
-                let found: Vec<(Rung, Band, Bid)> = match px.for_cycle(c) {
+                let found: Vec<(Rung, Band, ArmBid)> = match px.for_cycle(c) {
                     Some(pxc) => rungs(c, &pair, usize::from(leg), &pxc, s.rungs)
                         .into_iter()
-                        .filter_map(|r| bid_and_band(c, &pair, usize::from(leg), &r, &pxc, &s, &bids).map(|(b, bid)| (r, b, bid)))
+                        .filter_map(|r| bid_and_band(c, &pair, usize::from(leg), &r, &pxc, &s, &inputs).map(|(b, bid)| (r, b, bid)))
                         .collect(),
                     None => Vec::new(),
                 };
@@ -457,7 +472,7 @@ impl Engine {
         &self,
         c: &Cycle,
         leg: u8,
-        (rung, band, bid): (&Rung, &Band, &Bid),
+        (rung, band, bid): (&Rung, &Band, &ArmBid),
         snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>,
         (head, to_block): (u64, u64),
         base_fee_wei: u128,
@@ -514,12 +529,16 @@ impl Engine {
             calldata_hash,
             sender_slot: u16::try_from(sender).unwrap_or(u16::MAX),
             lender,
-            bid_wei_per_gas: bid.per_gas.to_string(),
-            p_win: bid.p_win,
+            bid_wei_per_gas: bid.sent.per_gas.to_string(),
+            p_win: bid.sent.p_win,
             renewals: Vec::new(),
             start: (c.start != crate::live::frontier::WETH).then_some(c.start),
             executor: Some(self.settings.executor2.unwrap_or(self.settings.executor)),
             start_per_eth: px.rate.map(|(num, den)| [num.to_string(), den.to_string()]),
+            bid_model: Some(bid.choice.label()),
+            alt_bid_wei_per_gas: bid.alt.map(|b| b.per_gas.to_string()),
+            alt_p_win: bid.alt.map(|b| b.p_win),
+            model_version: self.contest.as_ref().map(|s| s.model_version.clone()),
         })
     }
 
@@ -568,9 +587,25 @@ impl Engine {
     }
 }
 
-/// R36: a rung's bid against the route's measured winners (`bids`; none
-/// measured bids nothing and ranks as R26's did), and its band paying that
-/// bid's tip at both edges.
+/// R38: what a rung's bid is chosen against: the route's measured winners,
+/// the census's contest sample, and the rule whose bid is sent.
+#[derive(Clone, Copy)]
+pub struct BidInputs<'a> {
+    pub winners: &'a [u128],
+    pub sample: Option<&'a ShareSample>,
+    pub model: BidModel,
+}
+
+impl<'a> BidInputs<'a> {
+    /// R36's inputs alone: the route's measured winners, `best_bid` sent.
+    pub fn winners(winners: &'a [u128]) -> Self {
+        Self { winners, sample: None, model: BidModel::BestBid }
+    }
+}
+
+/// R36: a rung's bid (`arm_bid`: R36's against the route's measured winners,
+/// none measured bidding nothing and ranking as R26's did; R38's against the
+/// contest sample), and its band paying the sent bid's tip at both edges.
 pub fn bid_and_band(
     cycle: &Cycle,
     pair: &[Arc<PoolSnapshot>; 2],
@@ -578,17 +613,13 @@ pub fn bid_and_band(
     rung: &Rung,
     px: &Pricing,
     s: &EngineSettings,
-    bids: &[u128],
-) -> Option<(Band, Bid)> {
+    inputs: &BidInputs,
+) -> Option<(Band, ArmBid)> {
     let gas = rung.point.gas.expected.0;
-    let bid = if bids.is_empty() {
-        Bid { per_gas: 0, p_win: 1.0 }
-    } else {
-        // R37: winners bid wei a gas, so the surplus is measured in wei.
-        best_bid(bids, px.in_wei(rung.point.surplus), gas, s.max_priority_wei_per_gas)
-    };
+    // R37: winners bid wei a gas, so the surplus is measured in wei.
+    let bid = arm_bid(inputs.winners, inputs.sample, inputs.model, px.in_wei(rung.point.surplus), gas, s.max_priority_wei_per_gas);
     // And the band pays the tip in the cycle's start token.
-    let tip = px.in_start(U256::from(bid.per_gas).saturating_mul(U256::from(gas)));
+    let tip = px.in_start(U256::from(bid.sent.per_gas).saturating_mul(U256::from(gas)));
     band_paying(cycle, pair, leg, rung, px, s.band_cap_bps, tip).map(|b| (b, bid))
 }
 

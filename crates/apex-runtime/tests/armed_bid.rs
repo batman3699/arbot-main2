@@ -7,8 +7,8 @@ use alloy_primitives::{address, Address};
 use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
-use apex_runtime::armed::bid::{best_bid, rank_value, Bid};
-use apex_runtime::armed::engine::{bid_and_band, Engine, EngineSettings, REPRICE_BUDGET};
+use apex_runtime::armed::bid::{best_bid, rank_value, Bid, BidModel, ShareSample};
+use apex_runtime::armed::engine::{bid_and_band, BidInputs, Engine, EngineSettings, REPRICE_BUDGET};
 use apex_runtime::armed::lines::ArmedLine;
 use apex_runtime::armed::threshold::{band_paying, fixed, rungs, Pricing};
 use apex_runtime::econ::RouteCosts;
@@ -157,9 +157,9 @@ fn every_band_clears_the_hurdle_plus_its_tip() {
                 // just over it, a tip of about half its surplus.
                 let gas = r.point.gas.expected.0;
                 let winner = (r.point.surplus / U256::from(2 * gas)).as_u128();
-                let Some((b, bid)) = bid_and_band(c, &pair, leg, &r, &px(), &s, &[winner]) else { continue };
-                assert_eq!(bid.per_gas, winner + 1);
-                let tip = U256::from(bid.per_gas) * U256::from(gas);
+                let Some((b, bid)) = bid_and_band(c, &pair, leg, &r, &px(), &s, &BidInputs::winners(&[winner])) else { continue };
+                assert_eq!(bid.sent.per_gas, winner + 1);
+                let tip = U256::from(bid.sent.per_gas) * U256::from(gas);
                 let paying = Pricing { margin_wei: px().margin_wei + tip, ..px() };
                 for edge in &b.edges {
                     assert!(fixed(c, &pair, leg, &r.trigger, edge, r.point.size, b.point.mid, &paying).is_some(), "an edge pays the tip");
@@ -232,4 +232,56 @@ fn a_rung_that_outbids_no_one_takes_no_sender() {
     // Winners who paid a whole ETH per gas: no surplus here outbids them.
     let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _| vec![10u128.pow(18)]));
     assert!(engine.tick(&snap, 1_000, 5_000_000, &px(), 1).is_empty());
+}
+
+/// R38: with the census's contest sample, every arm records the rule that
+/// sent it, the other rule's bid and chance, and the sample's version; asked
+/// for `best_share` with a fit sample, the share bid is sent and `best_bid`'s
+/// rides along.
+#[test]
+fn every_arm_carries_both_rules_bids() {
+    let snap = snap();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let rows: Vec<(u128, u64)> = (0..400u128).map(|i| (i * 2_500_000, 1)).collect();
+    let sample = Arc::new(ShareSample::new(rows, 400, true, "r38-test".into()).unwrap());
+    let mut sent_by = Vec::new();
+    for (model, label) in [(BidModel::BestBid, "best_bid"), (BidModel::BestShare, "best_share")] {
+        let engine = Engine::new(cycles.clone(), settings(20_000_000), BTreeSet::new())
+            .with_bids(Arc::new(|_, _| BIDS.to_vec()))
+            .with_contest(Some(Arc::clone(&sample)), model);
+        let arms: Vec<_> = engine
+            .tick(&snap, 1_000, 5_000_000, &px(), 1)
+            .into_iter()
+            .filter_map(|l| if let ArmedLine::Arm(a) = l { Some(a) } else { None })
+            .collect();
+        assert!(!arms.is_empty());
+        for a in &arms {
+            assert_eq!((a.bid_model.as_deref(), a.model_version.as_deref()), (Some(label), Some("r38-test")));
+            let sent: u128 = a.bid_wei_per_gas.parse().unwrap();
+            let alt: u128 = a.alt_bid_wei_per_gas.as_deref().expect("the other rule's bid").parse().unwrap();
+            let winners_bid = if model == BidModel::BestBid { sent } else { alt };
+            assert!(winners_bid == 0 || BIDS.iter().any(|b| b + 1 == winners_bid), "best_bid's: {winners_bid}");
+            let share_p = if model == BidModel::BestShare { a.p_win } else { a.alt_p_win.unwrap() };
+            assert_eq!((share_p * 400.0).fract(), 0.0, "best_share's chance is a weight of the sample: {share_p}");
+        }
+        sent_by.push(arms.iter().map(|a| (a.arm_id, a.bid_wei_per_gas.clone())).collect::<Vec<_>>());
+    }
+    assert_ne!(sent_by[0], sent_by[1], "the model decides what is sent");
+}
+
+/// R38: without a sample, the arms record `best_bid` and carry nothing else.
+#[test]
+fn without_a_sample_an_arm_records_best_bid_alone() {
+    let snap = snap();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let engine = Engine::new(cycles, settings(20_000_000), BTreeSet::new()).with_bids(Arc::new(|_, _| BIDS.to_vec()));
+    let arms: Vec<_> = engine
+        .tick(&snap, 1_000, 5_000_000, &px(), 1)
+        .into_iter()
+        .filter_map(|l| if let ArmedLine::Arm(a) = l { Some(a) } else { None })
+        .collect();
+    assert!(!arms.is_empty());
+    for a in &arms {
+        assert_eq!((a.bid_model.as_deref(), a.alt_bid_wei_per_gas.as_deref(), a.alt_p_win, a.model_version.as_deref()), (Some("best_bid"), None, None, None));
+    }
 }

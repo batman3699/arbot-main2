@@ -325,6 +325,11 @@ pub struct ArmedConfig {
     /// (2026-10-29). At a run every five minutes, 2 is at most 576 a day.
     #[serde(default = "two_simulations")]
     pub eval_simulations_per_run: usize,
+    /// R38: the rule whose bid an arm sends; the other's rides along to be
+    /// judged. `best_share` sends only on a contest sample the census passed,
+    /// and falls back to `best_bid` otherwise (ops/host/ARMED.md).
+    #[serde(default)]
+    pub bid_model: crate::armed::bid::BidModel,
 }
 
 const fn two_simulations() -> usize {

@@ -378,6 +378,7 @@ fn the_shipped_canary_config_parses() {
     // every cap here.
     let a = &c.armed;
     assert_eq!(a.mode, apex_runtime::shadow::config::ArmedMode::Live);
+    assert_eq!(a.bid_model, apex_runtime::armed::bid::BidModel::BestBid, "R38: best_bid sends until the operator switches");
     assert_eq!(a.targets.as_deref(), Some(std::path::Path::new("var/armed/targets.json")));
     assert_eq!((a.daily_loss_budget_wei, a.max_priority_wei_per_gas), (10_000_000_000_000_000, 20_000_000_000));
     assert_eq!((a.max_size_wei, a.l1_fee_bound_wei, a.sender_reserve_wei), (5_000_000_000_000_000_000, 50_000_000_000_000, 200_000_000_000_000));
@@ -812,4 +813,23 @@ fn a_live_run_sends_to_the_deployed_executor2() {
     std::fs::write(&at, v1_only).unwrap();
     let v1 = ShadowConfig::load_canary(at.to_str().unwrap(), &env).unwrap();
     assert_eq!((v1.armed.executor2.as_ref(), v1.armed_executor()), (None, v1.executor.address), "no LeanExecutor2: v1");
+}
+
+/// R38: `armed.bid_model` names the rule whose bid is sent; absent, R36's
+/// `best_bid`. Another name is refused.
+#[test]
+fn the_bid_model_is_best_bid_unless_named() {
+    use apex_runtime::armed::bid::BidModel;
+    let path = format!("{}/../../ops/canary.base.yaml", env!("CARGO_MANIFEST_DIR"));
+    let env = env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("canary.yaml");
+    for (model, want) in [("best_share", Some(BidModel::BestShare)), ("best_bid", Some(BidModel::BestBid)), ("fixed_tip", None)] {
+        let named = text.replacen("armed:\n  mode: live\n", &format!("armed:\n  mode: live\n  bid_model: {model}\n"), 1);
+        assert_ne!(named, text);
+        std::fs::write(&at, named).unwrap();
+        let got = ShadowConfig::load_canary(at.to_str().unwrap(), &env).map(|c| c.armed.bid_model);
+        assert_eq!(got.ok(), want, "{model}");
+    }
 }
