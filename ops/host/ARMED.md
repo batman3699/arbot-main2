@@ -343,13 +343,16 @@ against its code, put at a placeholder address by a state override. The
 override also sets the trader as an executor, a recipient, and the
 executor's two Morpho approvals.
 
+`ops/host/deploy.sh` packages the code as `dist/LeanExecutor2.runtime.hex`
+(`forge inspect LeanExecutor2 deployedBytecode`). It refuses unless the code's
+keccak equals the revision's `armed.executor2.code_hash`. It also packages the
+v4 inventory with the others. On the host, after README §7's unpack:
+
 ```
-$ forge inspect LeanExecutor2 deployedBytecode > var/armed/LeanExecutor2.runtime.hex
-$ cast keccak "$(cat var/armed/LeanExecutor2.runtime.hex)"     # must equal armed.executor2.code_hash
+# install -o apex -g apex -m 0644 /root/dist/LeanExecutor2.runtime.hex /opt/apex/var/armed/LeanExecutor2.runtime.hex
 ```
 
-- Put the file, the v4 inventory and `ops/v4-hooks.base.json` on the host,
-  then deploy and restart (README §7).
+- `ops/v4-hooks.base.json` ships in the revision. Restart (README §7).
 - The boot logs v4 pools loaded. The boot also checks two things:
   - the code file's hash is `code_hash`. On a mismatch, "LeanExecutor2 is not
     the configured code: nothing is armed";
