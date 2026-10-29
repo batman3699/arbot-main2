@@ -339,8 +339,14 @@ $ echo <head block> > /opt/apex/var/census/v4-inventory.cursor
   PoolManager, not an `Initialize`, removed, or whose ID is not its key's hash,
   and it prints the counts.
 - After that, `apex-targets.service` scans each day's new pools before the
-  census (`--follow`, 2,000 blocks a query, over a public endpoint, never
-  BlockPI's key). A failed scan does not stop the census.
+  census: `--follow --rpc public`, 50 blocks a query over the census's public
+  endpoints, never BlockPI's key. A failed scan does not stop the census.
+- After the census it runs `scripts/data/target_pools.py`. That adds each
+  targeted v2/v3 pool no inventory holds, read from the pool and proven by
+  its own factory's `getPool`, with its hub-side depth.
+  - On 2026-10-29 the first R37 targets named ten such pools, among them the
+    four AXIS/USDC Uniswap v3 pools under the top v4 routes.
+  - Two are 1%-fee pools: the universe's 3,000 ppm cap keeps them out.
 
 ### f. The pre-deploy shadow (the host)
 

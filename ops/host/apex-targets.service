@@ -13,6 +13,9 @@ WorkingDirectory=/opt/apex/scripts/data
 # not stop the census.
 ExecStartPre=-/usr/sbin/runuser -u apex -- /usr/bin/python3 v4_inventory.py --out /opt/apex/data/base/uniswap_v4/pools.jsonl --follow /opt/apex/var/census/v4-inventory.cursor --rpc public
 ExecStart=/usr/sbin/runuser -u apex -- /usr/bin/nice -n 19 /usr/bin/python3 -m arb_census.targets --race /opt/apex/var/census --days 7 --top 50 --out /opt/apex/var/armed/targets.json --share-out /opt/apex/var/apex/armed-share.json --var /opt/apex/var/apex --meta /opt/apex/var/census/meta.json --gaps /opt/apex/var/census/r33-gaps.json --live-ledger /opt/apex/var/armed/armed-live.jsonl
+# R37: the targeted pools no inventory holds (new pools under the census's
+# routes), read from their factories, before the restart loads them.
+ExecStartPost=-/usr/sbin/runuser -u apex -- /usr/bin/python3 target_pools.py --targets /opt/apex/var/armed/targets.json --data /opt/apex/data/base --rpc public
 ExecStartPost=/bin/systemctl restart apex-canary
 
 # The census can scan multiple days through RPC when a day cache is missing:
