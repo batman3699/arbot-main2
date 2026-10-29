@@ -319,12 +319,24 @@ pub fn universe(
         .into_iter()
         .filter(|s| venues.contains(&s.venue))
         .collect();
-    // R37: pairs a cycle can start in: WETH's, and USDC's.
+    // R37: pairs a cycle can start in: WETH's, and USDC's where the census
+    // targets them. Every USDC pair over the floor brought stablecoin pools at
+    // tick spacing 1 into the book, whose ladders no target needed and whose
+    // reads timed out (2026-10-29).
     let usdc = apex_exec::lean2::USDC;
     Ok(inventory::pairs(&specs)
         .into_iter()
-        .filter(|((a, b), _)| [*a, *b].iter().any(|t| *t == WETH || *t == usdc))
-        .flat_map(|(_, pools)| pools)
+        .filter_map(|((a, b), pools)| {
+            if a == WETH || b == WETH {
+                Some(pools)
+            } else if a == usdc || b == usdc {
+                let targeted: Vec<PoolSpec> = pools.into_iter().filter(|p| include.contains(&p.pool)).collect();
+                (targeted.len() >= 2).then_some(targeted)
+            } else {
+                None
+            }
+        })
+        .flatten()
         .collect())
 }
 

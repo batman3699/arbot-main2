@@ -608,11 +608,13 @@ async fn settlement_is_refused_and_counted() {
 
 // ------------------------------------------------------------------ universe
 
-/// **The pools a WETH or USDC cycle can use** (R37), on the venues the
-/// executor can reach, and nothing else the census kept: a pair holding
-/// neither stays out. Filtered by venue **before** pairing: with Uniswap
-/// unreachable, PancakeSwap's lone WETH/USDC pool does not make a pair out of
-/// Uniswap's two.
+/// **The pools a WETH cycle can use**, on the venues the executor can reach,
+/// and a USDC pair's only where the census targets them (R37): every USDC pair
+/// over the floor put stablecoin pools at tick spacing 1 in the book, whose
+/// ladders no target needed and whose reads timed out (2026-10-29). A pair
+/// holding neither stays out. Filtered by venue **before** pairing: with
+/// Uniswap unreachable, PancakeSwap's lone WETH/USDC pool does not make a pair
+/// out of Uniswap's two.
 #[test]
 fn the_universe_is_the_reachable_weth_and_usdc_pairs_with_two_pools() {
     use apex_runtime::live::inventory::Venue;
@@ -635,8 +637,9 @@ fn the_universe_is_the_reachable_weth_and_usdc_pairs_with_two_pools() {
         std::fs::create_dir_all(dir.path().join(venue)).unwrap();
         std::fs::write(dir.path().join(venue).join("pools.jsonl"), lines.join("\n")).unwrap();
     }
-    let universe = |venues: &[Venue]| {
-        let mut got: Vec<u8> = apex_runtime::shadow::universe(dir.path(), venues, UniverseFilter::default(), &std::collections::BTreeSet::new(), &apex_runtime::live::v4::HookAllowlist::default())
+    let targeted = |venues: &[Venue], include: &[u8]| {
+        let include: std::collections::BTreeSet<Address> = include.iter().map(|n| Address::with_last_byte(*n)).collect();
+        let mut got: Vec<u8> = apex_runtime::shadow::universe(dir.path(), venues, UniverseFilter::default(), &include, &apex_runtime::live::v4::HookAllowlist::default())
             .unwrap()
             .iter()
             .map(|s| s.pool.as_slice()[19])
@@ -644,10 +647,14 @@ fn the_universe_is_the_reachable_weth_and_usdc_pairs_with_two_pools() {
         got.sort();
         got
     };
-    assert_eq!(universe(&[Venue::UniswapV3, Venue::Slipstream]), vec![1, 2, 3, 4]);
-    assert_eq!(universe(&Venue::ALL), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    let universe = |venues: &[Venue]| targeted(venues, &[]);
+    assert_eq!(universe(&[Venue::UniswapV3, Venue::Slipstream]), vec![1, 2], "an untargeted USDC pair stays out");
+    assert_eq!(universe(&Venue::ALL), vec![1, 2, 5, 6, 7, 8]);
     assert_eq!(universe(&[Venue::Slipstream, Venue::PancakeV3]), vec![5, 6]);
-    assert_eq!(universe(&[Venue::UniswapV3]), vec![1, 2, 3, 4]);
+    assert_eq!(universe(&[Venue::UniswapV3]), vec![1, 2]);
+    assert_eq!(targeted(&[Venue::UniswapV3], &[3, 4]), vec![1, 2, 3, 4], "a targeted USDC pair is in");
+    assert_eq!(targeted(&[Venue::UniswapV3], &[3]), vec![1, 2], "a pair needs two targeted pools");
+    assert_eq!(targeted(&[Venue::UniswapV3], &[9, 10]), vec![1, 2], "targeted, a pair holding neither still stays out");
     // R22: Aerodrome's two Slipstream factories pair with each other.
     assert_eq!(universe(&[Venue::Slipstream, Venue::SlipstreamV3]), vec![5, 8]);
 }
