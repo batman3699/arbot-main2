@@ -200,15 +200,23 @@ pub struct Landing {
     pub pessimistic: bool,
 }
 
-/// Who lands first. A rival in a later flashblock than ours always loses;
-/// in ours, the higher priority fee wins.
-pub fn landing(fire: (u64, u32), rival: Option<(u64, u32)>, bid: u128, rival_bid: u128) -> Landing {
+/// Who lands first. Ours is the trigger's flashblock, or the next one when
+/// the trigger `closes` its own: nothing follows a flashblock's last
+/// transaction in it, so the contest moves on and is decided by priority fee
+/// (live arm 3114, 2026-10-29). A rival in a later flashblock than ours
+/// always loses; in ours, the higher priority fee wins.
+pub fn landing(fire: (u64, u32), closes: bool, rival: Option<(u64, u32)>, bid: u128, rival_bid: u128) -> Landing {
     let Some(r) = rival else { return Landing { optimistic: true, pessimistic: true } };
-    let next = next_flashblock(fire);
-    Landing {
-        optimistic: r > fire || bid > rival_bid,
-        pessimistic: if r < next { false } else if r == next { bid > rival_bid } else { true },
-    }
+    let ours = if closes { next_flashblock(fire) } else { fire };
+    let at = |ours: (u64, u32)| if r < ours { false } else if r == ours { bid > rival_bid } else { true };
+    Landing { optimistic: at(ours), pessimistic: at(next_flashblock(ours)) }
+}
+
+/// The rival was our own send, landed at `sent_bid`: a bid at least as high
+/// lands, and a lower one is not known to, so it counts as lost.
+pub fn own_landing(bid: u128, sent_bid: u128) -> Landing {
+    let won = bid >= sent_bid;
+    Landing { optimistic: won, pessimistic: won }
 }
 
 /// `f` (per mille) of the surplus at the threshold, spread over the gas.

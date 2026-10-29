@@ -1,7 +1,7 @@
 //! R26: judging an arm against what the chain did.
 
 use apex_runtime::armed::eval::{
-    bid_wei_per_gas, judge, landing, merge_renewals, net_wei, next_flashblock, Point, TxEffect, Write, F_PERMILLE,
+    bid_wei_per_gas, judge, landing, merge_renewals, net_wei, next_flashblock, own_landing, Landing, Point, TxEffect, Write, F_PERMILLE,
 };
 use apex_runtime::armed::lines::{Arm, ArmedLine, Renewal, Word};
 use apex_runtime::armed::predicate::{expiry, Op, Predicate};
@@ -151,21 +151,50 @@ fn landing_follows_the_flashblock_rule() {
     let k = (102, 4);
     assert_eq!(next_flashblock((102, 10)), (103, 1));
     // No rival: won either way.
-    let l = landing(k, None, 1, 0);
+    let l = landing(k, false, None, 1, 0);
     assert!(l.optimistic && l.pessimistic);
     // Rival in the trigger's flashblock: optimistic needs the higher bid; pessimistic loses.
-    let l = landing(k, Some((102, 4)), 10, 5);
+    let l = landing(k, false, Some((102, 4)), 10, 5);
     assert!(l.optimistic && !l.pessimistic);
-    let l = landing(k, Some((102, 4)), 5, 10);
+    let l = landing(k, false, Some((102, 4)), 5, 10);
     assert!(!l.optimistic && !l.pessimistic);
     // Rival in the next: optimistic wins outright; pessimistic needs the higher bid.
-    let l = landing(k, Some((102, 5)), 5, 10);
+    let l = landing(k, false, Some((102, 5)), 5, 10);
     assert!(l.optimistic && !l.pessimistic);
-    let l = landing(k, Some((102, 5)), 10, 5);
+    let l = landing(k, false, Some((102, 5)), 10, 5);
     assert!(l.optimistic && l.pessimistic);
     // Rival later still: won either way.
-    let l = landing(k, Some((102, 7)), 0, 1_000);
+    let l = landing(k, false, Some((102, 7)), 0, 1_000);
     assert!(l.optimistic && l.pessimistic);
+}
+
+/// A trigger that is its flashblock's last transaction cannot be followed in
+/// it: the contest is in the next flashblock, by priority fee. Live arm 3114
+/// (2026-10-29): trigger at index 7 closing flashblock 1, our 0.005 gwei
+/// expired, the rival's 0.053 gwei landed at index 9 in flashblock 2. The
+/// old rule called that a win by position.
+#[test]
+fn a_trigger_that_closes_its_flashblock_is_contested_in_the_next() {
+    let k = (102, 4);
+    let l = landing(k, true, Some((102, 5)), 5_000_001, 53_150_146);
+    assert!(!l.optimistic && !l.pessimistic, "outbid in the next flashblock");
+    let l = landing(k, true, Some((102, 5)), 60_000_000, 53_150_146);
+    assert!(l.optimistic && !l.pessimistic, "the higher bid wins there; a flashblock later still loses");
+    let l = landing(k, true, Some((102, 6)), 0, 1_000);
+    assert!(l.optimistic && !l.pessimistic, "a rival two flashblocks on loses to us in the next, not one after");
+    let l = landing(k, true, None, 0, 0);
+    assert!(l.optimistic && l.pessimistic);
+    let l = landing((102, 10), true, Some((103, 1)), 1, 2);
+    assert!(!l.optimistic, "the block's last flashblock is followed by the next block's first");
+}
+
+/// The rival was our own send: it landed at the bid we sent, so every bid at
+/// least as high lands; a lower one is not known to, and counts as lost.
+#[test]
+fn our_own_landing_wins_at_the_bid_sent_and_above() {
+    assert_eq!(own_landing(5_000_001, 5_000_001), Landing { optimistic: true, pessimistic: true });
+    assert_eq!(own_landing(9_000_000, 5_000_001), Landing { optimistic: true, pessimistic: true });
+    assert_eq!(own_landing(5_000_000, 5_000_001), Landing { optimistic: false, pessimistic: false });
 }
 
 #[test]

@@ -6259,7 +6259,9 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - under via_ir the hash depends on the compile set, so the deploy builds the script's 18 files first;
     - two spare copies are unused.
   - **Armed-live, the operator's switch, 2026-10-29** (`ops/host/ARMED.md` §1f): `ops/canary.base.yaml` sets `armed.mode: live` after six of six real-contract simulations of post-deploy arms agreed with their quotes (v4 gas 0.85× expected). The 16 senders hold 0.002 ETH each; the budget is R36's 0.01 ETH a day; the reactive canary stays stopped.
-  - **Open:** the hookless AXIS pool `0x69241b…` is refused for its protocol fee (≈5% of v4 value).
+  - **First live landings, 2026-10-29:** arms 2374 and 4482, AXIS/USDC through v4, each in its trigger's own flashblock (index 77 after 76; 15 after 3), net +3.1e12 and +4.1e12 wei.
+  - **Correction: wins "by position" were mostly flashblock ends.** A trigger that closes its flashblock is contested in the next one, by fee (live arm 3114). Re-judged, 04:33–18:56 UTC's own-bid wins fall from 245 ($84.28) to 113 ($6.31). armed-eval now judges that, recognises our own landings, and judges each arm's own bid (`ops/host/ARMED.md` §3h).
+  - **Open:** the hookless AXIS pool `0x69241b…` is refused for its protocol fee (≈5% of v4 value). The bid model measures the wrong contest: R38 draft (`docs/superpowers/specs/2026-10-29-armed-bid-from-own-fires-design.md`), for the operator's review.
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
 I had this task down as "`Simulator` over `apex-sim::tier0`", on the reasoning that §20 lets a lower tier only *reject* and therefore makes Tier 0 the honest shadow simulator. **The reasoning was right and the conclusion was wrong.**

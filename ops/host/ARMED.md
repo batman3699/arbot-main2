@@ -464,3 +464,20 @@ at its own bid:
   55 by bid;
 - that is against 570 wins and $117.29 at 900‰, whose wins include 107 at a
   loss.
+
+**Correction, 2026-10-29 (the first live hour):** most of those wins by
+position were not wins.
+- A trigger that is its flashblock's last transaction cannot be followed in
+  that flashblock. The contest moves to the next one and is decided there by
+  priority fee.
+  - Live arm 3114's trigger closed flashblock 1. Our 0.005 gwei expired, and
+    the rival's 0.053 gwei landed in flashblock 2.
+  - The evaluator had called it a win by position.
+- Re-judged from 04:33 to 18:56 UTC:
+  - 245 own-bid wins ($84.28) become 113 ($6.31);
+  - 135 of the 245 ($78.00) were that case.
+- The evaluator also read our own live landings as a rival's.
+- armed-eval judges both correctly from R37's fix on, and judges each arm's
+  own bid (`own`). Figures above this note predate the fix.
+- The bid model's measured contest is the subject of the R38 draft,
+  `docs/superpowers/specs/2026-10-29-armed-bid-from-own-fires-design.md`.

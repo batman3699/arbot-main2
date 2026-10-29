@@ -11,12 +11,14 @@
 //! 4. checks the quote with `eth_simulateV1`: the fire block's earlier
 //!    transactions on those pools, then the armed call from the trader;
 //! 5. places both in their flashblocks (the flashblock ledger) and judges the
-//!    landing for every bid fraction.
+//!    landing for every bid fraction and the arm's own bid: a fire that closed
+//!    its flashblock is contested in the next one, by fee, and a rival that
+//!    is the arm's own send is armed-live's landing (R37).
 //!
 //! The lean executor sells all hop 1 returns, so a fire leaves no intermediate
 //! residue: `residue` is absent from verdicts since R36's lean quote.
 
-use super::eval::{self, bid_wei_per_gas, judge, landing, merge_renewals, net_wei, Landing, Point, TxEffect, Write, F_PERMILLE};
+use super::eval::{self, bid_wei_per_gas, judge, landing, merge_renewals, net_wei, own_landing, Landing, Point, TxEffect, Write, F_PERMILLE};
 use super::lines::{Arm, ArmedLine};
 use super::predicate::{layout, price_mask};
 use crate::live::book::{LiquidityWrite, PoolBook, StateWrite, SwapApplied, SwapWrite, SyncWrite};
@@ -168,6 +170,14 @@ pub struct PerF {
     pub net_wei: Option<String>,
 }
 
+/// R37: the arm's own bid, the one armed-live sends, judged like a fraction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OwnBid {
+    pub bid_wei_per_gas: String,
+    pub landing: Landing,
+    pub net_wei: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SimCheck {
     pub ok: bool,
@@ -210,9 +220,20 @@ pub struct Verdict {
     /// this one, would execute first.
     pub shadowed: bool,
     pub fire: Option<Position>,
+    /// The fire was its flashblock's last transaction: we could land in the
+    /// next flashblock at the earliest. Absent when the ledger did not place
+    /// it, and from verdicts before it was judged (R37).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire_closes_flashblock: Option<bool>,
     pub rival: Option<Position>,
     /// The rival's effective priority fee per gas.
     pub rival_priority_wei: Option<String>,
+    /// The rival was this arm's own send: armed-live landed it (R37).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ours: bool,
+    /// The arm's own bid, judged (R37). Absent for an arm without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own: Option<OwnBid>,
     /// WETH gross of the fire (hop 2's output less the loan).
     pub gross_wei: Option<String>,
     /// Hop 1's output beyond `mid`, left in the R26 executor. The lean
@@ -437,8 +458,11 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
         trigger_met: Some(j.trigger_met),
         shadowed,
         fire: None,
+        fire_closes_flashblock: None,
         rival: None,
         rival_priority_wei: None,
+        ours: false,
+        own: None,
         gross_wei: None,
         residue: None,
         quote_error: None,
@@ -497,24 +521,32 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
     let rival_fb = j.rival.as_ref().map(|r| locate(ctx.flashblocks, r.block, r.tx_index));
     let granular = fire_fb.is_some() && rival_fb.is_none_or(|x| x.is_some());
     v.fire = Some(Position { block: fire.block, tx_index: fire.tx_index, tx: fire.tx.clone(), flashblock: fire_fb });
+    v.fire_closes_flashblock = closes_flashblock(ctx.flashblocks, fire.block, fire.tx_index);
     let fire_at = (fire.block, if granular { fire_fb.unwrap_or(0) } else { 0 });
+    let closes = granular && v.fire_closes_flashblock == Some(true);
     let mut rival_at = None;
     let mut rival_bid = 0u128;
     if let Some(r) = &j.rival {
         let r_fb = rival_fb.flatten();
-        rival_bid = priority_of(ctx.rpc, r).await.unwrap_or(0);
+        let tx = rival_tx(ctx.rpc, r).await;
+        rival_bid = tx.as_ref().map_or(0, |t| t.priority);
+        let executor = arm.executor.unwrap_or(ctx.config.executor.address);
+        v.ours = tx.as_ref().is_some_and(|t| is_own_send(arm, executor, t.to, &t.input));
         v.rival = Some(Position { block: r.block, tx_index: r.tx_index, tx: r.tx.clone(), flashblock: r_fb });
         v.rival_priority_wei = Some(rival_bid.to_string());
         rival_at = Some((r.block, if granular { r_fb.unwrap_or(0) } else { 0 }));
     }
+    let judge_bid = |bid: u128| if v.ours { own_landing(bid, rival_bid) } else { landing(fire_at, closes, rival_at, bid, rival_bid) };
     let surplus = surplus_in_wei(arm, ctx.weth_usd);
     let gross = v.gross_wei.as_deref().and_then(|g| U256::from_dec_str(g).ok());
     let other: u128 = arm.other_wei.parse().unwrap_or(0);
+    let net = |bid: u128| gross.map(|g| net_wei(g, arm.gas_expected, base_fee, bid, other).to_string());
     for f in F_PERMILLE {
         let bid = bid_wei_per_gas(surplus, arm.gas_expected, f);
-        let l = landing(fire_at, rival_at, bid, rival_bid);
-        let net = gross.map(|g| net_wei(g, arm.gas_expected, base_fee, bid, other).to_string());
-        v.per_f.push(PerF { f_permille: f, bid_wei_per_gas: bid.to_string(), landing: l, net_wei: net });
+        v.per_f.push(PerF { f_permille: f, bid_wei_per_gas: bid.to_string(), landing: judge_bid(bid), net_wei: net(bid) });
+    }
+    if let Ok(bid) = arm.bid_wei_per_gas.parse::<u128>() {
+        v.own = Some(OwnBid { bid_wei_per_gas: bid.to_string(), landing: judge_bid(bid), net_wei: net(bid) });
     }
     v
 }
@@ -868,15 +900,43 @@ async fn block_object(rpc: &dyn RpcTransport, n: u64, full: bool) -> Option<Valu
     rpc.call("eth_getBlockByNumber", json!([format!("{n:#x}"), full])).await.ok().filter(|v| !v.is_null())
 }
 
-/// The rival's effective priority fee per gas.
-async fn priority_of(rpc: &dyn RpcTransport, r: &Point) -> Option<u128> {
+/// The rival transaction: its effective priority fee per gas, and what it
+/// called, to know our own send (R37).
+struct RivalTx {
+    priority: u128,
+    to: Option<Address>,
+    input: String,
+}
+
+async fn rival_tx(rpc: &dyn RpcTransport, r: &Point) -> Option<RivalTx> {
     let t = rpc.call("eth_getTransactionByHash", json!([r.tx])).await.ok()?;
     let b = block_object(rpc, r.block, false).await?;
     let base = hex_u128(b.get("baseFeePerGas")?)?;
-    match (t.get("maxPriorityFeePerGas").and_then(hex_u128), t.get("maxFeePerGas").and_then(hex_u128)) {
-        (Some(p), Some(m)) => Some(p.min(m.saturating_sub(base))),
-        _ => Some(hex_u128(t.get("gasPrice")?)?.saturating_sub(base)),
-    }
+    let priority = match (t.get("maxPriorityFeePerGas").and_then(hex_u128), t.get("maxFeePerGas").and_then(hex_u128)) {
+        (Some(p), Some(m)) => p.min(m.saturating_sub(base)),
+        _ => hex_u128(t.get("gasPrice")?)?.saturating_sub(base),
+    };
+    let to = t.get("to").and_then(Value::as_str).and_then(|a| a.parse().ok());
+    let input = t.get("input").and_then(Value::as_str).unwrap_or_default().to_string();
+    Some(RivalTx { priority, to, input })
+}
+
+/// The rival is this arm's own send: a call to `executor` with the arm's
+/// calldata or one of its renewals'. Only the executor's own senders can run
+/// it, and a sibling arm's send carries its own calldata.
+pub fn is_own_send(arm: &Arm, executor: Address, to: Option<Address>, input: &str) -> bool {
+    to == Some(executor)
+        && std::iter::once(&arm.calldata).chain(arm.renewals.iter().map(|r| &r.calldata)).any(|c| c.eq_ignore_ascii_case(input))
+}
+
+/// Whether transaction `tx_index` of `block` was its flashblock's last, from
+/// the ledger; `None` when the ledger does not place it.
+pub fn closes_flashblock(fbs: &[FlashblockSeen], block: u64, tx_index: u64) -> Option<bool> {
+    fbs.iter().filter(|f| f.block == block).find_map(|f| {
+        let first = u64::from(f.first_tx?);
+        let end = first + u64::from(f.tx_count);
+        (tx_index >= first && tx_index < end).then_some(tx_index + 1 == end)
+    })
 }
 
 /// The flashblock that added `tx_index` to `block`, from the ledger.
@@ -921,6 +981,10 @@ pub struct Summary {
     pub unfired_band_missed: u64,
     pub simulated: u64,
     pub sim_agreed: u64,
+    /// R37: by UTC day, at the arms' own bids, the ones armed-live sends.
+    pub own: BTreeMap<String, DayF>,
+    /// R37: fires the arm's own send took: armed-live's landings.
+    pub ours: u64,
 }
 
 /// The bid curve so far, from every verdict file in `dir`. Reads files only.
@@ -957,10 +1021,25 @@ pub fn summary(dir: &Path) -> Result<Summary, String> {
                 continue;
             }
             let reverts = v.quote_error.as_deref().is_some_and(|e| e.contains("revert"));
+            let usd_of = |net: &Option<String>| net.as_deref().and_then(|n| n.parse::<f64>().ok()).map_or(0.0, |n| n / 1e18 * v.weth_usd);
+            s.ours += u64::from(v.ours);
+            if let Some(o) = &v.own {
+                let d = s.own.entry(day.clone()).or_default();
+                d.fires += 1;
+                if o.landing.optimistic {
+                    d.wins_optimistic += 1;
+                    d.net_usd_optimistic += usd_of(&o.net_wei);
+                    d.included_reverts += u64::from(reverts);
+                }
+                if o.landing.pessimistic {
+                    d.wins_pessimistic += 1;
+                    d.net_usd_pessimistic += usd_of(&o.net_wei);
+                }
+            }
             for p in &v.per_f {
                 let d = s.days.entry(day.clone()).or_default().entry(p.f_permille).or_default();
                 d.fires += 1;
-                let usd = p.net_wei.as_deref().and_then(|n| n.parse::<f64>().ok()).map_or(0.0, |n| n / 1e18 * v.weth_usd);
+                let usd = usd_of(&p.net_wei);
                 if p.landing.optimistic {
                     d.wins_optimistic += 1;
                     d.net_usd_optimistic += usd;

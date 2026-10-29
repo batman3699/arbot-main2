@@ -121,6 +121,73 @@ fn the_summary_sums_the_bid_curve_and_splits_the_misses() {
     assert_eq!(day.len(), 2);
 }
 
+/// The arms' own bids, the ones armed-live sends, are summed by day beside the
+/// fractions, and a fire this arm's own send took counts as ours. A verdict
+/// from before the own bid was judged counts in neither.
+#[test]
+fn the_summary_sums_the_arms_own_bids_and_our_landings() {
+    let dir = tempfile::tempdir().unwrap();
+    let own = |landed: bool, net: &str| {
+        serde_json::json!({ "bid_wei_per_gas": "5000001", "landing": { "optimistic": landed, "pessimistic": landed }, "net_wei": net })
+    };
+    let lines = [
+        // 0.004 WETH at $2,500.
+        verdict(1, true, serde_json::json!({ "ours": true, "own": own(true, "4000000000000000") })),
+        verdict(2, true, serde_json::json!({ "own": own(false, "1000") })),
+        verdict(3, true, serde_json::json!({ "shadowed": true, "own": own(true, "1") })),
+        verdict(4, true, serde_json::json!({})),
+    ];
+    std::fs::write(dir.path().join("armed-verdicts-2026-10-29.jsonl"), lines.join("\n") + "\n").unwrap();
+    let s = summary(dir.path()).unwrap();
+    assert_eq!(s.ours, 1);
+    let d = &s.own["2026-10-29"];
+    assert_eq!((d.fires, d.wins_optimistic, d.wins_pessimistic), (2, 1, 1));
+    assert_eq!(d.net_usd_optimistic, 10.0);
+}
+
+/// Whether a transaction closed its flashblock, from the flashblock ledger:
+/// block 53,254,698's flashblock 1 held transactions 1-7 (live arm 3114).
+#[test]
+fn a_flashblock_s_last_transaction_is_read_from_the_ledger() {
+    use apex_chain::base::flashblock_stream::FlashblockSeen;
+    use apex_runtime::armed::run::closes_flashblock;
+    let fb = |index, first_tx: Option<u32>, tx_count| FlashblockSeen {
+        block: 53_254_698,
+        index,
+        arrived_at_ns: 0,
+        first_tx,
+        tx_count,
+        block_timestamp: None,
+    };
+    let ledger = [fb(0, Some(0), 1), fb(1, Some(1), 7), fb(2, Some(8), 0), fb(3, Some(8), 9), fb(4, None, 5)];
+    assert_eq!(closes_flashblock(&ledger, 53_254_698, 7), Some(true));
+    assert_eq!(closes_flashblock(&ledger, 53_254_698, 6), Some(false));
+    assert_eq!(closes_flashblock(&ledger, 53_254_698, 16), Some(true), "an empty flashblock between holds nothing");
+    assert_eq!(closes_flashblock(&ledger, 53_254_698, 20), None, "not seen whole");
+    assert_eq!(closes_flashblock(&ledger, 53_254_699, 1), None);
+}
+
+/// A rival that is this arm's own send: to its executor, with its calldata or
+/// a renewal's (the live landings of 2026-10-29 hash to their arms'
+/// `calldata_hash`). A sibling arm's send is not this arm's landing.
+#[test]
+fn our_own_send_is_known_by_its_executor_and_calldata() {
+    use apex_runtime::armed::lines::{Arm, Renewal};
+    use apex_runtime::armed::run::is_own_send;
+    let text = r#"{"arm_id":7,"at_ns":0,"armed_block":100,"to_block":110,"route_hash":"0xr","trigger_leg":0,"rung":1,"step":3,
+        "pools":["0xaa","0xbb"],"venues":["UniswapV4","UniswapV3"],"predicates":[],"start_words":[],"start_ticks":[],
+        "size_wei":"1","mid":"1","output_wei":"2","surplus_wei":"1","cost_wei":"0","gas_expected":1,"gas_limit":900000,
+        "base_fee_wei":"5000000","other_wei":"0","deadline":11,"calldata":"0xAbC1","calldata_hash":"0x","sender_slot":0}"#;
+    let mut arm: Arm = serde_json::from_str(text).unwrap();
+    arm.renewals.push(Renewal { after_block: 110, to_block: 115, deadline: 16, calldata: "0xdef2".into() });
+    let e = address!("443A997cF27Dac4BB32e007d4168492abC77ad6e");
+    assert!(is_own_send(&arm, e, Some(e), "0xabc1"));
+    assert!(is_own_send(&arm, e, Some(e), "0xDEF2"), "a renewal's");
+    assert!(!is_own_send(&arm, e, Some(AERO), "0xabc1"), "another contract");
+    assert!(!is_own_send(&arm, e, Some(e), "0x1234"), "a sibling arm's send");
+    assert!(!is_own_send(&arm, e, None, "0xabc1"), "a creation");
+}
+
 /// The simulation replays every transaction of the fire's block up to and
 /// including the fire, in order, whatever it touched: one that touched our
 /// pools can depend on one that did not (an approval, a transfer, a nonce), and
