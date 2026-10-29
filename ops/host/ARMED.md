@@ -384,6 +384,25 @@ Run at least three days. The gate passes when all of these hold:
 - the fires that would have won, and their net per day, are counted against
   the actual winners.
 
+**Passed, 2026-10-29, by the operator's decision, on about four hours of
+armed-shadow, not three days.** Revision 5e28d54; arms from 04:33 UTC,
+verdicts through 08:30 UTC.
+
+- **Fires:** 3,261, all starting in USDC; 3,176 run through the AXIS v4 pool,
+  simulated against LeanExecutor2's code before its deploy.
+- **Quote and simulation agree to the unit on 97.9%** of v4 fires
+  (2,789 / 2,848 at the last full count).
+- **Gas:** v4 fires used 0.84× the arm's expected gas at the median, and none
+  exceeded its limit. Our venues' USDC fires used 1.07×.
+- **Health:** every armed v4 pool's words matched the book: 82 of 82 slots
+  armable, no unarmable pool.
+- **Would have completed**, at 900‰ of the expected surplus as the bid:
+  - in the trigger's own flashblock: 526 won the race, 517 executed, 419 at a
+    profit, net $107.73;
+  - one flashblock later: 27 won, 24 executed, 18 at a profit, net $4.03.
+  - A won fire whose simulation fails would be included and revert: 9 at
+    900‰ (a hop short of its minimum).
+
 The operator's decisions 2–4 come next: sender funding, the live gate's
 threshold, and loss-budget netting. A USDC landing currently counts only its
 gas against the ETH budget. After them, §3a–c.
