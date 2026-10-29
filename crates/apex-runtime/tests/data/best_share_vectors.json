@@ -1,0 +1,218 @@
+{
+  "about": "R38 best_share golden vectors, derived by hand; read by crates/apex-runtime/tests/armed_share.rs and scripts/data/arb_census/test_contest.py. rows are [share in parts per 1e9, weight]; F(b) is the weight of rows with x * surplus < b * gas * 1e9.",
+  "cases": [
+    {
+      "name": "the cheap bid wins when the dear one keeps too little",
+      "rows": [
+        [
+          0,
+          1
+        ],
+        [
+          500000000,
+          1
+        ],
+        [
+          1000000000,
+          1
+        ],
+        [
+          3000000000,
+          1
+        ]
+      ],
+      "surplus": "1000000",
+      "gas": 100,
+      "cap": "340282366920938463463374607431768211455",
+      "bid": "1",
+      "below": 1,
+      "total": 4
+    },
+    {
+      "name": "weight makes the dear bid pay",
+      "rows": [
+        [
+          0,
+          1
+        ],
+        [
+          500000000,
+          3
+        ]
+      ],
+      "surplus": "1000000",
+      "gas": 100,
+      "cap": "340282366920938463463374607431768211455",
+      "bid": "5001",
+      "below": 4,
+      "total": 4
+    },
+    {
+      "name": "a tie keeps the lower bid",
+      "rows": [
+        [
+          0,
+          1
+        ],
+        [
+          500000000,
+          1
+        ]
+      ],
+      "surplus": "1000100",
+      "gas": 100,
+      "cap": "340282366920938463463374607431768211455",
+      "bid": "1",
+      "below": 1,
+      "total": 2
+    },
+    {
+      "name": "p_win is F at the integer bid, past the row that produced it",
+      "rows": [
+        [
+          0,
+          1
+        ],
+        [
+          500000000,
+          1
+        ],
+        [
+          500000001,
+          1
+        ]
+      ],
+      "surplus": "1000000",
+      "gas": 100,
+      "cap": "340282366920938463463374607431768211455",
+      "bid": "5001",
+      "below": 3,
+      "total": 3
+    },
+    {
+      "name": "the cap drops a dearer bid",
+      "rows": [
+        [
+          0,
+          1
+        ],
+        [
+          500000000,
+          3
+        ]
+      ],
+      "surplus": "1000000",
+      "gas": 100,
+      "cap": "5000",
+      "bid": "1",
+      "below": 1,
+      "total": 4
+    },
+    {
+      "name": "a bid whose gas equals the surplus is dropped",
+      "rows": [
+        [
+          0,
+          1
+        ],
+        [
+          999900000,
+          5
+        ]
+      ],
+      "surplus": "500100",
+      "gas": 100,
+      "cap": "340282366920938463463374607431768211455",
+      "bid": "1",
+      "below": 1,
+      "total": 6
+    },
+    {
+      "name": "a row exactly at a bid's share is not below it",
+      "rows": [
+        [
+          0,
+          1
+        ],
+        [
+          100000,
+          1
+        ]
+      ],
+      "surplus": "1000000",
+      "gas": 100,
+      "cap": "340282366920938463463374607431768211455",
+      "bid": "2",
+      "below": 2,
+      "total": 2
+    },
+    {
+      "name": "the cap itself may be bid",
+      "rows": [
+        [
+          0,
+          1
+        ],
+        [
+          500000000,
+          3
+        ]
+      ],
+      "surplus": "1000000",
+      "gas": 100,
+      "cap": "5001",
+      "bid": "5001",
+      "below": 4,
+      "total": 4
+    },
+    {
+      "name": "no row below any bid that pays bids nothing",
+      "rows": [
+        [
+          2000000000,
+          1
+        ]
+      ],
+      "surplus": "1000000",
+      "gas": 100,
+      "cap": "340282366920938463463374607431768211455",
+      "bid": "0",
+      "below": 0,
+      "total": 1
+    },
+    {
+      "name": "zero gas fails closed",
+      "rows": [
+        [
+          0,
+          1
+        ]
+      ],
+      "surplus": "1000000",
+      "gas": 0,
+      "cap": "1000",
+      "error": "zero gas"
+    },
+    {
+      "name": "zero surplus fails closed",
+      "rows": [
+        [
+          0,
+          1
+        ]
+      ],
+      "surplus": "0",
+      "gas": 100,
+      "cap": "1000",
+      "error": "zero surplus"
+    },
+    {
+      "name": "an empty sample fails closed",
+      "rows": [],
+      "surplus": "1000000",
+      "gas": 100,
+      "cap": "1000",
+      "error": "empty sample"
+    }
+  ]
+}
