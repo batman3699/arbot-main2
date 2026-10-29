@@ -32,7 +32,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from arb_census import race
+from arb_census import contest, race
 from arb_census.venues import USDC, WETH
 
 UTC = timezone.utc
@@ -693,6 +693,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         days.append(data)
 
     targets = build(days, args.top)
+    # R38: the armed bid's contest sample, from our own judged fires. It
+    # never changes whether the targets publish.
+    contest.attach_contest(targets, var_dir, Path(args.live_ledger), days_to_process)
+    if "contest" in targets:
+        c = targets["contest"]
+        print(f"R38 contest: {len(c['rows'])} rows, {c['effective']} effective, fit days {c['fit_days']}, held out "
+              f"{c['held_out_day']}; fit_ok={str(c['fit_ok']).lower()} {c['reasons']}", flush=True)
     # Readiness is the file's own ok, never merely successful JSON IO; an
     # unfit file is kept for the operator beside the last good one.
     published = publish(targets, Path(args.out))

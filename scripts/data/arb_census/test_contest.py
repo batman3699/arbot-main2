@@ -216,5 +216,29 @@ class Section(unittest.TestCase):
         self.assertIsNone(C.arm_of(arms, {"arm_id": 1, "route_hash": "0xr", "at_ns": 50}))
 
 
+
+class Schedule(unittest.TestCase):
+    def test_the_fit_is_the_three_days_before_the_held_out_one_from_r37_on(self):
+        days = [f"2026-10-{d}" for d in range(26, 32)] + ["2026-11-01"]
+        self.assertEqual(C.contest_days(days),
+                         (["2026-10-29", "2026-10-30", "2026-10-31"], "2026-11-01", ["2026-10-28", "2026-10-29", "2026-10-30", "2026-10-31", "2026-11-01"]))
+        fit, held, _ = C.contest_days([f"2026-10-{d}" for d in range(24, 31)])
+        self.assertEqual((fit, held), (["2026-10-29"], "2026-10-30"), "nothing before R37's arms")
+        self.assertEqual(C.contest_days([]), ([], None, []))
+
+    def test_attaching_a_section_never_breaks_the_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            targets = {"ok": True, "routes": []}
+            out = C.attach_contest(targets, Path(tmp), Path(tmp) / "none.jsonl", ["2026-10-29", "2026-10-30"])
+            self.assertIs(out, targets)
+            self.assertFalse(targets["contest"]["fit_ok"])
+            self.assertIn("no fit fires", targets["contest"]["reasons"])
+            self.assertTrue(targets["ok"], "an unfit contest never unpublishes the targets")
+            (Path(tmp) / "armed-verdicts-2026-10-29.jsonl").write_text('{"fired": true, "gross_wei": "1", "fire": 5}\n')
+            broken = C.attach_contest({"ok": True}, Path(tmp), Path(tmp) / "none.jsonl", ["2026-10-29", "2026-10-30"])
+            self.assertNotIn("contest", broken, "a census that cannot measure leaves best_bid alone")
+            self.assertTrue(broken["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

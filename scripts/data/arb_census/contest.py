@@ -483,3 +483,35 @@ def contest_section(var: Path, live_ledger: Path, fit_days: Sequence[str], held_
             "held_out_censored_at_zero": upper_eval,
         },
     }
+
+
+# R37's arms (USDC and v4, through LeanExecutor2) began on 2026-10-29: an
+# earlier day's fires are another population, and never enter the fit.
+SINCE = "2026-10-29"
+
+
+def contest_days(complete_days: Sequence[str]) -> tuple[list[str], str | None, list[str]]:
+    """``(fit days, held-out day, arm days)`` from the census's complete UTC
+    days, ascending: the last is held out, the three before it fit, none
+    before ``SINCE``. An arm signed the day before a fit day can be judged on
+    it, so the arm days start one earlier."""
+    if not complete_days:
+        return [], None, []
+    held = complete_days[-1]
+    fit = [d for d in complete_days[-4:-1] if d >= SINCE]
+    first = complete_days.index(fit[0] if fit else held)
+    return fit, held, list(complete_days[max(0, first - 1):])
+
+
+def attach_contest(targets: dict[str, Any], var: Path, live_ledger: Path, complete_days: Sequence[str]) -> dict[str, Any]:
+    """``targets`` with its ``contest`` section. A census that cannot
+    measure says why and leaves the section out, so the arms bid
+    ``best_bid`` alone. The section never changes the targets' own ``ok``."""
+    fit, held, arm_days = contest_days(complete_days)
+    if held is None:
+        return targets
+    try:
+        targets["contest"] = contest_section(var, live_ledger, fit, held, arm_days)
+    except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
+        print(f"R38 contest: not measured: {exc!r}", flush=True)
+    return targets

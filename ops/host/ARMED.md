@@ -481,3 +481,37 @@ position were not wins.
   own bid (`own`). Figures above this note predate the fix.
 - The bid model's measured contest is the subject of the R38 draft,
   `docs/superpowers/specs/2026-10-29-armed-bid-from-own-fires-design.md`.
+
+## 4. R38: the bid against our own fires
+
+The design is `docs/superpowers/specs/2026-10-29-armed-bid-from-own-fires-design.md`
+(approved 2026-10-29).
+
+- **The census measures it.** Each day `apex-targets` also writes a `contest`
+  section into `targets.json`.
+  - Its rows are, for each fire armed-eval judged, the share of the arm's
+    surplus a bid had to exceed to win (`arb_census/contest.py`).
+  - The fit is three complete UTC days from 2026-10-29 on, and the next day
+    is held out.
+  - `fit_ok` holds only when calibration and the paired net against
+    `best_bid` pass on the held-out day, and `reasons` says why not.
+  - It never changes the targets' own `ok`.
+- **Every arm carries both bids.**
+  - `bid_model` names the rule that sent it;
+  - `alt_bid_wei_per_gas` and `alt_p_win` are the other rule's;
+  - `model_version` names the sample.
+- **armed-eval judges three bids on every fire:** `own`, `alt`, and `base`
+  (1 wei). The report's summary has them by day.
+- **The switch is `armed.bid_model: best_share`** in `ops/canary.base.yaml`,
+  then a deploy and a restart. It is the operator's call, after the gates
+  and a full day of `alt`.
+  - Without a fit sample (absent, unfit, or under 300 effective rows), the
+    arms send `best_bid` and record `best_bid (fallback: <reason>)`.
+  - The boot logs the sample: `the arms bid with the census's contest
+    sample`, or `no contest sample`.
+- **History.** The fit reads `var/apex`: verdicts, arms and flashblock
+  ledgers.
+  - README §7's archive of `var/apex` moves them.
+  - Until four days have passed again, the sample is unfit and the arms send
+    `best_bid`.
+

@@ -80,6 +80,10 @@ was signed**. Nothing is re-priced from state after the fire.
 - **Why share, not per gas.** Across 4,115 contested fires the rival's bid per
   gas rises with our surplus (Spearman 0.65). A pooled per-gas `F` underbids
   big gaps and overbids small ones.
+- **At most 1,000 rows.** Past that, neighbouring shares merge into weight
+  quantiles, each at its largest share: rivals rounded the stronger way.
+  This keeps the engine's pass cheap, since `best_share` runs on every rung.
+  It was added in implementation.
 - **One fire, one row.** Arms of different routes or rungs fired by the same
   trigger transaction in the same flashblock are one market move. Rows are
   clustered by `(block, trigger tx)` for inference, and the fit counts a
