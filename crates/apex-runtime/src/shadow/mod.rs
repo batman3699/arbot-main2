@@ -578,6 +578,34 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     if targets.is_some() {
         info!(cycles = armed_set.len(), "the arming engine arms the targeted routes' cycles");
     }
+    // R37: an armed route's other token (neither WETH nor USDC) is armed only
+    // if it moves exactly, checked out of its deepest pool (PoolManager for a
+    // v4 one). A check that fails or does not run leaves its pools unarmed.
+    let mut unarmable = unarmable;
+    let mut by_token: BTreeMap<Address, (Address, f64, std::collections::BTreeSet<Address>)> = BTreeMap::new();
+    for p in armed_set.values().flat_map(|c| c.legs.iter()).filter_map(|l| everything.get(&l.pool)) {
+        let holder = if p.spec.venue == Venue::UniswapV4 { crate::live::v4::POOL_MANAGER } else { p.spec.pool };
+        for token in [p.spec.token0, p.spec.token1].into_iter().filter(|t| *t != WETH && *t != apex_exec::lean2::USDC) {
+            let e = by_token.entry(token).or_insert((holder, p.spec.depth_usd, std::collections::BTreeSet::new()));
+            if p.spec.depth_usd > e.1 {
+                (e.0, e.1) = (holder, p.spec.depth_usd);
+            }
+            e.2.insert(p.spec.pool);
+        }
+    }
+    for (token, (holder, _, pools)) in by_token {
+        match crate::armed::token_check::moves_exactly(&*rpc, token, holder, head).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!(%token, pools = pools.len(), "the token does not move exactly (a fee on transfer, or a failing transfer): its pools never armed");
+                unarmable.extend(pools);
+            }
+            Err(e) => {
+                warn!(%token, error = %e, "the token's transfer check did not run: its pools never armed");
+                unarmable.extend(pools);
+            }
+        }
+    }
     if cycles.is_empty() {
         return Err(ShadowError::Boot("the book holds no WETH cycle; nothing to search".into()));
     }
