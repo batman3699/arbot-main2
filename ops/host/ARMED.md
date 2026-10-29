@@ -261,7 +261,9 @@ deployed once, by the owner. Then every arm uses it, and the current
 executor keeps only the halted reactive lane.
 
 Nothing here happens before gate A″ passes and the operator approves the
-deploy (the spec's phase 5).
+deploy (the spec's phase 5). The order: the v4 inventory (§3e) and the
+pre-deploy shadow (§3f), gate A″ (§3g), the operator's decisions 2–4, then
+§3a–c.
 
 ### a. Deploy (the owner)
 
@@ -301,3 +303,72 @@ As in §2:
 - touch the kill file first;
 - trip the circuit or revoke on `LeanExecutor2` itself;
 - revoke on the old executor too, if a sender is still allowed there.
+
+### e. The v4 inventory: one backfill, then daily
+
+v4 pools live in `data/base/uniswap_v4/pools.jsonl` (outside git, like every
+inventory), one record per pool, folded from PoolManager's `Initialize` logs by
+`scripts/data/v4_inventory.py`. Records carry no depth, so a v4 pool loads only
+when the census targets it (a targeted pool loads below the floor). The loader
+then applies the hook allowlist (`ops/v4-hooks.base.json`), and refuses native
+currency, dynamic fees and protocol fees.
+
+The one-time backfill is an agent step, as on 2026-10-28:
+
+1. List the v4 pool IDs (the 32-byte `pools` entries) in the census's race
+   files, `/opt/apex/var/census/race-*.json.gz`.
+2. For each ID, read PoolManager's `Initialize` log through an explorer API:
+   Basescan `getLogs`, address `0x498581fF718922c3f8e6A244956aF099B2652b2b`,
+   topic0 `0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438`,
+   topic1 the ID. Save the answers to one file.
+3. Fold them in, and start the daily cursor at the block the backfill read to:
+
+```
+$ cd scripts/data
+$ python3 v4_inventory.py --out ../../data/base/uniswap_v4/pools.jsonl --logs /path/to/initialize-logs.json
+$ echo <head block> > /opt/apex/var/census/v4-inventory.cursor
+```
+
+- The fold is idempotent by pool ID. It refuses a log that is not from
+  PoolManager, not an `Initialize`, removed, or whose ID is not its key's hash,
+  and it prints the counts.
+- After that, `apex-targets.service` scans each day's new pools before the
+  census (`--follow`, 2,000 blocks a query, over a public endpoint, never
+  BlockPI's key). A failed scan does not stop the census.
+
+### f. The pre-deploy shadow (the host)
+
+Until the owner deploys `LeanExecutor2`, the evaluator simulates every fire
+against its code, put at a placeholder address by a state override. The
+override also sets the trader as an executor, a recipient, and the
+executor's two Morpho approvals.
+
+```
+$ forge inspect LeanExecutor2 deployedBytecode > var/armed/LeanExecutor2.runtime.hex
+$ cast keccak "$(cat var/armed/LeanExecutor2.runtime.hex)"     # must equal armed.executor2.code_hash
+```
+
+- Put the file, the v4 inventory and `ops/v4-hooks.base.json` on the host,
+  then deploy and restart (README §7).
+- The boot logs v4 pools loaded. The boot also checks two things:
+  - the code file's hash is `code_hash`. On a mismatch, "LeanExecutor2 is not
+    the configured code: nothing is armed";
+  - every non-WETH/USDC token moves exactly. A token that fails is logged,
+    with its pools never armed.
+- A live boot refuses `runtime_code`.
+
+### g. Gate A″: three days of v4 and USDC in shadow
+
+Run at least three days. The gate passes when all of these hold:
+
+- quote and simulation agree, to the wei, on ≥ 95% of v4 and USDC fires
+  (`ops/host/remote.sh armed`); a USDC fire's gross is USDC units;
+- every armed v4 pool's words matched the book (no "never armed" warnings);
+- the first AXIS fires' simulated `gasUsed` sits within the arm's expected and
+  limit (R37 Task 14 deferred this check to the first real fires);
+- the fires that would have won, and their net per day, are counted against
+  the actual winners.
+
+The operator's decisions 2–4 come next: sender funding, the live gate's
+threshold, and loss-budget netting. A USDC landing currently counts only its
+gas against the ETH budget. After them, §3a–c.

@@ -754,3 +754,47 @@ fn the_canary_refuses_to_start_unless_profit_goes_to_its_recipient() {
         assert!(err.contains("recipient"), "{err}");
     }
 }
+
+// ------------------------------------------------------------- R37: executor2
+
+/// LeanExecutor2 runs only on its configured code: at boot its code, read
+/// from the chain or, before the deploy, from `runtime_code`, must hash to
+/// `code_hash`. An address without code is refused by name.
+#[test]
+fn executor2_runs_only_on_its_configured_code() {
+    use apex_runtime::shadow::config::{check_executor2_hash, Executor2Config};
+    let code = [0x60u8, 0x80, 0x60, 0x40];
+    let e = Executor2Config { address: Address::repeat_byte(0xe2), code_hash: alloy_primitives::keccak256(code), runtime_code: None };
+    assert_eq!(check_executor2_hash(&e, alloy_primitives::keccak256(code)), Ok(()));
+    let other = check_executor2_hash(&e, alloy_primitives::keccak256([0x60u8])).unwrap_err();
+    assert!(other.contains("code_hash"), "{other}");
+    let empty = Executor2Config { code_hash: alloy_primitives::keccak256([]), ..e };
+    assert!(check_executor2_hash(&empty, alloy_primitives::keccak256([])).unwrap_err().contains("no code"));
+}
+
+/// The shipped canary carries LeanExecutor2 for the pre-deploy shadow; a live
+/// run refuses its `runtime_code`: live sends go to a deployed executor.
+#[test]
+fn a_live_run_refuses_the_pre_deploy_executor2() {
+    let path = format!("{}/../../ops/canary.base.yaml", env!("CARGO_MANIFEST_DIR"));
+    let env = env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key");
+    let c = ShadowConfig::load_canary(&path, &env).unwrap();
+    let e = c.armed.executor2.as_ref().expect("armed.executor2");
+    assert_eq!(e.runtime_code.as_deref(), Some(std::path::Path::new("var/armed/LeanExecutor2.runtime.hex")));
+    assert_eq!(e.code_hash, alloy_primitives::b256!("b67e7dd210e440dae114d36ca40d13d65fd2150a26a71dc53c86a3af83b39c7e"), "the deploy dry run's");
+    assert_eq!(c.armed.max_size_usdc, 12_000_000_000);
+    let shadow = ShadowConfig::load(&format!("{}/../../ops/shadow.base.yaml", env!("CARGO_MANIFEST_DIR")), &env).unwrap();
+    assert_eq!(shadow.armed.executor2.as_ref(), Some(e), "the shadow config simulates the same executor");
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let live = text.replacen("armed:\n  mode: shadow", "armed:\n  mode: live", 1);
+    assert_ne!(live, text);
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("canary.yaml");
+    std::fs::write(&at, &live).unwrap();
+    let refused = ShadowConfig::load_canary(at.to_str().unwrap(), &env).unwrap_err();
+    assert!(matches!(&refused, ShadowConfigError::Invalid(m) if m.contains("runtime_code")), "{refused:?}");
+    let deployed: String = live.lines().filter(|l| !l.trim_start().starts_with("runtime_code:")).map(|l| format!("{l}\n")).collect();
+    std::fs::write(&at, deployed).unwrap();
+    assert!(ShadowConfig::load_canary(at.to_str().unwrap(), &env).is_ok(), "deployed: live may send to it");
+}

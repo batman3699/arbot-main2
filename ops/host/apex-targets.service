@@ -7,6 +7,10 @@ After=network-online.target
 Type=oneshot
 User=root
 WorkingDirectory=/opt/apex/scripts/data
+# R37: the day's new v4 pools into the inventory before the census (ARMED.md
+# §3e): PoolManager's Initialize logs since the cursor, over a public endpoint
+# (never BlockPI's key). A failed scan ("-") does not stop the census.
+ExecStartPre=-/usr/sbin/runuser -u apex -- /usr/bin/python3 v4_inventory.py --out /opt/apex/data/base/uniswap_v4/pools.jsonl --follow /opt/apex/var/census/v4-inventory.cursor --rpc https://base-mainnet.public.blastapi.io
 ExecStart=/usr/sbin/runuser -u apex -- /usr/bin/nice -n 19 /usr/bin/python3 -m arb_census.targets --race /opt/apex/var/census --days 7 --top 50 --out /opt/apex/var/armed/targets.json --share-out /opt/apex/var/apex/armed-share.json --var /opt/apex/var/apex --meta /opt/apex/var/census/meta.json --gaps /opt/apex/var/census/r33-gaps.json --live-ledger /opt/apex/var/armed/armed-live.jsonl
 ExecStartPost=/bin/systemctl restart apex-canary
 

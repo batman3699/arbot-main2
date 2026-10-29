@@ -321,6 +321,18 @@ pub struct ArmedConfig {
     pub executor2: Option<Executor2Config>,
 }
 
+/// R37: whether `found`, the hash of `LeanExecutor2`'s code at boot (the
+/// chain's, or `runtime_code`'s before the deploy), is the configured one.
+pub fn check_executor2_hash(e: &Executor2Config, found: B256) -> Result<(), String> {
+    if found == keccak256([]) {
+        return Err(format!("armed.executor2 {:#x} has no code", e.address));
+    }
+    if found != e.code_hash {
+        return Err(format!("armed.executor2 {:#x}'s code hashes to {found:#x}, not its code_hash {:#x}", e.address, e.code_hash));
+    }
+    Ok(())
+}
+
 /// R37: `LeanExecutor2`'s deployment.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -532,6 +544,11 @@ impl ShadowConfig {
             }
             if a.live.is_none() {
                 return Err(invalid("armed.mode live needs armed.live: its keys, sequencer, ledger and kill file"));
+            }
+            if a.executor2.as_ref().is_some_and(|e| e.runtime_code.is_some()) {
+                return Err(invalid(
+                    "armed.executor2.runtime_code is the pre-deploy shadow's: live sends go to a deployed LeanExecutor2 (ops/host/ARMED.md §3c)",
+                ));
             }
         }
         for ((name, most), value) in ARMED_CAPS.iter().zip(a.caps()) {

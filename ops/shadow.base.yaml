@@ -50,6 +50,16 @@ armed:
   margin_wei: 0
   band_cap_bps: 5
   liquidity_floor_bps: 9800
+  # R37: LeanExecutor2 (ops/host/ARMED.md §3). Until the owner deploys it the
+  # address is a placeholder with no code, and the evaluator simulates every
+  # fire against runtime_code put there (`forge inspect LeanExecutor2
+  # deployedBytecode`), whose keccak is code_hash: the deploy dry run's
+  # 2026-10-29 hash. Live refuses runtime_code. Set, every arm is built for it.
+  executor2:
+    address: "0x00000000000000000000000000000000000e2e02"
+    code_hash: "0xb67e7dd210e440dae114d36ca40d13d65fd2150a26a71dc53c86a3af83b39c7e"
+    runtime_code: var/armed/LeanExecutor2.runtime.hex
+  max_size_usdc: 12000000000                 # 12,000 USDC, about max_size_wei's 5 WETH
 
 executor:
   # R29: the lean executor, deployed 2026-10-19 by the owner with

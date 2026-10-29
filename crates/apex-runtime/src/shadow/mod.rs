@@ -558,7 +558,26 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     }
     let book = Arc::new(book);
     // R26: the armed predicates' storage words, read back at the boot block.
-    let unarmable = crate::armed::engine::verify_layouts(&reads, &book.snapshot(), head).await;
+    let mut unarmable = crate::armed::engine::verify_layouts(&reads, &book.snapshot(), head).await;
+    // R37: LeanExecutor2 runs only on its configured code: the chain's, or
+    // before the deploy the code the evaluator simulates. Live refuses to
+    // boot on a mismatch; armed-shadow arms nothing.
+    if let Some(e) = &config.armed.executor2 {
+        let found = match &e.runtime_code {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|err| format!("armed.executor2.runtime_code {}: {err}", path.display()))
+                .and_then(|t| alloy_primitives::hex::decode(t.trim()).map_err(|err| format!("armed.executor2.runtime_code: {err}")))
+                .map(alloy_primitives::keccak256),
+            None => reads.code_hash(e.address, head).await.map_err(|err| format!("armed.executor2's code: {err}")),
+        };
+        if let Err(why) = found.and_then(|h| config::check_executor2_hash(e, h)) {
+            if config.armed.mode == config::ArmedMode::Live {
+                return Err(ShadowError::Boot(why));
+            }
+            warn!(%why, "LeanExecutor2 is not the configured code: nothing is armed");
+            unarmable.extend(book.snapshot().keys().copied());
+        }
+    }
     for pool in &unarmable {
         warn!(%pool, "its watched storage words did not read back as loaded: never armed");
     }
@@ -581,7 +600,6 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     // R37: an armed route's other token (neither WETH nor USDC) is armed only
     // if it moves exactly, checked out of its deepest pool (PoolManager for a
     // v4 one). A check that fails or does not run leaves its pools unarmed.
-    let mut unarmable = unarmable;
     let mut by_token: BTreeMap<Address, (Address, f64, std::collections::BTreeSet<Address>)> = BTreeMap::new();
     for p in armed_set.values().flat_map(|c| c.legs.iter()).filter_map(|l| everything.get(&l.pool)) {
         let holder = if p.spec.venue == Venue::UniswapV4 { crate::live::v4::POOL_MANAGER } else { p.spec.pool };
