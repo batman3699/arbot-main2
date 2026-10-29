@@ -204,6 +204,18 @@ use no space, and the archive keeps its copies.
 - The archive day's own ledger stays split: the new run writes from the
   restart on, so that census day misses the hours before it.
 
+The archive also clears the reactive canary's halt and its stop file, both in
+`var/apex`. A halted canary sends again at the next start. Unless it should,
+touch the stop file before starting:
+
+```
+# sudo -u apex touch /opt/apex/var/apex/canary.stop
+```
+
+On 2026-10-29 the restart after the R37 archive sent two live reactive
+transactions before the stop file was touched. Both reverted, costing about
+0.0000018 ETH.
+
 ## 8. The contest analysis
 
 On the host, with only the BlockPI key in the analyzer's environment:
