@@ -13,7 +13,8 @@
 //! 5. places both in their flashblocks (the flashblock ledger) and judges the
 //!    landing for every bid fraction and the arm's own bid: a fire that closed
 //!    its flashblock is contested in the next one, by fee, and a rival that
-//!    is the arm's own send is armed-live's landing (R37).
+//!    is the arm's own send is armed-live's landing (R37). R38: the other
+//!    rule's bid the arm carried, and a 1-wei baseline, on the same fire.
 //!
 //! The lean executor sells all hop 1 returns, so a fire leaves no intermediate
 //! residue: `residue` is absent from verdicts since R36's lean quote.
@@ -234,6 +235,13 @@ pub struct Verdict {
     /// The arm's own bid, judged (R37). Absent for an arm without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub own: Option<OwnBid>,
+    /// R38: the other rule's bid the arm carried, judged on the same fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt: Option<OwnBid>,
+    /// R38: a 1-wei bid on the same fire: what the fire was worth with no
+    /// contest cost, the baseline both rules are measured from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<OwnBid>,
     /// WETH gross of the fire (hop 2's output less the loan).
     pub gross_wei: Option<String>,
     /// Hop 1's output beyond `mid`, left in the R26 executor. The lean
@@ -463,6 +471,8 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
         rival_priority_wei: None,
         ours: false,
         own: None,
+        alt: None,
+        base: None,
         gross_wei: None,
         residue: None,
         quote_error: None,
@@ -545,9 +555,10 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
         let bid = bid_wei_per_gas(surplus, arm.gas_expected, f);
         v.per_f.push(PerF { f_permille: f, bid_wei_per_gas: bid.to_string(), landing: judge_bid(bid), net_wei: net(bid) });
     }
-    if let Ok(bid) = arm.bid_wei_per_gas.parse::<u128>() {
-        v.own = Some(OwnBid { bid_wei_per_gas: bid.to_string(), landing: judge_bid(bid), net_wei: net(bid) });
-    }
+    let judged = |bid: u128| OwnBid { bid_wei_per_gas: bid.to_string(), landing: judge_bid(bid), net_wei: net(bid) };
+    v.own = arm.bid_wei_per_gas.parse::<u128>().ok().map(judged);
+    v.alt = arm.alt_bid_wei_per_gas.as_deref().and_then(|b| b.parse::<u128>().ok()).map(judged);
+    v.base = Some(judged(1));
     v
 }
 
@@ -983,6 +994,10 @@ pub struct Summary {
     pub sim_agreed: u64,
     /// R37: by UTC day, at the arms' own bids, the ones armed-live sends.
     pub own: BTreeMap<String, DayF>,
+    /// R38: by UTC day, at the other rule's bids, on the same fires.
+    pub alt: BTreeMap<String, DayF>,
+    /// R38: by UTC day, at a 1-wei bid: the fires' worth without a contest.
+    pub base: BTreeMap<String, DayF>,
     /// R37: fires the arm's own send took: armed-live's landings.
     pub ours: u64,
 }
@@ -1023,8 +1038,9 @@ pub fn summary(dir: &Path) -> Result<Summary, String> {
             let reverts = v.quote_error.as_deref().is_some_and(|e| e.contains("revert"));
             let usd_of = |net: &Option<String>| net.as_deref().and_then(|n| n.parse::<f64>().ok()).map_or(0.0, |n| n / 1e18 * v.weth_usd);
             s.ours += u64::from(v.ours);
-            if let Some(o) = &v.own {
-                let d = s.own.entry(day.clone()).or_default();
+            for (judged, by_day) in [(&v.own, &mut s.own), (&v.alt, &mut s.alt), (&v.base, &mut s.base)] {
+                let Some(o) = judged else { continue };
+                let d = by_day.entry(day.clone()).or_default();
                 d.fires += 1;
                 if o.landing.optimistic {
                     d.wins_optimistic += 1;

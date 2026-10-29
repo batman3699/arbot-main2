@@ -145,6 +145,28 @@ fn the_summary_sums_the_arms_own_bids_and_our_landings() {
     assert_eq!(d.net_usd_optimistic, 10.0);
 }
 
+/// R38: the other rule's bid and the 1-wei baseline are summed by day as the
+/// arm's own bid is, so the two rules compare on the same fires.
+#[test]
+fn the_summary_sums_the_other_rule_and_the_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let judged = |landed: bool, net: &str| {
+        serde_json::json!({ "bid_wei_per_gas": "7", "landing": { "optimistic": landed, "pessimistic": false }, "net_wei": net })
+    };
+    let lines = [
+        // 0.002 WETH and 0.001 WETH at $2,500.
+        verdict(1, true, serde_json::json!({ "alt": judged(true, "2000000000000000"), "base": judged(false, "0") })),
+        verdict(2, true, serde_json::json!({ "alt": judged(false, "5"), "base": judged(true, "1000000000000000") })),
+        verdict(3, true, serde_json::json!({ "shadowed": true, "alt": judged(true, "1"), "base": judged(true, "1") })),
+    ];
+    std::fs::write(dir.path().join("armed-verdicts-2026-10-30.jsonl"), lines.join("\n") + "\n").unwrap();
+    let s = summary(dir.path()).unwrap();
+    let (alt, base) = (&s.alt["2026-10-30"], &s.base["2026-10-30"]);
+    assert_eq!((alt.fires, alt.wins_optimistic, alt.wins_pessimistic, alt.net_usd_optimistic), (2, 1, 0, 5.0));
+    assert_eq!((base.fires, base.wins_optimistic, base.net_usd_optimistic), (2, 1, 2.5));
+    assert!(s.own.is_empty());
+}
+
 /// Whether a transaction closed its flashblock, from the flashblock ledger:
 /// block 53,254,698's flashblock 1 held transactions 1-7 (live arm 3114).
 #[test]
