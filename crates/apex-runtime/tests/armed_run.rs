@@ -56,10 +56,10 @@ fn logs_become_ordered_effects_on_the_watched_words() {
         Write::Set { address: a.clone(), slot: U256::from(0), value: U256::one() << 96 },
         Write::Set { address: a.clone(), slot: U256::from(4), value: U256::from(1_000u64) },
         Write::Tick { address: a.clone(), tick: -12 },
-        Write::Liquidity { address: a.clone(), slot: U256::from(4), lower: -60, upper: 60, delta: 500 },
+        Write::Liquidity { address: a.clone(), slot: U256::from(4), pool: format!("{POOL:#x}"), lower: -60, upper: 60, delta: 500 },
     ]);
     assert_eq!(effects[1].writes, vec![
-        Write::Liquidity { address: a, slot: U256::from(4), lower: -60, upper: 60, delta: -200 },
+        Write::Liquidity { address: a, slot: U256::from(4), pool: format!("{POOL:#x}"), lower: -60, upper: 60, delta: -200 },
         Write::Set { address: b.clone(), slot: U256::from(20), value: U256::from(11u64) },
         Write::Set { address: b, slot: U256::from(21), value: U256::from(22u64) },
     ], "the removed log is ignored");
@@ -168,11 +168,11 @@ fn a_fire_after_a_renewal_simulates_the_renewal() {
     let executor: Address = address!("8940B565D050974b2b589B70De43bCb753b1F93B");
     let at = |block: u64| Point { block, tx_index: 0, tx: "0x".into() };
     let ours = |p: serde_json::Value| p[0]["blockStateCalls"][0]["calls"].as_array().unwrap().last().unwrap().clone();
-    let first = simulate_request(&arm, &at(104), &block, signer, executor).unwrap();
+    let first = simulate_request(&arm, &at(104), &block, signer, executor, None).unwrap();
     assert_eq!(ours(first.clone())["data"], "0xfirst");
     assert_eq!(first[1], "0x67", "on the parent block's state");
     assert_eq!(first[0]["blockStateCalls"][0]["calls"].as_array().unwrap().len(), 2, "the block so far, then ours");
-    let renewed = ours(simulate_request(&arm, &at(108), &block, signer, executor).unwrap());
+    let renewed = ours(simulate_request(&arm, &at(108), &block, signer, executor, None).unwrap());
     assert_eq!(renewed["data"], "0xrenewed");
     assert_eq!(renewed["gas"], "0xdbba0");
     assert_eq!(renewed["from"], format!("{signer:#x}"));
@@ -220,17 +220,17 @@ impl apex_chain::rpc::RpcTransport for Capped {
 async fn a_range_too_full_for_one_query_is_split_until_it_fits() {
     let pools: std::collections::BTreeSet<Address> = [POOL].into_iter().collect();
     let rpc = Capped { cap: 70, outright: false, asked: Default::default() };
-    let logs = get_logs(&rpc, &pools, 1_000, 1_499).await.unwrap();
+    let logs = get_logs(&rpc, &pools, &[], 1_000, 1_499).await.unwrap();
     assert_eq!(logs.iter().map(|l| l.block_number.unwrap()).collect::<Vec<_>>(), (1_000..=1_499).collect::<Vec<_>>(), "every block once, in order");
     assert!(rpc.asked.lock().unwrap().iter().all(|(f, t)| t >= f));
 
     let down = Capped { cap: 70, outright: true, asked: Default::default() };
-    assert!(get_logs(&down, &pools, 1_000, 1_499).await.unwrap_err().contains("connection refused"));
+    assert!(get_logs(&down, &pools, &[], 1_000, 1_499).await.unwrap_err().contains("connection refused"));
     assert_eq!(down.asked.lock().unwrap().len(), 1, "a provider that is down is not asked 500 more times");
 
     // A single block too full for one query cannot be split: its error returns.
     let full = Capped { cap: 0, outright: false, asked: Default::default() };
-    assert!(get_logs(&full, &pools, 1_000, 1_001).await.unwrap_err().contains("exceeds max results"));
+    assert!(get_logs(&full, &pools, &[], 1_000, 1_001).await.unwrap_err().contains("exceeds max results"));
     assert_eq!(*full.asked.lock().unwrap(), vec![(1_000, 1_001), (1_000, 1_000)]);
 }
 
@@ -417,6 +417,174 @@ fn a_v4_write_lands_on_its_256_bit_slot() {
     assert!(w.holds(&[at(price, Op::AtLeast, 5), at(liquidity, Op::AtLeast, 900)], 1));
     assert!(!w.holds(&[at(U256::from(price.low_u64()), Op::AtLeast, 5)], 1), "the low 64 bits are another slot");
     w.apply(&Write::Tick { address: pm.clone(), tick: 0 });
-    w.apply(&Write::Liquidity { address: pm.clone(), slot: liquidity, lower: -10, upper: 10, delta: -100 });
+    w.apply(&Write::Liquidity { address: pm.clone(), slot: liquidity, pool: pm.clone(), lower: -10, upper: 10, delta: -100 });
     assert!(w.holds(&[at(liquidity, Op::AtMost, 800)], 1), "in range: the liquidity word moves");
+}
+
+// ------------------------------------------------------------------ R37: v4
+
+const AXIS_ID: B256 = alloy_primitives::b256!("c19d91d99afc0332e5013a569c9721cd9ecb51a14c851f7a189a140950a627fa");
+
+fn word_u(v: U256) -> [u8; 32] {
+    let mut w = [0u8; 32];
+    v.to_big_endian(&mut w);
+    w
+}
+
+/// PoolManager's Swap for the AXIS pool: the swapper's deltas, then the
+/// pool's price, liquidity, tick and fee.
+fn v4_swap(id: B256, tick: i32, liquidity: u128, tx_index: u64, log_index: u64) -> RawLog {
+    use apex_math::cl_math::get_sqrt_ratio_at_tick;
+    use apex_runtime::live::feed::V4_SWAP;
+    use apex_runtime::live::v4::POOL_MANAGER;
+    let data = vec![word(-1_000), word(250), word_u(get_sqrt_ratio_at_tick(tick).unwrap()), word(liquidity as i128), word(i128::from(tick)), word(100)];
+    log(POOL_MANAGER, vec![V4_SWAP, id, B256::repeat_byte(9)], data, tx_index, log_index)
+}
+
+fn v4_modify(id: B256, lower: i32, upper: i32, delta: i128, tx_index: u64, log_index: u64) -> RawLog {
+    use apex_runtime::live::feed::MODIFY_LIQUIDITY;
+    use apex_runtime::live::v4::POOL_MANAGER;
+    let data = vec![word(i128::from(lower)), word(i128::from(upper)), word(delta), word(0)];
+    log(POOL_MANAGER, vec![MODIFY_LIQUIDITY, id, B256::repeat_byte(9)], data, tx_index, log_index)
+}
+
+/// A v4 pool's Swap and ModifyLiquidity are writes on PoolManager's slots; the
+/// tick a position's range is held against is the pool's own, by its key
+/// address. Another v4 pool's logs add nothing.
+#[test]
+fn v4_logs_become_writes_on_pool_manager_slots() {
+    use apex_math::cl_math::get_sqrt_ratio_at_tick;
+    use apex_runtime::live::v4::{key_address, liquidity_slot, state_slot, POOL_MANAGER};
+    let key = key_address(AXIS_ID);
+    let venues: BTreeMap<Address, Venue> = [(key, Venue::UniswapV4)].into_iter().collect();
+    let other = B256::repeat_byte(7);
+    let logs = [v4_swap(AXIS_ID, -289_950, 4_000, 2, 1), v4_modify(AXIS_ID, -289_960, -289_940, 500, 2, 2), v4_swap(other, 1, 1, 3, 1)];
+    let effects = effects_of(&logs, &venues);
+    assert_eq!(effects.len(), 1, "the other pool's swap is not watched");
+    let (pm, k) = (format!("{POOL_MANAGER:#x}"), format!("{key:#x}"));
+    let slot = |b: B256| U256::from_big_endian(b.as_slice());
+    assert_eq!(effects[0].writes, vec![
+        Write::Set { address: pm.clone(), slot: slot(state_slot(AXIS_ID)), value: get_sqrt_ratio_at_tick(-289_950).unwrap() },
+        Write::Set { address: pm.clone(), slot: slot(liquidity_slot(AXIS_ID)), value: U256::from(4_000u64) },
+        Write::Tick { address: k.clone(), tick: -289_950 },
+        Write::Liquidity { address: pm, slot: slot(liquidity_slot(AXIS_ID)), pool: k, lower: -289_960, upper: -289_940, delta: 500 },
+    ]);
+}
+
+/// The AXIS v4 pool, read at block 99.
+fn v4_read_pool() -> apex_runtime::live::book::PoolSnapshot {
+    use apex_runtime::live::v4::{key_address, V4Key, POOL_MANAGER};
+    let mut p = read_pool();
+    let (tick, lower, upper) = (-289_960, -291_960, -287_960);
+    p.spec.pool = key_address(AXIS_ID);
+    p.spec.venue = Venue::UniswapV4;
+    p.spec.token0 = address!("5be75e3b0aff5d1a042a5363ae36acb1d6d755ea");
+    p.spec.v4 = Some(V4Key { pool_id: AXIS_ID, fee: 100, tick_spacing: 1, hooks: Address::ZERO });
+    p.state.sqrt_price_x96 = apex_math::cl_math::get_sqrt_ratio_at_tick(tick).unwrap();
+    p.state.tick = tick;
+    p.state.tick_spacing = 1;
+    p.state.balance0 = Some(U256::exp10(30));
+    p.ladder = apex_math::cl_swap::TickLadder::new(vec![(lower, L as i128), (upper, -(L as i128))], lower - 5_000, upper + 5_000);
+    p.factory = POOL_MANAGER;
+    p
+}
+
+/// The fire's book takes the block's v4 swaps and positions through the
+/// trigger, from PoolManager's logs, and none after it.
+#[test]
+fn a_v4_fire_s_book_applies_its_swaps_and_positions() {
+    use apex_runtime::armed::run::apply_through;
+    use apex_runtime::live::book::PoolBook;
+    use apex_runtime::live::v4::key_address;
+    use apex_types::state::ReconstructionStatus;
+    let key = key_address(AXIS_ID);
+    let book = PoolBook::from_snapshots([v4_read_pool()], ReconstructionStatus::Verified);
+    let logs = [v4_swap(AXIS_ID, -289_950, L, 2, 1), v4_modify(AXIS_ID, -289_960, -289_940, 500, 3, 2), v4_swap(AXIS_ID, -289_000, L, 6, 3)];
+    apply_through(&book, &[key], 100, 5, &logs).unwrap();
+    let p = book.get(key).unwrap();
+    assert_eq!((p.state.tick, p.state.liquidity), (-289_950, L + 500), "the swap, then the position in range; not the swap after the trigger");
+}
+
+/// Before `LeanExecutor2` is deployed, a fire is simulated against its code
+/// put at its address: the constructor's work done by overrides (the
+/// trader allowed, slot 1's mapping; a recipient, slot 2) and by the
+/// executor's own approvals to Morpho Blue, called before ours.
+#[test]
+fn the_pre_deploy_simulation_overrides_code_and_trader() {
+    use apex_runtime::armed::eval::Point;
+    use apex_runtime::armed::lines::Arm;
+    use apex_runtime::armed::run::PreDeploy;
+    let text = r#"{"arm_id":7,"at_ns":0,"armed_block":100,"to_block":110,"route_hash":"0xr","trigger_leg":0,"rung":1,"step":3,
+        "pools":["0xaa","0xbb"],"venues":["UniswapV4","UniswapV3"],"predicates":[],"start_words":[],"start_ticks":[],
+        "size_wei":"1","mid":"1","output_wei":"2","surplus_wei":"1","cost_wei":"0","gas_expected":1,"gas_limit":900000,
+        "base_fee_wei":"5000000","other_wei":"0","deadline":11,"calldata":"0xours","calldata_hash":"0x","sender_slot":0}"#;
+    let arm: Arm = serde_json::from_str(text).unwrap();
+    let block = serde_json::json!({"timestamp": "0x10", "baseFeePerGas": "0x4c4b40", "transactions": [
+        {"transactionIndex": "0x0", "from": "0x01", "to": "0x02", "input": "0x", "value": "0x0", "gas": "0x1"},
+    ]});
+    let signer: Address = address!("CB436Ba3acb945b3fc8EE6345857262584356595");
+    let executor2: Address = address!("00000000000000000000000000000000000e2e02");
+    let fire = Point { block: 104, tx_index: 0, tx: "0x".into() };
+    let pre = PreDeploy { code: "0x6080604052".into() };
+    let p = simulate_request(&arm, &fire, &block, signer, executor2, Some(&pre)).unwrap();
+    let state = &p[0]["blockStateCalls"][0]["stateOverrides"][format!("{executor2:#x}")];
+    assert_eq!(state["code"], "0x6080604052");
+    let mut key = [0u8; 64];
+    key[12..32].copy_from_slice(signer.as_slice());
+    key[63] = 1;
+    let allowed = format!("{:#x}", alloy_primitives::keccak256(key));
+    assert_eq!(state["stateDiff"][allowed], format!("0x{:064x}", 1), "executors[trader] = true");
+    assert_eq!(state["stateDiff"][format!("0x{:064x}", 2)], format!("0x{:0>64}", alloy_primitives::hex::encode(signer)), "a recipient");
+    let calls = p[0]["blockStateCalls"][0]["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 4, "the block so far, two approvals, ours");
+    let morpho_max = format!("0x095ea7b3{:0>64}{}", "bbbbbbbbbb9cc5e90e3b3af64bdaf62c37eeffcb", "f".repeat(64));
+    for (c, token) in calls[1..3].iter().zip(["0x4200000000000000000000000000000000000006", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"]) {
+        assert_eq!((c["from"].as_str(), c["to"].as_str(), c["data"].as_str()), (Some(format!("{executor2:#x}").as_str()), Some(token), Some(morpho_max.as_str())));
+    }
+    assert_eq!((calls[3]["data"].as_str(), calls[3]["to"].as_str()), (Some("0xours"), Some(format!("{executor2:#x}").as_str())));
+    let deployed = simulate_request(&arm, &fire, &block, signer, executor2, None).unwrap();
+    assert!(deployed[0]["blockStateCalls"][0].get("stateOverrides").is_none(), "a deployed executor runs its own code");
+    assert_eq!(deployed[0]["blockStateCalls"][0]["calls"].as_array().unwrap().len(), 2);
+}
+
+/// A USDC fire's gross is USDC units: worth as many micro-dollars, and in
+/// ETH by the run's WETH price. A WETH fire's is wei.
+#[test]
+fn a_usdc_fire_s_gross_is_reported_in_usdc_and_usd() {
+    use apex_runtime::armed::run::fire_gross;
+    let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    let g = fire_gross(Some(usdc), U256::from(2_500_000u64), 2_500.0);
+    assert_eq!((g.start_units, g.wei, g.usd), (Some(U256::from(2_500_000u64)), Some(U256::exp10(15)), Some(2.5)));
+    let w = fire_gross(None, U256::exp10(15), 2_500.0);
+    assert_eq!((w.start_units, w.wei, w.usd), (None, Some(U256::exp10(15)), Some(2.5)));
+    assert_eq!(fire_gross(Some(usdc), U256::from(1u64), 0.0).wei, None, "no WETH price: no ETH value");
+}
+
+/// A recorder of `eth_getLogs` filters, answering none.
+#[derive(Default)]
+struct Filters(std::sync::Mutex<Vec<serde_json::Value>>);
+
+#[async_trait::async_trait]
+impl apex_chain::rpc::RpcTransport for Filters {
+    async fn call(&self, _method: &str, params: serde_json::Value) -> Result<serde_json::Value, apex_chain::rpc::RpcError> {
+        self.0.lock().unwrap().push(params[0].clone());
+        Ok(serde_json::json!([]))
+    }
+}
+
+/// v4 pools' logs are PoolManager's, filtered by pool ID in topic 1.
+#[tokio::test]
+async fn get_logs_reads_pool_manager_by_v4_pool_id() {
+    use apex_runtime::live::feed::{MODIFY_LIQUIDITY, V4_SWAP};
+    use apex_runtime::live::v4::POOL_MANAGER;
+    let pools: std::collections::BTreeSet<Address> = [POOL].into_iter().collect();
+    let rpc = Filters::default();
+    get_logs(&rpc, &pools, &[AXIS_ID], 1_000, 1_001).await.unwrap();
+    let asked = rpc.0.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2, "the pools', then PoolManager's");
+    assert_eq!(asked[1]["address"], serde_json::json!([format!("{POOL_MANAGER:#x}")]));
+    assert_eq!(asked[1]["topics"], serde_json::json!([[format!("{V4_SWAP:#x}"), format!("{MODIFY_LIQUIDITY:#x}")], [format!("{AXIS_ID:#x}")]]));
+    let none = Filters::default();
+    get_logs(&none, &pools, &[], 1_000, 1_001).await.unwrap();
+    assert_eq!(none.0.lock().unwrap().len(), 1, "no v4 pool, no PoolManager query");
 }

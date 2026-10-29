@@ -165,6 +165,7 @@ fn the_engine_arms_its_best_slots_and_renews_them() {
         assert!(a.predicates.iter().any(|p| matches!(p, Predicate::BlockNumber { .. })));
         assert!(a.calldata.starts_with("0x") && a.calldata.len() > 10);
         assert!(a.sender_slot < 4);
+        assert_eq!(a.executor, None, "no LeanExecutor2: built for v1");
         assert_eq!(a.start_words.len(), 4, "price and liquidity of both pools");
         // The fire lies past the threshold the ceiling was priced at (fires
         // used up to 7.4% over it), and execution runs to 1.25x the net gas
@@ -616,6 +617,7 @@ fn a_renewed_usdc_arm_keeps_its_lender() {
     assert!(!usdc.is_empty(), "USDC cycles arm");
     for a in &usdc {
         assert_eq!((lender_of(&a.calldata), a.lender.as_str()), (1, "morpho"), "Morpho's USDC");
+        assert_eq!(a.executor, Some(EXECUTOR2), "built for LeanExecutor2, and simulated against it");
     }
     let later = engine.tick(&snap, 1_005, 5_000_000, &px, 12_000_000_000);
     let mut renewed = 0;

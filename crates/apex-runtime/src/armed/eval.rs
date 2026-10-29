@@ -21,7 +21,10 @@ const LAST_INDEX: u32 = 10;
 pub enum Write {
     Set { address: String, slot: U256, value: U256 },
     Tick { address: String, tick: i32 },
-    Liquidity { address: String, slot: U256, lower: i32, upper: i32, delta: i128 },
+    /// `pool` is whose tick the range is held against: the storage address
+    /// for a v3 pool, the key address for a v4 one, whose words are all at
+    /// PoolManager (R37).
+    Liquidity { address: String, slot: U256, pool: String, lower: i32, upper: i32, delta: i128 },
 }
 
 /// One transaction's writes to the watched pools, in chain order.
@@ -66,8 +69,8 @@ impl Words {
             Write::Tick { address, tick } => {
                 self.ticks.insert(address.clone(), *tick);
             }
-            Write::Liquidity { address, slot, lower, upper, delta } => {
-                let in_range = self.ticks.get(address).is_some_and(|t| lower <= t && t < upper);
+            Write::Liquidity { address, slot, pool, lower, upper, delta } => {
+                let in_range = self.ticks.get(pool).is_some_and(|t| lower <= t && t < upper);
                 if in_range {
                     if let Some(v) = self.values.get_mut(&(address.clone(), *slot)) {
                         let d = U256::from(delta.unsigned_abs());

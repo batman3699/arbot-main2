@@ -20,7 +20,11 @@ use super::eval::{self, bid_wei_per_gas, judge, landing, merge_renewals, net_wei
 use super::lines::{Arm, ArmedLine};
 use super::predicate::{layout, price_mask};
 use crate::live::book::{LiquidityWrite, PoolBook, StateWrite, SwapApplied, SwapWrite, SyncWrite};
-use crate::live::feed::{decode_liquidity, decode_swap, decode_sync, BURN, MINT, PANCAKE_SWAP, SWAP, SYNC};
+use crate::live::feed::{
+    decode_liquidity, decode_modify_liquidity, decode_swap, decode_sync, decode_v4_swap, BURN, MINT, MODIFY_LIQUIDITY, PANCAKE_SWAP, SWAP,
+    SYNC, V4_SWAP,
+};
+use crate::live::v4::{key_address, liquidity_slot, state_slot, HookAllowlist, POOL_MANAGER};
 use crate::live::frontier::{self, Cycle, WETH};
 use crate::live::inventory::{self, PoolSpec, Venue};
 use crate::live::reads::ChainReads;
@@ -63,45 +67,14 @@ type TxWrites = (String, Vec<(u64, Write)>);
 pub fn effects_of(logs: &[RawLog], venues: &BTreeMap<Address, Venue>) -> Vec<TxEffect> {
     let mut by_tx: BTreeMap<(u64, u64), TxWrites> = BTreeMap::new();
     for l in logs.iter().filter(|l| !l.removed) {
-        let (Some(block), Some(txi), Some(li), Some(venue)) =
-            (l.block_number, l.transaction_index, l.log_index, venues.get(&l.address))
-        else {
-            continue;
+        let (Some(block), Some(txi), Some(li)) = (l.block_number, l.transaction_index, l.log_index) else { continue };
+        let writes = if l.address == POOL_MANAGER {
+            let Some(w) = v4_writes(l, venues) else { continue };
+            w
+        } else {
+            let Some(venue) = venues.get(&l.address) else { continue };
+            pool_writes(l, *venue)
         };
-        let lay = layout(*venue, l.address);
-        let a = format!("{:#x}", l.address);
-        let mut writes = Vec::new();
-        match l.topics.first() {
-            Some(t) if *t == SWAP || *t == PANCAKE_SWAP => {
-                if let (Some(s), Some(ps), Some(ls)) = (decode_swap(l), lay.price_slot, lay.liquidity_slot) {
-                    writes.push(Write::Set { address: a.clone(), slot: ps, value: u256_to_ethers(s.sqrt_price_x96) });
-                    writes.push(Write::Set { address: a.clone(), slot: ls, value: U256::from(s.liquidity) });
-                    writes.push(Write::Tick { address: a.clone(), tick: s.tick });
-                }
-            }
-            Some(t) if *t == SYNC => {
-                if let (Some(s), Some((s0, s1))) = (decode_sync(l), lay.reserve_slots) {
-                    writes.push(Write::Set { address: a.clone(), slot: s0, value: u256_to_ethers(s.reserve0) });
-                    writes.push(Write::Set { address: a.clone(), slot: s1, value: u256_to_ethers(s.reserve1) });
-                }
-            }
-            // Mint(sender, amount, amount0, amount1) and Burn(amount, amount0,
-            // amount1), with the tick range in topics 2 and 3.
-            Some(t) if (*t == MINT || *t == BURN) && l.topics.len() == 4 => {
-                let amount = if *t == MINT { data_u128(&l.data, 1) } else { data_u128(&l.data, 0) };
-                if let (Some(amount), Some(ls)) = (amount, lay.liquidity_slot) {
-                    let delta = i128::try_from(amount).unwrap_or(i128::MAX);
-                    writes.push(Write::Liquidity {
-                        address: a.clone(),
-                        slot: ls,
-                        lower: topic_i32(&l.topics[2]),
-                        upper: topic_i32(&l.topics[3]),
-                        delta: if *t == MINT { delta } else { -delta },
-                    });
-                }
-            }
-            _ => {}
-        }
         let tx = l.transaction_hash.map_or_else(String::new, |h| format!("{h:#x}"));
         let entry = by_tx.entry((block, txi)).or_insert_with(|| (tx, Vec::new()));
         entry.1.extend(writes.into_iter().map(|w| (li, w)));
@@ -113,6 +86,77 @@ pub fn effects_of(logs: &[RawLog], venues: &BTreeMap<Address, Venue>) -> Vec<TxE
             TxEffect { block, tx_index, tx, writes: writes.into_iter().map(|(_, w)| w).collect() }
         })
         .collect()
+}
+
+/// A watched v4 pool's Swap or ModifyLiquidity, as writes on PoolManager's
+/// slots (R37); its tick, under the pool's key address. None for a pool not
+/// watched.
+fn v4_writes(l: &RawLog, venues: &BTreeMap<Address, Venue>) -> Option<Vec<Write>> {
+    let id = *l.topics.get(1)?;
+    let key = key_address(id);
+    if venues.get(&key) != Some(&Venue::UniswapV4) {
+        return None;
+    }
+    let slot = |b: B256| U256::from_big_endian(b.as_slice());
+    let (pm, k) = (format!("{POOL_MANAGER:#x}"), format!("{key:#x}"));
+    let ls = slot(liquidity_slot(id));
+    let mut writes = Vec::new();
+    match l.topics.first() {
+        Some(t) if *t == V4_SWAP => {
+            if let Some(s) = decode_v4_swap(l) {
+                writes.push(Write::Set { address: pm.clone(), slot: slot(state_slot(id)), value: u256_to_ethers(s.sqrt_price_x96) });
+                writes.push(Write::Set { address: pm, slot: ls, value: U256::from(s.liquidity) });
+                writes.push(Write::Tick { address: k, tick: s.tick });
+            }
+        }
+        Some(t) if *t == MODIFY_LIQUIDITY => {
+            if let Some(p) = decode_modify_liquidity(l) {
+                writes.push(Write::Liquidity { address: pm, slot: ls, pool: k, lower: p.tick_lower, upper: p.tick_upper, delta: p.delta });
+            }
+        }
+        _ => {}
+    }
+    Some(writes)
+}
+
+/// A pool's own log, as writes on its own slots.
+fn pool_writes(l: &RawLog, venue: Venue) -> Vec<Write> {
+    let lay = layout(venue, l.address);
+    let a = format!("{:#x}", l.address);
+    let mut writes = Vec::new();
+    match l.topics.first() {
+        Some(t) if *t == SWAP || *t == PANCAKE_SWAP => {
+            if let (Some(s), Some(ps), Some(ls)) = (decode_swap(l), lay.price_slot, lay.liquidity_slot) {
+                writes.push(Write::Set { address: a.clone(), slot: ps, value: u256_to_ethers(s.sqrt_price_x96) });
+                writes.push(Write::Set { address: a.clone(), slot: ls, value: U256::from(s.liquidity) });
+                writes.push(Write::Tick { address: a.clone(), tick: s.tick });
+            }
+        }
+        Some(t) if *t == SYNC => {
+            if let (Some(s), Some((s0, s1))) = (decode_sync(l), lay.reserve_slots) {
+                writes.push(Write::Set { address: a.clone(), slot: s0, value: u256_to_ethers(s.reserve0) });
+                writes.push(Write::Set { address: a.clone(), slot: s1, value: u256_to_ethers(s.reserve1) });
+            }
+        }
+        // Mint(sender, amount, amount0, amount1) and Burn(amount, amount0,
+        // amount1), with the tick range in topics 2 and 3.
+        Some(t) if (*t == MINT || *t == BURN) && l.topics.len() == 4 => {
+            let amount = if *t == MINT { data_u128(&l.data, 1) } else { data_u128(&l.data, 0) };
+            if let (Some(amount), Some(ls)) = (amount, lay.liquidity_slot) {
+                let delta = i128::try_from(amount).unwrap_or(i128::MAX);
+                writes.push(Write::Liquidity {
+                    address: a.clone(),
+                    slot: ls,
+                    pool: a.clone(),
+                    lower: topic_i32(&l.topics[2]),
+                    upper: topic_i32(&l.topics[3]),
+                    delta: if *t == MINT { delta } else { -delta },
+                });
+            }
+        }
+        _ => {}
+    }
+    writes
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -179,6 +223,42 @@ pub struct Verdict {
     pub base_fee_wei: String,
     pub per_f: Vec<PerF>,
     pub weth_usd: f64,
+    /// R37: the fire's start token when not WETH. Its gross is then
+    /// `gross_start` of that token's units, and `gross_wei` their worth at
+    /// the run's WETH price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<Address>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gross_start: Option<String>,
+    /// R37: the gross in USD: USDC at 1:1, WETH at the run's price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gross_usd: Option<f64>,
+}
+
+/// A fire's gross, in its start token's units, in wei, and in USD (R37).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FireGross {
+    /// A USDC fire's: its USDC units. None for WETH, whose units are wei.
+    pub start_units: Option<U256>,
+    /// None for a USDC fire without a WETH price.
+    pub wei: Option<U256>,
+    pub usd: Option<f64>,
+}
+
+/// `gross` of the start token `start` (None: WETH) valued: USDC at a dollar,
+/// and in ETH at `weth_usd`; WETH at `weth_usd`. Reporting only: no arm is
+/// sized or sent on it.
+pub fn fire_gross(start: Option<Address>, gross: U256, weth_usd: f64) -> FireGross {
+    let priced = weth_usd.is_finite() && weth_usd > 0.0;
+    let units = gross.low_u128() as f64;
+    match start {
+        None => FireGross { start_units: None, wei: Some(gross), usd: priced.then(|| units * weth_usd / 1e18) },
+        Some(_) => FireGross {
+            start_units: Some(gross),
+            wei: priced.then(|| U256::from((units * 1e12 / weth_usd) as u128)),
+            usd: Some(units / 1e6),
+        },
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -244,11 +324,13 @@ pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
     let pools: BTreeSet<Address> = due.iter().flat_map(|a| a.pools.iter().filter_map(|p| p.parse().ok())).collect();
     // R36: an armed pool may sit below the floor (a census target): every pool
     // that was armed is read whatever its depth.
-    let specs = inventory::load(&config.inventory, config.universe.filter(), &pools, &config.universe.hooks()?).map_err(|e| e.to_string())?;
+    let hooks = config.universe.hooks()?;
+    let specs = inventory::load(&config.inventory, config.universe.filter(), &pools, &hooks).map_err(|e| e.to_string())?;
     let venues: BTreeMap<Address, Venue> = specs.iter().map(|s| (s.pool, s.venue)).collect();
+    let v4_ids: Vec<B256> = specs.iter().filter_map(|s| s.v4.map(|k| k.pool_id)).collect();
     let from = due.iter().map(|a| a.armed_block + 1).min().unwrap_or(head);
     let to = due.iter().map(|a| a.to_block).max().unwrap_or(head);
-    let logs = get_logs(&*rpc, &pools, from, to).await?;
+    let logs = get_logs(&*rpc, &pools, &v4_ids, from, to).await?;
     let effects = effects_of(&logs, &venues);
     let flashblocks: Vec<FlashblockSeen> = config.flashblocks.as_ref().map(|f| read_lines(&f.ledger, now, 2)).unwrap_or_default();
     let weth_usd = weth_usd(&reads, head).await.unwrap_or(0.0);
@@ -258,10 +340,11 @@ pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
         let own: Vec<TxEffect> = effects
             .iter()
             .filter(|e| {
+                // A v4 pool's words are PoolManager's: its writes carry the
+                // pool's key address in a Tick or a Liquidity's `pool` (R37).
                 e.writes.iter().any(|w| match w {
-                    Write::Set { address, .. } | Write::Tick { address, .. } | Write::Liquidity { address, .. } => {
-                        arm.pools.contains(address)
-                    }
+                    Write::Set { address, .. } | Write::Tick { address, .. } => arm.pools.contains(address),
+                    Write::Liquidity { address, pool, .. } => arm.pools.contains(address) || arm.pools.contains(pool),
                 })
             })
             .cloned()
@@ -280,7 +363,7 @@ pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
             }
         }
     }
-    let ctx = Ctx { reads: &reads, rpc: &*rpc, config, specs: &specs, logs: &logs, flashblocks: &flashblocks, weth_usd, now };
+    let ctx = Ctx { reads: &reads, rpc: &*rpc, config, specs: &specs, hooks: &hooks, logs: &logs, flashblocks: &flashblocks, weth_usd, now };
     for (arm, j) in &judged {
         report.judged += 1;
         let shadowed = j.fire.as_ref().is_some_and(|f| {
@@ -299,6 +382,7 @@ struct Ctx<'a> {
     rpc: &'a dyn RpcTransport,
     config: &'a ShadowConfig,
     specs: &'a [PoolSpec],
+    hooks: &'a HookAllowlist,
     logs: &'a [RawLog],
     flashblocks: &'a [FlashblockSeen],
     weth_usd: f64,
@@ -325,6 +409,9 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
         base_fee_wei: arm.base_fee_wei.clone(),
         per_f: Vec::new(),
         weth_usd: ctx.weth_usd,
+        start: arm.start,
+        gross_start: None,
+        gross_usd: None,
     };
     let Some(fire) = &j.fire else { return v };
     report.fired += 1;
@@ -332,11 +419,16 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
     let base_fee = block.as_ref().and_then(|b| hex_u128(b.get("baseFeePerGas")?)).unwrap_or(0);
     v.base_fee_wei = base_fee.to_string();
 
-    // The exact quote at the fire.
-    match quote_at_fire(ctx.reads, ctx.specs, arm, fire, ctx.logs).await {
+    // The exact quote at the fire, in its start token's units (R37).
+    let mut quoted = None;
+    match quote_at_fire(ctx.reads, ctx.specs, ctx.hooks, arm, fire, ctx.logs).await {
         Ok(gross) => {
             report.quoted += 1;
-            v.gross_wei = Some(gross.to_string());
+            let g = fire_gross(arm.start, gross, ctx.weth_usd);
+            v.gross_wei = g.wei.map(|w| w.to_string());
+            v.gross_start = g.start_units.map(|u| u.to_string());
+            v.gross_usd = g.usd;
+            quoted = Some(gross.to_string());
         }
         Err(e) => v.quote_error = Some(e),
     }
@@ -349,10 +441,11 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
             // chain's; the simulation is held to a quote on its own state.
             let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
             let diverged = replay_diverged(ctx.logs, &replay, fire.block, fire.tx_index, &pools);
+            // Both in the start token's units: the executor's Profit is.
             let expected = if diverged {
-                quote_at_fire(ctx.reads, ctx.specs, arm, fire, &replay).await.ok().map(|g| g.to_string())
+                quote_at_fire(ctx.reads, ctx.specs, ctx.hooks, arm, fire, &replay).await.ok().map(|g| g.to_string())
             } else {
-                v.gross_wei.clone()
+                quoted.clone()
             };
             let agrees = expected.is_some() && expected.as_deref() == sim.gross_wei.as_deref();
             report.sim_agreed += usize::from(agrees);
@@ -394,13 +487,14 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
 pub async fn book_after(
     reads: &ChainReads,
     specs: &[PoolSpec],
+    hooks: &HookAllowlist,
     pools: &[Address],
     block: u64,
     tx_index: u64,
     logs: &[RawLog],
 ) -> Result<Arc<BTreeMap<Address, Arc<crate::live::book::PoolSnapshot>>>, String> {
     let mine: Vec<PoolSpec> = specs.iter().filter(|s| pools.contains(&s.pool)).cloned().collect();
-    let (book, unloaded) = PoolBook::load(reads, &mine, block - 1).await.map_err(|e| e.to_string())?;
+    let (book, unloaded) = PoolBook::load_with_hooks(reads, &mine, block - 1, hooks).await.map_err(|e| e.to_string())?;
     if !unloaded.is_empty() {
         return Err("a pool did not load at the block's parent".into());
     }
@@ -411,23 +505,42 @@ pub async fn book_after(
 /// `block`'s writes to `pools` through transaction `tx_index`, applied to
 /// `book`: swaps, syncs, and Mints and Burns as the live book applies them
 /// (R28.1). A position change the book cannot apply exactly refuses, because
-/// the book would need a read at the block to price it.
+/// the book would need a read at the block to price it. A v4 pool's are
+/// PoolManager's logs, keyed by its pool ID (R37).
 pub fn apply_through(book: &PoolBook, pools: &[Address], block: u64, tx_index: u64, logs: &[RawLog]) -> Result<(), String> {
+    let pool_of = |l: &RawLog| if l.address == POOL_MANAGER { l.topics.get(1).map(|id| key_address(*id)) } else { Some(l.address) };
     let mut writes = Vec::new();
     for l in logs.iter().filter(|l| {
-        !l.removed && l.block_number == Some(block) && pools.contains(&l.address) && l.transaction_index.is_some_and(|i| i <= tx_index)
+        !l.removed
+            && l.block_number == Some(block)
+            && pool_of(l).is_some_and(|p| pools.contains(&p))
+            && l.transaction_index.is_some_and(|i| i <= tx_index)
     }) {
         let at = (block, l.log_index.unwrap_or(0));
         match l.topics.first() {
-            Some(t) if *t == SWAP || *t == PANCAKE_SWAP => {
+            Some(t) if (*t == SWAP || *t == PANCAKE_SWAP) && l.address != POOL_MANAGER => {
                 let s = decode_swap(l).ok_or("an undecodable swap")?;
                 writes.push(StateWrite::Swap(SwapWrite { pool: s.pool, sqrt_price_x96: s.sqrt_price_x96, liquidity: s.liquidity, tick: s.tick, at }));
             }
-            Some(t) if *t == SYNC => {
+            Some(t) if *t == V4_SWAP && l.address == POOL_MANAGER => {
+                let s = decode_v4_swap(l).ok_or("an undecodable v4 swap")?;
+                writes.push(StateWrite::Swap(SwapWrite { pool: s.pool, sqrt_price_x96: s.sqrt_price_x96, liquidity: s.liquidity, tick: s.tick, at }));
+            }
+            Some(t) if *t == MODIFY_LIQUIDITY && l.address == POOL_MANAGER => {
+                let p = decode_modify_liquidity(l).ok_or("a v4 position change past 128 bits")?;
+                writes.push(StateWrite::Liquidity(LiquidityWrite {
+                    pool: p.pool,
+                    tick_lower: p.tick_lower,
+                    tick_upper: p.tick_upper,
+                    delta: p.delta,
+                    at,
+                }));
+            }
+            Some(t) if *t == SYNC && l.address != POOL_MANAGER => {
                 let s = decode_sync(l).ok_or("an undecodable sync")?;
                 writes.push(StateWrite::Sync(SyncWrite { pool: s.pool, reserve0: s.reserve0, reserve1: s.reserve1, at }));
             }
-            Some(t) if *t == MINT || *t == BURN => {
+            Some(t) if (*t == MINT || *t == BURN) && l.address != POOL_MANAGER => {
                 let p = decode_liquidity(l).ok_or("an undecodable mint or burn")?;
                 writes.push(StateWrite::Liquidity(LiquidityWrite {
                     pool: p.pool,
@@ -449,11 +562,18 @@ pub fn apply_through(book: &PoolBook, pools: &[Address], block: u64, tx_index: u
 
 /// The fire, quoted exactly: both pools at the fire block's parent, that
 /// block's writes to them up to and including the trigger, then the armed
-/// plan's hops. The WETH gross.
-async fn quote_at_fire(reads: &ChainReads, specs: &[PoolSpec], arm: &Arm, fire: &Point, logs: &[RawLog]) -> Result<U256, String> {
+/// plan's hops. The gross, in the start token's units (R37).
+async fn quote_at_fire(
+    reads: &ChainReads,
+    specs: &[PoolSpec],
+    hooks: &HookAllowlist,
+    arm: &Arm,
+    fire: &Point,
+    logs: &[RawLog],
+) -> Result<U256, String> {
     let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
-    let snap = book_after(reads, specs, &pools, fire.block, fire.tx_index, logs).await?;
-    let (_, cycles) = frontier::build(ChainId::BASE, WETH, &snap);
+    let snap = book_after(reads, specs, hooks, &pools, fire.block, fire.tx_index, logs).await?;
+    let (_, cycles) = frontier::build_starts(ChainId::BASE, &[WETH, apex_exec::lean2::USDC], &snap);
     let cycle = cycle_through(&cycles, &arm.pools).ok_or("the route is not in the reloaded pools")?;
     let wei = |s: &str| U256::from_dec_str(s).map_err(|e| e.to_string());
     super::plan::armed_gross(cycle, &snap, wei(&arm.size_wei)?, wei(&arm.mid)?, wei(&arm.output_wei)?)
@@ -495,26 +615,52 @@ pub fn replay_calls(block: &Value, fire_tx_index: u64) -> Option<Vec<Value>> {
 /// The `eth_simulateV1` request for `arm` firing at `fire`: on the parent
 /// block's state, the fire's block so far ([`replay_calls`]), then the
 /// transaction that would execute in that block ([`Arm::calldata_at`]) from
-/// `signer` at the arm's gas limit.
-pub fn simulate_request(arm: &Arm, fire: &Point, block: &Value, signer: Address, executor: Address) -> Option<Value> {
+/// `signer` at the arm's gas limit. With `pre`, the executor is simulated
+/// before its deploy (R37): its code put at `executor`, and its constructor's
+/// work done by overrides (`executors[signer]`, slot 1's mapping; a recipient
+/// in slot 2) and by its approvals to Morpho Blue, called before ours.
+pub fn simulate_request(arm: &Arm, fire: &Point, block: &Value, signer: Address, executor: Address, pre: Option<&PreDeploy>) -> Option<Value> {
     let mut calls = replay_calls(block, fire.tx_index)?;
+    if pre.is_some() {
+        let approve = format!("0x095ea7b3{:0>64}{}", alloy_primitives::hex::encode(crate::live::lenders::MORPHO_BLUE), "f".repeat(64));
+        for token in [WETH, apex_exec::lean2::USDC] {
+            calls.push(json!({"from": format!("{executor:#x}"), "to": format!("{token:#x}"), "data": approve}));
+        }
+    }
     calls.push(json!({
         "from": format!("{signer:#x}"),
         "to": format!("{executor:#x}"),
         "data": arm.calldata_at(fire.block),
         "gas": format!("{:#x}", arm.gas_limit),
     }));
-    Some(json!([{
-        "blockStateCalls": [{
-            "blockOverrides": {
-                "number": format!("{:#x}", fire.block),
-                "time": block["timestamp"],
-                "baseFeePerGas": block["baseFeePerGas"],
+    let mut state = json!({
+        "blockOverrides": {
+            "number": format!("{:#x}", fire.block),
+            "time": block["timestamp"],
+            "baseFeePerGas": block["baseFeePerGas"],
+        },
+        "calls": calls,
+    });
+    if let Some(p) = pre {
+        let mut key = [0u8; 64];
+        key[12..32].copy_from_slice(signer.as_slice());
+        key[63] = 1;
+        state["stateOverrides"] = json!({ format!("{executor:#x}"): {
+            "code": p.code,
+            "stateDiff": {
+                format!("{:#x}", keccak256(key)): format!("0x{:064x}", 1),
+                format!("0x{:064x}", 2): format!("0x{:0>64}", alloy_primitives::hex::encode(signer)),
             },
-            "calls": calls,
-        }],
-        "validation": false,
-    }, format!("{:#x}", fire.block.checked_sub(1)?)]))
+        }});
+    }
+    Some(json!([{ "blockStateCalls": [state], "validation": false }, format!("{:#x}", fire.block.checked_sub(1)?)]))
+}
+
+/// R37: `LeanExecutor2`'s runtime code, simulated at its address before it
+/// is deployed (`armed.executor2.runtime_code`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreDeploy {
+    pub code: String,
 }
 
 /// The simulation's check, and the logs its replay wrote to the arm's pools.
@@ -525,12 +671,23 @@ async fn simulate(
     fire: &Point,
     block: &Value,
 ) -> Option<(SimCheck, Vec<RawLog>)> {
-    let params = simulate_request(arm, fire, block, config.signer.address, config.executor.address)?;
+    // R37: the executor the arm was built for; LeanExecutor2 before its
+    // deploy runs its configured code. Code that does not read is no check.
+    let executor = arm.executor.unwrap_or(config.executor.address);
+    let pre = match &config.armed.executor2 {
+        Some(e) if e.address == executor => match &e.runtime_code {
+            Some(path) => Some(PreDeploy { code: format!("0x{}", std::fs::read_to_string(path).ok()?.trim().trim_start_matches("0x")) }),
+            None => None,
+        },
+        _ => None,
+    };
+    let params = simulate_request(arm, fire, block, config.signer.address, executor, pre.as_ref())?;
     let out = rpc.call("eth_simulateV1", params).await.ok()?;
     let calls = out.get(0)?.get("calls")?.as_array()?;
     let last = calls.last()?.clone();
     let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
-    let replay = replayed_logs(block, fire.tx_index, &calls[..calls.len() - 1], &pools);
+    let replayed = calls.len() - 1 - if pre.is_some() { 2 } else { 0 };
+    let replay = replayed_logs(block, fire.tx_index, &calls[..replayed], &pools);
     let ok = last.get("status").and_then(Value::as_str) == Some("0x1");
     let gas_used = last.get("gasUsed").and_then(hex_u128).map_or(0, |g| u64::try_from(g).unwrap_or(u64::MAX));
     let gross = simulated_gross(&last);
@@ -624,9 +781,24 @@ fn too_many_logs(error: &str) -> bool {
 /// halved until it fits: a failed run never advances the cursor, so one busy
 /// stretch would otherwise stall the verdicts for good. Any other failure is
 /// returned at once.
-pub async fn get_logs(rpc: &dyn RpcTransport, pools: &BTreeSet<Address>, from: u64, to: u64) -> Result<Vec<RawLog>, String> {
+/// R37: and PoolManager's Swap and ModifyLiquidity for the v4 pools `v4_ids`,
+/// by pool ID in topic 1. In chain order.
+pub async fn get_logs(rpc: &dyn RpcTransport, pools: &BTreeSet<Address>, v4_ids: &[B256], from: u64, to: u64) -> Result<Vec<RawLog>, String> {
     let addresses: Vec<String> = pools.iter().map(|a| format!("{a:#x}")).collect();
     let topics: Vec<String> = [SWAP, PANCAKE_SWAP, SYNC, MINT, BURN].iter().map(|t| format!("{t:#x}")).collect();
+    let mut out = logs_of(rpc, &json!({"address": addresses, "topics": [topics]}), from, to).await?;
+    if !v4_ids.is_empty() {
+        let topics0: Vec<String> = [V4_SWAP, MODIFY_LIQUIDITY].iter().map(|t| format!("{t:#x}")).collect();
+        let ids: Vec<String> = v4_ids.iter().map(|i| format!("{i:#x}")).collect();
+        out.extend(logs_of(rpc, &json!({"address": [format!("{POOL_MANAGER:#x}")], "topics": [topics0, ids]}), from, to).await?);
+        out.sort_by_key(|l| (l.block_number, l.transaction_index, l.log_index));
+    }
+    Ok(out)
+}
+
+/// `filter`'s logs from `from` to `to`, a range too full for one query split
+/// until it fits.
+async fn logs_of(rpc: &dyn RpcTransport, filter: &Value, from: u64, to: u64) -> Result<Vec<RawLog>, String> {
     let mut out = Vec::new();
     // Ranges still to query, the next one last.
     let mut todo: Vec<(u64, u64)> = Vec::new();
@@ -637,13 +809,10 @@ pub async fn get_logs(rpc: &dyn RpcTransport, pools: &BTreeSet<Address>, from: u
         start = first;
     }
     while let Some((start, end)) = todo.pop() {
-        let answer = rpc
-            .call(
-                "eth_getLogs",
-                json!([{"address": addresses, "topics": [topics], "fromBlock": format!("{start:#x}"), "toBlock": format!("{end:#x}")}]),
-            )
-            .await
-            .map_err(|e| e.to_string());
+        let mut q = filter.clone();
+        q["fromBlock"] = json!(format!("{start:#x}"));
+        q["toBlock"] = json!(format!("{end:#x}"));
+        let answer = rpc.call("eth_getLogs", json!([q])).await.map_err(|e| e.to_string());
         match answer {
             Ok(v) => out.extend(v.as_array().ok_or("eth_getLogs: not an array")?.iter().filter_map(|l| parse_log(l, false))),
             Err(e) if end > start && too_many_logs(&e) => {

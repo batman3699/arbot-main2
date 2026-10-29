@@ -518,6 +518,7 @@ impl Engine {
             p_win: bid.p_win,
             renewals: Vec::new(),
             start: (c.start != crate::live::frontier::WETH).then_some(c.start),
+            executor: self.settings.executor2,
         })
     }
 

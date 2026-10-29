@@ -91,6 +91,10 @@ pub struct Arm {
     /// mid, output, surplus and cost are in that token's units. Absent: WETH.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<alloy_primitives::Address>,
+    /// R37: the executor the arm was built for when it is `LeanExecutor2`.
+    /// Absent: the configured v1 executor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<alloy_primitives::Address>,
 }
 
 fn balancer() -> String {

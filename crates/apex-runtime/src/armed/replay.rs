@@ -109,10 +109,12 @@ async fn replay_one(reads: &ChainReads, rpc: &dyn RpcTransport, config: &ShadowC
     let fire = verdict.fire.as_ref().ok_or("the verdict has no fire")?;
     let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
     let set: BTreeSet<Address> = pools.iter().copied().collect();
-    let specs = inventory::load(&config.inventory, config.universe.filter(), &set, &config.universe.hooks()?).map_err(|e| e.to_string())?;
-    let logs = get_logs(rpc, &set, fire.block, fire.block).await?;
-    let snap = book_after(reads, &specs, &pools, fire.block, fire.tx_index, &logs).await?;
-    let (_, cycles) = frontier::build(ChainId::BASE, WETH, &snap);
+    let hooks = config.universe.hooks()?;
+    let specs = inventory::load(&config.inventory, config.universe.filter(), &set, &hooks).map_err(|e| e.to_string())?;
+    let v4_ids: Vec<alloy_primitives::B256> = specs.iter().filter_map(|s| s.v4.map(|k| k.pool_id)).collect();
+    let logs = get_logs(rpc, &set, &v4_ids, fire.block, fire.block).await?;
+    let snap = book_after(reads, &specs, &hooks, &pools, fire.block, fire.tx_index, &logs).await?;
+    let (_, cycles) = frontier::build_starts(ChainId::BASE, &[WETH, apex_exec::lean2::USDC], &snap);
     let cycle = cycle_through(&cycles, &arm.pools).ok_or("the route is not in the reloaded pools")?;
     let live = LiveCycle::new(cycle, &snap).ok_or("a pool left its ladder")?;
     let armed = U256::from_dec_str(&arm.size_wei).map_err(|e| e.to_string())?;

@@ -167,6 +167,7 @@ fn arm(arm_id: u64, slot: u16, bid: u128, gas_limit: u64) -> Arm {
         p_win: 0.5,
         renewals: Vec::new(),
         start: None,
+        executor: None,
     }
 }
 
