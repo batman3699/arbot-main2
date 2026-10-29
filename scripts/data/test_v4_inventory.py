@@ -140,6 +140,17 @@ class Sources(unittest.TestCase):
         self.assertEqual(V.scan(call, 0, 4_500), [AXIS_LOG])
         self.assertEqual(asked, [(0, 1_999), (2_000, 3_999), (4_000, 4_500)])
 
+    def test_public_endpoints_are_asked_in_their_own_chunks(self):
+        # 2026-10-29 from the host: blastapi takes 10 blocks a getLogs, 1rpc
+        # 50, Tenderly 1,000; the census asks 50 at a time, and so does this.
+        self.assertEqual(V.PUBLIC_CHUNK, 50)
+        asked = []
+        V.scan(lambda m, p: asked.append((int(p[0]["fromBlock"], 16), int(p[0]["toBlock"], 16))) or [], 100, 219, chunk=V.PUBLIC_CHUNK)
+        self.assertEqual(asked, [(100, 149), (150, 199), (200, 219)])
+        call, chunk = V.client("public")
+        self.assertEqual(chunk, V.PUBLIC_CHUNK)
+        self.assertEqual(V.client("https://rpc.example")[1], V.CHUNK)
+
 
 if __name__ == "__main__":
     unittest.main()

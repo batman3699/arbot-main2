@@ -20,6 +20,7 @@ Run from scripts/data:
     python3 v4_inventory.py --out ... --scan FROM TO --rpc URL
     # Daily: from the cursor's block to the head (less a margin), then the cursor:
     python3 v4_inventory.py --out ... --follow CURSOR --rpc URL
+    # `--rpc public`: the census's public endpoints in turn, 50 blocks a query.
     # Pool IDs (one a line) resolved through PositionManager.poolKeys, each
     # kept only when its key hashes to its ID (no init_block then):
     python3 v4_inventory.py --out ... --resolve IDS --rpc URL
@@ -41,6 +42,9 @@ POSITION_MANAGER = "0x7c5f5a4bbd8fd63184577525326123b519429bdc"
 POOL_KEYS = "0x86b6be7d"
 INITIALIZE = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438"
 CHUNK = 2_000
+# What public endpoints answer (2026-10-29: blastapi 10 blocks, 1rpc 50,
+# Tenderly 1,000), as the census asks them (arb_census.race.STEP).
+PUBLIC_CHUNK = 50
 # Blocks behind the head a follow stops at: past any reorg Base has had.
 FOLLOW_LAG = 30
 
@@ -171,6 +175,16 @@ def scan(call, start: int, end: int, chunk: int = CHUNK) -> list[dict]:
     return logs
 
 
+def client(url: str):
+    """(call, chunk) for `url`: a keyed endpoint at CHUNK blocks a query, or
+    `public`, the census's public endpoints in turn, transient failures
+    retried on the next, at PUBLIC_CHUNK."""
+    if url == "public":
+        from arb_census import race
+        return race.Public(4.0).call, PUBLIC_CHUNK
+    return rpc(url), CHUNK
+
+
 def rpc(url: str):
     def call(method, params):
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
@@ -191,27 +205,28 @@ def main(argv=None) -> int:
     src.add_argument("--scan", nargs=2, type=int, metavar=("FROM", "TO"))
     src.add_argument("--follow", metavar="CURSOR", help="a file holding the last block scanned")
     src.add_argument("--resolve", metavar="IDS", help="a file of pool IDs, one a line")
-    p.add_argument("--rpc")
+    p.add_argument("--rpc", help="an endpoint URL, or `public`")
     a = p.parse_args(argv)
     if (a.scan or a.follow or a.resolve) and not a.rpc:
         p.error("--scan, --follow and --resolve need --rpc")
     if a.resolve:
         with open(a.resolve) as f:
             ids = [l.split()[0] for l in f if l.strip()]
-        records, unresolved = resolve(rpc(a.rpc), ids)
+        records, unresolved = resolve(client(a.rpc)[0], ids)
         added, refused = fold_records(records, a.out)
         print(json.dumps({"ids": len(ids), "added": added, "unresolved": unresolved, "out": a.out}))
         return 0
     if a.logs:
         logs = load_logs(a.logs)
     elif a.scan:
-        logs = scan(rpc(a.rpc), a.scan[0], a.scan[1])
+        call, chunk = client(a.rpc)
+        logs = scan(call, a.scan[0], a.scan[1], chunk)
     else:
-        call = rpc(a.rpc)
+        call, chunk = client(a.rpc)
         with open(a.follow) as f:
             last = int(f.read().strip())
         head = int(call("eth_blockNumber", []), 16) - FOLLOW_LAG
-        logs = scan(call, last + 1, head) if head > last else []
+        logs = scan(call, last + 1, head, chunk) if head > last else []
     added, refused = fold(logs, a.out)
     if a.follow and head > last:
         tmp = a.follow + ".tmp"
