@@ -79,6 +79,10 @@ armed:
     code_hash: "0xb67e7dd210e440dae114d36ca40d13d65fd2150a26a71dc53c86a3af83b39c7e"
     runtime_code: var/armed/LeanExecutor2.runtime.hex
   max_size_usdc: 12000000000                 # 12,000 USDC, about max_size_wei's 5 WETH
+  # R37: armed-eval simulates this many fires a run (an even sample, every
+  # fire still quoted): 2 a run every 5 minutes is at most 576 a day. All
+  # fires, 3,261 in four hours, spent BlockPI's prepaid units on 2026-10-29.
+  eval_simulations_per_run: 2
   live:
     keys_file: var/armed/armed.keys
     sequencer: https://mainnet-sequencer.base.org

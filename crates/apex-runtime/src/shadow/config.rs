@@ -319,6 +319,16 @@ pub struct ArmedConfig {
     /// arming engine builds for v1 and leaves USDC and v4 routes unarmed.
     #[serde(default)]
     pub executor2: Option<Executor2Config>,
+    /// R37: the fires `apex armed-eval` simulates a run, a fixed even sample;
+    /// every fire is still quoted exactly. Each simulation replays its fire's
+    /// whole block: 3,261 in four hours spent BlockPI's prepaid units
+    /// (2026-10-29). At a run every five minutes, 2 is at most 576 a day.
+    #[serde(default = "two_simulations")]
+    pub eval_simulations_per_run: usize,
+}
+
+const fn two_simulations() -> usize {
+    2
 }
 
 /// R37: whether `found`, the hash of `LeanExecutor2`'s code at boot (the

@@ -606,3 +606,25 @@ fn a_usdc_fire_s_bids_are_swept_on_its_surplus_in_wei() {
     assert_eq!(surplus_in_wei(&usdc, 2_500.0), U256::exp10(15), "$2.50 at $2,500 an ETH");
     assert_eq!(surplus_in_wei(&usdc, 0.0), U256::zero(), "no price: no bid");
 }
+
+/// R37: the evaluator simulates a sample of each run's fires, every fire
+/// still quoted exactly. 3,261 fires in four hours, each an eth_simulateV1
+/// replaying its whole block, spent BlockPI's prepaid units on 2026-10-29.
+/// The sample is spread evenly and fixed by the fires themselves: the same
+/// fires, in any order, give the same sample.
+#[test]
+fn a_run_simulates_a_fixed_even_sample_of_its_fires() {
+    use apex_runtime::armed::run::sample_for_simulation;
+    let fires: Vec<(u64, String)> = (0..100u64).map(|i| (i, format!("0x{i:064x}"))).collect();
+    let picked = sample_for_simulation(&fires, 2);
+    assert_eq!(picked.len(), 2);
+    let mut shuffled = fires.clone();
+    shuffled.reverse();
+    let again: std::collections::BTreeSet<(u64, String)> =
+        sample_for_simulation(&shuffled, 2).into_iter().map(|i| shuffled[i].clone()).collect();
+    let first: std::collections::BTreeSet<(u64, String)> = picked.into_iter().map(|i| fires[i].clone()).collect();
+    assert_eq!(first, again, "the fires decide, not their order");
+    assert_ne!(first, fires[..2].iter().cloned().collect(), "not simply the first ones");
+    assert_eq!(sample_for_simulation(&fires[..1], 2).len(), 1, "fewer fires than the sample: all of them");
+    assert!(sample_for_simulation(&fires, 0).is_empty(), "a sample of none");
+}

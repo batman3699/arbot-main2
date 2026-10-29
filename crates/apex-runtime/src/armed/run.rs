@@ -374,12 +374,26 @@ pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
         }
     }
     let ctx = Ctx { reads: &reads, rpc: &*rpc, config, specs: &specs, hooks: &hooks, logs: &logs, flashblocks: &flashblocks, weth_usd, now };
-    for (arm, j) in &judged {
+    let shadowed: Vec<bool> = judged
+        .iter()
+        .map(|(arm, j)| {
+            j.fire.as_ref().is_some_and(|f| {
+                top.get(&(arm.route_hash.clone(), arm.trigger_leg, f.block, f.tx_index)).is_some_and(|(_, id)| *id != arm.arm_id)
+            })
+        })
+        .collect();
+    // R37: a sample of the run's fires is simulated; every one is quoted.
+    let fired: Vec<(usize, (u64, String))> = judged
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (arm, j))| j.fire.as_ref().filter(|_| !shadowed[i]).map(|f| (i, (arm.arm_id, f.tx.clone()))))
+        .collect();
+    let keys: Vec<(u64, String)> = fired.iter().map(|(_, k)| k.clone()).collect();
+    let simulate: BTreeSet<usize> =
+        sample_for_simulation(&keys, config.armed.eval_simulations_per_run).into_iter().map(|k| fired[k].0).collect();
+    for (i, (arm, j)) in judged.iter().enumerate() {
         report.judged += 1;
-        let shadowed = j.fire.as_ref().is_some_and(|f| {
-            top.get(&(arm.route_hash.clone(), arm.trigger_leg, f.block, f.tx_index)).is_some_and(|(_, id)| *id != arm.arm_id)
-        });
-        let v = verdict(&ctx, arm, j, shadowed, &mut report).await;
+        let v = verdict(&ctx, arm, j, shadowed[i], simulate.contains(&i), &mut report).await;
         ledger::append_line(&config.armed.verdicts, now, &v).map_err(|e| e.to_string())?;
     }
     report.cursor = new_cursor;
@@ -399,7 +413,20 @@ struct Ctx<'a> {
     now: u64,
 }
 
-async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, report: &mut RunReport) -> Verdict {
+/// The `n` fires (arm ID, fire transaction) a run simulates, by index: the
+/// `n` whose keccak is lowest, so the sample is spread evenly and fixed by the
+/// fires themselves, whatever their order.
+pub fn sample_for_simulation(fires: &[(u64, String)], n: usize) -> BTreeSet<usize> {
+    let mut ranked: Vec<(B256, usize)> = fires
+        .iter()
+        .enumerate()
+        .map(|(i, (arm_id, tx))| (keccak256([arm_id.to_be_bytes().as_slice(), tx.as_bytes()].concat()), i))
+        .collect();
+    ranked.sort();
+    ranked.into_iter().take(n).map(|(_, i)| i).collect()
+}
+
+async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, simulate_it: bool, report: &mut RunReport) -> Verdict {
     let mut v = Verdict {
         at_ns: ctx.now,
         arm_id: arm.arm_id,
@@ -425,7 +452,8 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
     };
     let Some(fire) = &j.fire else { return v };
     report.fired += 1;
-    let block = block_object(ctx.rpc, fire.block, true).await;
+    // The block's transactions only for a simulation: it replays them.
+    let block = block_object(ctx.rpc, fire.block, simulate_it).await;
     let base_fee = block.as_ref().and_then(|b| hex_u128(b.get("baseFeePerGas")?)).unwrap_or(0);
     v.base_fee_wei = base_fee.to_string();
 
@@ -442,8 +470,8 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
         }
         Err(e) => v.quote_error = Some(e),
     }
-    // The simulation check.
-    if let Some(b) = &block {
+    // The simulation check, on the run's sample.
+    if let Some(b) = block.as_ref().filter(|_| simulate_it) {
         if let Some((sim, replay)) = simulate(ctx.rpc, ctx.config, arm, fire, b).await {
             report.simulated += 1;
             // A replayed transaction can run differently from the chain (its

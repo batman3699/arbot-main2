@@ -146,6 +146,7 @@ fn armed(mode: ArmedMode, targets: Option<&Path>) -> ArmedConfig {
         live: None,
         moves: None,
         executor2: None,
+        eval_simulations_per_run: 2,
     }
 }
 
