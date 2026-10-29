@@ -248,6 +248,15 @@ there, with `best_bid` as the alternative on every arm.
   on today's arms, far under the 20 gwei cap. Worst cases rise by at most
   `gas_limit × surplus / gas`, inside the 0.0018 ETH a sender can spend. No
   funding or budget change is part of R38.
+- **The band follows the sent bid** (found in implementation).
+  - An arm's band pays the tip it sends. A rule bidding higher would have a
+    narrower band, and fire on fewer moves.
+  - Judging the other rule's bid on the sending rule's fires therefore
+    flatters the dearer rule: `best_share` while `best_bid` sends, and the
+    reverse after a switch.
+  - The census's held-out comparison shares the bias.
+  - Only the realised live net after a switch settles it, so the revert rule
+    reads that too.
 - **Time of day.** The morning's contests were harder than the afternoon's.
   The time-segment calibration shows whether a segmented fit is needed.
 - **Denim (~November 2026)** ends flashblocks. The contest classes are
