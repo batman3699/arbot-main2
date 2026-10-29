@@ -90,6 +90,8 @@ pub struct Leg {
     /// Selling token0 for token1, which moves the price down.
     pub zero_for_one: bool,
     pub fee_ppm: u32,
+    /// R37: a v4 pool's key, which `LeanExecutor2`'s hop carries.
+    pub v4: Option<crate::live::v4::V4Key>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -127,6 +129,7 @@ fn leg(p: &PoolSnapshot, token_in: Address) -> Leg {
         token_out: if zero_for_one { p.spec.token1 } else { p.spec.token0 },
         zero_for_one,
         fee_ppm: p.state.fee_ppm,
+        v4: p.spec.v4,
     }
 }
 

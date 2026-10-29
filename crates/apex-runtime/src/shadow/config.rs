@@ -315,6 +315,24 @@ pub struct ArmedConfig {
     /// restart does not begin them again. None: learned in memory alone.
     #[serde(default)]
     pub moves: Option<PathBuf>,
+    /// R37: `LeanExecutor2`, which every arm is then built for. Unset, the
+    /// arming engine builds for v1 and leaves USDC and v4 routes unarmed.
+    #[serde(default)]
+    pub executor2: Option<Executor2Config>,
+}
+
+/// R37: `LeanExecutor2`'s deployment.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Executor2Config {
+    pub address: Address,
+    /// The deployed runtime code's keccak.
+    pub code_hash: B256,
+    /// The runtime code's hex (`forge inspect LeanExecutor2
+    /// deployedBytecode`), for simulating against it before it is deployed
+    /// (Task 14). Never sent.
+    #[serde(default)]
+    pub runtime_code: Option<PathBuf>,
 }
 
 /// R36: where armed-live's parts are, and nothing else: every cap is

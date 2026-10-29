@@ -131,6 +131,23 @@ impl CallBuilder for LiveCallBuilder {
     }
 }
 
+/// One hop of a cycle as `LeanExecutor2`'s (R37): v1's rules, and a v4 pool
+/// swapped by its key, exact input like v3, held to `min_out`.
+pub fn lean2_hop(leg: &Leg, quote: U256, min_out: U256) -> Result<apex_exec::lean2::Lean2Hop, String> {
+    use apex_exec::lean2::{Hop2Kind, Lean2Hop, V4HopKey};
+    let (kind, min_out, v4) = match leg.venue {
+        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => (Hop2Kind::UniswapV3Style, min_out, None),
+        Venue::PancakeV3 => (Hop2Kind::PancakeV3, min_out, None),
+        Venue::AerodromeV2 => (Hop2Kind::AerodromeV2, quote, None),
+        Venue::UniswapV4 => {
+            let k = leg.v4.ok_or_else(|| format!("the v4 pool {:#x} has no key", leg.pool))?;
+            (Hop2Kind::UniswapV4, min_out, Some(V4HopKey { fee: k.fee, tick_spacing: k.tick_spacing, hooks: k.hooks }))
+        }
+    };
+    let min_out = u128::try_from(min_out).map_err(|_| format!("a hop's minimum {min_out} does not fit 128 bits"))?;
+    Ok(Lean2Hop { kind, pool: leg.pool, token_out: leg.token_out, min_out, v4 })
+}
+
 /// One hop of a cycle as the lean executor's: shared by the reactive plan and
 /// the armed one (R26). A v3 pool pays what the swap returns, held to
 /// `min_out`; an Aerodrome v2 pool pays exactly what it is asked for, so it is

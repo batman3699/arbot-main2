@@ -6,7 +6,8 @@
 use super::bid::{best_bid, rank_value, Bid};
 use super::lines::{Arm, ArmedLine, Word};
 use super::moves::{spread_key, MoveStats};
-use super::plan::armed_call;
+use super::plan::{armed_call, armed_call2};
+use apex_exec::lean2::Lean2Lender;
 use super::predicate::{self, layout_of};
 use super::threshold::{band_paying, rungs, trigger_up, Band, Pricing, Rung};
 use crate::live::book::PoolSnapshot;
@@ -64,6 +65,9 @@ pub struct EngineSettings {
     pub band_cap_bps: u32,
     pub liquidity_floor_bps: u32,
     pub executor: Address,
+    /// R37: `LeanExecutor2`. Set, every arm is built for it; unset, a USDC
+    /// or v4 route is not armed (v1 runs neither).
+    pub executor2: Option<Address>,
     pub chain_id: u64,
     /// Slots repriced per tick at most ([`REPRICE_BUDGET`] in the shadow).
     pub reprice_budget: usize,
@@ -356,7 +360,10 @@ impl Engine {
                         // A new transaction on the same sender: re-signed with a
                         // deadline that runs from now, as the arm's did.
                         let deadline = self.deadline(now_ns);
-                        let Some((calldata, calldata_hash, _)) = self.calldata(c, band, snapshot, deadline, px) else { continue };
+                        // Renewed on the cycle's own pricing, its lender too,
+                        // as it was armed (R37).
+                        let Some(pxc) = px.for_cycle(c) else { continue };
+                        let Some((calldata, calldata_hash, _)) = self.calldata(c, band, snapshot, deadline, &pxc) else { continue };
                         live.arm.to_block = to_block;
                         live.arm.deadline = deadline;
                         live.arm.calldata.clone_from(&calldata);
@@ -535,9 +542,26 @@ impl Engine {
         snapshot.get(&c.legs[0].pool)?;
         snapshot.get(&c.legs[1].pool)?;
         let choice = px.lenders.and_then(|l| l.for_size(band.point.size)).unwrap_or(crate::live::lenders::MORPHO);
-        let call = armed_call(c, band.point.size, band.point.mid, band.point.output, s.executor, s.chain_id, deadline, &choice).ok()?;
+        let morpho = choice.id == crate::live::lenders::MORPHO_FLASH;
+        let (call, lender) = match s.executor2 {
+            // R37: a v4 route's choice is PoolManager's holding, and
+            // `armed_call2` borrows from PoolManager whatever it is passed.
+            Some(executor2) => {
+                let asked = if morpho { Lean2Lender::Morpho } else { Lean2Lender::Balancer };
+                let call = armed_call2(c, band.point.size, band.point.mid, band.point.output, executor2, s.chain_id, deadline, asked).ok()?;
+                let lender = match call.plan() {
+                    apex_exec::call::CallPlan::Lean2(p) if p.lender == Lean2Lender::PoolManager => "pool_manager",
+                    _ if morpho => "morpho",
+                    _ => "balancer",
+                };
+                (call, lender)
+            }
+            None => (
+                armed_call(c, band.point.size, band.point.mid, band.point.output, s.executor, s.chain_id, deadline, &choice).ok()?,
+                if morpho { "morpho" } else { "balancer" },
+            ),
+        };
         let data = call.data();
-        let lender = if choice.id == crate::live::lenders::MORPHO_FLASH { "morpho" } else { "balancer" };
         Some((format!("0x{}", alloy_primitives::hex::encode(data)), format!("{:#x}", keccak256(data)), lender.into()))
     }
 }

@@ -13,6 +13,7 @@ const USDC: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const SLIP: Address = address!("dbc6998296caA1652A810dc8D3BaF4A8294330f1");
 const UNI: Address = address!("d0b53D9277642d899DF5C87A3966A349A798F224");
 const L: u128 = 1_400_000_000_000_000_000;
+const EXECUTOR2: Address = address!("00000000000000000000000000000000000e2e02");
 
 fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32) -> PoolSnapshot {
     let spacing = 10;
@@ -75,6 +76,7 @@ fn setup_with(max_arms: usize, reprice_budget: usize, rungs: u8) -> (Engine, BTr
         band_cap_bps: 5,
         liquidity_floor_bps: 9_800,
         executor: EXECUTOR,
+        executor2: None,
         chain_id: 8453,
         reprice_budget,
         reprice_for: Duration::MAX,
@@ -105,6 +107,7 @@ fn setup_three(reprice_budget: usize, reprice_for: Duration, workers: usize) -> 
         band_cap_bps: 5,
         liquidity_floor_bps: 9_800,
         executor: EXECUTOR,
+        executor2: None,
         chain_id: 8453,
         reprice_budget,
         reprice_for,
@@ -217,7 +220,7 @@ fn an_unarmable_pool_arms_nothing() {
     let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
     let settings = EngineSettings {
         max_arms: 4, rungs: 3, window_s: 10, block_time_ms: 2_000, band_cap_bps: 5,
-        liquidity_floor_bps: 9_800, executor: EXECUTOR, chain_id: 8453, reprice_budget: REPRICE_BUDGET,
+        liquidity_floor_bps: 9_800, executor: EXECUTOR, executor2: None, chain_id: 8453, reprice_budget: REPRICE_BUDGET,
         reprice_for: Duration::MAX, workers: 1, max_priority_wei_per_gas: 20_000_000_000,
     };
     let engine = Engine::new(cycles, settings, [SLIP].into_iter().collect());
@@ -500,6 +503,7 @@ fn an_arm_closing_on_aerodrome_asks_for_its_output() {
         band_cap_bps: 5,
         liquidity_floor_bps: 9_800,
         executor: EXECUTOR,
+        executor2: None,
         chain_id: 8453,
         reprice_budget: REPRICE_BUDGET,
         reprice_for: Duration::MAX,
@@ -571,4 +575,57 @@ fn the_engine_watches_each_armed_route_s_spread() {
     engine.tick(&snap, 1_000, 5_000_000, &px(), 1);
     let seen = engine.moves_snapshot(1).pools;
     assert!(seen.contains_key(&spread_key(UNI, SLIP)) && seen.contains_key(&spread_key(SLIP, UNI)), "{:?}", seen.keys());
+}
+
+/// R37: a USDC arm borrows Morpho's USDC, and its renewal does too: renewed
+/// with the cycle's own pricing, not the WETH lenders'. `run(bytes)`'s plan
+/// starts at byte 68 with its lender (0 Balancer, 1 Morpho).
+#[test]
+fn a_renewed_usdc_arm_keeps_its_lender() {
+    use apex_runtime::armed::threshold::start_per_eth;
+    use apex_runtime::live::lenders::Lenders;
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> =
+        [(UNI, Arc::new(pool(UNI, Venue::UniswapV3, -197_350, 500))), (SLIP, Arc::new(pool(SLIP, Venue::Slipstream, -197_350, 400)))]
+            .into_iter()
+            .collect();
+    let (_, cycles) = frontier::build_starts(ChainId(8453), &[WETH, USDC], &snap);
+    let settings = EngineSettings {
+        max_arms: 64,
+        rungs: 3,
+        window_s: 10,
+        block_time_ms: 2_000,
+        band_cap_bps: 5,
+        liquidity_floor_bps: 9_800,
+        executor: EXECUTOR,
+        executor2: Some(EXECUTOR2),
+        chain_id: 8453,
+        reprice_budget: REPRICE_BUDGET,
+        reprice_for: Duration::MAX,
+        workers: 1,
+        max_priority_wei_per_gas: 20_000_000_000,
+    };
+    let engine = Engine::new(cycles, settings, BTreeSet::new());
+    let px = Pricing {
+        start_per_eth: start_per_eth(&snap),
+        usdc_lenders: Some(Lenders { balancer: U256::zero(), morpho: Some(U256::from(10u128.pow(13))) }),
+        ..px()
+    };
+    let lender_of = |calldata: &str| alloy_primitives::hex::decode(calldata.trim_start_matches("0x")).unwrap()[68];
+    let first = engine.tick(&snap, 1_000, 5_000_000, &px, 1);
+    let usdc: Vec<&Arm> = first.iter().filter_map(|l| if let ArmedLine::Arm(a) = l { Some(&**a) } else { None }).filter(|a| a.start == Some(USDC)).collect();
+    assert!(!usdc.is_empty(), "USDC cycles arm");
+    for a in &usdc {
+        assert_eq!((lender_of(&a.calldata), a.lender.as_str()), (1, "morpho"), "Morpho's USDC");
+    }
+    let later = engine.tick(&snap, 1_005, 5_000_000, &px, 12_000_000_000);
+    let mut renewed = 0;
+    for l in &later {
+        if let ArmedLine::Renew { arm_id, calldata: Some(c), .. } = l {
+            if usdc.iter().any(|a| a.arm_id == *arm_id) {
+                assert_eq!(lender_of(c), 1, "renewed on Morpho's USDC, not Balancer's WETH");
+                renewed += 1;
+            }
+        }
+    }
+    assert_eq!(renewed, usdc.len());
 }

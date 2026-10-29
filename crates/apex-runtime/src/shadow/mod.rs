@@ -666,6 +666,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
             band_cap_bps: config.armed.band_cap_bps,
             liquidity_floor_bps: config.armed.liquidity_floor_bps,
             executor: config.executor.address,
+            executor2: config.armed.executor2.as_ref().map(|e| e.address),
             chain_id: base.0,
             reprice_budget: crate::armed::engine::REPRICE_BUDGET,
             reprice_for: crate::armed::engine::REPRICE_FOR,

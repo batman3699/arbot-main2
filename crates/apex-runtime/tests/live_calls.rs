@@ -261,13 +261,13 @@ fn each_venue_maps_to_its_hop_kind() {
         (Venue::PancakeV3, HopKind::PancakeV3),
         (Venue::AerodromeV2, HopKind::AerodromeV2),
     ] {
-        let leg = Leg { pool: UNI, venue, token_in: WETH, token_out: USDC, zero_for_one: true, fee_ppm: 500 };
+        let leg = Leg { pool: UNI, venue, token_in: WETH, token_out: USDC, zero_for_one: true, fee_ppm: 500, v4: None };
         assert_eq!(
             lean_hop(&leg, U256::from(43u64), U256::from(42u64)),
             Ok(LeanHop { kind: want, pool: UNI, token_out: USDC, min_out: if venue == Venue::AerodromeV2 { 43 } else { 42 } })
         );
     }
-    let leg = Leg { pool: UNI, venue: Venue::UniswapV3, token_in: WETH, token_out: USDC, zero_for_one: true, fee_ppm: 500 };
+    let leg = Leg { pool: UNI, venue: Venue::UniswapV3, token_in: WETH, token_out: USDC, zero_for_one: true, fee_ppm: 500, v4: None };
     assert!(lean_hop(&leg, U256::ZERO, U256::from(u128::MAX) + U256::from(1u64)).is_err(), "a minimum beyond 128 bits");
 }
 

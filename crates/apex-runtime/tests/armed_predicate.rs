@@ -311,3 +311,118 @@ async fn verify_layouts_reads_v4_words_from_pool_manager() {
     let reads = ChainReads::new(Arc::new(at_pm(L - 1)));
     assert_eq!(verify_layouts(&reads, &snap, 100).await, [p.spec.pool].into_iter().collect(), "a word the book does not hold");
 }
+
+// ------------------------------------------------- R37: arms for LeanExecutor2
+
+const EXECUTOR2: Address = address!("00000000000000000000000000000000000e2e02");
+const ALPHA: Address = address!("b0b24b89db0dafbe43c5b40226b63a179f592880");
+const AXIS_A: Address = address!("e1bfc5ada1125718b53b2affc638ba9981f6070f");
+const AXIS_B: Address = address!("e381d2ec7996d9fa1a72e461fb4470db9230f37a");
+
+/// An AXIS/USDC pool: AXIS token0, with AXIS-sized balances.
+fn axis_pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32) -> PoolSnapshot {
+    let mut p = pool(addr, venue, tick, fee_ppm);
+    p.spec.token0 = AXIS;
+    p.state.balance0 = Some(U256::exp10(30));
+    p
+}
+
+fn axis_book(pools: Vec<PoolSnapshot>) -> BTreeMap<Address, Arc<PoolSnapshot>> {
+    pools.into_iter().map(|p| (p.spec.pool, Arc::new(p))).collect()
+}
+
+/// The v4 AXIS pool against a v3 one, priced 60 ticks apart: USDC cycles.
+fn v4_and_v3() -> (BTreeMap<Address, Arc<PoolSnapshot>>, Vec<frontier::Cycle>) {
+    let snap = axis_book(vec![v4_pool(-289_960), axis_pool(AXIS_A, Venue::UniswapV3, -289_900, 500)]);
+    let (_, cycles) = frontier::build_starts(ChainId(8453), &[apex_exec::lean2::USDC], &snap);
+    (snap, cycles.into_values().collect())
+}
+
+#[test]
+fn a_v4_hop_carries_its_pool_key() {
+    use apex_exec::lean2::{Hop2Kind, V4HopKey};
+    use apex_runtime::live::calls::lean2_hop;
+    let (_, cycles) = v4_and_v3();
+    let c = cycles.iter().find(|c| c.legs[0].venue == Venue::UniswapV4).unwrap();
+    let h = lean2_hop(&c.legs[0], alloy_primitives::U256::from(43u64), alloy_primitives::U256::from(42u64)).unwrap();
+    assert_eq!(h.kind, Hop2Kind::UniswapV4);
+    assert_eq!(h.v4, Some(V4HopKey { fee: 100, tick_spacing: 1, hooks: ALPHA }), "the spec's key");
+    assert_eq!((h.token_out, h.min_out), (AXIS, 42), "exact input, held to its minimum");
+    let v3 = lean2_hop(&c.legs[1], alloy_primitives::U256::from(43u64), alloy_primitives::U256::from(42u64)).unwrap();
+    assert_eq!((v3.kind, v3.pool, v3.v4), (Hop2Kind::UniswapV3Style, AXIS_A, None));
+    let mut keyless = c.legs[0].clone();
+    keyless.v4 = None;
+    assert!(lean2_hop(&keyless, alloy_primitives::U256::ZERO, alloy_primitives::U256::ZERO).is_err(), "a v4 hop without its key");
+}
+
+#[test]
+fn an_armed_v4_route_borrows_from_the_pool_manager() {
+    use apex_exec::call::CallPlan;
+    use apex_exec::lean2::{Lean2Lender, StartToken};
+    use apex_runtime::armed::plan::armed_call2;
+    let (_, cycles) = v4_and_v3();
+    let c = cycles.iter().find(|c| c.legs.iter().any(|l| l.venue == Venue::UniswapV4)).unwrap();
+    let (size, mid) = (U256::from(100_000_000u64), U256::exp10(20));
+    for asked in [Lean2Lender::Balancer, Lean2Lender::Morpho] {
+        let call = armed_call2(c, size, mid, size + U256::from(9u64), EXECUTOR2, 8453, 1_791_800_000, asked).unwrap();
+        let CallPlan::Lean2(plan) = call.plan() else { panic!("a LeanExecutor2 plan") };
+        assert_eq!((plan.lender, plan.start), (Lean2Lender::PoolManager, StartToken::Usdc), "a v4 hop runs inside PoolManager's unlock");
+        assert_eq!((call.to(), call.chain_id()), (EXECUTOR2, 8453));
+    }
+}
+
+#[test]
+fn an_armed_usdc_route_starts_and_ends_in_usdc() {
+    use apex_exec::call::CallPlan;
+    use apex_exec::lean2::{Lean2Lender, Lean2Plan, StartToken};
+    use apex_runtime::armed::plan::armed_call2;
+    use apex_runtime::live::calls::lean2_hop;
+    let snap = axis_book(vec![axis_pool(AXIS_A, Venue::UniswapV3, -289_960, 500), axis_pool(AXIS_B, Venue::Slipstream, -289_900, 400)]);
+    let (_, cycles) = frontier::build_starts(ChainId(8453), &[apex_exec::lean2::USDC], &snap);
+    let c = cycles.values().next().unwrap();
+    let (size, mid) = (U256::from(100_000_000u64), U256::exp10(20));
+    let output = size + U256::from(9u64);
+    let call = armed_call2(c, size, mid, output, EXECUTOR2, 8453, 1_791_800_000, Lean2Lender::Morpho).unwrap();
+    let (s, m) = (u256_to_alloy(size), u256_to_alloy(mid));
+    let want = Lean2Plan {
+        lender: Lean2Lender::Morpho,
+        start: StartToken::Usdc,
+        amount: 100_000_000,
+        deadline: 1_791_800_000,
+        min_profit: 1,
+        hops: vec![
+            lean2_hop(&c.legs[0], m, m).unwrap(),
+            lean2_hop(&c.legs[1], u256_to_alloy(output), s + alloy_primitives::U256::from(1)).unwrap(),
+        ],
+    };
+    assert_eq!(call.plan(), &CallPlan::Lean2(want));
+    let CallPlan::Lean2(plan) = call.plan() else { unreachable!() };
+    assert_eq!(plan.hops[1].token_out, apex_exec::lean2::USDC, "ends in what it borrowed");
+    // A WETH cycle through the same builder starts in WETH.
+    let weth = axis_book(vec![pool(UNI, Venue::UniswapV3, -197_350, 500), pool(SLIP, Venue::Slipstream, -197_300, 400)]);
+    let (_, wc) = frontier::build(ChainId(8453), WETH, &weth);
+    let call = armed_call2(wc.values().next().unwrap(), size, mid, output, EXECUTOR2, 8453, 1_791_800_000, Lean2Lender::Balancer).unwrap();
+    let CallPlan::Lean2(plan) = call.plan() else { panic!("a LeanExecutor2 plan") };
+    assert_eq!((plan.start, plan.lender), (StartToken::Weth, Lean2Lender::Balancer));
+}
+
+/// A v4 hop is exact input, as a v3 hop is: the lean quote's rules apply
+/// unchanged, and the gross is the chained quote's.
+#[test]
+fn armed_gross_quotes_a_v4_hop_as_the_executor_runs_it() {
+    use apex_runtime::armed::plan::armed_gross;
+    use apex_runtime::live::pricing::LiveCycle;
+    let (snap, cycles) = v4_and_v3();
+    let size = U256::from(100_000_000u64);
+    let (c, live) = cycles
+        .iter()
+        .filter(|c| c.legs.iter().any(|l| l.venue == Venue::UniswapV4))
+        .map(|c| (c, LiveCycle::new(c, &snap).unwrap()))
+        .find(|(_, l)| l.quote(size).unwrap().outputs[1] > size)
+        .expect("one direction pays");
+    let chained = live.quote(size).unwrap();
+    let mid = chained.outputs[0] * 99 / 100;
+    let at_mid = live.quote_fixed(size, mid).unwrap().outputs[1];
+    assert_eq!(armed_gross(c, &snap, size, mid, at_mid).unwrap(), chained.outputs[1] - size);
+    assert!(armed_gross(c, &snap, size, chained.outputs[0] + 1, at_mid).unwrap_err().contains("minimum"));
+}
