@@ -6,9 +6,10 @@
 #
 # writes dist/apex-<rev>.tar.gz (git archive of <rev>), dist/data-base.tar.gz
 # (each venue's pools.jsonl: data/ is outside git), dist/REVISION,
-# dist/LeanExecutor2.runtime.hex (R37: the code the pre-deploy shadow
-# simulates, its keccak checked against <rev>'s armed.executor2.code_hash) and
-# dist/MANIFEST.sha256, which the host checks before unpacking.
+# dist/LeanExecutor2.runtime.hex (R37, only while <rev>'s config still has
+# armed.executor2.runtime_code: the code the pre-deploy shadow simulates, its
+# keccak checked against <rev>'s code_hash) and dist/MANIFEST.sha256, which
+# the host checks before unpacking.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 rev="$(git rev-parse --verify "${1:?usage: ops/host/deploy.sh <revision>}^{commit}")"
@@ -30,8 +31,12 @@ mkdir -p dist
 rm -f dist/apex-*.tar.gz dist/data-base.tar.gz dist/MANIFEST.sha256 dist/REVISION dist/LeanExecutor2.runtime.hex
 # R37: LeanExecutor2's runtime code, which must hash to the revision's
 # armed.executor2.code_hash: the working tree's contracts must be <rev>'s.
-want="$(git show "$rev:ops/canary.base.yaml" | awk '/^  executor2:/{f=1} f && /code_hash:/{gsub(/[" ]/, "", $2); print $2; exit}')"
-if [[ -n "$want" ]]; then
+# Only before the deploy: once deployed (ARMED.md §3c) the config has no
+# runtime_code and the boot reads the chain's code. `forge inspect` builds the
+# full set, whose via_ir bytecode differs from the deployed 18-file build's.
+config="$(git show "$rev:ops/canary.base.yaml")"
+want="$(awk '/^  executor2:/{f=1} f && /code_hash:/{gsub(/[" ]/, "", $2); print $2; exit}' <<<"$config")"
+if [[ -n "$want" ]] && grep -q '^    runtime_code:' <<<"$config"; then
   forge inspect LeanExecutor2 deployedBytecode > dist/LeanExecutor2.runtime.hex
   got="$(cast keccak "$(cat dist/LeanExecutor2.runtime.hex)")"
   [[ "$got" == "$want" ]] || { echo "deploy: LeanExecutor2's runtime code hashes to $got, not $rev's code_hash $want" >&2; exit 1; }

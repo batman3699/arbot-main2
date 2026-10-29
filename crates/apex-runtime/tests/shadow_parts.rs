@@ -779,16 +779,18 @@ fn executor2_runs_only_on_its_configured_code() {
     assert!(check_executor2_hash(&empty, alloy_primitives::keccak256([])).unwrap_err().contains("no code"));
 }
 
-/// The shipped canary carries LeanExecutor2 for the pre-deploy shadow; a live
-/// run refuses its `runtime_code`: live sends go to a deployed executor.
+/// The shipped canary carries the deployed LeanExecutor2 (ARMED.md §3c): no
+/// pre-deploy `runtime_code`, so a live run may send to it; one that still
+/// carried `runtime_code` is refused.
 #[test]
-fn a_live_run_refuses_the_pre_deploy_executor2() {
+fn a_live_run_sends_to_the_deployed_executor2() {
     let path = format!("{}/../../ops/canary.base.yaml", env!("CARGO_MANIFEST_DIR"));
     let env = env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key");
     let c = ShadowConfig::load_canary(&path, &env).unwrap();
     let e = c.armed.executor2.as_ref().expect("armed.executor2");
-    assert_eq!(e.runtime_code.as_deref(), Some(std::path::Path::new("var/armed/LeanExecutor2.runtime.hex")));
-    assert_eq!(e.code_hash, alloy_primitives::b256!("b67e7dd210e440dae114d36ca40d13d65fd2150a26a71dc53c86a3af83b39c7e"), "the deploy dry run's");
+    assert_eq!(e.address, address!("443A997cF27Dac4BB32e007d4168492abC77ad6e"), "the owner's deploy, nonce 89");
+    assert_eq!(e.runtime_code, None, "deployed: the boot reads the chain's code");
+    assert_eq!(e.code_hash, alloy_primitives::b256!("b67e7dd210e440dae114d36ca40d13d65fd2150a26a71dc53c86a3af83b39c7e"), "the deployed code's");
     assert_eq!(c.armed.max_size_usdc, 12_000_000_000);
     assert_eq!(c.armed_executor(), e.address, "armed-live sends where the arms were built for");
     let shadow = ShadowConfig::load(&format!("{}/../../ops/shadow.base.yaml", env!("CARGO_MANIFEST_DIR")), &env).unwrap();
@@ -800,11 +802,13 @@ fn a_live_run_refuses_the_pre_deploy_executor2() {
     let dir = tempfile::tempdir().unwrap();
     let at = dir.path().join("canary.yaml");
     std::fs::write(&at, &live).unwrap();
+    assert!(ShadowConfig::load_canary(at.to_str().unwrap(), &env).is_ok(), "deployed: live may send to it");
+    let hash_line = "    code_hash: \"0xb67e7dd210e440dae114d36ca40d13d65fd2150a26a71dc53c86a3af83b39c7e\"\n";
+    let pre_deploy = live.replacen(hash_line, &format!("{hash_line}    runtime_code: var/armed/LeanExecutor2.runtime.hex\n"), 1);
+    assert_ne!(pre_deploy, live);
+    std::fs::write(&at, pre_deploy).unwrap();
     let refused = ShadowConfig::load_canary(at.to_str().unwrap(), &env).unwrap_err();
     assert!(matches!(&refused, ShadowConfigError::Invalid(m) if m.contains("runtime_code")), "{refused:?}");
-    let deployed: String = live.lines().filter(|l| !l.trim_start().starts_with("runtime_code:")).map(|l| format!("{l}\n")).collect();
-    std::fs::write(&at, deployed).unwrap();
-    assert!(ShadowConfig::load_canary(at.to_str().unwrap(), &env).is_ok(), "deployed: live may send to it");
     let v1_only: String = text.lines().take_while(|l| !l.trim_start().starts_with("# R37: LeanExecutor2")).map(|l| format!("{l}\n")).collect::<String>()
         + &text.lines().skip_while(|l| !l.trim_start().starts_with("max_size_usdc:")).map(|l| format!("{l}\n")).collect::<String>();
     std::fs::write(&at, v1_only).unwrap();

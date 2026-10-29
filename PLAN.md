@@ -6253,7 +6253,12 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
     - no threshold on the live gate;
     - "losses are counted as losses": wins no longer offset the day's loss budget, and a USDC landing is valued in wei at its arm's rate (`Arm::start_per_eth`).
   - At the engine's own bids (not the evaluator's 900‰), the four hours would have won 186 fires, all profitable, net $82.83.
-  - **Open:** the owner's deploy (§3a–c). The hookless AXIS pool `0x69241b…` is refused for its protocol fee (≈5% of v4 value).
+  - **The owner's deploy, 2026-10-29 (UTC)** (`ops/host/ARMED.md` §3a–c):
+    - `LeanExecutor2` is at `0x443A997cF27Dac4BB32e007d4168492abC77ad6e`, code hash `0xb67e…9c7e`, and all 16 senders are authorized on it;
+    - both configs point there, with no pre-deploy override;
+    - under via_ir the hash depends on the compile set, so the deploy builds the script's 18 files first;
+    - two spare copies are unused.
+  - **Open:** switching `armed.mode` to live, the operator's call. The hookless AXIS pool `0x69241b…` is refused for its protocol fee (≈5% of v4 value).
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
 I had this task down as "`Simulator` over `apex-sim::tier0`", on the reasoning that §20 lets a lower tier only *reject* and therefore makes Tier 0 the honest shadow simulator. **The reasoning was right and the conclusion was wrong.**

@@ -269,6 +269,7 @@ made 2026-10-29), then §3a–c.
 
 ```
 $ forge clean
+$ forge build script/DeployLeanExecutor2.s.sol
 $ forge script script/DeployLeanExecutor2.s.sol --sig "run(address,address)" 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3 0xCB436Ba3acb945b3fc8EE6345857262584356595 --rpc-url https://mainnet.base.org --sender 0x69D54e5fC0b9325D7250f0D0A11690327A3dd8A3
 $ (the same, with --broadcast --interactive)
 ```
@@ -277,9 +278,21 @@ $ (the same, with --broadcast --interactive)
   `armed.executor2.address` and `.code_hash`.
 - The script refuses another chain. It checks the roles and Morpho's USDC
   approval before anything is broadcast.
-- The dry run on 2026-10-29 simulated about 2.53M gas, roughly 0.000027 ETH,
-  and code hash `0xb67e7dd2…c7e`. A rebuilt contract changes the hash: use
-  the broadcast's own.
+- Build the script's own files first ("Compiling 18 files"). Under via_ir the
+  bytecode depends on what is compiled together:
+  - the 18 files give code hash `0xb67e…9c7e`, which the shadow simulated and
+    `forge test` ran on;
+  - `forge script` straight after `forge clean` compiles 40 files, and a full
+    build 83; both give `0x1de1…fd38`.
+- Compare the dry run's printed hash with `code_hash` before broadcasting.
+  Each broadcast deploys another copy, at the owner's next nonce.
+- Done on 2026-10-29 (UTC): `0x443A997cF27Dac4BB32e007d4168492abC77ad6e`,
+  owner nonce 89, block 53247811, code hash `0xb67e…9c7e`, 1,947,588 gas.
+  Two other copies are unused and hold nothing; on each, the trader is still an
+  executor:
+  - nonce 88, `0x29b92ef48A001a76b2E649Fe309356ABD8bf66f6`, the 40-file build
+    (`0x1de1…`);
+  - nonce 90, `0x3F594BafD57aBc31F3db084713867bEb86d751Ed`, `0xb67e…`.
 
 ### b. Authorize the 16 senders on it (the owner)
 
@@ -287,6 +300,10 @@ Set `executor` in `ops/armed-senders.json` to the new address. Then dry-run
 and broadcast `AuthorizeArmedSenders.s.sol` exactly as in §1c, and check that
 every sender reads true. The senders are the same 16, so no new keys are
 needed. They stay at 0.002 ETH each (decision 2, §3h).
+
+Done on 2026-10-29 (UTC): owner nonces 91–106, all in block 53248030,
+739,256 gas, and all 16 senders read true on `0x443A…`. They are still
+allowed on the R29 executor `0xd25B…f2c5` too (§3d).
 
 ### c. Point the runtime at it (the host)
 
