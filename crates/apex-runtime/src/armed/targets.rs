@@ -77,6 +77,21 @@ pub struct Targets {
     pub routes: Vec<TargetRoute>,
     /// Every targeted route's winners, ascending.
     pub bids_wei_per_gas: Vec<u128>,
+    /// R38: the census's contest sample, read only by [`Targets::share_sample`]
+    /// so that a malformed one never refuses the targets.
+    #[serde(default)]
+    pub contest: Option<serde_json::Value>,
+}
+
+/// R38: the contest section as the census writes it; its `report` is for
+/// people and is not read.
+#[derive(Deserialize)]
+struct Contest {
+    model_version: String,
+    scale: u64,
+    rows: Vec<(u128, u64)>,
+    effective: u64,
+    fit_ok: bool,
 }
 
 impl Targets {
@@ -131,6 +146,20 @@ impl Targets {
             .find(|r| r.pools == [weth_in, other])
             .and_then(|r| r.bids_wei_per_gas.as_deref())
             .unwrap_or(&self.bids_wei_per_gas)
+    }
+
+    /// R38: the contest sample the arms' `best_share` bids against, or why
+    /// there is none fit to use.
+    pub fn share_sample(&self) -> Result<crate::armed::bid::ShareSample, String> {
+        let raw = self.contest.as_ref().ok_or("the targets carry no contest sample")?;
+        let c = Contest::deserialize(raw).map_err(|e| format!("the contest sample does not parse: {e}"))?;
+        if c.scale != crate::armed::bid::SHARE_SCALE {
+            return Err(format!("the contest sample's scale is {}, not {}", c.scale, crate::armed::bid::SHARE_SCALE));
+        }
+        if c.rows.is_empty() {
+            return Err("the contest sample has no rows".into());
+        }
+        crate::armed::bid::ShareSample::new(c.rows, c.effective, c.fit_ok, c.model_version)
     }
 
     /// Fit to arm live: the census says so, and names a route.

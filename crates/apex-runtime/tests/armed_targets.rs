@@ -240,3 +240,33 @@ fn a_route_arms_only_its_start_token_s_cycles() {
     let c = armed.values().next().unwrap();
     assert_eq!((c.start, c.legs[0].pool, c.legs[1].pool), (USDC, UNI, SLIP));
 }
+
+/// R38: the census's contest sample rides in the targets. A malformed one is
+/// unusable, with its reason, and never refuses the targets themselves: the
+/// arms then bid `best_bid`, as before R38.
+#[test]
+fn the_contest_sample_loads_and_a_malformed_one_is_unusable() {
+    let base = targets_json("2026-10-24T01:10:00Z", true, &route(p(1), p(2), None), "1,2");
+    let with = |contest: &str| base.replacen(r#""calibration":[]"#, &format!(r#""calibration":[],"contest":{contest}"#), 1);
+    let t = load(&base, GENERATED).unwrap();
+    assert_eq!(t.share_sample().unwrap_err(), "the targets carry no contest sample");
+
+    let good = r#"{"model_version":"r38-2026-11-01","scale":1000000000,"rows":[[0,3],[5,1]],"effective":301,"fit_ok":true,"reasons":[],"report":{"any":1}}"#;
+    let s = load(&with(good), GENERATED).unwrap().share_sample().unwrap();
+    assert_eq!((s.total(), s.effective, s.fit_ok, s.model_version.as_str()), (4, 301, true, "r38-2026-11-01"));
+    let unfit = good.replace(r#""fit_ok":true,"reasons":[]"#, r#""fit_ok":false,"reasons":["calibration outside 2x"]"#);
+    let s = load(&with(&unfit), GENERATED).unwrap().share_sample().unwrap();
+    assert!(!s.fit_ok, "unfit to send on, still judged beside the sent bid");
+
+    for (bad, why) in [
+        (good.replace("1000000000", "1000000"), "scale"),
+        (good.replace("[[0,3],[5,1]]", "[[5,1],[0,3]]"), "ascending"),
+        (good.replace("[[0,3],[5,1]]", "[[0,0],[5,1]]"), "weight"),
+        (good.replace("[[0,3],[5,1]]", "[]"), "no rows"),
+        (r#"{"rows":"nope"}"#.to_string(), "contest sample"),
+    ] {
+        let t = load(&with(&bad), GENERATED).expect("a bad contest sample never refuses the targets");
+        let e = t.share_sample().unwrap_err();
+        assert!(e.contains(why), "{why}: {e}");
+    }
+}
