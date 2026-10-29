@@ -101,3 +101,41 @@ fn usdc_cycles_start_and_end_in_usdc() {
     assert!(!weth.is_empty(), "the WETH/USDC pair still makes WETH cycles");
     assert_eq!(cycles.len(), usdc.len() + weth.len());
 }
+
+/// A USDC cycle is sized in USDC's own units: its search starts at a dollar,
+/// not at 10^18 units. With the 18-decimal default its smallest size was
+/// 10^12 units, $1,000,000, over every AXIS/USDC pool's holding: no USDC
+/// route armed in the shadow (2026-10-29).
+#[test]
+fn a_usdc_cycle_is_sized_in_usdc_s_units() {
+    use apex_runtime::armed::threshold::{best_at, Pricing};
+    use apex_runtime::econ::RouteCosts;
+    use apex_runtime::live::gas;
+    use apex_runtime::live::lenders::Lenders;
+    let held = |mut p: PoolSnapshot| {
+        p.state.balance1 = Some(U256::from(50_000_000_000u64)); // $50,000 of USDC
+        p
+    };
+    let snap = book(vec![held(pool(DEEP, WETH, USDC, -197_350, 10u128.pow(17))), held(pool(THIN, WETH, USDC, -197_000, 10u128.pow(17)))]);
+    let (_, cycles) = build_starts(ChainId(8453), &[USDC], &snap);
+    let px = Pricing {
+        costs: RouteCosts { other_wei: 20_000_000_000, wei_per_gas: 5_000_000 },
+        gas: gas::LEAN,
+        lenders: Some(Lenders { balancer: U256::exp10(21), morpho: None }),
+        margin_wei: U256::zero(),
+        start_per_eth: start_per_eth(&snap),
+        rate: None,
+        usdc_lenders: Some(Lenders { balancer: U256::zero(), morpho: Some(U256::exp10(13)) }),
+        pool_manager: None,
+    };
+    let points: Vec<_> = cycles
+        .values()
+        .filter_map(|c| {
+            let pair = [Arc::clone(&snap[&c.legs[0].pool]), Arc::clone(&snap[&c.legs[1].pool])];
+            best_at(c, &pair, 0, (*pair[0]).clone(), &px.for_cycle(c)?)
+        })
+        .collect();
+    assert_eq!(points.len(), 1, "the direction across the gap pays");
+    let size = points[0].size;
+    assert!(size > U256::from(1_000_000u64) && size < U256::from(50_000_000_000u64), "{size}: between $1 and the pools' $50,000");
+}

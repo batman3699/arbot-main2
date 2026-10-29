@@ -174,13 +174,21 @@ pub struct SearchBudget {
 }
 
 impl Default for SearchBudget {
+    /// An 18-decimal input token's: [`Self::for_decimals`]`(18)`.
     fn default() -> Self {
-        Self {
-            max_evaluations: 128,
-            min_input: U256::from(1_000_000_000_000u64), // 1e-6 of an 18-decimal token
-            start: U256::from(1_000_000_000_000_000_000u64), // one 18-decimal token
-            tolerance_ppm: 1,
-        }
+        Self::for_decimals(18)
+    }
+}
+
+impl SearchBudget {
+    /// The budget for an input token of `decimals`: its smallest size a
+    /// millionth of a token (one unit below six decimals), its first size one
+    /// token. USDC's is 1 and 10^6 units; 18 decimals' 10^12 and 10^18 would
+    /// start a USDC search at $1,000,000 (R37).
+    pub fn for_decimals(decimals: u8) -> Self {
+        let unit = |e: u32| U256::from(10u64).checked_pow(U256::from(e)).unwrap_or(U256::MAX);
+        let d = u32::from(decimals);
+        Self { max_evaluations: 128, min_input: unit(d.saturating_sub(6)), start: unit(d), tolerance_ppm: 1 }
     }
 }
 

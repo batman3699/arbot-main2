@@ -172,9 +172,12 @@ fn map_of(cycle: &Cycle, pools: [Arc<PoolSnapshot>; 2]) -> BTreeMap<Address, Arc
 pub fn best_at(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, trigger: PoolSnapshot, px: &Pricing) -> Option<Point> {
     let mut pools = pair.clone();
     pools[leg] = Arc::new(trigger);
+    // R37: sized in the start token's own units (USDC's six decimals).
+    let first = &pools[0];
+    let decimals = if first.spec.token0 == cycle.start { first.decimals.0 } else { first.decimals.1 };
     let live = LiveCycle::new(cycle, &map_of(cycle, pools))?;
     let route = CostedCycle::new(live, px.costs, px.gas).lent(px.lenders).in_start(px.rate);
-    let best = best_size(&route, SearchBudget::default()).ok()?;
+    let best = best_size(&route, SearchBudget::for_decimals(decimals)).ok()?;
     let Surplus::Gain(surplus) = best.net else { return None };
     if surplus <= px.margin_wei {
         return None;
