@@ -80,6 +80,37 @@ class Fold(unittest.TestCase):
         self.assertNotEqual(V.pool_id(AXIS, USDC, 100, -1, ALPHA), V.pool_id(AXIS, USDC, 100, 1, ALPHA))
 
 
+# PositionManager.poolKeys(bytes25) for the AXIS pool, read 2026-10-29.
+AXIS_KEY_ANSWER = ("0x0000000000000000000000005be75e3b0aff5d1a042a5363ae36acb1d6d755ea"
+                   "000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+                   "0000000000000000000000000000000000000000000000000000000000000064"
+                   "0000000000000000000000000000000000000000000000000000000000000001"
+                   "000000000000000000000000b0b24b89db0dafbe43c5b40226b63a179f592880")
+
+
+class Resolve(unittest.TestCase):
+    def test_a_resolved_key_becomes_a_record_only_when_it_hashes_to_its_id(self):
+        # poolKeys is keyed by the ID's first 25 bytes: a second ID sharing
+        # them reads the AXIS key, which does not hash to it.
+        twin = AXIS_ID[:-2] + "00"
+        unknown = "0x" + "ab" * 32
+
+        def call(method, params):
+            self.assertEqual(method, "eth_call")
+            q = params[0]
+            self.assertEqual(q["to"], V.POSITION_MANAGER)
+            self.assertTrue(q["data"].startswith("0x86b6be7d") and len(q["data"]) == 10 + 64)
+            return AXIS_KEY_ANSWER if q["data"][10:60] == AXIS_ID[2:52] else "0x" + "00" * 160
+
+        records, unresolved = V.resolve(call, [AXIS_ID, twin, unknown])
+        self.assertEqual(records, [{k: v for k, v in AXIS_RECORD.items() if k != "init_block"}])
+        self.assertEqual(unresolved, [twin, unknown])
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "pools.jsonl")
+            self.assertEqual(V.fold_records(records, out), (1, 0))
+            self.assertEqual(V.fold([AXIS_LOG], out), (0, 0), "the same pool by its log: already held")
+
+
 class Sources(unittest.TestCase):
     def test_logs_files_in_any_shape_are_read(self):
         with tempfile.TemporaryDirectory() as d:

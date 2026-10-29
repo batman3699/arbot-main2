@@ -20,6 +20,9 @@ Run from scripts/data:
     python3 v4_inventory.py --out ... --scan FROM TO --rpc URL
     # Daily: from the cursor's block to the head (less a margin), then the cursor:
     python3 v4_inventory.py --out ... --follow CURSOR --rpc URL
+    # Pool IDs (one a line) resolved through PositionManager.poolKeys, each
+    # kept only when its key hashes to its ID (no init_block then):
+    python3 v4_inventory.py --out ... --resolve IDS --rpc URL
 """
 from __future__ import annotations
 
@@ -32,6 +35,10 @@ import urllib.request
 from keccak_lite import keccak256
 
 POOL_MANAGER = "0x498581ff718922c3f8e6a244956af099b2652b2b"
+# Uniswap v4's PositionManager on Base: `poolKeys(bytes25)` holds the key of
+# every pool it has minted a position in, by the ID's first 25 bytes.
+POSITION_MANAGER = "0x7c5f5a4bbd8fd63184577525326123b519429bdc"
+POOL_KEYS = "0x86b6be7d"
 INITIALIZE = "0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438"
 CHUNK = 2_000
 # Blocks behind the head a follow stops at: past any reorg Base has had.
@@ -75,24 +82,57 @@ def record_of(log: dict) -> dict | None:
             "hooks": hooks, "init_block": _quantity(log["blockNumber"])}
 
 
+def record_of_key(pool: str, answer: str) -> dict | None:
+    """The record `poolKeys` answered for `pool`, or None when it does not
+    hash to `pool`: an unknown pool's zeros, or another pool sharing its
+    first 25 bytes."""
+    data = str(answer).lower().removeprefix("0x")
+    if len(data) != 5 * 64:
+        return None
+    c0, c1 = _address(_word(data, 0)), _address(_word(data, 1))
+    fee, spacing, hooks = _word(data, 2), _signed(_word(data, 3)), _address(_word(data, 4))
+    if pool_id(c0, c1, fee, spacing, hooks) != pool.lower():
+        return None
+    return {"pool_id": pool.lower(), "currency0": c0, "currency1": c1, "fee": fee, "tick_spacing": spacing, "hooks": hooks}
+
+
+def resolve(call, ids) -> tuple[list[dict], list[str]]:
+    """Each of `ids` through PositionManager.poolKeys: (records, the IDs it
+    did not prove)."""
+    records, unresolved = [], []
+    for i in ids:
+        i = i.lower()
+        answer = call("eth_call", [{"to": POSITION_MANAGER, "data": POOL_KEYS + i[2:52] + "0" * 14}, "latest"])
+        r = record_of_key(i, answer)
+        if r is None:
+            unresolved.append(i)
+        else:
+            records.append(r)
+    return records, unresolved
+
+
 def fold(logs, out: str) -> tuple[int, int]:
     """Fold `logs` into the inventory at `out`: (records added, logs refused).
     The file is rewritten only when a record is added."""
+    return fold_records([record_of(l) for l in logs], out)
+
+
+def fold_records(records, out: str) -> tuple[int, int]:
+    """Fold `records` (None for one refused) into the inventory at `out`."""
     held: list[dict] = []
     if os.path.exists(out):
         with open(out) as f:
             held = [json.loads(l) for l in f if l.strip()]
     ids = {r["pool_id"].lower() for r in held}
     added, refused = [], 0
-    for log in logs:
-        r = record_of(log)
+    for r in records:
         if r is None:
             refused += 1
         elif r["pool_id"] not in ids:
             ids.add(r["pool_id"])
             added.append(r)
     if added:
-        added.sort(key=lambda r: (r["init_block"], r["pool_id"]))
+        added.sort(key=lambda r: (r.get("init_block", 0), r["pool_id"]))
         os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
         tmp = out + ".tmp"
         with open(tmp, "w") as f:
@@ -150,10 +190,18 @@ def main(argv=None) -> int:
     src.add_argument("--logs")
     src.add_argument("--scan", nargs=2, type=int, metavar=("FROM", "TO"))
     src.add_argument("--follow", metavar="CURSOR", help="a file holding the last block scanned")
+    src.add_argument("--resolve", metavar="IDS", help="a file of pool IDs, one a line")
     p.add_argument("--rpc")
     a = p.parse_args(argv)
-    if (a.scan or a.follow) and not a.rpc:
-        p.error("--scan and --follow need --rpc")
+    if (a.scan or a.follow or a.resolve) and not a.rpc:
+        p.error("--scan, --follow and --resolve need --rpc")
+    if a.resolve:
+        with open(a.resolve) as f:
+            ids = [l.split()[0] for l in f if l.strip()]
+        records, unresolved = resolve(rpc(a.rpc), ids)
+        added, refused = fold_records(records, a.out)
+        print(json.dumps({"ids": len(ids), "added": added, "unresolved": unresolved, "out": a.out}))
+        return 0
     if a.logs:
         logs = load_logs(a.logs)
     elif a.scan:

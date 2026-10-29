@@ -321,11 +321,17 @@ The one-time backfill is an agent step, as on 2026-10-28:
    Basescan `getLogs`, address `0x498581fF718922c3f8e6A244956aF099B2652b2b`,
    topic0 `0xdd466e674ea557f56295e2d0218a125ea4b4f0f6f3307b95f85e6110838d6438`,
    topic1 the ID. Save the answers to one file.
+   Or, for many IDs at once, resolve them through PositionManager's
+   `poolKeys` (`--resolve IDS --rpc URL`, below). Each key is kept only when
+   it hashes to its ID: `poolKeys` is keyed by the ID's first 25 bytes. Done
+   this way on 2026-10-29: the census's 313 most valuable v4 pools of 10-21 to
+   10-27, every one resolved. The 225 left out each carried under $0.19 a week.
 3. Fold them in, and start the daily cursor at the block the backfill read to:
 
 ```
 $ cd scripts/data
 $ python3 v4_inventory.py --out ../../data/base/uniswap_v4/pools.jsonl --logs /path/to/initialize-logs.json
+$ python3 v4_inventory.py --out ../../data/base/uniswap_v4/pools.jsonl --resolve /path/to/pool-ids.txt --rpc https://mainnet.base.org
 $ echo <head block> > /opt/apex/var/census/v4-inventory.cursor
 ```
 
