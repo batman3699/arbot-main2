@@ -35,6 +35,10 @@ SEED = 38
 # The share a fit is checked at: the canary's armed.max_priority_wei_per_gas.
 CAP_WEI_PER_GAS = 20_000_000_000
 U256 = 1 << 256
+# The largest share a row holds: a billion times the surplus. A bid that pays
+# takes under one surplus (10**9), so a share past this is as unreachable, and
+# the runtime parses it as a plain 64-bit JSON integer.
+SHARE_MAX = 10**18
 USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 BUCKETS = (0.0, 0.05, 0.15, 0.30, 0.60, 1.0000001)
 SEGMENTS = ((0, 8), (8, 16), (16, 24))
@@ -295,7 +299,7 @@ def fit_rows(sample: Sequence[Mapping[str, Any]], bound: str = "lower", max_rows
     sizes = Counter(f["cluster"] for f in sample)
     by_x: dict[int, int] = defaultdict(int)
     for f in sample:
-        x = 0 if (f["cls"] == "censored" and bound == "upper") else f["x"]
+        x = 0 if (f["cls"] == "censored" and bound == "upper") else min(f["x"], SHARE_MAX)
         by_x[x] += 10**6 // sizes[f["cluster"]]
     rows = sorted([x, w] for x, w in by_x.items() if w > 0)
     if len(rows) > max_rows:

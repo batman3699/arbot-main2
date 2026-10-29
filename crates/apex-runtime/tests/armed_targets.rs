@@ -255,6 +255,8 @@ fn the_contest_sample_loads_and_a_malformed_one_is_unusable() {
     let good = r#"{"model_version":"r38-2026-11-01","scale":1000000000,"rows":[[0,3],[5,1]],"effective":301,"fit_ok":true,"reasons":[],"report":{"any":1}}"#;
     let s = load(&with(good), GENERATED).unwrap().share_sample().unwrap();
     assert_eq!((s.total(), s.effective, s.fit_ok, s.model_version.as_str()), (4, 301, true, "r38-2026-11-01"));
+    let clamped = good.replace("[[0,3],[5,1]]", "[[0,3],[1000000000000000000,1]]");
+    assert_eq!(load(&with(&clamped), GENERATED).unwrap().share_sample().unwrap().total(), 4, "the census's largest share parses");
     let unfit = good.replace(r#""fit_ok":true,"reasons":[]"#, r#""fit_ok":false,"reasons":["calibration outside 2x"]"#);
     let s = load(&with(&unfit), GENERATED).unwrap().share_sample().unwrap();
     assert!(!s.fit_ok, "unfit to send on, still judged beside the sent bid");

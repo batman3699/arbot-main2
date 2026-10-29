@@ -114,6 +114,12 @@ class Fit(unittest.TestCase):
         upper, _ = C.fit_rows(sample, bound="upper")
         self.assertEqual(upper, [[0, 1_500_000], [50, 1_500_000]])
 
+    def test_a_share_no_bid_can_reach_is_clamped_to_what_the_runtime_reads(self):
+        # 10**18 ppb is a billion times the surplus; every bid that pays is under 10**9.
+        rows, _ = C.fit_rows([fire("exact", 10**25, 10**30, (1, "a")), fire("exact", 1, 5, (2, "b"))])
+        self.assertEqual(rows, [[5, 1_000_000], [C.SHARE_MAX, 1_000_000]])
+        self.assertLess(C.SHARE_MAX, 2**64, "a JSON integer the runtime parses")
+
     def test_past_the_cap_neighbours_merge_upwards_keeping_every_weight(self):
         sample = [fire("exact", i, i, (i, "c")) for i in range(1, 51)]
         rows, effective = C.fit_rows(sample, max_rows=10)
