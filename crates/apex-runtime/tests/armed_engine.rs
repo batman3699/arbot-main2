@@ -618,6 +618,8 @@ fn a_renewed_usdc_arm_keeps_its_lender() {
     for a in &usdc {
         assert_eq!((lender_of(&a.calldata), a.lender.as_str()), (1, "morpho"), "Morpho's USDC");
         assert_eq!(a.executor, Some(EXECUTOR2), "built for LeanExecutor2, and simulated against it");
+        let (num, den) = start_per_eth(&snap).unwrap();
+        assert_eq!(a.start_per_eth, Some([num.to_string(), den.to_string()]), "the rate its costs were converted at");
     }
     let later = engine.tick(&snap, 1_005, 5_000_000, &px, 12_000_000_000);
     let mut renewed = 0;

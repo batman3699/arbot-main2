@@ -31,6 +31,7 @@ fn submitting(sender: Address, nonce: u64, hash: B256, worst_case_wei: u128, at_
         worst_case_wei,
         at_ms,
         start: None,
+        start_per_eth: None,
     }
 }
 
@@ -136,6 +137,37 @@ fn the_budget_counts_realized_loss_and_reserved_exposure_together() {
     assert_eq!(state.reserved_wei, 3);
     assert!(state.admits(3, 10), "4 realized loss + 3 reserved + 3 new = 10");
     assert!(!state.admits(4, 10), "4 realized loss + 3 reserved + 4 new = 11");
+}
+
+/// The operator's decision 4 (2026-10-29): losses are counted as losses. A
+/// win gives back none of the budget a loss spent.
+#[test]
+fn a_win_does_not_offset_a_loss() {
+    let records = vec![
+        landed(addr(1), 7, tx(1), -6, OCT_24_UTC + 1),
+        landed(addr(2), 8, tx(2), 100, OCT_24_UTC + 2),
+    ];
+    let state = LiveState::from_records(&records, OCT_24_UTC + 3, 10);
+    assert_eq!((state.day_loss, state.day_net), (6, 94), "the loss stands; the net is reported apart");
+    assert!(state.admits(4, 10), "6 lost + 4 new = 10");
+    assert!(!state.admits(5, 10), "6 lost + 5 new = 11, whatever the win made");
+    let capped = [records, vec![landed(addr(3), 9, tx(3), -4, OCT_24_UTC + 4)]].concat();
+    let state = LiveState::from_records(&capped, OCT_24_UTC + 5, 10);
+    assert_eq!(state.halted, Some(Halt::LossCap { day: "2026-10-24".into() }), "6 + 4 lost reaches the budget");
+    let next_day = LiveState::from_records(&capped, OCT_25_UTC, 10);
+    assert_eq!((next_day.day_loss, next_day.halted), (0, None), "a new day starts with no loss");
+}
+
+/// An abandoned nonce's worst case is a loss like any other.
+#[test]
+fn an_abandoned_worst_case_counts_as_a_loss() {
+    let records = vec![
+        landed(addr(1), 7, tx(1), 50, OCT_24_UTC + 1),
+        LiveRecord::Abandoned { sender: addr(2), nonce: 8, worst_case_wei: 7, at_ms: OCT_24_UTC + 2 },
+    ];
+    let state = LiveState::from_records(&records, OCT_24_UTC + 3, 10);
+    assert_eq!(state.day_loss, 7);
+    assert!(state.admits(3, 10) && !state.admits(4, 10));
 }
 
 #[test]
@@ -258,6 +290,7 @@ fn all_record_variants_round_trip_and_wei_are_decimal_strings() {
             worst_case_wei: u128::MAX,
             at_ms: OCT_24_UTC,
             start: None,
+            start_per_eth: Some(["2313".into(), "1000000000000".into()]),
         },
         answered(tx(1), None, "network timeout", OCT_24_UTC + 1),
         landed(addr(1), 7, tx(1), -123, OCT_24_UTC + 2),

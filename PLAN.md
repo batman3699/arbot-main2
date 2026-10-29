@@ -6248,7 +6248,12 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
   - **Gate A″ passed 2026-10-29, by the operator's decision, on about four hours of shadow** (`ops/host/ARMED.md` §3g):
     - quote and simulation agree on 97.9% of v4 fires;
     - in the trigger's own flashblock, at 900‰ of the expected surplus as the bid, 517 of 3,261 fires would have executed, 419 at a profit, net $107.73.
-  - **Open, the operator's:** decisions 2–4 (sender float, the live gate's threshold, loss-budget netting), then the owner's deploy. The hookless AXIS pool `0x69241b…` is refused for its protocol fee (≈5% of v4 value).
+  - **Decisions 2–4, the operator's, 2026-10-29** (`ops/host/ARMED.md` §3h):
+    - sender funding "whatever necessary": 0.002 ETH a sender admits every arm that would have won, 8x over;
+    - no threshold on the live gate;
+    - "losses are counted as losses": wins no longer offset the day's loss budget, and a USDC landing is valued in wei at its arm's rate (`Arm::start_per_eth`).
+  - At the engine's own bids (not the evaluator's 900‰), the four hours would have won 186 fires, all profitable, net $82.83.
+  - **Open:** the owner's deploy (§3a–c). The hookless AXIS pool `0x69241b…` is refused for its protocol fee (≈5% of v4 value).
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
 I had this task down as "`Simulator` over `apex-sim::tier0`", on the reasoning that §20 lets a lower tier only *reject* and therefore makes Tier 0 the honest shadow simulator. **The reasoning was right and the conclusion was wrong.**

@@ -59,6 +59,7 @@ fn arm() -> Arm {
         renewals: Vec::new(),
         start: None,
         executor: None,
+        start_per_eth: None,
     }
 }
 

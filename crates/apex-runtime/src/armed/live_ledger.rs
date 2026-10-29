@@ -36,6 +36,10 @@ pub enum LiveRecord {
         /// R37: the arm's start token when not WETH. Absent: WETH.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start: Option<Address>,
+        /// Decision 4: the arm's rate (`Arm::start_per_eth`), which values a
+        /// USDC landing in wei.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_per_eth: Option<[String; 2]>,
     },
     /// `accepted = None` means the endpoint was silent: this submission may
     /// have reached the sequencer and must retain its reservation.
@@ -60,8 +64,9 @@ pub enum LiveRecord {
         #[serde(serialize_with = "dec::serialize", deserialize_with = "dec::deserialize")]
         net_wei: i128,
         at_ms: u64,
-        /// R37: a USDC trade's start token, and what it paid in it. The ETH
-        /// budget counts only its gas; `gross_wei` and `paid_wei` are then 0.
+        /// R37: a USDC trade's start token, and what it paid in it.
+        /// `gross_wei` and `paid_wei` are then 0, and `net_wei` values the USDC
+        /// paid at its arm's rate (decision 4); with no rate, at nothing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start: Option<Address>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,6 +121,8 @@ pub struct PendingTx {
     pub accepted: Option<bool>,
     /// R37: the start token when not WETH.
     pub start: Option<Address>,
+    /// Decision 4: its arm's rate, for a USDC landing's value in wei.
+    pub start_per_eth: Option<[String; 2]>,
 }
 
 /// The risk state reconstructed from the append-only live ledger.
@@ -124,6 +131,9 @@ pub struct LiveState {
     pub pending: BTreeMap<(Address, u64), Vec<PendingTx>>,
     pub day: String,
     pub day_net: i128,
+    /// Decision 4 (2026-10-29): the day's losses, which wins do not offset:
+    /// each losing landing's loss and each abandoned worst case.
+    pub day_loss: u128,
     pub reserved_wei: u128,
     pub halted: Option<Halt>,
     loss_capped: bool,
@@ -138,6 +148,7 @@ impl LiveState {
             pending: BTreeMap::new(),
             day: utc_day(now_ms),
             day_net: 0,
+            day_loss: 0,
             reserved_wei: 0,
             halted: None,
             loss_capped: false,
@@ -172,6 +183,7 @@ impl LiveState {
                 to_block,
                 worst_case_wei,
                 start,
+                start_per_eth,
                 ..
             } => {
                 let pending = self.pending.entry((*sender, *nonce)).or_default();
@@ -185,6 +197,7 @@ impl LiveState {
                         worst_case_wei: *worst_case_wei,
                         accepted: None,
                         start: *start,
+                        start_per_eth: start_per_eth.clone(),
                     });
                 }
             }
@@ -212,9 +225,12 @@ impl LiveState {
                 self.pending.remove(&(*sender, *nonce));
                 if utc_day(*at_ms) == self.day {
                     self.day_net = self.day_net.saturating_add(*net_wei);
+                    if *net_wei < 0 {
+                        self.day_loss = self.day_loss.saturating_add(net_wei.unsigned_abs());
+                    }
                     // Infer a missing Halted append after a crash between a
                     // synced Landed record and the explicit Halted record.
-                    if self.day_net < 0 && self.day_net.unsigned_abs() >= budget_wei {
+                    if self.loss_reached(budget_wei) {
                         self.loss_capped = true;
                     }
                 }
@@ -239,7 +255,8 @@ impl LiveState {
                 self.pending.remove(&(*sender, *nonce));
                 if utc_day(*at_ms) == self.day {
                     self.day_net = self.day_net.saturating_sub(i128::try_from(*worst_case_wei).unwrap_or(i128::MAX));
-                    if self.day_net < 0 && self.day_net.unsigned_abs() >= budget_wei {
+                    self.day_loss = self.day_loss.saturating_add(*worst_case_wei);
+                    if self.loss_reached(budget_wei) {
                         self.loss_capped = true;
                     }
                 }
@@ -270,6 +287,7 @@ impl LiveState {
         if day > self.day {
             self.day = day;
             self.day_net = 0;
+            self.day_loss = 0;
             self.loss_capped = false;
             self.settle();
         }
@@ -299,14 +317,16 @@ impl LiveState {
     }
 
     /// Whether another worst-case exposure can be reserved without exceeding
-    /// the daily budget. Unrealized pending exposure and realized net loss are
-    /// counted together; positive P&L cannot create more room than the cap.
+    /// the daily budget. Unrealized pending exposure and the day's realized
+    /// losses are counted together; a win gives none of it back (decision 4,
+    /// 2026-10-29: losses are counted as losses).
     pub fn admits(&self, worst_case_wei: u128, budget_wei: u128) -> bool {
-        let realized_loss = if self.day_net < 0 { self.day_net.unsigned_abs() } else { 0 };
-        realized_loss
-            .saturating_add(self.reserved_wei)
-            .saturating_add(worst_case_wei)
-            <= budget_wei
+        self.day_loss.saturating_add(self.reserved_wei).saturating_add(worst_case_wei) <= budget_wei
+    }
+
+    /// Whether the day's losses have spent its budget.
+    pub fn loss_reached(&self, budget_wei: u128) -> bool {
+        self.day_loss >= budget_wei
     }
 }
 

@@ -64,7 +64,7 @@ armed:
   band_cap_bps: 5
   liquidity_floor_bps: 9800
   max_priority_wei_per_gas: 20000000000
-  daily_loss_budget_wei: 10000000000000000   # 0.01 ETH: realized loss plus everything pending
+  daily_loss_budget_wei: 10000000000000000   # 0.01 ETH: realized losses (wins do not offset them) plus everything pending
   max_size_wei: 5000000000000000000          # 5 WETH
   l1_fee_bound_wei: 50000000000000           # 0.00005 ETH
   sender_reserve_wei: 200000000000000        # 0.0002 ETH

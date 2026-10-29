@@ -168,6 +168,7 @@ fn arm(arm_id: u64, slot: u16, bid: u128, gas_limit: u64) -> Arm {
         renewals: Vec::new(),
         start: None,
         executor: Some(EXECUTOR),
+        start_per_eth: None,
     }
 }
 
@@ -284,6 +285,7 @@ fn open_submission(sender: Address, nonce: u64, tx: B256, to_block: u64) -> Live
         worst_case_wei: 600_000_000_000,
         at_ms: NOW - 60_000,
         start: None,
+        start_per_eth: None,
     }
 }
 
@@ -933,8 +935,37 @@ async fn an_arm_built_for_another_executor_is_not_sent() {
     assert_eq!(skipped(&f.ledger), vec!["executor".to_string(), "executor".to_string()]);
 }
 
-/// R37: a USDC landing pays USDC, which the ETH loss budget does not net:
-/// only its gas counts against the day, and the USDC paid is recorded apart.
+/// Decision 4 (2026-10-29): a USDC landing is valued in wei at the rate its
+/// arm was costed at, so a USDC win is not a loss. Here the rate is 2,313 USDC
+/// an ETH: 151.259004 USDC is 65,395,159,533,073,929 wei, less 0.00035 ETH of
+/// gas.
+#[tokio::test]
+async fn a_usdc_landing_is_valued_at_its_arms_rate() {
+    let usdc: Address = USDC.parse().unwrap();
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    start(&f).await;
+    let a = Arm {
+        size_wei: "2000000000".into(),
+        start: Some(usdc),
+        start_per_eth: Some(["2313".into(), "1000000000000".into()]),
+        ..arm(1, 0, 1_000_000_000, 600_000)
+    };
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(a))], 0, NOW).await;
+    let sent = keccak256(&f.script.sent.lock().unwrap()[0].0);
+    f.chain.nonces.lock().unwrap().insert(key(1).address(), 8);
+    let landed = receipt_in(usdc, sent, true, 300_000, 1_000_000_000, 50_000_000_000_000, 151_259_004, 151_259_004);
+    f.chain.receipts.lock().unwrap().insert(sent, landed);
+    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    let landed: Vec<_> = records(&f.ledger).into_iter().filter(|r| matches!(r, LiveRecord::Landed { .. })).collect();
+    let [LiveRecord::Landed { cost_wei, net_wei, paid_start, .. }] = &landed[..] else { panic!("{landed:?}") };
+    assert_eq!(*cost_wei, 350_000_000_000_000);
+    assert_eq!(*net_wei, 65_045_159_533_073_929, "the USDC paid at the arm's rate, less the gas");
+    assert_eq!(paid_start.as_deref(), Some("151259004"));
+    assert_eq!(f.live.report(NOW + 10_000).loss_today_wei, "0", "a win is no loss");
+}
+
+/// R37: a USDC landing with no rate on record (an arm written before
+/// decision 4) counts all its gas as lost, and the USDC paid apart.
 #[tokio::test]
 async fn a_usdc_landing_counts_only_its_gas_against_the_budget() {
     let usdc: Address = USDC.parse().unwrap();

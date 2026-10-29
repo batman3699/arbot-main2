@@ -262,8 +262,8 @@ executor keeps only the halted reactive lane.
 
 Nothing here happens before gate A″ passes and the operator approves the
 deploy (the spec's phase 5). The order: the v4 inventory (§3e) and the
-pre-deploy shadow (§3f), gate A″ (§3g), the operator's decisions 2–4, then
-§3a–c.
+pre-deploy shadow (§3f), gate A″ (§3g), the operator's decisions 2–4 (§3h,
+made 2026-10-29), then §3a–c.
 
 ### a. Deploy (the owner)
 
@@ -286,7 +286,7 @@ $ (the same, with --broadcast --interactive)
 Set `executor` in `ops/armed-senders.json` to the new address. Then dry-run
 and broadcast `AuthorizeArmedSenders.s.sol` exactly as in §1c, and check that
 every sender reads true. The senders are the same 16, so no new keys are
-needed. Funding them past 0.002 ETH is the operator's decision 2.
+needed. They stay at 0.002 ETH each (decision 2, §3h).
 
 ### c. Point the runtime at it (the host)
 
@@ -403,6 +403,44 @@ verdicts through 08:30 UTC.
   - A won fire whose simulation fails would be included and revert: 9 at
     900‰ (a hop short of its minimum).
 
-The operator's decisions 2–4 come next: sender funding, the live gate's
-threshold, and loss-budget netting. A USDC landing currently counts only its
-gas against the ETH budget. After them, §3a–c.
+The operator's decisions 2–4 followed the same day (§3h). Then §3a–c.
+
+### h. The operator's decisions 2–4, 2026-10-29
+
+1. **Decision 2, sender funding: "whatever necessary".** The float stays at
+   0.002 ETH a sender, because that is what the shadow shows is necessary:
+   - from 04:33 to 08:36 UTC, every arm that would have won at its own bid
+     had a worst case of at most 0.00026 ETH;
+   - so 0.002 ETH admits all of them, with about 8x to spare;
+   - the arms that need more (bids up to 10 gwei on gas limits up to 3.1M,
+     worst cases up to 0.0256 ETH) never won;
+   - the 186 wins spent 0.00055 ETH in gas and tips between them.
+
+   Refill with `FundArmedSenders.s.sol` when the report's `days_left` runs
+   low. Raise the float only if a measured winner needs it: the script's
+   `MOST` (0.01 ETH) and the 0.01 ETH loss budget would both have to rise.
+
+2. **Decision 3, the live gate's threshold: none.** Gate A″ was the last
+   gate. The owner's deploy (§3a–c) and the pilot under R36's caps come next.
+
+3. **Decision 4, the daily loss budget: "losses are counted as losses".**
+   - A win gives back none of the budget a loss spent. The day's loss is each
+     losing landing's loss plus each abandoned worst case. `LiveState::admits`
+     counts it with everything pending, and reaching the budget halts the
+     lane until the next UTC day.
+   - A USDC landing's net values the USDC paid, in wei, at the rate its arm
+     was costed at (`Arm::start_per_eth`). A USDC win is therefore no loss.
+     A landing with no rate on record counts all its gas as lost.
+   - The report shows both: `loss_today_wei` (what the budget counts) and
+     `net_today_wei`.
+
+What the pilot's own bids would have made: the engine bids
+`best_bid` against the route's measured winners (median 0.005 gwei a gas),
+not the evaluator's 900‰ of the expected surplus. Over the same four hours,
+at its own bid:
+- 186 fires would have landed first (178 through v4), all profitable, net
+  $82.83;
+- 131 of those won by position, the rival landing in a later flashblock, and
+  55 by bid;
+- that is against 570 wins and $117.29 at 900‰, whose wins include 107 at a
+  loss.

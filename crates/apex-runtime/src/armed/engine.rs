@@ -519,6 +519,7 @@ impl Engine {
             renewals: Vec::new(),
             start: (c.start != crate::live::frontier::WETH).then_some(c.start),
             executor: Some(self.settings.executor2.unwrap_or(self.settings.executor)),
+            start_per_eth: px.rate.map(|(num, den)| [num.to_string(), den.to_string()]),
         })
     }
 

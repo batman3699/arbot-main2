@@ -95,6 +95,11 @@ pub struct Arm {
     /// to. Absent from lines written before R37: the configured v1 executor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<alloy_primitives::Address>,
+    /// Decision 4 (2026-10-29): a USDC arm's rate, the book's USDC units a
+    /// wei as `[num, den]` in decimal, which its costs were converted at and
+    /// its landing is valued at. Absent for WETH, and before decision 4.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_per_eth: Option<[String; 2]>,
 }
 
 fn balancer() -> String {

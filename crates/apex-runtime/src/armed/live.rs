@@ -208,6 +208,8 @@ pub struct LiveReport {
     pub gross_wei: String,
     pub cost_wei: String,
     pub net_today_wei: String,
+    /// Decision 4: the day's losses, which the budget counts.
+    pub loss_today_wei: String,
     pub reserved_wei: String,
     pub budget_wei: String,
     pub halted: Option<String>,
@@ -247,6 +249,8 @@ struct Readable {
     size: U256,
     /// R37: the start token when not WETH.
     start: Option<Address>,
+    /// Decision 4: its rate, carried to the landing.
+    start_per_eth: Option<[String; 2]>,
     bid: u128,
     data: Vec<u8>,
 }
@@ -402,6 +406,7 @@ impl ArmedLive {
             gross_wei: c.gross_wei.to_string(),
             cost_wei: c.cost_wei.to_string(),
             net_today_wei: inner.state.day_net.to_string(),
+            loss_today_wei: inner.state.day_loss.to_string(),
             reserved_wei: inner.state.reserved_wei.to_string(),
             budget_wei: self.policy.budget_wei.to_string(),
             halted: inner.state.halted.as_ref().map(|h| match h {
@@ -568,6 +573,7 @@ impl ArmedLive {
                 worst_case_wei: worst,
                 at_ms: now_ms,
                 start: read.start,
+                start_per_eth: read.start_per_eth.clone(),
             };
             if let Err(e) = self.ledger.append(&submitting) {
                 error!(error = %e, arm = arm.arm_id, "armed live: the submission could not be recorded, so it was not sent");
@@ -714,7 +720,8 @@ impl ArmedLive {
     /// Account a landing from its receipt, and halt the day if it spent the
     /// budget. False when the receipt does not read.
     fn land(&self, sender: Address, nonce: u64, sent: &PendingTx, receipt: &Value, now_ms: u64) -> bool {
-        // R37: a USDC trade pays USDC; the ETH budget nets only its gas.
+        // R37: a USDC trade pays USDC, valued in wei at its arm's rate
+        // (decision 4); with no rate on record, at nothing.
         let token = sent.start.unwrap_or(WETH);
         let read = match read_receipt(receipt, token, self.executor, &[self.recipient]) {
             Ok(read) => read,
@@ -727,7 +734,8 @@ impl ArmedLive {
         let cost = u128::from(r.gas_used).saturating_mul(r.effective_gas_price_wei).saturating_add(r.l1_fee_wei);
         let in_weth = token == WETH;
         let paid_wei = if in_weth { read.paid_wei } else { 0 };
-        let net = i128::try_from(paid_wei).unwrap_or(i128::MAX).saturating_sub(i128::try_from(cost).unwrap_or(i128::MAX));
+        let valued = if in_weth { paid_wei } else { sent.start_per_eth.as_ref().and_then(|r| in_wei(read.paid_wei, r)).unwrap_or(0) };
+        let net = i128::try_from(valued).unwrap_or(i128::MAX).saturating_sub(i128::try_from(cost).unwrap_or(i128::MAX));
         info!(%sender, nonce, tx = %sent.tx, success = r.success, net_wei = net, "armed live: landed");
         let landed = LiveRecord::Landed {
             arm_id: sent.arm_id,
@@ -744,12 +752,12 @@ impl ArmedLive {
             paid_start: (!in_weth).then(|| read.paid_wei.to_string()),
         };
         self.record(landed, now_ms);
-        let (day, day_net) = {
+        let (day, day_loss, reached) = {
             let inner = self.inner();
-            (inner.state.day.clone(), inner.state.day_net)
+            (inner.state.day.clone(), inner.state.day_loss, inner.state.loss_reached(self.policy.budget_wei))
         };
-        if day_net < 0 && day_net.unsigned_abs() >= self.policy.budget_wei {
-            error!(%day, day_net, budget_wei = self.policy.budget_wei, "armed live: the day's loss reached its budget; nothing more is sent today");
+        if reached {
+            error!(%day, day_loss, budget_wei = self.policy.budget_wei, "armed live: the day's losses reached its budget; nothing more is sent today");
             self.record(LiveRecord::Halted { reason: Halt::LossCap { day }, at_ms: now_ms }, now_ms);
         }
         true
@@ -828,11 +836,20 @@ impl ArmedLive {
     }
 }
 
+/// `units` of a start token in wei at `[num, den]`, the start token's units a
+/// wei (rounded down); None for a rate that does not read.
+fn in_wei(units: u128, [num, den]: &[String; 2]) -> Option<u128> {
+    let rate = (U256::from_dec_str(num).ok()?, U256::from_dec_str(den).ok()?);
+    let wei = super::threshold::to_wei(U256::from(units), rate);
+    Some(if wei > U256::from(u128::MAX) { u128::MAX } else { wei.as_u128() })
+}
+
 fn readable(arm: &Arm) -> Option<Readable> {
     Some(Readable {
         pools: [arm.pools[0].parse().ok()?, arm.pools[1].parse().ok()?],
         size: U256::from_dec_str(&arm.size_wei).ok()?,
         start: arm.start,
+        start_per_eth: arm.start_per_eth.clone(),
         bid: arm.bid_wei_per_gas.parse().ok()?,
         data: alloy_primitives::hex::decode(&arm.calldata).ok()?,
     })
