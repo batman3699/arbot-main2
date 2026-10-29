@@ -189,6 +189,21 @@ The same revision restarted is the same run. A new revision starts a new
 fourteen-day clock: archive `/opt/apex/var/apex` first
 (`systemctl stop apex-shadow && mv /opt/apex/var/apex /opt/apex/var/run-<n> && install -d -o apex -g apex /opt/apex/var/apex`).
 
+Then link the last eight complete days' flashblock ledgers back. Hard links
+use no space, and the archive keeps its copies.
+
+```
+# for f in $(ls /opt/apex/var/run-<n>/flashblocks-*.jsonl | sort | tail -9 | head -8); do ln "$f" /opt/apex/var/apex/; done
+```
+
+- The daily census (`apex-targets`) counts a cached race day as current only
+  while that day's ledger is in `var/apex`.
+- Without them it recomputes every day from block timestamps, and stops at the
+  first public endpoint with pruned history (2026-10-29: "pruned history
+  unavailable", no targets written).
+- The archive day's own ledger stays split: the new run writes from the
+  restart on, so that census day misses the hours before it.
+
 ## 8. The contest analysis
 
 On the host, with only the BlockPI key in the analyzer's environment:
