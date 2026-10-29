@@ -4,6 +4,7 @@ The key is read from .env and never printed: the client's repr hides the
 endpoint, and transport errors are reported by type, never with the URL.
 Requests are rate-limited because the shadow shares the endpoint.
 """
+import http.client
 import json
 import threading
 import time
@@ -52,7 +53,8 @@ class Rpc:
             try:
                 with urllib.request.urlopen(req, timeout=90) as r:
                     return json.loads(r.read())
-            except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as e:
+            # http.client's own (IncompleteRead: a body cut short) as well.
+            except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException, json.JSONDecodeError) as e:
                 if attempt == 3:
                     raise RpcError(f"transport failed: {type(e).__name__}") from None
                 time.sleep(2 ** attempt)
