@@ -167,7 +167,7 @@ fn arm(arm_id: u64, slot: u16, bid: u128, gas_limit: u64) -> Arm {
         p_win: 0.5,
         renewals: Vec::new(),
         start: None,
-        executor: None,
+        executor: Some(EXECUTOR),
     }
 }
 
@@ -918,6 +918,19 @@ async fn a_usdc_arm_over_the_usdc_size_cap_is_skipped() {
     let under = Arm { size_wei: "12000000000".into(), start: Some(USDC.parse().unwrap()), ..arm(2, 0, 1_000_000, 600_000) };
     f.live.on_lines(&[ArmedLine::Arm(Box::new(under))], 0, NOW).await;
     assert_eq!(f.script.sent.lock().unwrap().len(), 1, "at the cap: sent");
+}
+
+/// R37: an arm is sent only to the executor it was built for: LeanExecutor2's
+/// calldata at v1 (or v1's at LeanExecutor2) would revert, paying its gas.
+#[tokio::test]
+async fn an_arm_built_for_another_executor_is_not_sent() {
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    start(&f).await;
+    let other = Arm { executor: Some(Address::repeat_byte(0xe2)), ..arm(1, 0, 1_000_000, 600_000) };
+    let unnamed = Arm { executor: None, ..arm(2, 1, 1_000_000, 600_000) };
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(other)), ArmedLine::Arm(Box::new(unnamed))], 0, NOW).await;
+    assert!(f.script.sent.lock().unwrap().is_empty());
+    assert_eq!(skipped(&f.ledger), vec!["executor".to_string(), "executor".to_string()]);
 }
 
 /// R37: a USDC landing pays USDC, which the ETH loss budget does not net:

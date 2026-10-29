@@ -1010,7 +1010,9 @@ async fn boot_armed_live(
         )));
     }
     let senders: Vec<Address> = keys.iter().map(LaneKey::address).collect();
-    crate::armed::live_chain::check_executors(&**rpc, config.executor.address, &senders).await.map_err(ShadowError::Boot)?;
+    // R37: the executor every arm is built for: LeanExecutor2 when it is set.
+    let executor = config.armed_executor();
+    crate::armed::live_chain::check_executors(&**rpc, executor, &senders).await.map_err(ShadowError::Boot)?;
     // The daily restart compacts a long ledger first: the boot replays all of
     // it, and renewals add ~200 records a minute.
     match crate::armed::live_ledger::LiveLedger::compact_file(&live.ledger, now_ms(), a.daily_loss_budget_wei, ARMED_LEDGER_COMPACT_ABOVE) {
@@ -1034,7 +1036,7 @@ async fn boot_armed_live(
         kill_file: live.kill_file.clone(),
     };
     let chain = Arc::new(crate::armed::live_chain::RpcChain::new(Arc::clone(rpc)));
-    let worker = ArmedLive::new(keys, chain, Arc::new(submit), ledger, records, policy, config.executor.address, recipient, config.chain_id);
+    let worker = ArmedLive::new(keys, chain, Arc::new(submit), ledger, records, policy, executor, recipient, config.chain_id);
     worker.begin(now_ms()).await.map_err(|e| ShadowError::Boot(format!("armed-live: {e}")))?;
     info!(ready = worker.ready(), halted = ?worker.state(now_ms()).halted, "armed-live's ledger is read");
     Ok(worker)

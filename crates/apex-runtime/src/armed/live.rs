@@ -495,6 +495,11 @@ impl ArmedLive {
         if !allowed.get(usize::from(arm.sender_slot)).copied().unwrap_or(false) {
             return self.skip(arm, sender, "revoked", now_ms);
         }
+        // R37: only to the executor it was built for: another's calldata
+        // reverts there, and pays its gas.
+        if arm.executor != Some(self.executor) {
+            return self.skip(arm, sender, "executor", now_ms);
+        }
         let Some(read) = readable(arm) else {
             return self.skip(arm, sender, "unreadable", now_ms);
         };

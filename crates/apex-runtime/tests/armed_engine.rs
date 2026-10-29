@@ -165,7 +165,7 @@ fn the_engine_arms_its_best_slots_and_renews_them() {
         assert!(a.predicates.iter().any(|p| matches!(p, Predicate::BlockNumber { .. })));
         assert!(a.calldata.starts_with("0x") && a.calldata.len() > 10);
         assert!(a.sender_slot < 4);
-        assert_eq!(a.executor, None, "no LeanExecutor2: built for v1");
+        assert_eq!(a.executor, Some(EXECUTOR), "no LeanExecutor2: built for v1, and named");
         assert_eq!(a.start_words.len(), 4, "price and liquidity of both pools");
         // The fire lies past the threshold the ceiling was priced at (fires
         // used up to 7.4% over it), and execution runs to 1.25x the net gas

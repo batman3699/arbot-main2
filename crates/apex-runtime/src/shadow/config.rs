@@ -453,6 +453,12 @@ fn invalid(detail: impl Into<String>) -> ShadowConfigError {
 }
 
 impl ShadowConfig {
+    /// R37: the executor the arming engine builds for, and armed-live sends
+    /// to: `LeanExecutor2` when `armed.executor2` is set, else v1.
+    pub fn armed_executor(&self) -> Address {
+        self.armed.executor2.as_ref().map_or(self.executor.address, |e| e.address)
+    }
+
     pub fn load(path: &str, env: &Env) -> Result<Self, ShadowConfigError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| ShadowConfigError::Io { path: path.to_string(), detail: e.to_string() })?;

@@ -588,3 +588,21 @@ async fn get_logs_reads_pool_manager_by_v4_pool_id() {
     get_logs(&none, &pools, &[], 1_000, 1_001).await.unwrap();
     assert_eq!(none.0.lock().unwrap().len(), 1, "no v4 pool, no PoolManager query");
 }
+
+/// R37: a USDC arm's surplus is USDC units; the evaluator sweeps its bids
+/// per gas on that surplus in wei, at the run's WETH price, as the engine bid
+/// on it converted.
+#[test]
+fn a_usdc_fire_s_bids_are_swept_on_its_surplus_in_wei() {
+    use apex_runtime::armed::lines::Arm;
+    use apex_runtime::armed::run::surplus_in_wei;
+    let text = r#"{"arm_id":7,"at_ns":0,"armed_block":100,"to_block":110,"route_hash":"0xr","trigger_leg":0,"rung":1,"step":3,
+        "pools":["0xaa","0xbb"],"venues":["UniswapV4","UniswapV3"],"predicates":[],"start_words":[],"start_ticks":[],
+        "size_wei":"1","mid":"1","output_wei":"2","surplus_wei":"2500000","cost_wei":"0","gas_expected":1,"gas_limit":900000,
+        "base_fee_wei":"5000000","other_wei":"0","deadline":11,"calldata":"0x","calldata_hash":"0x","sender_slot":0}"#;
+    let weth: Arm = serde_json::from_str(text).unwrap();
+    assert_eq!(surplus_in_wei(&weth, 2_500.0), U256::from(2_500_000u64), "a WETH arm's surplus is wei");
+    let usdc = Arm { start: Some(address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")), ..weth };
+    assert_eq!(surplus_in_wei(&usdc, 2_500.0), U256::exp10(15), "$2.50 at $2,500 an ETH");
+    assert_eq!(surplus_in_wei(&usdc, 0.0), U256::zero(), "no price: no bid");
+}

@@ -235,6 +235,16 @@ pub struct Verdict {
     pub gross_usd: Option<f64>,
 }
 
+/// The arm's surplus in wei, which its bids per gas are swept on: a USDC
+/// arm's USDC units at the run's WETH price (R37), and nothing without one.
+pub fn surplus_in_wei(arm: &Arm, weth_usd: f64) -> U256 {
+    let surplus = U256::from_dec_str(&arm.surplus_wei).unwrap_or_default();
+    match arm.start {
+        None => surplus,
+        Some(_) => fire_gross(arm.start, surplus, weth_usd).wei.unwrap_or_default(),
+    }
+}
+
 /// A fire's gross, in its start token's units, in wei, and in USD (R37).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FireGross {
@@ -469,7 +479,7 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, rep
         v.rival_priority_wei = Some(rival_bid.to_string());
         rival_at = Some((r.block, if granular { r_fb.unwrap_or(0) } else { 0 }));
     }
-    let surplus = U256::from_dec_str(&arm.surplus_wei).unwrap_or_default();
+    let surplus = surplus_in_wei(arm, ctx.weth_usd);
     let gross = v.gross_wei.as_deref().and_then(|g| U256::from_dec_str(g).ok());
     let other: u128 = arm.other_wei.parse().unwrap_or(0);
     for f in F_PERMILLE {
