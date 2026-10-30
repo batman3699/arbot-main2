@@ -82,6 +82,8 @@ fn setup_with(max_arms: usize, reprice_budget: usize, rungs: u8) -> (Engine, BTr
         reprice_for: Duration::MAX,
         workers: 1,
         max_priority_wei_per_gas: 20_000_000_000,
+        max_size_wei: u128::MAX,
+        max_size_usdc: u128::MAX,
     };
     (Engine::new(cycles, settings, BTreeSet::new()), snap)
 }
@@ -113,6 +115,8 @@ fn setup_three(reprice_budget: usize, reprice_for: Duration, workers: usize) -> 
         reprice_for,
         workers,
         max_priority_wei_per_gas: 20_000_000_000,
+        max_size_wei: u128::MAX,
+        max_size_usdc: u128::MAX,
     };
     (Engine::new(cycles, settings, BTreeSet::new()), snap)
 }
@@ -222,7 +226,7 @@ fn an_unarmable_pool_arms_nothing() {
     let settings = EngineSettings {
         max_arms: 4, rungs: 3, window_s: 10, block_time_ms: 2_000, band_cap_bps: 5,
         liquidity_floor_bps: 9_800, executor: EXECUTOR, executor2: None, chain_id: 8453, reprice_budget: REPRICE_BUDGET,
-        reprice_for: Duration::MAX, workers: 1, max_priority_wei_per_gas: 20_000_000_000,
+        reprice_for: Duration::MAX, workers: 1, max_priority_wei_per_gas: 20_000_000_000, max_size_wei: u128::MAX, max_size_usdc: u128::MAX,
     };
     let engine = Engine::new(cycles, settings, [SLIP].into_iter().collect());
     assert!(engine.tick(&snap, 1_000, 5_000_000, &px(), 1).is_empty());
@@ -510,6 +514,8 @@ fn an_arm_closing_on_aerodrome_asks_for_its_output() {
         reprice_for: Duration::MAX,
         workers: 1,
         max_priority_wei_per_gas: 20_000_000_000,
+        max_size_wei: u128::MAX,
+        max_size_usdc: u128::MAX,
     };
     let engine = Engine::new(cycles, settings, BTreeSet::new());
     let arms: Vec<Arm> = engine
@@ -604,6 +610,8 @@ fn a_renewed_usdc_arm_keeps_its_lender() {
         reprice_for: Duration::MAX,
         workers: 1,
         max_priority_wei_per_gas: 20_000_000_000,
+        max_size_wei: u128::MAX,
+        max_size_usdc: u128::MAX,
     };
     let engine = Engine::new(cycles, settings, BTreeSet::new());
     let px = Pricing {
@@ -632,4 +640,97 @@ fn a_renewed_usdc_arm_keeps_its_lender() {
         }
     }
     assert_eq!(renewed, usdc.len());
+}
+
+/// R39: the arms of UNI, SLIP and CAKE's cycles from `starts`, six rungs
+/// each, under the live worker's size caps, in the order they were armed.
+/// Built for LeanExecutor2, so a USDC cycle arms too.
+fn capped(max_arms: usize, max_size_wei: u128, max_size_usdc: u128, starts: &[Address]) -> Vec<Arm> {
+    use apex_runtime::armed::threshold::start_per_eth;
+    use apex_runtime::live::lenders::Lenders;
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> = [
+        (UNI, pool(UNI, Venue::UniswapV3, -197_350, 500)),
+        (SLIP, pool(SLIP, Venue::Slipstream, -197_350, 400)),
+        (CAKE, pool(CAKE, Venue::PancakeV3, -197_350, 100)),
+    ]
+    .into_iter()
+    .map(|(a, p)| (a, Arc::new(p)))
+    .collect();
+    let (_, cycles) = frontier::build_starts(ChainId(8453), starts, &snap);
+    let settings = EngineSettings {
+        max_arms,
+        rungs: 6,
+        window_s: 10,
+        block_time_ms: 2_000,
+        band_cap_bps: 5,
+        liquidity_floor_bps: 9_800,
+        executor: EXECUTOR,
+        executor2: Some(EXECUTOR2),
+        chain_id: 8453,
+        reprice_budget: REPRICE_BUDGET,
+        reprice_for: Duration::MAX,
+        workers: 1,
+        max_priority_wei_per_gas: 20_000_000_000,
+        max_size_wei,
+        max_size_usdc,
+    };
+    let px = Pricing {
+        start_per_eth: start_per_eth(&snap),
+        usdc_lenders: Some(Lenders { balancer: U256::zero(), morpho: Some(U256::from(10u128.pow(13))) }),
+        ..px()
+    };
+    let mut arms: Vec<Arm> = Engine::new(cycles, settings, BTreeSet::new())
+        .tick(&snap, 1_000, 5_000_000, &px, 1)
+        .into_iter()
+        .filter_map(|l| if let ArmedLine::Arm(a) = l { Some(*a) } else { None })
+        .collect();
+    arms.sort_by_key(|a| a.arm_id);
+    arms
+}
+
+fn size_of(a: &Arm) -> u128 {
+    a.size_wei.parse().unwrap()
+}
+
+fn rung_of(a: &Arm) -> (String, u8, u8) {
+    (a.route_hash.clone(), a.trigger_leg, a.rung)
+}
+
+/// R39: the live worker refuses an arm over its start token's size cap, so
+/// the engine ranks no such rung: every rung at or under the cap is armed,
+/// and none over it.
+#[test]
+fn a_rung_over_the_size_cap_is_not_armed() {
+    let all = capped(256, u128::MAX, u128::MAX, &[WETH]);
+    let mut sizes: Vec<u128> = all.iter().map(size_of).collect();
+    sizes.sort_unstable();
+    let cap = sizes[sizes.len() / 2];
+    assert!(cap < sizes[sizes.len() - 1], "the test needs rungs either side of the cap: {sizes:?}");
+    let under: BTreeSet<_> = all.iter().filter(|a| size_of(a) <= cap).map(rung_of).collect();
+    let armed: BTreeSet<_> = capped(256, cap, u128::MAX, &[WETH]).iter().map(rung_of).collect();
+    assert_eq!(armed, under);
+}
+
+/// R39: no sender is left to an arm the worker would refuse. With four, the
+/// best four rungs under the cap take them, though a rung that took one
+/// uncapped is over it. Arms are numbered in rank order.
+#[test]
+fn the_senders_go_to_the_best_rungs_under_the_cap() {
+    let top = capped(4, u128::MAX, u128::MAX, &[WETH]);
+    let cap = top.iter().map(size_of).max().unwrap() - 1;
+    let ranked = capped(256, u128::MAX, u128::MAX, &[WETH]);
+    let best_under: Vec<_> = ranked.iter().filter(|a| size_of(a) <= cap).take(4).map(rung_of).collect();
+    assert_eq!(best_under.len(), 4, "the test needs four rungs under the cap");
+    let armed: Vec<_> = capped(4, cap, u128::MAX, &[WETH]).iter().map(rung_of).collect();
+    assert_eq!(armed, best_under);
+}
+
+/// R39: each cycle is held to its start token's cap, as the worker holds its
+/// arms: USDC's units for a USDC cycle, wei for a WETH one.
+#[test]
+fn each_start_token_has_its_own_cap() {
+    let starts = |arms: Vec<Arm>| arms.iter().map(|a| a.start).collect::<BTreeSet<_>>();
+    assert_eq!(starts(capped(256, u128::MAX, u128::MAX, &[WETH, USDC])), BTreeSet::from([None, Some(USDC)]));
+    assert_eq!(starts(capped(256, u128::MAX, 1, &[WETH, USDC])), BTreeSet::from([None]));
+    assert_eq!(starts(capped(256, 1, u128::MAX, &[WETH, USDC])), BTreeSet::from([Some(USDC)]));
 }

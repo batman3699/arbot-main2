@@ -140,6 +140,8 @@ fn settings(max_priority_wei_per_gas: u128) -> EngineSettings {
         reprice_for: Duration::MAX,
         workers: 1,
         max_priority_wei_per_gas,
+        max_size_wei: u128::MAX,
+        max_size_usdc: u128::MAX,
     }
 }
 
@@ -192,6 +194,8 @@ fn every_arm_carries_its_bid() {
         reprice_for: Duration::MAX,
         workers: 1,
         max_priority_wei_per_gas: 20_000_000,
+        max_size_wei: u128::MAX,
+        max_size_usdc: u128::MAX,
     };
     let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _| BIDS.to_vec()));
     let arms: Vec<_> = engine
@@ -228,6 +232,8 @@ fn a_rung_that_outbids_no_one_takes_no_sender() {
         reprice_for: Duration::MAX,
         workers: 1,
         max_priority_wei_per_gas: u128::MAX,
+        max_size_wei: u128::MAX,
+        max_size_usdc: u128::MAX,
     };
     // Winners who paid a whole ETH per gas: no surplus here outbids them.
     let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _| vec![10u128.pow(18)]));

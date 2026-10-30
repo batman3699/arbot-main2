@@ -77,12 +77,24 @@ pub struct EngineSettings {
     pub workers: usize,
     /// R36: the most an arm bids, in wei per gas over the base fee.
     pub max_priority_wei_per_gas: u128,
+    /// R39: the live worker's size caps, `armed.max_size_wei` for a WETH
+    /// cycle and `armed.max_size_usdc` for a USDC one, in the start token's
+    /// units. The worker refuses an arm over its cap, so a rung over it is
+    /// not ranked and takes no sender.
+    pub max_size_wei: u128,
+    pub max_size_usdc: u128,
 }
 
 impl EngineSettings {
     /// An arm's window in blocks: `window_s` at `block_time_ms`, rounded up.
     pub fn window_blocks(&self) -> u64 {
         (self.window_s * 1_000).div_ceil(self.block_time_ms.max(1)).max(1)
+    }
+
+    /// R39: the size cap of a cycle starting in `start`, as the live worker
+    /// holds its arm: USDC's for a USDC cycle, WETH's otherwise.
+    pub fn max_size(&self, start: Address) -> U256 {
+        U256::from(if start == apex_exec::lean2::USDC { self.max_size_usdc } else { self.max_size_wei })
     }
 }
 
@@ -339,6 +351,11 @@ impl Engine {
                 // orders the arms, as in R26, and excludes none.
                 // R37: ranked in wei, whatever the cycle's start token.
                 let Some(pxc) = px.for_cycle(c) else { continue };
+                // R39: a rung the live worker would refuse for its size is
+                // not ranked, so its sender goes to one it would send.
+                if b.point.size > s.max_size(c.start) {
+                    continue;
+                }
                 if bid.sent.p_win > 0.0 {
                     ranked.push((rank_value(p, &bid.sent, pxc.in_wei(b.point.surplus), b.point.gas.expected.0), (*id, *leg, r.index)));
                 }

@@ -730,6 +730,8 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
             reprice_for: crate::armed::engine::REPRICE_FOR,
             workers: crate::armed::engine::workers(),
             max_priority_wei_per_gas: config.armed.max_priority_wei_per_gas,
+            max_size_wei: config.armed.max_size_wei,
+            max_size_usdc: config.armed.max_size_usdc,
     };
     let window_blocks = engine_settings.window_blocks();
     // R38: the census's contest sample, which `best_share` bids against and

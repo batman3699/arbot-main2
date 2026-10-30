@@ -6262,6 +6262,10 @@ Measured against the code on 2026-09-30, not estimated from the port table. **`m
   - **First live landings, 2026-10-29:** arms 2374 and 4482, AXIS/USDC through v4, each in its trigger's own flashblock (index 77 after 76; 15 after 3), net +3.1e12 and +4.1e12 wei.
   - **Correction: wins "by position" were mostly flashblock ends.** A trigger that closes its flashblock is contested in the next one, by fee (live arm 3114). Re-judged, 04:33–18:56 UTC's own-bid wins fall from 245 ($84.28) to 113 ($6.31). armed-eval now judges that, recognises our own landings, and judges each arm's own bid (`ops/host/ARMED.md` §3h).
   - **Open:** the hookless AXIS pool `0x69241b…` is refused for its protocol fee (≈5% of v4 value). The bid model measures the wrong contest: R38 draft (`docs/superpowers/specs/2026-10-29-armed-bid-from-own-fires-design.md`), for the operator's review.
+- [ ] **R39 — the engine ranks only arms the live worker would send (code; the deploy is the operator's)**
+  - **Found 2026-10-30:** the engine filled its 16 senders by expected value without the size caps, and the worker then refused the arms over them. Since the live switch, 11,404 of about 37,000 send decisions were `skipped.size` (30%), each leaving its sender idle for its window. Over 5 WETH, 3 of 10-29's 21,626 arms fired ($11.25 gross, before the switch) and none since.
+  - The engine ranks no rung over its start token's cap (`armed.max_size_wei`, `armed.max_size_usdc`), so its sender goes to the best rung that can be sent. The worker keeps its own check.
+  - **Cost:** the evaluator judges only what is armed, so over-cap rungs are no longer measured; raising the cap is judged from the census, or from a shadow run at a higher cap.
 #### Correction: Tier 0 is a screen, and it cannot satisfy the `Simulator` port
 
 I had this task down as "`Simulator` over `apex-sim::tier0`", on the reasoning that §20 lets a lower tier only *reject* and therefore makes Tier 0 the honest shadow simulator. **The reasoning was right and the conclusion was wrong.**

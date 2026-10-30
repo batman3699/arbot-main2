@@ -171,7 +171,9 @@ That prints the report's `armed` section. `armed.live` carries:
   `days_left` at the last day's spend.
 
 `skipped.balance` means a sender cannot pay its worst case and keep its
-reserve: run Fund again. `skipped.size` counts arms over `max_size_wei`.
+reserve: run Fund again. `skipped.size` counts arms over `max_size_wei`
+(`max_size_usdc` for a USDC arm). Since R39 the engine ranks no rung over its
+cap, so this stays at 0: a count means the engine and the worker disagree.
 `armed.live_dropped` counts engine passes that found the send queue full.
 
 ### Stopping it
