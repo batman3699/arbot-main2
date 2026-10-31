@@ -755,7 +755,7 @@ fn head_at(number: u64, timestamp: u64) -> Head {
 fn the_block_being_built_follows_the_feed() {
     let book = book();
     let mut h = FeedHandler::new(BASE);
-    let at = |number, timestamp| Some(BlockContext { number, timestamp, base_fee: 5_000_000 });
+    let at = |number, timestamp: u64| Some(BlockContext { number, time_ms: timestamp * 1_000, block_time_ms: 2_000, base_fee: 5_000_000 });
     assert_eq!(h.block_being_built(), None, "no head, no block");
 
     h.handle(&book, Notification::Head(head_at(100, 1_000)), NOW);
@@ -782,6 +782,32 @@ fn the_block_being_built_follows_the_feed() {
 
     // A head without a base fee is no context to simulate in.
     h.handle(&book, Notification::Head(Head { base_fee_per_gas: None, ..head_at(104, 1_008) }), NOW);
+    assert_eq!(h.block_being_built(), None);
+}
+
+/// R41: under Denim the block being built is timed from the head's own
+/// milliseconds, 200 ms a block, and its EVM time is the whole second.
+#[test]
+fn a_denim_block_being_built_takes_the_head_s_milliseconds() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE).with_clock(200, true);
+    let stamped = Head { timestamp_ms: Some(1_792_605_601_400), ..head_at(100, 1_792_605_601) };
+    h.handle(&book, Notification::Head(stamped), NOW);
+    let built = h.block_being_built().expect("a stamped head");
+    assert_eq!(built, BlockContext { number: 101, time_ms: 1_792_605_601_600, block_time_ms: 200, base_fee: 5_000_000 });
+    assert_eq!(built.timestamp(), 1_792_605_601);
+    h.handle(&book, Notification::Log(swap(-197_360, 103, 0, true, 1, 1)), NOW);
+    let built = h.block_being_built().unwrap();
+    assert_eq!((built.number, built.time_ms, built.timestamp()), (103, 1_792_605_602_000, 1_792_605_602));
+}
+
+/// R41: no stamp, no block context: a whole-second timestamp does not say
+/// where in its second the head is.
+#[test]
+fn a_denim_head_without_milliseconds_builds_no_block() {
+    let book = book();
+    let mut h = FeedHandler::new(BASE).with_clock(200, true);
+    h.handle(&book, Notification::Head(head_at(100, 1_792_605_601)), NOW);
     assert_eq!(h.block_being_built(), None);
 }
 

@@ -345,7 +345,7 @@ fn hex_u64(v: &Value) -> u64 {
 /// last block is.
 fn building_for(answer: &Value) -> BlockContext {
     let last = answer.as_array().unwrap().last().unwrap();
-    BlockContext { number: hex_u64(&last["number"]), timestamp: hex_u64(&last["timestamp"]), base_fee: 5_000_000 }
+    BlockContext { number: hex_u64(&last["number"]), time_ms: hex_u64(&last["timestamp"]) * 1_000, block_time_ms: 2_000, base_fee: 5_000_000 }
 }
 
 fn building(at: Option<BlockContext>) -> watch::Receiver<Option<BlockContext>> {
@@ -410,7 +410,7 @@ async fn the_simulator_asks_one_call_as_the_lane_with_the_gas_limit() {
     assert_eq!(method, "eth_simulateV1");
     assert_eq!(
         params[0]["blockStateCalls"][0]["blockOverrides"],
-        json!({ "number": format!("{:#x}", at.number), "time": format!("{:#x}", at.timestamp), "baseFeePerGas": "0x4c4b40" })
+        json!({ "number": format!("{:#x}", at.number), "time": format!("{:#x}", at.timestamp()), "baseFeePerGas": "0x4c4b40" })
     );
     let one = &params[0]["blockStateCalls"][0]["calls"][0];
     assert_eq!(one["from"].as_str().unwrap().parse::<Address>().unwrap(), lane);
@@ -484,7 +484,7 @@ async fn a_simulation_that_cannot_run_fails_without_a_class() {
         Ok(json!({"unexpected": true})),
         Ok(json!([{ "number": "0x1", "hash": format!("0x{}", "11".repeat(32)), "parentHash": format!("0x{}", "22".repeat(32)), "calls": [] }])),
     ] {
-        let at = BlockContext { number: 1, timestamp: 1, base_fee: 1 };
+        let at = BlockContext { number: 1, time_ms: 1_000, block_time_ms: 2_000, base_fee: 1 };
         let sim = LiveSimulator::new(Arc::new(Recording::new(answer)), BASE, building(Some(at)), before_any_block());
         let err = sim
             .simulate(&c, &call_to(Address::repeat_byte(1)), Address::repeat_byte(2), c.total_execution_cost.gas_limit)
@@ -502,11 +502,44 @@ async fn a_simulation_that_cannot_run_fails_without_a_class() {
 /// built is the next.
 #[test]
 fn a_block_whose_time_has_passed_is_the_next_one() {
-    let b = BlockContext { number: 100, timestamp: 1_000, base_fee: 7 };
+    let b = BlockContext { number: 100, time_ms: 1_000_000, block_time_ms: 2_000, base_fee: 7 };
     let at = |ms: u64| b.at(UnixNanos(ms * 1_000_000));
     assert_eq!(at(999_999), b, "still being built");
-    assert_eq!(at(1_000_000), BlockContext { number: 101, timestamp: 1_002, base_fee: 7 });
-    assert_eq!(at(1_002_300), BlockContext { number: 102, timestamp: 1_004, base_fee: 7 });
+    assert_eq!(at(1_000_000), BlockContext { number: 101, time_ms: 1_002_000, ..b });
+    assert_eq!(at(1_002_300), BlockContext { number: 102, time_ms: 1_004_000, ..b });
+    assert_eq!(at(1_002_300).timestamp(), 1_004);
+}
+
+/// R41: under Denim a block's time has come 200 ms after the last's, so the
+/// context carries on in the config's block time.
+#[test]
+fn at_carries_on_in_the_config_s_block_time() {
+    let t = 1_792_605_601_400;
+    let b = BlockContext { number: 100, time_ms: t, block_time_ms: 200, base_fee: 7 };
+    let at = |ms: u64| b.at(UnixNanos(ms * 1_000_000));
+    assert_eq!(at(t - 1), b, "still being built");
+    assert_eq!(at(t), BlockContext { number: 101, time_ms: t + 200, ..b });
+    assert_eq!(at(t + 450), BlockContext { number: 103, time_ms: t + 600, ..b });
+    assert_eq!(at(t + 450).timestamp(), 1_792_605_602);
+}
+
+/// R41: under Denim the simulation runs on `latest`; Base's docs give
+/// `pending` no equivalent. Before it, on `pending`, as always.
+#[tokio::test]
+async fn a_denim_simulation_never_names_pending() {
+    let f = fixture();
+    let answer = lean_success().0;
+    let at = building_for(&answer);
+    let clock = Arc::new(ManualClock::at(at.timestamp() * 1_000_000_000 - 1));
+    let c = support::candidate(1, 100, 1);
+    for (denim, tag) in [(true, "latest"), (false, "pending")] {
+        let rpc = Arc::new(Recording::new(Ok(answer.clone())));
+        let sim = LiveSimulator::new(rpc.clone(), BASE, building(Some(at)), clock.clone()).on_denim(denim);
+        let _ = sim.simulate(&c, &call_to(executor(&f)), Address::repeat_byte(2), c.total_execution_cost.gas_limit).await;
+        let asked = rpc.asked.lock().unwrap();
+        assert_eq!(asked[0].1[1], json!(tag), "denim {denim}");
+        assert_eq!(asked[0].1.to_string().contains("\"pending\""), !denim);
+    }
 }
 
 /// The simulator asks for the block being built when it simulates, not when
@@ -518,8 +551,8 @@ async fn the_simulator_simulates_in_the_block_being_built_now() {
     // The lean executor's success (R31.1).
     let answer = lean_success().0;
     let now_built = building_for(&answer);
-    let feed_said = BlockContext { number: now_built.number - 1, timestamp: now_built.timestamp - 2, ..now_built };
-    let clock = Arc::new(ManualClock::at(feed_said.timestamp * 1_000_000_000 + 300_000_000));
+    let feed_said = BlockContext { number: now_built.number - 1, time_ms: now_built.time_ms - 2_000, ..now_built };
+    let clock = Arc::new(ManualClock::at(feed_said.timestamp() * 1_000_000_000 + 300_000_000));
     let rpc = Arc::new(Recording::new(Ok(answer)));
     let sim = LiveSimulator::new(rpc.clone(), BASE, building(Some(feed_said)), clock);
     let c = support::candidate(1, 100, 1);

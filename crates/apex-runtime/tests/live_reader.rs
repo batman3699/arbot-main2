@@ -158,6 +158,7 @@ fn config(max_age: Duration) -> ReaderConfig {
         fee_ceiling_wei: 100_000_000,
         min_profit: 1,
         max_age,
+        denim: false,
     }
 }
 

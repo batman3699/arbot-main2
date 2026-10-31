@@ -290,49 +290,72 @@ pub fn read_simulation(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockContext {
     pub number: u64,
-    pub timestamp: u64,
+    /// Its time in milliseconds: whole seconds before Denim, Denim's
+    /// `timestampMs` lattice after it (R41).
+    pub time_ms: u64,
+    /// The configured block time it carries on in: Base sealed a block every
+    /// two seconds before Denim (the pending header's timestamp was the
+    /// latest's plus two per block in every sample, 2026-10-06), and every
+    /// 200 ms after it.
+    pub block_time_ms: u64,
     pub base_fee: u128,
 }
 
-/// Base seals a block every two seconds: the pending header's timestamp was the
-/// latest's plus two per block in every sample (2026-10-06).
-pub const BLOCK_TIME_S: u64 = 2;
+/// R41: the state a read or a simulation is asked at: `pending` before Denim,
+/// `latest` under it, where Base's docs give `pending` no equivalent.
+pub const fn state_tag(denim: bool) -> &'static str {
+    if denim {
+        "latest"
+    } else {
+        "pending"
+    }
+}
 
 impl BlockContext {
+    /// The EVM's timestamp for it, in whole seconds as on chain.
+    pub const fn timestamp(&self) -> u64 {
+        self.time_ms / 1_000
+    }
+
     /// The block being built, from what the capture feed has seen: one past
     /// the newest sealed `head`, or the newest block a preconfirmed log came
-    /// from when the head lags behind the flashblocks. Its timestamp is the
-    /// head's plus two seconds a block.
+    /// from when the head lags behind the flashblocks. Its time is the
+    /// head's plus `block_time_ms` a block: from the head's whole seconds
+    /// before Denim, and under it from the head's `timestampMs` alone (R41).
+    /// A Denim head without one has no context: a whole second does not say
+    /// where in it the head is.
     ///
     /// The base fee is the head's. The next block's is at most a hundredth
     /// away — Base's EIP-1559 denominator is 100, and at its 0.005 gwei floor
     /// the two are equal — and nothing the simulated call runs reads it: the
     /// executor, the routers and the pools never use `BASEFEE`, and
     /// `validation: false` charges no gas. `None` for a head without one.
-    /// The block being built at `now`. A block is built in the two seconds
+    /// The block being built at `now`. A block is built in the block time
     /// before its timestamp, so once `now` reaches it the block is sealed and
-    /// the one being built is the next — or later, two seconds a block.
+    /// the one being built is the next — or later, a block time a block.
     /// BlockPI's pending block moved on 0.2–0.4 s after each boundary and the
     /// feed's head later still: without this, one simulation in five named the
     /// block before, and two of 94 were refused (2026-10-06).
     pub fn at(self, now: UnixNanos) -> Self {
-        let sealed_at = self.timestamp.saturating_mul(1_000_000_000);
+        let sealed_at = self.time_ms.saturating_mul(1_000_000);
         if now.0 < sealed_at {
             return self;
         }
-        let blocks = 1 + (now.0 - sealed_at) / BLOCK_TIME_S.saturating_mul(1_000_000_000);
+        let blocks = 1 + (now.0 - sealed_at) / self.block_time_ms.max(1).saturating_mul(1_000_000);
         Self {
             number: self.number.saturating_add(blocks),
-            timestamp: self.timestamp.saturating_add(BLOCK_TIME_S.saturating_mul(blocks)),
+            time_ms: self.time_ms.saturating_add(self.block_time_ms.saturating_mul(blocks)),
             ..self
         }
     }
 
-    pub fn being_built(head: &Head, newest_preconfirmed: Option<u64>) -> Option<Self> {
+    pub fn being_built(head: &Head, newest_preconfirmed: Option<u64>, block_time_ms: u64, denim: bool) -> Option<Self> {
         let number = head.number.saturating_add(1).max(newest_preconfirmed.unwrap_or(0));
+        let head_ms = if denim { head.timestamp_ms? } else { head.timestamp.saturating_mul(1_000) };
         Some(Self {
             number,
-            timestamp: head.timestamp.saturating_add(BLOCK_TIME_S.saturating_mul(number - head.number)),
+            time_ms: head_ms.saturating_add(block_time_ms.saturating_mul(number - head.number)),
+            block_time_ms,
             base_fee: head.base_fee_per_gas?,
         })
     }
@@ -340,14 +363,15 @@ impl BlockContext {
 }
 
 /// The `eth_simulateV1` request: one call, from the signing lane, at the gas
-/// limit it will be signed with, in the block `at` — on `pending`'s state, with
-/// the block's context set explicitly rather than taken from `pending`'s.
-pub fn simulate_request(call: &ExecutorCall, from: Address, gas_limit: GasLimit, at: BlockContext) -> Value {
+/// limit it will be signed with, in the block `at` — on `state`'s state
+/// ([`state_tag`]), with the block's context set explicitly rather than
+/// taken from it.
+pub fn simulate_request(call: &ExecutorCall, from: Address, gas_limit: GasLimit, at: BlockContext, state: &str) -> Value {
     json!([{
         "blockStateCalls": [{
             "blockOverrides": {
                 "number": format!("{:#x}", at.number),
-                "time": format!("{:#x}", at.timestamp),
+                "time": format!("{:#x}", at.timestamp()),
                 "baseFeePerGas": format!("{:#x}", at.base_fee),
             },
             "calls": [{
@@ -359,7 +383,7 @@ pub fn simulate_request(call: &ExecutorCall, from: Address, gas_limit: GasLimit,
         }],
         "traceTransfers": true,
         "validation": false,
-    }, "pending"])
+    }, state])
 }
 
 /// `eth_simulateV1` over the read-only transport.
@@ -370,6 +394,8 @@ pub struct LiveSimulator {
     building: tokio::sync::watch::Receiver<Option<BlockContext>>,
     /// To carry it on to the block being built when the simulation runs.
     clock: Arc<dyn Clock>,
+    /// R41: [`state_tag`]'s answer for the regime.
+    state: &'static str,
 }
 
 impl LiveSimulator {
@@ -379,7 +405,14 @@ impl LiveSimulator {
         building: tokio::sync::watch::Receiver<Option<BlockContext>>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        Self { rpc, chain, building, clock }
+        Self { rpc, chain, building, clock, state: state_tag(false) }
+    }
+
+    /// R41: under Denim, simulate on `latest`.
+    #[must_use]
+    pub const fn on_denim(mut self, denim: bool) -> Self {
+        self.state = state_tag(denim);
+        self
     }
 }
 
@@ -402,7 +435,7 @@ impl Simulator for LiveSimulator {
         let unrun = || Decline::SimulationFailed { class: None };
         let at = (*self.building.borrow()).ok_or_else(unrun)?.at(self.clock.now());
         let answer =
-            self.rpc.call("eth_simulateV1", simulate_request(call, from, gas_limit, at)).await.map_err(|_| unrun())?;
+            self.rpc.call("eth_simulateV1", simulate_request(call, from, gas_limit, at, self.state)).await.map_err(|_| unrun())?;
         let elapsed = DurationNanos(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         let r = read_simulation(self.chain, call.to(), &answer, elapsed).ok_or_else(unrun)?;
         if r.state_after.confirmed_block_number != at.number {

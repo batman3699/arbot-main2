@@ -831,6 +831,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
             fee_ceiling_wei: p.fee_ceiling_wei,
             min_profit: p.min_profit_wei,
             max_age: Duration::from_millis(p.max_view_age_ms),
+            denim: config.denim(),
         },
     ));
     let mut version = [0u8; 32];

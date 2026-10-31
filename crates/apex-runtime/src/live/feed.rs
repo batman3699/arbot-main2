@@ -48,6 +48,7 @@
 use crate::live::book::{LiquidityWrite, PoolBook, PoolSnapshot, StateWrite, SwapApplied, SwapWrite, SyncWrite};
 use crate::live::abi;
 use crate::live::inventory::Venue;
+use crate::denim::PRE_DENIM_BLOCK_MS;
 use crate::live::sim::BlockContext;
 use alloy_primitives::{b256, keccak256, Address, B256, U256};
 use apex_chain::rpc::ws::{Head, Notification, RawLog};
@@ -472,11 +473,23 @@ pub struct FeedHandler {
     newest_preconfirmed: Option<u64>,
     /// The burst still arriving, in arrival order, each log with when it came.
     held: Vec<(Held, UnixNanos)>,
+    /// R41: the block clock the block being built is timed by.
+    block_time_ms: u64,
+    denim: bool,
 }
 
 impl FeedHandler {
+    /// Base before Denim: 2 s blocks timed from the head's whole seconds.
     pub const fn new(chain: ChainId) -> Self {
-        Self { chain, last_head: None, newest_preconfirmed: None, held: Vec::new() }
+        Self { chain, last_head: None, newest_preconfirmed: None, held: Vec::new(), block_time_ms: PRE_DENIM_BLOCK_MS, denim: false }
+    }
+
+    /// R41: the configuration's block clock.
+    #[must_use]
+    pub const fn with_clock(mut self, block_time_ms: u64, denim: bool) -> Self {
+        self.block_time_ms = block_time_ms;
+        self.denim = denim;
+        self
     }
 
     pub const fn last_head(&self) -> Option<&Head> {
@@ -550,7 +563,7 @@ impl FeedHandler {
     /// The block a trade sent now would land in, from what this feed has
     /// seen — see [`BlockContext::being_built`]. Tier 2 simulates in it.
     pub fn block_being_built(&self) -> Option<BlockContext> {
-        BlockContext::being_built(self.last_head.as_ref()?, self.newest_preconfirmed)
+        BlockContext::being_built(self.last_head.as_ref()?, self.newest_preconfirmed, self.block_time_ms, self.denim)
     }
 
     /// Whether swaps are held, waiting for their burst to end.

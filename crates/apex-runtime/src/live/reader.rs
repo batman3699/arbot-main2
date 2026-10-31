@@ -90,6 +90,8 @@ pub struct ReaderConfig {
     pub min_profit: i128,
     /// A view older than this is stale.
     pub max_age: Duration,
+    /// R41: under Denim the nonce is read at `latest`, not `pending`.
+    pub denim: bool,
 }
 
 pub struct ChainReader {
@@ -130,7 +132,7 @@ impl ChainReader {
         let (code, balance, nonce, holding, switched) = tokio::join!(
             reads.code_hash(c.executor, head.number),
             self.rpc.call("eth_getBalance", json!([c.signer, at])),
-            self.rpc.call("eth_getTransactionCount", json!([c.signer, "pending"])),
+            self.rpc.call("eth_getTransactionCount", json!([c.signer, crate::live::sim::state_tag(c.denim)])),
             reads.multicall(&lender, head.number),
             reads.multicall(&switches, head.number),
         );
