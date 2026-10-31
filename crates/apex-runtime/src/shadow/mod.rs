@@ -1068,6 +1068,9 @@ async fn boot_armed_live(
         window_blocks,
         block_time_ms: a.block_time_ms,
         kill_file: live.kill_file.clone(),
+        denim: config.denim(),
+        max_head_lag_ms: a.max_head_lag_ms,
+        head_reads_every_ms: config.policy.head_reads_every_ms,
     };
     let chain = Arc::new(crate::armed::live_chain::RpcChain::new(Arc::clone(rpc)));
     let worker = ArmedLive::new(keys, chain, Arc::new(submit), ledger, records, policy, executor, recipient, config.chain_id);
@@ -1461,10 +1464,10 @@ impl Shadow {
         let Some(live) = &self.armed_live else { return };
         let mut heads = self.heads.subscribe();
         while heads.changed().await.is_ok() {
-            let number = heads.borrow_and_update().as_ref().map(|h| h.number);
-            if let Some(number) = number {
+            let head = heads.borrow_and_update().as_ref().map(|h| (h.number, h.timestamp_ms));
+            if let Some((number, stamp)) = head {
                 let now = now_ms();
-                live.on_head(number, now, now).await;
+                live.on_head(number, now, stamp, now).await;
             }
         }
     }

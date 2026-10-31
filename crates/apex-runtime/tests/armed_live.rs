@@ -52,6 +52,7 @@ struct Chain {
     nonce_blocks: Mutex<Vec<u64>>,
     circuit_open: AtomicBool,
     revoked: Mutex<BTreeSet<Address>>,
+    stops_asks: AtomicUsize,
 }
 
 impl Chain {
@@ -70,6 +71,7 @@ impl Chain {
             nonce_blocks: Mutex::new(Vec::new()),
             circuit_open: AtomicBool::new(false),
             revoked: Mutex::new(BTreeSet::new()),
+            stops_asks: AtomicUsize::new(0),
         })
     }
 }
@@ -90,6 +92,7 @@ impl LiveChain for Chain {
         self.nonce(a).await
     }
     async fn stops(&self, _: Address, senders: &[Address], _: u64) -> Result<Stops, String> {
+        self.stops_asks.fetch_add(1, Ordering::Relaxed);
         let revoked = self.revoked.lock().unwrap();
         Ok(Stops { circuit_open: self.circuit_open.load(Ordering::Relaxed), allowed: senders.iter().map(|s| !revoked.contains(s)).collect() })
     }
@@ -187,7 +190,32 @@ fn policy(budget_wei: u128, cap: u128) -> LivePolicy {
         window_blocks: 5,
         block_time_ms: 2_000,
         kill_file: PathBuf::from("/nonexistent/armed.disable"),
+        denim: false,
+        max_head_lag_ms: 0,
+        head_reads_every_ms: 0,
     }
+}
+
+/// R41: the Denim regime, as `ops/canary.denim.yaml` configures it.
+fn denim_policy() -> LivePolicy {
+    LivePolicy { block_time_ms: 200, window_blocks: 50, denim: true, max_head_lag_ms: 1_000, head_reads_every_ms: 2_000, ..policy(ETH, u128::MAX) }
+}
+
+/// R41: heads stamped 200 ms apart up to `last`, the newest stamped
+/// `newest_ms`; each seen 166 ms after its stamp (Sepolia's median lag), or,
+/// with `burst`, all within 10 ms of the last.
+async fn denim_heads(f: &Fixture, last: u64, newest_ms: u64, burst: bool) {
+    for head in last - 20..=last {
+        let stamp = newest_ms - (last - head) * 200;
+        let seen = if burst { newest_ms + 166 - (last - head) / 2 } else { stamp + 166 };
+        f.live.on_head(head, seen, Some(stamp), seen).await;
+    }
+}
+
+/// R41: booted on Denim heads up to head 100, the newest stamped at `NOW - 166`.
+async fn start_denim(f: &Fixture) {
+    f.live.begin(NOW).await.unwrap();
+    denim_heads(f, 100, NOW - 166, false).await;
 }
 
 struct Fixture {
@@ -216,7 +244,7 @@ fn fixture(policy: LivePolicy, answers: Vec<SendAnswer>, records: Vec<LiveRecord
 async fn heads(f: &Fixture, last: u64, at_ms: u64, every_ms: u64) {
     for head in last - 20..=last {
         let seen = at_ms - (last - head) * every_ms;
-        f.live.on_head(head, seen, seen).await;
+        f.live.on_head(head, seen, None, seen).await;
     }
 }
 
@@ -406,10 +434,10 @@ async fn a_balance_is_read_at_most_once_a_minute() {
     start(&f).await;
     let renew = |calldata: &str| ArmedLine::Renew { arm_id: 1, to_block: 110, at_ns: 0, deadline: None, calldata: Some(calldata.into()) };
     f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
-    f.live.on_head(130, NOW + 59_999, NOW + 59_999).await;
+    f.live.on_head(130, NOW + 59_999, None, NOW + 59_999).await;
     f.live.on_lines(&[renew("0xabce")], 0, NOW + 59_999).await;
     assert_eq!(f.chain.balance_asks.load(Ordering::Relaxed), 1, "an expiry spent nothing");
-    f.live.on_head(131, NOW + 60_000, NOW + 60_000).await;
+    f.live.on_head(131, NOW + 60_000, None, NOW + 60_000).await;
     f.live.on_lines(&[renew("0xabcf")], 0, NOW + 60_000).await;
     assert_eq!(f.chain.balance_asks.load(Ordering::Relaxed), 2);
 }
@@ -530,7 +558,7 @@ async fn boot_settles_every_pending_submission_before_any_send() {
     f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
     assert!(f.script.sent.lock().unwrap().is_empty(), "nothing before the boot is settled");
 
-    f.live.on_head(104, NOW + 2_000, NOW + 2_000).await;
+    f.live.on_head(104, NOW + 2_000, None, NOW + 2_000).await;
     assert!(f.live.ready());
     let landed: Vec<_> = records(&f.ledger).into_iter().filter(|r| matches!(r, LiveRecord::Landed { .. })).collect();
     assert!(matches!(&landed[..], [LiveRecord::Landed { tx, nonce: 7, arm_id: 9, .. }] if *tx == open), "{landed:?}");
@@ -564,7 +592,7 @@ async fn a_landing_is_accounted_from_its_receipt() {
     // 300k gas at 1 gwei and 0.00005 ETH of L1 fee, against 0.002 ETH paid.
     let landed = receipt(sent, true, 300_000, 1_000_000_000, 50_000_000_000_000, 2_000_000_000_000_000, 2_100_000_000_000_000);
     f.chain.receipts.lock().unwrap().insert(sent, landed);
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     let landed: Vec<_> = records(&f.ledger).into_iter().filter(|r| matches!(r, LiveRecord::Landed { .. })).collect();
     let [LiveRecord::Landed { arm_id, pools, sender, nonce, tx, gross_wei, paid_wei, cost_wei, net_wei, .. }] = &landed[..] else {
         panic!("{landed:?}")
@@ -593,7 +621,7 @@ async fn a_nonce_that_moved_without_our_transaction_trips_everything() {
         if with_receipt {
             f.chain.receipts.lock().unwrap().insert(sent, receipt(sent, true, 300_000, 1_000_000, 0, 1, 1));
         }
-        f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+        f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
         let halted = f.live.state(NOW + 10_000).halted;
         assert!(matches!(halted, Some(Halt::Tripwire { sender, .. }) if sender == key(1).address()), "nonce {nonce}: {halted:?}");
         assert!(records(&f.ledger).iter().any(|r| matches!(r, LiveRecord::Halted { reason: Halt::Tripwire { .. }, .. })));
@@ -611,7 +639,7 @@ async fn the_loss_cap_halts_before_the_next_send() {
     f.chain.nonces.lock().unwrap().insert(key(1).address(), 8);
     // Reverted: 1M gas at 11 gwei, 0.011 ETH against a 0.01 ETH budget.
     f.chain.receipts.lock().unwrap().insert(sent, receipt(sent, false, 1_000_000, 11_000_000_000, 0, 0, 0));
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     let all = records(&f.ledger);
     let landed = all.iter().position(|r| matches!(r, LiveRecord::Landed { net_wei: -11_000_000_000_000_000, .. }));
     let capped = all.iter().position(|r| matches!(r, LiveRecord::Halted { reason: Halt::LossCap { .. }, .. }));
@@ -664,7 +692,7 @@ async fn a_renewal_s_earlier_transaction_expires_alone() {
     let renew = ArmedLine::Renew { arm_id: 1, to_block: 105, at_ns: 0, deadline: Some(2), calldata: Some("0xabce".into()) };
     f.live.on_lines(&[renew], 0, NOW).await;
     let sent: Vec<B256> = f.script.sent.lock().unwrap().iter().map(|(raw, _)| keccak256(raw)).collect();
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     let left: Vec<B256> = f.live.state(NOW + 10_000).pending[&(key(1).address(), 7)].iter().map(|p| p.tx).collect();
     assert_eq!(left, vec![sent[1]], "104 is past at head 105; 105 is not");
 }
@@ -678,10 +706,10 @@ async fn a_receipt_read_that_fails_is_asked_again_not_tripped() {
     f.chain.nonces.lock().unwrap().insert(key(1).address(), 8);
     f.chain.receipts.lock().unwrap().insert(sent, receipt(sent, true, 300_000, 1_000_000, 0, 1, 1));
     f.chain.receipts_fail.store(true, Ordering::Relaxed);
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     assert_eq!(f.live.state(NOW + 10_000).halted, None);
     f.chain.receipts_fail.store(false, Ordering::Relaxed);
-    f.live.on_head(106, NOW + 12_000, NOW + 12_000).await;
+    f.live.on_head(106, NOW + 12_000, None, NOW + 12_000).await;
     assert!(records(&f.ledger).iter().any(|r| matches!(r, LiveRecord::Landed { tx, .. } if *tx == sent)));
 }
 
@@ -757,7 +785,7 @@ async fn the_report_carries_the_live_section() {
     // 300k gas at 1 gwei: 0.0003 ETH spent, against 0.002 ETH paid.
     let landed = receipt(first, true, 300_000, 1_000_000_000, 0, 2_000_000_000_000_000, 2_100_000_000_000_000);
     f.chain.receipts.lock().unwrap().insert(first, landed);
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     let r = f.live.report(NOW + 10_000);
     assert_eq!((r.landed, r.won), (1, 1));
     assert_eq!((r.gross_wei.as_str(), r.cost_wei.as_str(), r.net_today_wei.as_str()), ("2100000000000000", "300000000000000", "1700000000000000"));
@@ -776,7 +804,7 @@ async fn a_reset_after_a_tripwire_lets_the_lane_resume() {
     start(&f).await;
     f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
     f.chain.nonces.lock().unwrap().insert(key(1).address(), 9);
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     assert!(matches!(f.live.state(NOW + 10_000).halted, Some(Halt::Tripwire { .. })));
     let mut ledger = records(&f.ledger);
     assert!(ledger.iter().any(|r| matches!(r, LiveRecord::Abandoned { nonce: 7, worst_case_wei: 600_000_000_000, .. })), "{ledger:?}");
@@ -820,7 +848,7 @@ async fn an_unreadable_receipt_abandons_its_nonce_at_its_worst_case() {
     let mut unreadable = receipt(sent, true, 300_000, 1_000_000, 0, 1, 1);
     unreadable.as_object_mut().unwrap().remove("l1Fee");
     f.chain.receipts.lock().unwrap().insert(sent, unreadable);
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     let state = f.live.state(NOW + 10_000);
     assert!(matches!(state.halted, Some(Halt::Tripwire { .. })));
     assert!(state.pending.is_empty(), "nothing left to trip the next boot");
@@ -836,7 +864,7 @@ async fn a_read_the_state_has_outrun_is_not_judged() {
     start(&f).await;
     f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
     f.chain.nonces.lock().unwrap().insert(key(1).address(), 7);
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     let state = f.live.state(NOW + 10_000);
     assert_eq!(state.halted, None);
     assert!(state.pending.contains_key(&(key(1).address(), 8)));
@@ -851,10 +879,10 @@ async fn a_hash_expires_only_on_a_nonce_read_at_the_block_it_judges() {
     f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
     f.chain.nonce_blocks.lock().unwrap().clear();
     *f.chain.node_head.lock().unwrap() = 103;
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     assert_eq!(f.live.state(NOW + 10_000).pending.len(), 1, "a node behind the head judges nothing");
     *f.chain.node_head.lock().unwrap() = u64::MAX;
-    f.live.on_head(106, NOW + 12_000, NOW + 12_000).await;
+    f.live.on_head(106, NOW + 12_000, None, NOW + 12_000).await;
     assert!(f.live.state(NOW + 12_000).pending.is_empty());
     assert_eq!(*f.chain.nonce_blocks.lock().unwrap(), vec![104, 105], "each head is judged at the block before it");
 }
@@ -885,7 +913,7 @@ async fn an_open_circuit_stops_every_send() {
     f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
     assert!(f.script.sent.lock().unwrap().is_empty());
     f.chain.circuit_open.store(false, Ordering::Relaxed);
-    f.live.on_head(101, NOW + 2_000, NOW + 2_000).await;
+    f.live.on_head(101, NOW + 2_000, None, NOW + 2_000).await;
     f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW + 2_000).await;
     assert_eq!(f.script.sent.lock().unwrap().len(), 1, "closed again");
 }
@@ -959,7 +987,7 @@ async fn a_usdc_landing_is_valued_at_its_arms_rate() {
     f.chain.nonces.lock().unwrap().insert(key(1).address(), 8);
     let landed = receipt_in(usdc, sent, true, 300_000, 1_000_000_000, 50_000_000_000_000, 151_259_004, 151_259_004);
     f.chain.receipts.lock().unwrap().insert(sent, landed);
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     let landed: Vec<_> = records(&f.ledger).into_iter().filter(|r| matches!(r, LiveRecord::Landed { .. })).collect();
     let [LiveRecord::Landed { cost_wei, net_wei, paid_start, .. }] = &landed[..] else { panic!("{landed:?}") };
     assert_eq!(*cost_wei, 350_000_000_000_000);
@@ -981,7 +1009,7 @@ async fn a_usdc_landing_counts_only_its_gas_against_the_budget() {
     f.chain.nonces.lock().unwrap().insert(key(1).address(), 8);
     let landed = receipt_in(usdc, sent, true, 300_000, 1_000_000_000, 50_000_000_000_000, 151_259_004, 151_259_004);
     f.chain.receipts.lock().unwrap().insert(sent, landed);
-    f.live.on_head(105, NOW + 10_000, NOW + 10_000).await;
+    f.live.on_head(105, NOW + 10_000, None, NOW + 10_000).await;
     let landed: Vec<_> = records(&f.ledger).into_iter().filter(|r| matches!(r, LiveRecord::Landed { .. })).collect();
     let [LiveRecord::Landed { gross_wei, paid_wei, cost_wei, net_wei, start, paid_start, .. }] = &landed[..] else { panic!("{landed:?}") };
     assert_eq!((*gross_wei, *paid_wei, *cost_wei), (0, 0, 350_000_000_000_000), "no wei paid; the gas spent");
@@ -989,3 +1017,101 @@ async fn a_usdc_landing_counts_only_its_gas_against_the_budget() {
     assert_eq!((*start, paid_start.as_deref()), (Some(usdc), Some("151259004")), "the USDC paid, apart");
 }
 
+
+// ------------------------------------------------------------------ R41: Denim
+
+fn sent(f: &Fixture) -> usize {
+    f.script.sent.lock().unwrap().len()
+}
+
+async fn send_one(f: &Fixture, id: u64, now_ms: u64) {
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(id, 0, 1_000_000, 600_000)))], 0, now_ms).await;
+}
+
+/// R41: under Denim the guard is the chain's cadence and a fresh head.
+#[tokio::test]
+async fn denim_sends_on_chain_cadence_and_fresh_heads() {
+    let f = fixture(denim_policy(), vec![], vec![]);
+    start_denim(&f).await;
+    send_one(&f, 1, NOW).await;
+    assert_eq!(sent(&f), 1);
+}
+
+/// R41: a burst of arrivals is delivery, not the chain: Denim's guard holds
+/// through it, where the arrival median refuses.
+#[tokio::test]
+async fn a_denim_burst_still_sends() {
+    let f = fixture(denim_policy(), vec![], vec![]);
+    f.live.begin(NOW).await.unwrap();
+    denim_heads(&f, 100, NOW - 166, true).await;
+    send_one(&f, 1, NOW).await;
+    assert_eq!(sent(&f), 1, "Denim: the chain's clock");
+
+    let pre = fixture(LivePolicy { denim: false, max_head_lag_ms: 0, ..denim_policy() }, vec![], vec![]);
+    pre.live.begin(NOW).await.unwrap();
+    denim_heads(&pre, 100, NOW - 166, true).await;
+    send_one(&pre, 1, NOW).await;
+    assert_eq!(sent(&pre), 0, "the arrival median: twenty heads in 10 ms");
+}
+
+/// R41: a feed that delivers late, or stops, stops the sends within a second.
+#[tokio::test]
+async fn a_newest_head_too_old_stops_denim_sends() {
+    let f = fixture(denim_policy(), vec![], vec![]);
+    start_denim(&f).await;
+    let newest = NOW - 166;
+    send_one(&f, 1, newest + 1_001).await;
+    assert_eq!(sent(&f), 0, "1,001 ms old");
+    send_one(&f, 2, newest + 999).await;
+    assert_eq!(sent(&f), 1, "999 ms old");
+}
+
+/// R41: no `timestampMs`, no sends.
+#[tokio::test]
+async fn a_denim_head_without_timestamp_ms_stops_sends() {
+    let f = fixture(denim_policy(), vec![], vec![]);
+    start_denim(&f).await;
+    f.live.on_head(101, NOW + 200, None, NOW + 200).await;
+    send_one(&f, 1, NOW + 200).await;
+    assert_eq!(sent(&f), 0);
+}
+
+/// R41: the owner's stops are read on the clock, not on every head.
+#[tokio::test]
+async fn stops_are_read_on_the_clock() {
+    let f = fixture(denim_policy(), vec![], vec![]);
+    f.live.begin(NOW).await.unwrap();
+    let before = f.chain.stops_asks.load(Ordering::Relaxed);
+    for i in 0..=50u64 {
+        let at = NOW + i * 200;
+        f.live.on_head(100 + i, at, Some(at - 166), at).await;
+    }
+    let asks = f.chain.stops_asks.load(Ordering::Relaxed) - before;
+    assert!((5..=6).contains(&asks), "{asks} reads in 10 s of heads");
+    assert_eq!(f.live.report(NOW + 10_000).stops_reads, asks as u64);
+}
+
+/// R41: stops read every 2 s are fresh between rounds: three rounds, not
+/// three 200 ms blocks.
+#[tokio::test]
+async fn a_send_between_stops_rounds_goes_out_under_denim() {
+    let f = fixture(denim_policy(), vec![], vec![]);
+    start_denim(&f).await;
+    for i in 1..=9u64 {
+        let at = NOW + i * 200;
+        f.live.on_head(100 + i, at, Some(at - 166), at).await;
+    }
+    send_one(&f, 1, NOW + 1_900).await;
+    assert_eq!(sent(&f), 1, "1,900 ms after the last stops read");
+}
+
+/// R41: the report carries the Denim guard's readings for gate M.
+#[tokio::test]
+async fn the_denim_report_carries_cadence_lag_and_skips() {
+    let f = fixture(denim_policy(), vec![], vec![]);
+    start_denim(&f).await;
+    f.live.on_head(102, NOW + 400, Some(NOW + 234), NOW + 400).await;
+    let r = f.live.report(NOW + 500);
+    assert_eq!((r.chain_cadence_ms, r.head_skips, r.heads_without_ms), (Some(200), 1, 0));
+    assert_eq!(r.head_lag_ms, Some(266));
+}

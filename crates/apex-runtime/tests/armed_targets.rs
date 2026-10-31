@@ -132,6 +132,7 @@ fn armed(mode: ArmedMode, targets: Option<&Path>) -> ArmedConfig {
         rungs: 6,
         window_s: 10,
         block_time_ms: 2000,
+        max_head_lag_ms: 0,
         margin_wei: 0,
         band_cap_bps: 5,
         liquidity_floor_bps: 9800,

@@ -2,7 +2,10 @@
 //! becomes a validity transaction from its slot's own sender.
 //!
 //! **Before a send.** The worker checks five things:
-//! - the lane is ready, and heads keep the configured cadence;
+//! - the lane is ready, and heads keep the configured cadence: before Denim,
+//!   the median of their arrival intervals; under Denim (R41), the chain's
+//!   own cadence from `timestampMs` and a newest head no older than
+//!   `max_head_lag_ms`;
 //! - the owner's stops, read on the last head: the executor's circuit is
 //!   closed and still lets the sender trade;
 //! - no kill file exists;
@@ -37,6 +40,7 @@ use super::lines::{Arm, ArmedLine};
 use super::live_ledger::{nonce_views, Halt, LiveLedger, LiveRecord, LiveState, PendingTx};
 use super::predicate::{self, Op, Predicate};
 use crate::canary::chain::read_receipt;
+use crate::denim::{HeadWindow, ReadClock};
 use crate::live::frontier::WETH;
 use crate::sign::{Eip1559Tx, LaneKey};
 use alloy_primitives::{Address, B256};
@@ -112,6 +116,13 @@ pub struct LivePolicy {
     pub block_time_ms: u64,
     /// While this file exists, nothing new is sent.
     pub kill_file: PathBuf,
+    /// R41: the Denim regime: the guard is the chain's cadence from
+    /// `timestampMs` and the newest head's lag, not arrival intervals.
+    pub denim: bool,
+    /// R41: under Denim, the oldest the newest head's stamp may be at a send.
+    pub max_head_lag_ms: u64,
+    /// R41: the owner's stops are read at most this often; 0 is every head.
+    pub head_reads_every_ms: u64,
 }
 
 pub struct ArmedLive {
@@ -147,6 +158,11 @@ struct Inner {
     /// The last head and when it was seen, and the per-block intervals before it.
     last_head: Option<(u64, u64)>,
     intervals: VecDeque<u64>,
+    /// R41: the last twenty heads' stamps, for the Denim guard.
+    window: HeadWindow,
+    /// R41: when the stops are next read, and how often they have been.
+    stops_clock: ReadClock,
+    stops_reads: u64,
     /// What this process has recorded since boot.
     counts: Counts,
     /// Each landing's cost, by sender, over the last day.
@@ -215,6 +231,15 @@ pub struct LiveReport {
     pub halted: Option<String>,
     pub cadence_ms_measured: Option<u64>,
     pub cadence_ms_configured: u64,
+    /// R41: the chain's cadence over the last twenty stamped heads.
+    pub chain_cadence_ms: Option<u64>,
+    /// R41: the newest head's age by its stamp, as of the report.
+    pub head_lag_ms: Option<u64>,
+    /// R41: head numbers never seen, and heads without `timestampMs`.
+    pub head_skips: u64,
+    pub heads_without_ms: u64,
+    /// R41: how often the owner's stops have been read since boot.
+    pub stops_reads: u64,
     /// The furthest pending bound past the last head.
     pub expiry_horizon_blocks: Option<u64>,
     pub senders: Vec<SenderReport>,
@@ -289,6 +314,9 @@ impl ArmedLive {
             stops: None,
             last_head: None,
             intervals: VecDeque::with_capacity(CADENCE_SAMPLES),
+            window: HeadWindow::new(),
+            stops_clock: ReadClock::new(policy.head_reads_every_ms),
+            stops_reads: 0,
             counts: Counts::default(),
             spends: VecDeque::new(),
         };
@@ -415,6 +443,11 @@ impl ArmedLive {
             }),
             cadence_ms_measured: median(&inner.intervals),
             cadence_ms_configured: self.policy.block_time_ms,
+            chain_cadence_ms: inner.window.chain_cadence_ms(),
+            head_lag_ms: inner.window.head_lag_ms(now_ms),
+            head_skips: inner.window.skips(),
+            heads_without_ms: inner.window.without_ms(),
+            stops_reads: inner.stops_reads,
             expiry_horizon_blocks: horizon,
             senders,
         }
@@ -451,10 +484,12 @@ impl ArmedLive {
     /// A new head: the cadence it shows, then every sender with a pending
     /// transaction whose bound it has passed. The nonces are read outside the
     /// turn, so submissions do not wait on them, and judged inside it against
-    /// the state as it then is.
-    pub async fn on_head(&self, head: u64, head_seen_ms: u64, now_ms: u64) {
-        let due = {
+    /// the state as it then is. `timestamp_ms` is the head's Denim stamp
+    /// (R41); the owner's stops are read when their clock is due.
+    pub async fn on_head(&self, head: u64, head_seen_ms: u64, timestamp_ms: Option<u64>, now_ms: u64) {
+        let (due, read_stops) = {
             let mut inner = self.inner();
+            inner.window.observe(head, timestamp_ms);
             match inner.last_head {
                 Some((last, seen)) if head > last => {
                     if inner.intervals.len() == CADENCE_SAMPLES {
@@ -467,13 +502,17 @@ impl ArmedLive {
                 None => inner.last_head = Some((head, head_seen_ms)),
             }
             inner.state.roll(now_ms);
-            due(&inner.state, head)
+            let read_stops = inner.stops_clock.due(now_ms);
+            inner.stops_reads += u64::from(read_stops);
+            (due(&inner.state, head), read_stops)
         };
-        let senders: Vec<Address> = self.keys.iter().map(LaneKey::address).collect();
-        match self.chain.stops(self.executor, &senders, head.saturating_sub(1)).await {
-            Ok(stops) if stops.allowed.len() == senders.len() => self.inner().stops = Some((stops, now_ms)),
-            Ok(_) => warn!("armed live: the stops answered for the wrong number of senders"),
-            Err(e) => warn!(error = %e, "armed live: the owner's stops did not read"),
+        if read_stops {
+            let senders: Vec<Address> = self.keys.iter().map(LaneKey::address).collect();
+            match self.chain.stops(self.executor, &senders, head.saturating_sub(1)).await {
+                Ok(stops) if stops.allowed.len() == senders.len() => self.inner().stops = Some((stops, now_ms)),
+                Ok(_) => warn!("armed live: the stops answered for the wrong number of senders"),
+                Err(e) => warn!(error = %e, "armed live: the owner's stops did not read"),
+            }
         }
         let mut reads = Vec::with_capacity(due.len());
         for sender in due {
@@ -489,7 +528,7 @@ impl ArmedLive {
     /// One arm or renewal: checked, then signed, recorded and sent; re-signed
     /// at most twice when refused as an underpriced replacement.
     async fn submit_arm(&self, arm: &Arm, base_fee_wei: u128, now_ms: u64) {
-        if !self.ready() || !self.cadence_ok() || self.policy.kill_file.exists() || self.state(now_ms).halted.is_some() {
+        if !self.ready() || !self.cadence_ok(now_ms) || self.policy.kill_file.exists() || self.state(now_ms).halted.is_some() {
             return;
         }
         let Some(allowed) = self.stops_allow(now_ms) else { return };
@@ -776,18 +815,25 @@ impl ArmedLive {
     }
 
     /// Which senders may send, from the owner's stops: none while they were
-    /// last read more than three block times ago (the head feed has gone
-    /// quiet, and settlement with it) or the circuit is open.
+    /// last read more than three rounds ago (a round is a block time, or the
+    /// read clock's interval when longer: the head feed has gone quiet, and
+    /// settlement with it) or the circuit is open.
     fn stops_allow(&self, now_ms: u64) -> Option<Vec<bool>> {
         let inner = self.inner();
         let (stops, read_ms) = inner.stops.as_ref()?;
-        let fresh = now_ms.saturating_sub(*read_ms) <= self.policy.block_time_ms.saturating_mul(3);
+        let round = self.policy.block_time_ms.max(self.policy.head_reads_every_ms);
+        let fresh = now_ms.saturating_sub(*read_ms) <= round.saturating_mul(3);
         (fresh && !stops.circuit_open).then(|| stops.allowed.clone())
     }
 
-    /// Heads keep the configured cadence, within half of it either way.
-    fn cadence_ok(&self) -> bool {
+    /// Heads keep the configured cadence, within half of it either way:
+    /// before Denim by their arrival intervals; under Denim (R41) by their
+    /// own stamps, with the newest at most `max_head_lag_ms` old at `now_ms`.
+    fn cadence_ok(&self, now_ms: u64) -> bool {
         let configured = self.policy.block_time_ms;
+        if self.policy.denim {
+            return self.inner().window.holds(configured, self.policy.max_head_lag_ms, now_ms);
+        }
         self.cadence_ms().is_some_and(|m| m.abs_diff(configured).saturating_mul(2) <= configured)
     }
 
