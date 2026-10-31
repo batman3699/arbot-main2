@@ -113,6 +113,9 @@ async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("denim-check") {
         return denim_check().await;
     }
+    if std::env::args().nth(1).as_deref() == Some("denim-detect") {
+        return denim_detect().await;
+    }
 
     match run().await {
         Ok(report) => {
@@ -186,6 +189,40 @@ async fn denim_check() -> ExitCode {
             error!(error = %e, "denim-check did not run");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `apex denim-detect [--rpc URL]... [--chain-id 8453] [--fork-at 1793901600]`
+/// (R41): one round of the Denim switch's detection, read from public
+/// endpoints, as one JSON line. Exit 0 Denim, 1 not yet, 2 an anomaly, 3 no
+/// source answered. `ops/host/denim-switch.sh` runs it every 2 s.
+async fn denim_detect() -> ExitCode {
+    const USAGE: &str = "usage: apex denim-detect [--rpc URL]... [--chain-id 8453] [--fork-at 1793901600]";
+    let (mut urls, mut chain, mut fork_at) = (Vec::new(), 8_453u64, apex_runtime::denim::DENIM_MAINNET_TS);
+    let mut argv = std::env::args().skip(2);
+    while let Some(flag) = argv.next() {
+        let value = argv.next();
+        let number = value.as_deref().and_then(|n| n.parse::<u64>().ok());
+        match (flag.as_str(), value, number) {
+            ("--rpc", Some(u), _) => urls.push(u),
+            ("--chain-id", _, Some(n)) => chain = n,
+            ("--fork-at", _, Some(n)) => fork_at = n,
+            _ => {
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if urls.is_empty() {
+        urls = vec!["https://mainnet.base.org".into(), "https://base-rpc.publicnode.com".into()];
+    }
+    let line = apex_runtime::denim_check::detect_round(&urls, chain, fork_at).await;
+    match serde_json::to_string(&line) {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::from(line.exit_code())
+        }
+        Err(_) => ExitCode::from(3),
     }
 }
 

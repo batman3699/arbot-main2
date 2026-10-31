@@ -1,0 +1,14 @@
+# R41: one minute before Base's Denim hardfork (2026-11-05 18:00:00 UTC,
+# 07:00 NZDT 11-06). Persistent: a host that was down at 17:59 runs it at boot,
+# and the switch then gives up at once if 20:00 has passed. If Base moves the
+# fork, re-arm this for the new date (ops/host/ARMED.md "The Denim day").
+[Unit]
+Description=APEX Denim switch at 2026-11-05 17:59:00 UTC (Task 8.5 R41)
+
+[Timer]
+OnCalendar=2026-11-05 17:59:00 UTC
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

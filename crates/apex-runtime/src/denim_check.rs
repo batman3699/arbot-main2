@@ -14,7 +14,7 @@
 //!
 //! It sends nothing and reads no key the configuration does not name.
 
-use crate::denim::{HeadWindow, ReadClock, DENIM_BLOCK_MS, HEAD_WINDOW};
+use crate::denim::{detect, Detect, HeadWindow, LatticeBlock, ReadClock, DENIM_BLOCK_MS, HEAD_WINDOW};
 use crate::shadow::config::ShadowConfig;
 use apex_chain::rpc::ws::{Kind, LogFilter, Notification, WsFeed, WsSettings};
 use serde::Serialize;
@@ -253,4 +253,98 @@ pub async fn run(config: &ShadowConfig, for_s: u64) -> Result<Verdict, String> {
         other: stats.bytes_other(),
     };
     Ok(tally.verdict(chain_id, for_s, stats.refusals(), stats.sessions(), bytes))
+}
+
+// ------------------------------------------------------------- the switch's round
+
+/// One block as `apex denim-detect` prints it.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct DetectBlock {
+    pub number: u64,
+    pub timestamp: u64,
+    #[serde(rename = "timestampMs")]
+    pub timestamp_ms: Option<u64>,
+}
+
+/// `apex denim-detect`'s one line: which source answered (its host only), the
+/// chain it named, its ten newest blocks, and the verdict.
+#[derive(Clone, Debug, Serialize)]
+pub struct DetectLine {
+    pub source: Option<String>,
+    pub chain_id: Option<u64>,
+    pub blocks: Vec<DetectBlock>,
+    /// `denim`, `not_yet`, `anomaly`, or `no_source`.
+    pub verdict: &'static str,
+    pub reason: Option<String>,
+}
+
+impl DetectLine {
+    /// The exit code the switch reads: 0 Denim, 1 not yet, 2 an anomaly, 3
+    /// no source answered.
+    pub const fn exit_code(&self) -> u8 {
+        match self.verdict.as_bytes() {
+            b"denim" => 0,
+            b"not_yet" => 1,
+            b"anomaly" => 2,
+            _ => 3,
+        }
+    }
+}
+
+async fn post(client: &reqwest::Client, url: &str, body: String) -> Option<serde_json::Value> {
+    let text = client.post(url).header("content-type", "application/json").body(body).send().await.ok()?.text().await.ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// One answer's `result`, by id, from a batch.
+fn result_of(batch: &serde_json::Value, id: u64) -> Option<&serde_json::Value> {
+    batch.as_array()?.iter().find(|r| r.get("id").and_then(serde_json::Value::as_u64) == Some(id))?.get("result")
+}
+
+/// The chain ID and the newest ten blocks from one endpoint, or `None` if it
+/// did not answer all of it.
+async fn read_ten(client: &reqwest::Client, url: &str) -> Option<(u64, Vec<LatticeBlock>)> {
+    let q = apex_chain::rpc::parse_quantity;
+    let first = post(
+        client,
+        url,
+        r#"[{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]},{"jsonrpc":"2.0","id":2,"method":"eth_blockNumber","params":[]}]"#.into(),
+    )
+    .await?;
+    let (chain, head) = (q(result_of(&first, 1)?)?, q(result_of(&first, 2)?)?);
+    let ids = head.checked_sub(9)?..=head;
+    let calls: Vec<serde_json::Value> = ids
+        .clone()
+        .map(|n| serde_json::json!({"jsonrpc": "2.0", "id": n, "method": "eth_getBlockByNumber", "params": [format!("{n:#x}"), false]}))
+        .collect();
+    let batch = post(client, url, serde_json::Value::Array(calls).to_string()).await?;
+    let mut blocks = Vec::with_capacity(10);
+    for n in ids {
+        let b = result_of(&batch, n)?;
+        blocks.push(LatticeBlock {
+            number: q(b.get("number")?)?,
+            timestamp: q(b.get("timestamp")?)?,
+            timestamp_ms: b.get("timestampMs").and_then(q),
+        });
+    }
+    Some((chain, blocks))
+}
+
+/// One round of the switch: the first of `urls` that answers decides.
+pub async fn detect_round(urls: &[String], want_chain: u64, fork_at: u64) -> DetectLine {
+    let Ok(client) = reqwest::Client::builder().timeout(Duration::from_secs(5)).build() else {
+        return DetectLine { source: None, chain_id: None, blocks: Vec::new(), verdict: "no_source", reason: Some("no HTTP client".into()) };
+    };
+    for url in urls {
+        let Some((chain, blocks)) = read_ten(&client, url).await else { continue };
+        let source = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string));
+        let (verdict, reason) = match detect(chain, want_chain, &blocks, fork_at) {
+            Detect::Denim => ("denim", None),
+            Detect::NotYet(why) => ("not_yet", Some(why)),
+            Detect::Anomaly(why) => ("anomaly", Some(why)),
+        };
+        let blocks = blocks.iter().map(|b| DetectBlock { number: b.number, timestamp: b.timestamp, timestamp_ms: b.timestamp_ms }).collect();
+        return DetectLine { source, chain_id: Some(chain), blocks, verdict, reason };
+    }
+    DetectLine { source: None, chain_id: None, blocks: Vec::new(), verdict: "no_source", reason: Some(format!("none of {} sources answered", urls.len())) }
 }
