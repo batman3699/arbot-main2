@@ -456,6 +456,11 @@ impl ArmedLive {
     /// Submit each arm and renewal, in order.
     pub async fn on_lines(&self, lines: &[ArmedLine], base_fee_wei: u128, now_ms: u64) {
         let _turn = self.turn.lock().await;
+        // R41: each send is judged at its own time: the head lag and the
+        // stops' freshness of a send behind a slow one are as stale as they
+        // then are, not as they were when the batch began.
+        let started = std::time::Instant::now();
+        let mut now = now_ms;
         for line in lines {
             let arm = {
                 let mut inner = self.inner();
@@ -477,7 +482,8 @@ impl ArmedLive {
                     }
                 }
             };
-            self.submit_arm(&arm, base_fee_wei, now_ms).await;
+            self.submit_arm(&arm, base_fee_wei, now).await;
+            now = now_ms.saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         }
     }
 

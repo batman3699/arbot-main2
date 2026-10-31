@@ -735,3 +735,17 @@ fn old_verdicts_parse_and_units_serialise() {
         assert_eq!((v.offset_unit, v.fire_closes_block), (Some(u), Some(true)));
     }
 }
+
+/// R41: in whole blocks, the trigger closed its block when it was the
+/// block's last transaction, counted from the fire block as it was read
+/// (hashes or full transactions alike).
+#[test]
+fn a_trigger_closes_its_block_when_it_is_the_last_transaction() {
+    use apex_runtime::armed::run::closes_block;
+    let hashes = serde_json::json!({"transactions": (0..20).map(|i| format!("0x{i:064x}")).collect::<Vec<_>>()});
+    assert_eq!(closes_block(19, &hashes), Some(true));
+    assert_eq!(closes_block(18, &hashes), Some(false));
+    let full = serde_json::json!({"transactions": [{"hash": "0x1"}, {"hash": "0x2"}]});
+    assert_eq!(closes_block(1, &full), Some(true));
+    assert_eq!(closes_block(0, &serde_json::json!({"number": "0x1"})), None, "no transactions read");
+}

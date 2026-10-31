@@ -573,8 +573,7 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
     let fire_time = block.as_ref().and_then(|b| u64::try_from(hex_u128(b.get("timestamp")?)?).ok());
     v.offset_unit = unit_of(granular, fire_time);
     if !granular {
-        let txs = block.as_ref().and_then(|b| Some(b.get("transactions")?.as_array()?.len() as u64));
-        v.fire_closes_block = txs.map(|n| fire.tx_index + 1 == n);
+        v.fire_closes_block = block.as_ref().and_then(|b| closes_block(fire.tx_index, b));
     }
     let mut rival_at = None;
     let mut rival_block = None;
@@ -992,6 +991,13 @@ async fn rival_tx(rpc: &dyn RpcTransport, r: &Point) -> Option<RivalTx> {
 pub fn is_own_send(arm: &Arm, executor: Address, to: Option<Address>, input: &str) -> bool {
     to == Some(executor)
         && std::iter::once(&arm.calldata).chain(arm.renewals.iter().map(|r| &r.calldata)).any(|c| c.eq_ignore_ascii_case(input))
+}
+
+/// R41: whether transaction `tx_index` was its block's last, from the block
+/// as read (its `transactions`, hashes or objects); `None` without them.
+pub fn closes_block(tx_index: u64, block: &Value) -> Option<bool> {
+    let n = block.get("transactions")?.as_array()?.len() as u64;
+    Some(tx_index + 1 == n)
 }
 
 /// Whether transaction `tx_index` of `block` was its flashblock's last, from

@@ -304,3 +304,21 @@ fn a_refused_subscription_fails_the_check() {
     assert!(v.reasons.iter().any(|r| r.contains("refused")), "{:?}", v.reasons);
     assert!(v.reasons.iter().any(|r| r.contains("session")), "{:?}", v.reasons);
 }
+
+/// R41: "within half of the block time either way" is inclusive: a chain
+/// at 300 or 100 ms against 200 holds; past either it does not.
+#[test]
+fn the_cadence_bound_is_half_the_block_time_either_way_inclusive() {
+    let window = |step: u64| {
+        let mut w = HeadWindow::new();
+        for n in 0..20u64 {
+            w.observe(100 + n, Some(1_792_605_600_000 + n * step));
+        }
+        (w, 1_792_605_600_000 + 19 * step)
+    };
+    for (step, holds) in [(300, true), (302, false), (100, true), (98, false)] {
+        let (w, newest) = window(step);
+        assert_eq!(w.chain_cadence_ms(), Some(step));
+        assert_eq!(w.holds(200, 10_000, newest), holds, "{step} ms a block");
+    }
+}

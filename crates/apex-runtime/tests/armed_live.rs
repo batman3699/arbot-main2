@@ -117,6 +117,8 @@ struct Script {
     sent: Mutex<Vec<(Vec<u8>, Value)>>,
     ledger: Option<PathBuf>,
     written_first: AtomicUsize,
+    /// How long each send takes to answer, in ms.
+    delay_ms: std::sync::atomic::AtomicU64,
 }
 
 #[async_trait::async_trait]
@@ -130,6 +132,10 @@ impl ValiditySend for Script {
             }
         }
         self.sent.lock().unwrap().push((raw.to_vec(), validity.clone()));
+        let delay = self.delay_ms.load(Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
         self.answers.lock().unwrap().pop_front().unwrap_or(SendAnswer::Accepted(keccak256(raw)))
     }
 }
@@ -1115,4 +1121,17 @@ async fn the_denim_report_carries_cadence_lag_and_skips() {
     let r = f.live.report(NOW + 500);
     assert_eq!((r.chain_cadence_ms, r.head_skips, r.heads_without_ms), (Some(200), 1, 0));
     assert_eq!(r.head_lag_ms, Some(266));
+}
+
+/// R41: each send in a batch is held to the head lag at its own time, not at
+/// the batch's start: a send that waits behind a slow one sees the feed as
+/// stale as it then is.
+#[tokio::test]
+async fn a_late_send_in_a_batch_is_held_to_the_lag_at_its_own_time() {
+    let f = fixture(denim_policy(), vec![], vec![]);
+    start_denim(&f).await;
+    f.script.delay_ms.store(1_100, Ordering::Relaxed);
+    let batch = [ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000))), ArmedLine::Arm(Box::new(arm(2, 1, 1_000_000, 600_000)))];
+    f.live.on_lines(&batch, 0, NOW).await;
+    assert_eq!(sent(&f), 1, "the second send came 1.1 s after the first, with no head since: 1,266 ms of lag");
 }
