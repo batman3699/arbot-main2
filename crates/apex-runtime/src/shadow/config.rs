@@ -25,6 +25,7 @@
 use alloy_primitives::{keccak256, Address, B256};
 use apex_config::{ConfigError, Env, Secret};
 use apex_econ::eligibility::EligibilityPolicy;
+use crate::denim::{DENIM_BLOCK_MS, PRE_DENIM_BLOCK_MS};
 use crate::live::inventory::UniverseFilter;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -190,6 +191,11 @@ pub struct Policy {
     pub report_every_s: u64,
     /// How often, in blocks, the L1 fee oracle is read again.
     pub l1_every_blocks: u64,
+    /// R41: the head loop's reads of slow values (the view, Slipstream's
+    /// TWAPs, Aerodrome v2's fees) and armed-live's stops, at most once this
+    /// often. 0, the default, is every head, as before Denim.
+    #[serde(default)]
+    pub head_reads_every_ms: u64,
     /// The risk gate's cost-confidence cap for this run: how large a share of
     /// the expected profit the gas estimate's p50-to-p99 width may be, in bps.
     pub max_cost_confidence_bps: u32,
@@ -277,7 +283,12 @@ pub struct ArmedConfig {
     pub max_arms: usize,
     pub rungs: u8,
     pub window_s: u64,
+    /// 2000 before Denim, 200 after (R41's load check).
     pub block_time_ms: u64,
+    /// R41: under Denim, the oldest the newest head's `timestampMs` may be at
+    /// a send, in ms. 0 before Denim, whose heads carry no such stamp.
+    #[serde(default)]
+    pub max_head_lag_ms: u64,
     pub margin_wei: u64,
     pub band_cap_bps: u32,
     pub liquidity_floor_bps: u32,
@@ -467,7 +478,47 @@ fn invalid(detail: impl Into<String>) -> ShadowConfigError {
     ShadowConfigError::Invalid(detail.into())
 }
 
+/// R41: one regime or the other, never half of each. Base's 2 s blocks keep
+/// `pendingLogs` and have no stamp to measure lag by; Denim's 200 ms blocks
+/// have neither `pendingLogs` nor flashblocks, and a bounded head lag.
+fn regime(raw: &Raw) -> Result<(), ShadowConfigError> {
+    let a = &raw.armed;
+    match a.block_time_ms {
+        DENIM_BLOCK_MS => {
+            if raw.feed.pending_logs {
+                return Err(invalid("feed.pending_logs must be false at 200 ms: Denim ends pendingLogs"));
+            }
+            if raw.flashblocks.is_some() {
+                return Err(invalid("the flashblocks section must be absent at 200 ms: Denim ends flashblocks"));
+            }
+            if !(1..=5_000).contains(&a.max_head_lag_ms) {
+                return Err(invalid(format!("armed.max_head_lag_ms {} is outside 1-5000 at 200 ms", a.max_head_lag_ms)));
+            }
+        }
+        PRE_DENIM_BLOCK_MS => {
+            if !raw.feed.pending_logs {
+                return Err(invalid("feed.pending_logs must be true at 2000 ms"));
+            }
+            if a.max_head_lag_ms != 0 {
+                return Err(invalid("armed.max_head_lag_ms must be 0 at 2000 ms: pre-fork heads carry no timestampMs"));
+            }
+        }
+        other => return Err(invalid(format!("armed.block_time_ms {other}: 2000 before Denim, 200 after"))),
+    }
+    let reads = raw.policy.head_reads_every_ms;
+    if reads != 0 && !(1_000..=10_000).contains(&reads) {
+        return Err(invalid(format!("policy.head_reads_every_ms {reads}: 0, or 1000-10000")));
+    }
+    Ok(())
+}
+
 impl ShadowConfig {
+    /// R41: a Denim configuration: 200 ms blocks. Every path whose behaviour
+    /// depends on the regime asks this.
+    pub const fn denim(&self) -> bool {
+        self.armed.block_time_ms == DENIM_BLOCK_MS
+    }
+
     /// R37: the executor the arming engine builds for, and armed-live sends
     /// to: `LeanExecutor2` when `armed.executor2` is set, else v1.
     pub fn armed_executor(&self) -> Address {
@@ -583,14 +634,14 @@ impl ShadowConfig {
         if !(1..=64).contains(&a.max_arms)
             || !(1..=crate::armed::threshold::RUNG_OFFSETS.len()).contains(&usize::from(a.rungs))
             || !(2..=50).contains(&a.window_s)
-            || a.block_time_ms == 0
             || a.band_cap_bps == 0
             || a.liquidity_floor_bps > 10_000
         {
             return Err(invalid(
-                "armed: max_arms 1-64, rungs 1-6, window_s 2-50, block_time_ms > 0, band_cap_bps > 0, liquidity_floor_bps <= 10000",
+                "armed: max_arms 1-64, rungs 1-6, window_s 2-50, band_cap_bps > 0, liquidity_floor_bps <= 10000",
             ));
         }
+        regime(&raw)?;
         Ok(Self {
             version,
             chain_id: raw.chain_id,

@@ -149,9 +149,102 @@ fn after_denim_the_feed_is_heads_and_canonical_logs() {
     );
 
     let var = "APEX_SECRET_SHADOW_TEST_DENIM";
-    let denim = yaml(var, "var/apex/shadow.journal").replace("armed:\n", "feed:\n  pending_logs: false\narmed:\n");
-    let c = ShadowConfig::from_yaml_str(&denim, &env(var, SECRET)).unwrap();
+    // R41: a 2 s config that drops pendingLogs is half-flipped, and refused.
+    let half = yaml(var, "var/apex/shadow.journal").replace("armed:\n", "feed:\n  pending_logs: false\narmed:\n");
+    assert!(matches!(ShadowConfig::from_yaml_str(&half, &env(var, SECRET)), Err(ShadowConfigError::Invalid(m)) if m.contains("feed.pending_logs")));
+    let c = ShadowConfig::from_yaml_str(&denim_yaml(var), &env(var, SECRET)).unwrap();
     assert!(!c.feed.pending_logs);
+}
+
+/// R41: `yaml` switched to Denim as the Denim files are: 200 ms blocks, no
+/// pendingLogs, no flashblocks, and the head-lag bound.
+fn denim_yaml(var: &str) -> String {
+    yaml(var, "var/apex/shadow.journal")
+        .replace("flashblocks:\n  stream: wss://mainnet.flashblocks.base.org/ws\n  ledger: var/f.jsonl\n", "")
+        .replace("armed:\n", "feed:\n  pending_logs: false\narmed:\n")
+        .replace("  block_time_ms: 2000\n", "  block_time_ms: 200\n  max_head_lag_ms: 1000\n")
+}
+
+/// R41: a config is one regime or the other, never half of each. Each refusal
+/// names its field.
+#[test]
+fn a_half_flipped_config_is_refused() {
+    let var = "APEX_SECRET_SHADOW_TEST_DENIM";
+    let e = env(var, SECRET);
+    let base = yaml(var, "var/apex/shadow.journal");
+    let denim = denim_yaml(var);
+    let refused = |text: String, field: &str| match ShadowConfig::from_yaml_str(&text, &e) {
+        Err(ShadowConfigError::Invalid(m)) => assert!(m.contains(field), "{m} should name {field}"),
+        other => panic!("{field}: expected a refusal, got {:?}", other.map(|c| c.armed.block_time_ms)),
+    };
+    refused(denim.replace("feed:\n  pending_logs: false\n", ""), "feed.pending_logs");
+    refused(denim.replace("armed:\n", "flashblocks:\n  stream: wss://x/ws\n  ledger: var/f.jsonl\narmed:\n"), "flashblocks");
+    refused(denim.replace("  max_head_lag_ms: 1000\n", ""), "armed.max_head_lag_ms");
+    refused(denim.replace("max_head_lag_ms: 1000", "max_head_lag_ms: 5001"), "armed.max_head_lag_ms");
+    refused(base.replace("armed:\n", "feed:\n  pending_logs: false\narmed:\n"), "feed.pending_logs");
+    refused(base.replace("  block_time_ms: 2000\n", "  block_time_ms: 2000\n  max_head_lag_ms: 1000\n"), "armed.max_head_lag_ms");
+    refused(base.replace("block_time_ms: 2000", "block_time_ms: 1000"), "armed.block_time_ms");
+    let reads = |v: u64| base.replace("  l1_every_blocks: 30\n", &format!("  l1_every_blocks: 30\n  head_reads_every_ms: {v}\n"));
+    refused(reads(999), "policy.head_reads_every_ms");
+    refused(reads(10_001), "policy.head_reads_every_ms");
+    for v in [0, 1_000, 10_000] {
+        assert_eq!(ShadowConfig::from_yaml_str(&reads(v), &e).unwrap().policy.head_reads_every_ms, v);
+    }
+    assert!(!ShadowConfig::from_yaml_str(&base, &e).unwrap().denim());
+    let d = ShadowConfig::from_yaml_str(&denim, &e).unwrap();
+    assert!(d.denim());
+    assert_eq!((d.armed.block_time_ms, d.armed.max_head_lag_ms), (200, 1_000));
+}
+
+/// R41: each Denim file is its base file with exactly the switch's fields
+/// changed. An edit to a base file that forgets its Denim twin fails here.
+#[test]
+fn the_denim_configs_differ_from_the_base_ones_only_by_the_switch() {
+    use serde_yaml::Value;
+    let ops = format!("{}/../../ops", env!("CARGO_MANIFEST_DIR"));
+    let read = |f: &str| -> Value { serde_yaml::from_str(&std::fs::read_to_string(format!("{ops}/{f}")).unwrap()).unwrap() };
+    let take = |v: &mut Value, section: Option<&str>, key: &str| -> Option<Value> {
+        let m = match section {
+            Some(s) => v.get_mut(s).and_then(Value::as_mapping_mut).unwrap(),
+            None => v.as_mapping_mut().unwrap(),
+        };
+        m.remove(key)
+    };
+    let switch = |v: &mut Value| {
+        [
+            take(v, Some("armed"), "block_time_ms"),
+            take(v, None, "feed"),
+            take(v, None, "flashblocks").map(|_| Value::from("present")),
+            take(v, Some("policy"), "l1_every_blocks"),
+            take(v, Some("policy"), "max_evidence_age_blocks"),
+            take(v, Some("policy"), "head_reads_every_ms"),
+            take(v, Some("armed"), "max_head_lag_ms"),
+        ]
+    };
+    let feed_off: Value = serde_yaml::from_str("pending_logs: false").unwrap();
+    for name in ["canary", "shadow"] {
+        let (mut base, mut denim) = (read(&format!("{name}.base.yaml")), read(&format!("{name}.denim.yaml")));
+        let b = switch(&mut base);
+        let d = switch(&mut denim);
+        assert_eq!(base, denim, "{name}: the files differ beyond the switch");
+        let n = |x: u64| Some(Value::from(x));
+        assert_eq!(b, [n(2_000), None, Some(Value::from("present")), n(30), n(1_800), None, None], "{name}.base.yaml");
+        assert_eq!(d, [n(200), Some(feed_off.clone()), None, n(300), n(18_000), n(2_000), n(1_000)], "{name}.denim.yaml");
+    }
+    let e = env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key");
+    for (file, canary, denim) in [
+        ("canary.base.yaml", true, false),
+        ("canary.denim.yaml", true, true),
+        ("shadow.base.yaml", false, false),
+        ("shadow.denim.yaml", false, true),
+    ] {
+        let path = format!("{ops}/{file}");
+        let c = if canary { ShadowConfig::load_canary(&path, &e) } else { ShadowConfig::load(&path, &e) }.unwrap_or_else(|err| panic!("{file}: {err}"));
+        assert_eq!(c.denim(), denim, "{file}");
+        if denim {
+            assert_eq!(c.armed.window_s * 1_000 / c.armed.block_time_ms, 50, "{file}: the bound is 50 blocks");
+        }
+    }
 }
 
 /// R36, Denim: flashblocks end, and with them the stream and its ledger.
