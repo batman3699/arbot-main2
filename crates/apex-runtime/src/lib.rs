@@ -37,6 +37,7 @@ pub mod armed;
 pub mod bus;
 pub mod canary;
 pub mod commit;
+pub mod denim;
 pub mod econ;
 pub mod live;
 pub mod plane;
