@@ -85,6 +85,17 @@ pub enum Kind {
     NewFlashblocks,
 }
 
+impl Kind {
+    const fn index(self) -> usize {
+        match self {
+            Self::NewHeads => 0,
+            Self::Logs => 1,
+            Self::PendingLogs => 2,
+            Self::NewFlashblocks => 3,
+        }
+    }
+}
+
 impl Subscription {
     pub const fn kind(&self) -> Kind {
         match self {
@@ -121,6 +132,9 @@ pub struct Head {
     pub number: u64,
     pub hash: B256,
     pub timestamp: u64,
+    /// R41: Denim's `timestampMs`, the block's time in milliseconds. `None`
+    /// before Denim, and for anything but a `0x` quantity: never a guess.
+    pub timestamp_ms: Option<u64>,
     pub base_fee_per_gas: Option<u128>,
     pub gas_used: u64,
     pub gas_limit: u64,
@@ -191,6 +205,7 @@ pub fn parse_notification(msg: &Value, ids: &BTreeMap<String, Kind>) -> Option<N
             number: quantity(r.get("number")?)?,
             hash: r.get("hash")?.as_str()?.parse().ok()?,
             timestamp: quantity(r.get("timestamp")?)?,
+            timestamp_ms: r.get("timestampMs").and_then(quantity),
             base_fee_per_gas: r.get("baseFeePerGas").and_then(quantity_u128),
             gas_used: quantity(r.get("gasUsed")?)?,
             gas_limit: quantity(r.get("gasLimit")?)?,
@@ -279,6 +294,10 @@ pub struct WsStats {
     refusals: AtomicU64,
     dropped: AtomicU64,
     last_failure: Mutex<Option<String>>,
+    /// R41: notification text bytes by subscription kind ([`Kind::index`]),
+    /// and every other text frame: what a provider billing by the byte bills.
+    bytes: [AtomicU64; 4],
+    bytes_other: AtomicU64,
 }
 
 impl WsStats {
@@ -292,6 +311,19 @@ impl WsStats {
     /// Notifications discarded because the consumer was behind.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+    /// Text bytes received as notifications on `kind`'s subscriptions.
+    pub fn bytes(&self, kind: Kind) -> u64 {
+        self.bytes[kind.index()].load(Ordering::Relaxed)
+    }
+    /// Every other text frame's bytes: subscription answers, notifications
+    /// for no subscription of this session, anything unparsed.
+    pub fn bytes_other(&self) -> u64 {
+        self.bytes_other.load(Ordering::Relaxed)
+    }
+    fn count_bytes(&self, kind: Option<Kind>, n: usize) {
+        let counter = kind.map_or(&self.bytes_other, |k| &self.bytes[k.index()]);
+        counter.fetch_add(n as u64, Ordering::Relaxed);
     }
     /// The most recent failure, described by kind. Never carries the URL.
     pub fn last_failure(&self) -> Option<String> {
@@ -466,7 +498,16 @@ impl WsFeed {
             };
             match msg {
                 Message::Text(text) => {
-                    let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                        self.stats.count_bytes(None, text.len());
+                        continue;
+                    };
+                    let kind = v
+                        .get("params")
+                        .and_then(|p| p.get("subscription"))
+                        .and_then(Value::as_str)
+                        .and_then(|sid| ids.get(sid).copied());
+                    self.stats.count_bytes(kind, text.len());
                     if let Some(id) = v.get("id").and_then(Value::as_u64) {
                         let Some(kind) = awaiting.remove(&id) else { continue };
                         match v.get("result").and_then(Value::as_str) {

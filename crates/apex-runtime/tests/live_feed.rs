@@ -367,6 +367,7 @@ fn a_head_is_remembered_not_published() {
         number: 105,
         hash: B256::repeat_byte(9),
         timestamp: 1,
+        timestamp_ms: None,
         base_fee_per_gas: Some(6_000_000),
         gas_used: 1,
         gas_limit: 2,
@@ -644,7 +645,7 @@ fn heads_and_liquidity_events_do_not_end_a_burst() {
     let book = book();
     let mut h = FeedHandler::new(BASE);
     assert!(h.handle(&book, Notification::Log(swap(-197_360, 101, 7, true, 1, 1)), NOW).is_empty());
-    let head = Head { number: 100, hash: B256::repeat_byte(9), timestamp: 1, base_fee_per_gas: None, gas_used: 1, gas_limit: 2 };
+    let head = Head { number: 100, hash: B256::repeat_byte(9), timestamp: 1, timestamp_ms: None, base_fee_per_gas: None, gas_used: 1, gas_limit: 2 };
     assert!(h.handle(&book, Notification::Head(head), NOW).is_empty());
     let mint = RawLog { topics: vec![MINT], ..swap(TICK, 101, 8, true, 1, 1) };
     assert_eq!(h.handle(&book, Notification::Log(mint), NOW), vec![Effect::Reload(vec![POOL])]);
@@ -677,7 +678,7 @@ fn the_quiet_deadline_follows_the_latest_swap() {
     assert_eq!(h.quiet_deadline(), None);
     h.handle(&book, Notification::Log(swap(-197_360, 101, 7, true, 1, 1)), ms(0));
     assert_eq!(h.quiet_deadline(), Some(ms(20)));
-    let head = Head { number: 100, hash: B256::repeat_byte(9), timestamp: 1, base_fee_per_gas: None, gas_used: 1, gas_limit: 2 };
+    let head = Head { number: 100, hash: B256::repeat_byte(9), timestamp: 1, timestamp_ms: None, base_fee_per_gas: None, gas_used: 1, gas_limit: 2 };
     h.handle(&book, Notification::Head(head), ms(5));
     assert_eq!(h.quiet_deadline(), Some(ms(20)));
     h.handle(&book, Notification::Log(swap(-197_361, 101, 9, true, 1, 1)), ms(8));
@@ -741,7 +742,7 @@ fn a_swap_that_cannot_be_sized_makes_the_burst_unmeasured() {
 // ------------------------------------------- R18: the block being built, from the feed
 
 fn head_at(number: u64, timestamp: u64) -> Head {
-    Head { number, hash: B256::repeat_byte(9), timestamp, base_fee_per_gas: Some(5_000_000), gas_used: 1, gas_limit: 2 }
+    Head { number, hash: B256::repeat_byte(9), timestamp, timestamp_ms: None, base_fee_per_gas: Some(5_000_000), gas_used: 1, gas_limit: 2 }
 }
 
 /// **The block being built comes from the feed.** Tier 2 sets the context of

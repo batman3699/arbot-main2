@@ -95,6 +95,43 @@ fn a_new_head_parses() {
     }
 }
 
+fn head_of(result: Value) -> apex_chain::rpc::ws::Head {
+    match parse_notification(&note("0x1", result), &ids()) {
+        Some(Notification::Head(h)) => h,
+        other => panic!("expected a head, got {other:?}"),
+    }
+}
+
+/// R41: a Denim head carries `timestampMs` beside its whole-second timestamp
+/// (Base Sepolia, measured 2026-10-31).
+#[test]
+fn a_denim_head_carries_its_millisecond_timestamp() {
+    let mut v = head_json(100);
+    v["timestamp"] = json!("0x6ad8fda1");
+    v["timestampMs"] = json!("0x1a15f9ebe78");
+    let h = head_of(v);
+    assert_eq!(h.timestamp, 1_792_605_601);
+    assert_eq!(h.timestamp_ms, Some(1_792_605_601_400));
+}
+
+/// R41: a pre-fork head has none.
+#[test]
+fn a_head_without_timestamp_ms_has_none() {
+    assert_eq!(head_of(head_json(100)).timestamp_ms, None);
+}
+
+/// R41: anything but a `0x` quantity is no timestamp at all, never a wrong
+/// one; the head still parses.
+#[test]
+fn a_timestamp_ms_that_is_not_a_quantity_is_absent() {
+    for odd in [json!(1_792_605_601_400u64), json!("1792605601400")] {
+        let mut v = head_json(100);
+        v["timestampMs"] = odd.clone();
+        let h = head_of(v);
+        assert_eq!((h.number, h.timestamp_ms), (100, None), "{odd}");
+    }
+}
+
 /// A preconfirmed log says so. The two kinds are different facts — a
 /// flashblock the sequencer may still reorder, and a sealed block — and a
 /// consumer that could not tell them apart would treat one as the other.
@@ -215,6 +252,39 @@ async fn the_feed_subscribes_and_forwards() {
     let requests = node.requests();
     assert_eq!(requests.len(), 3);
     assert!(requests.iter().all(|r| r["method"] == json!("eth_subscribe")));
+
+    stop_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle).await.expect("stops").expect("joins");
+}
+
+/// R41: what each subscription costs in bytes, which is what BlockPI bills:
+/// every notification's text frame counted against its own kind, and every
+/// other frame (the subscription answers) apart.
+#[tokio::test]
+async fn bytes_are_counted_by_subscription() {
+    let pushes = [(1usize, head_json(100)), (3, log_json(None, false)), (2, log_json(Some(100), false))];
+    let node = WsNode::start(vec![Script {
+        pushes: pushes.iter().map(|(s, r)| Push { subscription: *s, result: r.clone() }).collect(),
+        ..Script::default()
+    }])
+    .await;
+    let feed = WsFeed::new(&node.url("/v1/ws/key"), subs(), fast()).expect("a feed");
+    let stats = feed.stats();
+    let (stop_tx, stop) = tokio::sync::watch::channel(false);
+    let (handle, mut rx) = feed.spawn(stop);
+    for _ in 0..3 {
+        recv(&mut rx).await;
+    }
+    // Each frame as `support/ws.rs` writes it.
+    let frame = |s: usize, r: &Value| {
+        json!({"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":format!("0x{s:x}"),"result":r}}).to_string().len() as u64
+    };
+    let answer = |id: u64| json!({"jsonrpc":"2.0","id":id,"result":format!("0x{id:x}")}).to_string().len() as u64;
+    assert_eq!(stats.bytes(Kind::NewHeads), frame(1, &pushes[0].1));
+    assert_eq!(stats.bytes(Kind::PendingLogs), frame(3, &pushes[1].1));
+    assert_eq!(stats.bytes(Kind::Logs), frame(2, &pushes[2].1));
+    assert_eq!(stats.bytes(Kind::NewFlashblocks), 0);
+    assert_eq!(stats.bytes_other(), answer(1) + answer(2) + answer(3));
 
     stop_tx.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(5), handle).await.expect("stops").expect("joins");

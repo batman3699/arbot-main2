@@ -162,7 +162,7 @@ fn config(max_age: Duration) -> ReaderConfig {
 }
 
 fn head(number: u64) -> Head {
-    Head { number, hash: B256::repeat_byte(9), timestamp: 1, base_fee_per_gas: Some(6_000_000), gas_used: 1, gas_limit: 400_000_000 }
+    Head { number, hash: B256::repeat_byte(9), timestamp: 1, timestamp_ms: None, base_fee_per_gas: Some(6_000_000), gas_used: 1, gas_limit: 400_000_000 }
 }
 
 /// A ticket whose route is UNI then SLIP, borrowing 5 WETH.
