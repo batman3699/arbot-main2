@@ -227,6 +227,38 @@ pub fn landing(fire: (u64, u32), closes: bool, rival: Option<(u64, u32)>, bid: u
     Landing { optimistic: at(ours), pessimistic: at(next_flashblock(ours)) }
 }
 
+/// R41: who lands first where only whole blocks place the fire and the
+/// rival: the ledger's gaps before Denim, and every fire under it. Ours is
+/// the trigger's block, or the next when the trigger `closes` its own (it was
+/// the block's last transaction); in ours the higher priority fee wins, a
+/// rival before it wins, and one after it loses.
+pub fn landing_in_blocks(fire_block: u64, closes: bool, rival_block: Option<u64>, bid: u128, rival_bid: u128) -> Landing {
+    let Some(r) = rival_block else { return Landing { optimistic: true, pessimistic: true } };
+    let ours = fire_block + u64::from(closes);
+    let at = |ours: u64| if r < ours { false } else if r == ours { bid > rival_bid } else { true };
+    Landing { optimistic: at(ours), pessimistic: at(ours + 1) }
+}
+
+/// R41: where a fire and its rival were placed: by the flashblock ledger, or
+/// by whole blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    Flashblocks { fire: (u64, u32), closes: bool, rival: Option<(u64, u32)> },
+    Blocks { fire: u64, closes: bool, rival: Option<u64> },
+}
+
+/// R41: a bid's landing at `p`: our own send's rule when the rival was ours,
+/// else the placement's.
+pub fn land(p: &Placement, ours: bool, bid: u128, rival_bid: u128) -> Landing {
+    if ours {
+        return own_landing(bid, rival_bid);
+    }
+    match *p {
+        Placement::Flashblocks { fire, closes, rival } => landing(fire, closes, rival, bid, rival_bid),
+        Placement::Blocks { fire, closes, rival } => landing_in_blocks(fire, closes, rival, bid, rival_bid),
+    }
+}
+
 /// The rival was our own send, landed at `sent_bid`: a bid at least as high
 /// lands, and a lower one is not known to, so it counts as lost.
 pub fn own_landing(bid: u128, sent_bid: u128) -> Landing {

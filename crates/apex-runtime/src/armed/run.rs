@@ -1,7 +1,7 @@
 //! `apex armed-eval` (R26): every closed arm judged against the chain, and a
 //! verdict per arm, written to the verdict ledger.
 //!
-//! One run takes arms whose window closed at least [`SETTLE_BLOCKS`] ago and
+//! One run takes arms whose window closed at least [`settle_blocks`] ago and
 //! after the cursor (`armed-eval.cursor` beside the verdicts). For each it:
 //! 1. rebuilds the watched words from one `eth_getLogs` over the run's pools;
 //! 2. finds the fire point and the rival (`eval::judge`);
@@ -19,7 +19,7 @@
 //! The lean executor sells all hop 1 returns, so a fire leaves no intermediate
 //! residue: `residue` is absent from verdicts since R36's lean quote.
 
-use super::eval::{self, bid_wei_per_gas, judge, landing, merge_renewals, net_wei, own_landing, Landing, Logged, Point, TxEffect, Write, F_PERMILLE};
+use super::eval::{self, bid_wei_per_gas, judge, land, merge_renewals, net_wei, Landing, Logged, Placement, Point, TxEffect, Write, F_PERMILLE};
 use super::lines::{Arm, ArmedLine};
 use super::predicate::{layout, price_mask};
 use crate::live::book::{LiquidityWrite, PoolBook, StateWrite, SwapApplied, SwapWrite, SyncWrite};
@@ -48,8 +48,35 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Blocks a window must have closed for before its arm is judged: a minute.
-pub const SETTLE_BLOCKS: u64 = 30;
+/// Blocks a window must have closed for before its arm is judged: a minute
+/// in the configuration's blocks, 30 at 2 s and 300 at 200 ms (R41).
+pub const fn settle_blocks(block_time_ms: u64) -> u64 {
+    60_000 / if block_time_ms == 0 { 1 } else { block_time_ms }
+}
+
+/// R41: the unit a verdict's positions count in, so that offsets from
+/// different eras are never pooled as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OffsetUnit {
+    /// The flashblock ledger placed both.
+    #[serde(rename = "flashblock")]
+    Flashblock,
+    /// Whole 2 s blocks: a pre-Denim fire the ledger did not place.
+    #[serde(rename = "block_2s")]
+    Block2s,
+    /// Whole 200 ms blocks: a fire at or after the Denim fork block.
+    #[serde(rename = "block_200ms")]
+    Block200ms,
+}
+
+/// R41: the unit, from whether the ledger placed the fire and its rival, and
+/// otherwise from the fire block's own timestamp.
+pub fn unit_of(granular: bool, fire_timestamp: Option<u64>) -> Option<OffsetUnit> {
+    if granular {
+        return Some(OffsetUnit::Flashblock);
+    }
+    fire_timestamp.map(|t| if t >= crate::denim::DENIM_MAINNET_TS { OffsetUnit::Block200ms } else { OffsetUnit::Block2s })
+}
 /// Blocks per `eth_getLogs`.
 const LOG_CHUNK: u64 = 500;
 
@@ -228,6 +255,15 @@ pub struct Verdict {
     /// it, and from verdicts before it was judged (R37).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fire_closes_flashblock: Option<bool>,
+    /// R41: in whole blocks, the fire was its block's last transaction: ours
+    /// lands in the next block at the earliest. Absent where the ledger
+    /// placed the fire, and before R41.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire_closes_block: Option<bool>,
+    /// R41: the unit `fire` and `rival` are placed in. Absent before R41, and
+    /// where the fire block could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_unit: Option<OffsetUnit>,
     pub rival: Option<Position>,
     /// The rival's effective priority fee per gas.
     pub rival_priority_wei: Option<String>,
@@ -355,7 +391,7 @@ pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
     let lines: Vec<ArmedLine> = read_lines(&config.armed.ledger, now, 2);
     let due: Vec<Arm> = merge_renewals(lines)
         .into_iter()
-        .filter(|a| a.to_block > cursor && a.to_block + SETTLE_BLOCKS <= head)
+        .filter(|a| a.to_block > cursor && a.to_block + settle_blocks(config.armed.block_time_ms) <= head)
         .collect();
     let mut report = RunReport { cursor, ..Default::default() };
     if due.is_empty() {
@@ -466,6 +502,8 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
         shadowed,
         fire: None,
         fire_closes_flashblock: None,
+        fire_closes_block: None,
+        offset_unit: None,
         rival: None,
         rival_priority_wei: None,
         ours: false,
@@ -524,16 +562,22 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
         }
     }
     // Positions and the rival's bid. Flashblocks when the ledger places both;
-    // otherwise whole blocks (index 0), where a rival in the fire's own block
-    // competes by fee and the pessimistic case gives it the block.
+    // otherwise whole blocks (R41): the fire block's own transaction count
+    // says whether the trigger closed it, and its time which era's blocks
+    // the offsets count.
     let fire_fb = locate(ctx.flashblocks, fire.block, fire.tx_index);
     let rival_fb = j.rival.as_ref().map(|r| locate(ctx.flashblocks, r.block, r.tx_index));
     let granular = fire_fb.is_some() && rival_fb.is_none_or(|x| x.is_some());
     v.fire = Some(Position { block: fire.block, tx_index: fire.tx_index, tx: fire.tx.clone(), flashblock: fire_fb });
     v.fire_closes_flashblock = closes_flashblock(ctx.flashblocks, fire.block, fire.tx_index);
-    let fire_at = (fire.block, if granular { fire_fb.unwrap_or(0) } else { 0 });
-    let closes = granular && v.fire_closes_flashblock == Some(true);
+    let fire_time = block.as_ref().and_then(|b| u64::try_from(hex_u128(b.get("timestamp")?)?).ok());
+    v.offset_unit = unit_of(granular, fire_time);
+    if !granular {
+        let txs = block.as_ref().and_then(|b| Some(b.get("transactions")?.as_array()?.len() as u64));
+        v.fire_closes_block = txs.map(|n| fire.tx_index + 1 == n);
+    }
     let mut rival_at = None;
+    let mut rival_block = None;
     let mut rival_bid = 0u128;
     if let Some(r) = &j.rival {
         let r_fb = rival_fb.flatten();
@@ -543,9 +587,20 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
         v.ours = tx.as_ref().is_some_and(|t| is_own_send(arm, executor, t.to, &t.input));
         v.rival = Some(Position { block: r.block, tx_index: r.tx_index, tx: r.tx.clone(), flashblock: r_fb });
         v.rival_priority_wei = Some(rival_bid.to_string());
-        rival_at = Some((r.block, if granular { r_fb.unwrap_or(0) } else { 0 }));
+        rival_at = Some((r.block, r_fb.unwrap_or(0)));
+        rival_block = Some(r.block);
     }
-    let judge_bid = |bid: u128| if v.ours { own_landing(bid, rival_bid) } else { landing(fire_at, closes, rival_at, bid, rival_bid) };
+    let placement = if granular {
+        Placement::Flashblocks {
+            fire: (fire.block, fire_fb.unwrap_or(0)),
+            closes: v.fire_closes_flashblock == Some(true),
+            rival: rival_at,
+        }
+    } else {
+        Placement::Blocks { fire: fire.block, closes: v.fire_closes_block == Some(true), rival: rival_block }
+    };
+    let ours = v.ours;
+    let judge_bid = |bid: u128| land(&placement, ours, bid, rival_bid);
     let surplus = surplus_in_wei(arm, ctx.weth_usd);
     let gross = v.gross_wei.as_deref().and_then(|g| U256::from_dec_str(g).ok());
     let other: u128 = arm.other_wei.parse().unwrap_or(0);

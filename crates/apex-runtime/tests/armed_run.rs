@@ -722,3 +722,16 @@ fn a_run_simulates_a_fixed_even_sample_of_its_fires() {
     assert_eq!(sample_for_simulation(&fires[..1], 2).len(), 1, "fewer fires than the sample: all of them");
     assert!(sample_for_simulation(&fires, 0).is_empty(), "a sample of none");
 }
+
+/// R41: a verdict line from before R41 parses; the units serialise by name.
+#[test]
+fn old_verdicts_parse_and_units_serialise() {
+    use apex_runtime::armed::run::{OffsetUnit, Verdict};
+    let old: Verdict = serde_json::from_str(&verdict(1, false, serde_json::json!({}))).unwrap();
+    assert_eq!((old.offset_unit, old.fire_closes_block), (None, None));
+    for (u, name) in [(OffsetUnit::Flashblock, "flashblock"), (OffsetUnit::Block2s, "block_2s"), (OffsetUnit::Block200ms, "block_200ms")] {
+        assert_eq!(serde_json::to_value(u).unwrap(), serde_json::json!(name));
+        let v: Verdict = serde_json::from_str(&verdict(2, true, serde_json::json!({"offset_unit": name, "fire_closes_block": true}))).unwrap();
+        assert_eq!((v.offset_unit, v.fire_closes_block), (Some(u), Some(true)));
+    }
+}

@@ -278,3 +278,81 @@ fn a_read_start_point_skips_its_whole_block() {
     assert_eq!(j.fire, Some(Point { block: 102, tx_index: 1, tx: "0x1021".into() }));
     assert_eq!(j.rival, Some(Point { block: 103, tx_index: 1, tx: "0x1031".into() }), "102's burn is applied");
 }
+
+// ------------------------------------------------------------------ R41: blocks
+
+use apex_runtime::armed::eval::{land, landing_in_blocks, Placement};
+use apex_runtime::armed::run::{settle_blocks, unit_of, OffsetUnit};
+
+const BOTH: Landing = Landing { optimistic: true, pessimistic: true };
+
+/// Nothing follows a block's last transaction in it: a trigger that closes
+/// its block is contested in the next, by priority fee.
+#[test]
+fn in_blocks_a_trigger_that_closes_its_block_is_contested_in_the_next() {
+    assert!(!landing_in_blocks(101, true, Some(102), 5, 9).optimistic, "outbid in the next block");
+    assert!(landing_in_blocks(101, true, Some(102), 9, 5).optimistic, "our bid higher");
+    assert!(!landing_in_blocks(101, true, Some(101), 9, 5).optimistic, "a rival in the trigger's own block is before us");
+}
+
+/// On Denim a validity transaction can follow its trigger in the trigger's
+/// own block: a rival there is a fee contest.
+#[test]
+fn in_blocks_a_rival_after_the_trigger_in_its_own_block_is_a_fee_contest() {
+    assert!(!landing_in_blocks(101, false, Some(101), 5, 9).optimistic);
+    assert!(landing_in_blocks(101, false, Some(101), 9, 5).optimistic);
+}
+
+#[test]
+fn in_blocks_a_rival_in_a_later_block_loses() {
+    assert_eq!(landing_in_blocks(101, false, Some(102), 1, 9), Landing { optimistic: true, pessimistic: false });
+    assert_eq!(landing_in_blocks(101, false, Some(103), 1, 9), BOTH);
+    assert_eq!(landing_in_blocks(101, false, None, 1, 9), BOTH);
+}
+
+#[test]
+fn our_own_landing_in_block_mode_wins_at_the_bid_sent_and_above() {
+    let p = Placement::Blocks { fire: 101, closes: false, rival: Some(101) };
+    assert_eq!(land(&p, true, 7, 7), BOTH);
+    assert_eq!(land(&p, true, 6, 7), Landing { optimistic: false, pessimistic: false });
+    // Placed in flashblocks, the rule is the flashblock rule's.
+    let f = Placement::Flashblocks { fire: (101, 3), closes: false, rival: Some((101, 3)) };
+    assert_eq!(land(&f, false, 9, 5), landing((101, 3), false, Some((101, 3)), 9, 5));
+}
+
+/// The rival is the first transaction after the fire to break a predicate:
+/// one before the trigger in its block never counts.
+#[test]
+fn a_write_before_the_fire_in_its_block_is_never_the_rival() {
+    let effects = vec![
+        tx(101, 1, vec![set(B, 0, 12)]), // B out of its band, before the trigger
+        tx(101, 2, vec![set(A, 0, 55)]), // the trigger: B still out
+        tx(101, 3, vec![set(B, 0, 10)]), // B back: fires
+    ];
+    let j = judge(&arm(), &effects).unwrap();
+    assert_eq!(j.fire, Some(Point { block: 101, tx_index: 3, tx: "0x1013".into() }));
+    assert_eq!(j.rival, None);
+}
+
+#[test]
+fn of_two_rivals_after_the_fire_the_first_decides() {
+    let effects = vec![tx(102, 7, vec![set(A, 0, 55)]), tx(102, 9, vec![set(A, 0, 41)]), tx(103, 1, vec![set(B, 0, 12)])];
+    let j = judge(&arm(), &effects).unwrap();
+    assert_eq!(j.rival, Some(Point { block: 102, tx_index: 9, tx: "0x1029".into() }));
+}
+
+/// A minute in the configuration's blocks.
+#[test]
+fn settle_is_a_minute_in_the_config_s_blocks() {
+    assert_eq!((settle_blocks(2_000), settle_blocks(200)), (30, 300));
+}
+
+/// The fire block's own time says which era's blocks the offsets count.
+#[test]
+fn the_unit_is_the_fire_block_s_era() {
+    assert_eq!(unit_of(false, Some(1_793_901_599)), Some(OffsetUnit::Block2s));
+    assert_eq!(unit_of(false, Some(1_793_901_600)), Some(OffsetUnit::Block200ms));
+    assert_eq!(unit_of(true, Some(1_793_901_600)), Some(OffsetUnit::Flashblock));
+    assert_eq!(unit_of(true, None), Some(OffsetUnit::Flashblock));
+    assert_eq!(unit_of(false, None), None);
+}
