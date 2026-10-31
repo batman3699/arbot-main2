@@ -246,5 +246,56 @@ class Schedule(unittest.TestCase):
             self.assertTrue(broken["ok"])
 
 
+
+class Blocks(unittest.TestCase):
+    """R41: fires the ledger did not place, in whole blocks; and the eras'
+    units, never pooled."""
+
+    def cls(self, v, own=None):
+        return C.classify(v, LAYOUTS, own or {})
+
+    def block(self, closes, rival=None, priority=None, **extra):
+        v = verdict(fire=(100, None, 20), rival=None if rival is None else (rival, None, 2), priority=priority,
+                    offset_unit="block_200ms", **extra)
+        if closes is not None:
+            v["fire_closes_block"] = closes
+        return v
+
+    def test_block_200ms_classify(self):
+        self.assertEqual(self.cls(self.block(True, 101, 7)), ("exact", 7), "the trigger closed its block: the next one, by fee")
+        self.assertEqual(self.cls(self.block(False, 100, 9)), ("exact", 9), "after the trigger in its own block")
+        self.assertEqual(self.cls(self.block(False, 101, 9)), ("uncontested", 0))
+        self.assertEqual(self.cls(self.block(True, 100, 9)), ("excluded:rival before our block", None))
+        self.assertEqual(self.cls(self.block(None, 101, 9)), ("excluded:fire not placed", None))
+        self.assertEqual(self.cls(self.block(False)), ("uncontested", 0))
+        self.assertEqual(self.cls(self.block(False, 100, None)), ("excluded:rival unreadable", None))
+        self.assertEqual(self.cls(dict(self.block(False, 100, 5), ours=True)), ("censored", 5))
+
+    def test_block_2s_never_fits(self):
+        v = verdict(fire=(100, None, 20), offset_unit="block_2s", fire_closes_block=False)
+        self.assertEqual(self.cls(v), ("excluded:block_2s", None))
+
+    def test_units_are_never_pooled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            var = Path(tmp)
+            arm = {"kind": "arm", "arm_id": 1, "route_hash": "0xr", "at_ns": 1_000, "gas_expected": 100_000,
+                   "surplus_wei": "10000000000000", "bid_wei_per_gas": "5000001", "other_wei": "0", "base_fee_wei": "5000000"}
+            write_lines(var / "armed-2026-11-06.jsonl", [arm])
+            flash = verdict(fire=(100, 4, 15), rival=(100, 4, 16), priority=9)
+            denim = verdict(fire=(200, None, 3), rival=(200, None, 4), priority=8, offset_unit="block_200ms", fire_closes_block=False)
+            write_lines(var / "armed-verdicts-2026-11-06.jsonl", [flash, denim])
+            arms = C.load_arms(var, ["2026-11-06"])
+            rows, counts = C.fires(var, ["2026-11-06"], arms, LAYOUTS, {}, unit="block_200ms")
+            self.assertEqual([(r["unit"], r["value"]) for r in rows], [("block_200ms", 8)])
+            self.assertEqual(counts["excluded:unit flashblock"], 1)
+            rows, counts = C.fires(var, ["2026-11-06"], arms, LAYOUTS, {}, unit="flashblock")
+            self.assertEqual([(r["unit"], r["value"]) for r in rows], [("flashblock", 9)])
+            self.assertEqual(counts["excluded:unit block_200ms"], 1)
+
+    def test_the_contest_s_unit_follows_its_held_out_day(self):
+        self.assertEqual(C.contest_unit("2026-11-05"), "flashblock", "the fork day is counted to 18:00, by its ledger")
+        self.assertEqual(C.contest_unit("2026-11-06"), "block_200ms")
+
+
 if __name__ == "__main__":
     unittest.main()

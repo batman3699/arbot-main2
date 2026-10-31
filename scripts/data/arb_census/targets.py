@@ -349,6 +349,9 @@ def build(days: Sequence[Mapping[str, Any]], top: int = 50) -> dict[str, Any]:
         "routes": routes,
         "bids_wei_per_gas": sorted(all_bids),
         "calibration": calibration_rows,
+        # R41: each day's offset unit, for the record; the ranking is the same
+        # in each (offset 0 in the day's own unit).
+        "units": {_day_label(day): day.get("offset_unit") for day in days if _day_label(day)},
     }
     payload["ok"] = bool(enough_days and routes and finite_source_data and _all_finite(payload))
     return payload
@@ -426,6 +429,36 @@ def ours_vs_market(days: Sequence[Mapping[str, Any]], landings: Iterable[Mapping
         rows.sort(key=lambda row: (-row["market_usd"], row["pools"][0], row["pools"][1]))
     return rows
 
+def fork_block(rpc: Any, resolver: Any) -> int | None:
+    """R41: Denim's first block on Base, found once by time and cached in
+    the census's pool metadata (``meta.json``, beside ``_sets``). ``None``
+    while the chain's head is before the fork, and nothing is cached."""
+    cached = resolver.meta.get("_denim_fork_block")
+    if isinstance(cached, int):
+        return cached
+    head = int(rpc.call("eth_blockNumber", []), 16)
+    block = rpc.call("eth_getBlockByNumber", [hex(head), False])
+    if not block or int(block["timestamp"], 16) < race.DENIM_TS:
+        return None
+    first = _first_block_at_or_after(rpc, head, race.DENIM_TS)
+    resolver.meta["_denim_fork_block"] = first
+    resolver.save()
+    return first
+
+
+def offset_unit(has_flashblocks: bool, lo: int | None, fork: int | None) -> str:
+    """R41: the unit a day's offsets count in. ``flashblock`` with a ledger;
+    otherwise whole blocks, ``block_200ms`` from the fork block on and
+    ``block_2s`` before it. An offset of 0 is the trigger's own ~200 ms unit
+    in ``flashblock`` and ``block_200ms`` alike; ``block_2s`` is ten times
+    coarser."""
+    if has_flashblocks:
+        return "flashblock"
+    if fork is not None and lo is not None and lo >= fork:
+        return "block_200ms"
+    return "block_2s"
+
+
 def _first_block_at_or_after(rpc: Any, head: int, timestamp: int) -> int:
     """Binary-search the first Base block whose timestamp >= ``timestamp``.
 
@@ -493,8 +526,12 @@ def _block_offsets_match(data: Mapping[str, Any]) -> bool:
     return True
 
 
-def _cache_current(data: Mapping[str, Any], day: str, has_flashblocks: bool) -> bool:
+def _cache_current(data: Mapping[str, Any], day: str, has_flashblocks: bool, unit: str | None = None) -> bool:
     """Avoid rereading chain history only when cache day/schema/offset semantics match."""
+    # R41: a day cached in another era's unit (a 2 s window on a Denim day) is
+    # recomputed; one cached before units were recorded is stamped, not reread.
+    if unit is not None and data.get("offset_unit", unit) != unit:
+        return False
     expected_mode = "flashblock" if has_flashblocks else "block_number"
     if data.get("_targets_cache_schema") == CACHE_SCHEMA_VERSION:
         if data.get("date") != day or not _route_schema_present(data):
@@ -581,13 +618,15 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _ensure_race_day(day: str, race_dir: Path, var_dir: Path,
-                     rpc: Any, resolver: Any) -> dict[str, Any]:
+                     rpc: Any, resolver: Any, fork: int | None = None) -> dict[str, Any]:
     cache_path = race_dir / f"race-{day}.json.gz"
     flashblocks_path = var_dir / f"flashblocks-{day}.jsonl"
     has_flashblocks = flashblocks_path.is_file() and flashblocks_path.stat().st_size > 0
     cached = _load_race_cache(cache_path)
-    if cached is not None and _cache_current(cached, day, has_flashblocks):
+    unit = None if cached is None else offset_unit(has_flashblocks, _integer(cached.get("lo")), fork)
+    if cached is not None and _cache_current(cached, day, has_flashblocks, unit):
         cached["date"] = day
+        cached["offset_unit"] = unit
         cached["_targets_cache_schema"] = CACHE_SCHEMA_VERSION
         cached["_targets_offset_mode"] = "flashblock" if has_flashblocks else "block_number"
         _atomic_gzip_json(cache_path, cached)
@@ -604,14 +643,16 @@ def _ensure_race_day(day: str, race_dir: Path, var_dir: Path,
 
     print(f"{day}: rebuilding race census for blocks {lo}..{hi} "
           f"({'flashblock ledger' if has_flashblocks else 'block-offset fallback'})", flush=True)
-    ledger = race.day_ledger(str(var_dir), lo, hi)
-    data = race.race_day(rpc, resolver, ledger, lo, hi)
+    back = race.back_blocks(lo, fork)
+    ledger = race.day_ledger(str(var_dir), lo, hi, back)
+    data = race.race_day(rpc, resolver, ledger, lo, hi, back=back)
     if not isinstance(data, dict) or not _route_schema_present(data):
         raise RuntimeError(
             "race census output lacks Task 1 fields ('pools', 'weth_in', 'gain'); "
             "merge and test R36 Task 1 before running Task 2"
         )
     data["date"] = day
+    data["offset_unit"] = offset_unit(has_flashblocks, lo, fork)
     data["_targets_cache_schema"] = CACHE_SCHEMA_VERSION
     data["_targets_offset_mode"] = "flashblock" if has_flashblocks else "block_number"
     _atomic_gzip_json(cache_path, data)
@@ -686,9 +727,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     days_to_process = _complete_utc_days(args.days)
     rpc = race.Public(args.rate)
     resolver = race.Resolving(rpc, str(meta_path))
+    # R41: Denim's first block, once; None until the chain reaches it.
+    fork = fork_block(rpc, resolver)
     days: list[dict[str, Any]] = []
     for day in days_to_process:
-        data = _ensure_race_day(day, race_dir, var_dir, rpc, resolver)
+        data = _ensure_race_day(day, race_dir, var_dir, rpc, resolver, fork)
         data["date"] = day
         days.append(data)
 

@@ -200,6 +200,12 @@ def classify(verdict: Mapping[str, Any], layouts: Mapping[tuple[int, int], tuple
         return "excluded:shadowed", None
     if verdict.get("quote_error") is not None or not verdict.get("gross_wei"):
         return "excluded:not priced", None
+    # R41: whole 2 s blocks are ten flashblocks wide: never fitted.
+    unit = verdict.get("offset_unit")
+    if unit == "block_2s":
+        return "excluded:block_2s", None
+    if unit == "block_200ms":
+        return _classify_blocks(verdict, own_sends)
     fire = verdict.get("fire") or {}
     if fire.get("flashblock") is None:
         return "excluded:fire not placed", None
@@ -213,8 +219,7 @@ def classify(verdict: Mapping[str, Any], layouts: Mapping[tuple[int, int], tuple
     if rival is None:
         return "uncontested", 0
     priority = verdict.get("rival_priority_wei")
-    tx = str(rival.get("tx", "")).lower()
-    if verdict.get("ours") or (tx in own_sends and own_sends[tx] == verdict.get("arm_id")):
+    if _own(verdict, own_sends):
         return ("censored", int(priority)) if priority is not None else ("excluded:own send unpriced", None)
     if rival.get("flashblock") is None:
         if rival["block"] > earliest[0]:
@@ -230,11 +235,48 @@ def classify(verdict: Mapping[str, Any], layouts: Mapping[tuple[int, int], tuple
     return "exact", int(priority)
 
 
+def _own(verdict: Mapping[str, Any], own_sends: Mapping[str, int | None]) -> bool:
+    tx = str((verdict.get("rival") or {}).get("tx", "")).lower()
+    return bool(verdict.get("ours")) or (tx in own_sends and own_sends[tx] == verdict.get("arm_id"))
+
+
+def _classify_blocks(verdict: Mapping[str, Any], own_sends: Mapping[str, int | None]) -> tuple[str, int | None]:
+    """R41: a Denim fire, placed in whole 200 ms blocks. Our earliest block is
+    the trigger's own, or the next when the trigger was its block's last
+    transaction; in it the higher priority fee wins."""
+    fire = verdict.get("fire") or {}
+    closes = verdict.get("fire_closes_block")
+    if closes is None or fire.get("block") is None:
+        return "excluded:fire not placed", None
+    earliest = fire["block"] + int(bool(closes))
+    rival = verdict.get("rival")
+    if rival is None:
+        return "uncontested", 0
+    priority = verdict.get("rival_priority_wei")
+    if _own(verdict, own_sends):
+        return ("censored", int(priority)) if priority is not None else ("excluded:own send unpriced", None)
+    if rival["block"] > earliest:
+        return "uncontested", 0
+    if rival["block"] < earliest:
+        return "excluded:rival before our block", None
+    if priority is None:
+        return "excluded:rival unreadable", None
+    return "exact", int(priority)
+
+
+def contest_unit(held_out_day: str) -> str:
+    """R41: the one unit a contest section fits and holds out in: the
+    flashblock era's through the fork day (its ledger ranges it to 18:00),
+    Denim's 200 ms blocks after it."""
+    return "block_200ms" if held_out_day > FORK_DAY else "flashblock"
+
+
 def fires(var: Path, days: Iterable[str], arms: Mapping[tuple[int, str], list[dict[str, Any]]],
-          layouts: Mapping[tuple[int, int], tuple[int, int]], own_sends: Mapping[str, int | None]
-          ) -> tuple[list[dict[str, Any]], Counter]:
-    """Every fired verdict of ``days`` as a scored fire, and the count of
-    each class and exclusion."""
+          layouts: Mapping[tuple[int, int], tuple[int, int]], own_sends: Mapping[str, int | None],
+          unit: str = "flashblock") -> tuple[list[dict[str, Any]], Counter]:
+    """Every fired verdict of ``days`` in ``unit`` as a scored fire, and the
+    count of each class and exclusion. A fire in another unit is excluded as
+    such (R41): eras are never pooled."""
     out: list[dict[str, Any]] = []
     counts: Counter = Counter()
     for day in days:
@@ -246,6 +288,10 @@ def fires(var: Path, days: Iterable[str], arms: Mapping[tuple[int, str], list[di
             arm = arm_of(arms, v)
             if cls.startswith("excluded"):
                 counts[cls] += 1
+                continue
+            fire_unit = v.get("offset_unit") or "flashblock"
+            if fire_unit != unit:
+                counts[f"excluded:unit {fire_unit}"] += 1
                 continue
             if arm is None:
                 counts["excluded:no arm record"] += 1
@@ -272,6 +318,7 @@ def fires(var: Path, days: Iterable[str], arms: Mapping[tuple[int, str], list[di
                 "base_fee": int(v.get("base_fee_wei") or arm.get("base_fee_wei") or 0),
                 "other": int(arm.get("other_wei") or 0),
                 "best_bid": _best_bid_of(arm),
+                "unit": fire_unit,
             })
     return out, counts
 
@@ -433,7 +480,7 @@ def evaluate(fit: Sequence[list[int]], held: Sequence[Mapping[str, Any]], cap: i
 
 
 def contest_section(var: Path, live_ledger: Path, fit_days: Sequence[str], held_out_day: str,
-                    arm_days: Sequence[str] | None = None) -> dict[str, Any]:
+                    arm_days: Sequence[str] | None = None, unit: str = "flashblock") -> dict[str, Any]:
     """The ``contest`` section: the fit's rows, and whether they passed.
 
     The runtime bids ``best_share`` on ``rows`` only when ``fit_ok``. Every
@@ -444,8 +491,8 @@ def contest_section(var: Path, live_ledger: Path, fit_days: Sequence[str], held_
     arms = load_arms(var, arm_days)
     layouts = load_layouts(var, days)
     own_sends = load_own_sends(live_ledger)
-    fit_fires, fit_counts = fires(var, fit_days, arms, layouts, own_sends)
-    held_fires, held_counts = fires(var, [held_out_day], arms, layouts, own_sends)
+    fit_fires, fit_counts = fires(var, fit_days, arms, layouts, own_sends, unit)
+    held_fires, held_counts = fires(var, [held_out_day], arms, layouts, own_sends, unit)
     rows, effective = fit_rows(fit_fires)
     upper, _ = fit_rows(fit_fires, bound="upper")
     lower_eval = evaluate(rows, held_fires)
@@ -480,6 +527,7 @@ def contest_section(var: Path, live_ledger: Path, fit_days: Sequence[str], held_
         "reasons": reasons,
         "fit_days": list(fit_days),
         "held_out_day": held_out_day,
+        "unit": unit,
         "report": {
             "fit_counts": dict(fit_counts),
             "held_out_counts": dict(held_counts),
@@ -488,6 +536,10 @@ def contest_section(var: Path, live_ledger: Path, fit_days: Sequence[str], held_
         },
     }
 
+
+# R41: Base's Denim hardfork, 2026-11-05 18:00 UTC. The fork day itself is
+# ranged by its flashblock ledger, which ends at the fork.
+FORK_DAY = "2026-11-05"
 
 # R37's arms (USDC and v4, through LeanExecutor2) began on 2026-10-29: an
 # earlier day's fires are another population, and never enter the fit.
@@ -515,7 +567,7 @@ def attach_contest(targets: dict[str, Any], var: Path, live_ledger: Path, comple
     if held is None:
         return targets
     try:
-        targets["contest"] = contest_section(var, live_ledger, fit, held, arm_days)
+        targets["contest"] = contest_section(var, live_ledger, fit, held, arm_days, contest_unit(held))
     except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as exc:
         print(f"R38 contest: not measured: {exc!r}", flush=True)
     return targets

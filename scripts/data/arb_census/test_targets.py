@@ -223,5 +223,71 @@ class UtcBlockRange(unittest.TestCase):
         self.assertFalse(T._cache_current(data, "2026-10-24", has_flashblocks=False))
 
 
+
+class Denim(unittest.TestCase):
+    """R41: the fork block, found once by time; and each day's offset unit."""
+
+    class Chain:
+        """Blocks 0..head, block n stamped ``first_ts + n``; counts its calls."""
+
+        def __init__(self, head, first_ts):
+            self.head, self.first_ts, self.calls = head, first_ts, 0
+
+        def call(self, method, params):
+            self.calls += 1
+            if method == "eth_blockNumber":
+                return hex(self.head)
+            return {"timestamp": hex(self.first_ts + int(params[0], 16))}
+
+    class Meta:
+        def __init__(self):
+            self.meta, self.saves = {}, 0
+
+        def save(self):
+            self.saves += 1
+
+    def test_fork_block_is_found_once_and_cached(self):
+        chain, resolver = self.Chain(200, T.race.DENIM_TS - 100), self.Meta()
+        self.assertEqual(T.fork_block(chain, resolver), 100)
+        self.assertEqual((resolver.meta["_denim_fork_block"], resolver.saves), (100, 1))
+        chain.calls = 0
+        self.assertEqual(T.fork_block(chain, resolver), 100)
+        self.assertEqual(chain.calls, 0, "read from the cache")
+
+    def test_fork_block_is_none_before_the_fork(self):
+        chain, resolver = self.Chain(200, T.race.DENIM_TS - 1_000), self.Meta()
+        self.assertIsNone(T.fork_block(chain, resolver))
+        self.assertEqual((resolver.meta, resolver.saves), ({}, 0), "nothing cached")
+
+    def test_offset_unit_by_day(self):
+        self.assertEqual(T.offset_unit(True, 5, 10), "flashblock")
+        self.assertEqual(T.offset_unit(False, 10, 10), "block_200ms")
+        self.assertEqual(T.offset_unit(False, 9, 10), "block_2s")
+        self.assertEqual(T.offset_unit(False, 50, None), "block_2s")
+
+    def test_a_cached_day_gains_its_unit_without_a_rebuild(self):
+        class NoChain:
+            def call(self, method, params):
+                raise AssertionError(f"rebuilt: {method}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            race_dir, var_dir = Path(tmp) / "race", Path(tmp) / "var"
+            race_dir.mkdir()
+            var_dir.mkdir()
+            (var_dir / "flashblocks-2026-10-30.jsonl").write_text('{"block": 1}\n')
+            cached = {"date": "2026-10-30", "_targets_cache_schema": T.CACHE_SCHEMA_VERSION,
+                      "_targets_offset_mode": "flashblock", "arbs": []}
+            T._atomic_gzip_json(race_dir / "race-2026-10-30.json.gz", cached)
+            data = T._ensure_race_day("2026-10-30", race_dir, var_dir, NoChain(), None, fork=None)
+            self.assertEqual(data["offset_unit"], "flashblock")
+
+    def test_a_cached_day_in_another_unit_is_rebuilt(self):
+        data = {"date": "2026-11-06", "_targets_cache_schema": T.CACHE_SCHEMA_VERSION,
+                "_targets_offset_mode": "block_number", "offset_unit": "block_2s", "lo": 100, "arbs": []}
+        self.assertTrue(T._cache_current(data, "2026-11-06", has_flashblocks=False))
+        self.assertFalse(T._cache_current(data, "2026-11-06", has_flashblocks=False, unit="block_200ms"))
+        self.assertTrue(T._cache_current(data, "2026-11-06", has_flashblocks=False, unit="block_2s"))
+
+
 if __name__ == "__main__":
     unittest.main()

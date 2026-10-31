@@ -169,5 +169,15 @@ class Shares(unittest.TestCase):
         self.assertEqual(race.by_offset(arbs), {"0": 0.6, "1": 0.2, "2": 0.0, "3+": 0.1, "none": 0.1})
 
 
+
+class DenimWindow(unittest.TestCase):
+    """R41: the trigger window is five minutes in each era's blocks."""
+
+    def test_back_blocks_is_five_minutes_in_each_era(self):
+        self.assertEqual(race.back_blocks(999, 1_000), 150)
+        self.assertEqual(race.back_blocks(1_000, 1_000), 1_500)
+        self.assertEqual(race.back_blocks(5_000, None), 150, "no fork yet")
+
+
 if __name__ == "__main__":
     unittest.main()

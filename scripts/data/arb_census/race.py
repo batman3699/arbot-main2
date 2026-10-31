@@ -44,6 +44,10 @@ from arb_census.rpc import Rpc, RpcError
 
 SHARE = 0.5            # the trigger: where half the flow the arbitrage took back had arrived
 BACK_BLOCKS = 150      # five minutes of each pool's trades, to find it in
+# R41: Base's Denim hardfork (base/base v1.5.1): 200 ms blocks from this time,
+# so five minutes is 1,500 of them.
+DENIM_TS = 1_793_901_600
+DENIM_BACK_BLOCKS = 1_500
 GAS = 350_000          # the lean executor's two-hop trade (R29)
 STEP = 50              # blocks a getLogs (1rpc's limit)
 VALUED_USD = 1.0       # arbitrages from here have their receipts read: the priority fee
@@ -226,11 +230,19 @@ def category(venues):
     return "ours" if v <= OURS else "others"
 
 
-def race_day(rpc, resolver, ledger, lo, hi, say=print):
+def back_blocks(lo, fork_block):
+    """R41: the trigger window, five minutes in the day's own blocks: 150 of
+    2 s blocks, 1,500 of 200 ms ones from the fork block on. A day is one era
+    or the other: the fork day is ranged by its flashblock ledger, which ends
+    at the fork."""
+    return DENIM_BACK_BLOCKS if fork_block is not None and lo >= fork_block else BACK_BLOCKS
+
+
+def race_day(rpc, resolver, ledger, lo, hi, say=print, back=BACK_BLOCKS):
     """Every arbitrage in blocks lo..hi, with its trigger and their flashblocks."""
     save, resolver.save = resolver.save, lambda: None   # 6 MB a write: once, at the end
     try:
-        return _race_day(rpc, resolver, ledger, lo, hi, say)
+        return _race_day(rpc, resolver, ledger, lo, hi, say, back)
     finally:
         resolver.save = save
         save()
@@ -244,7 +256,7 @@ def _decoded(entries, meta):
     return [(e[0], e[2]) for e in entries if e[2]]
 
 
-def _race_day(rpc, resolver, ledger, lo, hi, say):
+def _race_day(rpc, resolver, ledger, lo, hi, say, back=BACK_BLOCKS):
     history, arbs, legs_kept = defaultdict(deque), [], []
     b, step = lo, STEP
     while b <= hi:
@@ -282,7 +294,7 @@ def _race_day(rpc, resolver, ledger, lo, hi, say):
                     history[k].append([pos, l, None])
         for p in list(history):
             q = history[p]
-            while q and q[0][0][0] < e - BACK_BLOCKS:
+            while q and q[0][0][0] < e - back:
                 q.popleft()
             if not q:
                 del history[p]
@@ -312,7 +324,7 @@ def _race_day(rpc, resolver, ledger, lo, hi, say):
             a["prio"] = max(0, int(r["effectiveGasPrice"], 16) - base[a["block"]])
             a["base_fee"], a["gas"] = base[a["block"]], int(r["gasUsed"], 16)
             a["sender"], a["to"] = r["from"].lower(), (r.get("to") or "").lower()
-    return {"lo": lo, "hi": hi, "eth_usd": usd.get(V.WETH, 0.0), "unresolved_pools": len(getattr(resolver, "failed", ())),
+    return {"lo": lo, "hi": hi, "back_blocks": back, "eth_usd": usd.get(V.WETH, 0.0), "unresolved_pools": len(getattr(resolver, "failed", ())),
             "base_fee_median": statistics.median(base.values()) if base else None, "arbs": arbs}
 
 
@@ -324,7 +336,7 @@ def day_range(var, day):
     return lo, hi - 1   # the next day's file starts at its last block
 
 
-def day_ledger(var, lo, hi):
+def day_ledger(var, lo, hi, back=BACK_BLOCKS):
     import race_analysis as RA
     lines = []
     for p in sorted(Path(var).glob("flashblocks-*.jsonl")):
@@ -335,7 +347,7 @@ def day_ledger(var, lo, hi):
             f.seek(0)
             for line in f:
                 x = json.loads(line)
-                if lo - BACK_BLOCKS <= x["block"] <= hi + 1:
+                if lo - back <= x["block"] <= hi + 1:
                     lines.append(x)
     return RA.Ledger(lines)
 
