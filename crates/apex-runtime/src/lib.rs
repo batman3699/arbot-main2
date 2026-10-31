@@ -38,6 +38,7 @@ pub mod bus;
 pub mod canary;
 pub mod commit;
 pub mod denim;
+pub mod denim_check;
 pub mod econ;
 pub mod live;
 pub mod plane;

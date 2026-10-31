@@ -231,3 +231,76 @@ fn detect_orders_its_answers() {
     half[4].timestamp_ms = None;
     assert!(matches!(detect(8_453, 8_453, &half, DENIM_MAINNET_TS), Detect::Anomaly(_)));
 }
+
+// ------------------------------------------------------------- denim-check
+
+use apex_runtime::denim_check::{Bytes, Tally};
+
+fn tally(file: &str, block_time_ms: u64, max_head_lag_ms: u64) -> Tally {
+    let mut t = Tally::new(block_time_ms, max_head_lag_ms, 2_000);
+    for (n, s, ms, arrival) in heads(file) {
+        t.head(n, s, Some(ms), arrival);
+    }
+    t
+}
+
+const QUIET: Bytes = Bytes { heads: 1, logs: 0, pending_logs: 0, other: 1 };
+
+/// R41: the rehearsal passes on a clean minute of Sepolia's Denim heads.
+#[test]
+fn the_check_passes_sepolia_s_heads() {
+    let v = tally("sepolia_denim_heads.json", 200, 1_000).verdict(Some(84_532), 60, 0, 1, QUIET);
+    assert!(v.pass, "{:?}", v.reasons);
+    assert!(v.read_min_gap_ms.unwrap() >= 2_000);
+    // A round starts at the first head 2 s after the last round: between one
+    // per 2 s and one per 2.4 s of 200 ms heads.
+    let hs = clean();
+    let span = hs.last().unwrap().3 - hs[0].3;
+    assert!((1 + span / 2_400..=1 + span / 2_000).contains(&v.read_rounds), "{} rounds in {span} ms", v.read_rounds);
+    assert_eq!((v.skips, v.repeats, v.off_lattice, v.without_ms), (0, 0, 0, 0));
+    assert!(v.lag_ms.p99.unwrap() <= 1_000);
+}
+
+/// R41: the same heads against a 2 s configuration fail: the guard never holds.
+#[test]
+fn the_check_fails_at_2000() {
+    let v = tally("sepolia_denim_heads.json", 2_000, 1_000).verdict(Some(84_532), 60, 0, 1, QUIET);
+    assert!(!v.pass);
+    assert!(v.reasons.iter().any(|r| r.contains("guard")), "{:?}", v.reasons);
+}
+
+/// R41: a delivery stall puts lag p99 over the limit, and the check says so.
+#[test]
+fn the_check_fails_when_lag_p99_exceeds_the_limit() {
+    let v = tally("sepolia_denim_heads_stall.json", 200, 1_000).verdict(Some(84_532), 60, 0, 1, QUIET);
+    assert!(!v.pass);
+    assert!(v.lag_ms.p99.unwrap() > 1_000);
+    assert!(v.reasons.iter().any(|r| r.contains("lag")), "{:?}", v.reasons);
+}
+
+#[test]
+fn the_check_counts_skips_repeats_and_off_lattice() {
+    let hs = clean();
+    let mut t = Tally::new(200, 1_000, 2_000);
+    for (i, (n, s, ms, arrival)) in hs.into_iter().take(40).enumerate() {
+        match i {
+            10 => continue,
+            30 => t.head(n, s, Some(ms + 100), arrival),
+            _ => t.head(n, s, Some(ms), arrival),
+        }
+        if i == 20 {
+            t.head(n, s, Some(ms), arrival + 3);
+        }
+    }
+    t.log();
+    let v = t.verdict(Some(84_532), 8, 0, 1, QUIET);
+    assert_eq!((v.heads, v.logs, v.skips, v.repeats, v.off_lattice), (39, 1, 1, 1, 2));
+}
+
+#[test]
+fn a_refused_subscription_fails_the_check() {
+    let v = tally("sepolia_denim_heads.json", 200, 1_000).verdict(Some(84_532), 60, 1, 2, QUIET);
+    assert!(!v.pass);
+    assert!(v.reasons.iter().any(|r| r.contains("refused")), "{:?}", v.reasons);
+    assert!(v.reasons.iter().any(|r| r.contains("session")), "{:?}", v.reasons);
+}

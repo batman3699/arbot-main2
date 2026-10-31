@@ -110,6 +110,9 @@ async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("keys") {
         return keys();
     }
+    if std::env::args().nth(1).as_deref() == Some("denim-check") {
+        return denim_check().await;
+    }
 
     match run().await {
         Ok(report) => {
@@ -131,6 +134,56 @@ async fn main() -> ExitCode {
         }
         Err(e) => {
             error!(error = %e, "apex refused to start");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `apex denim-check [--config PATH] [--for-s N]` (R41): the configuration's
+/// feed and the Denim guard against its endpoints for N seconds (default
+/// 600), and one JSON verdict on stdout. Exit 0 when it passes. Sends
+/// nothing; the file is a canary's (`ops/canary.denim.yaml`, or a scratch
+/// copy pointed at public Sepolia endpoints).
+async fn denim_check() -> ExitCode {
+    const USAGE: &str = "usage: apex denim-check [--config ops/canary.denim.yaml] [--for-s 600]";
+    let (mut config, mut for_s) = ("ops/canary.denim.yaml".to_string(), 600u64);
+    let mut argv = std::env::args().skip(2);
+    while let Some(flag) = argv.next() {
+        match (flag.as_str(), argv.next()) {
+            ("--config", Some(p)) => config = p,
+            ("--for-s", Some(n)) => match n.parse::<u64>() {
+                Ok(n) if n > 0 => for_s = n,
+                _ => {
+                    error!("{USAGE}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            _ => {
+                error!("{USAGE}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let c = match apex_runtime::shadow::config::ShadowConfig::load_canary(&config, &Env::secrets_only()) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, config, "denim-check: the configuration did not load");
+            return ExitCode::FAILURE;
+        }
+    };
+    match apex_runtime::denim_check::run(&c, for_s).await {
+        Ok(v) => match serde_json::to_string(&v) {
+            Ok(line) => {
+                println!("{line}");
+                if v.pass { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+            }
+            Err(e) => {
+                error!(error = %e, "denim-check: the verdict did not serialize");
+                ExitCode::FAILURE
+            }
+        },
+        Err(e) => {
+            error!(error = %e, "denim-check did not run");
             ExitCode::FAILURE
         }
     }
