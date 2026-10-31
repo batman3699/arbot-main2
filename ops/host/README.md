@@ -501,3 +501,27 @@ it did for the old executor, and every trade checks both on chain:
 $ cast send <executor> "tripCircuit()" --rpc-url https://mainnet.base.org --interactive    # resetCircuit() to close
 $ cast send <executor> "setExecutor(address,bool)" 0xCB436Ba3acb945b3fc8EE6345857262584356595 false --rpc-url https://mainnet.base.org --interactive
 ```
+
+## 12. The Denim switch (R41)
+
+Base's Denim hardfork is at 2026-11-05 18:00:00 UTC. The switch and what to
+check are in `ops/host/ARMED.md` "The Denim day". Install its timer with the
+revision that carries it:
+
+```
+# install -m 0644 /opt/apex/ops/host/apex-denim-switch.service /opt/apex/ops/host/apex-denim-switch.timer /etc/systemd/system/
+# systemctl daemon-reload && systemctl enable --now apex-denim-switch.timer
+# systemctl list-timers apex-denim-switch.timer --no-pager        # NEXT: Thu 2026-11-05 17:59:00 UTC
+```
+
+At the fork the switch writes two drop-ins,
+`/etc/systemd/system/apex-canary.service.d/denim.conf` and
+`/etc/systemd/system/apex-armed-eval.service.d/denim.conf`, which point the
+units at `ops/canary.denim.yaml` and `ops/shadow.denim.yaml`. `deploy.sh`
+and `provision.sh` never touch `*.service.d/`, and installing a unit file
+(§4, §10) leaves its drop-ins in place: `systemctl cat apex-canary` shows both.
+
+**Do not archive `/opt/apex/var/apex` between now and 11-07** (§7's archive
+step): it would take `canary.stop` and the flashblock ledgers the daily census
+reads with it. Restart without archiving.
+
