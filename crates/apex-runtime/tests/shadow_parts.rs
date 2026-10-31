@@ -926,3 +926,19 @@ fn the_bid_model_is_best_bid_unless_named() {
         assert_eq!(got.ok(), want, "{model}");
     }
 }
+
+/// R41: the capacity sampler is a flashblock model's: it runs before Denim
+/// and not under it, where the parked reactive lane refuses every submission.
+#[test]
+fn the_capacity_sampler_runs_only_before_denim() {
+    let ops = format!("{}/../../ops", env!("CARGO_MANIFEST_DIR"));
+    let e = env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key");
+    for (file, sampled) in [("canary.base.yaml", true), ("canary.denim.yaml", false)] {
+        let c = ShadowConfig::load_canary(&format!("{ops}/{file}"), &e).unwrap();
+        assert_eq!(apex_runtime::shadow::samples_capacity(&c), sampled, "{file}");
+    }
+    for (file, sampled) in [("shadow.base.yaml", true), ("shadow.denim.yaml", false)] {
+        let c = ShadowConfig::load(&format!("{ops}/{file}"), &e).unwrap();
+        assert_eq!(apex_runtime::shadow::samples_capacity(&c), sampled, "{file}");
+    }
+}

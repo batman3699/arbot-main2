@@ -84,7 +84,7 @@ use apex_chain::base::flashblock::{sample, FlashblockRecorder};
 use apex_chain::base::flashblock_stream::{FlashblockIndexer, FlashblockStream, FlashblockStreamStats};
 use apex_chain::base::send::{FallbackTransport, HttpSubmitter, RawTransport};
 use apex_chain::rpc::failover::{FailoverSettings, FailoverTransport, MethodUsage};
-use apex_chain::rpc::ws::{Head, LogFilter, Notification, Subscription, WsFeed, WsSettings, WsStats};
+use apex_chain::rpc::ws::{Head, Kind, LogFilter, Notification, Subscription, WsFeed, WsSettings, WsStats};
 use apex_chain::rpc::RpcTransport;
 use apex_config::{Env, Secret};
 use apex_econ::cost::failure::FailureProfile;
@@ -153,6 +153,8 @@ struct Stats {
     pools_removed: AtomicU64,
     view_failures: AtomicU64,
     twap_failures: AtomicU64,
+    /// R41: rounds of the head loop's slow reads, on their clock.
+    head_read_rounds: AtomicU64,
     /// Aerodrome v2's per-pool fees, re-read each head (R24).
     fee_failures: AtomicU64,
     l1_failures: AtomicU64,
@@ -353,6 +355,13 @@ pub fn subscriptions(feed: &config::FeedConfig, filters: Vec<LogFilter>) -> Vec<
     subs
 }
 
+/// R41: whether the flashblock capacity sampler runs: before Denim only. Its
+/// model is a flashblock model; without one the parked reactive lane refuses
+/// every submission, the fail-safe it already has.
+pub fn samples_capacity(config: &ShadowConfig) -> bool {
+    !config.denim()
+}
+
 /// R36: the census's targets the arming engine arms from. In live mode a
 /// missing, stale or unfit file stops the boot; armed-shadow arms R26's
 /// universe instead, and says why.
@@ -438,14 +447,18 @@ pub async fn run(config: ShadowConfig, env: &Env, stop: impl Future<Output = ()>
             Box::pin(async move { s.flashblock_ledger(stopped).await })
         }));
     }
+    let capacity = samples_capacity(&shadow.config).then_some(("capacity", Task::Capacity));
     for (name, task) in [
-        ("reload", Task::Reload),
-        ("heads", Task::Heads),
-        ("capacity", Task::Capacity),
-        ("full-reload", Task::FullReload),
-        ("race", Task::Race),
-        ("armed", Task::Armed),
-    ] {
+        Some(("reload", Task::Reload)),
+        Some(("heads", Task::Heads)),
+        capacity,
+        Some(("full-reload", Task::FullReload)),
+        Some(("race", Task::Race)),
+        Some(("armed", Task::Armed)),
+    ]
+    .into_iter()
+    .flatten()
+    {
         let s = Arc::clone(&shadow);
         spawn(name, Box::new(move || {
             let s = Arc::clone(&s);
@@ -512,6 +525,13 @@ enum Task {
 async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     let started = Instant::now();
     let base = ChainId::BASE;
+    info!(
+        denim = config.denim(),
+        block_time_ms = config.armed.block_time_ms,
+        head_reads_every_ms = config.policy.head_reads_every_ms,
+        max_head_lag_ms = config.armed.max_head_lag_ms,
+        "the chain regime"
+    );
 
     // The key: read once, straight into a `Secret`, and held to the address
     // the executor authorizes. A key signing as anyone else would sign tickets
@@ -919,7 +939,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         chain: adapter.clone(),
         search: search.clone(),
         econ,
-        sim: Arc::new(LiveSimulator::new(Arc::clone(&rpc), base, building_now, Arc::new(SystemClock))),
+        sim: Arc::new(LiveSimulator::new(Arc::clone(&rpc), base, building_now, Arc::new(SystemClock)).on_denim(config.denim())),
         // Nothing records a loss into the breaker, so it never trips here; a
         // canary's limits are its own (R28), and they hold every candidate.
         risk: Arc::new({
@@ -1112,7 +1132,7 @@ impl Shadow {
         self.reloads.request_full();
 
         let (task, mut rx) = feed.spawn(stopped);
-        let mut handler = FeedHandler::new(ChainId::BASE);
+        let mut handler = FeedHandler::new(ChainId::BASE).with_clock(self.config.armed.block_time_ms, self.config.denim());
         loop {
             // A burst of swaps is held until the feed has been quiet for
             // `BURST_QUIET`, then applied and published as one state (R17).
@@ -1312,56 +1332,18 @@ impl Shadow {
         let mut fees = Health::default();
         let mut l1: Option<(u64, L1FeeParameters)> = None;
         let every = self.config.policy.l1_every_blocks;
+        // R41: the slow reads (the view, the TWAPs, the fees) at most once a
+        // clock interval; the L1 oracle by blocks and the costs on every head.
+        let mut clock = crate::denim::ReadClock::new(self.config.policy.head_reads_every_ms);
         loop {
             if heads.changed().await.is_err() {
                 return;
             }
             let Some(h) = heads.borrow_and_update().clone() else { continue };
-            let window = self.largest_window.load(Ordering::Relaxed);
-            view.note("the live reader's view", self.reader.refresh(&h, window).await, &self.stats.view_failures);
-            if let Some(v) = self.reader.view() {
-                let boot = *self.boot_nonce.get_or_init(|| v.signer_pending_nonce);
-                if let Some(c) = &self.canary {
-                    // R28: the canary's own sends move the nonce; only a move
-                    // beyond them means the key is in use elsewhere.
-                    let sent = c.sent_since_boot();
-                    if nonce_beyond_ours(boot, v.signer_pending_nonce, sent) {
-                        self.nonce_moved.store(true, Ordering::Relaxed);
-                        let _ = c.halt(crate::canary::Halt::Tripwire { boot, now: v.signer_pending_nonce, sent });
-                    }
-                } else if nonce_moved(Some(boot), v.signer_pending_nonce) {
-                    self.nonce_moved.store(true, Ordering::Relaxed);
-                    error!(
-                        boot,
-                        now = v.signer_pending_nonce,
-                        "the signer's nonce moved: a shadow never sends, so the trader key was used elsewhere; revoke it (ops/host/README.md)"
-                    );
-                }
-                let held = Some(crate::live::lenders::Lenders {
-                    balancer: ethers_core::types::U256::from(v.lender_holding),
-                    morpho: Some(ethers_core::types::U256::from(v.morpho_holding)),
-                });
-                self.lender.send_if_modified(|now| {
-                    let moved = *now != held;
-                    *now = held;
-                    moved
-                });
-                let usdc = Some(crate::live::lenders::Lenders {
-                    balancer: ethers_core::types::U256::zero(),
-                    morpho: Some(ethers_core::types::U256::from(v.morpho_usdc_holding)),
-                });
-                let pm = Some((
-                    ethers_core::types::U256::from(v.pool_manager_holdings.0),
-                    ethers_core::types::U256::from(v.pool_manager_holdings.1),
-                ));
-                self.armed_holdings.send_replace((usdc, pm));
+            if clock.due(now_ms()) {
+                bump(&self.stats.head_read_rounds);
+                self.read_round(&h, &mut view, &mut twap, &mut fees).await;
             }
-            twap.note("Slipstream's TWAPs", self.book.refresh_twaps(&self.reads, h.number).await.map(|_| ()), &self.stats.twap_failures);
-            fees.note(
-                "Aerodrome v2's fees",
-                self.book.refresh_cp_fees(&self.reads, h.number).await.map(|_| ()),
-                &self.stats.fee_failures,
-            );
             if l1.is_none_or(|(at, _)| h.number >= at.saturating_add(every)) {
                 let read = costs::read_l1(&self.reads, h.number).await;
                 if let Ok(p) = &read {
@@ -1374,6 +1356,58 @@ impl Shadow {
                 self.stats.base_fee_wei.store(u64::try_from(fee).unwrap_or(u64::MAX), Ordering::Relaxed);
             }
         }
+    }
+
+    /// One round of the head loop's slow reads at `h`: the reader's view (the
+    /// signer's nonce, the lenders' and PoolManager's holdings, the owner's
+    /// stops), Slipstream's TWAPs and Aerodrome v2's fees. None of them is
+    /// pool state: prices and liquidity come from the log feed.
+    async fn read_round(&self, h: &Head, view: &mut Health, twap: &mut Health, fees: &mut Health) {
+        let window = self.largest_window.load(Ordering::Relaxed);
+        view.note("the live reader's view", self.reader.refresh(h, window).await, &self.stats.view_failures);
+        if let Some(v) = self.reader.view() {
+            let boot = *self.boot_nonce.get_or_init(|| v.signer_pending_nonce);
+            if let Some(c) = &self.canary {
+                // R28: the canary's own sends move the nonce; only a move
+                // beyond them means the key is in use elsewhere.
+                let sent = c.sent_since_boot();
+                if nonce_beyond_ours(boot, v.signer_pending_nonce, sent) {
+                    self.nonce_moved.store(true, Ordering::Relaxed);
+                    let _ = c.halt(crate::canary::Halt::Tripwire { boot, now: v.signer_pending_nonce, sent });
+                }
+            } else if nonce_moved(Some(boot), v.signer_pending_nonce) {
+                self.nonce_moved.store(true, Ordering::Relaxed);
+                error!(
+                    boot,
+                    now = v.signer_pending_nonce,
+                    "the signer's nonce moved: a shadow never sends, so the trader key was used elsewhere; revoke it (ops/host/README.md)"
+                );
+            }
+            let held = Some(crate::live::lenders::Lenders {
+                balancer: ethers_core::types::U256::from(v.lender_holding),
+                morpho: Some(ethers_core::types::U256::from(v.morpho_holding)),
+            });
+            self.lender.send_if_modified(|now| {
+                let moved = *now != held;
+                *now = held;
+                moved
+            });
+            let usdc = Some(crate::live::lenders::Lenders {
+                balancer: ethers_core::types::U256::zero(),
+                morpho: Some(ethers_core::types::U256::from(v.morpho_usdc_holding)),
+            });
+            let pm = Some((
+                ethers_core::types::U256::from(v.pool_manager_holdings.0),
+                ethers_core::types::U256::from(v.pool_manager_holdings.1),
+            ));
+            self.armed_holdings.send_replace((usdc, pm));
+        }
+        twap.note("Slipstream's TWAPs", self.book.refresh_twaps(&self.reads, h.number).await.map(|_| ()), &self.stats.twap_failures);
+        fees.note(
+            "Aerodrome v2's fees",
+            self.book.refresh_cp_fees(&self.reads, h.number).await.map(|_| ()),
+            &self.stats.fee_failures,
+        );
     }
 
     /// R26: armed-shadow. The engine's pass over the verified book, off the
@@ -1613,6 +1647,10 @@ impl Shadow {
                 fees: get(&self.stats.fee_failures),
                 l1: get(&self.stats.l1_failures),
             },
+            head_reads: HeadReadsReport {
+                every_ms: self.config.policy.head_reads_every_ms,
+                rounds: get(&self.stats.head_read_rounds),
+            },
             costs: CostReport { base_fee_wei: get(&self.stats.base_fee_wei), route_other_wei: self.costs.route_costs().other_wei },
             capacity: CapacityReport {
                 samples: get(&self.stats.capacity_samples),
@@ -1627,6 +1665,10 @@ impl Shadow {
                 dropped: feed.as_ref().map_or(0, |f| f.dropped()),
                 published: bus.published(),
                 fast_lane_lossless: bus.fast_lane_is_lossless(),
+                bytes_heads: feed.as_ref().map_or(0, |f| f.bytes(Kind::NewHeads)),
+                bytes_logs: feed.as_ref().map_or(0, |f| f.bytes(Kind::Logs)),
+                bytes_pending_logs: feed.as_ref().map_or(0, |f| f.bytes(Kind::PendingLogs)),
+                bytes_other: feed.as_ref().map_or(0, |f| f.bytes_other()),
             },
             misses_written: get(&self.stats.misses_written),
             near_miss: self.near_misses.report(),
@@ -1735,6 +1777,8 @@ pub struct Report {
     pub book: BookReport,
     pub reloads: ReloadReport,
     pub read_failures: ReadFailures,
+    /// R41: the head loop's slow reads: their clock and how many rounds ran.
+    pub head_reads: HeadReadsReport,
     pub costs: CostReport,
     pub capacity: CapacityReport,
     pub feed: FeedReport,
@@ -1864,6 +1908,13 @@ pub struct ReloadReport {
     pub positions_read_again: u64,
 }
 
+/// R41: the head loop's read clock. 0 is every head.
+#[derive(Clone, Debug, Serialize)]
+pub struct HeadReadsReport {
+    pub every_ms: u64,
+    pub rounds: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ReadFailures {
     pub view: u64,
@@ -1897,4 +1948,10 @@ pub struct FeedReport {
     pub dropped: u64,
     pub published: u64,
     pub fast_lane_lossless: bool,
+    /// R41: websocket text bytes by subscription, and every other frame:
+    /// what BlockPI bills, beside `rpc`'s HTTP bytes by method.
+    pub bytes_heads: u64,
+    pub bytes_logs: u64,
+    pub bytes_pending_logs: u64,
+    pub bytes_other: u64,
 }
