@@ -53,6 +53,7 @@ fn book() -> PoolBook {
         code_hash: B256::ZERO,
         block: 100,
         last_log: None,
+        through: None,
         dynamic_fee: None,
         seq: 0,
         reserves: None,

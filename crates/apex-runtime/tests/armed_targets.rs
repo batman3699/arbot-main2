@@ -170,6 +170,7 @@ fn snapshot(addr: Address, venue: Venue) -> PoolSnapshot {
         code_hash: B256::repeat_byte(0xc0),
         block: 100,
         last_log: None,
+        through: None,
         dynamic_fee: None,
         seq: 0,
         reserves: None,

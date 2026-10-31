@@ -148,6 +148,7 @@ pub fn snapshot(spec: &PoolSpec, l: Loaded, code_hash: B256, block: u64) -> Pool
         code_hash,
         block,
         last_log: None,
+        through: None,
         dynamic_fee: None,
         seq: 0,
         reserves: Some(l.reserves),

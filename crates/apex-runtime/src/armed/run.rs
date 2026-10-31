@@ -19,7 +19,7 @@
 //! The lean executor sells all hop 1 returns, so a fire leaves no intermediate
 //! residue: `residue` is absent from verdicts since R36's lean quote.
 
-use super::eval::{self, bid_wei_per_gas, judge, landing, merge_renewals, net_wei, own_landing, Landing, Point, TxEffect, Write, F_PERMILLE};
+use super::eval::{self, bid_wei_per_gas, judge, landing, merge_renewals, net_wei, own_landing, Landing, Logged, Point, TxEffect, Write, F_PERMILLE};
 use super::lines::{Arm, ArmedLine};
 use super::predicate::{layout, price_mask};
 use crate::live::book::{LiquidityWrite, PoolBook, StateWrite, SwapApplied, SwapWrite, SyncWrite};
@@ -63,7 +63,7 @@ fn data_u128(data: &[u8], i: usize) -> Option<u128> {
 }
 
 /// A transaction's hash, and its writes keyed by log index.
-type TxWrites = (String, Vec<(u64, Write)>);
+type TxWrites = (String, Vec<Logged>);
 
 /// The watched pools' logs as per-transaction effects, in chain order. A
 /// removed log, an unknown pool or an undecodable log adds nothing.
@@ -79,14 +79,16 @@ pub fn effects_of(logs: &[RawLog], venues: &BTreeMap<Address, Venue>) -> Vec<TxE
             pool_writes(l, *venue)
         };
         let tx = l.transaction_hash.map_or_else(String::new, |h| format!("{h:#x}"));
+        let pool = if l.address == POOL_MANAGER { l.topics.get(1).map(|id| key_address(*id)) } else { Some(l.address) };
+        let Some(pool) = pool.map(|p| format!("{p:#x}")) else { continue };
         let entry = by_tx.entry((block, txi)).or_insert_with(|| (tx, Vec::new()));
-        entry.1.extend(writes.into_iter().map(|w| (li, w)));
+        entry.1.extend(writes.into_iter().map(|write| Logged { log_index: li, pool: pool.clone(), write }));
     }
     by_tx
         .into_iter()
         .map(|((block, tx_index), (tx, mut writes))| {
-            writes.sort_by_key(|(li, _)| *li);
-            TxEffect { block, tx_index, tx, writes: writes.into_iter().map(|(_, w)| w).collect() }
+            writes.sort_by_key(|w| w.log_index);
+            TxEffect { block, tx_index, tx, writes }
         })
         .collect()
 }
@@ -381,10 +383,7 @@ pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
             .filter(|e| {
                 // A v4 pool's words are PoolManager's: its writes carry the
                 // pool's key address in a Tick or a Liquidity's `pool` (R37).
-                e.writes.iter().any(|w| match w {
-                    Write::Set { address, .. } | Write::Tick { address, .. } => arm.pools.contains(address),
-                    Write::Liquidity { address, pool, .. } => arm.pools.contains(address) || arm.pools.contains(pool),
-                })
+                e.writes.iter().any(|w| arm.pools.contains(&w.pool))
             })
             .cloned()
             .collect();

@@ -36,6 +36,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32) -> PoolSnapshot {
         code_hash: Default::default(),
         block: 100,
         last_log: None,
+        through: None,
         dynamic_fee: None,
         seq: 0,
         reserves: None,
@@ -733,4 +734,31 @@ fn each_start_token_has_its_own_cap() {
     assert_eq!(starts(capped(256, u128::MAX, u128::MAX, &[WETH, USDC])), BTreeSet::from([None, Some(USDC)]));
     assert_eq!(starts(capped(256, u128::MAX, 1, &[WETH, USDC])), BTreeSet::from([None]));
     assert_eq!(starts(capped(256, 1, u128::MAX, &[WETH, USDC])), BTreeSet::from([Some(USDC)]));
+}
+
+/// R41: each arm records where its two pools' start words stand: a pool's
+/// newest applied log, or the block it was read at. The pool strings are the
+/// arm's own, or the evaluator's skip never matches.
+#[test]
+fn start_at_names_the_arm_s_pools_as_written() {
+    use apex_runtime::armed::lines::StartAt;
+    let (engine, mut snap) = setup(16);
+    let uni = PoolSnapshot { through: Some((1_001, 2)), ..(*snap[&UNI]).clone() };
+    let slip = PoolSnapshot { block: 99, ..(*snap[&SLIP]).clone() };
+    snap.insert(UNI, Arc::new(uni));
+    snap.insert(SLIP, Arc::new(slip));
+    let arms: Vec<Arm> =
+        engine.tick(&snap, 1_000, 5_000_000, &px(), 1).into_iter().filter_map(|l| if let ArmedLine::Arm(a) = l { Some(*a) } else { None }).collect();
+    assert!(!arms.is_empty());
+    for a in &arms {
+        assert_eq!(a.start_at.iter().map(|s| s.pool.clone()).collect::<Vec<_>>(), a.pools.to_vec());
+        for s in &a.start_at {
+            let want = if s.pool == format!("{UNI:#x}") {
+                StartAt { pool: s.pool.clone(), block: 1_001, log_index: Some(2) }
+            } else {
+                StartAt { pool: s.pool.clone(), block: 99, log_index: None }
+            };
+            assert_eq!(*s, want);
+        }
+    }
 }

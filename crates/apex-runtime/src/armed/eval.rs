@@ -27,13 +27,22 @@ pub enum Write {
     Liquidity { address: String, slot: U256, pool: String, lower: i32, upper: i32, delta: i128 },
 }
 
+/// One write, as the log it came from: its index in the block, and the pool
+/// it is a write to (a v4 pool's key address, whose words are PoolManager's).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Logged {
+    pub log_index: u64,
+    pub pool: String,
+    pub write: Write,
+}
+
 /// One transaction's writes to the watched pools, in chain order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxEffect {
     pub block: u64,
     pub tx_index: u64,
     pub tx: String,
-    pub writes: Vec<Write>,
+    pub writes: Vec<Logged>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -132,6 +141,10 @@ pub struct Judged {
 /// The fire point (the first transaction after which every predicate holds)
 /// and the rival (the first after that which makes one false). `effects`
 /// must hold every transaction that touched the arm's pools, in chain order.
+///
+/// R41: a write the arm's start words already hold (at or before its pool's
+/// `start_at`) is not applied again: a Mint or Burn moves liquidity by a
+/// delta, so replaying it would count it twice.
 pub fn judge(arm: &Arm, effects: &[TxEffect]) -> Option<Judged> {
     let mut words = Words::from_arm(arm)?;
     let trigger_pool = arm.pools.get(usize::from(arm.trigger_leg))?;
@@ -145,7 +158,9 @@ pub fn judge(arm: &Arm, effects: &[TxEffect]) -> Option<Judged> {
     let mut trigger_met = false;
     for e in effects.iter().filter(|e| e.block > arm.armed_block && e.block <= arm.to_block) {
         for w in &e.writes {
-            words.apply(w);
+            if !arm.start_at.iter().any(|s| s.pool == w.pool && s.holds(e.block, w.log_index)) {
+                words.apply(&w.write);
+            }
         }
         trigger_met |= words.holds(&trigger, e.block);
         let holds = words.holds(&arm.predicates, e.block);

@@ -179,6 +179,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, dynamic_fee: Optio
         code_hash: B256::ZERO,
         block: 100,
         last_log: None,
+        through: None,
         dynamic_fee,
         seq: 0,
         reserves: None,

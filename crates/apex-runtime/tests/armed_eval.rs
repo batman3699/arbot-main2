@@ -1,9 +1,9 @@
 //! R26: judging an arm against what the chain did.
 
 use apex_runtime::armed::eval::{
-    bid_wei_per_gas, judge, landing, merge_renewals, net_wei, next_flashblock, own_landing, Landing, Point, TxEffect, Write, F_PERMILLE,
+    bid_wei_per_gas, judge, landing, merge_renewals, net_wei, next_flashblock, own_landing, Landing, Logged, Point, TxEffect, Write, F_PERMILLE,
 };
-use apex_runtime::armed::lines::{Arm, ArmedLine, Renewal, Word};
+use apex_runtime::armed::lines::{Arm, ArmedLine, Renewal, StartAt, Word};
 use apex_runtime::armed::predicate::{expiry, Op, Predicate};
 use ethers_core::types::U256;
 
@@ -64,6 +64,7 @@ fn arm() -> Arm {
         alt_bid_wei_per_gas: None,
         alt_p_win: None,
         model_version: None,
+        start_at: Vec::new(),
     }
 }
 
@@ -71,8 +72,37 @@ fn set(addr: &str, slot: u64, v: u64) -> Write {
     Write::Set { address: addr.into(), slot: U256::from(slot), value: U256::from(v) }
 }
 
+/// A write as its log: the pool it is a write to (a Liquidity's `pool`, else
+/// its address), at `log_index`.
+fn logged(log_index: u64, write: Write) -> Logged {
+    let pool = match &write {
+        Write::Liquidity { pool, .. } => pool.clone(),
+        Write::Set { address, .. } | Write::Tick { address, .. } => address.clone(),
+    };
+    Logged { log_index, pool, write }
+}
+
+/// Transaction `i`'s writes, its logs numbered from `100 i`.
 fn tx(block: u64, i: u64, writes: Vec<Write>) -> TxEffect {
+    let writes = writes.into_iter().enumerate().map(|(k, w)| logged(i * 100 + k as u64, w)).collect();
     TxEffect { block, tx_index: i, tx: format!("0x{block}{i}"), writes }
+}
+
+fn tx_at(block: u64, i: u64, writes: Vec<Logged>) -> TxEffect {
+    TxEffect { block, tx_index: i, tx: format!("0x{block}{i}"), writes }
+}
+
+fn burn(delta: i128) -> Write {
+    Write::Liquidity { address: B.into(), slot: U256::from(4), pool: B.into(), lower: -10, upper: 10, delta }
+}
+
+/// The arm's start words already hold a burn of 60 on B: 940 of liquidity,
+/// over the 900 floor; the same burn counted twice is 880, under it.
+fn arm_after_burn(start_at: Vec<StartAt>) -> Arm {
+    let mut a = arm();
+    a.start_words[2].value = "0x3ac".into(); // 940
+    a.start_at = start_at;
+    a
 }
 
 #[test]
@@ -208,4 +238,43 @@ fn bids_and_nets_are_exact() {
     assert_eq!(bid_wei_per_gas(U256::from(300_000_000_000_000u64), 300_000, 500), 500_000_000);
     // gross 1e15 − 3e5 × (5e6 + 5e8) − 1e10
     assert_eq!(net_wei(U256::from(10u64.pow(15)), 300_000, 5_000_000, 500_000_000, 10_000_000_000), 848_490_000_000_000);
+}
+
+// ------------------------------------------------------------------ R41: start_at
+
+/// **A start point ahead of the arming block is not replayed twice.** The
+/// book had already applied a burn at (101, log 3) when the arm was taken at
+/// head 100: replaying it again on top of words that hold it would invent a
+/// breach of the liquidity floor.
+#[test]
+fn a_start_point_ahead_of_the_armed_block_is_not_replayed_twice() {
+    let start_at = vec![
+        StartAt { pool: A.into(), block: 100, log_index: None },
+        StartAt { pool: B.into(), block: 101, log_index: Some(3) },
+    ];
+    let effects = vec![tx_at(101, 1, vec![logged(3, burn(-60))]), tx_at(101, 2, vec![logged(5, set(A, 0, 55))])];
+    let j = judge(&arm_after_burn(start_at), &effects).unwrap();
+    assert_eq!(j.fire, Some(Point { block: 101, tx_index: 2, tx: "0x1012".into() }));
+    assert_eq!(j.rival, None);
+}
+
+/// Arms from before `start_at` are judged exactly as before.
+#[test]
+fn without_start_at_the_answer_is_today_s() {
+    let effects = vec![tx_at(101, 1, vec![logged(3, burn(-60))]), tx_at(101, 2, vec![logged(5, set(A, 0, 55))])];
+    assert_eq!(judge(&arm_after_burn(Vec::new()), &effects).unwrap().fire, None, "940 − 60 < 900");
+}
+
+/// A pool read at a block holds every write of that block, and none after it.
+#[test]
+fn a_read_start_point_skips_its_whole_block() {
+    let start_at = vec![StartAt { pool: B.into(), block: 101, log_index: None }];
+    let effects = vec![
+        tx_at(101, 4, vec![logged(9, burn(-60))]),
+        tx_at(102, 1, vec![logged(2, set(A, 0, 55))]),
+        tx_at(103, 1, vec![logged(1, burn(-60))]),
+    ];
+    let j = judge(&arm_after_burn(start_at), &effects).unwrap();
+    assert_eq!(j.fire, Some(Point { block: 102, tx_index: 1, tx: "0x1021".into() }));
+    assert_eq!(j.rival, Some(Point { block: 103, tx_index: 1, tx: "0x1031".into() }), "102's burn is applied");
 }

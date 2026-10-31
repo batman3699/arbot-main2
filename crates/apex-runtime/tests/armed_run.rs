@@ -3,7 +3,7 @@
 
 use alloy_primitives::{address, Address, B256};
 use apex_chain::rpc::ws::RawLog;
-use apex_runtime::armed::eval::Write;
+use apex_runtime::armed::eval::{Logged, Write};
 use apex_runtime::armed::run::{effects_of, get_logs, replay_calls, simulate_request, summary};
 use apex_runtime::live::feed::{BURN, MINT, SWAP, SYNC};
 use apex_runtime::live::inventory::Venue;
@@ -52,16 +52,18 @@ fn logs_become_ordered_effects_on_the_watched_words() {
     assert_eq!((effects[0].tx_index, effects[1].tx_index), (4, 6), "chain order");
     let a = format!("{POOL:#x}");
     let b = format!("{AERO:#x}");
+    // R41: each write carries its log's index and its pool.
+    let at = |log_index: u64, pool: &str, write: Write| Logged { log_index, pool: pool.to_string(), write };
     assert_eq!(effects[0].writes, vec![
-        Write::Set { address: a.clone(), slot: U256::from(0), value: U256::one() << 96 },
-        Write::Set { address: a.clone(), slot: U256::from(4), value: U256::from(1_000u64) },
-        Write::Tick { address: a.clone(), tick: -12 },
-        Write::Liquidity { address: a.clone(), slot: U256::from(4), pool: format!("{POOL:#x}"), lower: -60, upper: 60, delta: 500 },
+        at(9, &a, Write::Set { address: a.clone(), slot: U256::from(0), value: U256::one() << 96 }),
+        at(9, &a, Write::Set { address: a.clone(), slot: U256::from(4), value: U256::from(1_000u64) }),
+        at(9, &a, Write::Tick { address: a.clone(), tick: -12 }),
+        at(10, &a, Write::Liquidity { address: a.clone(), slot: U256::from(4), pool: format!("{POOL:#x}"), lower: -60, upper: 60, delta: 500 }),
     ]);
     assert_eq!(effects[1].writes, vec![
-        Write::Liquidity { address: a, slot: U256::from(4), pool: format!("{POOL:#x}"), lower: -60, upper: 60, delta: -200 },
-        Write::Set { address: b.clone(), slot: U256::from(20), value: U256::from(11u64) },
-        Write::Set { address: b, slot: U256::from(21), value: U256::from(22u64) },
+        at(2, &a, Write::Liquidity { address: a.clone(), slot: U256::from(4), pool: format!("{POOL:#x}"), lower: -60, upper: 60, delta: -200 }),
+        at(3, &b, Write::Set { address: b.clone(), slot: U256::from(20), value: U256::from(11u64) }),
+        at(3, &b, Write::Set { address: b.clone(), slot: U256::from(21), value: U256::from(22u64) }),
     ], "the removed log is ignored");
 }
 
@@ -419,6 +421,7 @@ fn read_pool() -> apex_runtime::live::book::PoolSnapshot {
         code_hash: Default::default(),
         block: 99,
         last_log: None,
+        through: None,
         dynamic_fee: None,
         seq: 0,
         reserves: None,
@@ -552,11 +555,13 @@ fn v4_logs_become_writes_on_pool_manager_slots() {
     assert_eq!(effects.len(), 1, "the other pool's swap is not watched");
     let (pm, k) = (format!("{POOL_MANAGER:#x}"), format!("{key:#x}"));
     let slot = |b: B256| U256::from_big_endian(b.as_slice());
+    // R41: a v4 write's pool is the pool's key address, not PoolManager.
+    let at = |log_index: u64, write: Write| Logged { log_index, pool: k.clone(), write };
     assert_eq!(effects[0].writes, vec![
-        Write::Set { address: pm.clone(), slot: slot(state_slot(AXIS_ID)), value: get_sqrt_ratio_at_tick(-289_950).unwrap() },
-        Write::Set { address: pm.clone(), slot: slot(liquidity_slot(AXIS_ID)), value: U256::from(4_000u64) },
-        Write::Tick { address: k.clone(), tick: -289_950 },
-        Write::Liquidity { address: pm, slot: slot(liquidity_slot(AXIS_ID)), pool: k, lower: -289_960, upper: -289_940, delta: 500 },
+        at(1, Write::Set { address: pm.clone(), slot: slot(state_slot(AXIS_ID)), value: get_sqrt_ratio_at_tick(-289_950).unwrap() }),
+        at(1, Write::Set { address: pm.clone(), slot: slot(liquidity_slot(AXIS_ID)), value: U256::from(4_000u64) }),
+        at(1, Write::Tick { address: k.clone(), tick: -289_950 }),
+        at(2, Write::Liquidity { address: pm, slot: slot(liquidity_slot(AXIS_ID)), pool: k.clone(), lower: -289_960, upper: -289_940, delta: 500 }),
     ]);
 }
 

@@ -1202,3 +1202,30 @@ async fn a_fee_refresh_follows_the_factory() {
     assert_eq!(book.refresh_cp_fees(&reads, 102).await.unwrap(), 1);
     assert_eq!(book.get(AERO).unwrap().state.fee_ppm, 5_000);
 }
+
+// ------------------------------------------------------------------ R41: where the state stands
+
+/// **`through` is the newest log the state holds.** A swap, and a Mint or Burn
+/// applied in place, which moves liquidity but not `last_log`; a read keeps
+/// the changes it carries, and a read after them holds them itself. The
+/// evaluator replays a pool's writes only after this point (`start_at`).
+#[tokio::test]
+async fn through_follows_every_applied_log() {
+    let node = Arc::new(Scripted::default());
+    healthy(&node, Venue::UniswapV3.factory());
+    let reads = ChainReads::new(node.clone());
+    let (book, _) = PoolBook::load(&reads, &[spec()], 100).await.unwrap();
+    assert_eq!(book.get(WETH_USDC).unwrap().through, None, "the read alone");
+    let price = U256::from(4_100_000_000_000_000_000_000_000u128);
+    assert_eq!(book.apply_swap(WETH_USDC, price, 7, -197_348, (110, 5)), SwapApplied::Updated);
+    assert_eq!(book.get(WETH_USDC).unwrap().through, Some((110, 5)));
+    assert_eq!(book.apply_writes(&[position(300, (111, 2))]), vec![SwapApplied::Updated]);
+    let p = book.get(WETH_USDC).unwrap();
+    assert_eq!((p.through, p.last_log), (Some((111, 2)), Some((110, 5))), "a mint in place is held, and is no swap");
+
+    book.reload(&reads, &[WETH_USDC], 110).await.unwrap();
+    assert_eq!(book.get(WETH_USDC).unwrap().through, Some((111, 2)), "the read carries the mint");
+    book.reload(&reads, &[WETH_USDC], 112).await.unwrap();
+    let p = book.get(WETH_USDC).unwrap();
+    assert_eq!((p.through, p.block), (None, 112), "the read holds it");
+}

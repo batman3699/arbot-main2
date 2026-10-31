@@ -4,7 +4,7 @@
 //! [`Engine::tick`] and writes what it returns.
 
 use super::bid::{arm_bid, rank_value, ArmBid, BidModel, ShareSample};
-use super::lines::{Arm, ArmedLine, Word};
+use super::lines::{Arm, ArmedLine, StartAt, Word};
 use super::moves::{spread_key, MoveStats};
 use super::plan::{armed_call, armed_call2};
 use apex_exec::lean2::Lean2Lender;
@@ -556,6 +556,15 @@ impl Engine {
             alt_bid_wei_per_gas: bid.alt.map(|b| b.per_gas.to_string()),
             alt_p_win: bid.alt.map(|b| b.p_win),
             model_version: self.contest.as_ref().map(|s| s.model_version.clone()),
+            // In `pools`' order, which is the legs'.
+            start_at: if t == 0 { [trigger_pool, other_pool] } else { [other_pool, trigger_pool] }
+                .iter()
+                .map(|p| StartAt {
+                    pool: format!("{:#x}", p.spec.pool),
+                    block: p.through.map_or(p.block, |t| t.0),
+                    log_index: p.through.map(|t| t.1),
+                })
+                .collect(),
         })
     }
 

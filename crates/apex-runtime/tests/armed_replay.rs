@@ -48,6 +48,7 @@ fn pool(addr: Address, venue: Venue, tick: i32, fee_ppm: u32, every: i32) -> Poo
         code_hash: Default::default(),
         block: 100,
         last_log: None,
+        through: None,
         dynamic_fee: None,
         seq: 0,
         reserves: None,

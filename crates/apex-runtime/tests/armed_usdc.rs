@@ -41,6 +41,7 @@ fn pool(addr: Address, token0: Address, token1: Address, tick: i32, l: u128) -> 
         code_hash: Default::default(),
         block: 100,
         last_log: None,
+        through: None,
         dynamic_fee: None,
         seq: 0,
         reserves: None,

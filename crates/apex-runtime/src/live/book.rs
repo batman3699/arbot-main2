@@ -90,6 +90,12 @@ pub struct PoolSnapshot {
     pub block: u64,
     /// The last log applied, so an older one is refused.
     pub last_log: Option<LogPosition>,
+    /// R41: the newest log the state holds: the last swap or sync, or a Mint
+    /// or Burn applied in place (which moves liquidity, not `last_log`),
+    /// whichever is later. `None` while it is the read's alone, at `block`.
+    /// An arm records it as its start point (`start_at`), so the evaluator
+    /// never replays a write the arm's start words already hold.
+    pub through: Option<LogPosition>,
     /// Slipstream's fee regime; `None` for a pool with a fixed fee. While set,
     /// `state.fee_ppm` is its after-first fee at `state.tick`, maintained by
     /// the book.
@@ -657,6 +663,7 @@ pub async fn v4_snapshot<S: apex_venues::cl_ticks::TickDataSource + ?Sized>(
         code_hash: read.hook_code_hash,
         block,
         last_log: None,
+        through: None,
         dynamic_fee: None,
         seq: 0,
         reserves: None,
@@ -794,6 +801,7 @@ impl PoolBook {
                     code_hash,
                     block,
                     last_log: None,
+                    through: None,
                     dynamic_fee: None,
                     seq: 0,
                     reserves: None,
@@ -1175,6 +1183,7 @@ impl PoolBook {
         });
         next.block = s.at.0;
         next.last_log = Some(s.at);
+        next.through = next.through.max(Some(s.at));
         next.seq = seq;
         map.insert(s.pool, Arc::new(next));
         SwapApplied::Updated
@@ -1203,6 +1212,7 @@ impl PoolBook {
         next.state.tick = s.tick;
         next.block = s.at.0;
         next.last_log = Some(s.at);
+        next.through = next.through.max(Some(s.at));
         // The swap moved the tick, and on Slipstream the fee with it.
         next.fee_from_tick();
         next.seq = w.seq;
@@ -1249,6 +1259,7 @@ impl PoolBook {
             }
         }
         next.ladder = applied.ladder;
+        next.through = next.through.max(Some(s.at));
         next.seq = seq;
         pos.applied.insert(s.at, *s);
         map.insert(s.pool, Arc::new(next));
@@ -1354,6 +1365,7 @@ impl PoolBook {
                     snap.state.tick = old.state.tick;
                     snap.block = old.block;
                     snap.last_log = old.last_log;
+                    snap.through = old.through;
                     snap.reserves = old.reserves;
                     // The fresh regime at the kept tick.
                     snap.fee_from_tick();
@@ -1366,6 +1378,11 @@ impl PoolBook {
                             None => pos.refused = pos.refused.max(Some(c.at.0)),
                         }
                     }
+                }
+                // R41: the read holds everything to its block; the changes
+                // carried onto it are the newest it holds, if any.
+                if map.get(&addr).is_none_or(|o| o.last_log.is_none_or(|(b, _)| b <= block)) {
+                    snap.through = pos.applied.keys().next_back().copied();
                 }
                 // A read carries gross, so each change applies exactly or not
                 // at all: none is left in doubt.

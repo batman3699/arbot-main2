@@ -112,6 +112,30 @@ pub struct Arm {
     /// R38: the census's contest sample the arm was priced with, when loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_version: Option<String>,
+    /// R41: where each pool's start words stand, in `pools`' order: the
+    /// evaluator replays a pool's writes only after it. Absent from lines
+    /// written before R41, which are judged as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub start_at: Vec<StartAt>,
+}
+
+/// R41: a pool's start point: its newest applied log, `(block, log_index)`,
+/// or, with no log index, the block its state was read at, which holds every
+/// write of that block.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartAt {
+    pub pool: String,
+    pub block: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_index: Option<u64>,
+}
+
+impl StartAt {
+    /// Whether a write to this pool at `(block, log_index)` is already in the
+    /// start words.
+    pub fn holds(&self, block: u64, log_index: u64) -> bool {
+        (block, log_index) <= (self.block, self.log_index.unwrap_or(u64::MAX))
+    }
 }
 
 fn balancer() -> String {
