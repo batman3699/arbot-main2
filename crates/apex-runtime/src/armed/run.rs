@@ -413,6 +413,28 @@ pub struct RunReport {
     pub simulated: usize,
     pub sim_agreed: usize,
     pub cursor: u64,
+    /// R40.1: the sized lane's run, when it is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sized: Option<Box<RunReport>>,
+}
+
+/// R40.1: one lane's arms, verdicts and cursor. Each lane keeps its own
+/// cursor, so neither skips the other's arms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvalLane {
+    pub ledger: PathBuf,
+    pub verdicts: PathBuf,
+    pub cursor: &'static str,
+}
+
+/// R39's lane, then the sized lane's when `armed.sized` is set.
+pub fn eval_lanes(config: &ShadowConfig) -> Vec<EvalLane> {
+    let mut lanes =
+        vec![EvalLane { ledger: config.armed.ledger.clone(), verdicts: config.armed.verdicts.clone(), cursor: "armed-eval.cursor" }];
+    if let Some(sz) = &config.armed.sized {
+        lanes.push(EvalLane { ledger: sz.ledger.clone(), verdicts: sz.verdicts.clone(), cursor: "armed-eval-sized.cursor" });
+    }
+    lanes
 }
 
 fn now_ns() -> u64 {
@@ -436,6 +458,16 @@ fn read_lines<T: serde::de::DeserializeOwned>(base: &Path, now: u64, days: u64) 
 
 /// Judge every arm closed since the last run.
 pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
+    let mut lanes = eval_lanes(config).into_iter();
+    let first = lanes.next().ok_or("no lane to judge")?;
+    let mut report = run_lane(config, &first).await?;
+    if let Some(sized) = lanes.next() {
+        report.sized = Some(Box::new(run_lane(config, &sized).await?));
+    }
+    Ok(report)
+}
+
+async fn run_lane(config: &ShadowConfig, lane: &EvalLane) -> Result<RunReport, String> {
     let urls: Vec<String> = config.rpc_http.iter().map(|u| u.expose().clone()).collect();
     let rpc: Arc<dyn RpcTransport> = Arc::new(
         FailoverTransport::connect(
@@ -449,13 +481,13 @@ pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
     drop(urls);
     let reads = ChainReads::new(Arc::clone(&rpc));
     let head = reads.head().await.map_err(|e| e.to_string())?;
-    let dir = config.armed.verdicts.parent().map(Path::to_path_buf).unwrap_or_default();
-    let cursor_path = dir.join("armed-eval.cursor");
+    let dir = lane.verdicts.parent().map(Path::to_path_buf).unwrap_or_default();
+    let cursor_path = dir.join(lane.cursor);
     let cursor: u64 = std::fs::read_to_string(&cursor_path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     let now = now_ns();
 
     // Today's and yesterday's arms: a window is seconds long.
-    let lines: Vec<ArmedLine> = read_lines(&config.armed.ledger, now, 2);
+    let lines: Vec<ArmedLine> = read_lines(&lane.ledger, now, 2);
     let due: Vec<Arm> = merge_renewals(lines)
         .into_iter()
         .filter(|a| a.to_block > cursor && a.to_block + settle_blocks(config.armed.block_time_ms) <= head)
@@ -525,7 +557,7 @@ pub async fn run(config: &ShadowConfig) -> Result<RunReport, String> {
     for (i, (arm, j)) in judged.iter().enumerate() {
         report.judged += 1;
         let v = verdict(&ctx, arm, j, shadowed[i], simulate.contains(&i), &mut report).await;
-        ledger::append_line(&config.armed.verdicts, now, &v).map_err(|e| e.to_string())?;
+        ledger::append_line(&lane.verdicts, now, &v).map_err(|e| e.to_string())?;
     }
     report.cursor = new_cursor;
     std::fs::write(&cursor_path, report.cursor.to_string()).map_err(|e| e.to_string())?;

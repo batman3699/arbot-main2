@@ -91,6 +91,21 @@ armed:
   executor2:
     address: "0x443A997cF27Dac4BB32e007d4168492abC77ad6e"
     code_hash: "0xb67e7dd210e440dae114d36ca40d13d65fd2150a26a71dc53c86a3af83b39c7e"
+  # R40.1: the sized lane, LeanExecutor3's, beside R39's on the same feed: in
+  # shadow it arms and records, and never sends. Until the owner deploys it,
+  # the address is a placeholder with no code, and the evaluator simulates
+  # every fire against runtime_code put there (`forge inspect LeanExecutor3
+  # deployedBytecode`, packaged by ops/host/deploy.sh), whose keccak is
+  # code_hash. Live refuses runtime_code, and at most one lane is live
+  # (ops/host/ARMED.md, R40.1).
+  sized:
+    mode: shadow
+    ledger: var/apex/armed-sized.jsonl
+    verdicts: var/apex/armed-sized-verdicts.jsonl
+    executor3:
+      address: "0x00000000000000000000000000000000000e3e03"
+      code_hash: "0xfc900951ded02368fc5e39d88682d01d9af72eb75552fc1b1e88283ee5110767"
+      runtime_code: var/armed/LeanExecutor3.runtime.hex
   max_size_usdc: 12000000000                 # 12,000 USDC, about max_size_wei's 5 WETH
   # R37: armed-eval simulates this many fires a run (an even sample, every
   # fire still quoted): 2 a run every 5 minutes is at most 576 a day. All

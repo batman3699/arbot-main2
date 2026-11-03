@@ -990,3 +990,21 @@ fn the_live_lane_sends_to_its_own_executor() {
     assert_eq!(fixed.live_lane(), Some(Lane::Fixed));
     assert_eq!(fixed.live_senders(), fixed.armed.max_arms);
 }
+
+/// R40.1: armed-eval judges each lane into its own verdicts, past its own
+/// cursor: R39's file names are unchanged, so its cursor carries on.
+#[test]
+fn each_lane_is_judged_past_its_own_cursor() {
+    use apex_runtime::armed::run::eval_lanes;
+    let var = "APEX_SECRET_SHADOW_TEST_EVAL";
+    let e = env(var, SECRET);
+    let base = denim_yaml(var);
+    let r39 = eval_lanes(&ShadowConfig::from_yaml_str(&base, &e).unwrap());
+    assert_eq!(r39.len(), 1);
+    assert_eq!((r39[0].ledger.to_str(), r39[0].verdicts.to_str(), r39[0].cursor), (Some("var/a.jsonl"), Some("var/v.jsonl"), "armed-eval.cursor"));
+    let sized = "  sized:\n    mode: shadow\n    ledger: var/s.jsonl\n    verdicts: var/sv.jsonl\n    executor3:\n      address: \"0x00000000000000000000000000000000000000e3\"\n      code_hash: \"0x00000000000000000000000000000000000000000000000000000000000000c3\"\n";
+    let both = eval_lanes(&ShadowConfig::from_yaml_str(&base.replace("executor:\n  address", &format!("{sized}executor:\n  address")), &e).unwrap());
+    assert_eq!(both.len(), 2);
+    assert_eq!((both[1].ledger.to_str(), both[1].verdicts.to_str(), both[1].cursor), (Some("var/s.jsonl"), Some("var/sv.jsonl"), "armed-eval-sized.cursor"));
+    assert_ne!(both[0].cursor, both[1].cursor);
+}

@@ -8,7 +8,8 @@
 # (each venue's pools.jsonl: data/ is outside git), dist/REVISION,
 # dist/LeanExecutor2.runtime.hex (R37, only while <rev>'s config still has
 # armed.executor2.runtime_code: the code the pre-deploy shadow simulates, its
-# keccak checked against <rev>'s code_hash) and dist/MANIFEST.sha256, which
+# keccak checked against <rev>'s code_hash), dist/LeanExecutor3.runtime.hex
+# (R40.1, the same for armed.sized.executor3) and dist/MANIFEST.sha256, which
 # the host checks before unpacking.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -28,7 +29,7 @@ else
   echo "deploy: no data/base/uniswap_v4/pools.jsonl: the host will load no v4 pool" >&2
 fi
 mkdir -p dist
-rm -f dist/apex-*.tar.gz dist/data-base.tar.gz dist/MANIFEST.sha256 dist/REVISION dist/LeanExecutor2.runtime.hex
+rm -f dist/apex-*.tar.gz dist/data-base.tar.gz dist/MANIFEST.sha256 dist/REVISION dist/LeanExecutor2.runtime.hex dist/LeanExecutor3.runtime.hex
 # R37: LeanExecutor2's runtime code, which must hash to the revision's
 # armed.executor2.code_hash: the working tree's contracts must be <rev>'s.
 # Only before the deploy: once deployed (ARMED.md §3c) the config has no
@@ -41,9 +42,16 @@ if [[ -n "$want" ]] && grep -q '^    runtime_code:' <<<"$config"; then
   got="$(cast keccak "$(cat dist/LeanExecutor2.runtime.hex)")"
   [[ "$got" == "$want" ]] || { echo "deploy: LeanExecutor2's runtime code hashes to $got, not $rev's code_hash $want" >&2; exit 1; }
 fi
+# R40.1: LeanExecutor3's, while the sized lane's executor3 has runtime_code.
+want3="$(awk '/^  sized:/{s=1} s && /^    executor3:/{e=1} e && /code_hash:/{gsub(/[" ]/, "", $2); print $2; exit}' <<<"$config")"
+if [[ -n "$want3" ]] && grep -q '^      runtime_code:' <<<"$config"; then
+  forge inspect LeanExecutor3 deployedBytecode > dist/LeanExecutor3.runtime.hex
+  got3="$(cast keccak "$(cat dist/LeanExecutor3.runtime.hex)")"
+  [[ "$got3" == "$want3" ]] || { echo "deploy: LeanExecutor3's runtime code hashes to $got3, not $rev's code_hash $want3" >&2; exit 1; }
+fi
 git archive --format=tar.gz --prefix=apex/ -o "dist/apex-$short.tar.gz" "$rev"
 tar -czf dist/data-base.tar.gz "${files[@]}"
 echo "$rev" > dist/REVISION
-( cd dist && sha256sum "apex-$short.tar.gz" data-base.tar.gz REVISION $( [[ -f LeanExecutor2.runtime.hex ]] && echo LeanExecutor2.runtime.hex ) > MANIFEST.sha256 )
+( cd dist && sha256sum "apex-$short.tar.gz" data-base.tar.gz REVISION $( [[ -f LeanExecutor2.runtime.hex ]] && echo LeanExecutor2.runtime.hex ) $( [[ -f LeanExecutor3.runtime.hex ]] && echo LeanExecutor3.runtime.hex ) > MANIFEST.sha256 )
 echo "packaged $rev"
 echo "manifest sha256 (compare on the host): $(sha256sum dist/MANIFEST.sha256 | cut -d' ' -f1)"

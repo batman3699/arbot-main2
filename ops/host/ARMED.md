@@ -578,3 +578,55 @@ The design is `docs/superpowers/specs/2026-10-29-armed-bid-from-own-fires-design
   - Until four days have passed again, the sample is unfit and the arms send
     `best_bid`.
 
+
+## 5. R40.1: the sized lane (`LeanExecutor3`)
+
+The plan is `docs/superpowers/plans/2026-11-02-r40-1-any-size-armed-lane.md`.
+`LeanExecutor3` sizes each trade itself at execution, and prices its floor at
+the transaction's own gas price. Its engine runs beside R39's on the same
+feed. One lane sends at a time; the other only records.
+
+### a. Shadow, before the deploy (the host)
+
+Every shipped config carries `armed.sized` in `mode: shadow`, at a
+placeholder address with `runtime_code`. `ops/host/deploy.sh` packages
+`dist/LeanExecutor3.runtime.hex`, and refuses unless its keccak is the
+revision's `armed.sized.executor3.code_hash`. On the host, after README §7's
+unpack:
+
+```
+# install -o apex -g apex -m 0644 /root/dist/LeanExecutor3.runtime.hex /opt/apex/var/armed/LeanExecutor3.runtime.hex
+```
+
+- The boot logs "the sized lane arms beside R39's". On a hash mismatch it
+  logs "LeanExecutor3 is not the configured code: the sized lane arms
+  nothing", and R39 runs on alone.
+- Its arms go to `var/apex/armed-sized-*.jsonl`, never to the worker.
+- `apex armed-eval` judges them into `var/apex/armed-sized-verdicts-*.jsonl`,
+  past its own cursor, `armed-eval-sized.cursor`. Each verdict's `sized`
+  field says what the executor would have done at the fire: `traded`,
+  `capped`, `truncated` or `early_exit`, with what the cap and the step
+  limit left.
+
+### b. Gate C: one post-Denim UTC day
+
+Pass means no correctness failure: book and chain storage agree; every
+simulated fire's `sim.agrees`; the reservations and budget hold; overlapping
+arms behave. Early exits, capped and truncated value, and the comparison
+with R39 are reported, not gated.
+
+### c. Deploy, authorize, flip (the owner, then the host)
+
+1. Forge clean, `forge build script/DeployLeanExecutor3.s.sol`, a dry run, then
+   the owner broadcasts. The printed code hash becomes
+   `armed.sized.executor3.code_hash`, the address its `address`, and
+   `runtime_code` goes.
+2. Authorize the senders in one transaction:
+   `forge script script/AuthorizeArmedSenders.s.sol --sig "runBatch()"`, with
+   `ops/armed-senders.json`'s `executor` set to the new address.
+3. Flip: `armed.sized.mode: live` and `armed.mode: shadow`, then restart.
+   The worker now sends to `LeanExecutor3`, with `armed.sized.max_senders`
+   keys.
+
+Rollback: the same two fields back, and a restart. `LeanExecutor2` stays
+deployed and authorized.
