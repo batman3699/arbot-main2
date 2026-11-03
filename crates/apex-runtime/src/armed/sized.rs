@@ -26,7 +26,7 @@ use super::bid::{BidModel, ShareSample};
 use super::engine::{position, words_of, BidInputs, EngineStats, RouteBids};
 use super::lines::{Arm, ArmedLine, SizedLine, StartAt};
 use super::moves::{spread_key, MoveStats};
-use super::plan::{sized_call, sized_outcome, SizedOutcome, SizedTerms};
+use super::plan::{sized_call, sized_trade, SizedOutcome, SizedTerms};
 use super::predicate;
 use super::threshold::{expected_net, sized_points, trigger_up, Pricing, SizedArmPoint, BAND_WIDTHS, TIER1_BID_STEPS};
 use crate::live::book::PoolSnapshot;
@@ -89,8 +89,9 @@ pub struct SizedSettings {
     /// its fires.
     pub p_no_trade_ppm: u32,
     pub p_revert_ppm: u32,
-    /// How long a pass goes on pricing slots.
+    /// How long a pass goes on pricing slots, and on how many threads.
     pub reprice_for: Duration,
+    pub workers: usize,
     pub l1_fee_bound_wei: u128,
 }
 
@@ -229,6 +230,11 @@ impl SizedEngine {
         self
     }
 
+    /// The settings the engine was built with.
+    pub fn settings_for_test(&self) -> &SizedSettings {
+        &self.settings
+    }
+
     pub fn restore_moves(&self, snapshot: &super::moves::MovesSnapshot) -> Result<usize, String> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).moves.restore(snapshot)
     }
@@ -361,17 +367,37 @@ impl SizedEngine {
             }
         }
         stale.sort_by_key(|(_, order)| *order);
-        for (i, ((id, leg), _)) in stale.into_iter().enumerate() {
-            if i > 0 && started.elapsed() >= s.reprice_for {
-                break;
+        let work: Vec<(RouteId, u8)> = stale.into_iter().map(|(slot, _)| slot).collect();
+        // On the pass's threads, while it has time; the first slot always, or
+        // a book too slow for the time would never be priced at all.
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let moves = &st.moves;
+        let price = || {
+            let mut done = Vec::new();
+            loop {
+                let i = next.fetch_add(1, Relaxed);
+                if i >= work.len() || (i > 0 && started.elapsed() >= s.reprice_for) {
+                    return done;
+                }
+                let (id, leg) = work[i];
+                if let Some(mut p) = self.price_slot(&self.cycles[&id], leg, snapshot, px, l1_upper_wei, moves) {
+                    p.at_ns = now_ns;
+                    done.push(((id, leg), p));
+                }
             }
-            let c = &self.cycles[&id];
-            if let Some(mut p) = self.price_slot(c, leg, snapshot, px, l1_upper_wei, &st.moves) {
-                p.at_ns = now_ns;
-                st.priced.insert((id, leg), p);
-                self.priced.fetch_add(1, Relaxed);
-            }
-        }
+        };
+        let threads = s.workers.clamp(1, work.len().max(1));
+        let done: Vec<((RouteId, u8), Priced)> = if threads == 1 {
+            price()
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads).map(|_| scope.spawn(price)).collect();
+                // A thread that panicked loses its slots to the next pass.
+                handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+            })
+        };
+        self.priced.fetch_add(done.len() as u64, Relaxed);
+        st.priced.extend(done);
         self.armable.store(st.priced.values().filter(|p| !p.points.is_empty()).count() as u64, Relaxed);
 
         // Candidates: every point of every slot priced at this book.
@@ -524,7 +550,7 @@ impl SizedEngine {
             book.insert(pc.legs[pl].pool, Arc::new(after.clone()));
             book.insert(o.spec.pool, Arc::clone(o));
             let price = U256::from(pxc.costs.wei_per_gas);
-            if let SizedOutcome::Trade { size, mid, .. } = sized_outcome(pc, &book, &pp.terms, price, &pxc.gas) {
+            if let SizedOutcome::Trade { size, mid, .. } = sized_trade(pc, &book, &pp.terms, price, &pxc.gas) {
                 // The trigger is the prior route's hop `pl`: its input there is
                 // the size on hop 0, and what hop 0 returned on hop 1.
                 let input = if pl == 0 { size } else { mid };
@@ -552,7 +578,7 @@ impl SizedEngine {
         book.insert(c.legs[leg].pool, Arc::new(trigger.clone()));
         book.insert(other.spec.pool, Arc::clone(other));
         let (terms, _) = self.terms_for(c, &pxc, 0);
-        match sized_outcome(c, &book, &terms, U256::from(pxc.costs.wei_per_gas), &pxc.gas) {
+        match sized_trade(c, &book, &terms, U256::from(pxc.costs.wei_per_gas), &pxc.gas) {
             SizedOutcome::Trade { gross, .. } => pxc.in_wei(gross).as_u128() as f64,
             SizedOutcome::NoTrade(_) => 0.0,
         }
@@ -592,7 +618,7 @@ impl SizedEngine {
         let mut at = snapshot.clone();
         at.insert(c.legs[t].pool, Arc::new(point.trigger.clone()));
         let price = U256::from(base_fee_wei.saturating_add(point.bid.sent.per_gas));
-        let (size, gross) = match sized_outcome(c, &at, &p.terms, price, &pxc.gas) {
+        let (size, gross) = match sized_trade(c, &at, &p.terms, price, &pxc.gas) {
             SizedOutcome::Trade { size, gross, .. } => (size, gross),
             SizedOutcome::NoTrade(_) => (U256::zero(), U256::zero()),
         };
@@ -727,6 +753,7 @@ mod tests {
             p_no_trade_ppm: 0,
             p_revert_ppm: 0,
             reprice_for: Duration::MAX,
+            workers: 1,
             l1_fee_bound_wei: 1_000_000_000_000,
         };
         let px = Pricing {

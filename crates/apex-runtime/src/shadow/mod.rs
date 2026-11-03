@@ -816,6 +816,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
                         p_no_trade_ppm: sz.p_no_trade_ppm,
                         p_revert_ppm: sz.p_revert_ppm,
                         reprice_for: crate::armed::engine::REPRICE_FOR,
+                        workers: crate::armed::engine::workers(),
                         l1_fee_bound_wei: a.l1_fee_bound_wei,
                     };
                     let t = targets.clone();

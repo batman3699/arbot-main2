@@ -141,6 +141,7 @@ fn engine(max_senders: usize) -> (SizedEngine, BTreeMap<Address, Arc<PoolSnapsho
         p_no_trade_ppm: 20_000,
         p_revert_ppm: 0,
         reprice_for: Duration::MAX,
+        workers: 1,
         l1_fee_bound_wei: 1_000_000_000_000,
     };
     (SizedEngine::new(cycles, settings, BTreeSet::new()), snap)
@@ -243,4 +244,27 @@ fn the_l1_bound_is_read_with_one_oracle_call() {
     assert_eq!(l1_upper_of(&answer), Some(1_482_055_036));
     assert_eq!(l1_upper_of(&answer[..31]), None, "not a word");
     assert_eq!(l1_upper_of(&[0xff; 32]), None, "past 128 bits");
+}
+
+/// R40.1: a pass's pricing, timed: three pools of one pair, every slot stale.
+#[test]
+fn a_full_pass_is_timed() {
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> = [
+        (UNI, pool(UNI, Venue::UniswapV3, -197_350, 500)),
+        (CAKE, pool(CAKE, Venue::PancakeV3, -197_350, 100)),
+        (address!("dbc6998296caA1652A810dc8D3BaF4A8294330f1"), pool(address!("dbc6998296caA1652A810dc8D3BaF4A8294330f1"), Venue::Slipstream, -197_350, 400)),
+    ]
+    .into_iter()
+    .map(|(a, p)| (a, Arc::new(p)))
+    .collect();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let slots = 2 * cycles.len();
+    let (e, _) = engine(64);
+    let mut settings = *e.settings_for_test();
+    settings.workers = 6;
+    let e = SizedEngine::new(cycles, settings, BTreeSet::new());
+    let started = std::time::Instant::now();
+    e.tick(&snap, 1_000, 300_000, &px(), 1, 10_000_000_000_000_000, 1_500_000_000);
+    let took = started.elapsed();
+    eprintln!("{slots} slots priced in {took:?}: {:?} a slot", took / u32::try_from(slots).unwrap_or(1));
 }

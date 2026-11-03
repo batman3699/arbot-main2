@@ -148,13 +148,37 @@ pub fn cross_gas(leg: &crate::live::frontier::Leg, gas: &SettlementGas) -> u64 {
 }
 
 /// The executor's choice at `book` and `wei_per_gas`: the walk, its exact
-/// quote, and its early exit predicted with `terms.read_gas`.
+/// quote, and its early exit predicted with `terms.read_gas`, with what the cap
+/// and the step limit left: the evaluator's.
 pub fn sized_outcome(
     cycle: &Cycle,
     book: &BTreeMap<Address, Arc<PoolSnapshot>>,
     terms: &SizedTerms,
     wei_per_gas: EthersU256,
     gas: &SettlementGas,
+) -> SizedOutcome {
+    outcome(cycle, book, terms, wei_per_gas, gas, true)
+}
+
+/// The same, without the two walks that measure what the limits left: the
+/// engine's, which prices a slot with dozens of these.
+pub fn sized_trade(
+    cycle: &Cycle,
+    book: &BTreeMap<Address, Arc<PoolSnapshot>>,
+    terms: &SizedTerms,
+    wei_per_gas: EthersU256,
+    gas: &SettlementGas,
+) -> SizedOutcome {
+    outcome(cycle, book, terms, wei_per_gas, gas, false)
+}
+
+fn outcome(
+    cycle: &Cycle,
+    book: &BTreeMap<Address, Arc<PoolSnapshot>>,
+    terms: &SizedTerms,
+    wei_per_gas: EthersU256,
+    gas: &SettlementGas,
+    limits: bool,
 ) -> SizedOutcome {
     let (Some(a), Some(b)) = (book.get(&cycle.legs[0].pool), book.get(&cycle.legs[1].pool)) else { return SizedOutcome::NoTrade(2) };
     let legs = [walk_leg(&cycle.legs[0], a, gas), walk_leg(&cycle.legs[1], b, gas)];
@@ -174,7 +198,12 @@ pub fn sized_outcome(
     if gross < floor {
         return SizedOutcome::NoTrade(1);
     }
-    let more = |cap, steps| gross_at(cap, steps).map_or(EthersU256::zero(), |(_, _, g)| g.saturating_sub(gross));
+    let more = |cap, steps| {
+        if !limits {
+            return EthersU256::zero();
+        }
+        gross_at(cap, steps).map_or(EthersU256::zero(), |(_, _, g)| g.saturating_sub(gross))
+    };
     SizedOutcome::Trade {
         size: walked.size,
         mid,

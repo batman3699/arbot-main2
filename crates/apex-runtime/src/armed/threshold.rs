@@ -348,7 +348,7 @@ pub fn net_at(
     let trigger = pair[leg].moved(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
     let book = map_of(cycle, with(pair, leg, &trigger, other));
     let price = U256::from(px.costs.wei_per_gas.saturating_add(bid_wei_per_gas));
-    let super::plan::SizedOutcome::Trade { gross, walked, size, .. } = super::plan::sized_outcome(cycle, &book, terms, price, &px.gas)
+    let super::plan::SizedOutcome::Trade { gross, walked, size, .. } = super::plan::sized_trade(cycle, &book, terms, price, &px.gas)
     else {
         return None;
     };
