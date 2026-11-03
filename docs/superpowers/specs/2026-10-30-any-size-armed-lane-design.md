@@ -235,15 +235,19 @@ arm can wait a whole window, and its gas depends on the size chosen, so an
 arm-time estimate is not a floor. The contract measures:
 
 ```
-cost_wei = (gasStart − gasleft() + gasOverhead) × tx.gasprice + l1Bound
+cost_wei = (used_in_run + used_in_callback + gasOverhead) × tx.gasprice + l1Bound
 floor:     out ≥ borrowed + lenderFee + toStart(cost_wei) + minNet
 ```
 
-- `gasStart` is `gasleft()` on entry. `tx.gasprice` is the effective price
-  (base fee plus our bid), read at execution.
+- Gas is measured a frame at a time: `run`'s work before it borrows, and the
+  lender's callback's from its own entry. One `gasleft()` against the start
+  would also count what the 63/64 rule holds back in each calling frame,
+  which is reserved, not spent (corrected while building: about 30k gas at a
+  1M limit). `tx.gasprice` is the effective price (base fee plus our bid),
+  read at execution.
 - `gasOverhead` (in the plan) covers what the measurement can't see: the
-  intrinsic gas and calldata of this exact transaction, and the work after
-  the floor (event, transfer). The engine sets it at signing from
+  intrinsic gas and calldata of this exact transaction, the lender's own
+  work around the callback, and the work after the floor (event, transfer). The engine sets it at signing from
   fork-measured constants, rounded up. Refunds are ignored, which only
   overstates the cost.
 - **The contract's cost is a guard, not the accounts.** Realised net comes from

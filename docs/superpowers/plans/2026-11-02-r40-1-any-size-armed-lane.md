@@ -694,10 +694,14 @@ minimums.
 **Then the floor:**
 
 ```text
-cost     = (gasStart − gasleft() + gasOverhead) × tx.gasprice + l1Bound
+cost     = (used in run before the loan + used in the callback + gasOverhead) × tx.gasprice + l1Bound
 required = size + lenderFee + toStart(cost) + minNet
 out < required: revert Floor(out, required)
 ```
+
+Each frame measures its own gas: one `gasleft()` against `run`'s start would
+also count what the 63/64 rule holds back in the calling frames (found by
+these tests: 33M gas under forge's limit).
 
 The gross `out − size − lenderFee` goes to `profitRecipient`, and `Traded` is
 emitted. A mocked hop 2 returning less than quoted must hit `Floor`.

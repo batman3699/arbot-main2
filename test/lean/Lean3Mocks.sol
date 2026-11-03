@@ -316,6 +316,9 @@ contract MockPoolManager3 is MockClEngine {
     address public synced;
     uint256 public syncedReserves;
     uint256 public swaps;
+    /// A swap that reports its input as owed to the caller: a delta of the
+    /// wrong sign, which the executor must refuse.
+    bool public flipDelta;
     mapping(bytes32 => bytes32) internal words;
     mapping(bytes32 => bytes32) internal stateOf;
     mapping(bytes32 => uint24) internal protocolFee;
@@ -332,6 +335,10 @@ contract MockPoolManager3 is MockClEngine {
 
     function setTick(MockPoolKey3 memory key, int24 tick, int128 net) external {
         _setTick(idOf(key), tick, net);
+    }
+
+    function setFlipDelta(bool f) external {
+        flipDelta = f;
     }
 
     function setProtocolFee(MockPoolKey3 memory key, uint24 f) external {
@@ -384,9 +391,8 @@ contract MockPoolManager3 is MockClEngine {
             params.zeroForOne ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
         _account(tokenIn, -int128(int256(used)));
         _account(tokenOut, int128(int256(out)));
-        (int128 a0, int128 a1) = params.zeroForOne
-            ? (-int128(int256(used)), int128(int256(out)))
-            : (int128(int256(out)), -int128(int256(used)));
+        int128 owedIn = flipDelta ? int128(int256(used)) : -int128(int256(used));
+        (int128 a0, int128 a1) = params.zeroForOne ? (owedIn, int128(int256(out))) : (int128(int256(out)), owedIn);
         return (int256(a0) << 128) | int256(uint256(uint128(a1)));
     }
 
