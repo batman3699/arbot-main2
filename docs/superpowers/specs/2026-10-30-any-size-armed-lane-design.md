@@ -76,8 +76,8 @@ change at a time: Denim is not combined with `LeanExecutor3` or a bid change.
 
 ## Goal
 
-1. **Every target route whose pools are loaded holds an arm on each trigger
-   leg, at all times**, within the sender and budget limits of section 5.
+1. **Every trigger leg worth holding holds an arm**, by marginal expected net,
+   within the sender and budget limits of section 5.
 2. **Any move past the arm's threshold is traded at its best size,**
    computed on chain from the pools' state at execution.
 3. **Realised net goes up.** This is the measure of success. A capture
@@ -185,15 +185,16 @@ Verified, in this repo or on chain:
   `bool` where theirs is a fee. `slot0` and `ticks` must be read raw: the
   first two words of each are the same on all three.
 - **The L1 oracle today:** `getL1FeeUpperBound(600)` is 1.48e9 wei.
+- **Sequencer limits** (`base/base` v1.5.1 and `main`, 2026-11-03): no send-rate
+  limit in the node. Each validity transaction needs a block expiry inside the
+  wall-clock window, and a predicate count within the batch limit, which R39's
+  arms already meet. `main` holds validity transactions in their own pool, at
+  reth's pending limits by default. Any rate limit in front of the node isn't
+  visible from source.
 
-To verify in phase 1, before any code (on Denim):
-
-- The sequencer's rate limit for `base_sendRawTransactionValidity` at about
-  5–10 sends a second.
-- Any limit on pending validity transactions per account or in total.
-- Any limit on predicates per transaction.
-- How many distinct (trigger pool, direction) groups today's target routes
-  have, and how many routes share each.
+Still to read from the host, for launch values and not holding up the build:
+R39's peak accepted send rate, its revert share, every landing's L1 fee, and how
+many (trigger pool, direction) groups the target routes have.
 
 ## Design
 
@@ -245,12 +246,15 @@ floor:     out ≥ borrowed + lenderFee + toStart(cost_wei) + minNet
   the floor (event, transfer). The engine sets it at signing from
   fork-measured constants, rounded up. Refunds are ignored, which only
   overstates the cost.
+- **The contract's cost is a guard, not the accounts.** Realised net comes from
+  the receipt, and `NoTrade`s and reverts are charged at their real cost.
 - `l1Bound` (in the plan) bounds the L1 fee. **(my call)** Twice the
   `GasPriceOracle.getL1FeeUpperBound(tx size)` that the worker reads once a
   minute. The receipts above show it is about 0.3% of the L2 cost.
 - `toStart` converts wei to a non-WETH start token at a rate in the plan:
   the arm-time rate plus **(my call)** 5%, rounded up. For WETH it is 1.
-- `minNet` is a margin, **(my call)** 0 at first.
+- `minNet` is 1: the smallest value that stops rounding from recording a zero.
+  The ranking, not a fixed floor, refuses inferior arms.
 
 So a trade the executor lets through never nets below zero after its own
 gas, bid and L1 fee, except by the L1 bound being exceeded, which the ledger
@@ -296,7 +300,8 @@ arithmetic as `apex_math`'s CL swap, step for step:
    reads (measured: about 20k on a v3 or Pancake route, and up to about 170k
    on Slipstream to Slipstream), not two swaps. It is a loss, and section 3
    keeps it rare.
-6. **Otherwise trade:** borrow exactly Δ, run both hops as exact-input
+6. **Otherwise check the lender holds Δ** (`NoTrade` if not), **and trade:**
+   borrow exactly Δ, run both hops as exact-input
    swaps with no price limit, and check the floor on real balances.
 
 **Rounding is always against us:** outputs round down, costs and repayments
@@ -386,25 +391,26 @@ overlapping routes, with and without a rival in between.
 threshold, the band edges and the bid. Re-arms should fall sharply, which
 the sequencer's rate limit may require.
 
-### 4. Ranking: groups first, by marginal value
+### 4. Ranking: by marginal expected net
 
 `Engine::tick` replaces "the top `max_arms` rungs by `rank_value`" with a
 greedy fill under two limits: senders, and the budget's pending reservation
 (section 5).
 
-1. **Group the candidates** by (trigger pool, direction). A move on the
-   trigger pool makes every route in its group eligible at once.
-2. **Base pass.** Each group gets its best route's tier-1 arm, in order of
-   expected value, until senders or budget run out.
-3. **Extras.** Remaining capacity goes to a group's second route, or to a
-   tier 2, by **marginal** value: the value the census says the arm adds
-   beyond the arms already chosen (a second route counts only the rival value
-   the first one would not have covered), less its expected early-exit cost,
-   per sender and per unit of reserved budget.
+1. **Value each candidate by its expected net:**
+   `P(trigger) × P(wins) × expected trade net − P(no trade) × its cost −
+   P(revert) × its cost`. Trade net is the mirror's sized output less principal,
+   lender fee, gas, L1 fee and bid, integrated over the move distribution.
+2. **Take the best** per sender and unit of reserved budget, and stop at no
+   positive value.
+3. **Re-value its group,** the candidates sharing its (trigger pool, direction):
+   replay the chosen trades on the book, in order, and value the rest only on
+   what remains. A tier 2 counts only what it adds to its tier 1.
 
 A candidate whose tier 1 can't pay at any move up to `MAX_STEP` holds no
-sender. A greedy fill is enough to start (**my call**); a knapsack only if
-replay shows the greedy leaving value.
+sender. A sample's zero chance of winning isn't evidence of zero, so it is
+floored: such an arm ranks last, and is not excluded. A greedy fill is enough to
+start; a knapsack only if replay shows the greedy leaving value.
 
 R39's cap filter goes away. The cap is now a clamp inside the executor:
 over-cap moves are traded up to the cap instead of skipped, and the
@@ -441,7 +447,7 @@ bound that would let the reservation be N worst cases instead of all. Only
 if tier 2 proves budget-bound and worth it.
 
 **How many senders.** **(my call)** Up to 64, ramped 16 → 32 → 64
-(section 7). More only when the last step added net. Senders are a config
+(section 7). More only while the last step's realised net was positive. Senders are a config
 count (`max_arms`); the keys file holds that many keys.
 
 **What each sender needs.** Tier-1 senders 0.001 ETH each, tier-2 senders
@@ -473,9 +479,10 @@ by the owner in steps.
     measured by R28.1's per-method HTTP counters.
 - **The L1 bound** is read from `GasPriceOracle.getL1FeeUpperBound` once a
   minute, one call.
-- **The send window** (`window_s`, 10 s today) may lengthen towards Cobalt's
-  60 s bound. A sized arm goes stale only when its band or threshold moves.
-  The shadow picks the window from re-arms against missed fires.
+- **The send window** stays 10 s in this release. A longer one holds senders
+  and goes stale on the USDC rate, for value nobody has shown.
+- **Local tracking and the rate limiter wait for 32 senders:** at 16, R39's reads
+  stand.
 - **A send-rate limiter** (a config field) holds sends to whatever phase 1
   finds the sequencer allows.
 - **Unchanged:** the ledger's write-ahead, replacement bumps, expiry,
@@ -520,31 +527,24 @@ tracked 9 of 11 landings). So realised net is measured live, in small steps.
   - Fork tests land each venue pair at the mirror's size and output, and
     the gas at `maxSteps` is measured.
   - The overlapping-routes tests of section 3 pass.
-- **C (shadow, on post-Denim days).** **(my call)** The canary runs the new
-  engine in shadow next to the live R39 engine, on the same feed: no live
-  day is given up, and both are judged on the same fires. If the builder
-  finds two engines in one process too costly, the fallback is one day with
-  live off (about $1.70 forgone). Passing means:
+- **C (shadow, on one post-Denim day).** The canary runs the new engine in
+  shadow next to the live R39 engine, on the same feed: no live day is given up.
+  If two engines in one process cost too much, the fallback is one day with live
+  off (about $1.70 forgone). Passing means no correctness failure:
   - book and chain storage agree for every armable pool;
   - the mirror matches the real-contract simulation on every simulated fire;
-  - predicted early exits are under 2% of fires **(my call)**;
-  - at least 90% of groups are armed at least 90% of the time;
-  - the send rate is inside the sequencer's limit, and reads within the bar;
-  - coverage and the paired replay net (R40.1 against R39, pessimistic
-    landing, bootstrapped by market move) are reported. Coverage of at least
-    60% is the target; it is a diagnostic, not a pass on money.
-- **L (live ramp).** 16 senders (the same as R39, so the step measures the
-  executor and ranking alone), then 32, then 64. Each step runs at least
-  three UTC days. A step goes up when:
-  - its realised net is positive, and above the previous step's per day;
-  - included losses stayed within budget, with no halt;
-  - early exits and reverts stayed rare, and BlockPI was not exhausted;
-  - landings' realised net matched the evaluator's pessimistic estimate.
+  - the reservations and budget hold, with no stale pool armed;
+  - overlapping arms behave as gate S's tests say.
 
-  The bootstrapped interval of the step's added net is reported each time.
-  A positive lower bound is required only for raising a risk limit (budget,
-  caps), not for adding senders: a sender step risks only its funding and
-  what the unchanged budget allows.
+  Early exits, capped and truncated value, and the paired replay against R39 are
+  reported, not gated.
+- **L (live ramp).** 16 senders (the same as R39, so the step measures the
+  executor and ranking alone), then 32, then 64. Each step runs one UTC day. A
+  step goes up when realised net from receipts was positive and no lower than
+  the last step's, positive-EV candidates are waiting for the new senders, no
+  invariant failed, and BlockPI was not exhausted. Stop if a sequencer limit
+  appears or the added senders earn nothing. A positive lower bound on added net
+  is required only for raising a risk limit (budget, caps).
 
 ## Phasing
 
@@ -555,12 +555,12 @@ tracked 9 of 11 landings). So realised net is measured live, in small steps.
 2. **The Rust mirror** and its tests against `best_size`.
 3. **`LeanExecutor3` and `LeanPlan3Codec`,** with unit, differential, fork
    and overlapping-route tests. Gate S.
-4. **Engine and worker:** grouping and marginal ranking, tiers, the wider
-   band, the new plan, cached chain reads, the L1 bound, the rate limiter,
-   the evaluator's sized judgement and classes, and the daily report.
-5. **Shadow on the host,** next to live R39. Gate C.
-6. **Operator:** deploy `LeanExecutor3`, authorize in one batch, generate
-   and fund the keys, then the live ramp through gate L.
+4. **Engine and evaluator:** expected-net ranking, tiers, the wider band, the
+   new plan, the L1 bound, and the sized judgement.
+5. **Shadow on the host,** next to live R39. Gate C. Then the owner deploys
+   `LeanExecutor3`, and first live at 16 senders.
+6. **Scale:** landings from logs, cached chain reads, the rate limiter, then 32
+   and 64 through gate L. The daily report comes only if a fix needs aiming.
 
 ## Risks
 
@@ -581,6 +581,10 @@ tracked 9 of 11 landings). So realised net is measured live, in small steps.
   the owner can revoke any key and trip the circuit.
 - **Post-Denim competition is unknown.** The bid contest changes with the
   block cadence. Nothing is fitted on pre-Denim days.
+- **Signed predicates.** `base/base` has an opt-in `--validity-signature-mode`
+  (default `off`), with a stated rollout to `required`. At `required`, unsigned
+  arms are refused, R39's too. Arms would then need an EIP-712 sidecar signature.
+  The refusal's text would show it; nothing is built for it yet.
 - **Unknown value.** The prize on target routes ranges from about $0.9k to
   $21k a day of rival gross, and what we can net from it is not known until
   gate L measures it.
@@ -623,6 +627,32 @@ or the release notes.
 | Every ramp step needs a positive lower confidence bound | **Modified.** At today's volumes that stalls the ramp indefinitely. Required for raising risk limits; reported for sender steps |
 | Paired replay R39 against R40 | **Accepted** as the C report, with both engines on one feed; realised net decides |
 | Verify the live bid model | **Known:** `best_bid` (contest empty, `fit_ok` false at 10-30 02:07). R38's gates on 11-02 would fit flashblock-era contests that Denim ends three days later (decision 6) |
+
+## Review response (2026-11-03)
+
+A second independent review, "build now", with six amendments. Each was checked
+against the code, the chain or Base's source.
+
+| Review point | Response |
+|---|---|
+| Build now; correctness checks, not research gates | **Accepted.** Phases 2 to 4 start now; gates C and L are cut to correctness and realised net |
+| Value candidates by expected net, with a state-aware marginal | **Accepted.** It replaces the census's `marginal_usd`, so a task goes away |
+| No unconditional base pass in `fill` | **Accepted, with an addition:** `p_win` is floored, or the stop rule would idle senders on unmeasured routes |
+| Compare the walk on historical pool snapshots | **Modified.** None hold tick ladders, so real books are compared in shadow on every fire, as the plan had it |
+| Record what the cap and the step limit left | **Accepted.** `maxSteps` also moves into the plan, so evidence can raise it without a redeploy |
+| Positive `minNet`, receipt accounting | **Accepted:** `minNet` is 1. The accounting was already so |
+| Set the L1 bound to 1e12 only if data shows it covers | **Accepted.** It is computed from every landing's receipt before the change |
+| Keep the 10 s window | **Accepted** |
+| Lender preflight into `NoTrade` | **Accepted.** It costs about 2k gas a trade, and reverses my earlier ruling |
+| v4 restrictions at the executor | **Modified.** Delta-returning hook bits, dynamic fee and protocol fee are checked there. The code hash stays at admission: since EIP-6780 code at an address can't change, so an on-chain registry adds an owner transaction per hook and catches nothing |
+| Overlap tests on portfolio net | **Accepted** |
+| Launch values from existing evidence | **Accepted.** No tier fit; 10× launches |
+| Add senders on the model alone, with no dwell | **Modified.** One UTC day a step, and realised net must have been positive. The model has been wrong before (R38's 93% artifact), and realised net is the objective. A sender step's risk is small, so three days wasn't needed either |
+| Stop on a feed gap, reorg or block-hash mismatch | **Already so in effect.** R41's head-lag guard stops stale sends, and the predicates and the floor mean a stale book loses a fire, not money |
+
+Scope also moved: local tracking and the limiter now follow first live, since
+R39's reads stand at 16 senders, and the daily report waits until a fix needs
+aiming.
 
 ## Decisions that are the operator's
 

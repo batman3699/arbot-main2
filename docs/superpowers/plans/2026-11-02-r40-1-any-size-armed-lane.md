@@ -4,8 +4,10 @@
 > a self-review of the whole branch (no subagents: the operator's standing
 > rule). Steps are test first and use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** One standing arm on each trigger leg of each target route, traded at
-its best size computed on chain at execution, so realised net goes up.
+**Goal:** Realised net goes up: standing arms on the trigger legs worth holding,
+each traded at its best size, computed on chain at execution. Revised
+2026-11-03 after an independent review: build now, launch on the evidence
+already held, and treat only correctness failures as stops.
 
 **Architecture:**
 - **`LeanExecutor3`** takes a plan with no size and no hop minimums. It reads
@@ -15,11 +17,12 @@ its best size computed on chain at execution, so realised net goes up.
 - **`apex_math::walk`** mirrors the walk in Rust, integer for integer. The
   engine predicts with it, the evaluator judges with it, and shared fixtures
   hold it to the contract.
-- **`SizedEngine`** sits beside today's `Engine`. It groups candidates by
-  (trigger pool, direction) and fills senders and budget by marginal value.
+- **`SizedEngine`** sits beside today's `Engine`. It prices each slot through the
+  mirror, values each candidate by its expected net, and fills senders and budget
+  greedily by marginal net, replaying each trigger group's trades on the book.
   Both run in one canary: R39 live, R40.1 in shadow, on the same feed.
-- **The worker** tracks each sender's nonce and balance locally, sees landings
-  in the executor's own logs, and limits its send rate.
+- **First live is at 16 senders**, with today's worker reads. Only then does the
+  worker learn local nonces and balances for 32 and 64.
 
 **Tech Stack:**
 - Solidity 0.8.24, `via_ir`, Foundry: `contracts/lean`, `test/lean`,
@@ -28,21 +31,32 @@ its best size computed on chain at execution, so realised net goes up.
 - Python 3.12: `scripts/data/arb_census`.
 
 **Spec:** `docs/superpowers/specs/2026-10-30-any-size-armed-lane-design.md`
-(approved 2026-11-02, all six decisions). **Branch:** `r40-1-any-size`, from
-`main` at `661b0cd` (R41, merged locally, unpushed).
+(approved 2026-11-02, all six decisions; its "Review response (2026-11-03)" holds
+each of this revision's verdicts). **Branch:** `r40-1-any-size`, from `main` at
+`661b0cd` (R41, merged locally, unpushed).
 
 ## When this runs
 
-- **R41 deploys first** (11-03, on "yes, push and deploy <rev>"). Phases 2 and
-  3 may start once it has: they are maths and a contract, and nothing reaches
-  the host.
-- **Phase 1 needs Denim** (11-05 18:00 UTC). Its numbers feed Phase 4's
-  defaults, so Phase 4 code may precede them, but no default is final until
-  Task 1 is done.
-- **Nothing from this branch reaches the host until R41's gate D has passed.**
-  If R41 needs a fix on `main`, rebase this branch onto it.
-- **Fitted numbers** (tier 2's threshold, bids, bands, the window) come only
-  from post-Denim days.
+- **Phases 2 to 4 start now.** They are maths, a contract and an engine, on a
+  branch. Nothing reaches the host until R41's gate D has passed, and R39 stays
+  live and unchanged until the go decision.
+- **R41 deploys first** (on "yes, push and deploy <rev>"). If it needs a fix on
+  `main`, rebase this branch onto it.
+- **Launch values come from what is already measured** (the table below). Keep
+  pre-Denim and post-Denim observations labelled apart, and change a value only
+  where Denim changed its meaning.
+
+| Launch value | |
+|---|---|
+| Start tokens, hops | WETH and USDC; 2 |
+| Size caps, budget | 5 WETH, 12,000 USDC; 0.01 ETH a day, pending worst cases reserved |
+| Window, band cap | 10 s; 20 bps, chosen online among 5, 10 and 20 steps |
+| Tier 1's bid reference, tier 2's multiple | 4 steps past the no-tip threshold; 10×, and 2× tier 1's bid |
+| Bid model | The production R38 rule, unchanged |
+| `maxSteps`, `minNet` | 8; 1 |
+| USDC rate cushion | 5% |
+| Senders | 16, then 32, then 64 at most |
+| `send_rate_per_s` | R39's peak accepted rate (Task 1), raised with each sender step |
 
 ## Global Constraints
 
@@ -65,11 +79,16 @@ its best size computed on chain at execution, so realised net goes up.
   `check_placeholder_endpoints.sh` and `cl_parity_sweep.sh` are known red.
 - **After each structural commit**, run `git diff --stat` before committing,
   and build the commit in a throwaway worktree.
-- **The operator approves** each merge, push and deploy. The size caps stay 5
-  WETH and 12,000 USDC, and the budget stays 0.01 ETH. R39 stays live and
-  unchanged until gate C has passed.
-- **One change at a time on Denim:** nothing here combines with a bid-rule
-  switch.
+- **The operator approves** each merge, push and deploy. No new venues, hops or
+  bid rule in this release.
+- **A transaction is not sent** when: the mirror and the contract disagree beyond
+  rounding; a pool's state can't be reconciled; a v4 pool is unsupported; the
+  lender is short; a gas bound can't cover its transaction; the pending worst
+  cases plus realised losses could pass the budget; a sender's nonce, balance or
+  receipt is uncertain; the feed is stale; or the executor's code hash or
+  authorization differs from what was approved.
+- **Everything else is telemetry:** coverage, capped and truncated value, early
+  exits, and bids improve the strategy, and hold nothing up.
 - **Mutation:** each new guard gets a mutant. A surviving one usually means
   delete the guard, not add a test. Touch files after restoring a mutant, and
   use `--no-fail-fast`.
@@ -83,7 +102,7 @@ its best size computed on chain at execution, so realised net goes up.
    `quote_exact_input_multi_tick` does. Only the quote must match a swap to the
    unit. This is what makes "a trade that passes the early exit cannot fail
    the floor on rounding" true: the predicted output equals the real one.
-2. **Plans are fixed-length:** two hops, 161 bytes. The spec's sizer is
+2. **Plans are fixed-length:** two hops, 162 bytes. The spec's sizer is
    two-pool, so a list is no use.
 3. **Slipstream gets its own kind (4).** Its fee is read with `fee()` at
    execution. v3 and Pancake fees are immutable and travel in the plan, saving
@@ -96,11 +115,12 @@ its best size computed on chain at execution, so realised net goes up.
 5. **"Real balances" means what the swaps returned.** A pool that returned less
    than it reported fails the repayment or the profit transfer, so
    `balanceOf` calls would add gas and no safety.
-6. **The lender is chosen at arm time for the cap.** `cap = min(max_size,
-   lender's holding)`. A holding that drops inside the window reverts, which
-   the ledger classifies. A read at execution would cost every trade for a
-   case that has not happened.
-7. **Landings come from the executor's own logs.** `Traded` and `NoTrade`
+6. **The lender is checked before borrowing.** `cap = min(max_size, lender's
+   holding)` at arm time, and `balanceOf(lender)` once a trade is decided: short
+   is `NoTrade(LENDER_SHORT)`, not a revert. About 2k gas a trade, since the loan
+   then finds that slot warm.
+7. **For 32 senders and up, landings come from the executor's own logs.**
+   `Traded` and `NoTrade`
    carry an indexed `sender`, and the feed also subscribes to the executor.
    A pending transaction whose bound passes with no log costs no read: the
    sender may send again on that nonce, holding the same reservation. A revert
@@ -121,10 +141,32 @@ its best size computed on chain at execution, so realised net goes up.
     threshold is taken as `threshold(5) + (B − 5)`, so only the chosen width
     pays for a search.
 11. **The tier 1 bid has a reference.** A threshold's own surplus is near zero,
-    which would bid nothing. `arm_bid` is priced at the surplus
+    which would bid nothing. `arm_bid` is priced at the net
     `TIER1_BID_STEPS = 4` past the no-tip threshold (where ordinary moves land,
     as in R36), and the threshold is then searched again with that tip as its
     margin.
+12. **A candidate's value is its expected net.** It integrates the mirror's net
+    over `MoveStats`' move distribution, at R36's six offsets, times the contest's
+    chance, less the expected cost of `NoTrade`s and reverts. A point estimate at
+    one step would undervalue exactly the moves that pay most.
+13. **`fill` is greedy on marginal net, not group-first.** A second route is worth
+    what is left after replaying the first's trade on the book, so the census's
+    `marginal_usd` isn't needed, and neither is an unconditional base pass:
+    breadth comes from second arms in a group being worth less.
+    One addition to the review: `p_win` is floored at `P_WIN_FLOOR`. A sample's
+    zero isn't evidence of zero, and an arm costs nothing unless it pays, so an
+    unmeasured route ranks last rather than being excluded. Without this, the
+    stop rule would leave senders idle on exactly the routes rivals are taking.
+14. **`maxSteps` travels in the plan,** up to a contract limit of 16. The executor
+    isn't upgradeable, and this lets evidence raise it without a redeploy.
+15. **v4 is enforced at the executor by what can change at run time.** The
+    hook's permission bits (no delta-returning hook), the dynamic-fee flag and the
+    protocol fee are checked in `load`. The code hash stays at inventory admission:
+    since EIP-6780, code at an address can't change, so an on-chain registry would
+    add an owner transaction per hook and catch nothing. The engine signs only
+    allowlisted hooks.
+16. **Tier 2 launches at 10× with no fit,** so `tiers.py` and the census task are
+    gone. The R38 refit on post-Denim days (decision 6) stands, separately.
 
 ## Review Focus
 
@@ -133,7 +175,7 @@ Each has its test in the task named.
 
 1. **A simulation at gas price zero** collapses the floor, so a trade that
    could never pay "passes" `eth_simulateV1`, and gate C's agreement means
-   nothing. Expected: simulations carry the arm's real fee. (Task 17)
+   nothing. Expected: simulations carry the arm's real fee. (Task 14)
 2. **The gap is gone when the predicates hold** (an equal move on the other
    pool, inside its band). Expected: `NoTrade(NoGap)`, success, no borrow, no
    revert. (Task 7)
@@ -142,10 +184,10 @@ Each has its test in the task named.
    inventory. (Task 5)
 4. **A restart with transactions pending**, under local nonce and balance
    tracking. Expected: the ledger and one read per sender rebuild the truth,
-   and no nonce is reused or skipped. (Task 16)
+   and no nonce is reused or skipped. (Task 19)
 5. **The owner funds a sender** that local tracking believes is empty.
    Expected: the "balance" skip re-reads at most once a minute per sender, so
-   funding takes effect without per-send reads. (Task 16)
+   funding takes effect without per-send reads. (Task 19)
 
 ## Files
 
@@ -164,37 +206,37 @@ Each has its test in the task named.
 | `crates/apex-exec/tests/fixtures/sizer3_cases.json` (new) | Rust ↔ sizer |
 | `crates/apex-runtime/src/armed/sized.rs` (new) | `SizedEngine`, grouping, the fill |
 | `crates/apex-runtime/src/armed/tracked.rs` (new) | Local nonce and balance state |
-| `scripts/data/arb_census/coverage.py` (new) | The daily report |
-| `scripts/data/arb_census/tiers.py` (new) | Tier 2's fit |
+| `scripts/data/arb_census/coverage.py` (new, last) | The daily report |
 
-Modified: `armed/{threshold,plan,live,live_chain,live_ledger,run,lines,eval,targets,engine,mod}.rs`,
-`live/{calls,gas}.rs`, `canary/chain.rs`, `shadow/{config,mod}.rs`,
-`apex-exec/src/{lib,call}.rs`, `targets.py`, `ops/*.yaml`,
-`ops/host/ARMED.md`, `script/AuthorizeArmedSenders.s.sol`.
+Modified: `armed/{threshold,plan,live,live_chain,live_ledger,run,lines,eval,engine,mod}.rs`,
+`live/{calls,gas,book}.rs`, `canary/chain.rs`, `shadow/{config,mod}.rs`,
+`apex-exec/src/{lib,call}.rs`, `ops/*.yaml`, `ops/host/ARMED.md`,
+`script/AuthorizeArmedSenders.s.sol`.
 
 ---
 
-## Phase 1: facts, on Denim
+## Phase 1: facts
 
-### Task 1: The four facts (no code; after 11-05 18:00 UTC)
+### Task 1: The facts
 
 **Files:** Modify: the spec's "Facts verified" section.
 
-**Interfaces:** Produces the default of `armed.sized.send_rate_per_s`, and the
-list of (trigger pool, direction) groups Task 13's tests size against.
+**Interfaces:** Produces `armed.sized.send_rate_per_s`, `p_revert`, and the
+groups Task 12's tests size against.
 
-- [ ] **Step 1: The sequencer's limits.** Read `base/base`'s
-  `base_sendRawTransactionValidity` handler at the release Denim runs, for a
-  rate limit, a pending limit per account and in total, and a predicate limit.
-  Take R39's accepted send rate from `var/armed/armed-live.jsonl` as a lower
-  bound. If the source sets no limit, say so; don't probe with extra sends.
-- [ ] **Step 2: The groups.** From `var/armed/targets.json` on the host, count
-  distinct (trigger pool, direction) pairs and routes per group.
-- [ ] **Step 3: The L1 bound.** Sample `getL1FeeUpperBound(600)` over a day of
-  blobs and compare with receipts: it should stay within the 1e12 of decision 3.
-- [ ] **Step 4: Record them.** Write the four answers into the spec. If a limit
-  caps breadth below 64 senders, stop and raise the spec's fallback (one arm
-  per trigger group choosing among its routes) with the operator.
+Done on 2026-11-03, from `base/base` at v1.5.1 and its `main`: no send-rate limit
+in the node; validity transactions get their own pool on `main`, at reth's
+pending limits by default, with `--rollup.validity-pool-*` overrides; arms use
+one account slot each, and no more predicates than R39's.
+
+- [ ] **Step 1: The host's numbers** (needs `aws login --profile apex-us`). From
+  `var/armed/armed-live.jsonl`: R39's peak accepted sends a second, its share of
+  landings that reverted, and every refusal's text. From `var/armed/targets.json`:
+  distinct (trigger pool, direction) groups, and routes per group.
+- [ ] **Step 2: The L1 fees.** Read `l1Fee` from every landing's receipt on a
+  public RPC, and `getL1FeeUpperBound` at the signed size of a plan-3 transaction.
+- [ ] **Step 3: Record them** in the spec, and set the three config values. This
+  doesn't hold up Phases 2 to 4.
 
 ## Phase 2: the mirror
 
@@ -213,6 +255,7 @@ list of (trigger pool, direction) groups Task 13's tests size against.
 - Produces:
 
 ```rust
+/// The launch value of the plan's `maxSteps`; the contract holds it to 16.
 pub const MAX_STEPS: u32 = 8;
 
 pub enum WalkLeg<'a> {
@@ -238,7 +281,7 @@ pub struct Walked {
 }
 
 /// None when there is no gap: the pair's margin is at most one.
-pub fn walk(legs: [WalkLeg; 2], cap: U256, price: WalkPrice) -> Option<Walked>;
+pub fn walk(legs: [WalkLeg; 2], cap: U256, price: WalkPrice, max_steps: u32) -> Option<Walked>;
 /// The exact outputs at `size`: [hop 1's, hop 2's].
 pub fn quote(legs: [WalkLeg; 2], size: U256) -> Option<[U256; 2]>;
 /// A wei amount in start units, rounded up: `ceil(wei × rate / 1e18)`, 1:1
@@ -279,7 +322,7 @@ loop:
        dx_b = a's input returning in_b, rounded up
        a forward by dx_b inside its segment; b to its boundary; total += dx_b
   steps += 1
-  if steps == MAX_STEPS: truncated; total −= 1; stop
+  if steps == max_steps: truncated; total −= 1; stop
   apply the crossed leg's liquidityNet if its boundary is initialized
   if gain(a, b) ≤ to_start(cross_gas × wei_per_gas): total −= 1; stop
   find the crossed leg's next boundary
@@ -307,6 +350,8 @@ size = min(total, cap)
 #[test] fn a_crossing_is_refused_when_it_does_not(); // same pools, wei_per_gas raised: size is the boundary's less 1
 #[test] fn negative_net_narrows_and_positive_net_deepens();
 #[test] fn word_edges_are_steps_and_cost_no_crossing_gas();
+#[test] fn several_bitmap_words_and_negative_ticks();
+#[test] fn an_input_exactly_at_a_boundary();
 #[test] fn max_steps_truncates_below_the_boundary();
 #[test] fn both_directions_mirror();         // swapping token order gives the same size
 #[test] fn reserves_leg_has_no_boundary();
@@ -327,7 +372,8 @@ size = min(total, cap)
   `CostedCycle`. Assert the walk's net is at least `best_size`'s net less the
   rounding allowance `2 × (steps + 1)` start units, plus one crossing's gas
   when `gain`'s upper bound took a crossing `best_size` wouldn't. Print the
-  worst shortfall.
+  worst shortfall. No tick ladders are stored anywhere, so real books are
+  compared in shadow: every fire logs both nets (Task 14).
 
   Run: `cargo test -j 3 -p apex-runtime --test walk_vs_best_size -- --nocapture`.
   Expected: PASS.
@@ -354,13 +400,13 @@ git commit -m "feat(math): the two-pool tick walk (Task 8.5 R40.1)"
 
 ```rust
 pub const LEAN3_PLAN_VERSION: u32 = 5;
-pub const LEAN3_PLAN_LEN: usize = 161;
+pub const LEAN3_PLAN_LEN: usize = 162;
 pub enum Hop3Kind { UniswapV3 = 0, PancakeV3 = 1, AerodromeV2 = 2, UniswapV4 = 3, Slipstream = 4 }
 pub struct Lean3Hop { pub kind: Hop3Kind, pub pool: Address, pub token_out: Address,
                       pub fee: u32, pub tick_spacing: i32, pub cross_gas: u16 }
 pub struct Lean3Plan { pub lender: Lean2Lender, pub start: StartToken, pub cap: u128, pub deadline: u64,
                        pub rate: u128, pub gas_overhead: u32, pub swap_gas: u32,
-                       pub l1_bound: u64, pub min_net: u64, pub hops: [Lean3Hop; 2] }
+                       pub l1_bound: u64, pub min_net: u64, pub max_steps: u8, pub hops: [Lean3Hop; 2] }
 pub fn encode_plan3(plan: &Lean3Plan) -> Result<Vec<u8>, Lean3Error>;
 pub fn run3_calldata(plan: &Lean3Plan) -> Result<Vec<u8>, Lean3Error>;
 pub fn lean3_commitment(plan: &Lean3Plan, chain_id: u64, executor: Address) -> Result<B256, Lean3Error>;
@@ -373,8 +419,8 @@ In Solidity:
 ```solidity
 struct Hop3 { uint8 kind; address pool; address tokenOut; uint24 fee; int24 tickSpacing; uint16 crossGas; }
 struct Plan3 { uint8 lender; uint8 start; uint256 cap; uint256 deadline; uint256 rate;
-               uint256 gasOverhead; uint256 swapGas; uint256 l1Bound; uint256 minNet; Hop3[2] hops; }
-library LeanPlan3Codec { uint256 internal constant LENGTH = 161; function decode(bytes calldata p) internal pure returns (Plan3 memory); }
+               uint256 gasOverhead; uint256 swapGas; uint256 l1Bound; uint256 minNet; uint256 maxSteps; Hop3[2] hops; }
+library LeanPlan3Codec { uint256 internal constant LENGTH = 162; function decode(bytes calldata p) internal pure returns (Plan3 memory); }
 ```
 
 **The bytes** (big-endian, packed):
@@ -390,7 +436,8 @@ library LeanPlan3Codec { uint256 internal constant LENGTH = 161; function decode
 | 43 | 4 | swapGas: both hops and the loan, as the gas model expects them |
 | 47 | 8 | l1Bound, wei |
 | 55 | 8 | minNet, in the start token |
-| 63 + 49i | 1 | kind |
+| 63 | 1 | maxSteps, at most 16 |
+| 64 + 49i | 1 | kind |
 | +1 | 20 | pool; for kind 3 the key's hooks |
 | +21 | 20 | tokenOut (tokenIn: the start for hop 0, else the previous tokenOut) |
 | +41 | 3 | fee: ppm for kinds 0, 1 and the key's for 3; 0 for 2 and 4 |
@@ -398,7 +445,7 @@ library LeanPlan3Codec { uint256 internal constant LENGTH = 161; function decode
 | +47 | 2 | crossGas: one tick crossed on this hop |
 
 `Lean3Error` refuses, in Rust and by `BadPlan` in Solidity: a length other than
-161, the last hop not ending in the start token, a v4 hop under another lender,
+162, a `maxSteps` of 0 or over 16, the last hop not ending in the start token, a v4 hop under another lender,
 a kind above 4, a deadline past 40 bits, and a key field past its bytes.
 
 - [ ] **Step 1: Write the failing tests.** `tests/lean3_plan.rs` encodes each
@@ -406,7 +453,7 @@ a kind above 4, a deadline past 40 bits, and a key field past its bytes.
   and asserts each `Lean3Error`. The fixture covers WETH under Balancer, USDC
   under Morpho, each kind in each hop position, and v4 under PoolManager.
   `Lean3PlanFixture.t.sol` decodes the same hex, field for field, and asserts
-  `BadPlan` on 160 and 162 bytes.
+  `BadPlan` on 161 and 163 bytes.
 - [ ] **Step 2: Run them.** `cargo test -j 3 -p apex-exec --test lean3_plan` and
   `forge test --match-path test/lean/Lean3PlanFixture.t.sol`. Expected: FAIL.
 - [ ] **Step 3: Implement** the Rust module, `CallPlan::Lean3`, and the codec.
@@ -475,7 +522,7 @@ struct Leg {
     uint160 sqrtP; uint128 liquidity; int24 tick; int24 spacing; uint24 feePpm;
     uint256 reserveIn; uint256 reserveOut;                        // kind 2 only
     uint256 word; int16 wordPos; bool wordRead;                   // the one cached bitmap word
-    Bound[10] bounds; uint8 known; uint16 crossGas;               // MAX_STEPS + 2
+    Bound[18] bounds; uint8 known; uint16 crossGas;               // the limit of 16, plus 2
 }
 library LeanPools3 {
     /// False: a pool the sizer must not trade (`NoTrade(Unsupported)`).
@@ -501,8 +548,10 @@ info is `keccak256(abi.encode(int24 tick, state + 4))`, with liquidityNet in the
 high 128 bits of the first word. Verify both against PoolManager on a fork
 before relying on them, as R37 verified slot0 and liquidity.
 
-`load` returns false when: v4's `protocolFee` is non-zero, its `lpFee` has the
-dynamic flag (`0x800000`) set, or liquidity is zero and the pool is CL.
+`load` returns false when: v4's `protocolFee` is non-zero; its `lpFee` has the
+dynamic flag (`0x800000`) set; its hook's address has `beforeSwapReturnDelta` or
+`afterSwapReturnDelta` set (bits 3 and 2); or liquidity is zero and the pool is
+CL.
 
 `Lean3Mocks.sol` holds `MockCl3Pool` (settable slot0, liquidity, bitmap and
 ticks, a Slipstream-shaped and a v3-shaped `slot0`, a real `swap` over
@@ -520,6 +569,8 @@ function testAeroFeeBpsBecomesPpm() public;
 function testV4WordsDecode() public;                      // negative tick, lpFee, protocolFee
 function testV4ProtocolFeeRefused() public;               // load returns false
 function testV4DynamicFeeRefused() public;
+function testV4DeltaReturningHookRefused() public;     // each of the two bits
+function testV4NoDeltaHookLoads() public;
 function testZeroLiquidityRefused() public;
 function testBoundsMatchNextInitializedTickWithinOneWord() public; // both directions, negative ticks, spacing 1, 60, 200
 function testBitmapWordIsReadOnce() public;               // vm.expectCall count 1 across two bounds in one word
@@ -552,9 +603,9 @@ uint8 constant FLAG_CAPPED = 1;
 uint8 constant FLAG_TRUNCATED = 2;
 struct Sized { uint256 size; uint256 out; uint256 crossGas; uint8 steps; uint8 flags; }
 library LeanSizer3 {
-    uint256 internal constant MAX_STEPS = 8;
+    uint256 internal constant MAX_STEPS_LIMIT = 16;
     /// size 0: no gap. `costPerGas` is what one gas costs in start units, scaled by 1e18.
-    function size(Leg memory a, Leg memory b, uint256 cap, uint256 costPerGas) internal view returns (Sized memory);
+    function size(Leg memory a, Leg memory b, uint256 cap, uint256 costPerGas, uint256 maxSteps) internal view returns (Sized memory);
     /// The exact output of `amountIn`, step for step, extending `bounds` as needed.
     function quote(Leg memory leg, uint256 amountIn) internal view returns (uint256 out);
 }
@@ -576,7 +627,8 @@ positive_net / negative_net tick_exactly_at_boundary  out_of_range_liquidity_zer
 fee_rounding_1ppm_gap       usdc_six_decimals         usdc_start_rate
 v4_no_hook                  v4_allowed_hook           aero_volatile_first / second
 max_steps_clamp             cap_clamp                 crossing_refused
-word_edge_step              zero_net_tick
+word_edge_step              zero_net_tick             several_bitmap_words
+negative_ticks              exact_boundary_amount
 ```
 
 - [ ] **Step 2: Write the failing test.** `LeanSizer3.t.sol` deploys the mocks
@@ -616,7 +668,7 @@ event Traded(address indexed sender, uint8 start, uint256 amountIn, uint256 out,
              uint256 lenderFee, uint256 costWei, uint8 steps, uint8 flags);
 event NoTrade(address indexed sender, uint8 reason, uint8 steps);
 // reasons
-uint8 constant NO_GAP = 0; uint8 constant BELOW_FLOOR = 1; uint8 constant UNSUPPORTED = 2;
+uint8 constant NO_GAP = 0; uint8 constant BELOW_FLOOR = 1; uint8 constant UNSUPPORTED = 2; uint8 constant LENDER_SHORT = 3;
 ```
 
 **`run`, in order:**
@@ -629,7 +681,9 @@ uint8 constant NO_GAP = 0; uint8 constant BELOW_FLOOR = 1; uint8 constant UNSUPP
 6. Predicted floor:
    `size + toStart(((gasStart − gasleft()) + swapGas + gasOverhead + crossGas) × tx.gasprice + l1Bound) + minNet`.
    `out` below it emits `NoTrade(BELOW_FLOOR, steps)` and returns.
-7. Store the size and `gasStart` in transient slots `T_SIZE` and `T_GAS_START`,
+7. `balanceOf(lender)` in the start token. Below the size, emit
+   `NoTrade(LENDER_SHORT, steps)` and return.
+8. Store the size and `gasStart` in transient slots `T_SIZE` and `T_GAS_START`,
    set `T_LOAN`, and borrow from the plan's lender.
 
 **In the trade:** hop 1 is exact input at the size, and hop 2 at what hop 1
@@ -660,6 +714,7 @@ function testNetNeverNegativeAtAnyGasPrice() public;  // fuzz gas price: gross �
 function testUsdcCostConvertsAtTheRateRoundedUp() public;
 function testGapClosedByThePredicatesTimeIsNoTrade() public; // equal prices: NoTrade(NO_GAP), status ok, no borrow (vm.expectCall count 0)
 function testBelowFloorBorrowsNothing() public;
+function testLenderShortIsNoTrade() public;           // each lender: no borrow, no revert
 function testShortHopRevertsFloor() public;           // mock pays less than the quote
 function testCapClamps() public;                      // FLAG_CAPPED
 function testMaxStepsFlagsTruncated() public;
@@ -685,7 +740,7 @@ function testEachLender() public;                     // Balancer, Morpho, PoolM
   bytes.
 - [ ] **Step 5: Mutate.** Remove in turn: the deadline check; `T_LOAN`'s clear;
   `T_POOL`'s check; `gasOverhead` from the floor; `l1Bound` from the floor;
-  `lenderFee` from `required`. Each must fail a test. Touch the file after each
+  `lenderFee` from `required`; the lender check. Each must fail a test. Touch the file after each
   restore.
 - [ ] **Step 6: Commit.**
 
@@ -725,8 +780,9 @@ function testPair_<a>_<b>() public; // size and out equal Sized's; out equals th
 ```
 
   plus `testV4SlotsMatchThePool` (bitmap and tick slots against `StateLibrary`'s
-  answers), `testGasAtMaxSteps` (a move big enough to reach `MAX_STEPS`, logging
-  gas, which must stay under `SIZED.limit`), `testNoTradeGasByVenuePair`, and
+  answers), `testGasAtMaxSteps` (a move big enough to reach 8 steps, then 16,
+  logging gas: 8 must stay under `SIZED.limit`, and 16 shows what a higher value
+  would cost), `testNoTradeGasByVenuePair`, and
   `testSlipstreamFeeAtTheLimit` (the fee read at the sized gas limit equals the
   fee with unlimited gas: `getSwapFee` calls its module with a 200,000 gas cap
   and falls back if that fails).
@@ -739,7 +795,7 @@ FOUNDRY_PROFILE=fork FOUNDRY_COMPUTE_UNITS_PER_SECOND=25 FOUNDRY_FORK_RETRIES=12
   Expected: PASS, with gas logged per pair. A size or output mismatch stops the
   plan: go back to Task 6 with the failing state as a new case.
 - [ ] **Step 3: Set the constants** from those logs, rounded up to the next 100.
-  `MAX_STEPS` stays 8 unless gas at it exceeds `limit`. Add
+  The plan's `maxSteps` stays 8 unless gas at it exceeds `limit`. Add
   `sized_limit_covers_max_steps`, asserting `limit` covers the logged worst case
   plus 25% for refunds (`gas-limits-must-cover-refunds`).
 - [ ] **Step 4: Commit.**
@@ -764,11 +820,14 @@ address and code hash, and an `--sig "runBatch(address)"` path through
   pool, each arm a separate `run` in one block:
 
 ```solidity
-function testSecondArmTradesTheRemainder() public;     // two routes: the second sizes what is left, and nets ≥ 0
-function testRemainderBelowFloorIsNoTrade() public;    // the second's remainder doesn't pay: NoTrade, no revert
-function testTwentyArmsOnOneMove() public;             // 20 overlapping arms: net ≥ 0 each; total ≥ the best single
-function testRivalBetweenOurArms() public;             // a mock rival swap between two runs: the second re-sizes
-function testHigherBidTierSweepsTheLowerTier() public; // tiers of one route: second is NoGap once the first traded
+function testSecondArmTradesOnlyTheRemainder() public; // two routes: the second's size is the walk on the state the first left,
+                                                       // and portfolio net, each tx's gas counted, beats the first alone
+function testFirstClosesTheGapSecondIsNoTrade() public;// the second's input is 0: NoTrade(NO_GAP), no borrow (expectCall count 0)
+function testRemainderBelowFloorIsNoTrade() public;    // a remainder that doesn't pay: NoTrade, no borrow, no revert
+function testTwentyArmsPortfolioNet() public;          // 20 overlapping arms: portfolio net after every included tx's gas,
+                                                       // NoTrades' included, is logged and ≥ the best single arm's less those NoTrades' gas
+function testRivalBetweenOurArms() public;             // a mock rival swap between two runs: the second re-sizes on the new state
+function testHigherBidTierSweepsTheLowerTier() public; // tiers of one route: the second is NoTrade(NO_GAP) once the first traded
 ```
 
 - [ ] **Step 2: Run them.** `forge test --match-path test/lean/LeanExecutor3Overlap.t.sol`.
@@ -788,11 +847,11 @@ git commit -m "test(lean3): overlapping arms, and the deploy script (Task 8.5 R4
 **Gate S (sizing).** All must hold before Phase 4 merges anywhere:
 - the contract equals the mirror on every fixture, to the unit;
 - the mirror's net is within rounding of `best_size`'s (Task 2's test);
-- every venue pair lands at the mirror's size and output, and gas at
-  `MAX_STEPS` is measured;
+- every venue pair lands at the mirror's size and output, and gas at 8
+  and 16 steps is measured;
 - the overlapping-routes tests pass.
 
-## Phase 4: engine and worker
+## Phase 4: engine and evaluator (to first live)
 
 ### Task 10: Config, and the sized call
 
@@ -812,10 +871,12 @@ pub struct SizedConfig {
     pub max_senders: usize,              // 16, then 32, then 64
     pub band_cap_bps: u32,               // 20
     pub window_s: u64,                   // 10
-    pub tier2_multiple: u32,             // 10: the placeholder
-    pub tiers: Option<PathBuf>,          // tiers.py's fit
-    pub min_net_wei: u64,                // 0
-    pub send_rate_per_s: u32,
+    pub tier2_multiple: u32,             // 10
+    pub min_net_wei: u64,                // 1: rounding alone can't record a zero
+    pub max_steps: u8,                   // 8
+    pub p_no_trade: f64,                 // 0.02, until live data replaces it
+    pub p_revert: f64,                   // R39's measured share, from Task 1
+    pub send_rate_per_s: u32,            // used from Task 19
 }
 
 // live/calls.rs
@@ -823,20 +884,21 @@ pub fn lean3_hop(leg: &Leg, cross_gas: u16) -> Result<Lean3Hop, String>;
 
 // armed/plan.rs
 pub struct SizedTerms { pub cap: U256, pub rate: Option<(U256, U256)>, pub overhead: u32,
-                        pub swap_gas: u32, pub l1_bound: u64, pub min_net: u64 }
+                        pub swap_gas: u32, pub l1_bound: u64, pub min_net: u64, pub max_steps: u8 }
 pub fn sized_call(cycle: &Cycle, terms: &SizedTerms, executor3: Address, chain_id: u64,
                   deadline: u64, lender: Lean2Lender) -> Result<ExecutorCall, String>;
 /// What the executor would do on `book`: the mirror's walk and quote.
 pub fn sized_outcome(cycle: &Cycle, book: &BTreeMap<Address, Arc<PoolSnapshot>>, terms: &SizedTerms,
                      wei_per_gas: U256) -> SizedOutcome;
-pub enum SizedOutcome { Trade { size: U256, gross: U256, walked: Walked, beyond_cap: U256 }, NoTrade(u8) }
+pub enum SizedOutcome { Trade { size: U256, gross: U256, walked: Walked, beyond_cap: U256, beyond_steps: U256 }, NoTrade(u8) }
 
 // armed/lines.rs, on Arm, all #[serde(default)]
-pub sized: Option<SizedLine>,   // cap, rate, overhead, swap_gas, l1_bound, min_net, tier
+pub sized: Option<SizedLine>,   // cap, rate, overhead, swap_gas, l1_bound, min_net, max_steps, tier
 ```
 
-`beyond_cap` is what a walk with no cap would add, at the same gas price: the
-value the cap left.
+`beyond_cap` is what a walk with no cap would add at the same gas price, and
+`beyond_steps` what a walk of 64 steps would: the value each limit left, in the
+start token. They are logged on every outcome, and decide `maxSteps`.
 
 A load-time check refuses a config with both `armed.mode: live` and
 `armed.sized.mode: live`, a `band_cap_bps` over 20, and an `executor3` equal to
@@ -847,13 +909,14 @@ A load-time check refuses a config with both `armed.mode: live` and
   kind 4; v3, 0; Pancake, 1); `a_v4_route_borrows_from_pool_manager`;
   `rate_is_arm_time_plus_five_percent_rounded_up`;
   `sized_outcome_matches_walk`; `beyond_cap_is_zero_under_the_cap`;
+  `beyond_steps_is_zero_when_the_walk_finished`;
   `both_lanes_live_refuses_to_load`; and `arm_lines_without_sized_still_read`.
   Stable Aerodrome pools need no test here: `inventory.rs` refuses them at
   admission, unchanged.
 - [ ] **Step 2: Run them.** `cargo test -j 3 -p apex-runtime sized`.
   Expected: FAIL.
 - [ ] **Step 3: Implement them.** No `ops/*.yaml` carries `armed.sized` until
-  Task 19, so this task changes no running behaviour.
+  Task 15, so this task changes no running behaviour.
 - [ ] **Step 4: Run them.** Expected: PASS.
 - [ ] **Step 5: Commit.**
 
@@ -862,38 +925,54 @@ git add crates/apex-runtime/src/shadow/config.rs crates/apex-runtime/src/armed/p
 git commit -m "feat(armed): the sized call and its config (Task 8.5 R40.1)"
 ```
 
-### Task 11: The threshold at the band's adverse edge, and tiers
+### Task 11: Pricing a slot through the mirror: threshold, tiers, expected net
 
 **Files:** Modify: `armed/threshold.rs`. Test: in it.
 
-**Interfaces:** Consumes `rungs`, `best_at`, `move_of`, `trigger_up`,
-`bid_and_band`'s inputs. Produces:
+**Interfaces:** Consumes `walk`, `quote`, `sized_outcome`, `move_of`,
+`trigger_up`, `arm_bid`. Produces:
 
 ```rust
 pub const TIER1_BID_STEPS: u32 = 4;
 pub const BAND_WIDTHS: [u32; 3] = [5, 10, 20];
+/// Past the threshold, where expected net is measured: R36's rung offsets.
+pub const NET_GRID: [u32; 6] = RUNG_OFFSETS;
 
-pub struct SizedArmPoint { pub tier: u8, pub step: u32, pub trigger: PoolSnapshot,
-                           pub edges: [PoolSnapshot; 2], pub point: Point, pub bid: ArmBid }
+/// The trade with the trigger `step` from where it is and the other pool as
+/// given, as the executor would make it, net of gas, L1 and `tip_wei`, in wei.
+pub fn net_at(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, other: &PoolSnapshot, step: u32,
+              px: &Pricing, terms: &SizedTerms, tip_wei: U256) -> Option<U256>;
 
 /// The other pool at its adverse edge: `band` steps against the cycle's swap there.
 pub fn adverse_edge(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, band: u32) -> Option<PoolSnapshot>;
 
+pub struct SizedArmPoint { pub tier: u8, pub step: u32, pub trigger: PoolSnapshot, pub edges: [PoolSnapshot; 2],
+                           pub bid: ArmBid, pub gas: u64,
+                           /// (step, net in wei) across NET_GRID.
+                           pub grid: [(u32, f64); 6] }
+
 /// Tier 1 and, when it can pay, tier 2. Empty when no move up to MAX_STEP pays.
-pub fn sized_points(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, px: &Pricing,
+pub fn sized_points(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, px: &Pricing, terms: &SizedTerms,
                     band: u32, tier2_multiple: u32, inputs: &BidInputs, cap_wei_per_gas: u128) -> Vec<SizedArmPoint>;
+
+/// Σ over the grid of P(the move ends in that bucket) × net there.
+pub fn expected_net(grid: &[(u32, f64)], p_at_least: impl Fn(u32) -> f64) -> f64;
 ```
 
 `sized_points`, in order:
-1. Replace the other pool with `adverse_edge`. `rungs(.., 1)` gives the no-tip
-   threshold.
-2. `best_at` at `step + TIER1_BID_STEPS`, on the real pair, is the reference
-   surplus. `arm_bid` on it gives tier 1's bid.
-3. `rungs(.., 1)` again, with `margin_wei` raised by that bid's tip, gives tier
-   1's step.
-4. Tier 2: from that step, double then bisect to the first step whose surplus
-   is at least `tier2_multiple ×` the reference; `arm_bid` there. It exists only
-   if its bid is at least twice tier 1's.
+1. Replace the other pool with `adverse_edge`, and double then bisect to the
+   smallest step with `net_at` above zero at no tip.
+2. `net_at` at `step + TIER1_BID_STEPS`, on the real pair, is the reference.
+   `arm_bid` on it gives tier 1's bid.
+3. Search again with that bid's tip: tier 1's step.
+4. Fill `grid` on the real pair, tip included.
+5. Tier 2: from that step, double then bisect to the first step whose net is at
+   least `tier2_multiple ×` the reference; `arm_bid` there. It exists only if its
+   bid is at least twice tier 1's.
+
+Everything here is the mirror, so a slot is priced by what the chain will do, cap
+and crossing refusals included. `best_size` stays the reference in tests only,
+and a slot costs a handful of walks where `rungs` costs dozens of quotes.
 
 `gas` in every tip is the sized figure: `LEAN`'s hops plus `SIZED.read` and one
 step.
@@ -903,7 +982,9 @@ step.
   tip); `a_wider_band_raises_the_threshold`; `the_adverse_edge_follows_the_cycle`
   (both legs, both directions); `no_paying_move_is_empty`;
   `tier_two_needs_twice_the_bid`; `tier_two_sits_at_the_multiple`;
-  `a_usdc_cycle_prices_in_usdc`.
+  `a_usdc_cycle_prices_in_usdc`; `expected_net_weights_each_bucket`
+  (hand-worked: p of 0.5, 0.2, 0.1 with nets 1, 5, 10);
+  `the_cap_limits_the_grid`; and `net_at_is_within_rounding_of_best_at`.
 - [ ] **Step 2: Run them.** `cargo test -j 3 -p apex-runtime threshold`. Expected:
   FAIL.
 - [ ] **Step 3: Implement them.**
@@ -912,81 +993,50 @@ step.
 
 ```bash
 git add crates/apex-runtime/src/armed/threshold.rs
-git commit -m "feat(armed): thresholds at the band's adverse edge, and tiers (Task 8.5 R40.1)"
+git commit -m "feat(armed): pricing a slot through the mirror (Task 8.5 R40.1)"
 ```
 
-### Task 12: Census: marginal value and tier 2's fit
-
-**Files:**
-- Create: `scripts/data/arb_census/tiers.py`, `scripts/data/arb_census/test_tiers.py`
-- Modify: `scripts/data/arb_census/targets.py`,
-  `scripts/data/arb_census/test_targets.py`, `armed/targets.rs`
-
-**Interfaces:** Produces, in `targets.json`, each route's optional
-`marginal_usd` and `group`, read by `TargetRoute`:
-
-```rust
-pub marginal_usd: Option<f64>,    // None on older files: `usd` stands in
-```
-
-and `tiers.json`: `{"tier2_multiple": <int>, "fit_days": [...], "check_day": ..., "held": <bool>}`.
-
-- `marginal_usd`: within each (trigger pool, direction) group, routes ordered by
-  `usd`. A route's marginal value is its rival value at triggers no route above
-  it also traded. An arb's trigger is `a["trigger"]`, `(block, tx index)`.
-- `tiers.py`: on three post-Denim fit days, the surplus multiple at which
-  `contest.py`'s best bid at least doubles; checked on a fourth. It writes
-  nothing with `held: true` unless the fourth day agrees within a factor of 2,
-  and takes the days as arguments so a pre-Denim day can't enter by default.
-
-- [ ] **Step 1: Write the failing tests:** `test_marginal_of_the_top_route_is_its_usd`;
-  `test_a_shared_trigger_counts_once`; `test_a_second_route_at_its_own_triggers_keeps_them`;
-  `test_tiers_refuses_a_pre_denim_day`; `test_tiers_held_out_disagreement_is_not_held`;
-  and Rust's `targets_without_marginal_still_load`.
-- [ ] **Step 2: Run them.** `python3 -m pytest scripts/data/arb_census -q` and
-  `cargo test -j 3 -p apex-runtime targets`. Expected: FAIL.
-- [ ] **Step 3: Implement them.**
-- [ ] **Step 4: Run them.** Expected: PASS.
-- [ ] **Step 5: Commit.**
-
-```bash
-git add scripts/data/arb_census/targets.py scripts/data/arb_census/test_targets.py scripts/data/arb_census/tiers.py scripts/data/arb_census/test_tiers.py crates/apex-runtime/src/armed/targets.rs
-git commit -m "feat(census): marginal value by trigger group, and tier 2's fit (Task 8.5 R40.1)"
-```
-
-### Task 13: `SizedEngine`
+### Task 12: `SizedEngine`
 
 **Files:**
 - Create: `crates/apex-runtime/src/armed/sized.rs`
-- Modify: `crates/apex-runtime/src/armed/mod.rs`
+- Modify: `crates/apex-runtime/src/armed/mod.rs`, `armed/engine.rs`,
+  `live/book.rs`
 - Test: in `sized.rs`
 
-**Interfaces:** Consumes `sized_points`, `sized_call`, `MoveStats`, `arm_bid`,
-`rank_value`, `predicate`, `TargetRoute::marginal_usd`. Produces:
+**Interfaces:** Consumes `sized_points`, `expected_net`, `sized_call`,
+`sized_outcome`, `MoveStats`, `arm_bid`, `predicate`. Produces:
 
 ```rust
+pub const P_WIN_FLOOR: f64 = 0.001;
+
 pub struct SizedSettings { pub max_senders: usize, pub window_s: u64, pub block_time_ms: u64,
                            pub band_cap_bps: u32, pub liquidity_floor_bps: u32, pub tier2_multiple: u32,
                            pub executor3: Address, pub chain_id: u64, pub max_size_wei: u128, pub max_size_usdc: u128,
-                           pub max_priority_wei_per_gas: u128, pub min_net_wei: u64, pub reprice_for: Duration,
+                           pub max_priority_wei_per_gas: u128, pub min_net_wei: u64, pub max_steps: u8,
+                           pub p_no_trade: f64, pub p_revert: f64, pub reprice_for: Duration,
                            pub workers: usize, pub l1_fee_bound_wei: u128 }
 
-pub struct Candidate { pub key: SizedKey, pub group: (Address, bool), pub tier: u8, pub value: f64, pub worst_wei: u128 }
+pub struct Candidate { pub key: SizedKey, pub group: (Address, bool), pub tier: u8, pub ev: f64, pub worst_wei: u128 }
 
 /// The greedy fill: indices of the chosen candidates, in the order chosen.
-pub fn fill(cands: &[Candidate], senders: usize, budget_wei: u128) -> Vec<usize>;
+/// `marginal(candidate, chosen in its group)` is its EV after those.
+pub fn fill(cands: &[Candidate], senders: usize, budget_wei: u128,
+            marginal: impl FnMut(&Candidate, &[usize]) -> f64) -> Vec<usize>;
 
 impl SizedEngine {
     pub fn new(cycles: BTreeMap<RouteId, Cycle>, settings: SizedSettings, unarmable: BTreeSet<Address>) -> Self;
     pub fn with_bids(self, bids: RouteBids) -> Self;
     pub fn with_contest(self, contest: Option<Arc<ShareSample>>, model: BidModel) -> Self;
-    pub fn with_marginal(self, marginal: BTreeMap<RouteId, f64>) -> Self;
     pub fn stats(&self) -> EngineStats;
     /// As `Engine::tick`, the fill bounded by `budget_left_wei`, and `l1_upper_wei`
     /// the oracle's bound.
     pub fn tick(&self, snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>, head: u64, base_fee_wei: u128,
                 px: &Pricing, now_ns: u64, budget_left_wei: u128, l1_upper_wei: u128) -> Vec<ArmedLine>;
 }
+// live/book.rs
+impl PoolSnapshot { /// This pool after an exact-input swap, by the book's own arithmetic.
+    pub fn swapped(&self, amount_in: U256, zero_for_one: bool) -> Option<PoolSnapshot>; }
 ```
 
 Repricing, the stale ordering, the worker pool, senders' busy-until blocks, and
@@ -994,14 +1044,26 @@ Repricing, the stale ordering, the worker pool, senders' busy-until blocks, and
 
 - **A slot** prices `sized_points` at the width Ruling 10 chooses. A slot whose
   tier 1 can't pay holds no sender.
-- **Value** is `rank_value(p, bid, surplus, gas)`, with `p` the spread's chance
-  of reaching the step and `surplus` the reference, scaled by the route's
-  census weight `marginal_usd / usd` for any candidate after a group's first.
-- **`fill`:**
-  1. Base pass: each group's best tier 1, by value, until senders or budget
-     run out.
-  2. Extras: the rest by density,
-     `value / (1 / senders + worst_wei / budget_wei)`.
+- **A candidate's EV** is Ruling 12's:
+
+```text
+EV = max(p_win, P_WIN_FLOOR) × expected_net(grid, p)
+     − p(threshold) × (p_no_trade × no_trade_cost + p_revert × revert_cost)
+```
+
+  `p` is the spread's `p_at_least`. `no_trade_cost` is the route's reads at base
+  fee plus bid, plus the L1 bound. `revert_cost` is its expected gas at the same
+  price.
+- **`fill`** is Ruling 13's. It repeatedly takes the candidate with the highest
+  `ev / (1 / senders + worst_wei / budget_wei)`, and re-evaluates only the group
+  it just touched:
+  - A second route in a group gets `marginal`: replay, at the first's reference
+    move, each chosen arm's trade with `swapped`, in the order chosen, and scale
+    the candidate's EV by its net there over its net alone, clamped to 0..1.
+  - A tier 2 gets only what it adds to its tier 1: over the buckets past its
+    threshold, `p_win₂ × net₂ − p_win₁ × net₁`.
+  - It stops at no positive EV, or at senders or budget. Every arm holds a sender
+    for one window, so sender-time needs no term of its own.
 - **`worst_wei`** is `limit × (2·baseFee + bid) + max(l1_fee_bound_wei, 2 × l1_upper_wei)`.
 - **The fingerprint** is threshold price, band edges and bid. Size and mid are
   gone.
@@ -1009,20 +1071,24 @@ Repricing, the stale ordering, the worker pool, senders' busy-until blocks, and
 - **The predicates** are `predicate::trigger` at the tier's threshold,
   `predicate::band` at its edges, and `expiry`.
 - **The line:** `rung` is the tier, and `step` its threshold. `size_wei`, `mid`
-  and `output_wei` are `sized_outcome` at the threshold: the engine's prediction
-  through the mirror, logged and never enforced.
+  and `output_wei` are `sized_outcome` at the threshold: logged, never enforced.
 - **`gasOverhead`, `swapGas`, `crossGas`** come from `SIZED` and `LEAN`.
   `l1Bound` is `2 × l1_upper_wei`, rounded up.
 
 - [ ] **Step 1: Write the failing tests:**
 
 ```rust
-#[test] fn every_group_gets_one_before_any_gets_two();
+#[test] fn the_best_ev_goes_first_whatever_its_group();
+#[test] fn a_low_value_group_does_not_outrank_a_better_second_arm();
+#[test] fn a_second_route_counts_only_what_the_first_leaves();  // real `swapped` replay, not a ratio of census gross
+#[test] fn a_second_route_on_a_closed_gap_takes_no_sender();
+#[test] fn a_tier_two_counts_only_what_it_adds();
 #[test] fn budget_stops_the_fill();                     // tier 2 worst cases: only what fits
 #[test] fn sixty_four_tier_one_arms_fit_a_tenth_of_the_budget(); // the spec's table: 64 × 1.2e13 < 1e15
-#[test] fn a_tier_two_is_taken_only_if_its_density_beats_a_second_route();
-#[test] fn a_second_route_counts_only_its_marginal_value();
+#[test] fn a_zero_p_win_ranks_last_but_is_not_excluded();
+#[test] fn it_stops_at_no_positive_ev();
 #[test] fn a_candidate_that_cannot_pay_holds_no_sender();
+#[test] fn no_trade_and_revert_costs_lower_the_ev();
 #[test] fn an_unchanged_arm_renews_and_does_not_rearm();
 #[test] fn a_size_change_alone_does_not_rearm();        // a pool's liquidity moves, thresholds don't
 #[test] fn a_threshold_change_rearms_when_its_sender_frees();
@@ -1043,11 +1109,11 @@ Repricing, the stale ordering, the worker pool, senders' busy-until blocks, and
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add crates/apex-runtime/src/armed/sized.rs crates/apex-runtime/src/armed/mod.rs crates/apex-runtime/src/armed/engine.rs
-git commit -m "feat(armed): SizedEngine, groups first and marginal value (Task 8.5 R40.1)"
+git add crates/apex-runtime/src/armed/sized.rs crates/apex-runtime/src/armed/mod.rs crates/apex-runtime/src/armed/engine.rs crates/apex-runtime/src/live/book.rs
+git commit -m "feat(armed): SizedEngine, chosen by marginal expected net (Task 8.5 R40.1)"
 ```
 
-### Task 14: Receipts and the ledger's classes
+### Task 13: Receipts and the ledger's classes
 
 **Files:** Modify: `canary/chain.rs`, `armed/live.rs`, `armed/live_ledger.rs`.
 Test: in those modules.
@@ -1091,7 +1157,125 @@ git add crates/apex-runtime/src/canary/chain.rs crates/apex-runtime/src/armed/li
 git commit -m "feat(armed): Traded and NoTrade in receipts and the ledger (Task 8.5 R40.1)"
 ```
 
-### Task 15: Landings from the executor's logs
+### Task 14: The evaluator judges sized fires
+
+**Files:** Modify: `armed/run.rs` (around `plan::armed_gross` and
+`simulate_request`), `armed/eval.rs`. Test: in them.
+
+**Interfaces:** Produces, in each verdict line of a sized arm:
+
+```rust
+pub struct SizedVerdict { pub outcome: String, // traded | capped | truncated | early_exit
+                          pub size: String, pub gross: String, pub beyond_cap: String, pub beyond_steps: String,
+                          pub best_size_net: String, pub walk_net: String, pub ladder_end: bool }
+```
+
+`simulated_gross` reads `Traded` as well as `Profit`. `simulate_request` sets the
+call's `gasPrice` to the arm's base fee plus bid; with a zero, the floor means
+nothing. The landing model stays R41's block mode.
+
+- [ ] **Step 1: Write the failing tests:** `a_sized_fire_is_judged_at_the_walks_size`;
+  `a_fire_past_the_cap_reports_what_it_left`;
+  `a_truncated_fire_reports_what_the_steps_left`; `a_gap_gone_is_early_exit`;
+  `the_simulation_carries_the_real_gas_price` (Review Focus 1: the request's
+  price is non-zero and equals base fee plus bid);
+  `simulated_gross_reads_traded`; `walk_and_best_size_are_both_logged`; and
+  `unsized_arms_are_judged_as_before`.
+- [ ] **Step 2: Run them.** `cargo test -j 3 -p apex-runtime armed::run armed::eval`.
+  Expected: FAIL.
+- [ ] **Step 3: Implement them.**
+- [ ] **Step 4: Run them.** Expected: PASS.
+- [ ] **Step 5: Commit.**
+
+```bash
+git add crates/apex-runtime/src/armed/run.rs crates/apex-runtime/src/armed/eval.rs
+git commit -m "feat(armed): the evaluator judges sized fires (Task 8.5 R40.1)"
+```
+
+### Task 15: Two engines on one feed
+
+**Files:** Modify: `armed/run.rs`, `ops/{canary,shadow}.yaml`,
+`ops/{canary,shadow}.denim.yaml`, `ops/host/ARMED.md`. Test: `armed/run.rs`.
+
+**Interfaces:** Consumes `SizedEngine`. Produces `LiveChain::l1_fee_upper_bound(
+&self, tx_size: u64) -> Result<u128, String>`, read once a minute on R41's
+`ReadClock` and passed to `SizedEngine::tick`, and, in `run`: with `armed.sized`
+set and `mode: shadow`, a second pass on its own thread over the same snapshot,
+writing `armed.sized.ledger`, and `armed-eval` judging that ledger into
+`armed.sized.verdicts`. It holds no keys, sends nothing, and reads no chain state
+of its own beyond the executor's code hash at boot.
+
+- [ ] **Step 1: Write the failing tests:** `the_shadow_engine_never_reaches_the_worker`
+  (a sized `Arm` from a shadow engine doesn't reach `ArmedLive`);
+  `the_two_ledgers_stay_apart`; `the_sized_pass_cannot_delay_the_live_one`
+  (a stalled sized pass leaves the live pass's timing unchanged);
+  `a_wrong_code_hash_arms_nothing`; `the_l1_read_is_once_a_minute`;
+  `an_l1_spike_raises_the_reservation`; and `the_sized_section_absent_changes_nothing`.
+- [ ] **Step 2: Run them.** `cargo test -j 3 -p apex-runtime armed::run`.
+  Expected: FAIL.
+- [ ] **Step 3: Implement them.** The section goes in all four files, so R41's
+  drift test still sees seven differing fields, with `mode: shadow` and the
+  pre-deploy `runtime_code` override R37 used. `ARMED.md` gains R40.1's section:
+  how to read the report, how to flip, and how to roll back to R39.
+- [ ] **Step 4: Run them.** Expected: PASS.
+- [ ] **Step 5: Run all five gates** and `python3 -m pytest
+  scripts/data/arb_census`. Expected: as R41's, with the two known-red scripts
+  unchanged.
+- [ ] **Step 6: Commit.**
+
+```bash
+git add crates/apex-runtime/src/armed/run.rs ops/canary.yaml ops/shadow.yaml ops/canary.denim.yaml ops/shadow.denim.yaml ops/host/ARMED.md
+git commit -m "feat(armed): SizedEngine in shadow beside the live lane (Task 8.5 R40.1)"
+```
+
+- [ ] **Step 7: Self-review the whole branch,** against the spec's sections 2 to 7.
+
+## Phase 5: shadow, then first live (operator steps, each approved at the time)
+
+### Task 16: Shadow, then the go decision
+
+Needs R41's gate D, the five gates, and the operator's "yes, push and deploy
+<rev>". `LeanExecutor3` is not yet on chain, so the shadow simulates with the
+`runtime_code` override.
+
+- [ ] **Step 1: The L1 bound, on its own.** After gate D, as its own config
+  change, set `l1_fee_bound_wei: 1000000000000` (decision 3), but only if Task 1's
+  receipts and the oracle show 1e12 covers the signed transaction. If not, use
+  the smallest round figure that does. R39 gets it too, so the first live step
+  compares like with like.
+- [ ] **Step 2: Deploy.** `ops/host/deploy.sh`, then confirm the canary boots
+  with R39's live numbers unchanged, and `armed-sized.jsonl` growing. If two
+  engines cost too much CPU (a live pass's p95 up by more than 20%), take the
+  spec's fallback, one day with live off, and ask first.
+- [ ] **Step 3: One post-Denim UTC day.** Pass means no correctness failure:
+  - book and chain storage agree for every armable pool;
+  - the mirror matches the real-contract simulation on every simulated fire;
+  - the reservations and the budget hold, with no stale pool armed;
+  - overlapping arms behave as Task 9 says.
+- [ ] **Step 4: Set `maxSteps`.** From the verdicts' `beyond_steps`: raise it, up to
+  what fork gas allows, if truncation left real money. Otherwise it stays 8.
+- [ ] **Step 5: Report to the operator,** with early exits, capped and truncated
+  value, and the paired replay against R39. These are telemetry, not gates.
+
+### Task 17: First live, at 16 senders
+
+Each step is the operator's explicit yes. The owner broadcasts.
+
+- [ ] **Step 1: Deploy `LeanExecutor3`.** Forge clean, `forge build
+  script/DeployLeanExecutor3.s.sol`, a dry run, then the owner broadcasts. Check
+  the printed code hash against `armed.sized.executor3.code_hash`.
+- [ ] **Step 2: Authorize** the 16 senders in one batch with `setExecutors`.
+- [ ] **Step 3: Flip:** `armed.sized.mode: live`, `armed.mode: shadow`. The same
+  sender count as R39, so the step measures the executor and ranking alone.
+  Rollback: flip them back; `LeanExecutor2` stays deployed.
+- [ ] **Step 4: Run one UTC day,** then report realised net against R39's.
+
+## Phase 6: scale (after first live)
+
+Not needed at 16 senders: R39's reads stand there, so this waits until the
+executor has earned the extra senders.
+
+### Task 18: Landings from the executor's logs
 
 **Files:** Modify: `armed/run.rs`, `shadow/mod.rs` (the feed's log filters),
 `armed/live.rs`. Test: in those modules.
@@ -1115,11 +1299,11 @@ git add crates/apex-runtime/src/armed/run.rs crates/apex-runtime/src/armed/live.
 git commit -m "feat(armed): landings from the executor's logs (Task 8.5 R40.1)"
 ```
 
-### Task 16: Local nonces and balances, the L1 read, the rate limiter
+### Task 19: Local nonces and balances, and the rate limiter
 
 **Files:**
 - Create: `crates/apex-runtime/src/armed/tracked.rs`
-- Modify: `armed/live.rs`, `armed/live_chain.rs`, `armed/run.rs`
+- Modify: `armed/live.rs`, `armed/run.rs`
 
 **Interfaces:** Produces:
 
@@ -1144,17 +1328,13 @@ impl SendLimiter { pub fn new(per_s: u32) -> Self; pub fn admits(&mut self, now_
 // LivePolicy gains
 pub tracked: bool,          // false under R39: its reads stay as they are
 pub send_rate_per_s: u32,   // 0: no limit
-// LiveChain gains
-async fn l1_fee_upper_bound(&self, tx_size: u64) -> Result<u128, String>;
 ```
 
 With `tracked`, a bound passing with no landing log sends again on the same
 nonce with no read, and `balance()` answers from `Tracked`. The sweep calls the
 existing `landing_check`, so a revert is costed and its pending slot cleared as
 today. A slot's reservation is held until a log or the sweep settles it; a send
-on that nonce shares it, as `admits` already does. The L1 term is Ruling 8's.
-`l1_fee_upper_bound` is read once a minute on R41's `ReadClock`, passed to
-`SizedEngine::tick`, and logged in the worker's status line.
+on that nonce shares it, as `admits` already does.
 
 - [ ] **Step 1: Write the failing tests:**
 
@@ -1170,8 +1350,6 @@ on that nonce shares it, as `admits` already does. The L1 term is Ruling 8's.
 #[test] fn reads_do_not_grow_with_senders();            // a counting fake chain, 16 against 64 senders, a thousand heads: equal
 #[test] fn the_limiter_holds_the_rate();
 #[test] fn the_limiter_skips_as_rate_not_budget();
-#[test] fn the_l1_read_is_once_a_minute();
-#[test] fn an_l1_spike_raises_the_reservation();
 #[test] fn untracked_keeps_r39s_reads();                // policy.tracked false: reads as before
 ```
 
@@ -1182,45 +1360,28 @@ on that nonce shares it, as `admits` already does. The L1 term is Ruling 8's.
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add crates/apex-runtime/src/armed/tracked.rs crates/apex-runtime/src/armed/live.rs crates/apex-runtime/src/armed/live_chain.rs crates/apex-runtime/src/armed/run.rs crates/apex-runtime/src/armed/mod.rs
+git add crates/apex-runtime/src/armed/tracked.rs crates/apex-runtime/src/armed/live.rs crates/apex-runtime/src/armed/run.rs crates/apex-runtime/src/armed/mod.rs
 git commit -m "feat(armed): reads that do not grow with senders (Task 8.5 R40.1)"
 ```
 
-### Task 17: The evaluator judges sized fires
+### Task 20: 32, then 64
 
-**Files:** Modify: `armed/run.rs` (around `plan::armed_gross` and
-`simulate_request`), `armed/eval.rs`. Test: in them.
+Each step is the operator's yes.
 
-**Interfaces:** Produces, in each verdict line of a sized arm:
+- [ ] **Step 1: Generate the keys** on the host (`keys::generate`), authorize in a
+  batch, and fund in steps: tier-1 senders 0.001 ETH each, tier-2 senders 0.005
+  ETH, about 0.08 ETH at 64. Set `send_rate_per_s` to cover the new count.
+- [ ] **Step 2: Run one UTC day** at each step. Go up when:
+  - realised net from receipts was positive and no lower than the last step's;
+  - the fill has positive-EV candidates waiting for the new senders;
+  - no safety or accounting invariant failed, and BlockPI was not exhausted.
 
-```rust
-pub struct SizedVerdict { pub outcome: String, // traded | capped | truncated | early_exit
-                          pub size: String, pub gross: String, pub beyond_cap: String,
-                          pub best_size_net: String, pub walk_net: String, pub ladder_end: bool }
-```
+  Stop if a sequencer limit appears or the added senders earn nothing. A sender
+  step risks only its funding and what the unchanged budget allows.
+- [ ] **Step 3: Close out.** With 64 senders stable, propose a separate change
+  deleting `Engine`, the rungs and `Lean2` arming.
 
-`simulated_gross` reads `Traded` as well as `Profit`. `simulate_request` sets the
-call's `gasPrice` to the arm's base fee plus bid; with a zero, the floor means
-nothing. The landing model stays R41's block mode.
-
-- [ ] **Step 1: Write the failing tests:** `a_sized_fire_is_judged_at_the_walks_size`;
-  `a_fire_past_the_cap_reports_what_it_left`; `a_gap_gone_is_early_exit`;
-  `the_simulation_carries_the_real_gas_price` (Review Focus 1: the request's
-  price is non-zero and equals base fee plus bid);
-  `simulated_gross_reads_traded`; `walk_and_best_size_are_both_logged`; and
-  `unsized_arms_are_judged_as_before`.
-- [ ] **Step 2: Run them.** `cargo test -j 3 -p apex-runtime armed::run armed::eval`.
-  Expected: FAIL.
-- [ ] **Step 3: Implement them.**
-- [ ] **Step 4: Run them.** Expected: PASS.
-- [ ] **Step 5: Commit.**
-
-```bash
-git add crates/apex-runtime/src/armed/run.rs crates/apex-runtime/src/armed/eval.rs
-git commit -m "feat(armed): the evaluator judges sized fires (Task 8.5 R40.1)"
-```
-
-### Task 18: The daily report
+### Task 21: The daily report (only when needed to aim a fix)
 
 **Files:**
 - Create: `scripts/data/arb_census/coverage.py`,
@@ -1262,99 +1423,3 @@ git add scripts/data/arb_census/coverage.py scripts/data/arb_census/test_coverag
 git commit -m "feat(census): the daily coverage report (Task 8.5 R40.1)"
 ```
 
-### Task 19: Two engines on one feed
-
-**Files:** Modify: `armed/run.rs`, `ops/{canary,shadow}.yaml`,
-`ops/{canary,shadow}.denim.yaml`, `ops/host/ARMED.md`. Test: `armed/run.rs`.
-
-**Interfaces:** Consumes `SizedEngine`. Produces, in `run`: with `armed.sized`
-set and `mode: shadow`, a second pass on its own thread over the same snapshot,
-writing `armed.sized.ledger`, and `armed-eval` judging that ledger into
-`armed.sized.verdicts`. It holds no keys, sends nothing, and reads no chain state
-of its own beyond the executor's code hash at boot.
-
-- [ ] **Step 1: Write the failing tests:** `the_shadow_engine_never_reaches_the_worker`
-  (a sized `Arm` from a shadow engine doesn't reach `ArmedLive`);
-  `the_two_ledgers_stay_apart`; `the_sized_pass_cannot_delay_the_live_one`
-  (a stalled sized pass leaves the live pass's timing unchanged);
-  `a_wrong_code_hash_arms_nothing`; and `the_sized_section_absent_changes_nothing`.
-- [ ] **Step 2: Run them.** `cargo test -j 3 -p apex-runtime armed::run`.
-  Expected: FAIL.
-- [ ] **Step 3: Implement them.** The section goes in all four files, so R41's
-  drift test still sees seven differing fields, with `mode: shadow` and the
-  pre-deploy `runtime_code` override R37 used. `ARMED.md` gains R40.1's section:
-  how to read the report, how to flip, and how to roll back to R39.
-- [ ] **Step 4: Run them.** Expected: PASS.
-- [ ] **Step 5: Run all five gates** and `python3 -m pytest
-  scripts/data/arb_census`. Expected: as R41's, with the two known-red scripts
-  unchanged.
-- [ ] **Step 6: Commit.**
-
-```bash
-git add crates/apex-runtime/src/armed/run.rs ops/canary.yaml ops/shadow.yaml ops/canary.denim.yaml ops/shadow.denim.yaml ops/host/ARMED.md
-git commit -m "feat(armed): SizedEngine in shadow beside the live lane (Task 8.5 R40.1)"
-```
-
-- [ ] **Step 7: Self-review the whole branch,** against the spec's sections 2 to 7.
-
-## Phase 5: shadow (operator steps, each approved at the time)
-
-### Task 20: Gate C on the host
-
-Needs R41's gate D, the five gates, and the operator's "yes, push and deploy
-<rev>". `LeanExecutor3` is not yet on chain, so the shadow simulates with the
-`runtime_code` override.
-
-- [ ] **Step 0: The L1 bound, on its own.** After gate D, as its own config
-  change, set `l1_fee_bound_wei: 1000000000000` (decision 3). R39 gets it too, so
-  gate L's first step compares like with like, and it needs no new code.
-  Confirm a day later that "balance" skips fell and no landing paid over the
-  bound.
-- [ ] **Step 1: Deploy.** `ops/host/deploy.sh`, then confirm the canary boots
-  with R39's live numbers unchanged, and `armed-sized.jsonl` growing. If two
-  engines cost too much CPU (a live pass's p95 up by more than 20%), take the
-  spec's fallback, one day with live off, and ask first.
-- [ ] **Step 2: Three post-Denim days.** Enable `apex-coverage.timer`.
-- [ ] **Step 3: Fit tier 2, and pick the window.** Run `tiers.py` on three
-  post-Denim days and a fourth, and set `tier2_multiple` only if `held` is true.
-  Set `armed.sized.window_s` from the report's re-arms against missed fires, up
-  to Cobalt's 60 s.
-- [ ] **Step 4: Judge gate C.** Pass means:
-  - book and chain storage agree for every armable pool;
-  - the mirror matches the real-contract simulation on every simulated fire;
-  - predicted early exits are under 2% of fires;
-  - at least 90% of groups are armed at least 90% of the time;
-  - the send rate is inside the sequencer's limit, and reads are within the
-    post-Denim R39 level, by R28.1's counters;
-  - coverage and the paired replay net are reported (coverage of at least 60%
-    is the target, not a pass on money).
-- [ ] **Step 5: Report to the operator,** with the numbers and a recommendation.
-
-## Phase 6: the live ramp (the operator's)
-
-### Task 21: Deploy, authorize, fund, ramp through gate L
-
-Each step is the operator's explicit yes. The owner broadcasts.
-
-- [ ] **Step 1: Deploy `LeanExecutor3`.** Forge clean, `forge build
-  script/DeployLeanExecutor3.s.sol`, a dry run, then the owner broadcasts. Check
-  the printed code hash against `armed.sized.executor3.code_hash`.
-- [ ] **Step 2: Authorize** the 16 senders in one batch with `setExecutors`.
-- [ ] **Step 3: Flip at 16 senders:** `armed.sized.mode: live`, `armed.mode:
-  shadow`. The same sender count as R39, so the step measures the executor and
-  ranking alone. Rollback: flip them back; `LeanExecutor2` stays deployed.
-- [ ] **Step 4: Run at least three UTC days,** then judge the step. It goes up
-  when:
-  - its realised net is positive, and above the previous step's per day;
-  - included losses stayed within budget, with no halt;
-  - early exits and reverts stayed rare, and BlockPI was not exhausted;
-  - landings' realised net matched the evaluator's pessimistic estimate.
-
-  The bootstrapped interval of the step's added net is reported each time. A
-  positive lower bound is required only for raising a risk limit, not for adding
-  senders.
-- [ ] **Step 5: 32, then 64.** Generate the keys on the host (`keys::generate`),
-  authorize in a batch, and fund in steps: tier-1 senders 0.001 ETH each, tier-2
-  senders 0.005 ETH, about 0.08 ETH at 64. Repeat Step 4 at each.
-- [ ] **Step 6: Close out.** With gate L passed at the last step, propose a
-  separate change deleting `Engine`, the rungs and `Lean2` arming.
