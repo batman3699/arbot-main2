@@ -197,10 +197,29 @@ Verified, in this repo or on chain:
   arms already meet. `main` holds validity transactions in their own pool, at
   reth's pending limits by default. Any rate limit in front of the node isn't
   visible from source.
+- **R39 on chain, every landing** (`LeanExecutor2`'s `Profit` logs and their
+  receipts, 2026-10-29 18:23 to 11-03 08:15 UTC):
+  - **324 landings, 1 revert.** The 16 senders' nonces rose by 325 from the
+    deploy block. The one send without `Profit` reverted (nonce 20 of
+    0xFcE3…1111, block 53,416,074, 179k gas, about $0.007). `p_revert_ppm` is
+    3,100.
+  - **Landings a day:** 10, 39, 28, 61, 125 and 61 (11-03 to 08:15). At most two
+    landed in one block, so the chain doesn't bound the send rate; at 16
+    senders R39 already sends at the launch count.
+  - **Gas:** 227k to 298k, median 234k. Every transaction is 228 bytes of
+    calldata.
+  - **The L1 fee:** median 9.5e8 wei, p99 4.9e11, highest 8.17e11 (10-29 21:47,
+    L1 base fee 45 gwei, blob base fee 2.8 gwei). Three were over 5e11 and
+    none over 1e12. The median is 0.04% of a landing's fee.
+- **The oracle's bound against those fees.** At the 21:47 spike block,
+  `getL1FeeUpperBound` was 1.41e12 at 338 bytes (R39's signed size) and 2.08e12
+  at 512. So the plan's bound, twice the 512-byte figure, was 4.2e12, 5.1 times
+  what was paid. A signed plan-3 transaction is about 376 bytes. Today, the
+  512-byte bound is 1.7e9.
 
 Still to read from the host, for launch values and not holding up the build:
-R39's peak accepted send rate, its revert share, every landing's L1 fee, and how
-many (trigger pool, direction) groups the target routes have.
+every refusal's text, and how many (trigger pool, direction) groups the target
+routes have. The send-rate limit waits for the ramp past 16 senders.
 
 ## Design
 
@@ -436,8 +455,10 @@ pending arm's worst case counts against the day's 0.01 ETH, as today:
 
 **What makes breadth fit is the L1 bound.** At 5e13 wei it is 660–18,000
 times the L1 fees paid, and it is most of a tier-1 arm's worst case. With
-`l1_fee_bound_wei` set to **(my call)** 1e12 (13 times the highest seen) and
-tied to the oracle's upper bound:
+`l1_fee_bound_wei` set to **(my call)** 1e12 and tied to the oracle's upper
+bound. 1e12 is above every L1 fee R39 paid in 324 landings, though only 1.2
+times the highest. The oracle term, twice its 512-byte bound, carries a spike
+past it (5.1 times the fee at 10-29's):
 
 | | Gas limit, bid | Worst case each | 64 tier-1 arms |
 |---|---|---|---|
@@ -653,7 +674,7 @@ against the code, the chain or Base's source.
 | Compare the walk on historical pool snapshots | **Modified.** None hold tick ladders, so real books are compared in shadow on every fire, as the plan had it |
 | Record what the cap and the step limit left | **Accepted.** `maxSteps` also moves into the plan, so evidence can raise it without a redeploy |
 | Positive `minNet`, receipt accounting | **Accepted:** `minNet` is 1. The accounting was already so |
-| Set the L1 bound to 1e12 only if data shows it covers | **Accepted.** It is computed from every landing's receipt before the change |
+| Set the L1 bound to 1e12 only if data shows it covers | **Accepted, and it does.** No landing's L1 fee in 324 exceeded it (highest 8.17e11); twice the oracle's 512-byte bound was 5.1 times the fee at the worst spike. A sized pass prices nothing until the oracle has been read |
 | Keep the 10 s window | **Accepted** |
 | Lender preflight into `NoTrade` | **Accepted.** It costs about 2k gas a trade, and reverses my earlier ruling |
 | v4 restrictions at the executor | **Modified.** Delta-returning hook bits, dynamic fee and protocol fee are checked there. The code hash stays at admission: since EIP-6780 code at an address can't change, so an on-chain registry adds an owner transaction per hook and catches nothing |

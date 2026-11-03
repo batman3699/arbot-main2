@@ -84,6 +84,10 @@ armed:
       address: "0x00000000000000000000000000000000000e3e03"
       code_hash: "0xfc900951ded02368fc5e39d88682d01d9af72eb75552fc1b1e88283ee5110767"
       runtime_code: var/armed/LeanExecutor3.runtime.hex
+    # R39 on chain, 2026-10-29 18:23 to 11-03 08:15 UTC: 1 revert in 325
+    # sends (16 senders, at most 2 landings a block); the send-rate limit
+    # waits for the 32-sender ramp.
+    p_revert_ppm: 3100
   max_size_usdc: 12000000000                 # 12,000 USDC, about max_size_wei's 5 WETH
   # R37: armed-eval simulates this many fires a run (an even sample, every
   # fire still quoted): 2 a run every 5 minutes is at most 576 a day. All

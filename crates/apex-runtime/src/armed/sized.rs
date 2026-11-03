@@ -349,6 +349,11 @@ impl SizedEngine {
             st.moves.observe(spread_key(a.spec.pool, b.spec.pool), x - y, now_ns);
             st.moves.observe(spread_key(b.spec.pool, a.spec.pool), y - x, now_ns);
         }
+        // No plan before the oracle's bound has been read: its floor would
+        // leave the L1 fee out.
+        if l1_upper_wei == 0 {
+            return Vec::new();
+        }
 
         // Reprice: the changed first, then the oldest, while the pass has time.
         let mut stale: Vec<((RouteId, u8), (bool, u64))> = Vec::new();
@@ -721,12 +726,9 @@ mod tests {
         }
     }
 
-    /// Two routes share the trigger, Uniswap's pool, in one direction: the
-    /// first's trade, replayed on the book, moves it back, so the second is
-    /// worth less with the first armed than alone, and more than nothing when
-    /// its own pool is deeper.
-    #[test]
-    fn a_second_route_counts_only_what_the_first_leaves() {
+    /// Three pools on one pair, Slipstream's the deepest, and an engine over
+    /// their cycles.
+    fn fixture() -> (BTreeMap<Address, Arc<PoolSnapshot>>, SizedEngine, Pricing) {
         let snap: BTreeMap<Address, Arc<PoolSnapshot>> = [
             (UNI, pool(UNI, Venue::UniswapV3, L)),
             (CAKE, pool(CAKE, Venue::PancakeV3, L)),
@@ -766,8 +768,27 @@ mod tests {
             usdc_lenders: None,
             pool_manager: None,
         };
-        let e = SizedEngine::new(cycles, settings, BTreeSet::new());
-        e.tick(&snap, 1_000, 1, &px, 1, u128::MAX / 4, 0);
+        (snap, SizedEngine::new(cycles, settings, BTreeSet::new()), px)
+    }
+
+    /// Before the oracle's L1 bound is read, a pass prices nothing.
+    #[test]
+    fn no_plan_without_the_l1_bound() {
+        let (snap, e, px) = fixture();
+        assert!(e.tick(&snap, 1_000, 1, &px, 1, u128::MAX / 4, 0).is_empty());
+        assert!(e.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).priced.is_empty());
+        e.tick(&snap, 1_000, 1, &px, 1, u128::MAX / 4, 1);
+        assert!(!e.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).priced.is_empty());
+    }
+
+    /// Two routes share the trigger, Uniswap's pool, in one direction: the
+    /// first's trade, replayed on the book, moves it back, so the second is
+    /// worth less with the first armed than alone, and more than nothing when
+    /// its own pool is deeper.
+    #[test]
+    fn a_second_route_counts_only_what_the_first_leaves() {
+        let (snap, e, px) = fixture();
+        e.tick(&snap, 1_000, 1, &px, 1, u128::MAX / 4, 1);
         let st = e.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // The slots whose trigger is Uniswap's pool, in one direction, one per other pool.
         let mut by_other: BTreeMap<Address, Candidate> = BTreeMap::new();

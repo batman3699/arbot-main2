@@ -230,13 +230,15 @@ pending limits by default, with `--rollup.validity-pool-*` overrides; arms use
 one account slot each, and no more predicates than R39's.
 
 - [ ] **Step 1: The host's numbers** (needs `aws login --profile apex-us`). From
-  `var/armed/armed-live.jsonl`: R39's peak accepted sends a second, its share of
-  landings that reverted, and every refusal's text. From `var/armed/targets.json`:
-  distinct (trigger pool, direction) groups, and routes per group.
-- [ ] **Step 2: The L1 fees.** Read `l1Fee` from every landing's receipt on a
-  public RPC, and `getL1FeeUpperBound` at the signed size of a plan-3 transaction.
-- [ ] **Step 3: Record them** in the spec, and set the three config values. This
-  doesn't hold up Phases 2 to 4.
+  `var/armed/armed-live.jsonl`: every refusal's text. From `var/armed/targets.json`:
+  distinct (trigger pool, direction) groups, and routes per group. The revert
+  share came from the chain instead (Step 2). The peak send rate isn't needed
+  at 16 senders, R39's own count, so `send_rate_per_s` stays 0 until the ramp.
+- [x] **Step 2: The L1 fees and reverts** (2026-11-03, from the chain): 324
+  landings and 1 revert in 325 sends; L1 fees at most 8.17e11; the oracle's
+  512-byte bound 2.08e12 at that spike.
+- [x] **Step 3: Record them** in the spec. `p_revert_ppm: 3100` is in all four
+  configs. 1e12 covers every fee paid, so decision 3 stands for Task 16.
 
 ## Phase 2: the mirror
 
