@@ -38,6 +38,7 @@ pub mod finite_size;
 pub mod math;
 pub mod quote_common;
 pub mod quote_solidly;
+pub mod walk;
 
 /// Crate version, exposed so workspace wiring is testable independently of any
 /// particular engine.
