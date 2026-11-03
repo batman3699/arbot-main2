@@ -557,9 +557,11 @@ impl ArmedLive {
         if arm.predicates.iter().all(is_bound) {
             return self.skip(arm, sender, "unconditional", now_ms);
         }
-        // R37: a USDC arm's size is USDC's units, held to USDC's cap.
+        // R37: a USDC arm's size is USDC's units, held to USDC's cap. R40.1: a
+        // sized arm's plan clamps to its cap on chain, so its size is a
+        // prediction and not held here.
         let cap = if read.start == Some(apex_exec::lean2::USDC) { self.policy.max_size_usdc } else { self.policy.max_size_wei };
-        if read.size > cap {
+        if arm.sized.is_none() && read.size > cap {
             return self.skip(arm, sender, "size", now_ms);
         }
         let head = match self.chain.head().await {
@@ -795,6 +797,7 @@ impl ArmedLive {
             at_ms: now_ms,
             start: sent.start,
             paid_start: (!in_weth).then(|| read.paid_wei.to_string()),
+            class: super::live_ledger::LandedClass::of(r.success, read.sized),
         };
         self.record(landed, now_ms);
         let (day, day_loss, reached) = {

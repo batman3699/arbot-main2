@@ -53,6 +53,7 @@ fn landed(sender: Address, nonce: u64, hash: B256, net_wei: i128, at_ms: u64) ->
         at_ms,
         start: None,
         paid_start: None,
+        class: None,
     }
 }
 
@@ -419,4 +420,11 @@ fn a_long_ledger_is_compacted_and_the_original_kept() {
     assert_eq!(std::fs::read(&archive).unwrap(), before);
     let (_, records) = LiveLedger::open(&path).unwrap();
     assert_eq!(records, compact(&a_busy_day(), now, 100).unwrap());
+}
+
+#[test]
+fn ledger_lines_without_a_class_still_read() {
+    let line = r#"{"kind":"landed","arm_id":1,"pools":["0x00000000000000000000000000000000000000a1","0x00000000000000000000000000000000000000b2"],"sender":"0x00000000000000000000000000000000000000c3","nonce":4,"tx":"0x0505050505050505050505050505050505050505050505050505050505050505","gross_wei":"0","paid_wei":"0","cost_wei":"5","net_wei":"-5","at_ms":9}"#;
+    let r: LiveRecord = serde_json::from_str(line).expect("an R39 line");
+    assert!(matches!(r, LiveRecord::Landed { class: None, .. }));
 }

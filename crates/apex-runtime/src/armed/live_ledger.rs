@@ -71,6 +71,9 @@ pub enum LiveRecord {
         start: Option<Address>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         paid_start: Option<String>,
+        /// R40.1: what a `LeanExecutor3` landing was. Absent for R39's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        class: Option<LandedClass>,
     },
     /// `tx`'s bound has passed with the sender's nonce unmoved, so it can no
     /// longer land; with no `tx`, every hash at this sender/nonce has.
@@ -101,6 +104,36 @@ pub enum LiveRecord {
     /// Operator acknowledgement. Clears a tripwire, but deliberately does not
     /// clear a same-day loss-cap halt: that halt expires at the next UTC day.
     Reset { at_ms: u64 },
+}
+
+/// R40.1: every inclusion of a sized arm is one of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandedClass {
+    Traded,
+    /// Traded, its size held at the plan's cap.
+    Capped,
+    /// Traded, its walk stopped at the step limit.
+    Truncated,
+    /// Included, and traded nothing: `NoTrade`.
+    EarlyExit,
+    Reverted,
+}
+
+impl LandedClass {
+    /// The class of a landing `LeanExecutor3` reported as `sized`, or None for
+    /// one that is not that executor's.
+    pub fn of(success: bool, sized: Option<crate::canary::chain::SizedEvent>) -> Option<Self> {
+        use crate::canary::chain::SizedEvent;
+        match (success, sized) {
+            (false, _) => Some(Self::Reverted),
+            (true, Some(SizedEvent::NoTrade { .. })) => Some(Self::EarlyExit),
+            (true, Some(SizedEvent::Traded { flags, .. })) if flags & 1 != 0 => Some(Self::Capped),
+            (true, Some(SizedEvent::Traded { flags, .. })) if flags & 2 != 0 => Some(Self::Truncated),
+            (true, Some(SizedEvent::Traded { .. })) => Some(Self::Traded),
+            (true, None) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

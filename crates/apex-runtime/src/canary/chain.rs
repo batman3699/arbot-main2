@@ -23,6 +23,20 @@ use std::time::{Duration, Instant};
 const TRANSFER: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 /// The lean executor's `Profit(uint256 gross)` (R29).
 const PROFIT: &str = "0x357d905f1831209797df4d55d79c5c5bf1d9f7311c976afd05e13d881eab9bc8";
+/// R40.1: `LeanExecutor3`'s `Traded(address indexed sender, uint8 start,
+/// uint256 amountIn, uint256 out, uint256 lenderFee, uint256 costWei, uint8
+/// steps, uint8 flags)`, and `NoTrade(address indexed sender, uint8 reason,
+/// uint8 steps)`.
+pub const TRADED: &str = "0xb4c0b7a3d513c247cc12e464ba0050ed1a4a83f72a141e8292104095f1b9e5dc";
+pub const NO_TRADE: &str = "0xe7f01ccb005f58cd63bbf30970d6f55b078a669e04c01feea4a1cb7778687653";
+
+/// R40.1: what `LeanExecutor3` said of its run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizedEvent {
+    /// `gross` is `out − amount_in − lender_fee`, in the start token.
+    Traded { gross: u128, amount_in: u128, out: u128, cost_wei: u128, steps: u8, flags: u8 },
+    NoTrade { reason: u8, steps: u8 },
+}
 /// A revert under this much gas stopped before the swaps: the deadline, the
 /// caller, the circuit (spec §7). The lean executor's expired run costs 24,399
 /// (R29's fork measurement).
@@ -34,8 +48,11 @@ pub struct Read {
     pub receipt: Receipt,
     /// WETH transferred from the executor to the recipients.
     pub paid_wei: u128,
-    /// `Profit`'s gross, when the executor emitted it.
+    /// `Profit`'s gross, when the executor emitted it; `Traded`'s for
+    /// `LeanExecutor3`.
     pub realised_wei: Option<u128>,
+    /// R40.1: `LeanExecutor3`'s `Traded` or `NoTrade`.
+    pub sized: Option<SizedEvent>,
 }
 
 fn quantity(v: &Value, field: &str) -> Result<u128, String> {
@@ -73,6 +90,7 @@ pub fn read_receipt(v: &Value, weth: Address, executor: Address, recipients: &[A
     let logs = v.get("logs").and_then(Value::as_array).cloned().unwrap_or_default();
     let mut paid_wei = 0u128;
     let mut realised_wei = None;
+    let mut sized = None;
     for log in &logs {
         let address = log.get("address").and_then(Value::as_str).and_then(|s| s.parse::<Address>().ok());
         let topics = log.get("topics").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -87,8 +105,20 @@ pub fn read_receipt(v: &Value, weth: Address, executor: Address, recipients: &[A
         if address == Some(executor) && topic0.as_deref() == Some(PROFIT) {
             realised_wei = Some(data_word(log, 0).ok_or("Profit's gross did not decode")?);
         }
+        if address == Some(executor) && topic0.as_deref() == Some(TRADED) {
+            let word = |i| data_word(log, i).ok_or("Traded did not decode");
+            let (amount_in, out, lender_fee, cost_wei) = (word(1)?, word(2)?, word(3)?, word(4)?);
+            let small = |i| u8::try_from(word(i)?).map_err(|_| "Traded's steps or flags past a byte");
+            let gross = out.checked_sub(amount_in).and_then(|g| g.checked_sub(lender_fee)).ok_or("Traded's out is below its loan")?;
+            realised_wei = Some(gross);
+            sized = Some(SizedEvent::Traded { gross, amount_in, out, cost_wei, steps: small(5)?, flags: small(6)? });
+        }
+        if address == Some(executor) && topic0.as_deref() == Some(NO_TRADE) {
+            let small = |i| data_word(log, i).and_then(|w| u8::try_from(w).ok()).ok_or("NoTrade did not decode");
+            sized = Some(SizedEvent::NoTrade { reason: small(0)?, steps: small(1)? });
+        }
     }
-    Ok(Read { receipt, paid_wei, realised_wei })
+    Ok(Read { receipt, paid_wei, realised_wei, sized })
 }
 
 #[derive(Clone, Debug)]

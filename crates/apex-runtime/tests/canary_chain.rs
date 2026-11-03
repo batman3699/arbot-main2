@@ -302,3 +302,86 @@ fn the_lean_executors_expired_run_is_an_early_revert() {
     const LEAN_EXPIRED_RUN_GAS: u64 = 24_399;
     const { assert!(LEAN_EXPIRED_RUN_GAS < apex_runtime::canary::chain::EARLY_REVERT_GAS) };
 }
+
+// ------------------------------------------------- R40.1: LeanExecutor3's events
+
+/// A `LeanExecutor3` receipt: one log from the executor, `topic` with `words`.
+fn sized_receipt(ok: bool, topic: &str, words: &[u128], paid: u128) -> Value {
+    let data = format!("0x{}", words.iter().map(|w| word(*w)).collect::<String>());
+    let mut logs = vec![json!({ "address": format!("{EXECUTOR:#x}"), "topics": [topic, topic_addr(TRADER)], "data": data })];
+    if paid > 0 {
+        logs.push(json!({
+            "address": format!("{WETH:#x}"),
+            "topics": [TRANSFER, topic_addr(EXECUTOR), topic_addr(OWNER)],
+            "data": format!("0x{}", word(paid)),
+        }));
+    }
+    json!({
+        "transactionHash": format!("{:#x}", B256::repeat_byte(7)),
+        "blockNumber": "0x3200000",
+        "status": if ok { "0x1" } else { "0x0" },
+        "gasUsed": "0x61a80",
+        "effectiveGasPrice": "0x5f5e100",
+        "l1Fee": "0x3b9aca00",
+        "logs": if ok { logs } else { vec![] },
+    })
+}
+
+#[test]
+fn the_topics_are_the_events_signatures() {
+    use apex_runtime::canary::chain::{NO_TRADE, TRADED};
+    let k = |s: &str| format!("{:#x}", alloy_primitives::keccak256(s));
+    assert_eq!(TRADED, k("Traded(address,uint8,uint256,uint256,uint256,uint256,uint8,uint8)"));
+    assert_eq!(NO_TRADE, k("NoTrade(address,uint8,uint8)"));
+}
+
+#[test]
+fn traded_reads_its_gross_flags_and_cost() {
+    use apex_runtime::canary::chain::{SizedEvent, TRADED};
+    // 2 WETH in, 2.01 out, a fee of 1,000: the gross is what the recipient got.
+    let words = [0, 2_000_000_000_000_000_000, 2_010_000_000_000_000_000, 1_000, 4_000_000_000_000, 3, 1];
+    let gross = 10_000_000_000_000_000 - 1_000;
+    let r = read_receipt(&sized_receipt(true, TRADED, &words, gross), WETH, EXECUTOR, &[OWNER]).unwrap();
+    assert_eq!(r.realised_wei, Some(gross));
+    assert_eq!(r.paid_wei, gross);
+    let Some(SizedEvent::Traded { gross: g, amount_in, out, cost_wei, steps, flags }) = r.sized else { panic!("{:?}", r.sized) };
+    assert_eq!((g, amount_in, out, cost_wei, steps, flags), (gross, words[1], words[2], words[4], 3, 1));
+}
+
+#[test]
+fn no_trade_is_a_landing_that_paid_nothing() {
+    use apex_runtime::canary::chain::{SizedEvent, NO_TRADE};
+    let r = read_receipt(&sized_receipt(true, NO_TRADE, &[1, 2], 0), WETH, EXECUTOR, &[OWNER]).unwrap();
+    assert_eq!(r.sized, Some(SizedEvent::NoTrade { reason: 1, steps: 2 }));
+    assert_eq!((r.paid_wei, r.realised_wei), (0, None));
+    assert!(r.receipt.success);
+}
+
+#[test]
+fn each_inclusion_has_one_class() {
+    use apex_runtime::armed::live_ledger::LandedClass;
+    use apex_runtime::canary::chain::{SizedEvent, NO_TRADE, TRADED};
+    let traded = |flags| Some(SizedEvent::Traded { gross: 1, amount_in: 1, out: 2, cost_wei: 0, steps: 0, flags });
+    assert_eq!(LandedClass::of(true, traded(0)), Some(LandedClass::Traded));
+    assert_eq!(LandedClass::of(true, traded(1)), Some(LandedClass::Capped));
+    assert_eq!(LandedClass::of(true, traded(2)), Some(LandedClass::Truncated));
+    assert_eq!(LandedClass::of(true, Some(SizedEvent::NoTrade { reason: 0, steps: 0 })), Some(LandedClass::EarlyExit));
+    assert_eq!(LandedClass::of(false, None), Some(LandedClass::Reverted));
+    assert_eq!(LandedClass::of(true, None), None, "R39's landings carry no class");
+    let reverted = read_receipt(&sized_receipt(false, TRADED, &[], 0), WETH, EXECUTOR, &[OWNER]).unwrap();
+    assert_eq!(LandedClass::of(reverted.receipt.success, reverted.sized), Some(LandedClass::Reverted));
+    let _ = NO_TRADE;
+}
+
+#[test]
+fn a_traded_out_below_its_loan_does_not_read() {
+    use apex_runtime::canary::chain::TRADED;
+    let words = [0, 2_000, 1_999, 0, 0, 0, 0];
+    assert!(read_receipt(&sized_receipt(true, TRADED, &words, 0), WETH, EXECUTOR, &[OWNER]).is_err());
+}
+
+#[test]
+fn profit_still_reads_for_lean_executor_two() {
+    let r = read_receipt(&receipt(B256::repeat_byte(1), true, 30, 970, 1_000), WETH, EXECUTOR, &[OWNER]).unwrap();
+    assert_eq!((r.realised_wei, r.sized), (Some(1_000), None));
+}
