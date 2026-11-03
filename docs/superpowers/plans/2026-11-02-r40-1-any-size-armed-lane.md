@@ -229,11 +229,11 @@ in the node; validity transactions get their own pool on `main`, at reth's
 pending limits by default, with `--rollup.validity-pool-*` overrides; arms use
 one account slot each, and no more predicates than R39's.
 
-- [ ] **Step 1: The host's numbers** (needs `aws login --profile apex-us`). From
-  `var/armed/armed-live.jsonl`: every refusal's text. From `var/armed/targets.json`:
-  distinct (trigger pool, direction) groups, and routes per group. The revert
-  share came from the chain instead (Step 2). The peak send rate isn't needed
-  at 16 senders, R39's own count, so `send_rate_per_s` stays 0 until the ramp.
+- [x] **Step 1: The host's numbers** (2026-11-04 NZ): 1,038 of 179,921 sends
+  refused with http 429, in bursts of a median 13 sends a second, so
+  `send_rate_per_s` is 10 when Task 19 builds the limiter (before 32 senders);
+  the 15 s validity cap, which R41's 10 s window is inside; and 73 (pool,
+  direction) groups from 50 routes.
 - [x] **Step 2: The L1 fees and reverts** (2026-11-03, from the chain): 324
   landings and 1 revert in 325 sends; L1 fees at most 8.17e11; the oracle's
   512-byte bound 2.08e12 at that spike.

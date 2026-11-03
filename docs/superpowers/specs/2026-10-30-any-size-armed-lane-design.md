@@ -217,9 +217,28 @@ Verified, in this repo or on chain:
   what was paid. A signed plan-3 transaction is about 376 bytes. Today, the
   512-byte bound is 1.7e9.
 
-Still to read from the host, for launch values and not holding up the build:
-every refusal's text, and how many (trigger pool, direction) groups the target
-routes have. The send-rate limit waits for the ramp past 16 senders.
+- **R39 on the host** (`var/armed/armed-live*.jsonl`, 2026-11-02 01:11 to 11-03
+  15:58 UTC, 179,921 sends):
+  - **The sequencer rate-limits bursts.** 1,038 sends got `http 429 Too Many
+    Requests`: 0.6% overall, 1.0% on 11-03. In the second before a 429 there
+    were a median 13 sends, against 3 in an ordinary second (p99 11, highest
+    16). So `send_rate_per_s` is 10 when the limiter is built. A sized lane
+    at 16 senders sends about as often as R39, so the limiter can still wait
+    for the ramp, but it has to be built before 32 senders.
+  - **The validity window is at most 15 seconds:** "block-number predicate …
+    exceeds the maximum validity window of 15 seconds", 9 times. R41's 10 s
+    window (50 blocks of 200 ms) is inside it.
+  - **Other refusals** are a few dozen "nonce too low" a day, after a landing,
+    plus timeouts and the odd 502 or 503.
+  - **Realised net so far:** 437 landings since R37, 0.002083 ETH, one of them
+    negative; 0.00068 ETH in the last 15 hours. That is the baseline R40.1 has
+    to beat.
+- **The target routes** (`var/armed/targets.json`, 10-27 to 11-02): 50 routes,
+  all two-hop, 26 starting in USDC and 24 in WETH, on 48 pools. They make 73
+  groups by (trigger pool, our token in): 55 with one route, 11 with two, 6
+  with three and 1 with five. The five-route group, the v4 pool 0xc19d…'s
+  USDC side, carries 61% of the routes' rival-taken value. 16 senders cover
+  the top 16 groups.
 
 ## Design
 
