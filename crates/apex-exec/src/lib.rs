@@ -40,6 +40,7 @@ pub mod commitment;
 pub mod encode;
 pub mod lean;
 pub mod lean2;
+pub mod lean3;
 pub mod sign;
 
 pub use call::{CallPlan, ExecutorCall};

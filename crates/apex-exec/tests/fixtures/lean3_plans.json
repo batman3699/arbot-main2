@@ -1,0 +1,199 @@
+{
+  "_provenance": "Task 8.5 R40.1. Written 2026-11-03 by an independent packer (Python int.to_bytes, big-endian, signed for tick_spacing) from the fields below, per the byte table in apex_exec::lean3 and the R40.1 plan (header: lender, start, cap 16, deadline 5, rate 16, gas_overhead 4, swap_gas 4, l1_bound 8, min_net 8, max_steps 1; two hops of kind, pool or hooks 20, token_out 20, fee 3, tick_spacing 3, cross_gas 2). apex_exec::lean3 (crates/apex-exec/tests/lean3_plan.rs) and LeanPlan3Codec (test/lean/Lean3PlanFixture.t.sol) are both held to it and NEITHER writes it. spacing_sign exists only to pin int24's sign.",
+  "names": [
+    "weth_balancer_v3_pancake",
+    "usdc_morpho_slipstream_aero",
+    "usdc_pool_manager_v4_v3",
+    "usdc_pool_manager_v3_v4",
+    "every_field_at_its_most",
+    "spacing_sign"
+  ],
+  "cases": {
+    "weth_balancer_v3_pancake": {
+      "lender": 0,
+      "start": 0,
+      "cap": "5000000000000000000",
+      "deadline": "1793900000",
+      "rate": "0",
+      "gas_overhead": 61000,
+      "swap_gas": 250000,
+      "l1_bound": "3000000000",
+      "min_net": "1",
+      "max_steps": 8,
+      "hops": [
+        {
+          "kind": 0,
+          "pool": "0xd0b53D9277642d899DF5C87A3966A349A798F224",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "fee": 500,
+          "tick_spacing": 10,
+          "cross_gas": 30000
+        },
+        {
+          "kind": 1,
+          "pool": "0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38",
+          "token_out": "0x4200000000000000000000000000000000000006",
+          "fee": 100,
+          "tick_spacing": 1,
+          "cross_gas": 35000
+        }
+      ],
+      "encoded": "0x000000000000000000004563918244f40000006aecbde0000000000000000000000000000000000000ee480003d09000000000b2d05e0000000000000000010800d0b53d9277642d899df5c87a3966a349a798f224833589fcd6edb6e08f4c7c32d4f71b54bda029130001f400000a75300172ab388e2e2f6facef59e3c3fa2c4e29011c2d38420000000000000000000000000000000000000600006400000188b8"
+    },
+    "usdc_morpho_slipstream_aero": {
+      "lender": 1,
+      "start": 1,
+      "cap": "12000000000",
+      "deadline": "1793900010",
+      "rate": "3150000000",
+      "gas_overhead": 64000,
+      "swap_gas": 420000,
+      "l1_bound": "3000000000",
+      "min_net": "1",
+      "max_steps": 8,
+      "hops": [
+        {
+          "kind": 4,
+          "pool": "0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59",
+          "token_out": "0x4200000000000000000000000000000000000006",
+          "fee": 0,
+          "tick_spacing": 100,
+          "cross_gas": 45000
+        },
+        {
+          "kind": 2,
+          "pool": "0xcDAC0d6c6C59727a65F871236188350531885C43",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "fee": 0,
+          "tick_spacing": 0,
+          "cross_gas": 0
+        }
+      ],
+      "encoded": "0x0101000000000000000000000002cb417800006aecbdea000000000000000000000000bbc12f800000fa00000668a000000000b2d05e0000000000000000010804b2cc224c1c9fee385f8ad6a55b4d94e92359dc594200000000000000000000000000000000000006000000000064afc802cdac0d6c6c59727a65f871236188350531885c43833589fcd6edb6e08f4c7c32d4f71b54bda029130000000000000000"
+    },
+    "usdc_pool_manager_v4_v3": {
+      "lender": 2,
+      "start": 1,
+      "cap": "12000000000",
+      "deadline": "1793900020",
+      "rate": "3150000000",
+      "gas_overhead": 62000,
+      "swap_gas": 330000,
+      "l1_bound": "2500000000",
+      "min_net": "1",
+      "max_steps": 8,
+      "hops": [
+        {
+          "kind": 3,
+          "pool": "0xB0b24B89dB0dafbE43C5b40226b63A179f592880",
+          "token_out": "0x5bE75e3b0aFf5D1A042A5363Ae36AcB1d6d755ea",
+          "fee": 100,
+          "tick_spacing": 1,
+          "cross_gas": 25000
+        },
+        {
+          "kind": 0,
+          "pool": "0xE1bfc5ADa1125718B53B2affC638Ba9981f6070F",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "fee": 500,
+          "tick_spacing": 10,
+          "cross_gas": 30000
+        }
+      ],
+      "encoded": "0x0201000000000000000000000002cb417800006aecbdf4000000000000000000000000bbc12f800000f23000050910000000009502f90000000000000000010803b0b24b89db0dafbe43c5b40226b63a179f5928805be75e3b0aff5d1a042a5363ae36acb1d6d755ea00006400000161a800e1bfc5ada1125718b53b2affc638ba9981f6070f833589fcd6edb6e08f4c7c32d4f71b54bda029130001f400000a7530"
+    },
+    "usdc_pool_manager_v3_v4": {
+      "lender": 2,
+      "start": 1,
+      "cap": "2000000000",
+      "deadline": "1793900030",
+      "rate": "3150000000",
+      "gas_overhead": 62000,
+      "swap_gas": 330000,
+      "l1_bound": "2500000000",
+      "min_net": "1",
+      "max_steps": 12,
+      "hops": [
+        {
+          "kind": 0,
+          "pool": "0xE1bfc5ADa1125718B53B2affC638Ba9981f6070F",
+          "token_out": "0x5bE75e3b0aFf5D1A042A5363Ae36AcB1d6d755ea",
+          "fee": 500,
+          "tick_spacing": 10,
+          "cross_gas": 30000
+        },
+        {
+          "kind": 3,
+          "pool": "0xB0b24B89dB0dafbE43C5b40226b63A179f592880",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "fee": 100,
+          "tick_spacing": 1,
+          "cross_gas": 25000
+        }
+      ],
+      "encoded": "0x020100000000000000000000000077359400006aecbdfe000000000000000000000000bbc12f800000f23000050910000000009502f90000000000000000010c00e1bfc5ada1125718b53b2affc638ba9981f6070f5be75e3b0aff5d1a042a5363ae36acb1d6d755ea0001f400000a753003b0b24b89db0dafbe43c5b40226b63a179f592880833589fcd6edb6e08f4c7c32d4f71b54bda0291300006400000161a8"
+    },
+    "every_field_at_its_most": {
+      "lender": 0,
+      "start": 0,
+      "cap": "340282366920938463463374607431768211455",
+      "deadline": "1099511627775",
+      "rate": "340282366920938463463374607431768211455",
+      "gas_overhead": 4294967295,
+      "swap_gas": 4294967295,
+      "l1_bound": "18446744073709551615",
+      "min_net": "18446744073709551615",
+      "max_steps": 16,
+      "hops": [
+        {
+          "kind": 1,
+          "pool": "0x72AB388E2E2F6FaceF59E3C3FA2C4E29011c2D38",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "fee": 16777215,
+          "tick_spacing": 8388607,
+          "cross_gas": 65535
+        },
+        {
+          "kind": 0,
+          "pool": "0xd0b53D9277642d899DF5C87A3966A349A798F224",
+          "token_out": "0x4200000000000000000000000000000000000006",
+          "fee": 16777215,
+          "tick_spacing": 8388607,
+          "cross_gas": 65535
+        }
+      ],
+      "encoded": "0x0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff100172ab388e2e2f6facef59e3c3fa2c4e29011c2d38833589fcd6edb6e08f4c7c32d4f71b54bda02913ffffff7fffffffff00d0b53d9277642d899df5c87a3966a349a798f2244200000000000000000000000000000000000006ffffff7fffffffff"
+    },
+    "spacing_sign": {
+      "lender": 1,
+      "start": 0,
+      "cap": "1",
+      "deadline": "0",
+      "rate": "0",
+      "gas_overhead": 0,
+      "swap_gas": 0,
+      "l1_bound": "0",
+      "min_net": "0",
+      "max_steps": 1,
+      "hops": [
+        {
+          "kind": 0,
+          "pool": "0xd0b53D9277642d899DF5C87A3966A349A798F224",
+          "token_out": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "fee": 1,
+          "tick_spacing": -1,
+          "cross_gas": 1
+        },
+        {
+          "kind": 4,
+          "pool": "0xb2cc224c1c9feE385f8ad6a55b4d94E92359DC59",
+          "token_out": "0x4200000000000000000000000000000000000006",
+          "fee": 0,
+          "tick_spacing": -8388608,
+          "cross_gas": 2
+        }
+      ],
+      "encoded": "0x0100000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100d0b53d9277642d899df5c87a3966a349a798f224833589fcd6edb6e08f4c7c32d4f71b54bda02913000001ffffff000104b2cc224c1c9fee385f8ad6a55b4d94e92359dc5942000000000000000000000000000000000000060000008000000002"
+    }
+  }
+}
