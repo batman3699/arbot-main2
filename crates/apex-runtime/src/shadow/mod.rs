@@ -263,6 +263,11 @@ struct Shadow {
     canary: Option<Arc<Canary>>,
     /// R26: the arming engine (armed-shadow).
     armed: Arc<crate::armed::engine::Engine>,
+    /// R40.1: the sized lane's engine, when `armed.sized` is set and its
+    /// executor is the configured code; and the oracle's L1 fee bound for its
+    /// transactions, read once a minute.
+    armed_sized: Option<Arc<crate::armed::sized::SizedEngine>>,
+    l1_upper: AtomicU64,
     /// R36: armed-live's worker, in armed-live; and each pass's lines on their
     /// way to it, with the pass's base fee, in the order they were armed.
     armed_live: Option<Arc<crate::armed::live::ArmedLive>>,
@@ -455,6 +460,8 @@ pub async fn run(config: ShadowConfig, env: &Env, stop: impl Future<Output = ()>
         Some(("full-reload", Task::FullReload)),
         Some(("race", Task::Race)),
         Some(("armed", Task::Armed)),
+        shadow.armed_sized.is_some().then_some(("armed-sized", Task::ArmedSized)),
+        shadow.armed_sized.is_some().then_some(("l1-upper", Task::L1Upper)),
     ]
     .into_iter()
     .flatten()
@@ -520,6 +527,9 @@ enum Task {
     ArmedLive,
     ArmedHeads,
     ArmedMoves,
+    /// R40.1: the sized lane's engine, and the L1 bound its plans carry.
+    ArmedSized,
+    L1Upper,
 }
 
 async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
@@ -773,6 +783,62 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         }
         None => None,
     };
+    // R40.1: the sized lane, beside R39's on the same book: built only on
+    // its executor's configured code. Live refuses to boot without it; in
+    // shadow it is left out with a warning.
+    let armed_sized = match &config.armed.sized {
+        Some(sz) => {
+            let e = &sz.executor3;
+            let found = match &e.runtime_code {
+                Some(path) => std::fs::read_to_string(path)
+                    .map_err(|err| format!("armed.sized.executor3.runtime_code {}: {err}", path.display()))
+                    .and_then(|t| alloy_primitives::hex::decode(t.trim()).map_err(|err| format!("armed.sized.executor3.runtime_code: {err}")))
+                    .map(alloy_primitives::keccak256),
+                None => reads.code_hash(e.address, head).await.map_err(|err| format!("armed.sized.executor3's code: {err}")),
+            };
+            match found.and_then(|h| config::check_executor3_hash(e, h)) {
+                Ok(()) => {
+                    let a = &config.armed;
+                    let settings = crate::armed::sized::SizedSettings {
+                        max_senders: sz.max_senders,
+                        window_s: sz.window_s,
+                        block_time_ms: a.block_time_ms,
+                        band_cap_bps: sz.band_cap_bps,
+                        liquidity_floor_bps: a.liquidity_floor_bps,
+                        tier2_multiple: sz.tier2_multiple,
+                        executor3: e.address,
+                        chain_id: base.0,
+                        max_size_wei: a.max_size_wei,
+                        max_size_usdc: a.max_size_usdc,
+                        max_priority_wei_per_gas: a.max_priority_wei_per_gas,
+                        min_net_wei: sz.min_net_wei,
+                        max_steps: sz.max_steps,
+                        p_no_trade_ppm: sz.p_no_trade_ppm,
+                        p_revert_ppm: sz.p_revert_ppm,
+                        reprice_for: crate::armed::engine::REPRICE_FOR,
+                        l1_fee_bound_wei: a.l1_fee_bound_wei,
+                    };
+                    let t = targets.clone();
+                    let engine = crate::armed::sized::SizedEngine::new(armed_set.clone(), settings, unarmable.clone())
+                        .with_bids(Arc::new(move |weth_in, other| t.as_ref().map_or_else(Vec::new, |t| t.bids_for(weth_in, other).to_vec())))
+                        .with_contest(contest.clone(), config.armed.bid_model);
+                    if let Some(path) = &config.armed.moves {
+                        if let Ok(snap) = crate::armed::moves::MovesSnapshot::load(path) {
+                            let _ = engine.restore_moves(&snap);
+                        }
+                    }
+                    info!(executor3 = %e.address, mode = ?sz.mode, senders = sz.max_senders, "the sized lane arms beside R39's");
+                    Some(Arc::new(engine))
+                }
+                Err(why) if sz.mode == config::ArmedMode::Live => return Err(ShadowError::Boot(why)),
+                Err(why) => {
+                    warn!(%why, "LeanExecutor3 is not the configured code: the sized lane arms nothing");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     let armed = Arc::new(crate::armed::engine::Engine::new(armed_set.clone(), engine_settings, unarmable)
     .with_bids({
         let t = targets.clone();
@@ -976,9 +1042,14 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     }
     // R36: armed-live's worker. The configuration allows the mode only under
     // `apex canary`, with its section; the executor pays the canary's recipient.
-    let armed_live = match (config.armed.mode, &config.armed.live, &config.canary) {
-        (config::ArmedMode::Live, Some(live), Some(k)) => {
-            Some(Arc::new(boot_armed_live(&config, live, k.profit_recipient, &rpc, window_blocks).await?))
+    // R40.1: whichever lane is live sends; at most one is.
+    let armed_live = match (config.live_lane(), &config.armed.live, &config.canary) {
+        (Some(lane), Some(live), Some(k)) => {
+            let window = match (lane, &config.armed.sized) {
+                (config::Lane::Sized, Some(sz)) => (sz.window_s * 1_000).div_ceil(config.armed.block_time_ms.max(1)).max(1),
+                _ => window_blocks,
+            };
+            Some(Arc::new(boot_armed_live(&config, live, k.profit_recipient, &rpc, window).await?))
         }
         _ => None,
     };
@@ -1031,6 +1102,8 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         nonce_moved: AtomicBool::new(false),
         canary: canary.map(|(c, _, _)| c),
         armed,
+        armed_sized,
+        l1_upper: AtomicU64::new(0),
         armed_live,
         armed_lines,
         armed_lines_rx: tokio::sync::Mutex::new(armed_lines_rx),
@@ -1056,12 +1129,14 @@ async fn boot_armed_live(
     use crate::armed::live::{ArmedLive, LivePolicy};
     let keys = crate::armed::keys::load(&live.keys_file).map_err(ShadowError::Boot)?;
     let a = &config.armed;
-    if keys.len() != a.max_arms {
+    // R40.1: the live lane's senders: `armed.max_arms`, or the sized lane's.
+    let slots = config.live_senders();
+    if keys.len() != slots {
         return Err(ShadowError::Boot(format!(
-            "{} holds {} keys for {} slots (armed.max_arms): one sender a slot",
+            "{} holds {} keys for {} slots (the live lane's senders): one sender a slot",
             live.keys_file.display(),
             keys.len(),
-            a.max_arms
+            slots
         )));
     }
     let senders: Vec<Address> = keys.iter().map(LaneKey::address).collect();
@@ -1245,6 +1320,8 @@ impl Shadow {
             Task::ArmedLive => self.armed_live_loop().await,
             Task::ArmedHeads => self.armed_head_loop().await,
             Task::ArmedMoves => self.armed_moves_loop().await,
+            Task::ArmedSized => self.armed_sized_loop().await,
+            Task::L1Upper => self.l1_upper_loop().await,
             Task::FullReload => {
                 let mut every = tokio::time::interval(Duration::from_secs(self.config.policy.full_reload_every_s));
                 every.tick().await;
@@ -1449,8 +1526,70 @@ impl Shadow {
                     bump(&self.stats.armed_write_failures);
                 }
             }
-            if self.armed_live.is_some() && !lines.is_empty() && self.armed_lines.try_send((lines, base_fee)).is_err() {
+            let sends = self.config.live_lane() == Some(config::Lane::Fixed);
+            if sends && self.armed_live.is_some() && !lines.is_empty() && self.armed_lines.try_send((lines, base_fee)).is_err() {
                 bump(&self.stats.armed_live_dropped);
+            }
+        }
+    }
+
+    /// R40.1: the sized lane's pass over the same verified book as R39's, its
+    /// lines to its own ledger, and to armed-live only when it is the live
+    /// lane. Its budget is the day's whole budget in shadow; live, armed-live
+    /// holds every send to it anyway.
+    async fn armed_sized_loop(&self) {
+        let Some(sz) = self.config.armed.sized.clone() else { return };
+        loop {
+            tokio::time::sleep(crate::armed::engine::IDLE_PAUSE).await;
+            let Some(engine) = self.armed_sized.clone() else { return };
+            if self.book.status() != ReconstructionStatus::Verified {
+                continue;
+            }
+            let Some(head) = self.heads.borrow().clone() else { continue };
+            let snapshot = self.book.snapshot();
+            let (usdc_lenders, pool_manager) = *self.armed_holdings.borrow();
+            let px = crate::armed::threshold::Pricing {
+                costs: self.costs.route_costs(),
+                gas: gas::LEAN,
+                lenders: *self.lender.borrow(),
+                margin_wei: ethers_core::types::U256::from(self.config.armed.margin_wei),
+                start_per_eth: crate::armed::threshold::start_per_eth(&snapshot),
+                rate: None,
+                usdc_lenders,
+                pool_manager,
+            };
+            let base_fee = head.base_fee_per_gas.unwrap_or(0);
+            let now = SystemClock.now().0;
+            let (budget, l1) = (self.config.armed.daily_loss_budget_wei, u128::from(self.l1_upper.load(Ordering::Relaxed)));
+            let lines = tokio::task::spawn_blocking(move || engine.tick(&snapshot, head.number, base_fee, &px, now, budget, l1))
+                .await
+                .unwrap_or_default();
+            for line in &lines {
+                if ledger::append_line(&sz.ledger, now, line).is_err() {
+                    bump(&self.stats.armed_write_failures);
+                }
+            }
+            let sends = self.config.live_lane() == Some(config::Lane::Sized);
+            if sends && self.armed_live.is_some() && !lines.is_empty() && self.armed_lines.try_send((lines, base_fee)).is_err() {
+                bump(&self.stats.armed_live_dropped);
+            }
+        }
+    }
+
+    /// R40.1: the oracle's L1 fee bound for a sized transaction, once a
+    /// minute: one call.
+    async fn l1_upper_loop(&self) {
+        let mut every = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            every.tick().await;
+            let Some(head) = self.heads.borrow().clone() else { continue };
+            let call = [(crate::armed::sized::GAS_PRICE_ORACLE, crate::armed::sized::l1_upper_call(crate::armed::sized::SIZED_TX_BYTES))];
+            match self.reads.multicall(&call, head.number).await {
+                Ok(answers) => match answers.first().and_then(Option::as_ref).and_then(|a| crate::armed::sized::l1_upper_of(a)) {
+                    Some(wei) => self.l1_upper.store(u64::try_from(wei).unwrap_or(u64::MAX), Ordering::Relaxed),
+                    None => warn!("the L1 fee bound did not read"),
+                },
+                Err(e) => warn!(error = %e, "the L1 fee bound was not read"),
             }
         }
     }

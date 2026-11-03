@@ -228,3 +228,19 @@ fn a_book_with_no_gap_to_open_arms_nothing() {
     let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, 10_000_000_000_000_000, 1_500_000_000);
     assert!(arms(&lines).is_empty());
 }
+
+#[test]
+fn the_l1_bound_is_read_with_one_oracle_call() {
+    use apex_runtime::armed::sized::{l1_upper_call, l1_upper_of, GAS_PRICE_ORACLE, SIZED_TX_BYTES};
+    assert_eq!(format!("{GAS_PRICE_ORACLE:#x}"), "0x420000000000000000000000000000000000000f");
+    let call = l1_upper_call(SIZED_TX_BYTES);
+    // getL1FeeUpperBound(uint256): 0xf1c7a58b, then 512 as a word.
+    assert_eq!(alloy_primitives::hex::encode(&call[..4]), "f1c7a58b");
+    assert_eq!(call.len(), 36);
+    assert_eq!(&call[34..], &[0x02, 0x00]);
+    let mut answer = [0u8; 32];
+    answer[28..].copy_from_slice(&1_482_055_036u32.to_be_bytes());
+    assert_eq!(l1_upper_of(&answer), Some(1_482_055_036));
+    assert_eq!(l1_upper_of(&answer[..31]), None, "not a word");
+    assert_eq!(l1_upper_of(&[0xff; 32]), None, "past 128 bits");
+}

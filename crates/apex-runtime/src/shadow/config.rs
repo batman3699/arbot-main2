@@ -351,6 +351,13 @@ const fn two_simulations() -> usize {
     2
 }
 
+/// R40.1: the two arming lanes: R39's fixed-size one, and the sized one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    Fixed,
+    Sized,
+}
+
 /// R40.1: the sized lane. Its caps, budget and senders' keys are `armed:`'s;
 /// what is its own is here.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -636,7 +643,30 @@ impl ShadowConfig {
     /// R37: the executor the arming engine builds for, and armed-live sends
     /// to: `LeanExecutor2` when `armed.executor2` is set, else v1.
     pub fn armed_executor(&self) -> Address {
+        if let Some(s) = self.armed.sized.as_ref().filter(|s| s.mode == ArmedMode::Live) {
+            return s.executor3.address;
+        }
         self.armed.executor2.as_ref().map_or(self.executor.address, |e| e.address)
+    }
+
+    /// R40.1: which lane's lines go to armed-live: R39's, the sized lane's,
+    /// or neither. The load check lets at most one be live.
+    pub fn live_lane(&self) -> Option<Lane> {
+        if self.armed.sized.as_ref().is_some_and(|s| s.mode == ArmedMode::Live) {
+            Some(Lane::Sized)
+        } else if self.armed.mode == ArmedMode::Live {
+            Some(Lane::Fixed)
+        } else {
+            None
+        }
+    }
+
+    /// R40.1: the senders the live lane arms with: one key each.
+    pub fn live_senders(&self) -> usize {
+        match (self.live_lane(), &self.armed.sized) {
+            (Some(Lane::Sized), Some(s)) => s.max_senders,
+            _ => self.armed.max_arms,
+        }
     }
 
     pub fn load(path: &str, env: &Env) -> Result<Self, ShadowConfigError> {

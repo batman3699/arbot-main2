@@ -960,3 +960,33 @@ fn the_sized_section_loads_and_its_checks_hold() {
     );
     refused(with(&shared), "armed.executor2's address");
 }
+
+/// R40.1: one lane sends. With the sized lane absent or in shadow, R39's
+/// sends as before; flipped live, the sized lane's does, to its executor,
+/// with its own count of senders.
+#[test]
+fn the_live_lane_sends_to_its_own_executor() {
+    use apex_runtime::shadow::config::Lane;
+    let var = "APEX_SECRET_SHADOW_TEST_LANE";
+    let e = env(var, SECRET);
+    let base = denim_yaml(var);
+    let with = |section: &str| base.replace("executor:\n  address", &format!("{section}executor:\n  address"));
+    let sized = "  sized:\n    mode: shadow\n    max_senders: 32\n    ledger: var/s.jsonl\n    verdicts: var/sv.jsonl\n    executor3:\n      address: \"0x00000000000000000000000000000000000000e3\"\n      code_hash: \"0x00000000000000000000000000000000000000000000000000000000000000c3\"\n";
+    let c = ShadowConfig::from_yaml_str(&with(sized), &e).unwrap();
+    assert_eq!(c.live_lane(), None, "both in shadow");
+    assert_eq!(c.armed_executor(), c.executor.address, "R39's executor while the sized lane shadows");
+    assert_eq!(c.live_senders(), c.armed.max_arms);
+    // Flipped: the config check wants the canary for a live lane, which this
+    // shadow file lacks, so the lane rules are checked on the parsed value.
+    let mut flipped = c.clone();
+    if let Some(s) = flipped.armed.sized.as_mut() {
+        s.mode = apex_runtime::shadow::config::ArmedMode::Live;
+    }
+    assert_eq!(flipped.live_lane(), Some(Lane::Sized));
+    assert_eq!(format!("{:#x}", flipped.armed_executor()), "0x00000000000000000000000000000000000000e3");
+    assert_eq!(flipped.live_senders(), 32);
+    let mut fixed = c.clone();
+    fixed.armed.mode = apex_runtime::shadow::config::ArmedMode::Live;
+    assert_eq!(fixed.live_lane(), Some(Lane::Fixed));
+    assert_eq!(fixed.live_senders(), fixed.armed.max_arms);
+}

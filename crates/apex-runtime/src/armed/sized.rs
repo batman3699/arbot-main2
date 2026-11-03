@@ -41,6 +41,29 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// The L2 gas price oracle, whose `getL1FeeUpperBound` a sized plan's L1
+/// bound comes from.
+pub const GAS_PRICE_ORACLE: Address = alloy_primitives::address!("420000000000000000000000000000000000000F");
+/// A sized arm's transaction, unsigned, in bytes: a 162-byte plan's calldata
+/// (260) and the envelope, rounded up.
+pub const SIZED_TX_BYTES: u64 = 512;
+
+/// `getL1FeeUpperBound(uint256)`'s calldata for a transaction of `bytes`.
+pub fn l1_upper_call(bytes: u64) -> Vec<u8> {
+    let mut data = keccak256("getL1FeeUpperBound(uint256)")[..4].to_vec();
+    let mut word = [0u8; 32];
+    U256::from(bytes).to_big_endian(&mut word);
+    data.extend_from_slice(&word);
+    data
+}
+
+/// The oracle's answer as wei; None for one that is not a word, or past 128 bits.
+pub fn l1_upper_of(answer: &[u8]) -> Option<u128> {
+    let word: [u8; 32] = answer.get(..32)?.try_into().ok()?;
+    let v = U256::from_big_endian(&word);
+    (v.bits() <= 128).then(|| v.as_u128())
+}
+
 /// The least chance of winning a candidate is valued at.
 pub const P_WIN_FLOOR: f64 = 0.001;
 /// The least chance of a move a candidate is valued at: a pool or spread not
