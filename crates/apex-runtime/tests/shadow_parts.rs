@@ -926,3 +926,37 @@ fn the_capacity_sampler_runs_only_before_denim() {
     let denim = ShadowConfig::from_yaml_str(&denim_yaml(var), &env(var, SECRET)).unwrap();
     assert!(!apex_runtime::shadow::samples_capacity(&denim));
 }
+
+/// R40.1: the sized lane's section loads with the plan's defaults, and its
+/// checks refuse what would send twice, reuse R39's executor, or leave a range.
+#[test]
+fn the_sized_section_loads_and_its_checks_hold() {
+    let var = "APEX_SECRET_SHADOW_TEST_SIZED";
+    let e = env(var, SECRET);
+    let base = denim_yaml(var);
+    let with = |section: &str| base.replace("executor:\n  address", &format!("{section}executor:\n  address"));
+    let sized = "  sized:\n    mode: shadow\n    ledger: var/s.jsonl\n    verdicts: var/sv.jsonl\n    executor3:\n      address: \"0x00000000000000000000000000000000000000e3\"\n      code_hash: \"0x00000000000000000000000000000000000000000000000000000000000000c3\"\n";
+    let c = ShadowConfig::from_yaml_str(&with(sized), &e).unwrap();
+    let s = c.armed.sized.expect("the section");
+    assert_eq!((s.max_senders, s.band_cap_bps, s.window_s, s.tier2_multiple), (16, 20, 10, 10));
+    assert_eq!((s.min_net_wei, s.max_steps, s.p_no_trade_ppm, s.p_revert_ppm, s.send_rate_per_s), (1, 8, 20_000, 0, 0));
+    assert!(ShadowConfig::from_yaml_str(&base, &e).unwrap().armed.sized.is_none(), "absent, nothing changes");
+
+    let refused = |text: String, field: &str| match ShadowConfig::from_yaml_str(&text, &e) {
+        Err(ShadowConfigError::Invalid(m)) => assert!(m.contains(field), "{m} should name {field}"),
+        other => panic!("{field}: expected a refusal, got {:?}", other.map(|c| c.armed.sized)),
+    };
+    refused(with(&format!("{sized}    band_cap_bps: 21\n")), "armed.sized");
+    refused(with(&format!("{sized}    max_steps: 17\n")), "armed.sized");
+    refused(with(&format!("{sized}    max_steps: 0\n")), "armed.sized");
+    refused(with(&format!("{sized}    max_senders: 65\n")), "armed.sized");
+    refused(with(&format!("{sized}    tier2_multiple: 1\n")), "armed.sized");
+    refused(with(&format!("{sized}    p_no_trade_ppm: 1000001\n")), "armed.sized");
+    let both = with(&sized.replace("mode: shadow", "mode: live")).replace("  mode: shadow\n  ledger: var/a.jsonl", "  mode: live\n  ledger: var/a.jsonl");
+    refused(both, "both live");
+    refused(with(&sized.replace("mode: shadow", "mode: live")), "never `apex shadow`");
+    let shared = format!(
+        "  executor2:\n    address: \"0x00000000000000000000000000000000000000e3\"\n    code_hash: \"0x00000000000000000000000000000000000000000000000000000000000000c2\"\n{sized}"
+    );
+    refused(with(&shared), "armed.executor2's address");
+}

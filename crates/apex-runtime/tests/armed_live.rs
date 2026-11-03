@@ -183,6 +183,7 @@ fn arm(arm_id: u64, slot: u16, bid: u128, gas_limit: u64) -> Arm {
         alt_p_win: None,
         model_version: None,
         start_at: Vec::new(),
+        sized: None,
     }
 }
 

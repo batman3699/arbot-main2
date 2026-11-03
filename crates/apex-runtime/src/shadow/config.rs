@@ -341,20 +341,99 @@ pub struct ArmedConfig {
     /// and falls back to `best_bid` otherwise (ops/host/ARMED.md).
     #[serde(default)]
     pub bid_model: crate::armed::bid::BidModel,
+    /// R40.1: the sized lane, `LeanExecutor3`'s, beside this one: in shadow
+    /// until it is flipped live, and then this one goes to shadow.
+    #[serde(default)]
+    pub sized: Option<SizedConfig>,
 }
 
 const fn two_simulations() -> usize {
     2
 }
 
+/// R40.1: the sized lane. Its caps, budget and senders' keys are `armed:`'s;
+/// what is its own is here.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SizedConfig {
+    pub mode: ArmedMode,
+    pub ledger: PathBuf,
+    pub verdicts: PathBuf,
+    pub executor3: Executor2Config,
+    /// 16, then 32, then 64 (the ramp).
+    #[serde(default = "sixteen")]
+    pub max_senders: usize,
+    /// The widest band the engine may choose, of 5, 10 and 20 steps.
+    #[serde(default = "twenty")]
+    pub band_cap_bps: u32,
+    #[serde(default = "ten")]
+    pub window_s: u64,
+    /// Tier 2 sits where the surplus reaches this many times tier 1's
+    /// reference, and only with at least twice tier 1's bid.
+    #[serde(default = "ten_u32")]
+    pub tier2_multiple: u32,
+    /// The executor's `minNet`: the least a trade may net, in the start token.
+    #[serde(default = "one")]
+    pub min_net_wei: u64,
+    /// The plan's `maxSteps`: 1 to 16.
+    #[serde(default = "eight")]
+    pub max_steps: u8,
+    /// The priors the expected net is charged with, in parts per million of
+    /// fires: a `NoTrade`, and a revert. Live data replaces them.
+    #[serde(default = "two_percent_ppm")]
+    pub p_no_trade_ppm: u32,
+    #[serde(default)]
+    pub p_revert_ppm: u32,
+    /// Sends a second at most, from Task 19; 0 is no limit.
+    #[serde(default)]
+    pub send_rate_per_s: u32,
+}
+
+const fn sixteen() -> usize {
+    16
+}
+
+const fn twenty() -> u32 {
+    20
+}
+
+const fn ten() -> u64 {
+    10
+}
+
+const fn ten_u32() -> u32 {
+    10
+}
+
+const fn one() -> u64 {
+    1
+}
+
+const fn eight() -> u8 {
+    8
+}
+
+const fn two_percent_ppm() -> u32 {
+    20_000
+}
+
 /// R37: whether `found`, the hash of `LeanExecutor2`'s code at boot (the
 /// chain's, or `runtime_code`'s before the deploy), is the configured one.
 pub fn check_executor2_hash(e: &Executor2Config, found: B256) -> Result<(), String> {
+    check_executor_hash("armed.executor2", e, found)
+}
+
+/// R40.1: the same, for `LeanExecutor3` under `armed.sized.executor3`.
+pub fn check_executor3_hash(e: &Executor2Config, found: B256) -> Result<(), String> {
+    check_executor_hash("armed.sized.executor3", e, found)
+}
+
+fn check_executor_hash(name: &str, e: &Executor2Config, found: B256) -> Result<(), String> {
     if found == keccak256([]) {
-        return Err(format!("armed.executor2 {:#x} has no code", e.address));
+        return Err(format!("{name} {:#x} has no code", e.address));
     }
     if found != e.code_hash {
-        return Err(format!("armed.executor2 {:#x}'s code hashes to {found:#x}, not its code_hash {:#x}", e.address, e.code_hash));
+        return Err(format!("{name} {:#x}'s code hashes to {found:#x}, not its code_hash {:#x}", e.address, e.code_hash));
     }
     Ok(())
 }
@@ -476,6 +555,41 @@ fn scrub(mut message: String, secrets: &[String]) -> String {
 
 fn invalid(detail: impl Into<String>) -> ShadowConfigError {
     ShadowConfigError::Invalid(detail.into())
+}
+
+/// R40.1: the sized lane's section. Only one lane sends; its ranges are the
+/// plan's; its executor is not R39's.
+fn sized(a: &ArmedConfig, sz: &SizedConfig, command: Command) -> Result<(), ShadowConfigError> {
+    if sz.mode == ArmedMode::Live {
+        if a.mode == ArmedMode::Live {
+            return Err(invalid("armed.mode and armed.sized.mode are both live: one lane sends, the other shadows"));
+        }
+        if command == Command::Shadow {
+            return Err(invalid("armed.sized.mode live sends: it runs under `apex canary`, never `apex shadow`"));
+        }
+        if a.live.is_none() {
+            return Err(invalid("armed.sized.mode live needs armed.live: its keys, sequencer, ledger and kill file"));
+        }
+        if sz.executor3.runtime_code.is_some() {
+            return Err(invalid("armed.sized.executor3.runtime_code is the pre-deploy shadow's: live sends go to a deployed LeanExecutor3"));
+        }
+    }
+    if a.executor2.as_ref().is_some_and(|e| e.address == sz.executor3.address) {
+        return Err(invalid("armed.sized.executor3 is armed.executor2's address: LeanExecutor3 is its own contract"));
+    }
+    if !(1..=64).contains(&sz.max_senders)
+        || !(1..=20).contains(&sz.band_cap_bps)
+        || !(2..=50).contains(&sz.window_s)
+        || !(1..=apex_exec::lean3::MAX_STEPS_LIMIT).contains(&sz.max_steps)
+        || sz.tier2_multiple < 2
+        || sz.p_no_trade_ppm > 1_000_000
+        || sz.p_revert_ppm > 1_000_000
+    {
+        return Err(invalid(
+            "armed.sized: max_senders 1-64, band_cap_bps 1-20, window_s 2-50, max_steps 1-16, tier2_multiple >= 2, priors <= 1000000 ppm",
+        ));
+    }
+    Ok(())
 }
 
 /// R41: one regime or the other, never half of each. Base's 2 s blocks keep
@@ -610,6 +724,9 @@ impl ShadowConfig {
             return Err(invalid("a universe fee ceiling of zero admits no pool"));
         }
         let a = &raw.armed;
+        if let Some(sz) = &a.sized {
+            sized(a, sz, command)?;
+        }
         if a.mode == ArmedMode::Live {
             if command == Command::Shadow {
                 return Err(invalid("armed.mode live sends: it runs under `apex canary`, never `apex shadow`"));

@@ -133,6 +133,26 @@ impl CallBuilder for LiveCallBuilder {
 
 /// One hop of a cycle as `LeanExecutor2`'s (R37): v1's rules, and a v4 pool
 /// swapped by its key, exact input like v3, held to `min_out`.
+/// R40.1: a hop as `LeanExecutor3` runs it. `spacing` is the pool's, from the
+/// book (a v4 key carries its own); `cross_gas` is one tick crossed on it.
+/// v3's and PancakeSwap's fees travel in the plan; Slipstream's and
+/// Aerodrome's are read at execution, so theirs is 0.
+pub fn lean3_hop(leg: &Leg, spacing: i32, cross_gas: u64) -> Result<apex_exec::lean3::Lean3Hop, String> {
+    use apex_exec::lean3::{Hop3Kind, Lean3Hop};
+    let cross_gas = u16::try_from(cross_gas).map_err(|_| format!("a crossing's gas {cross_gas} does not fit two bytes"))?;
+    let (kind, pool, fee, tick_spacing) = match leg.venue {
+        Venue::UniswapV3 => (Hop3Kind::UniswapV3, leg.pool, leg.fee_ppm, spacing),
+        Venue::PancakeV3 => (Hop3Kind::PancakeV3, leg.pool, leg.fee_ppm, spacing),
+        Venue::Slipstream | Venue::SlipstreamV3 => (Hop3Kind::Slipstream, leg.pool, 0, spacing),
+        Venue::AerodromeV2 => (Hop3Kind::AerodromeV2, leg.pool, 0, 0),
+        Venue::UniswapV4 => {
+            let k = leg.v4.ok_or_else(|| format!("the v4 pool {:#x} has no key", leg.pool))?;
+            (Hop3Kind::UniswapV4, k.hooks, k.fee, k.tick_spacing)
+        }
+    };
+    Ok(Lean3Hop { kind, pool, token_out: leg.token_out, fee, tick_spacing, cross_gas })
+}
+
 pub fn lean2_hop(leg: &Leg, quote: U256, min_out: U256) -> Result<apex_exec::lean2::Lean2Hop, String> {
     use apex_exec::lean2::{Hop2Kind, Lean2Hop, V4HopKey};
     let (kind, min_out, v4) = match leg.venue {

@@ -568,6 +568,7 @@ impl Engine {
                     log_index: p.through.map(|t| t.1),
                 })
                 .collect(),
+            sized: None,
         })
     }
 

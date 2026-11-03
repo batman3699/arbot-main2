@@ -65,6 +65,7 @@ fn arm() -> Arm {
         alt_p_win: None,
         model_version: None,
         start_at: Vec::new(),
+        sized: None,
     }
 }
 

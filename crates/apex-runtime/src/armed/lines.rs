@@ -117,6 +117,27 @@ pub struct Arm {
     /// written before R41, which are judged as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub start_at: Vec<StartAt>,
+    /// R40.1: an arm for `LeanExecutor3`: what its plan carries beside the
+    /// hops. Its `size_wei`, `mid` and `output_wei` are then the engine's
+    /// prediction at the threshold, logged and never enforced. Absent: a
+    /// fixed-size arm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sized: Option<SizedLine>,
+}
+
+/// R40.1: a sized arm's plan terms, decimal strings for the amounts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizedLine {
+    /// 1 or 2.
+    pub tier: u8,
+    pub cap: String,
+    /// The plan's rate: start units per 1e18 wei; "0" for WETH.
+    pub rate: String,
+    pub gas_overhead: u32,
+    pub swap_gas: u32,
+    pub l1_bound: u64,
+    pub min_net: u64,
+    pub max_steps: u8,
 }
 
 /// R41: a pool's start point: its newest applied log, `(block, log_index)`,
