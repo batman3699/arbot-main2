@@ -749,3 +749,112 @@ fn a_trigger_closes_its_block_when_it_is_the_last_transaction() {
     assert_eq!(closes_block(1, &full), Some(true));
     assert_eq!(closes_block(0, &serde_json::json!({"number": "0x1"})), None, "no transactions read");
 }
+
+// ------------------------------------------------- R40.1: sized arms
+
+fn sized_arm() -> apex_runtime::armed::lines::Arm {
+    let text = r#"{"arm_id":9,"at_ns":0,"armed_block":100,"to_block":150,"route_hash":"0xr","trigger_leg":0,"rung":1,"step":3,
+        "pools":["0xaa","0xbb"],"venues":["UniswapV3","PancakeV3"],"predicates":[],"start_words":[],"start_ticks":[],
+        "size_wei":"1","mid":"0","output_wei":"2","surplus_wei":"1","cost_wei":"0","gas_expected":1,"gas_limit":1000000,
+        "base_fee_wei":"5000000","other_wei":"0","deadline":11,"calldata":"0xours","calldata_hash":"0x","sender_slot":0,
+        "bid_wei_per_gas":"10000000",
+        "sized":{"tier":1,"cap":"5000000000000000000","rate":"0","gas_overhead":110000,"swap_gas":250000,"l1_bound":3000000000,"min_net":1,"max_steps":8}}"#;
+    serde_json::from_str(text).unwrap()
+}
+
+/// Review focus 1: `LeanExecutor3` floors at `tx.gasprice`, so a sized fire is
+/// simulated at the block's base fee plus its bid, with the balance to pay it.
+/// At zero the floor would pass anything, and the check would mean nothing.
+#[test]
+fn a_sized_fire_is_simulated_at_its_real_gas_price() {
+    use apex_runtime::armed::eval::Point;
+    use apex_runtime::armed::run::PreDeploy;
+    let arm = sized_arm();
+    let block = serde_json::json!({"timestamp": "0x10", "baseFeePerGas": "0x4c4b40", "transactions": [
+        {"transactionIndex": "0x0", "from": "0x01", "to": "0x02", "input": "0x", "value": "0x0", "gas": "0x1"},
+    ]});
+    let signer: Address = address!("CB436Ba3acb945b3fc8EE6345857262584356595");
+    let executor3: Address = address!("00000000000000000000000000000000000e3e03");
+    let fire = Point { block: 104, tx_index: 0, tx: "0x".into() };
+    let p = simulate_request(&arm, &fire, &block, signer, executor3, Some(&PreDeploy { code: "0x60".into() })).unwrap();
+    let state = &p[0]["blockStateCalls"][0];
+    let ours = state["calls"].as_array().unwrap().last().unwrap();
+    assert_eq!(ours["maxPriorityFeePerGas"], "0x989680", "its bid");
+    assert_eq!(ours["maxFeePerGas"], "0x1312d00", "twice the base fee and the bid");
+    assert_eq!(state["stateOverrides"][format!("{signer:#x}")]["balance"], "0x56bc75e2d63100000", "the fee is payable");
+    assert_eq!(state["stateOverrides"][format!("{executor3:#x}")]["code"], "0x60", "and the pre-deploy code beside it");
+}
+
+#[test]
+fn a_fixed_size_fire_is_simulated_as_before() {
+    use apex_runtime::armed::eval::Point;
+    let mut arm = sized_arm();
+    arm.sized = None;
+    let block = serde_json::json!({"timestamp": "0x10", "baseFeePerGas": "0x4c4b40", "transactions": []});
+    let signer: Address = address!("CB436Ba3acb945b3fc8EE6345857262584356595");
+    let fire = Point { block: 104, tx_index: 0, tx: "0x".into() };
+    let p = simulate_request(&arm, &fire, &block, signer, Address::repeat_byte(2), None).unwrap();
+    let ours = p[0]["blockStateCalls"][0]["calls"].as_array().unwrap().last().unwrap().clone();
+    assert!(ours.get("maxFeePerGas").is_none());
+    assert!(p[0]["blockStateCalls"][0].get("stateOverrides").is_none());
+}
+
+#[test]
+fn a_simulated_sized_fires_gross_is_traded_net_of_the_loan_and_fee() {
+    use apex_runtime::armed::run::simulated_gross;
+    use apex_runtime::canary::chain::{NO_TRADE, TRADED};
+    let words = [0u128, 2_000_000, 2_010_000, 1_000, 5, 3, 0];
+    let data = format!("0x{}", words.iter().map(|w| format!("{w:064x}")).collect::<String>());
+    let call = |topic: &str| serde_json::json!({ "logs": [{ "topics": [topic, "0x00"], "data": data }] });
+    assert_eq!(simulated_gross(&call(TRADED)), Some(U256::from(9_000u64)));
+    assert_eq!(simulated_gross(&call(NO_TRADE)), None, "a NoTrade grossed nothing");
+}
+
+#[test]
+fn a_sized_arm_s_terms_come_from_its_line_and_its_outcome_has_a_class() {
+    use apex_runtime::armed::plan::SizedOutcome;
+    use apex_runtime::armed::run::{sized_terms_of, sized_verdict};
+    use apex_runtime::live::gas::SIZED;
+    let arm = sized_arm();
+    use apex_runtime::live::frontier;
+    use apex_runtime::live::inventory::{PoolSpec, Venue};
+    let usdc = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+    let snapshot = |addr: Address, venue: Venue| {
+        let tick = -197_350;
+        std::sync::Arc::new(apex_runtime::live::book::PoolSnapshot {
+            spec: PoolSpec { pool: addr, venue, token0: frontier::WETH, token1: usdc, fee_ppm: 500, depth_usd: 5e6, v4: None },
+            state: apex_math::cl_state::ClPoolState {
+                sqrt_price_x96: apex_math::cl_math::get_sqrt_ratio_at_tick(tick).unwrap(),
+                liquidity: L,
+                tick,
+                tick_spacing: 10,
+                fee_ppm: 500,
+                balance0: None,
+                balance1: None,
+            },
+            ladder: apex_math::cl_swap::TickLadder::new(vec![], tick - 1_000, tick + 1_000),
+            decimals: (18, 6),
+            factory: venue.factory(),
+            code_hash: Default::default(),
+            block: 100,
+            last_log: None,
+            through: None,
+            dynamic_fee: None,
+            seq: 0,
+            reserves: None,
+        })
+    };
+    let pools = [(Address::repeat_byte(0xaa), Venue::UniswapV3), (Address::repeat_byte(0xbb), Venue::PancakeV3)];
+    let snap = pools.iter().map(|(a, v)| (*a, snapshot(*a, *v))).collect();
+    let (_, cycles) = frontier::build(apex_types::ids::ChainId(8453), frontier::WETH, &snap);
+    let cycle = cycles.into_values().next().unwrap();
+    let t = sized_terms_of(&arm, &cycle).unwrap();
+    assert_eq!((t.cap, t.overhead, t.swap_gas, t.l1_bound, t.min_net, t.max_steps), (U256::exp10(18) * 5, 110_000, 250_000, 3_000_000_000, 1, 8));
+    assert_eq!(t.read_gas, SIZED.read.of(cycle.legs[0].venue) + SIZED.read.of(cycle.legs[1].venue));
+    assert_eq!(t.rate, None, "a WETH arm carries no rate");
+    let (gross, v) = sized_verdict(SizedOutcome::NoTrade(1));
+    assert_eq!((gross, v.outcome.as_str()), (U256::zero(), "early_exit 1"));
+    let mut fixed = sized_arm();
+    fixed.sized = None;
+    assert!(sized_terms_of(&fixed, &cycle).is_none());
+}

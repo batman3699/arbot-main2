@@ -300,6 +300,73 @@ pub struct Verdict {
     /// R37: the gross in USD: USDC at 1:1, WETH at the run's price.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gross_usd: Option<f64>,
+    /// R40.1: a sized arm's fire, as `LeanExecutor3` would size it there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sized: Option<SizedVerdict>,
+}
+
+/// R40.1: what the executor would do at a sized arm's fire, by the mirror.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizedVerdict {
+    /// `traded`, `capped`, `truncated`, or `early_exit` with its reason.
+    pub outcome: String,
+    pub size: String,
+    pub gross: String,
+    /// What a walk with no cap, and one of 64 steps, would add to the gross:
+    /// what each limit left.
+    pub beyond_cap: String,
+    pub beyond_steps: String,
+    pub steps: u32,
+    /// The book's ladder ended before the walk: the mirror is short of the chain.
+    pub ladder_end: bool,
+}
+
+/// R40.1: the plan terms a sized arm carries, and the reads its venues cost.
+/// None for a fixed-size arm, or a line that does not read.
+pub fn sized_terms_of(arm: &Arm, cycle: &Cycle) -> Option<super::plan::SizedTerms> {
+    let s = arm.sized.as_ref()?;
+    let rate = match &arm.start_per_eth {
+        Some([num, den]) => Some((U256::from_dec_str(num).ok()?, U256::from_dec_str(den).ok()?)),
+        None => None,
+    };
+    Some(super::plan::SizedTerms {
+        cap: U256::from_dec_str(&s.cap).ok()?,
+        rate,
+        overhead: s.gas_overhead,
+        swap_gas: s.swap_gas,
+        l1_bound: s.l1_bound,
+        min_net: s.min_net,
+        max_steps: s.max_steps,
+        read_gas: crate::live::gas::SIZED.read.of(cycle.legs[0].venue) + crate::live::gas::SIZED.read.of(cycle.legs[1].venue),
+    })
+}
+
+/// R40.1: the mirror's outcome as a verdict, and the gross it trades.
+pub fn sized_verdict(outcome: super::plan::SizedOutcome) -> (U256, SizedVerdict) {
+    use super::plan::SizedOutcome;
+    match outcome {
+        SizedOutcome::Trade { size, gross, walked, beyond_cap, beyond_steps, .. } => {
+            let outcome = if walked.capped { "capped" } else if walked.truncated { "truncated" } else { "traded" };
+            (gross, SizedVerdict {
+                outcome: outcome.into(),
+                size: size.to_string(),
+                gross: gross.to_string(),
+                beyond_cap: beyond_cap.to_string(),
+                beyond_steps: beyond_steps.to_string(),
+                steps: walked.steps,
+                ladder_end: walked.ladder_end,
+            })
+        }
+        SizedOutcome::NoTrade(reason) => (U256::zero(), SizedVerdict {
+            outcome: format!("early_exit {reason}"),
+            size: "0".into(),
+            gross: "0".into(),
+            beyond_cap: "0".into(),
+            beyond_steps: "0".into(),
+            steps: 0,
+            ladder_end: false,
+        }),
+    }
 }
 
 /// The arm's surplus in wei, which its bids per gas are swept on: a USDC
@@ -520,6 +587,7 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
         start: arm.start,
         gross_start: None,
         gross_usd: None,
+        sized: None,
     };
     let Some(fire) = &j.fire else { return v };
     report.fired += 1;
@@ -531,8 +599,9 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
     // The exact quote at the fire, in its start token's units (R37).
     let mut quoted = None;
     match quote_at_fire(ctx.reads, ctx.specs, ctx.hooks, arm, fire, ctx.logs).await {
-        Ok(gross) => {
+        Ok((gross, sized)) => {
             report.quoted += 1;
+            v.sized = sized;
             let g = fire_gross(arm.start, gross, ctx.weth_usd);
             v.gross_wei = g.wei.map(|w| w.to_string());
             v.gross_start = g.start_units.map(|u| u.to_string());
@@ -552,7 +621,7 @@ async fn verdict(ctx: &Ctx<'_>, arm: &Arm, j: &eval::Judged, shadowed: bool, sim
             let diverged = replay_diverged(ctx.logs, &replay, fire.block, fire.tx_index, &pools);
             // Both in the start token's units: the executor's Profit is.
             let expected = if diverged {
-                quote_at_fire(ctx.reads, ctx.specs, ctx.hooks, arm, fire, &replay).await.ok().map(|g| g.to_string())
+                quote_at_fire(ctx.reads, ctx.specs, ctx.hooks, arm, fire, &replay).await.ok().map(|(g, _)| g.to_string())
             } else {
                 quoted.clone()
             };
@@ -704,13 +773,21 @@ async fn quote_at_fire(
     arm: &Arm,
     fire: &Point,
     logs: &[RawLog],
-) -> Result<U256, String> {
+) -> Result<(U256, Option<SizedVerdict>), String> {
     let pools: Vec<Address> = arm.pools.iter().filter_map(|p| p.parse().ok()).collect();
     let snap = book_after(reads, specs, hooks, &pools, fire.block, fire.tx_index, logs).await?;
     let (_, cycles) = frontier::build_starts(ChainId::BASE, &[WETH, apex_exec::lean2::USDC], &snap);
     let cycle = cycle_through(&cycles, &arm.pools).ok_or("the route is not in the reloaded pools")?;
     let wei = |s: &str| U256::from_dec_str(s).map_err(|e| e.to_string());
-    super::plan::armed_gross(cycle, &snap, wei(&arm.size_wei)?, wei(&arm.mid)?, wei(&arm.output_wei)?)
+    // R40.1: a sized arm is judged at the size the executor would compute
+    // there, at its own gas price: base fee and bid.
+    if arm.sized.is_some() {
+        let terms = sized_terms_of(arm, cycle).ok_or("the sized arm's terms do not read")?;
+        let price = wei(&arm.base_fee_wei)?.saturating_add(wei(&arm.bid_wei_per_gas).unwrap_or_default());
+        let (gross, verdict) = sized_verdict(super::plan::sized_outcome(cycle, &snap, &terms, price, &crate::live::gas::LEAN));
+        return Ok((gross, Some(verdict)));
+    }
+    Ok((super::plan::armed_gross(cycle, &snap, wei(&arm.size_wei)?, wei(&arm.mid)?, wei(&arm.output_wei)?)?, None))
 }
 
 /// The cycle through `pools` in leg order. Not by route hash: that carries
@@ -761,12 +838,22 @@ pub fn simulate_request(arm: &Arm, fire: &Point, block: &Value, signer: Address,
             calls.push(json!({"from": format!("{executor:#x}"), "to": format!("{token:#x}"), "data": approve}));
         }
     }
-    calls.push(json!({
+    let mut ours = json!({
         "from": format!("{signer:#x}"),
         "to": format!("{executor:#x}"),
         "data": arm.calldata_at(fire.block),
         "gas": format!("{:#x}", arm.gas_limit),
-    }));
+    });
+    // R40.1: `LeanExecutor3` prices its floor at `tx.gasprice`, so a sized
+    // arm is simulated at its own: the block's base fee and its bid. At zero
+    // the floor would pass anything, and the check would mean nothing.
+    if arm.sized.is_some() {
+        let base = hex_u128(block.get("baseFeePerGas")?)?;
+        let bid: u128 = arm.bid_wei_per_gas.parse().unwrap_or(0);
+        ours["maxPriorityFeePerGas"] = json!(format!("{bid:#x}"));
+        ours["maxFeePerGas"] = json!(format!("{:#x}", base.saturating_mul(2).saturating_add(bid)));
+    }
+    calls.push(ours);
     let mut state = json!({
         "blockOverrides": {
             "number": format!("{:#x}", fire.block),
@@ -775,17 +862,22 @@ pub fn simulate_request(arm: &Arm, fire: &Point, block: &Value, signer: Address,
         },
         "calls": calls,
     });
+    if arm.sized.is_some() {
+        // Its fee is paid from the signer's balance, which a simulation need not know.
+        state["stateOverrides"] = json!({ format!("{signer:#x}"): { "balance": "0x56bc75e2d63100000" } });
+    }
     if let Some(p) = pre {
         let mut key = [0u8; 64];
         key[12..32].copy_from_slice(signer.as_slice());
         key[63] = 1;
-        state["stateOverrides"] = json!({ format!("{executor:#x}"): {
+        let overrides = state.as_object_mut()?.entry("stateOverrides").or_insert_with(|| json!({}));
+        overrides[format!("{executor:#x}")] = json!({
             "code": p.code,
             "stateDiff": {
                 format!("{:#x}", keccak256(key)): format!("0x{:064x}", 1),
                 format!("0x{:064x}", 2): format!("0x{:0>64}", alloy_primitives::hex::encode(signer)),
             },
-        }});
+        });
     }
     Some(json!([{ "blockStateCalls": [state], "validation": false }, format!("{:#x}", fire.block.checked_sub(1)?)]))
 }
@@ -808,12 +900,14 @@ async fn simulate(
     // R37: the executor the arm was built for; LeanExecutor2 before its
     // deploy runs its configured code. Code that does not read is no check.
     let executor = arm.executor.unwrap_or(config.executor.address);
-    let pre = match &config.armed.executor2 {
-        Some(e) if e.address == executor => match &e.runtime_code {
+    // R40.1: `LeanExecutor3` before its deploy runs its configured code too.
+    let deployments = [config.armed.executor2.as_ref(), config.armed.sized.as_ref().map(|s| &s.executor3)];
+    let pre = match deployments.into_iter().flatten().find(|e| e.address == executor) {
+        Some(e) => match &e.runtime_code {
             Some(path) => Some(PreDeploy { code: format!("0x{}", std::fs::read_to_string(path).ok()?.trim().trim_start_matches("0x")) }),
             None => None,
         },
-        _ => None,
+        None => None,
     };
     let params = simulate_request(arm, fire, block, config.signer.address, executor, pre.as_ref())?;
     let out = rpc.call("eth_simulateV1", params).await.ok()?;
@@ -829,14 +923,23 @@ async fn simulate(
 }
 
 /// The gross a simulated call's executor reported: the lean executor's
-/// `Profit(uint256 gross)` (R29).
+/// `Profit(uint256 gross)` (R29), or R40.1's `Traded`'s `out − amountIn −
+/// lenderFee`.
 pub fn simulated_gross(call: &Value) -> Option<U256> {
-    let topic = keccak256(b"Profit(uint256)");
+    let profit = keccak256(b"Profit(uint256)");
+    let traded: B256 = crate::canary::chain::TRADED.parse().ok()?;
     call.get("logs").and_then(Value::as_array).and_then(|logs| {
         logs.iter().find_map(|l| {
             let t0: B256 = l.get("topics")?.get(0)?.as_str()?.parse().ok()?;
             let data = l.get("data")?.as_str()?;
-            (t0 == topic).then(|| U256::from_str_radix(data.get(2..66)?, 16).ok()).flatten()
+            let word = |i: usize| U256::from_str_radix(data.get(2 + 64 * i..2 + 64 * (i + 1))?, 16).ok();
+            if t0 == profit {
+                word(0)
+            } else if t0 == traded {
+                word(2)?.checked_sub(word(1)?)?.checked_sub(word(3)?)
+            } else {
+                None
+            }
         })
     })
 }
