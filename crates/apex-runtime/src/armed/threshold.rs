@@ -310,3 +310,176 @@ pub fn fixed(
     let surplus = q.outputs[1].checked_sub(size)?.checked_sub(cost)?;
     (surplus > px.margin_wei).then_some(Point { size, mid, output: q.outputs[1], cost, surplus, gas })
 }
+
+// ------------------------------------------------- R40.1: sized arms
+
+/// How far past the no-tip threshold tier 1's bid is priced: where ordinary
+/// moves land (R36's rungs).
+pub const TIER1_BID_STEPS: u32 = 4;
+/// The bands the engine chooses among, in steps, up to `band_cap_bps`.
+pub const BAND_WIDTHS: [u32; 3] = [5, 10, 20];
+/// Past the threshold, where a slot's expected net is measured.
+pub const NET_GRID: [u32; 6] = RUNG_OFFSETS;
+
+/// A sized trade at one state: what it nets in wei after its gas at the base
+/// fee plus its bid and the L1 and other costs, its gas, and its size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetAt {
+    pub net_wei: U256,
+    pub gas: u64,
+    pub size: U256,
+}
+
+/// The trade `LeanExecutor3` would make with the trigger `step` from where it
+/// is and the other pool as `other`, bidding `bid_wei_per_gas` over the base
+/// fee: the mirror's walk, quote and early exit. None when it would not trade,
+/// or would net nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn net_at(
+    cycle: &Cycle,
+    pair: &[Arc<PoolSnapshot>; 2],
+    leg: usize,
+    other: &PoolSnapshot,
+    step: u32,
+    px: &Pricing,
+    terms: &super::plan::SizedTerms,
+    bid_wei_per_gas: u128,
+) -> Option<NetAt> {
+    let trigger = pair[leg].moved(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
+    let book = map_of(cycle, with(pair, leg, &trigger, other));
+    let price = U256::from(px.costs.wei_per_gas.saturating_add(bid_wei_per_gas));
+    let super::plan::SizedOutcome::Trade { gross, walked, size, .. } = super::plan::sized_outcome(cycle, &book, terms, price, &px.gas)
+    else {
+        return None;
+    };
+    let gas = terms.read_gas + u64::from(terms.swap_gas) + u64::from(terms.overhead) + walked.cross_gas;
+    let cost = U256::from(gas).saturating_mul(price).saturating_add(U256::from(px.costs.other_wei));
+    let net_wei = px.in_wei(gross).checked_sub(cost).filter(|n| !n.is_zero())?;
+    Some(NetAt { net_wei, gas, size })
+}
+
+/// The other pool at its adverse edge: `band` steps the way that closes the
+/// gap, against the cycle's swap there.
+pub fn adverse_edge(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, band: u32) -> Option<PoolSnapshot> {
+    let other = 1 - leg;
+    pair[other].moved(move_of(&pair[other], !trigger_up(cycle, other), band))
+}
+
+/// The smallest step from `from` at which `pays` holds, `pays` growing with
+/// the step: doubling, then bisecting. None when nothing up to [`MAX_STEP`]
+/// does.
+fn smallest(from: u32, pays: impl Fn(u32) -> bool) -> Option<u32> {
+    let from = from.max(1);
+    let mut hi = from;
+    while !pays(hi) {
+        if hi >= MAX_STEP {
+            return None;
+        }
+        hi = hi.saturating_mul(2).min(MAX_STEP);
+    }
+    // Nothing pays below `from`, nor at half of `hi`: it doubled from a step
+    // that did not, or was clamped above one.
+    let mut lo = (from - 1).max(hi / 2);
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if pays(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    Some(hi)
+}
+
+/// One sized arm a slot can hold: its tier, its threshold and band, its bid,
+/// and its net across [`NET_GRID`] past the threshold, in wei.
+#[derive(Clone, Debug)]
+pub struct SizedArmPoint {
+    pub tier: u8,
+    pub step: u32,
+    /// The trigger pool at the threshold.
+    pub trigger: PoolSnapshot,
+    /// The other pool at its band's lower and upper edge, in price.
+    pub edges: [PoolSnapshot; 2],
+    pub bid: crate::armed::bid::ArmBid,
+    pub gas: u64,
+    pub grid: [(u32, f64); 6],
+}
+
+/// Tier 1 and, when it can pay, tier 2, for the slot (`cycle`, trigger
+/// `leg`) with the other pool's band `band` steps wide. Empty when no move up
+/// to [`MAX_STEP`] pays.
+///
+/// Tier 1 sits at the smallest move that pays its own bid with the other pool
+/// at its adverse edge, so whenever its predicates hold, the trade pays. Its
+/// bid is priced [`TIER1_BID_STEPS`] past the no-tip threshold, since a
+/// threshold's own surplus is near zero. Tier 2 sits where the net reaches
+/// `tier2_multiple` times that reference, and exists only when its bid is at
+/// least twice tier 1's.
+#[allow(clippy::too_many_arguments)]
+pub fn sized_points(
+    cycle: &Cycle,
+    pair: &[Arc<PoolSnapshot>; 2],
+    leg: usize,
+    px: &Pricing,
+    terms: &super::plan::SizedTerms,
+    band: u32,
+    tier2_multiple: u32,
+    inputs: &crate::armed::engine::BidInputs,
+    cap_wei_per_gas: u128,
+) -> Vec<SizedArmPoint> {
+    let other = 1 - leg;
+    let (Some(adverse), Some(lo), Some(hi)) = (
+        adverse_edge(cycle, pair, leg, band),
+        pair[other].moved(move_of(&pair[other], false, band)),
+        pair[other].moved(move_of(&pair[other], true, band)),
+    ) else {
+        return Vec::new();
+    };
+    let at = |o: &PoolSnapshot, step: u32, bid: u128| net_at(cycle, pair, leg, o, step, px, terms, bid);
+    let Some(bare) = smallest(1, |s| at(&adverse, s, 0).is_some()) else { return Vec::new() };
+    let Some(reference) = at(&pair[other], bare + TIER1_BID_STEPS, 0) else { return Vec::new() };
+    let bid_for = |n: &NetAt| {
+        crate::armed::bid::arm_bid(inputs.winners, inputs.sample, inputs.model, n.net_wei, n.gas, cap_wei_per_gas)
+    };
+    let point = |tier: u8, step: u32, bid: crate::armed::bid::ArmBid| -> Option<SizedArmPoint> {
+        let trigger = pair[leg].moved(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
+        let mut grid = [(0u32, 0f64); 6];
+        for (g, off) in grid.iter_mut().zip(NET_GRID) {
+            let s = step.saturating_add(off).min(MAX_STEP);
+            *g = (s, at(&pair[other], s, bid.sent.per_gas).map_or(0.0, |n| n.net_wei.as_u128() as f64));
+        }
+        let gas = at(&pair[other], step, bid.sent.per_gas).map_or(reference.gas, |n| n.gas);
+        Some(SizedArmPoint { tier, step, trigger, edges: [lo.clone(), hi.clone()], bid, gas, grid })
+    };
+    let one_bid = bid_for(&reference);
+    let Some(one) = smallest(bare, |s| at(&adverse, s, one_bid.sent.per_gas).is_some()) else { return Vec::new() };
+    let Some(first) = point(1, one, one_bid) else { return Vec::new() };
+    let mut out = vec![first];
+    let target = reference.net_wei.saturating_mul(U256::from(tier2_multiple));
+    let big = smallest(one, |s| at(&pair[other], s, one_bid.sent.per_gas).is_some_and(|n| n.net_wei >= target));
+    if let Some(two_step) = big {
+        if let Some(surplus) = at(&pair[other], two_step, 0) {
+            let two_bid = bid_for(&surplus);
+            let doubled = two_bid.sent.per_gas >= one_bid.sent.per_gas.saturating_mul(2) && two_bid.sent.per_gas > one_bid.sent.per_gas;
+            let pays = at(&adverse, two_step, two_bid.sent.per_gas).is_some();
+            if doubled && pays {
+                out.extend(point(2, two_step, two_bid));
+            }
+        }
+    }
+    out
+}
+
+/// Σ over the grid of P(the move ends in that bucket) × the net there:
+/// `p_at_least(step)` is the chance the move reaches at least `step`.
+pub fn expected_net(grid: &[(u32, f64)], p_at_least: impl Fn(u32) -> f64) -> f64 {
+    let p: Vec<f64> = grid.iter().map(|(s, _)| p_at_least(*s)).collect();
+    grid.iter()
+        .enumerate()
+        .map(|(i, (_, net))| {
+            let next = p.get(i + 1).copied().unwrap_or(0.0);
+            (p[i] - next).max(0.0) * net
+        })
+        .sum()
+}
