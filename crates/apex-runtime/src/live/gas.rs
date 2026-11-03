@@ -142,24 +142,27 @@ pub struct SizedGas {
     pub limit: u64,
 }
 
-/// R40.1, `test/fork/LeanExecutor3Fork.t.sol` at block 53,155,787. `read`
-/// solves the six venue pairs' `NoTrade` gas for each venue's half (the
-/// second Slipstream factory reads its fee module more, as its hop does, and
-/// v4's comes from its trade); `step` is the trades' gas per boundary less
-/// the pool's crossing; `limit` covers eight steps on PancakeSwap's spacing-1
-/// pool (1.18M at seven) with a quarter for refunds.
+/// R40.1, `test/fork/LeanExecutor3Fork.t.sol` at block 53,155,787, each call
+/// its own transaction. `read` solves the six venue pairs' `NoTrade` gas (82k
+/// to 113k) for each venue's half; the second Slipstream factory reads its fee
+/// module more, as its hop does, and v4's is estimated from its trade (350k at
+/// one step). `step` is the trades' gas per boundary (about 55k at seven on
+/// PancakeSwap's spacing-1 pool) less the pool's own crossing. `overhead` left
+/// 13.7k to spare on every priced trade under Morpho. `limit` covers eight
+/// steps on that pool (683k; 730k with sixteen allowed) with a quarter for
+/// refunds.
 pub const SIZED: SizedGas = SizedGas {
     read: PerVenue {
-        uniswap_v3: 46_900,
-        slipstream: 69_300,
-        slipstream_v3: 75_000,
-        pancake_v3: 49_000,
-        aerodrome_v2: 76_400,
-        uniswap_v4: 60_000,
+        uniswap_v3: 39_800,
+        slipstream: 62_000,
+        slipstream_v3: 70_000,
+        pancake_v3: 41_900,
+        aerodrome_v2: 50_500,
+        uniswap_v4: 45_000,
     },
-    step: 70_000,
-    overhead: 70_000,
-    limit: 1_650_000,
+    step: 15_000,
+    overhead: 110_000,
+    limit: 1_000_000,
 };
 
 /// A slot written from zero, 22,100 cold, over one already non-zero, 5,000.

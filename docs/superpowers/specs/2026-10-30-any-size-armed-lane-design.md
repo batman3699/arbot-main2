@@ -166,6 +166,12 @@ Verified, in this repo or on chain:
   10,000,000 wei bid). A bid is almost all of the gas price.
 - **The live ledger already computes net from receipts** (`net_wei` in
   `var/armed/armed-live.jsonl`), not from the `Profit` event.
+- **What a sized trade costs, all in** (forked Base at block 53,155,787, each
+  call its own transaction, 2026-11-03): a `NoTrade` 82k to 113k by venue
+  pair; a trade with no boundaries 323k to 468k; 469k at three boundaries and
+  701k to 715k at seven, on PancakeSwap's spacing-1 pool. A square root seeded
+  from x / 2 had cost up to 479k of that at seven; seeded from its bit length,
+  it costs nothing worth measuring.
 - **What the sizer's reads cost** (forked Base, 2026-11-02, `via_ir`, inside
   one transaction). The first figure is cold, the second warm.
 
@@ -439,9 +445,9 @@ tied to the oracle's upper bound:
 | Tier 2 | ~1.0M, 2 gwei | ~2.0e15 wei | n/a |
 
 So 64 tier-1 arms reserve under a tenth of the budget, and the rest holds
-about 4 tier-2 arms at 2 gwei. (Measured while building: the fork's gas puts a
-sized arm's limit at 1.65M, not 1.0M, so 64 tier-1 arms reserve about 0.0012
-ETH, an eighth.) The ranking decides whether a tier-2 arm is
+about 4 tier-2 arms at 2 gwei. (Measured while building, on a fork: eight
+steps on PancakeSwap's spacing-1 pool use 683k gas, so the 1.0M limit holds
+with a quarter for refunds.) The ranking decides whether a tier-2 arm is
 worth its reservation. Rivals' 51 gwei bids on big gaps are out of reach
 under this rule; that is deliberate.
 

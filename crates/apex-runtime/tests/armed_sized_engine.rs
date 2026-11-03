@@ -64,11 +64,11 @@ fn the_budget_term_prefers_the_cheaper_reservation_at_equal_value() {
 }
 
 #[test]
-fn sixty_four_tier_one_arms_reserve_an_eighth_of_the_budget() {
-    // A tier-1 arm at 0.01 gwei, base fee 0.0003 gwei, the fork-measured
-    // limit, and the L1 bound of 1e12: 0.00118 ETH for 64, of 0.01.
+fn sixty_four_tier_one_arms_reserve_under_a_tenth_of_the_budget() {
+    // The spec's table: a tier-1 arm at 0.01 gwei, base fee 0.0003 gwei, the
+    // fork-measured limit, and the L1 bound of 1e12.
     let worst = u128::from(SIZED.limit) * (2 * 300_000 + 10_000_000) + 1_000_000_000_000;
-    assert!(64 * worst < 1_250_000_000_000_000, "{} wei", 64 * worst);
+    assert!(64 * worst < 1_000_000_000_000_000, "{} wei", 64 * worst);
 }
 
 // ------------------------------------------------------------- on a book

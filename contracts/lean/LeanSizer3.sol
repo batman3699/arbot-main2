@@ -56,10 +56,12 @@ library LeanSizer3 {
     {
         Pos memory pa = _start(a);
         Pos memory pb = _start(b);
-        if (_margin(a, pa, b, pb) <= Q96) return r;
+        // The fees' root, scaled by 2^64: the fees do not change in a walk.
+        uint256 keep = LeanSwapMath3.sqrt((_keep(a) * _keep(b)) << 128);
+        if (_margin(a, pa, b, pb, keep) <= Q96) return r;
         uint256 total;
         while (true) {
-            uint256 best = FullMath.mulDiv(_scale(a, pa, b, pb), _margin(a, pa, b, pb) - Q96, Q96);
+            uint256 best = FullMath.mulDiv(_scale(a, pa, b, pb), _margin(a, pa, b, pb, keep) - Q96, Q96);
             bool clamped = total + best >= cap;
             uint256 dx = clamped ? cap - total : best;
             (uint256 inA, uint256 outA) = _toBoundary(a, pa);
@@ -90,7 +92,7 @@ library LeanSizer3 {
             uint256 gas = aFirst ? _cross(a, pa) : _cross(b, pb);
             uint256 cost = _toStart(gas * weiPerGas, rate);
             // No liquidity left in a segment has no gain either: this stops there too.
-            if (_gain(a, pa, b, pb) <= cost) {
+            if (_gain(a, pa, b, pb, keep) <= cost) {
                 if (total > 0) total -= 1;
                 break;
             }
@@ -174,11 +176,14 @@ library LeanSizer3 {
         return leg.zeroForOne ? p.sqrtP : FullMath.mulDiv(Q96, Q96, p.sqrtP);
     }
 
-    /// The pair's `sqrt(a / b)`, Q96: above one in Q96, a trade pays.
-    function _margin(Leg memory a, Pos memory pa, Leg memory b, Pos memory pb) private pure returns (uint256) {
+    /// The pair's `sqrt(a / b)`, Q96: above one in Q96, a trade pays. `keep`
+    /// is the fees' root, scaled by 2^64: in whole ppm it would blur a small gap.
+    function _margin(Leg memory a, Pos memory pa, Leg memory b, Pos memory pb, uint256 keep)
+        private
+        pure
+        returns (uint256)
+    {
         uint256 roots = FullMath.mulDiv(_root(a, pa), _root(b, pb), Q96);
-        // Scaled by 2^64: the fees' root in whole ppm would blur a small gap.
-        uint256 keep = LeanSwapMath3.sqrt((_keep(a) * _keep(b)) << 128);
         return FullMath.mulDiv(roots, keep, PPM << 64);
     }
 
@@ -190,8 +195,12 @@ library LeanSizer3 {
     }
 
     /// The profit of the pair's closed-form best, boundaries ignored.
-    function _gain(Leg memory a, Pos memory pa, Leg memory b, Pos memory pb) private pure returns (uint256) {
-        uint256 m = _margin(a, pa, b, pb);
+    function _gain(Leg memory a, Pos memory pa, Leg memory b, Pos memory pb, uint256 keep)
+        private
+        pure
+        returns (uint256)
+    {
+        uint256 m = _margin(a, pa, b, pb, keep);
         if (m <= Q96) return 0;
         uint256 over = m - Q96;
         return FullMath.mulDiv(FullMath.mulDiv(_scale(a, pa, b, pb), over, Q96), over, Q96);

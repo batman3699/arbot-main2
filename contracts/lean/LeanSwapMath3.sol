@@ -87,17 +87,49 @@ library LeanSwapMath3 {
         feeAmount = reached ? mulDivUp(amountIn, feePips, keep) : remaining - amountIn;
     }
 
-    /// The integer square root, rounded down.
+    /// The integer square root, rounded down: Newton's method from a power of
+    /// two above the root, which takes a handful of steps where x / 2 takes a
+    /// hundred.
     function sqrt(uint256 x) internal pure returns (uint256 z) {
-        if (x > 3) {
-            z = x;
-            uint256 y = x / 2 + 1;
-            while (y < z) {
-                z = y;
-                y = (x / y + y) / 2;
-            }
-        } else if (x != 0) {
-            z = 1;
+        if (x == 0) return 0;
+        z = 1 << ((log2(x) >> 1) + 1);
+        uint256 y = (z + x / z) >> 1;
+        while (y < z) {
+            z = y;
+            y = (z + x / z) >> 1;
         }
+    }
+
+    /// The index of `x`'s highest set bit; `x` is not 0.
+    function log2(uint256 x) internal pure returns (uint256 r) {
+        if (x >= 1 << 128) {
+            x >>= 128;
+            r += 128;
+        }
+        if (x >= 1 << 64) {
+            x >>= 64;
+            r += 64;
+        }
+        if (x >= 1 << 32) {
+            x >>= 32;
+            r += 32;
+        }
+        if (x >= 1 << 16) {
+            x >>= 16;
+            r += 16;
+        }
+        if (x >= 1 << 8) {
+            x >>= 8;
+            r += 8;
+        }
+        if (x >= 1 << 4) {
+            x >>= 4;
+            r += 4;
+        }
+        if (x >= 1 << 2) {
+            x >>= 2;
+            r += 2;
+        }
+        if (x >= 1 << 1) r += 1;
     }
 }
