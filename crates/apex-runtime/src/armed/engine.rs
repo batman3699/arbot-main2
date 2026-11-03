@@ -175,7 +175,7 @@ pub struct Engine {
 }
 
 /// A pool's position for move statistics: its tick, or log-price in bps.
-fn position(p: &PoolSnapshot) -> f64 {
+pub(super) fn position(p: &PoolSnapshot) -> f64 {
     match &p.reserves {
         Some(r) if !r.reserve0.is_zero() => (r.reserve1.as_u128() as f64 / r.reserve0.as_u128() as f64).ln() * 10_000.0,
         _ => f64::from(p.state.tick),
@@ -183,7 +183,7 @@ fn position(p: &PoolSnapshot) -> f64 {
 }
 
 /// The words an arm's predicates watch, as `p` holds them now.
-fn words_of(p: &PoolSnapshot) -> Vec<Word> {
+pub(super) fn words_of(p: &PoolSnapshot) -> Vec<Word> {
     let l = layout_of(p);
     let a = format!("{:#x}", l.address);
     let w = |slot: U256, v: U256| Word { address: a.clone(), slot: format!("{slot:#x}"), value: format!("{v:#x}") };

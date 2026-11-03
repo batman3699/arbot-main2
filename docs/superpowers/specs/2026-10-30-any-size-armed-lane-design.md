@@ -439,7 +439,9 @@ tied to the oracle's upper bound:
 | Tier 2 | ~1.0M, 2 gwei | ~2.0e15 wei | n/a |
 
 So 64 tier-1 arms reserve under a tenth of the budget, and the rest holds
-about 4 tier-2 arms at 2 gwei. The ranking decides whether a tier-2 arm is
+about 4 tier-2 arms at 2 gwei. (Measured while building: the fork's gas puts a
+sized arm's limit at 1.65M, not 1.0M, so 64 tier-1 arms reserve about 0.0012
+ETH, an eighth.) The ranking decides whether a tier-2 arm is
 worth its reservation. Rivals' 51 gwei bids on big gaps are out of reach
 under this rule; that is deliberate.
 

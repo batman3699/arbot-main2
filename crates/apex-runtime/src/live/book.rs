@@ -139,6 +139,30 @@ impl PoolSnapshot {
         Some(next)
     }
 
+    /// R40.1: this pool after an exact-input swap of `amount_in`, by the book's
+    /// own arithmetic: a constant-product pool's reserves exactly, a
+    /// concentrated pool moved to the tick its quote ends at. None when the
+    /// quote cannot fill it.
+    pub fn swapped(&self, amount_in: ethers_core::types::U256, zero_for_one: bool) -> Option<Self> {
+        if let Some(r) = &self.reserves {
+            let out = crate::live::cp::quote_out(r, self.state.fee_ppm, amount_in, zero_for_one)?;
+            let fee = amount_in.checked_mul(ethers_core::types::U256::from(self.state.fee_ppm))? / ethers_core::types::U256::from(1_000_000u64);
+            let added = amount_in.checked_sub(fee)?;
+            let mut next = self.clone();
+            next.reserves = Some(if zero_for_one {
+                crate::live::cp::Reserves { reserve0: r.reserve0.checked_add(added)?, reserve1: r.reserve1.checked_sub(out)? }
+            } else {
+                crate::live::cp::Reserves { reserve0: r.reserve0.checked_sub(out)?, reserve1: r.reserve1.checked_add(added)? }
+            });
+            return Some(next);
+        }
+        let q = apex_math::cl_swap::quote_exact_input_multi_tick(&self.state, &self.ladder, amount_in, zero_for_one, u32::MAX)?;
+        if q.exhausted {
+            return None;
+        }
+        self.moved(Move::Tick(apex_math::cl_math::get_tick_at_sqrt_ratio(q.sqrt_price_after)?))
+    }
+
     /// Set the fee from the tick, for a pool whose fee is a function of it.
     fn fee_from_tick(&mut self) {
         if let Some(d) = self.dynamic_fee {

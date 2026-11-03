@@ -16,6 +16,7 @@ pub mod plan;
 pub mod predicate;
 pub mod replay;
 pub mod run;
+pub mod sized;
 pub mod targets;
 pub mod token_check;
 pub mod threshold;

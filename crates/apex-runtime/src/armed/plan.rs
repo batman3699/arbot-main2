@@ -119,12 +119,15 @@ impl SizedTerms {
 }
 
 /// R40.1: what `LeanExecutor3` would do on `book`, as the mirror computes it.
+// Returned by value from the pricing pass, many times a tick: a box would add
+// an allocation to each for a variant that lives a moment.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SizedOutcome {
-    /// It trades `size` for `gross` over the loan, in the start token. What a
-    /// walk with no cap, and one of 64 steps, would add to the gross is what
-    /// each limit left.
-    Trade { size: EthersU256, gross: EthersU256, walked: Walked, beyond_cap: EthersU256, beyond_steps: EthersU256 },
+    /// It trades `size` for `gross` over the loan, in the start token; `mid`
+    /// is hop 0's output. What a walk with no cap, and one of 64 steps, would
+    /// add to the gross is what each limit left.
+    Trade { size: EthersU256, mid: EthersU256, gross: EthersU256, walked: Walked, beyond_cap: EthersU256, beyond_steps: EthersU256 },
     /// Its `NoTrade` reason: 0 no gap, 1 below the floor, 2 unsupported.
     NoTrade(u8),
 }
@@ -156,12 +159,12 @@ pub fn sized_outcome(
     let (Some(a), Some(b)) = (book.get(&cycle.legs[0].pool), book.get(&cycle.legs[1].pool)) else { return SizedOutcome::NoTrade(2) };
     let legs = [walk_leg(&cycle.legs[0], a, gas), walk_leg(&cycle.legs[1], b, gas)];
     let price = WalkPrice { wei_per_gas, rate: terms.plan_rate() };
-    let gross_at = |cap: EthersU256, steps: u32| -> Option<(Walked, EthersU256)> {
+    let gross_at = |cap: EthersU256, steps: u32| -> Option<(Walked, EthersU256, EthersU256)> {
         let w = walk(legs, cap, price, steps)?;
-        let [_, out] = quote(legs, w.size)?;
-        Some((w, out.saturating_sub(w.size)))
+        let [mid, out] = quote(legs, w.size)?;
+        Some((w, mid, out.saturating_sub(w.size)))
     };
-    let Some((walked, gross)) = gross_at(terms.cap, u32::from(terms.max_steps)) else { return SizedOutcome::NoTrade(0) };
+    let Some((walked, mid, gross)) = gross_at(terms.cap, u32::from(terms.max_steps)) else { return SizedOutcome::NoTrade(0) };
     if walked.size.is_zero() {
         return SizedOutcome::NoTrade(0);
     }
@@ -171,9 +174,10 @@ pub fn sized_outcome(
     if gross < floor {
         return SizedOutcome::NoTrade(1);
     }
-    let more = |cap, steps| gross_at(cap, steps).map_or(EthersU256::zero(), |(_, g)| g.saturating_sub(gross));
+    let more = |cap, steps| gross_at(cap, steps).map_or(EthersU256::zero(), |(_, _, g)| g.saturating_sub(gross));
     SizedOutcome::Trade {
         size: walked.size,
+        mid,
         gross,
         walked,
         beyond_cap: more(EthersU256::MAX, u32::from(terms.max_steps)),

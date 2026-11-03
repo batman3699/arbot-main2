@@ -126,6 +126,42 @@ impl SettlementGas {
     }
 }
 
+/// R40.1: what `LeanExecutor3` uses beyond the hops [`LEAN`] prices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SizedGas {
+    /// A `NoTrade`'s gas, half a pair to each venue: its pools' reads and the
+    /// walk, and half of `run`'s own checks.
+    pub read: PerVenue,
+    /// Each boundary the walk reaches, beyond the pool's own crossing: its
+    /// reads, the walk and the quote.
+    pub step: u64,
+    /// `gasOverhead`: the intrinsic gas and calldata, the lender's own work,
+    /// and what follows the floor.
+    pub overhead: u64,
+    /// The gas limit every sized arm carries.
+    pub limit: u64,
+}
+
+/// R40.1, `test/fork/LeanExecutor3Fork.t.sol` at block 53,155,787. `read`
+/// solves the six venue pairs' `NoTrade` gas for each venue's half (the
+/// second Slipstream factory reads its fee module more, as its hop does, and
+/// v4's comes from its trade); `step` is the trades' gas per boundary less
+/// the pool's crossing; `limit` covers eight steps on PancakeSwap's spacing-1
+/// pool (1.18M at seven) with a quarter for refunds.
+pub const SIZED: SizedGas = SizedGas {
+    read: PerVenue {
+        uniswap_v3: 46_900,
+        slipstream: 69_300,
+        slipstream_v3: 75_000,
+        pancake_v3: 49_000,
+        aerodrome_v2: 76_400,
+        uniswap_v4: 60_000,
+    },
+    step: 70_000,
+    overhead: 70_000,
+    limit: 1_650_000,
+};
+
 /// A slot written from zero, 22,100 cold, over one already non-zero, 5,000.
 pub const ZERO_SLOT_PREMIUM: u64 = 17_100;
 
