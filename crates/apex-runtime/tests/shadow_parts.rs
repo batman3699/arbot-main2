@@ -196,54 +196,38 @@ fn a_half_flipped_config_is_refused() {
     assert_eq!((d.armed.block_time_ms, d.armed.max_head_lag_ms), (200, 1_000));
 }
 
-/// R41: each Denim file is its base file with exactly the switch's fields
-/// changed. An edit to a base file that forgets its Denim twin fails here.
+/// R41.1: since the fork the base files are the Denim configs: the switch's
+/// seven fields at their Denim values, and a bound of 50 blocks.
 #[test]
-fn the_denim_configs_differ_from_the_base_ones_only_by_the_switch() {
+fn the_base_configs_are_the_denim_ones() {
     use serde_yaml::Value;
     let ops = format!("{}/../../ops", env!("CARGO_MANIFEST_DIR"));
     let read = |f: &str| -> Value { serde_yaml::from_str(&std::fs::read_to_string(format!("{ops}/{f}")).unwrap()).unwrap() };
-    let take = |v: &mut Value, section: Option<&str>, key: &str| -> Option<Value> {
-        let m = match section {
-            Some(s) => v.get_mut(s).and_then(Value::as_mapping_mut).unwrap(),
-            None => v.as_mapping_mut().unwrap(),
-        };
-        m.remove(key)
-    };
-    let switch = |v: &mut Value| {
-        [
-            take(v, Some("armed"), "block_time_ms"),
-            take(v, None, "feed"),
-            take(v, None, "flashblocks").map(|_| Value::from("present")),
-            take(v, Some("policy"), "l1_every_blocks"),
-            take(v, Some("policy"), "max_evidence_age_blocks"),
-            take(v, Some("policy"), "head_reads_every_ms"),
-            take(v, Some("armed"), "max_head_lag_ms"),
-        ]
-    };
     let feed_off: Value = serde_yaml::from_str("pending_logs: false").unwrap();
+    let n = |x: u64| Some(Value::from(x));
     for name in ["canary", "shadow"] {
-        let (mut base, mut denim) = (read(&format!("{name}.base.yaml")), read(&format!("{name}.denim.yaml")));
-        let b = switch(&mut base);
-        let d = switch(&mut denim);
-        assert_eq!(base, denim, "{name}: the files differ beyond the switch");
-        let n = |x: u64| Some(Value::from(x));
-        assert_eq!(b, [n(2_000), None, Some(Value::from("present")), n(30), n(1_800), None, None], "{name}.base.yaml");
-        assert_eq!(d, [n(200), Some(feed_off.clone()), None, n(300), n(18_000), n(2_000), n(1_000)], "{name}.denim.yaml");
+        let v = read(&format!("{name}.base.yaml"));
+        let at = |section: &str, key: &str| v.get(section).and_then(|m| m.get(key)).cloned();
+        assert_eq!(
+            [
+                at("armed", "block_time_ms"),
+                v.get("feed").cloned(),
+                v.get("flashblocks").cloned(),
+                at("policy", "l1_every_blocks"),
+                at("policy", "max_evidence_age_blocks"),
+                at("policy", "head_reads_every_ms"),
+                at("armed", "max_head_lag_ms"),
+            ],
+            [n(200), Some(feed_off.clone()), None, n(300), n(18_000), n(2_000), n(1_000)],
+            "{name}.base.yaml"
+        );
     }
     let e = env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key");
-    for (file, canary, denim) in [
-        ("canary.base.yaml", true, false),
-        ("canary.denim.yaml", true, true),
-        ("shadow.base.yaml", false, false),
-        ("shadow.denim.yaml", false, true),
-    ] {
+    for (file, canary) in [("canary.base.yaml", true), ("shadow.base.yaml", false)] {
         let path = format!("{ops}/{file}");
         let c = if canary { ShadowConfig::load_canary(&path, &e) } else { ShadowConfig::load(&path, &e) }.unwrap_or_else(|err| panic!("{file}: {err}"));
-        assert_eq!(c.denim(), denim, "{file}");
-        if denim {
-            assert_eq!(c.armed.window_s * 1_000 / c.armed.block_time_ms, 50, "{file}: the bound is 50 blocks");
-        }
+        assert!(c.denim(), "{file}");
+        assert_eq!(c.armed.window_s * 1_000 / c.armed.block_time_ms, 50, "{file}: the bound is 50 blocks");
     }
 }
 
@@ -933,12 +917,12 @@ fn the_bid_model_is_best_bid_unless_named() {
 fn the_capacity_sampler_runs_only_before_denim() {
     let ops = format!("{}/../../ops", env!("CARGO_MANIFEST_DIR"));
     let e = env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key");
-    for (file, sampled) in [("canary.base.yaml", true), ("canary.denim.yaml", false)] {
-        let c = ShadowConfig::load_canary(&format!("{ops}/{file}"), &e).unwrap();
-        assert_eq!(apex_runtime::shadow::samples_capacity(&c), sampled, "{file}");
-    }
-    for (file, sampled) in [("shadow.base.yaml", true), ("shadow.denim.yaml", false)] {
-        let c = ShadowConfig::load(&format!("{ops}/{file}"), &e).unwrap();
-        assert_eq!(apex_runtime::shadow::samples_capacity(&c), sampled, "{file}");
-    }
+    assert!(!apex_runtime::shadow::samples_capacity(&ShadowConfig::load_canary(&format!("{ops}/canary.base.yaml"), &e).unwrap()));
+    assert!(!apex_runtime::shadow::samples_capacity(&ShadowConfig::load(&format!("{ops}/shadow.base.yaml"), &e).unwrap()));
+    // R41.1 retired the 2 s files; the 2 s regime is the inline one.
+    let var = "APEX_SECRET_SHADOW_TEST_DENIM";
+    let two_s = ShadowConfig::from_yaml_str(&yaml(var, "var/apex/shadow.journal"), &env(var, SECRET)).unwrap();
+    assert!(apex_runtime::shadow::samples_capacity(&two_s));
+    let denim = ShadowConfig::from_yaml_str(&denim_yaml(var), &env(var, SECRET)).unwrap();
+    assert!(!apex_runtime::shadow::samples_capacity(&denim));
 }

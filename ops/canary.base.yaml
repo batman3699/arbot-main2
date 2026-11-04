@@ -1,3 +1,11 @@
+# Base runs Denim since 2026-11-05 18:00:00 UTC (R41): 200 ms blocks, no
+# flashblocks, no pendingLogs. Since R41.1 this is the Denim config, held so by
+# tests/shadow_parts.rs: armed.block_time_ms 200, feed.pending_logs false, no
+# flashblocks section, policy.l1_every_blocks 300,
+# policy.max_evidence_age_blocks 18000, policy.head_reads_every_ms 2000 and
+# armed.max_head_lag_ms 1000. A config half one regime and half the other is
+# refused at load; the 2 s one is in git history (R41's ops/canary.base.yaml).
+#
 # `apex canary` on Base (Task 8.5 R28): the reactive lane SENDS, one ticket at
 # a time, under the canary's limits at the end of this file. The armed lane
 # stays in shadow. See ops/host/README.md §10 and
@@ -39,9 +47,7 @@ misses: var/apex/shadow.misses.jsonl
 # flashblock stream with its ledger. Measurement only; nothing priced reads
 # them. Each is a file per UTC day: race-YYYY-MM-DD.jsonl.
 race: var/apex/race.jsonl
-flashblocks:
-  stream: wss://mainnet.flashblocks.base.org/ws
-  ledger: var/apex/flashblocks.jsonl
+# R41: no flashblocks section: Denim ends flashblocks.
 # R26: armed backruns. armed-shadow arms each top route's gap as a validity
 # transaction would wait in Base's builder: built and recorded, never sent.
 # `apex armed-eval` (a timer on the host) judges every arm against the chain.
@@ -53,6 +59,9 @@ flashblocks:
 # Live since 2026-10-29, the operator's switch (ARMED.md §1f), after gate A''
 # and real-contract simulations of LeanExecutor2 agreeing. Off: `mode: shadow`
 # and a restart; soft stop: touch live.kill_file.
+# R41: Denim ends pendingLogs: heads and canonical logs only.
+feed:
+  pending_logs: false
 armed:
   mode: live
   ledger: var/apex/armed.jsonl
@@ -62,7 +71,9 @@ armed:
   max_arms: 16
   rungs: 6
   window_s: 10
-  block_time_ms: 2000            # 200 on the Denim day (ops/host/ARMED.md)
+  block_time_ms: 200             # Denim (R41)
+  # R41: sends stop while the newest head's timestampMs is older than this.
+  max_head_lag_ms: 1000
   margin_wei: 0
   band_cap_bps: 5
   liquidity_floor_bps: 9800
@@ -126,13 +137,17 @@ policy:
   # allows one to fail, and a failed one is asked for again at the next head.
   # Every 30 minutes, not 15, since R28.1: Mint and Burn are applied in place,
   # and each full reload is ~12.5 MB of BlockPI traffic.
-  max_evidence_age_blocks: 1800
-  # Three blocks: a view the head task has stopped refreshing is not a reading.
+  max_evidence_age_blocks: 18000   # an hour of 200 ms blocks (R41)
+  # Three 2 s read rounds: a view the head task has stopped refreshing is not
+  # a reading.
   max_view_age_ms: 6000
   full_reload_every_s: 1800
   report_every_s: 300
   # The L1 fee oracle moves with L1 blocks; once a minute.
-  l1_every_blocks: 30
+  l1_every_blocks: 300             # a minute of 200 ms blocks (R41)
+  # R41: the head loop's slow reads (the view, TWAPs, fees) and armed-live's
+  # stops, at most once every 2 s: the 2 s regime's rate in wall time.
+  head_reads_every_ms: 2000
   # The risk gate's cost-confidence cap: the gas estimate's p50-to-p99 width
   # in wei, as a share of the expected profit. The default (1,000 bps, a tenth)
   # refused the first trade ever to pass Tier 2 in the block being built
@@ -160,6 +175,7 @@ costs:
   gas_on_failure: 411945
   failure_ppm: 50000
 
+# R41: not sampled under Denim, which has no flashblocks (shadow::samples_capacity).
 # R5: `newFlashblocks` is ~750 KiB/s, so it is sampled, never held open.
 # Hourly since R27.3: BlockPI charges by the byte, and 20 s every 15 minutes
 # was 1.4 GB a day, a sixth of everything the host moves, for a figure (the

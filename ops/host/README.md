@@ -502,24 +502,29 @@ $ cast send <executor> "tripCircuit()" --rpc-url https://mainnet.base.org --inte
 $ cast send <executor> "setExecutor(address,bool)" 0xCB436Ba3acb945b3fc8EE6345857262584356595 false --rpc-url https://mainnet.base.org --interactive
 ```
 
-## 12. The Denim switch (R41)
+## 12. Denim (R41, R41.1)
 
-Base's Denim hardfork is at 2026-11-05 18:00:00 UTC. The switch and what to
-check are in `ops/host/ARMED.md` "The Denim day". Install its timer with the
-revision that carries it:
-
-```
-# install -m 0644 /opt/apex/ops/host/apex-denim-switch.service /opt/apex/ops/host/apex-denim-switch.timer /etc/systemd/system/
-# systemctl daemon-reload && systemctl enable --now apex-denim-switch.timer
-# systemctl list-timers apex-denim-switch.timer --no-pager        # NEXT: Thu 2026-11-05 17:59:00 UTC
-```
-
-At the fork the switch writes two drop-ins,
+Base runs Denim since 2026-11-05 18:00:00 UTC; the regime and how to check it
+are in `ops/host/ARMED.md` "Denim". At the fork R41's switch
+(`apex-denim-switch.timer`) wrote two drop-ins,
 `/etc/systemd/system/apex-canary.service.d/denim.conf` and
-`/etc/systemd/system/apex-armed-eval.service.d/denim.conf`, which point the
-units at `ops/canary.denim.yaml` and `ops/shadow.denim.yaml`. `deploy.sh`
-and `provision.sh` never touch `*.service.d/`, and installing a unit file
-(§4, §10) leaves its drop-ins in place: `systemctl cat apex-canary` shows both.
+`/etc/systemd/system/apex-armed-eval.service.d/denim.conf`, which pointed the
+units at the Denim configs. R41.1 made the base configs the Denim ones and
+retired the switch. Its deploy, once, after the tarball is unpacked and the
+binary installed (§7), in place of the restart (`rmdir` refuses a directory
+that holds another drop-in):
+
+```
+# rm /etc/systemd/system/apex-canary.service.d/denim.conf /etc/systemd/system/apex-armed-eval.service.d/denim.conf
+# rmdir /etc/systemd/system/apex-canary.service.d /etc/systemd/system/apex-armed-eval.service.d
+# systemctl disable apex-denim-switch.timer && rm /etc/systemd/system/apex-denim-switch.service /etc/systemd/system/apex-denim-switch.timer
+# rm /opt/apex/ops/canary.denim.yaml /opt/apex/ops/shadow.denim.yaml /opt/apex/ops/host/denim-switch.sh
+# systemctl daemon-reload && systemctl restart apex-canary
+# systemctl cat apex-canary | grep -E "^# /etc|^ExecStart"       # the unit alone, ops/canary.base.yaml
+```
+
+The tarball unpacks over the tree and deletes nothing, hence the `rm` of the
+retired files; `deploy.sh` and `provision.sh` never touch `*.service.d/`.
 
 **Do not archive `/opt/apex/var/apex` between now and 11-07** (§7's archive
 step): it would take `canary.stop` and the flashblock ledgers the daily census

@@ -242,82 +242,55 @@ the canary is not restarted into a live boot that would refuse it.
   moves those, so until a day passes it falls back to block offsets.
 - Targets older than `targets_max_age_s` (2 days) stop a live boot.
 
-### The Denim day
+### Denim (since 2026-11-05)
 
-Base's Denim hardfork activates at **2026-11-05 18:00:00 UTC** (07:00 NZDT
-11-06; timestamp 1793901600, from the `base/base` v1.5.1 client). From that
-block on, blocks are 200 ms, and flashblocks, `pendingLogs` and the `pending`
-tag end. R41 (`docs/superpowers/specs/2026-10-31-denim-readiness-design.md`)
-makes the switch automatic and chain-gated.
+Base's Denim hardfork activated at **2026-11-05 18:00:00 UTC** (timestamp
+1793901600, from the `base/base` v1.5.1 client): 200 ms blocks, and no
+flashblocks, `pendingLogs` or `pending` tag. R41
+(`docs/superpowers/specs/2026-10-31-denim-readiness-design.md`) switched the
+host on chain at the fork, with two systemd drop-ins; R41.1 made
+`ops/canary.base.yaml` and `ops/shadow.base.yaml` the Denim configs, removed
+the drop-ins and retired the switch (README §12). The switch's record is
+`/opt/apex/var/apex/denim-switch.jsonl`.
 
-**The two regimes.** `ops/canary.denim.yaml` and `ops/shadow.denim.yaml` are
-the base files with exactly seven changes (a test holds them so):
+**The regime.** Seven fields set it, and a test holds both files to them:
 - `armed.block_time_ms: 200` and `armed.max_head_lag_ms: 1000`;
 - `feed.pending_logs: false`, and no `flashblocks:` section;
 - `policy.l1_every_blocks: 300` and `policy.max_evidence_age_blocks: 18000`
-  (a minute and an hour, as now);
+  (a minute and an hour);
 - `policy.head_reads_every_ms: 2000`: the view, the TWAPs, the fees and the
-  stops are read at most every 2 s, today's rate in wall time.
+  stops are read at most every 2 s, the 2 s regime's rate in wall time.
 
-Under them, armed-live sends only while the last twenty heads' own
-`timestampMs` keep 200 ms and the newest is at most 1 s old at the send; a
-head without `timestampMs` stops sends. No request names `pending`. W stays
-10 s, now 50 blocks, inside Base's 60 s bound limit. A config that is half one
-regime and half the other is refused at load, naming the field.
+Armed-live sends only while the last twenty heads' own `timestampMs` keep
+200 ms and the newest is at most 1 s old at the send; a head without
+`timestampMs` stops sends. No request names `pending`. W is 10 s, 50 blocks,
+inside Base's 60 s bound limit. A config that is half one regime and half the
+other is refused at load, naming the field.
 
-**The switch.** `apex-denim-switch.timer` starts `apex-denim-switch.service`
-at 17:59:00 UTC, which runs `ops/host/denim-switch.sh` as root:
-- every 2 s, `apex denim-detect` reads the chain ID and the newest ten blocks
-  from `https://mainnet.base.org` (`https://base-rpc.publicnode.com` if it
-  does not answer);
-- Denim is live when the chain is 8453, the ten are consecutive, every one
-  carries `timestampMs` on the 200 ms lattice within its own second, each step
-  is exactly 200 ms, and the oldest is at or after 1793901600;
-- then it writes `/etc/systemd/system/apex-canary.service.d/denim.conf` and
-  `.../apex-armed-eval.service.d/denim.conf` (each an empty `ExecStart=`, then
-  the Denim config's), reloads systemd and restarts `apex-canary`; the
-  evaluator's timer takes its drop-in at its next run;
-- it gives up at 20:00 UTC, changing nothing. If Base moves the fork, re-arm
-  it: `systemctl edit apex-denim-switch.timer` (an empty `OnCalendar=`, then
-  the new time) and `systemctl edit apex-denim-switch.service` (an empty
-  `ExecStart=`, then the script with `--fork-at <ts> --give-up-at <ts>`).
-
-The new process sends nothing until the reopened ledger's pending
+A booting process sends nothing until the reopened ledger's pending
 transactions are settled, 20 stamped heads show 200 ms, the newest head is at
 most 1 s old, the stops are fresh, and there is no kill file or halt; each is
 checked again before every send.
 
-**Reading the switch's record.** `/opt/apex/var/apex/denim-switch.jsonl`, one
-JSON line per event: `switched` (with the ten blocks, `detect.blocks`, and
-`restarted_at`), `anomaly` or `no_source` (once per kind), or `gave_up`.
-
-```
-# systemctl list-timers apex-denim-switch.timer --no-pager      # NEXT: Thu 2026-11-05 17:59:00 UTC
-# tail -3 /opt/apex/var/apex/denim-switch.jsonl
-# systemctl cat apex-canary | grep ExecStart                       # the Denim config, after the switch
-# /opt/apex/ops/host/denim-switch.sh --dry-run                     # one round, writes nothing: "not yet" before the fork
-# /opt/apex/ops/host/denim-switch.sh --dry-run --rpc https://sepolia.base.org --chain-id 84532 --fork-at 1792605600   # Sepolia: Denim
-```
-
-**Gate M (18:00-19:00 UTC, read at ~18:30).**
-- The switch's record shows `switched` with ten lattice blocks.
-- The last report's `armed.live`: `chain_cadence_ms` 200, `head_lag_ms` under
+**Checking it** (gate M's checks, at any time):
+- the last report's `armed.live`: `chain_cadence_ms` 200, `head_lag_ms` under
   1000, `head_skips` counted, `heads_without_ms` 0; `stops_reads` and
-  `head_reads.rounds` each rising by about 30 a minute, never more.
-- The book is not Rebuilding, logs arrive every minute, no reconnect storm (a
-  check by eye; the predicates are what stop a stale book from trading).
-- The first arms carry a bound of head + 50 and `start_at`, and are accepted.
-- `rpc` (HTTP bytes by method) and `feed.bytes_*` (websocket bytes by
-  subscription) per hour within 1.5x of the 11-03 baseline.
+  `head_reads.rounds` each rising by about 30 a minute, never more;
+- the book is not Rebuilding, logs arrive every minute, no reconnect storm (a
+  check by eye; the predicates are what stop a stale book from trading);
+- the arms carry a bound of head + 50 and `start_at`, and are accepted;
+- `rpc` (HTTP bytes by method) per hour within 1.5x of the 2 s regime's
+  (R41's boot, 11-04: about 190 MB/h, 167 MB of it `eth_call`); `feed.bytes_heads`
+  about 10x it and no `bytes_pending_logs`, the feed about 0.9x in all;
 - `denim-check` against BlockPI for 5 minutes; the verdict is the last line:
 
 ```
-# systemd-run --uid=apex --wait --pipe -p WorkingDirectory=/opt/apex -p EnvironmentFile=/etc/apex/shadow.env /opt/apex/bin/apex denim-check --config ops/canary.denim.yaml --for-s 300 | tail -1
+# systemd-run --uid=apex --wait --pipe -p WorkingDirectory=/opt/apex -p EnvironmentFile=/etc/apex/shadow.env /opt/apex/bin/apex denim-check --config ops/canary.base.yaml --for-s 300 | tail -1
 ```
 
-**Responses at gate M:**
+**Responses:**
 - **refusals naming the bound:** set `armed.window_s: 6` (30 blocks) in
-  `ops/canary.denim.yaml` and restart;
+  `ops/canary.base.yaml` and restart;
 - **BlockPI frozen or storming:** `touch /opt/apex/var/armed/armed.disable`,
   test the key over HTTP for the error code (402 or 503 is prepaid RU run
   out); then wait, or a second websocket (R41 decision 4);
@@ -326,26 +299,13 @@ JSON line per event: `switched` (with the ten blocks, `detect.blocks`, and
   if the lag is steady rather than growing;
 - **RU rising:** stop `apex-canary` and read the per-method counters.
 
-**The manual fallback** (if R41's deploy has not happened by 11-05 12:00 UTC):
-at 07:00 NZDT, make R36's three edits in both base configs (add
-`feed: {pending_logs: false}`, remove `flashblocks:`, set
-`armed.block_time_ms: 200`), which the old binary accepts, and touch the kill
-file. Without R41's read clock the old binary reads every head, ten times the
-rate: safe for hours only. After the first check, stop the canary until R41
-is deployed.
+**There is no going back to 2 s.** The kill file stops sends at once and the
+process keeps measuring; stopping `apex-canary` stops the RU.
 
-**After the fork there is no going back to 2 s.** The kill file stops sends
-at once and the process keeps measuring; stopping `apex-canary` stops the RU.
-
-**Not across the fork:** `apex armed-moves-seed` (it turns hours into blocks
-at the configured block time) and `apex send-probe` (it reads the nonce at
-`pending`). `moves.json` persists across restarts, so the switch needs no
-seed.
-
-**R41.1 (about 11-06):** a commit makes the base configs the Denim ones; then
-remove both drop-ins (`rm /etc/systemd/system/apex-{canary,armed-eval}.service.d/denim.conf
-&& systemctl daemon-reload`), and this section drops the 2 s regime. Until
-then, the drop-ins are the record of what the host runs.
+**Not under Denim:** `apex send-probe` (it reads the nonce at `pending`).
+`apex armed-moves-seed` turns hours into blocks at the configured block time,
+so a seed must not reach back across the fork; `moves.json` persists across
+restarts, so a restart needs no seed.
 
 ## 3. R37: the second executor (`LeanExecutor2`)
 

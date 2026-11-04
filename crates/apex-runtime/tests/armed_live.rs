@@ -203,7 +203,7 @@ fn policy(budget_wei: u128, cap: u128) -> LivePolicy {
     }
 }
 
-/// R41: the Denim regime, as `ops/canary.denim.yaml` configures it.
+/// R41: the Denim regime, as `ops/canary.base.yaml` configures it (R41.1).
 fn denim_policy() -> LivePolicy {
     LivePolicy { block_time_ms: 200, window_blocks: 50, denim: true, max_head_lag_ms: 1_000, head_reads_every_ms: 2_000, ..policy(ETH, u128::MAX) }
 }

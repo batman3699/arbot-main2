@@ -145,11 +145,11 @@ async fn main() -> ExitCode {
 /// `apex denim-check [--config PATH] [--for-s N]` (R41): the configuration's
 /// feed and the Denim guard against its endpoints for N seconds (default
 /// 600), and one JSON verdict on stdout. Exit 0 when it passes. Sends
-/// nothing; the file is a canary's (`ops/canary.denim.yaml`, or a scratch
+/// nothing; the file is a canary's (`ops/canary.base.yaml`, or a scratch
 /// copy pointed at public Sepolia endpoints).
 async fn denim_check() -> ExitCode {
-    const USAGE: &str = "usage: apex denim-check [--config ops/canary.denim.yaml] [--for-s 600]";
-    let (mut config, mut for_s) = ("ops/canary.denim.yaml".to_string(), 600u64);
+    const USAGE: &str = "usage: apex denim-check [--config ops/canary.base.yaml] [--for-s 600]";
+    let (mut config, mut for_s) = ("ops/canary.base.yaml".to_string(), 600u64);
     let mut argv = std::env::args().skip(2);
     while let Some(flag) = argv.next() {
         match (flag.as_str(), argv.next()) {
@@ -195,7 +195,8 @@ async fn denim_check() -> ExitCode {
 /// `apex denim-detect [--rpc URL]... [--chain-id 8453] [--fork-at 1793901600]`
 /// (R41): one round of the Denim switch's detection, read from public
 /// endpoints, as one JSON line. Exit 0 Denim, 1 not yet, 2 an anomaly, 3 no
-/// source answered. `ops/host/denim-switch.sh` runs it every 2 s.
+/// source answered. R41's switch at the fork ran it every 2 s (retired at
+/// R41.1).
 async fn denim_detect() -> ExitCode {
     const USAGE: &str = "usage: apex denim-detect [--rpc URL]... [--chain-id 8453] [--fork-at 1793901600]";
     let (mut urls, mut chain, mut fork_at) = (Vec::new(), 8_453u64, apex_runtime::denim::DENIM_MAINNET_TS);
