@@ -1195,26 +1195,54 @@ pub struct Summary {
     pub base: BTreeMap<String, DayF>,
     /// R37: fires the arm's own send took: armed-live's landings.
     pub ours: u64,
+    /// R40.1: by UTC day, what `LeanExecutor3` would have done at each fire.
+    /// Empty but in the sized lane's summary.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub sized_days: BTreeMap<String, SizedDay>,
+    /// R40.1: the sized lane's verdicts, summarised on their own (gate C).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sized: Option<Box<Summary>>,
 }
 
-/// The bid curve so far, from every verdict file in `dir`. Reads files only.
+/// R40.1: one UTC day of the sized lane's fires.
+#[derive(Debug, Default, Serialize)]
+pub struct SizedDay {
+    pub fires: u64,
+    /// By `SizedVerdict::outcome`: traded, capped, truncated, early exits.
+    pub outcomes: BTreeMap<String, u64>,
+    /// What a walk with no cap, and one of 64 steps, would have added, in
+    /// dollars: USDC at 1:1, WETH at the verdict's price.
+    pub beyond_cap_usd: f64,
+    pub beyond_steps_usd: f64,
+    /// Fires the book's ladder ended before the walk did.
+    pub ladder_end: u64,
+    pub simulated: u64,
+    pub sim_agreed: u64,
+}
+
+/// The bid curve so far, from every verdict file in `dir`, and the sized
+/// lane's beside it (R40.1). Reads files only.
 pub fn summary(dir: &Path) -> Result<Summary, String> {
+    let mut s = summary_of(dir, "armed-verdicts-")?;
+    let sized = summary_of(dir, "armed-sized-verdicts-")?;
+    s.sized = (sized.arms_judged > 0).then(|| Box::new(sized));
+    Ok(s)
+}
+
+/// One lane's verdict files in `dir`, by their name's prefix.
+fn summary_of(dir: &Path, prefix: &str) -> Result<Summary, String> {
     let mut s = Summary::default();
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| e.to_string())?
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("armed-verdicts-") && n.ends_with(".jsonl"))
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(prefix) && n.ends_with(".jsonl"))
         })
         .collect();
     files.sort();
     for f in files {
-        let day = f
-            .file_stem()
-            .and_then(|n| n.to_str())
-            .map(|n| n.trim_start_matches("armed-verdicts-").to_string())
-            .unwrap_or_default();
+        let day = f.file_stem().and_then(|n| n.to_str()).map(|n| n.trim_start_matches(prefix).to_string()).unwrap_or_default();
         for line in std::fs::read_to_string(&f).map_err(|e| e.to_string())?.lines() {
             let Ok(v) = serde_json::from_str::<Verdict>(line) else { continue };
             s.arms_judged += 1;
@@ -1233,6 +1261,23 @@ pub fn summary(dir: &Path) -> Result<Summary, String> {
             let reverts = v.quote_error.as_deref().is_some_and(|e| e.contains("revert"));
             let usd_of = |net: &Option<String>| net.as_deref().and_then(|n| n.parse::<f64>().ok()).map_or(0.0, |n| n / 1e18 * v.weth_usd);
             s.ours += u64::from(v.ours);
+            if let Some(z) = &v.sized {
+                // In the start token's units.
+                let usd = |units: &str| {
+                    let units = units.parse::<f64>().unwrap_or(0.0);
+                    if v.start == Some(apex_exec::lean2::USDC) { units / 1e6 } else { units / 1e18 * v.weth_usd }
+                };
+                let d = s.sized_days.entry(day.clone()).or_default();
+                d.fires += 1;
+                *d.outcomes.entry(z.outcome.clone()).or_default() += 1;
+                d.beyond_cap_usd += usd(&z.beyond_cap);
+                d.beyond_steps_usd += usd(&z.beyond_steps);
+                d.ladder_end += u64::from(z.ladder_end);
+                if let Some(sim) = &v.sim {
+                    d.simulated += 1;
+                    d.sim_agreed += u64::from(sim.agrees);
+                }
+            }
             for (judged, by_day) in [(&v.own, &mut s.own), (&v.alt, &mut s.alt), (&v.base, &mut s.base)] {
                 let Some(o) = judged else { continue };
                 let d = by_day.entry(day.clone()).or_default();

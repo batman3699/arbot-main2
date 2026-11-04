@@ -169,6 +169,62 @@ fn the_summary_sums_the_other_rule_and_the_baseline() {
     assert!(s.own.is_empty());
 }
 
+/// R40.1: the sized lane's verdicts are summarised beside R39's, never mixed
+/// with them, and each day counts what the executor would have done at its
+/// fires, what the cap and the step limit left in dollars (USDC at 1:1), the
+/// fires whose ladder ended before the walk, and the day's simulations.
+#[test]
+fn the_summary_reads_the_sized_lane_on_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let sized = |outcome: &str, beyond_cap: &str, beyond_steps: &str, ladder_end: bool| {
+        serde_json::json!({
+            "outcome": outcome, "size": "1", "gross": "1", "beyond_cap": beyond_cap,
+            "beyond_steps": beyond_steps, "steps": 3, "ladder_end": ladder_end,
+        })
+    };
+    let own = serde_json::json!({ "bid_wei_per_gas": "5", "landing": { "optimistic": true, "pessimistic": true }, "net_wei": "4000000000000000" });
+    let lines = [
+        // 0.001 WETH left by the cap at $2,500.
+        verdict(1, true, serde_json::json!({
+            "sized": sized("capped", "1000000000000000", "0", false), "own": own,
+            "sim": { "ok": true, "gross_wei": "1", "gas_used": 1, "agrees": true },
+        })),
+        // 2 USDC left by the step limit.
+        verdict(2, true, serde_json::json!({
+            "start": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            "sized": sized("truncated", "0", "2000000", true),
+            "sim": { "ok": true, "gross_wei": "1", "gas_used": 1, "agrees": false },
+        })),
+        verdict(3, true, serde_json::json!({ "sized": sized("early_exit 1", "0", "0", false) })),
+        verdict(4, true, serde_json::json!({ "shadowed": true, "sized": sized("traded", "0", "0", false) })),
+        verdict(5, false, serde_json::json!({ "trigger_met": false })),
+    ];
+    std::fs::write(dir.path().join("armed-sized-verdicts-2026-11-07.jsonl"), lines.join("\n") + "\n").unwrap();
+    std::fs::write(dir.path().join("armed-verdicts-2026-11-07.jsonl"), verdict(9, false, serde_json::json!({})) + "\n").unwrap();
+
+    let s = summary(dir.path()).unwrap();
+    assert_eq!(s.arms_judged, 1, "R39's lane reads only its own verdicts");
+    assert!(s.sized_days.is_empty());
+    let z = s.sized.expect("the sized lane's verdicts are summarised");
+    assert_eq!(z.arms_judged, 5);
+    assert_eq!(z.own["2026-11-07"].net_usd_pessimistic, 10.0, "its own bids sum as R39's do");
+    let d = &z.sized_days["2026-11-07"];
+    assert_eq!(d.fires, 3, "a shadowed fire is not counted");
+    let outcomes: Vec<(&str, u64)> = d.outcomes.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    assert_eq!(outcomes, [("capped", 1), ("early_exit 1", 1), ("truncated", 1)]);
+    assert_eq!((d.beyond_cap_usd, d.beyond_steps_usd), (2.5, 2.0));
+    assert_eq!(d.ladder_end, 1);
+    assert_eq!((d.simulated, d.sim_agreed), (2, 1));
+}
+
+/// Without sized verdicts there is no sized summary.
+#[test]
+fn the_summary_has_no_sized_lane_without_its_verdicts() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("armed-verdicts-2026-11-07.jsonl"), verdict(1, false, serde_json::json!({})) + "\n").unwrap();
+    assert!(summary(dir.path()).unwrap().sized.is_none());
+}
+
 /// Whether a transaction closed its flashblock, from the flashblock ledger:
 /// block 53,254,698's flashblock 1 held transactions 1-7 (live arm 3114).
 #[test]

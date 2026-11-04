@@ -615,6 +615,15 @@ simulated fire's `sim.agrees`; the reservations and budget hold; overlapping
 arms behave. Early exits, capped and truncated value, and the comparison
 with R39 are reported, not gated.
 
+`ops/host/remote.sh armed-sized` prints both lanes' `own` by day (the arms'
+own bids, pessimistic and optimistic: `r39_own` and `sized_own`), and the
+sized lane's `sized_days`; `apex armed-eval --summary` has it all, R39's at
+the top level and the sized lane's under `sized`. For each day, `sized_days`
+give the fires by outcome, `beyond_cap_usd` and `beyond_steps_usd` (what the
+cap and `maxSteps` left), `ladder_end` (fires the book's ladder ended before
+the walk: the mirror short of the chain), and `simulated` against
+`sim_agreed`, which must be equal.
+
 ### c. Deploy, authorize, flip (the owner, then the host)
 
 1. Forge clean, `forge build script/DeployLeanExecutor3.s.sol`, a dry run, then

@@ -8,6 +8,7 @@
 #   ops/host/remote.sh warnings      # every WARN and ERROR line since the unit started
 #   ops/host/remote.sh analyze       # the contest analyzer over the run so far (G1, G2)
 #   ops/host/remote.sh armed         # armed-shadow's bid curve so far (R26)
+#   ops/host/remote.sh armed-sized   # the sized lane's summary: gate C (R40.1)
 #   ops/host/remote.sh live          # the last report's armed section: armed-live (R36)
 #
 # The host is the running instance tagged Name=apex-shadow. Override with
@@ -39,6 +40,7 @@ case "${1:-status}" in
   warnings) cmd="journalctl -u apex-shadow --no-pager -o cat | sed '$strip' | grep -E ' (WARN|ERROR) ' | cut -c1-240 | tail -60" ;;
   analyze) cmd="cd /opt/apex/scripts/data && APEX_SECRET_BLOCKPI_KEY=\"\$(sed -n 's/^APEX_SECRET_BLOCKPI_KEY=//p' /etc/apex/shadow.env)\" python3 race_analysis.py --dir /opt/apex/var/apex --delta-ms $delta_ms --out /root/race_rows.jsonl 2>&1 | tail -60" ;;
   armed) cmd='/opt/apex/bin/apex armed-eval --summary --dir /opt/apex/var/apex 2>&1 | tail -120' ;;
+  armed-sized) cmd='/opt/apex/bin/apex armed-eval --summary --dir /opt/apex/var/apex 2>/dev/null | python3 -c "import json,sys; s=json.load(sys.stdin); z=s.get(\"sized\") or {}; print(json.dumps({\"r39_own\": s.get(\"own\"), \"sized_own\": z.get(\"own\"), \"sized_days\": z.get(\"sized_days\"), \"sized_simulated\": z.get(\"simulated\"), \"sized_sim_agreed\": z.get(\"sim_agreed\")}, indent=1))" | head -200' ;;
   live) cmd='tail -1 /opt/apex/var/apex/shadow.report.jsonl | python3 -c "import json,sys; a=json.load(sys.stdin)[\"armed\"]; a.pop(\"engine\", None); print(json.dumps(a, indent=1))" | head -200' ;;
   *) sed -n '2,15p' "$0"; exit 1 ;;
 esac
