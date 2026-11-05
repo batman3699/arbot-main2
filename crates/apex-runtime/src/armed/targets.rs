@@ -5,9 +5,40 @@
 //! 32-byte pool ID.
 
 use alloy_primitives::{Address, B256};
+use ethers_core::types::U256;
 use serde::Deserialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
+
+/// R41.2: the band edges in wei, ascending, and each band's winners: one
+/// more list than edges.
+pub type Bands = (Arc<[u128]>, Vec<Arc<[u128]>>);
+
+/// R41.2: a route's measured winners' bids per gas, by the size of the gap
+/// they took: cheap gaps are won at a few Mwei a gas, $1 ones at gwei.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RouteWinners {
+    /// Every band's, R36's list: what a rung bids against with no bands.
+    pub all: Arc<[u128]>,
+    pub bands: Option<Bands>,
+}
+
+impl RouteWinners {
+    /// R36's winners alone.
+    pub fn unbanded(all: Vec<u128>) -> Self {
+        Self { all: all.into(), bands: None }
+    }
+
+    /// The winners a rung taking `surplus_wei` bids against: those of gaps
+    /// its size. An edge opens the band above it.
+    pub fn at(&self, surplus_wei: U256) -> &[u128] {
+        match &self.bands {
+            Some((edges, lists)) => &lists[edges.iter().take_while(|e| surplus_wei >= U256::from(**e)).count()],
+            None => &self.all,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(try_from = "RawRoute")]
@@ -20,6 +51,8 @@ pub struct TargetRoute {
     /// The route's own winners' effective priority fees per gas, when it has
     /// twenty or more.
     pub bids_wei_per_gas: Option<Vec<u128>>,
+    /// R41.2: the same by gap band, a band empty under twenty of its own.
+    pub bands_wei_per_gas: Option<Vec<Vec<u128>>>,
     /// R37: the token the route starts in and gains; WETH when unnamed.
     pub start: Address,
     /// R37: the route's v4 pools' IDs, as the census named them.
@@ -35,6 +68,8 @@ struct RawRoute {
     arbs: u32,
     #[serde(default)]
     bids_wei_per_gas: Option<Vec<u128>>,
+    #[serde(default)]
+    bands_wei_per_gas: Option<Vec<Vec<u128>>>,
     #[serde(default)]
     start: Option<Address>,
 }
@@ -62,6 +97,7 @@ impl TryFrom<RawRoute> for TargetRoute {
             usd: r.usd,
             arbs: r.arbs,
             bids_wei_per_gas: r.bids_wei_per_gas,
+            bands_wei_per_gas: r.bands_wei_per_gas,
             start: r.start.unwrap_or(crate::live::frontier::WETH),
             v4_ids,
         })
@@ -77,10 +113,19 @@ pub struct Targets {
     pub routes: Vec<TargetRoute>,
     /// Every targeted route's winners, ascending.
     pub bids_wei_per_gas: Vec<u128>,
+    /// R41.2: the gap bands' edges in wei, ascending.
+    #[serde(default)]
+    pub band_edges_wei: Option<Vec<u128>>,
     /// R38: the census's contest sample, read only by [`Targets::share_sample`]
     /// so that a malformed one never refuses the targets.
     #[serde(default)]
     pub contest: Option<serde_json::Value>,
+    /// R41.2: each route's winners, and everyone's (R36's, unbanded),
+    /// built by `load`.
+    #[serde(skip)]
+    winners: BTreeMap<[Address; 2], RouteWinners>,
+    #[serde(skip)]
+    everyone: RouteWinners,
 }
 
 /// R38: the contest section as the census writes it; its `report` is for
@@ -100,7 +145,7 @@ impl Targets {
     pub fn load(path: &Path, now_unix: u64, max_age_s: u64) -> Result<Self, String> {
         let shown = path.display();
         let text = std::fs::read_to_string(path).map_err(|e| format!("targets file {shown}: {e}"))?;
-        let t: Self = serde_json::from_str(&text).map_err(|e| format!("targets file {shown}: {e}"))?;
+        let mut t: Self = serde_json::from_str(&text).map_err(|e| format!("targets file {shown}: {e}"))?;
         let at = unix_of(&t.generated_at)
             .ok_or_else(|| format!("targets file {shown}: generated_at {:?} is not YYYY-MM-DDTHH:MM:SSZ", t.generated_at))?;
         let age = now_unix.saturating_sub(at);
@@ -118,7 +163,31 @@ impl Targets {
                 return Err(format!("targets file {shown}: the route {:#x}, {:#x} is worth {}", r.pools[0], r.pools[1], r.usd));
             }
         }
+        t.index();
         Ok(t)
+    }
+
+    /// R41.2: each route's winners by band: its own where the census measured
+    /// twenty, its R36 list otherwise, so only a route with its own evidence
+    /// bids differently. Edges that do not ascend, or a route's bands that do
+    /// not line up with them, are not read: R36's lists.
+    fn index(&mut self) {
+        let all: Arc<[u128]> = Arc::from(self.bids_wei_per_gas.as_slice());
+        let edges: Option<Arc<[u128]>> =
+            self.band_edges_wei.as_ref().filter(|e| e.windows(2).all(|w| w[0] < w[1])).map(|e| Arc::from(e.as_slice()));
+        let mut by_route = BTreeMap::new();
+        for r in &self.routes {
+            let own_all: Arc<[u128]> = r.bids_wei_per_gas.as_deref().map_or_else(|| Arc::clone(&all), Arc::from);
+            let own = r.bands_wei_per_gas.as_ref();
+            let bands = edges.as_ref().zip(own.filter(|b| edges.as_ref().is_some_and(|e| b.len() == e.len() + 1))).map(|(edges, own)| {
+                let lists = own.iter().map(|b| if b.is_empty() { Arc::clone(&own_all) } else { Arc::from(b.as_slice()) }).collect();
+                (Arc::clone(edges), lists)
+            });
+            // As `bids_for`: the first route on these pools, in either start token.
+            by_route.entry(r.pools).or_insert(RouteWinners { all: own_all, bands });
+        }
+        self.everyone = RouteWinners { all, bands: None };
+        self.winners = by_route;
     }
 
     /// Every pool a targeted route uses.
@@ -146,6 +215,12 @@ impl Targets {
             .find(|r| r.pools == [weth_in, other])
             .and_then(|r| r.bids_wei_per_gas.as_deref())
             .unwrap_or(&self.bids_wei_per_gas)
+    }
+
+    /// R41.2: the winners an arm on that route bids against, by the gap it
+    /// would take: `bids_for`'s, banded when the census banded them.
+    pub fn winners_for(&self, weth_in: Address, other: Address) -> RouteWinners {
+        self.winners.get(&[weth_in, other]).unwrap_or(&self.everyone).clone()
     }
 
     /// R38: the contest sample the arms' `best_share` bids against, or why

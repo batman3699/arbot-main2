@@ -169,6 +169,107 @@ class Build(unittest.TestCase):
             self.assertEqual(path.read_text().strip(), '{"ok":true,"bids_wei_per_gas":[1,2]}')
 
 
+class Bands(unittest.TestCase):
+    """R41.2: winners banded by the gap they took."""
+
+    def test_r36_bids_stay_the_winners_from_a_dollar(self):
+        rows = [arb(usd=0.5, prio=5, gas=1)] * 20 + [arb(usd=2.0, prio=9, gas=1)] * 20
+        out = T.build([{"eth_usd": 2500.0, "arbs": rows}] * 3, top=50)
+        self.assertEqual(out["bids_wei_per_gas"], [9] * 60)
+        self.assertEqual(out["routes"][0]["bids_wei_per_gas"], [9] * 60)
+        self.assertEqual([r["bid"] for r in out["calibration"]], [9] * 4, "calibrated on the same winners")
+
+    def test_each_band_holds_the_winners_of_its_gaps(self):
+        rows = ([arb(usd=0.02, prio=10**6, gas=1)] * 20 + [arb(usd=2.0, prio=2 * 10**9, gas=1)] * 20
+                + [arb(usd=5.0, prio=10**9, gas=1)] * 20 + [arb(usd=50.0, prio=10**8, gas=1)] * 5)
+        out = T.build([{"eth_usd": 2500.0, "arbs": rows}], top=50)
+        self.assertEqual(out["band_edges_wei"], [4 * 10**14, 12 * 10**14, 4 * 10**15])
+        self.assertEqual(out["routes"][0]["bands_wei_per_gas"],
+                         [[10**6] * 20, [2 * 10**9] * 20, [10**9] * 20, []],
+                         "a band under twenty of the route's own is left to its R36 list")
+
+    def test_an_edge_opens_the_band_above_it(self):
+        self.assertEqual([T.band(u) for u in (0.0, 0.99, 1.0, 2.99, 3.0, 9.99, 10.0, 1e6)], [0, 0, 1, 1, 2, 2, 3, 3])
+
+    def test_without_an_eth_price_there_are_no_bands(self):
+        out = T.build([{"arbs": [arb(usd=2.0, prio=9, gas=1)] * 20}] * 3, top=50)
+        self.assertNotIn("band_edges_wei", out)
+        self.assertNotIn("bands_wei_per_gas", out["routes"][0])
+        self.assertTrue(out["ok"])
+
+
+class FakeRpc:
+    """Blocks at base fee 100; receipts at effectiveGasPrice 100 + the tx's
+    number, from 0xff... ; none for a tx in `missing`."""
+
+    def __init__(self, missing=()):
+        self.missing, self.receipts = set(missing), []
+
+    def batch(self, calls):
+        out = []
+        for method, params in calls:
+            if method == "eth_getBlockByNumber":
+                out.append({"baseFeePerGas": hex(100)})
+            else:
+                self.receipts.append(params[0])
+                tx = params[0]
+                out.append(None if tx in self.missing else
+                           {"effectiveGasPrice": hex(100 + int(tx, 16)), "gasUsed": hex(200_000), "from": "0xFF", "to": "0xEE"})
+        return out
+
+
+def cheap(tx, **kw):
+    out = arb(usd=0.05, **kw)
+    out.update(tx=tx, block=7)
+    return out
+
+
+class SampleSmall(unittest.TestCase):
+    ROUTE = {("pa", "pb", WETH)}
+
+    def day(self):
+        # The three passed over sort first: a sampler that took them would
+        # read them before 0x01.
+        return {"arbs": [cheap("0x03"), cheap("0x01"), cheap("0x02"),
+                         dict(cheap("0x00"), usd=2.0),                       # read by the race census
+                         cheap("0x000", offset=1),                           # not a trigger-block winner
+                         cheap("0x0000", pools=("pc", "pd"), weth_in="pc")]}  # not a selected route
+
+    def test_the_lowest_hashes_of_each_route_are_read(self):
+        day, rpc = self.day(), FakeRpc()
+        self.assertEqual(T.sample_small(day, self.ROUTE, rpc, per_route=2), 2)
+        self.assertEqual(rpc.receipts, ["0x01", "0x02"])
+        by_tx = {a["tx"]: a for a in day["arbs"]}
+        self.assertEqual((by_tx["0x01"]["prio"], by_tx["0x01"]["gas"], by_tx["0x01"]["sender"]), (1, 200_000, "0xff"))
+        self.assertIsNone(by_tx["0x03"]["prio"])
+
+    def test_a_rerun_reads_only_what_is_left(self):
+        day = self.day()
+        T.sample_small(day, self.ROUTE, FakeRpc(), per_route=2)
+        rpc = FakeRpc()
+        self.assertEqual(T.sample_small(day, self.ROUTE, rpc, per_route=2), 0)
+        self.assertEqual(rpc.receipts, [])
+        self.assertEqual(T.sample_small(day, self.ROUTE, rpc, per_route=3), 1)
+        self.assertEqual(rpc.receipts, ["0x03"])
+
+    def test_one_that_does_not_read_is_marked_and_passed_over(self):
+        day = self.day()
+        self.assertEqual(T.sample_small(day, self.ROUTE, FakeRpc(missing={"0x01"}), per_route=2), 1)
+        rpc = FakeRpc()
+        self.assertEqual(T.sample_small(day, self.ROUTE, rpc, per_route=2), 1)
+        self.assertEqual(rpc.receipts, ["0x03"], "0x01 is not asked for again")
+
+    def test_the_sampled_winners_band_and_leave_r36_alone(self):
+        days = []
+        for _ in range(3):
+            day = {"eth_usd": 2500.0, "arbs": [cheap(f"0x{i:02x}") for i in range(1, 31)]}
+            T.sample_small(day, self.ROUTE, FakeRpc(), per_route=10)
+            days.append(day)
+        out = T.build(days, top=50)
+        self.assertEqual(out["bids_wei_per_gas"], [])
+        self.assertEqual(out["routes"][0]["bands_wei_per_gas"][0], sorted(list(range(1, 11)) * 3))
+
+
 class MarketShare(unittest.TestCase):
     def test_our_landings_are_set_against_market_per_route_and_day(self):
         day = {"day": "2026-10-25", "eth_usd": 2500.0,

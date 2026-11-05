@@ -10,6 +10,7 @@ use apex_math::cl_swap::TickLadder;
 use apex_runtime::armed::bid::{best_bid, rank_value, Bid, BidModel, ShareSample};
 use apex_runtime::armed::engine::{bid_and_band, BidInputs, Engine, EngineSettings, REPRICE_BUDGET};
 use apex_runtime::armed::lines::ArmedLine;
+use apex_runtime::armed::targets::RouteWinners;
 use apex_runtime::armed::threshold::{band_paying, fixed, rungs, Pricing};
 use apex_runtime::econ::RouteCosts;
 use apex_runtime::live::book::PoolSnapshot;
@@ -198,7 +199,7 @@ fn every_arm_carries_its_bid() {
         max_size_wei: u128::MAX,
         max_size_usdc: u128::MAX,
     };
-    let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _| BIDS.to_vec()));
+    let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _| RouteWinners::unbanded(BIDS.to_vec())));
     let arms: Vec<_> = engine
         .tick(&snap, 1_000, 5_000_000, &px(), 1)
         .into_iter()
@@ -237,8 +238,34 @@ fn a_rung_that_outbids_no_one_takes_no_sender() {
         max_size_usdc: u128::MAX,
     };
     // Winners who paid a whole ETH per gas: no surplus here outbids them.
-    let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _| vec![10u128.pow(18)]));
+    let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _| RouteWinners::unbanded(vec![10u128.pow(18)])));
     assert!(engine.tick(&snap, 1_000, 5_000_000, &px(), 1).is_empty());
+}
+
+/// R41.2: a rung bids against the winners of gaps its size: winners it
+/// outbids under the edge, a whole ETH a gas over it. R36's list, a whole ETH
+/// too, is not read once there are bands.
+#[test]
+fn a_rung_bids_against_its_own_bands_winners() {
+    let snap = snap();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let arms = |edge: u128| -> Vec<_> {
+        let whole_eth: Arc<[u128]> = vec![10u128.pow(18)].into();
+        let w = RouteWinners { all: Arc::clone(&whole_eth), bands: Some((vec![edge].into(), vec![BIDS.to_vec().into(), whole_eth])) };
+        Engine::new(cycles.clone(), settings(20_000_000), BTreeSet::new())
+            .with_bids(Arc::new(move |_, _| w.clone()))
+            .tick(&snap, 1_000, 5_000_000, &px(), 1)
+            .into_iter()
+            .filter_map(|l| if let ArmedLine::Arm(a) = l { Some(a) } else { None })
+            .collect()
+    };
+    let under = arms(u128::MAX);
+    assert!(!under.is_empty(), "every rung under the edge outbids some cheap winner");
+    for a in &under {
+        let bid: u128 = a.bid_wei_per_gas.parse().unwrap();
+        assert!(bid == 0 || BIDS.iter().any(|b| b + 1 == bid), "a cheap winner's bid + 1 wei: {bid}");
+    }
+    assert!(arms(0).is_empty(), "every rung over the edge faces a whole ETH a gas");
 }
 
 /// R38: with the census's contest sample, every arm records the rule that
@@ -254,7 +281,7 @@ fn every_arm_carries_both_rules_bids() {
     let mut sent_by = Vec::new();
     for (model, label) in [(BidModel::BestBid, "best_bid"), (BidModel::BestShare, "best_share")] {
         let engine = Engine::new(cycles.clone(), settings(20_000_000), BTreeSet::new())
-            .with_bids(Arc::new(|_, _| BIDS.to_vec()))
+            .with_bids(Arc::new(|_, _| RouteWinners::unbanded(BIDS.to_vec())))
             .with_contest(Some(Arc::clone(&sample)), model);
         let arms: Vec<_> = engine
             .tick(&snap, 1_000, 5_000_000, &px(), 1)
@@ -281,7 +308,7 @@ fn every_arm_carries_both_rules_bids() {
 fn without_a_sample_an_arm_records_best_bid_alone() {
     let snap = snap();
     let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
-    let engine = Engine::new(cycles, settings(20_000_000), BTreeSet::new()).with_bids(Arc::new(|_, _| BIDS.to_vec()));
+    let engine = Engine::new(cycles, settings(20_000_000), BTreeSet::new()).with_bids(Arc::new(|_, _| RouteWinners::unbanded(BIDS.to_vec())));
     let arms: Vec<_> = engine
         .tick(&snap, 1_000, 5_000_000, &px(), 1)
         .into_iter()

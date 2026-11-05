@@ -316,16 +316,27 @@ def _race_day(rpc, resolver, ledger, lo, hi, say, back=BACK_BLOCKS):
             a["offset"] = block_offset(a["block"], t[0])
         a["timing"] = "no_trigger" if not t else "unseen" if a["offset"] is None else "ok"
     want = [a for a in arbs if a["usd"] >= VALUED_USD and a["category"] in ("v4_with_ours", "ours")]
+    base, _ = read_prio(rpc, want)
+    return {"lo": lo, "hi": hi, "back_blocks": back, "eth_usd": usd.get(V.WETH, 0.0), "unresolved_pools": len(getattr(resolver, "failed", ())),
+            "base_fee_median": statistics.median(base.values()) if base else None, "arbs": arbs}
+
+
+def read_prio(rpc, want):
+    """Each arbitrage in `want` given its receipt's priority fee per gas over
+    its block's base fee, its gas, sender and destination. Returns the base
+    fees read and the arbitrages read; one whose receipt or block did not
+    read is left as it was."""
     blocks = sorted({a["block"] for a in want})
     heads = rpc.batch([("eth_getBlockByNumber", [hex(x), False]) for x in blocks])
     base = {x: int(h["baseFeePerGas"], 16) for x, h in zip(blocks, heads) if h}
+    read = []
     for a, r in zip(want, rpc.batch([("eth_getTransactionReceipt", [a["tx"]]) for a in want])):
         if r and a["block"] in base:
             a["prio"] = max(0, int(r["effectiveGasPrice"], 16) - base[a["block"]])
             a["base_fee"], a["gas"] = base[a["block"]], int(r["gasUsed"], 16)
             a["sender"], a["to"] = r["from"].lower(), (r.get("to") or "").lower()
-    return {"lo": lo, "hi": hi, "back_blocks": back, "eth_usd": usd.get(V.WETH, 0.0), "unresolved_pools": len(getattr(resolver, "failed", ())),
-            "base_fee_median": statistics.median(base.values()) if base else None, "arbs": arbs}
+            read.append(a)
+    return base, read
 
 
 def day_range(var, day):

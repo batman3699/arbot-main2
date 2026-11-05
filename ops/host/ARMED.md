@@ -241,6 +241,17 @@ the canary is not restarted into a live boot that would refuse it.
 - It reads the flashblock ledgers in `var/apex`. A new revision's archive
   moves those, so until a day passes it falls back to block offsets.
 - Targets older than `targets_max_age_s` (2 days) stop a live boot.
+- R41.2: winners bid by the gap they take, so each route's bids are banded
+  by gap value (under $1, $1-3, $3-10, $10 up). A rung bids against its own
+  band's winners, or the route's R36 list where the route has fewer than
+  twenty there. The race census reads receipts from $1 only, so the census
+  also reads 40 of each selected route's cheaper trigger-block winners a day
+  into the day's cache ("read N cheap winners' receipts"). The first run
+  backfills the seven days, about 20 minutes over the public endpoints;
+  after that it is about 3 minutes a run.
+- Why (2026-11-05): with $1 winners alone, the AXIS/USDC route's sample was
+  the 10-29 spike's 3.2 gwei bids, so its cheap rungs ranked at about nothing
+  and R39 stopped landing. Its cheap winners bid 1-80 Mwei a gas.
 
 ### Denim (since 2026-11-05)
 

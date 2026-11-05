@@ -39,6 +39,13 @@ UTC = timezone.utc
 CACHE_SCHEMA_VERSION = 1
 MIN_ROUTE_BIDS = 20
 MAX_U128 = (1 << 128) - 1
+# R41.2: winners bid by the gap they take (11-04: under $1 a median 8.8 Mwei a
+# gas, 55% of the gap; $1-3 72%; $3-10 34%; $10-100 27%; $100 up 9%), so each
+# route's bids are banded by gap value, and a rung bids against its own band.
+# The first edge is where the race census reads receipts.
+BAND_EDGES_USD = (race.VALUED_USD, 3.0, 10.0)
+# R41.2: the cheap winners whose receipts are read, per selected route and day.
+SMALL_SAMPLE = 40
 # R37: the tokens a route may start in, and gain.
 STARTS = frozenset({WETH, USDC})
 VENUES = race.OURS | {race.V4}
@@ -169,6 +176,43 @@ def _observed_bid(arb: Mapping[str, Any]) -> int | None:
     return bid
 
 
+def band(usd: float) -> int:
+    """R41.2: the gap band of an arbitrage worth ``usd``: 0 under the first
+    of ``BAND_EDGES_USD``, one more from each edge it reaches."""
+    return sum(usd >= edge for edge in BAND_EDGES_USD)
+
+
+def sample_small(day: Mapping[str, Any], selected: set[tuple[str, str, str]], rpc: Any,
+                 per_route: int = SMALL_SAMPLE) -> int:
+    """R41.2: read the receipts of up to ``per_route`` of each selected
+    route's eligible winners worth under ``race.VALUED_USD`` on ``day``,
+    whose priority fees the race census does not read: the bids a cheap rung
+    contests. The sample is the lowest transaction hashes, so a rerun reads
+    only what an earlier one did not, and one whose receipt did not read is
+    marked and passed over. Returns how many were read."""
+    by_route: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for arb in day.get("arbs", []):
+        if not select(arb):
+            continue
+        key = _build_key(arb)
+        usd = _finite_number(arb.get("usd"))
+        if key in selected and usd is not None and 0 <= usd < race.VALUED_USD:
+            by_route[key].append(arb)
+    want: list[dict[str, Any]] = []
+    for arbs in by_route.values():
+        have = sum(arb.get("prio") is not None for arb in arbs)
+        todo = sorted((a for a in arbs if a.get("prio") is None and not a.get("prio_unread")), key=lambda a: str(a.get("tx")))
+        want += todo[:max(0, per_route - have)]
+    if not want:
+        return 0
+    _, read = race.read_prio(rpc, want)
+    got = {id(arb) for arb in read}
+    for arb in want:
+        if id(arb) not in got:
+            arb["prio_unread"] = True
+    return len(read)
+
+
 def _day_label(day: Mapping[str, Any]) -> str | None:
     value = day.get("date") or day.get("day")
     if not isinstance(value, str):
@@ -225,7 +269,9 @@ def _selected_route_observations(
             # Keep calibration and the aggregate bid CDF consistent with the
             # observations admitted to route ranking and per-route samples.
             usd = _finite_number(arb.get("usd"))
-            if usd is None or usd < 0:
+            # R41.2: R36's bids are the winners from VALUED_USD, as before
+            # the cheap ones were read; those are in the bands only.
+            if usd is None or usd < race.VALUED_USD:
                 continue
             bid = _observed_bid(arb)
             if bid is None:
@@ -299,12 +345,14 @@ def build(days: Sequence[Mapping[str, Any]], top: int = 50) -> dict[str, Any]:
                     finite_source_data = False
 
             item = by_route.setdefault(key, {"pools": [key[0], key[1]], "start": key[2], "usd": 0.0,
-                                             "arbs": 0, "_bids": []})
+                                             "arbs": 0, "_bids": [], "_bands": [[] for _ in range(len(BAND_EDGES_USD) + 1)]})
             item["usd"] += usd
             item["arbs"] += 1
             bid = _observed_bid(arb)
             if bid is not None:
-                item["_bids"].append(bid)
+                if usd >= race.VALUED_USD:
+                    item["_bids"].append(bid)
+                item["_bands"][band(usd)].append(bid)
             if not math.isfinite(item["usd"]):
                 finite_source_data = False
 
@@ -312,11 +360,19 @@ def build(days: Sequence[Mapping[str, Any]], top: int = 50) -> dict[str, Any]:
     selected_pairs = ordered[:top]
     selected_keys = {key for key, _ in selected_pairs}
 
+    # R41.2: the edges in wei at the last day's ETH price, which the runtime
+    # compares a rung's surplus with; without one there are no bands.
+    eth_usd = next((p for p in (_finite_number(day.get("eth_usd")) for day in reversed(days)) if p and p > 0), None)
+    banded = eth_usd is not None
     routes: list[dict[str, Any]] = []
     for key, item in selected_pairs:
         row: dict[str, Any] = {"pools": item["pools"], "start": item["start"], "usd": item["usd"], "arbs": item["arbs"]}
         if len(item["_bids"]) >= MIN_ROUTE_BIDS:
             row["bids_wei_per_gas"] = sorted(item["_bids"])
+        if banded:
+            # A band with too few of the route's own is left empty: the
+            # runtime bids it against the route's R36 list, as before bands.
+            row["bands_wei_per_gas"] = [sorted(b) if len(b) >= MIN_ROUTE_BIDS else [] for b in item["_bands"]]
         routes.append(row)
 
     all_bids, _, bids_by_day = _selected_route_observations(days, selected_keys)
@@ -353,6 +409,8 @@ def build(days: Sequence[Mapping[str, Any]], top: int = 50) -> dict[str, Any]:
         # in each (offset 0 in the day's own unit).
         "units": {_day_label(day): day.get("offset_unit") for day in days if _day_label(day)},
     }
+    if banded:
+        payload["band_edges_wei"] = [int(edge * 10**18 / eth_usd) for edge in BAND_EDGES_USD]
     payload["ok"] = bool(enough_days and routes and finite_source_data and _all_finite(payload))
     return payload
 
@@ -735,6 +793,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         data["date"] = day
         days.append(data)
 
+    # R41.2: the selected routes' cheap winners, read once into each day's
+    # cache; the ranking is by value alone, so the second build selects the
+    # same routes.
+    selected = {(r["pools"][0], r["pools"][1], r["start"]) for r in build(days, args.top)["routes"]}
+    for day, data in zip(days_to_process, days):
+        read = sample_small(data, selected, rpc)
+        if read:
+            _atomic_gzip_json(race_dir / f"race-{day}.json.gz", data)
+            print(f"{day}: read {read} cheap winners' receipts", flush=True)
     targets = build(days, args.top)
     # R38: the armed bid's contest sample, from our own judged fires. It
     # never changes whether the targets publish.

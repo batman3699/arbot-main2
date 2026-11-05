@@ -776,7 +776,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     let armed = Arc::new(crate::armed::engine::Engine::new(armed_set.clone(), engine_settings, unarmable)
     .with_bids({
         let t = targets.clone();
-        Arc::new(move |weth_in, other| t.as_ref().map_or_else(Vec::new, |t| t.bids_for(weth_in, other).to_vec()))
+        Arc::new(move |weth_in, other| t.as_ref().map_or_else(Default::default, |t| t.winners_for(weth_in, other)))
     })
     .with_contest(contest, config.armed.bid_model));
     // R36: the move statistics an earlier run saved (or a seed wrote), so the

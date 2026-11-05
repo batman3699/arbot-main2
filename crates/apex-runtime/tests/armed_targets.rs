@@ -12,6 +12,7 @@ use apex_runtime::live::frontier::{self, WETH};
 use apex_runtime::live::inventory::{self, PoolSpec, UniverseFilter, Venue};
 use apex_runtime::shadow::config::{ArmedConfig, ArmedMode};
 use apex_types::ids::ChainId;
+use ethers_core::types::U256;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -106,6 +107,50 @@ fn a_route_without_twenty_bids_bids_against_everyone_s() {
     assert_eq!(t.bids_for(p(1), p(2)), &[5, 6]);
     assert_eq!(t.bids_for(p(3), p(4)), &[1, 2, 3]);
     assert_eq!(t.bids_for(p(7), p(8)), &[1, 2, 3], "a route not targeted bids against everyone's too");
+}
+
+/// R41.2: a file with gap band `edges`, p(1), p(2)'s own bands `own` beside
+/// its R36 list [5, 6], p(3), p(4) with neither, and everyone's [1, 2, 3].
+fn banded_targets(edges: &str, own: &str) -> String {
+    let banded = format!(
+        r#"{{"pools":["{:#x}","{:#x}"],"usd":12.5,"arbs":3,"bids_wei_per_gas":[5,6],"bands_wei_per_gas":{own}}}"#,
+        p(1),
+        p(2)
+    );
+    let routes = [banded, route(p(3), p(4), None)].join(",");
+    let t = targets_json("2026-10-24T01:10:00Z", true, &routes, "1,2,3");
+    t.replacen(r#""calibration":[]"#, &format!(r#""calibration":[],"band_edges_wei":{edges}"#), 1)
+}
+
+#[test]
+fn a_rung_s_winners_are_its_band_s_own_else_its_r36_list() {
+    let t = load(&banded_targets("[100,1000]", "[[7],[],[9]]"), GENERATED).unwrap();
+    let w = t.winners_for(p(1), p(2));
+    assert_eq!(w.at(U256::from(99)), &[7], "its own band");
+    assert_eq!(w.at(U256::from(100)), &[5, 6], "an edge opens the band above; under twenty of its own there, its R36 list");
+    assert_eq!(w.at(U256::from(5_000)), &[9]);
+    assert_eq!(t.winners_for(p(3), p(4)).at(U256::from(50)), &[1, 2, 3], "no bands of its own: R36's, everyone's");
+    assert_eq!(t.winners_for(p(7), p(8)).at(U256::from(50)), &[1, 2, 3], "a route not targeted: everyone's");
+}
+
+#[test]
+fn two_start_tokens_on_one_pool_order_bid_as_the_first_as_r36() {
+    let usdc = format!(r#"{{"pools":["{:#x}","{:#x}"],"usd":1.0,"arbs":3,"start":"{USDC:#x}","bids_wei_per_gas":[8],"bands_wei_per_gas":[[8],[],[]]}}"#, p(1), p(2));
+    let t = banded_targets("[100,1000]", "[[7],[],[]]").replacen(r#"}],"bids_wei_per_gas""#, &format!(r#"}},{usdc}],"bids_wei_per_gas""#), 1);
+    let t = load(&t, GENERATED).unwrap();
+    assert_eq!(t.winners_for(p(1), p(2)).at(U256::from(50)), &[7]);
+    assert_eq!(t.bids_for(p(1), p(2)), &[5, 6]);
+}
+
+#[test]
+fn bands_that_do_not_line_up_are_not_read() {
+    for (edges, own) in [("[1000,100]", "[[7],[],[9]]"), ("[100,1000]", "[[7],[9]]")] {
+        let t = load(&banded_targets(edges, own), GENERATED).unwrap();
+        assert_eq!(t.winners_for(p(1), p(2)).at(U256::from(50)), &[5, 6], "R36's: {edges} {own}");
+        assert_eq!(t.winners_for(p(1), p(2)).at(U256::from(5_000)), &[5, 6], "R36's: {edges} {own}");
+    }
+    let t = load(&targets_json("2026-10-24T01:10:00Z", true, &route(p(1), p(2), Some("5,6")), "1,2,3"), GENERATED).unwrap();
+    assert_eq!(t.winners_for(p(1), p(2)).at(U256::from(50)), t.bids_for(p(1), p(2)), "a file without bands bids as R36's did");
 }
 
 #[test]
