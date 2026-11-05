@@ -24,6 +24,7 @@
 
 use super::bid::{BidModel, ShareSample};
 use super::engine::{position, words_of, BidInputs, EngineStats, RouteBids};
+use super::targets::RouteWinners;
 use super::lines::{Arm, ArmedLine, SizedLine, StartAt};
 use super::moves::{spread_key, MoveStats};
 use super::plan::{sized_call, sized_trade, SizedOutcome, SizedTerms};
@@ -203,7 +204,7 @@ impl SizedEngine {
         };
         Self {
             cycles,
-            bids: Arc::new(|_, _| Vec::new()),
+            bids: Arc::new(|_, _| RouteWinners::default()),
             contest: None,
             bid_model: BidModel::BestBid,
             settings,
@@ -310,7 +311,7 @@ impl SizedEngine {
         let pxc = px.for_cycle(c)?;
         let (terms, lender) = self.terms_for(c, &pxc, l1_upper_wei);
         let winners = (self.bids)(c.legs[0].pool, c.legs[1].pool);
-        let inputs = BidInputs { winners: &winners, sample: self.contest.as_deref(), model: self.bid_model };
+        let inputs = BidInputs { winners: &winners.all, banded: Some(&winners), sample: self.contest.as_deref(), model: self.bid_model };
         let cap = self.settings.max_priority_wei_per_gas;
         let l = usize::from(leg);
         let at5 = sized_points(c, &pair, l, &pxc, &terms, BAND_WIDTHS[0], self.settings.tier2_multiple, &inputs, cap);

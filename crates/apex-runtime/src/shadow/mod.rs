@@ -821,7 +821,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
                     };
                     let t = targets.clone();
                     let engine = crate::armed::sized::SizedEngine::new(armed_set.clone(), settings, unarmable.clone())
-                        .with_bids(Arc::new(move |weth_in, other| t.as_ref().map_or_else(Vec::new, |t| t.bids_for(weth_in, other).to_vec())))
+                        .with_bids(Arc::new(move |weth_in, other| t.as_ref().map_or_else(Default::default, |t| t.winners_for(weth_in, other))))
                         .with_contest(contest.clone(), config.armed.bid_model);
                     if let Some(path) = &config.armed.moves {
                         if let Ok(snap) = crate::armed::moves::MovesSnapshot::load(path) {

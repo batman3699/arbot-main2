@@ -7,6 +7,7 @@ use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::armed::engine::BidInputs;
 use apex_runtime::armed::plan::SizedTerms;
+use apex_runtime::armed::targets::RouteWinners;
 use apex_runtime::armed::threshold::{adverse_edge, expected_net, net_at, sized_points, Pricing, MAX_STEP};
 use apex_runtime::econ::RouteCosts;
 use apex_runtime::live::book::PoolSnapshot;
@@ -133,6 +134,29 @@ fn tier_two_needs_a_bid_at_least_twice_tier_ones() {
     assert_eq!(two.tier, 2);
     assert!(two.step > one.step);
     assert!(two.bid.sent.per_gas >= one.bid.sent.per_gas * 2);
+}
+
+/// R41.2: a point bids against the winners of gaps its size: under an edge
+/// above every net, that band's; over an edge at nothing, the band above's;
+/// never R36's list beside them.
+#[test]
+fn a_point_bids_against_its_own_bands_winners() {
+    let (pair, c) = slot(L);
+    let winners: Vec<u128> = (0u32..60).map(|i| 1_000_000u128 * 10u128.pow(i % 4) * u128::from(1 + i / 4)).collect();
+    let mut sorted = winners.clone();
+    sorted.sort_unstable();
+    let sent = |inputs: &BidInputs| -> Vec<u128> {
+        sized_points(&c, &pair, 0, &px(), &terms(), 5, 10, inputs, 20_000_000_000).iter().map(|p| p.bid.sent.per_gas).collect()
+    };
+    let banded = |edge: u128, under: &[u128], over: &[u128]| RouteWinners {
+        all: NONE.to_vec().into(),
+        bands: Some((vec![edge].into(), vec![under.to_vec().into(), over.to_vec().into()])),
+    };
+    let by = |w: &RouteWinners| sent(&BidInputs { winners: &w.all, banded: Some(w), ..BidInputs::winners(NONE) });
+    let plain = sent(&BidInputs::winners(&sorted));
+    assert!(plain.iter().any(|b| *b > 0), "the winners price some bid");
+    assert_eq!(by(&banded(u128::MAX, &sorted, NONE)), plain, "under the edge: that band's winners");
+    assert_eq!(by(&banded(0, NONE, &sorted)), plain, "over an edge at nothing: the band above's");
 }
 
 #[test]

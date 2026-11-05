@@ -440,7 +440,8 @@ pub fn sized_points(
     let Some(bare) = smallest(1, |s| at(&adverse, s, 0).is_some()) else { return Vec::new() };
     let Some(reference) = at(&pair[other], bare + TIER1_BID_STEPS, 0) else { return Vec::new() };
     let bid_for = |n: &NetAt| {
-        crate::armed::bid::arm_bid(inputs.winners, inputs.sample, inputs.model, n.net_wei, n.gas, cap_wei_per_gas)
+        // R41.2: against the winners of gaps the point's size.
+        crate::armed::bid::arm_bid(inputs.winners_at(n.net_wei), inputs.sample, inputs.model, n.net_wei, n.gas, cap_wei_per_gas)
     };
     let point = |tier: u8, step: u32, bid: crate::armed::bid::ArmBid| -> Option<SizedArmPoint> {
         let trigger = pair[leg].moved(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
