@@ -80,7 +80,10 @@ armed:
   max_priority_wei_per_gas: 20000000000
   daily_loss_budget_wei: 10000000000000000   # 0.01 ETH: realized losses (wins do not offset them) plus everything pending
   max_size_wei: 5000000000000000000          # 5 WETH
-  l1_fee_bound_wei: 50000000000000           # 0.00005 ETH
+  # R40.1 decision 3: the most any landing paid was 8.17e11 (the 10-29 L1
+  # spike); since Denim, under 1.6e10. The sized lane also takes twice the
+  # oracle's upper bound when that is larger.
+  l1_fee_bound_wei: 1000000000000            # 0.000001 ETH
   sender_reserve_wei: 200000000000000        # 0.0002 ETH
   moves: var/armed/moves.json                # the ranking's move statistics, kept across restarts
   # R37: LeanExecutor2 (ops/host/ARMED.md §3), deployed by the owner on
