@@ -7,7 +7,7 @@ The design is `docs/superpowers/specs/2026-10-23-armed-lane-v2-design.md`;
 the plan, `docs/superpowers/plans/2026-10-23-armed-lane-v2.md`.
 
 Every cap is in `ops/canary.base.yaml`'s `armed:` section, which the engine
-and the live worker both read: the daily loss budget (0.01 ETH, realized
+and the live worker both read: the daily loss budget (0.05 ETH since 2026-11-09, step 1 of the operator's $220 limit; realized
 losses plus the worst case of everything pending), the tip cap, the size
 cap, the L1 fee bound and each sender's reserve. `armed.live:` says only where
 things are.

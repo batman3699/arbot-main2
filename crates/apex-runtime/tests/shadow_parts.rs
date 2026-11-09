@@ -457,7 +457,7 @@ fn the_shipped_canary_config_parses() {
     assert_eq!(a.mode, apex_runtime::shadow::config::ArmedMode::Live);
     assert_eq!(a.bid_model, apex_runtime::armed::bid::BidModel::BestBid, "R38: best_bid sends until the operator switches");
     assert_eq!(a.targets.as_deref(), Some(std::path::Path::new("var/armed/targets.json")));
-    assert_eq!((a.daily_loss_budget_wei, a.max_priority_wei_per_gas), (10_000_000_000_000_000, 20_000_000_000));
+    assert_eq!((a.daily_loss_budget_wei, a.max_priority_wei_per_gas), (50_000_000_000_000_000, 20_000_000_000));
     assert_eq!((a.max_size_wei, a.l1_fee_bound_wei, a.sender_reserve_wei), (5_000_000_000_000_000_000, 1_000_000_000_000, 200_000_000_000_000));
     let live = a.live.as_ref().expect("armed.live");
     assert_eq!(live.sequencer, "https://mainnet-sequencer.base.org");
