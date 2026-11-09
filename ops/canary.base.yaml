@@ -78,7 +78,11 @@ armed:
   band_cap_bps: 5
   liquidity_floor_bps: 9800
   max_priority_wei_per_gas: 20000000000
-  daily_loss_budget_wei: 10000000000000000   # 0.01 ETH: realized losses (wins do not offset them) plus everything pending
+  # Operator, 2026-11-09: the most they accept to lose in a day is $220. Step 1
+  # is 0.05 ETH (~$106 at $2,124/ETH); step 2, 0.1 ETH (~$212, the load check's
+  # ceiling), only after positive realised net days, and only while ETH is
+  # under $2,200, so that 0.1 ETH stays within $220.
+  daily_loss_budget_wei: 50000000000000000   # 0.05 ETH: realized losses (wins do not offset them) plus everything pending
   max_size_wei: 5000000000000000000          # 5 WETH
   # R40.1 decision 3: the most any landing paid was 8.17e11 (the 10-29 L1
   # spike); since Denim, under 1.6e10. The sized lane also takes twice the
