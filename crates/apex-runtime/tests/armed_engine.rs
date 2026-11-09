@@ -762,3 +762,102 @@ fn start_at_names_the_arm_s_pools_as_written() {
         }
     }
 }
+
+/// R42: the live worker's senders as the engine's lines leave them: each
+/// slot's arm and the last block of its window. An arm takes its slot only
+/// once the window of the arm there has ended; a renewal re-signs the arm its
+/// slot still carries, or the worker has nothing to re-sign.
+#[derive(Default)]
+struct Worker {
+    senders: BTreeMap<u16, (u64, u64)>,
+    slot_of: BTreeMap<u64, u16>,
+}
+
+impl Worker {
+    fn take(&mut self, lines: &[ArmedLine], head: u64) {
+        for l in lines {
+            match l {
+                ArmedLine::Arm(a) => {
+                    if let Some((held, to)) = self.senders.get(&a.sender_slot) {
+                        assert!(*to <= head, "head {head}: arm {} took sender {} from arm {held}, open to {to}", a.arm_id, a.sender_slot);
+                    }
+                    self.senders.insert(a.sender_slot, (a.arm_id, a.to_block));
+                    self.slot_of.insert(a.arm_id, a.sender_slot);
+                }
+                ArmedLine::Renew { arm_id, to_block, .. } => {
+                    let slot = self.slot_of[arm_id];
+                    let held = self.senders[&slot].0;
+                    assert_eq!(held, *arm_id, "head {head}: a renewal of arm {arm_id}, whose sender {slot} carries arm {held}");
+                    self.senders.insert(slot, (*arm_id, *to_block));
+                }
+            }
+        }
+    }
+}
+
+/// R42: a renewal re-signs its arm on the arm's own sender, which another arm
+/// may have taken once the window ended. On 2026-11-08 11,044 of R39's 23,930
+/// renewals named an arm the worker had replaced: it dropped them, and the
+/// engine counted those arms live for as long as it renewed them, 18% of the
+/// coverage it believed it had. One sender: a still spread ranks rung A first
+/// at 1,000, a moving one rung B at 1,005, and B takes the sender; at 1,006
+/// the spread is still again and A, its plan unchanged, ranks first. B holds
+/// the sender to 1,010, so A waits, and is then armed afresh.
+#[test]
+fn a_renewal_never_re_signs_an_arm_whose_sender_another_took() {
+    use apex_runtime::armed::moves::{spread_key, MovesSnapshot};
+    let (engine, snap) = setup_with(1, REPRICE_BUDGET, 6);
+    let history = |spread_move: f64| {
+        let big = vec![(100.0, 100.0); 400];
+        let small = vec![(spread_move, spread_move); 400];
+        let pools = [(UNI, big.clone()), (SLIP, big), (spread_key(UNI, SLIP), small.clone()), (spread_key(SLIP, UNI), small)];
+        MovesSnapshot { window_ns: 10_000_000_000, saved_at_ns: 0, pools: pools.into_iter().collect() }
+    };
+    let s = 1_000_000_000u64;
+    let mut worker = Worker::default();
+    let mut pass = |spread_move: f64, head: u64| {
+        engine.restore_moves(&history(spread_move)).unwrap();
+        let lines = engine.tick(&snap, head, 5_000_000, &px(), (head - 1_000) * 2 * s + 1);
+        worker.take(&lines, head);
+        lines
+    };
+    let arm_of = |lines: &[ArmedLine]| match lines {
+        [ArmedLine::Arm(a)] => (a.arm_id, (a.trigger_leg, a.rung)),
+        _ => panic!("one arm: {lines:?}"),
+    };
+    let (a_id, a) = arm_of(&pass(0.0, 1_000));
+    let (_, b) = arm_of(&pass(100.0, 1_005));
+    assert_ne!(a, b, "the moving spread ranks another rung first");
+    assert_eq!(pass(0.0, 1_006), vec![], "B holds the one sender to 1,010");
+    let (again_id, again) = arm_of(&pass(0.0, 1_010));
+    assert_eq!(again, a);
+    assert_ne!(again_id, a_id, "armed afresh: the worker no longer holds arm {a_id}");
+}
+
+/// R42: whatever the ranking does pass to pass, the worker holds every arm the
+/// engine renews. Spreads still and moving in turn, on two to four senders, so
+/// rungs keep trading senders.
+#[test]
+fn the_worker_holds_every_arm_the_engine_renews() {
+    use apex_runtime::armed::moves::{spread_key, MovesSnapshot};
+    let history = |spread_move: f64| {
+        let big = vec![(100.0, 100.0); 400];
+        let small = vec![(spread_move, spread_move); 400];
+        let pools = [(UNI, big.clone()), (SLIP, big), (spread_key(UNI, SLIP), small.clone()), (spread_key(SLIP, UNI), small)];
+        MovesSnapshot { window_ns: 10_000_000_000, saved_at_ns: 0, pools: pools.into_iter().collect() }
+    };
+    for max_arms in 2..=4 {
+        let (engine, snap) = setup_with(max_arms, REPRICE_BUDGET, 6);
+        let mut worker = Worker::default();
+        let (mut arms, mut renewals) = (0, 0);
+        for (i, head) in (1_000..1_040u64).enumerate() {
+            engine.restore_moves(&history([0.0, 100.0, 30.0][i / 3 % 3])).unwrap();
+            let lines = engine.tick(&snap, head, 5_000_000, &px(), (head - 1_000) * 2_000_000_000 + 1);
+            worker.take(&lines, head);
+            arms += lines.iter().filter(|l| matches!(l, ArmedLine::Arm(_))).count();
+            renewals += lines.len();
+        }
+        renewals -= arms;
+        assert!(arms > max_arms && renewals > 0, "{max_arms} senders: {arms} arms, {renewals} renewals");
+    }
+}

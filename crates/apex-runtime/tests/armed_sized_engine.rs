@@ -268,3 +268,64 @@ fn a_full_pass_is_timed() {
     let took = started.elapsed();
     eprintln!("{slots} slots priced in {took:?}: {:?} a slot", took / u32::try_from(slots).unwrap_or(1));
 }
+
+/// R42: the live worker's senders as the engine's lines leave them: each
+/// slot's arm and the last block of its window. An arm takes its slot only
+/// once the window of the arm there has ended; a renewal re-signs the arm its
+/// slot still carries, or the worker has nothing to re-sign.
+#[derive(Default)]
+struct Worker {
+    senders: BTreeMap<u16, (u64, u64)>,
+    slot_of: BTreeMap<u64, u16>,
+}
+
+impl Worker {
+    fn take(&mut self, lines: &[ArmedLine], head: u64) {
+        for l in lines {
+            match l {
+                ArmedLine::Arm(a) => {
+                    if let Some((held, to)) = self.senders.get(&a.sender_slot) {
+                        assert!(*to <= head, "head {head}: arm {} took sender {} from arm {held}, open to {to}", a.arm_id, a.sender_slot);
+                    }
+                    self.senders.insert(a.sender_slot, (a.arm_id, a.to_block));
+                    self.slot_of.insert(a.arm_id, a.sender_slot);
+                }
+                ArmedLine::Renew { arm_id, to_block, .. } => {
+                    let slot = self.slot_of[arm_id];
+                    let held = self.senders[&slot].0;
+                    assert_eq!(held, *arm_id, "head {head}: a renewal of arm {arm_id}, whose sender {slot} carries arm {held}");
+                    self.senders.insert(slot, (*arm_id, *to_block));
+                }
+            }
+        }
+    }
+}
+
+/// R42: the sized lane renewed arms the worker had replaced as R39's did, 7,459
+/// of them on 2026-11-08, and believed them live: 26% of its coverage. Here
+/// the spread moves one way for two windows and then the other, on one to
+/// three senders, so the trigger legs trade the senders on prices that do not
+/// change; the worker must hold every arm the engine renews.
+#[test]
+fn the_worker_holds_every_arm_the_sized_engine_renews() {
+    use apex_runtime::armed::moves::{spread_key, MovesSnapshot};
+    let history = |uni_first: bool| {
+        let (a, b) = if uni_first { (300.0, 0.0) } else { (0.0, 300.0) };
+        let pools = [(spread_key(UNI, CAKE), vec![(a, a); 400]), (spread_key(CAKE, UNI), vec![(b, b); 400])];
+        MovesSnapshot { window_ns: 10_000_000_000, saved_at_ns: 0, pools: pools.into_iter().collect() }
+    };
+    for max_senders in 1..=3 {
+        let (e, snap) = engine(max_senders);
+        let mut worker = Worker::default();
+        let (mut armed, mut renewed) = (0, 0);
+        for (i, head) in (1_000..1_400u64).step_by(25).enumerate() {
+            e.restore_moves(&history(i % 8 < 4)).unwrap();
+            // Inside the first pricing's window: the plans stay as priced.
+            let lines = e.tick(&snap, head, 300_000, &px(), 1 + i as u64, 10_000_000_000_000_000, 1_500_000_000);
+            worker.take(&lines, head);
+            armed += arms(&lines).len();
+            renewed += lines.len() - arms(&lines).len();
+        }
+        assert!(armed > max_senders && renewed > 0, "{max_senders} senders: {armed} arms, {renewed} renewals");
+    }
+}

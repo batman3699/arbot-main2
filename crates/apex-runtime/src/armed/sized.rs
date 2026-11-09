@@ -482,6 +482,9 @@ impl SizedEngine {
             let Some(arm) = self.arm(c, leg, point, p, snapshot, (head, to_block), base_fee_wei, px, now_ns, sender, st.next_arm_id) else { continue };
             st.next_arm_id += 1;
             st.senders[sender] = to_block;
+            // R42: the arm this sender carried is no longer the worker's, as in
+            // R39's engine: 7,459 renewals of such arms on 2026-11-08.
+            st.live.retain(|_, l| usize::from(l.arm.sender_slot) != sender);
             self.arms.fetch_add(1, Relaxed);
             out.push(ArmedLine::Arm(Box::new(arm.clone())));
             st.live.insert(key, Live { arm, fingerprint });

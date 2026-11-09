@@ -462,24 +462,38 @@ impl ArmedLive {
         let started = std::time::Instant::now();
         let mut now = now_ms;
         for line in lines {
-            let arm = {
+            let held = {
                 let mut inner = self.inner();
                 match line {
                     ArmedLine::Arm(arm) => {
                         inner.arms.insert(arm.sender_slot, (**arm).clone());
-                        (**arm).clone()
+                        Ok((**arm).clone())
                     }
                     ArmedLine::Renew { arm_id, to_block, deadline, calldata, .. } => {
-                        let Some(arm) = inner.arms.values_mut().find(|a| a.arm_id == *arm_id) else { continue };
-                        arm.to_block = *to_block;
-                        if let Some(deadline) = deadline {
-                            arm.deadline = *deadline;
+                        match inner.arms.values_mut().find(|a| a.arm_id == *arm_id) {
+                            Some(arm) => {
+                                arm.to_block = *to_block;
+                                if let Some(deadline) = deadline {
+                                    arm.deadline = *deadline;
+                                }
+                                if let Some(calldata) = calldata {
+                                    arm.calldata.clone_from(calldata);
+                                }
+                                Ok(arm.clone())
+                            }
+                            None => Err(*arm_id),
                         }
-                        if let Some(calldata) = calldata {
-                            arm.calldata.clone_from(calldata);
-                        }
-                        arm.clone()
                     }
+                }
+            };
+            let arm = match held {
+                Ok(arm) => arm,
+                // R42: an arm whose sender went to another arm: nothing to
+                // re-sign. Written down, as 11,044 such renewals on
+                // 2026-11-08 were not.
+                Err(arm_id) => {
+                    self.record(LiveRecord::Skipped { arm_id, sender: Address::ZERO, reason: "orphaned".into(), at_ms: now }, now);
+                    continue;
                 }
             };
             self.submit_arm(&arm, base_fee_wei, now).await;

@@ -436,6 +436,26 @@ async fn a_renewal_reserves_only_what_it_adds_to_its_nonce() {
     assert_eq!(f.live.state(NOW).reserved_wei, 3_000_000_000_000_000);
 }
 
+/// R42: a renewal of an arm the worker no longer holds, its sender having
+/// gone to another arm, is written down and sends nothing. On 2026-11-08 the
+/// worker dropped 11,044 such renewals without a trace, and the engine went on
+/// counting their arms live.
+#[tokio::test]
+async fn a_renewal_of_an_arm_the_worker_replaced_is_recorded_and_not_sent() {
+    let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000)))], 0, NOW).await;
+    f.live.on_lines(&[ArmedLine::Arm(Box::new(arm(2, 0, 2_000_000, 600_000)))], 0, NOW).await;
+    let (sent, before) = (f.script.sent.lock().unwrap().len(), skipped(&f.ledger));
+    let renew = ArmedLine::Renew { arm_id: 1, to_block: 110, at_ns: 0, deadline: Some(2), calldata: Some("0xabce".into()) };
+    f.live.on_lines(&[renew], 0, NOW).await;
+    assert_eq!(f.script.sent.lock().unwrap().len(), sent, "arm 1 is not the worker's to re-sign");
+    assert_eq!(skipped(&f.ledger), [before, vec!["orphaned".to_string()]].concat());
+    let (_, records) = LiveLedger::open(&f.ledger).unwrap();
+    let Some(LiveRecord::Skipped { arm_id: 1, sender, .. }) = records.last() else { panic!("{:?}", records.last()) };
+    assert_eq!(*sender, Address::ZERO, "the sender is arm 2's now");
+}
+
 #[tokio::test]
 async fn a_balance_is_read_at_most_once_a_minute() {
     let f = fixture(policy(ETH, u128::MAX), vec![], vec![]);

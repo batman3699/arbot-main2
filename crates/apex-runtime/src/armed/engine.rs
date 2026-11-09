@@ -423,6 +423,10 @@ impl Engine {
             };
             st.next_arm_id += 1;
             st.senders[sender] = to_block;
+            // R42: the arm this sender carried is no longer the worker's, which
+            // holds one arm a sender: renewed, it would re-sign nothing there.
+            // On 2026-11-08 11,044 of 23,930 renewals were of such arms.
+            st.live.retain(|_, l| usize::from(l.arm.sender_slot) != sender);
             self.arms.fetch_add(1, Relaxed);
             out.push(ArmedLine::Arm(Box::new(arm.clone())));
             st.live.insert(key, Live { arm, fingerprint });
