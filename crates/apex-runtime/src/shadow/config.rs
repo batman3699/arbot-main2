@@ -394,6 +394,61 @@ pub struct SizedConfig {
     /// Sends a second at most, from Task 19; 0 is no limit.
     #[serde(default)]
     pub send_rate_per_s: u32,
+    /// R43: the tiers for large moves, smallest first, at most
+    /// [`MAX_SPIKE_TIERS`]. Each holds its own senders, the last of
+    /// `max_senders`, in the tiers' order: with 16 senders and tiers of 6 and
+    /// 2, slots 8 to 13 and 14 to 15. None is R40.1's lane.
+    #[serde(default)]
+    pub tiers: Vec<SpikeTierConfig>,
+    /// R43: what a pending arm holds of the day's budget: `worst_case`, its
+    /// gas limit at its fee, or `no_trade`, what an inclusion that does not
+    /// trade costs.
+    #[serde(default)]
+    pub reserve: crate::armed::sized::Reserve,
+}
+
+/// R43: the most spike tiers a lane holds.
+pub const MAX_SPIKE_TIERS: usize = 3;
+/// R43: the most of its net a spike tier may tip: half.
+pub const MAX_BID_SHARE_BPS: u32 = 5_000;
+
+/// R43: one spike tier (`armed.sized.tiers`).
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpikeTierConfig {
+    /// What a move must open before any tip, in wei, for the tier to trade it.
+    pub least_net_wei: u128,
+    /// The share of that net the tier tips, in basis points.
+    pub bid_share_bps: u32,
+    /// The tier's own priority cap: a sender is funded for the lane's gas
+    /// limit at this, plus twice the base fee.
+    pub max_priority_wei_per_gas: u128,
+    /// The senders held for the tier.
+    pub senders: usize,
+    /// The most its plan may size to; `armed.max_size_wei` and
+    /// `armed.max_size_usdc` when unset.
+    #[serde(default)]
+    pub max_size_wei: Option<u128>,
+    #[serde(default)]
+    pub max_size_usdc: Option<u128>,
+}
+
+impl SizedConfig {
+    /// R43: the tiers as the engine and the live worker take them, each
+    /// unset size cap `armed`'s.
+    pub fn spike_tiers(&self, a: &ArmedConfig) -> Vec<crate::armed::threshold::SpikeTier> {
+        self.tiers
+            .iter()
+            .map(|t| crate::armed::threshold::SpikeTier {
+                least_net_wei: t.least_net_wei,
+                bid_share_bps: t.bid_share_bps,
+                cap_wei_per_gas: t.max_priority_wei_per_gas,
+                senders: t.senders,
+                max_size_wei: t.max_size_wei.unwrap_or(a.max_size_wei),
+                max_size_usdc: t.max_size_usdc.unwrap_or(a.max_size_usdc),
+            })
+            .collect()
+    }
 }
 
 const fn sixteen() -> usize {
@@ -595,6 +650,42 @@ fn sized(a: &ArmedConfig, sz: &SizedConfig, command: Command) -> Result<(), Shad
         return Err(invalid(
             "armed.sized: max_senders 1-64, band_cap_bps 1-20, window_s 2-50, max_steps 1-16, tier2_multiple >= 2, priors <= 1000000 ppm",
         ));
+    }
+    spike_tiers(a, sz)
+}
+
+/// R43: the spike tiers: each within the ceilings `armed`'s own caps are held
+/// to, rising in what they wait for and never falling in what they may bid,
+/// on senders the lane has.
+fn spike_tiers(a: &ArmedConfig, sz: &SizedConfig) -> Result<(), ShadowConfigError> {
+    let ceiling = |name: &str| ARMED_CAPS.iter().find(|(n, _)| *n == name).map_or(0, |(_, most)| *most);
+    if sz.tiers.len() > MAX_SPIKE_TIERS {
+        return Err(invalid(format!("armed.sized.tiers: {} tiers, at most {MAX_SPIKE_TIERS}", sz.tiers.len())));
+    }
+    for (i, t) in sz.spike_tiers(a).iter().enumerate() {
+        let at = format!("armed.sized.tiers[{i}]");
+        if t.least_net_wei == 0 || t.senders == 0 || !(1..=MAX_BID_SHARE_BPS).contains(&t.bid_share_bps) {
+            return Err(invalid(format!("{at}: least_net_wei > 0, senders >= 1, bid_share_bps 1-{MAX_BID_SHARE_BPS}")));
+        }
+        let most = ceiling("max_priority_wei_per_gas");
+        if t.cap_wei_per_gas == 0 || t.cap_wei_per_gas > most {
+            return Err(invalid(format!("{at}.max_priority_wei_per_gas {} is outside 1..={most} wei", t.cap_wei_per_gas)));
+        }
+        let most = ceiling("max_size_wei");
+        if t.max_size_wei == 0 || t.max_size_wei > most {
+            return Err(invalid(format!("{at}.max_size_wei {} is outside 1..={most} wei", t.max_size_wei)));
+        }
+        if t.max_size_usdc == 0 || t.max_size_usdc > MAX_SIZE_USDC_CEILING {
+            return Err(invalid(format!("{at}.max_size_usdc {} is outside 1..={MAX_SIZE_USDC_CEILING} USDC units", t.max_size_usdc)));
+        }
+    }
+    let tiers = sz.spike_tiers(a);
+    if tiers.windows(2).any(|w| w[1].least_net_wei <= w[0].least_net_wei || w[1].cap_wei_per_gas < w[0].cap_wei_per_gas) {
+        return Err(invalid("armed.sized.tiers: each tier's least_net_wei is above the one before, and its cap is no lower"));
+    }
+    let held: usize = tiers.iter().map(|t| t.senders).sum();
+    if held > sz.max_senders {
+        return Err(invalid(format!("armed.sized.tiers hold {held} senders, and armed.sized.max_senders is {}", sz.max_senders)));
     }
     Ok(())
 }

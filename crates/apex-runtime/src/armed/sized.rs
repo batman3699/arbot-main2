@@ -296,8 +296,8 @@ struct State {
     next_arm_id: u64,
 }
 
-/// R43: what the census values a route at, start-in pool first.
-pub type RouteRank = Arc<dyn Fn(Address, Address) -> f64 + Send + Sync>;
+/// R43: what the census values a cycle's route at.
+pub type RouteRank = Arc<dyn Fn(&Cycle) -> f64 + Send + Sync>;
 
 pub struct SizedEngine {
     cycles: BTreeMap<RouteId, Cycle>,
@@ -327,7 +327,7 @@ impl SizedEngine {
         Self {
             cycles,
             bids: Arc::new(|_, _| RouteWinners::default()),
-            rank: Arc::new(|_, _| 0.0),
+            rank: Arc::new(|_| 0.0),
             contest: None,
             bid_model: BidModel::BestBid,
             settings,
@@ -566,7 +566,7 @@ impl SizedEngine {
                     group: (pool, up),
                     ev: self.value(point, p, base_fee_wei, &chance),
                     worst_wei: self.worst(point, base_fee_wei, l1_upper_wei),
-                    rank: (self.rank)(c.legs[0].pool, c.legs[1].pool),
+                    rank: (self.rank)(c),
                 });
             }
         }

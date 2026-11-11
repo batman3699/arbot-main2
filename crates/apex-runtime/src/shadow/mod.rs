@@ -818,19 +818,30 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
                         reprice_for: crate::armed::engine::REPRICE_FOR,
                         workers: crate::armed::engine::workers(),
                         l1_fee_bound_wei: a.l1_fee_bound_wei,
-                        tiers: Vec::new(),
-                        reserve: crate::armed::sized::Reserve::WorstCase,
+                        tiers: sz.spike_tiers(a),
+                        reserve: sz.reserve,
                     };
                     let t = targets.clone();
+                    let ranked = targets.clone();
                     let engine = crate::armed::sized::SizedEngine::new(armed_set.clone(), settings, unarmable.clone())
                         .with_bids(Arc::new(move |weth_in, other| t.as_ref().map_or_else(Default::default, |t| t.winners_for(weth_in, other))))
+                        // R43: a spike tier's senders go where the census found the most value.
+                        .with_rank(Arc::new(move |c| ranked.as_ref().map_or(0.0, |t| t.usd_for(c.start, c.legs[0].pool, c.legs[1].pool))))
                         .with_contest(contest.clone(), config.armed.bid_model);
                     if let Some(path) = &config.armed.moves {
                         if let Ok(snap) = crate::armed::moves::MovesSnapshot::load(path) {
                             let _ = engine.restore_moves(&snap);
                         }
                     }
-                    info!(executor3 = %e.address, mode = ?sz.mode, senders = sz.max_senders, "the sized lane arms beside R39's");
+                    info!(
+                        executor3 = %e.address,
+                        mode = ?sz.mode,
+                        senders = sz.max_senders,
+                        spike_tiers = sz.tiers.len(),
+                        spike_senders = sz.tiers.iter().map(|t| t.senders).sum::<usize>(),
+                        reserve = ?sz.reserve,
+                        "the sized lane arms beside R39's"
+                    );
                     Some(Arc::new(engine))
                 }
                 Err(why) if sz.mode == config::ArmedMode::Live => return Err(ShadowError::Boot(why)),

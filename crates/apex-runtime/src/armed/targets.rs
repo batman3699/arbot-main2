@@ -207,6 +207,13 @@ impl Targets {
         self.routes.iter().any(|r| r.start == start && r.pools == [start_in, other])
     }
 
+    /// R43: what the census valued the route at, in dollars over its days:
+    /// `start` into `start_in`, then `other`. Nothing for one it does not
+    /// target.
+    pub fn usd_for(&self, start: Address, start_in: Address, other: Address) -> f64 {
+        self.routes.iter().filter(|r| r.start == start && r.pools == [start_in, other]).map(|r| r.usd).sum()
+    }
+
     /// The winners' bids an arm on that route bids against: its own when it
     /// has them, every targeted route's otherwise.
     pub fn bids_for(&self, weth_in: Address, other: Address) -> &[u128] {

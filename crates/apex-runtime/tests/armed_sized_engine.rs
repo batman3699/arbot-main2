@@ -247,7 +247,7 @@ fn ordinary_arms_never_take_a_spike_tiers_sender() {
 #[test]
 fn spike_senders_follow_the_census_rank() {
     let (e, snap) = engine_with(6, vec![tier(2)], Reserve::WorstCase);
-    let e = e.with_rank(Arc::new(|start_in, _| if start_in == CAKE { 7.0 } else { 0.0 }));
+    let e = e.with_rank(Arc::new(|c| if c.legs[0].pool == CAKE { 7.0 } else { 0.0 }));
     let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, BUDGET, 1_500_000_000);
     let spikes: Vec<_> = arms(&lines).into_iter().filter(|a| a.rung >= SPIKE_TIER_BASE).collect();
     assert_eq!(spikes.len(), 2);
@@ -471,8 +471,8 @@ fn a_spike_tier_with_no_sender_free_does_not_stop_the_ordinary_arms() {
     let (built, _) = engine_with(16, vec![tier(2)], Reserve::WorstCase);
     let flipped = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&flipped);
-    let e = SizedEngine::new(cycles, built.settings_for_test().clone(), BTreeSet::new()).with_rank(Arc::new(move |start_in, other| {
-        let first = start_in == UNI && other == CAKE;
+    let e = SizedEngine::new(cycles, built.settings_for_test().clone(), BTreeSet::new()).with_rank(Arc::new(move |c| {
+        let first = c.legs[0].pool == UNI && c.legs[1].pool == CAKE;
         if first != seen.load(Ordering::Relaxed) { 9.0 } else { 0.0 }
     }));
     let mut two = all.clone();

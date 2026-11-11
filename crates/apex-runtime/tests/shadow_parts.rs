@@ -961,6 +961,60 @@ fn the_sized_section_loads_and_its_checks_hold() {
     refused(with(&shared), "armed.executor2's address");
 }
 
+/// R43: the spike tiers load with `armed`'s size caps where they name none,
+/// the reservation defaults to the worst case, and the checks refuse a tier
+/// outside the caps' ceilings, out of order, or holding senders the lane
+/// does not have.
+#[test]
+fn the_spike_tiers_load_and_their_checks_hold() {
+    use apex_runtime::armed::sized::Reserve;
+    let var = "APEX_SECRET_SHADOW_TEST_SPIKE";
+    let e = env(var, SECRET);
+    let base = denim_yaml(var);
+    let with = |section: &str| base.replace("executor:\n  address", &format!("{section}executor:\n  address"));
+    let sized = "  sized:\n    mode: shadow\n    ledger: var/s.jsonl\n    verdicts: var/sv.jsonl\n    executor3:\n      address: \"0x00000000000000000000000000000000000000e3\"\n      code_hash: \"0x00000000000000000000000000000000000000000000000000000000000000c3\"\n";
+    let tier = |least: &str, share: u32, cap: &str, senders: usize, more: &str| {
+        format!("      - least_net_wei: {least}\n        bid_share_bps: {share}\n        max_priority_wei_per_gas: {cap}\n        senders: {senders}\n{more}")
+    };
+    let hundred = tier("47000000000000000", 2_500, "25000000000", 6, "        max_size_wei: 50000000000000000000\n");
+    let thousand = tier("470000000000000000", 2_000, "200000000000", 2, "");
+    let two = format!("{sized}    reserve: no_trade\n    tiers:\n{hundred}{thousand}");
+    let c = ShadowConfig::from_yaml_str(&with(&two), &e).unwrap();
+    let s = c.armed.sized.as_ref().expect("the section");
+    assert_eq!(s.reserve, Reserve::NoTrade);
+    let tiers = s.spike_tiers(&c.armed);
+    assert_eq!(tiers.len(), 2);
+    assert_eq!((tiers[0].least_net_wei, tiers[0].bid_share_bps, tiers[0].cap_wei_per_gas, tiers[0].senders), (47_000_000_000_000_000, 2_500, 25_000_000_000, 6));
+    assert_eq!(tiers[0].max_size_wei, 50 * 10u128.pow(18), "its own size cap");
+    assert_eq!((tiers[1].max_size_wei, tiers[1].max_size_usdc), (c.armed.max_size_wei, c.armed.max_size_usdc), "armed's where it names none");
+    let plain = ShadowConfig::from_yaml_str(&with(sized), &e).unwrap().armed.sized.unwrap();
+    assert!(plain.tiers.is_empty(), "absent, R40.1's lane");
+    assert_eq!(plain.reserve, Reserve::WorstCase);
+
+    let refused = |tiers: String, field: &str| match ShadowConfig::from_yaml_str(&with(&format!("{sized}    tiers:\n{tiers}")), &e) {
+        Err(ShadowConfigError::Invalid(m)) => assert!(m.contains(field), "{m} should name {field}"),
+        other => panic!("{field}: expected a refusal, got {:?}", other.map(|c| c.armed.sized)),
+    };
+    refused(tier("0", 2_500, "25000000000", 6, ""), "least_net_wei > 0");
+    refused(tier("47000000000000000", 0, "25000000000", 6, ""), "bid_share_bps");
+    refused(tier("47000000000000000", 5_001, "25000000000", 6, ""), "bid_share_bps");
+    refused(tier("47000000000000000", 2_500, "25000000000", 0, ""), "senders >= 1");
+    refused(tier("47000000000000000", 2_500, "1000000000001", 6, ""), "max_priority_wei_per_gas");
+    refused(tier("47000000000000000", 2_500, "0", 6, ""), "max_priority_wei_per_gas");
+    refused(tier("47000000000000000", 2_500, "25000000000", 6, "        max_size_wei: 100000000000000000001\n"), "max_size_wei");
+    refused(tier("47000000000000000", 2_500, "25000000000", 6, "        max_size_usdc: 100000000001\n"), "max_size_usdc");
+    refused(format!("{thousand}{hundred}"), "above the one before");
+    refused(format!("{hundred}{}", tier("470000000000000000", 2_000, "24999999999", 2, "")), "its cap is no lower");
+    refused(format!("{hundred}{}", tier("470000000000000000", 2_000, "200000000000", 11, "")), "hold 17 senders");
+    let four: String = (1..=4).map(|i| tier(&format!("{i}000"), 100, "1000", 1, "")).collect();
+    refused(four, "at most 3");
+    let unknown = tier("47000000000000000", 2_500, "25000000000", 6, "        size: 1\n");
+    assert!(
+        matches!(ShadowConfig::from_yaml_str(&with(&format!("{sized}    tiers:\n{unknown}")), &e), Err(ShadowConfigError::Parse(m)) if m.contains("unknown field `size`")),
+        "a misspelt field is not ignored"
+    );
+}
+
 /// R40.1: one lane sends. With the sized lane absent or in shadow, R39's
 /// sends as before; flipped live, the sized lane's does, to its executor,
 /// with its own count of senders.
