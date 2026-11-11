@@ -443,16 +443,8 @@ pub fn sized_points(
         // R41.2: against the winners of gaps the point's size.
         crate::armed::bid::arm_bid(inputs.winners_at(n.net_wei), inputs.sample, inputs.model, n.net_wei, n.gas, cap_wei_per_gas)
     };
-    let point = |tier: u8, step: u32, bid: crate::armed::bid::ArmBid| -> Option<SizedArmPoint> {
-        let trigger = pair[leg].moved(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
-        let mut grid = [(0u32, 0f64); 6];
-        for (g, off) in grid.iter_mut().zip(NET_GRID) {
-            let s = step.saturating_add(off).min(MAX_STEP);
-            *g = (s, at(&pair[other], s, bid.sent.per_gas).map_or(0.0, |n| n.net_wei.as_u128() as f64));
-        }
-        let gas = at(&pair[other], step, bid.sent.per_gas).map_or(reference.gas, |n| n.gas);
-        Some(SizedArmPoint { tier, step, trigger, edges: [lo.clone(), hi.clone()], bid, gas, grid })
-    };
+    let edges = [lo, hi];
+    let point = |tier: u8, step: u32, bid: crate::armed::bid::ArmBid| arm_point(cycle, pair, leg, px, terms, &edges, tier, step, bid, reference.gas);
     let one_bid = bid_for(&reference);
     let Some(one) = smallest(bare, |s| at(&adverse, s, one_bid.sent.per_gas).is_some()) else { return Vec::new() };
     let Some(first) = point(1, one, one_bid) else { return Vec::new() };
@@ -470,6 +462,103 @@ pub fn sized_points(
         }
     }
     out
+}
+
+/// A point at `step`: the trigger there, the band's edges, and the net across
+/// [`NET_GRID`] past it at the point's own bid. `gas` stands in when the
+/// threshold itself does not trade where the other pool is.
+#[allow(clippy::too_many_arguments)]
+fn arm_point(
+    cycle: &Cycle,
+    pair: &[Arc<PoolSnapshot>; 2],
+    leg: usize,
+    px: &Pricing,
+    terms: &super::plan::SizedTerms,
+    edges: &[PoolSnapshot; 2],
+    tier: u8,
+    step: u32,
+    bid: crate::armed::bid::ArmBid,
+    gas: u64,
+) -> Option<SizedArmPoint> {
+    let other = 1 - leg;
+    let at = |s: u32| net_at(cycle, pair, leg, &pair[other], s, px, terms, bid.sent.per_gas);
+    let trigger = pair[leg].moved(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
+    let mut grid = [(0u32, 0f64); 6];
+    for (g, off) in grid.iter_mut().zip(NET_GRID) {
+        let s = step.saturating_add(off).min(MAX_STEP);
+        *g = (s, at(s).map_or(0.0, |n| n.net_wei.as_u128() as f64));
+    }
+    let gas = at(step).map_or(gas, |n| n.gas);
+    Some(SizedArmPoint { tier, step, trigger, edges: edges.clone(), bid, gas, grid })
+}
+
+/// R43: the first spike tier's number: 1 and 2 are [`sized_points`]'.
+pub const SPIKE_TIER_BASE: u8 = 3;
+
+/// R43: a tier for large moves. Ordinary tiers sit where a trade first pays;
+/// a spike tier sits where it pays at least `least_net_wei`, and tips a set
+/// share of it. The trades it waits for are a few a day, too few on any one
+/// route for a measured bid: over 2026-11-03..09, 41 trades of $100 or more
+/// held 56% of our shape's value, and their winners tipped a median 8%.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpikeTier {
+    /// What the move must open before any tip, in wei.
+    pub least_net_wei: u128,
+    /// The share of that net the arm tips, in basis points: a floor under
+    /// the model's bid.
+    pub bid_share_bps: u32,
+    /// The tier's own priority cap, wei per gas.
+    pub cap_wei_per_gas: u128,
+    /// The senders held for it, funded for its cap.
+    pub senders: usize,
+    /// The most its plan may size to, in WETH's and USDC's units.
+    pub max_size_wei: u128,
+    pub max_size_usdc: u128,
+}
+
+/// R43: `spec`'s point for the slot (`cycle`, trigger `leg`), numbered
+/// `tier`, no earlier than `from`. `terms` are the tier's own: its size cap
+/// and lender.
+///
+/// It sits at the smallest move whose net, with the other pool where it is
+/// and nothing tipped, reaches the tier's least; its bid is the larger of the
+/// model's and the tier's share of that net over the gas the trade uses, under
+/// the tier's cap; and, as tier 1's, the threshold then moves out to where the
+/// bid is still paid with the other pool at the band's adverse edge. None when
+/// no move up to [`MAX_STEP`] reaches the least net.
+#[allow(clippy::too_many_arguments)]
+pub fn spike_point(
+    cycle: &Cycle,
+    pair: &[Arc<PoolSnapshot>; 2],
+    leg: usize,
+    px: &Pricing,
+    terms: &super::plan::SizedTerms,
+    band: u32,
+    tier: u8,
+    spec: &SpikeTier,
+    from: u32,
+    inputs: &crate::armed::engine::BidInputs,
+) -> Option<SizedArmPoint> {
+    use crate::armed::bid::{arm_bid, share_below, ArmBid, Bid, BidChoice};
+    let other = 1 - leg;
+    let adverse = adverse_edge(cycle, pair, leg, band)?;
+    let lo = pair[other].moved(move_of(&pair[other], false, band))?;
+    let hi = pair[other].moved(move_of(&pair[other], true, band))?;
+    let at = |o: &PoolSnapshot, step: u32, bid: u128| net_at(cycle, pair, leg, o, step, px, terms, bid);
+    let least = U256::from(spec.least_net_wei);
+    let reach = smallest(from, |s| at(&pair[other], s, 0).is_some_and(|n| n.net_wei >= least))?;
+    let surplus = at(&pair[other], reach, 0)?;
+    let winners = inputs.winners_at(surplus.net_wei);
+    let model = arm_bid(winners, inputs.sample, inputs.model, surplus.net_wei, surplus.gas, spec.cap_wei_per_gas);
+    let share = surplus.net_wei.saturating_mul(U256::from(spec.bid_share_bps)) / U256::from(10_000u32) / U256::from(surplus.gas.max(1));
+    let share = if share > U256::from(spec.cap_wei_per_gas) { spec.cap_wei_per_gas } else { share.as_u128() };
+    let bid = if share > model.sent.per_gas {
+        ArmBid { sent: Bid { per_gas: share, p_win: share_below(winners, share) }, alt: Some(model.sent), choice: BidChoice::TierShare }
+    } else {
+        model
+    };
+    let step = smallest(reach, |s| at(&adverse, s, bid.sent.per_gas).is_some())?;
+    arm_point(cycle, pair, leg, px, terms, &[lo, hi], tier, step, bid, surplus.gas)
 }
 
 /// Σ over the grid of P(the move ends in that bucket) × the net there:

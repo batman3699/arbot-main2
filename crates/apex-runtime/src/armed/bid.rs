@@ -159,6 +159,8 @@ pub enum BidChoice {
     /// `best_share` was asked for and could not be used: `best_bid`, the
     /// known-miscalibrated rule, was sent.
     Fallback(&'static str),
+    /// R43: a spike tier's share of its net, which no measured bid exceeded.
+    TierShare,
 }
 
 impl BidChoice {
@@ -168,6 +170,7 @@ impl BidChoice {
             Self::BestBid => "best_bid".into(),
             Self::BestShare => "best_share".into(),
             Self::Fallback(why) => format!("best_bid (fallback: {why})"),
+            Self::TierShare => "tier_share".into(),
         }
     }
 }
@@ -178,6 +181,15 @@ pub struct ArmBid {
     pub sent: Bid,
     pub alt: Option<Bid>,
     pub choice: BidChoice,
+}
+
+/// R43: the share of `sorted_bids` strictly below `bid`; with none measured,
+/// 1, as [`arm_bid`] ranks a route nobody was seen to win.
+pub fn share_below(sorted_bids: &[u128], bid: u128) -> f64 {
+    if sorted_bids.is_empty() {
+        return 1.0;
+    }
+    sorted_bids.partition_point(|b| *b < bid) as f64 / sorted_bids.len() as f64
 }
 
 /// R38: the bid `model` asks for. `best_bid` against the route's measured

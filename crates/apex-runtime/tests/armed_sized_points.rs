@@ -8,7 +8,7 @@ use apex_math::cl_swap::TickLadder;
 use apex_runtime::armed::engine::BidInputs;
 use apex_runtime::armed::plan::SizedTerms;
 use apex_runtime::armed::targets::RouteWinners;
-use apex_runtime::armed::threshold::{adverse_edge, expected_net, net_at, sized_points, Pricing, MAX_STEP};
+use apex_runtime::armed::threshold::{adverse_edge, expected_net, net_at, sized_points, spike_point, Pricing, SpikeTier, MAX_STEP, SPIKE_TIER_BASE};
 use apex_runtime::econ::RouteCosts;
 use apex_runtime::live::book::PoolSnapshot;
 use apex_runtime::live::frontier::{self, Cycle, WETH};
@@ -184,4 +184,82 @@ fn expected_net_weights_each_bucket_by_its_chance() {
     // 0.3 × 1 + 0.1 × 5 + 0.1 × 10.
     assert!((expected_net(&grid, p) - 1.8).abs() < 1e-12);
     assert_eq!(expected_net(&grid, |_| 0.0), 0.0);
+}
+
+// ------------------------------------------------------------- R43: spike tiers
+
+const GWEI: u128 = 1_000_000_000;
+
+fn spike(least_net_wei: u128, bid_share_bps: u32, cap_wei_per_gas: u128) -> SpikeTier {
+    SpikeTier { least_net_wei, bid_share_bps, cap_wei_per_gas, senders: 1, max_size_wei: 5 * 10u128.pow(18), max_size_usdc: 12_000_000_000 }
+}
+
+/// The smallest move whose net, before any tip and with the other pool where
+/// it is, reaches `least`: found one step at a time.
+fn reach(pair: &[Arc<PoolSnapshot>; 2], c: &Cycle, least: u128) -> (u32, apex_runtime::armed::threshold::NetAt) {
+    (1..=MAX_STEP)
+        .find_map(|s| net_at(c, pair, 0, &pair[1], s, &px(), &terms(), 0).filter(|n| n.net_wei >= U256::from(least)).map(|n| (s, n)))
+        .expect("the least net is within reach")
+}
+
+/// R43: a spike tier sits at the smallest move that opens its least net, and
+/// tips its share of that net over the gas the trade is expected to use.
+#[test]
+fn a_spike_tier_sits_where_the_net_reaches_its_least_and_tips_its_share() {
+    let (pair, c) = slot(L);
+    let least = 10u128.pow(16);
+    let tier = spike(least, 2_500, 200 * GWEI);
+    let p = spike_point(&c, &pair, 0, &px(), &terms(), 5, SPIKE_TIER_BASE, &tier, 1, &BidInputs::winners(NONE)).expect("within reach");
+    assert_eq!(p.tier, SPIKE_TIER_BASE);
+    let (at, net) = reach(&pair, &c, least);
+    assert!(p.step >= at, "never before the least net: {} against {at}", p.step);
+    let share = net.net_wei.as_u128() / 4 / u128::from(net.gas);
+    assert!(share > 0);
+    assert_eq!(p.bid.sent.per_gas, share, "a quarter of the net, per gas");
+    assert_eq!(p.bid.choice.label(), "tier_share");
+    // It still pays its own bid with the other pool at the band's adverse edge.
+    let edge = adverse_edge(&c, &pair, 0, 5).unwrap();
+    assert!(net_at(&c, &pair, 0, &edge, p.step, &px(), &terms(), share).is_some());
+    assert!(p.grid[0].1 > 0.0, "{:?}", p.grid);
+}
+
+/// R43: the tier's own cap holds its bid, whatever the share asks.
+#[test]
+fn a_spike_tiers_bid_stops_at_its_own_cap() {
+    let (pair, c) = slot(L);
+    let p = spike_point(&c, &pair, 0, &px(), &terms(), 5, SPIKE_TIER_BASE, &spike(10u128.pow(16), 2_500, GWEI), 1, &BidInputs::winners(NONE)).unwrap();
+    assert_eq!(p.bid.sent.per_gas, GWEI);
+}
+
+/// R43: a least net no move within reach opens is no arm: the size cap holds
+/// the net of even the furthest move below it.
+#[test]
+fn a_spike_tier_out_of_reach_is_no_point() {
+    let (pair, c) = slot(L);
+    assert!(spike_point(&c, &pair, 0, &px(), &terms(), 5, SPIKE_TIER_BASE, &spike(10u128.pow(20), 2_500, 200 * GWEI), 1, &BidInputs::winners(NONE)).is_none());
+}
+
+/// R43: the share is a floor under the model's bid, not a ceiling over it:
+/// winners measured above the share are bid against as before.
+#[test]
+fn a_spike_tier_keeps_the_models_bid_when_it_is_higher() {
+    let (pair, c) = slot(L);
+    let least = 10u128.pow(16);
+    let winners: Vec<u128> = (1u128..=40).map(|i| i * 50_000_000).collect();
+    let p = spike_point(&c, &pair, 0, &px(), &terms(), 5, SPIKE_TIER_BASE, &spike(least, 1, 200 * GWEI), 1, &BidInputs::winners(&winners)).unwrap();
+    let (_, net) = reach(&pair, &c, least);
+    let share = net.net_wei.as_u128() / 10_000 / u128::from(net.gas);
+    assert!(p.bid.sent.per_gas > share, "{} against the share's {share}", p.bid.sent.per_gas);
+    assert_eq!(p.bid.choice.label(), "best_bid");
+    assert!(p.bid.sent.p_win > 0.0);
+}
+
+/// R43: a tier starts no earlier than the point before it.
+#[test]
+fn a_spike_tier_starts_no_earlier_than_asked() {
+    let (pair, c) = slot(L);
+    let tier = spike(10u128.pow(16), 2_500, 200 * GWEI);
+    let free = spike_point(&c, &pair, 0, &px(), &terms(), 5, SPIKE_TIER_BASE, &tier, 1, &BidInputs::winners(NONE)).unwrap();
+    let held = spike_point(&c, &pair, 0, &px(), &terms(), 5, SPIKE_TIER_BASE, &tier, free.step + 7, &BidInputs::winners(NONE)).unwrap();
+    assert_eq!(held.step, free.step + 7);
 }
