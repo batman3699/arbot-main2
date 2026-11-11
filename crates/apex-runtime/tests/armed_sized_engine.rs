@@ -7,8 +7,8 @@ use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::armed::lines::ArmedLine;
-use apex_runtime::armed::sized::{fill, Candidate, SizedEngine, SizedSettings};
-use apex_runtime::armed::threshold::Pricing;
+use apex_runtime::armed::sized::{fill, fill_spike, Candidate, Reserve, SizedEngine, SizedSettings};
+use apex_runtime::armed::threshold::{Pricing, SpikeTier, SPIKE_TIER_BASE};
 use apex_runtime::econ::RouteCosts;
 use apex_runtime::live::book::{Move, PoolSnapshot};
 use apex_runtime::live::frontier::{self, WETH};
@@ -26,7 +26,42 @@ fn route(n: u8) -> RouteId {
 }
 
 fn cand(n: u8, group: u8, ev: f64, worst_wei: u128) -> Candidate {
-    Candidate { key: (route(n), 0, 1), group: (Address::repeat_byte(group), true), ev, worst_wei }
+    Candidate { key: (route(n), 0, 1), group: (Address::repeat_byte(group), true), ev, worst_wei, rank: 0.0 }
+}
+
+/// A spike candidate of tier `SPIKE_TIER_BASE + k`.
+fn spike(n: u8, group: u8, k: u8, rank: f64, worst_wei: u128) -> Candidate {
+    Candidate { key: (route(n), 0, SPIKE_TIER_BASE + k), group: (Address::repeat_byte(group), true), ev: 1.0, worst_wei, rank }
+}
+
+#[test]
+fn spike_senders_go_to_the_best_ranked_pairs_one_a_trigger() {
+    // Two on trigger 1, ranked 9 and 8; one on trigger 2, ranked 5; one unranked.
+    let cands = vec![spike(1, 1, 0, 8.0, 1), spike(2, 1, 0, 9.0, 1), spike(3, 2, 0, 5.0, 1), spike(4, 3, 0, 0.0, 1)];
+    assert_eq!(fill_spike(&cands, &[2], 1_000), vec![1, 2], "the second arm on trigger 1 is passed over");
+    assert_eq!(fill_spike(&cands, &[8], 1_000), vec![1, 2, 3], "and an unranked pair comes last");
+}
+
+#[test]
+fn each_spike_tier_fills_its_own_senders() {
+    let cands = vec![spike(1, 1, 0, 9.0, 1), spike(2, 1, 1, 9.0, 1), spike(3, 2, 1, 5.0, 1), cand(4, 4, 99.0, 1)];
+    assert_eq!(fill_spike(&cands, &[1, 1], 1_000), vec![0, 1], "one a tier; the same trigger may hold one of each");
+    assert_eq!(fill_spike(&cands, &[0, 2], 1_000), vec![1, 2]);
+    assert!(fill_spike(&cands, &[], 1_000).is_empty(), "no tiers, no spike arms; an ordinary arm is never one");
+}
+
+#[test]
+fn a_spike_arm_is_held_to_the_budget_and_to_a_positive_value() {
+    let mut worthless = spike(3, 3, 0, 9.5, 1);
+    worthless.ev = 0.0;
+    let cands = vec![spike(1, 1, 0, 9.0, 600), spike(2, 2, 0, 8.0, 600), worthless, spike(4, 4, 0, 1.0, 400)];
+    assert_eq!(fill_spike(&cands, &[4], 1_000), vec![0, 3], "the second's reservation does not fit; the fourth's does");
+}
+
+#[test]
+fn the_ordinary_fill_never_takes_a_spike_arm() {
+    let cands = vec![spike(1, 1, 0, 9.0, 1), cand(2, 2, 3.0, 1)];
+    assert_eq!(fill(&cands, 4, 1_000, |c, _| c.ev), vec![1]);
 }
 
 #[test]
@@ -118,6 +153,10 @@ fn px() -> Pricing {
 }
 
 fn engine(max_senders: usize) -> (SizedEngine, BTreeMap<Address, Arc<PoolSnapshot>>) {
+    engine_with(max_senders, Vec::new(), Reserve::WorstCase)
+}
+
+fn engine_with(max_senders: usize, tiers: Vec<SpikeTier>, reserve: Reserve) -> (SizedEngine, BTreeMap<Address, Arc<PoolSnapshot>>) {
     let snap: BTreeMap<Address, Arc<PoolSnapshot>> =
         [(UNI, pool(UNI, Venue::UniswapV3, -197_350, 500)), (CAKE, pool(CAKE, Venue::PancakeV3, -197_350, 100))]
             .into_iter()
@@ -143,8 +182,90 @@ fn engine(max_senders: usize) -> (SizedEngine, BTreeMap<Address, Arc<PoolSnapsho
         reprice_for: Duration::MAX,
         workers: 1,
         l1_fee_bound_wei: 1_000_000_000_000,
+        tiers,
+        reserve,
     };
     (SizedEngine::new(cycles, settings, BTreeSet::new()), snap)
+}
+
+const GWEI: u128 = 1_000_000_000;
+
+/// A tier at 0.01 ETH, tipping a quarter, with 50 WETH to size to.
+fn tier(senders: usize) -> SpikeTier {
+    SpikeTier {
+        least_net_wei: 10u128.pow(16),
+        bid_share_bps: 2_500,
+        cap_wei_per_gas: 200 * GWEI,
+        senders,
+        max_size_wei: 50 * 10u128.pow(18),
+        max_size_usdc: 120_000_000_000,
+    }
+}
+
+const BUDGET: u128 = 10u128.pow(18);
+
+/// R43: with a tier configured, its arms take its own senders, the last of
+/// the lane's, and carry its size cap and its share bid; ordinary arms keep
+/// to the rest.
+#[test]
+fn spike_arms_take_their_reserved_senders_and_their_own_terms() {
+    let (e, snap) = engine_with(6, vec![tier(2)], Reserve::WorstCase);
+    let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, BUDGET, 1_500_000_000);
+    let armed = arms(&lines);
+    let (spikes, ordinary): (Vec<_>, Vec<_>) = armed.iter().partition(|a| a.rung >= SPIKE_TIER_BASE);
+    assert_eq!(spikes.len(), 2, "two reserved senders");
+    assert_eq!(ordinary.len(), 4, "tier 1 on each slot");
+    let slots = |v: &[&&apex_runtime::armed::lines::Arm]| v.iter().map(|a| a.sender_slot).collect::<BTreeSet<u16>>();
+    assert_eq!(slots(&spikes), BTreeSet::from([4, 5]));
+    assert_eq!(slots(&ordinary), BTreeSet::from([0, 1, 2, 3]));
+    for a in &spikes {
+        let sized = a.sized.as_ref().unwrap();
+        assert_eq!(sized.tier, SPIKE_TIER_BASE);
+        assert_eq!(sized.cap, (50 * 10u128.pow(18)).to_string(), "the tier's size cap is the plan's");
+        let bid: u128 = a.bid_wei_per_gas.parse().unwrap();
+        assert!(bid > 0 && bid <= 200 * GWEI, "{bid}");
+        assert_eq!(a.bid_model.as_deref(), Some("tier_share"));
+        let ordinary_step = ordinary.iter().find(|o| o.route_hash == a.route_hash && o.trigger_leg == a.trigger_leg).map(|o| o.step).unwrap();
+        assert!(a.step > ordinary_step, "a spike arm waits for a larger move than tier 1's");
+    }
+}
+
+/// R43: an ordinary arm never takes a spike tier's sender, however many it
+/// could fill.
+#[test]
+fn ordinary_arms_never_take_a_spike_tiers_sender() {
+    let (e, snap) = engine_with(4, vec![tier(2)], Reserve::WorstCase);
+    let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, BUDGET, 1_500_000_000);
+    let armed = arms(&lines);
+    let ordinary: Vec<_> = armed.iter().filter(|a| a.rung < SPIKE_TIER_BASE).collect();
+    assert_eq!(ordinary.len(), 2, "four slots could pay, two senders are theirs");
+    assert!(ordinary.iter().all(|a| a.sender_slot < 2));
+    assert_eq!(armed.len(), 4);
+}
+
+/// R43: the spike senders go to the pairs the census values most.
+#[test]
+fn spike_senders_follow_the_census_rank() {
+    let (e, snap) = engine_with(6, vec![tier(2)], Reserve::WorstCase);
+    let e = e.with_rank(Arc::new(|start_in, _| if start_in == CAKE { 7.0 } else { 0.0 }));
+    let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, BUDGET, 1_500_000_000);
+    let spikes: Vec<_> = arms(&lines).into_iter().filter(|a| a.rung >= SPIKE_TIER_BASE).collect();
+    assert_eq!(spikes.len(), 2);
+    assert!(spikes.iter().all(|a| a.pools[0] == format!("{CAKE:#x}")), "both legs of the route that starts in the ranked pool");
+}
+
+/// R43: what a pending sized arm holds of the day's budget. Here a spike arm
+/// bids 16.7 gwei: its gas limit at that is 0.0167 ETH, over a budget of
+/// 0.006; what an inclusion that does not trade costs is 0.0023, and two fit.
+#[test]
+fn a_no_trade_reservation_lets_a_spike_arm_into_a_small_budget() {
+    let small = 6_000_000_000_000_000;
+    let (e, snap) = engine_with(6, vec![tier(2)], Reserve::WorstCase);
+    let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, small, 1_500_000_000);
+    assert!(arms(&lines).iter().all(|a| a.rung < SPIKE_TIER_BASE), "a million gas at the tier's bid is over the budget");
+    let (e, snap) = engine_with(6, vec![tier(2)], Reserve::NoTrade);
+    let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, small, 1_500_000_000);
+    assert_eq!(arms(&lines).iter().filter(|a| a.rung >= SPIKE_TIER_BASE).count(), 2);
 }
 
 fn arms(lines: &[ArmedLine]) -> Vec<&apex_runtime::armed::lines::Arm> {
@@ -260,7 +381,7 @@ fn a_full_pass_is_timed() {
     let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
     let slots = 2 * cycles.len();
     let (e, _) = engine(64);
-    let mut settings = *e.settings_for_test();
+    let mut settings = e.settings_for_test().clone();
     settings.workers = 6;
     let e = SizedEngine::new(cycles, settings, BTreeSet::new());
     let started = std::time::Instant::now();
@@ -328,4 +449,39 @@ fn the_worker_holds_every_arm_the_sized_engine_renews() {
         }
         assert!(armed > max_senders && renewed > 0, "{max_senders} senders: {armed} arms, {renewed} renewals");
     }
+}
+
+/// R43: a spike tier whose senders are all pending holds nothing else up.
+/// The census's rank moves to another route while both spike senders carry
+/// the first route's arms, and a third pool's slots appear with ordinary
+/// senders free: those are armed in the same pass.
+#[test]
+fn a_spike_tier_with_no_sender_free_does_not_stop_the_ordinary_arms() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const SLIP: Address = address!("dbc6998296caA1652A810dc8D3BaF4A8294330f1");
+    let all: BTreeMap<Address, Arc<PoolSnapshot>> = [
+        (UNI, pool(UNI, Venue::UniswapV3, -197_350, 500)),
+        (CAKE, pool(CAKE, Venue::PancakeV3, -197_350, 100)),
+        (SLIP, pool(SLIP, Venue::Slipstream, -197_350, 400)),
+    ]
+    .into_iter()
+    .map(|(a, p)| (a, Arc::new(p)))
+    .collect();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &all);
+    let (built, _) = engine_with(16, vec![tier(2)], Reserve::WorstCase);
+    let flipped = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&flipped);
+    let e = SizedEngine::new(cycles, built.settings_for_test().clone(), BTreeSet::new()).with_rank(Arc::new(move |start_in, other| {
+        let first = start_in == UNI && other == CAKE;
+        if first != seen.load(Ordering::Relaxed) { 9.0 } else { 0.0 }
+    }));
+    let mut two = all.clone();
+    two.remove(&SLIP);
+    let first = e.tick(&two, 1_000, 300_000, &px(), 1, BUDGET, 1_500_000_000);
+    assert_eq!(arms(&first).iter().filter(|a| a.rung >= SPIKE_TIER_BASE).count(), 2);
+    flipped.store(true, Ordering::Relaxed);
+    let second = e.tick(&all, 1_010, 300_000, &px(), 2_000_000_000, BUDGET, 1_500_000_000);
+    let armed = arms(&second);
+    assert!(armed.iter().all(|a| a.rung < SPIKE_TIER_BASE), "both spike senders are pending");
+    assert!(armed.iter().any(|a| a.pools.contains(&format!("{SLIP:#x}"))), "the new pool's ordinary arms went out: {}", armed.len());
 }

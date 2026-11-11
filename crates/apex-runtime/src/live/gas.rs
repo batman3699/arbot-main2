@@ -142,6 +142,24 @@ pub struct SizedGas {
     pub limit: u64,
 }
 
+impl SizedGas {
+    /// R43: the most a `NoTrade` uses on any pair of venues: twice the
+    /// dearest venue's half.
+    pub const fn no_trade_ceiling(&self) -> u64 {
+        let r = &self.read;
+        let mut most = r.uniswap_v3;
+        let rest = [r.slipstream, r.slipstream_v3, r.pancake_v3, r.aerodrome_v2, r.uniswap_v4];
+        let mut i = 0;
+        while i < rest.len() {
+            if rest[i] > most {
+                most = rest[i];
+            }
+            i += 1;
+        }
+        most * 2
+    }
+}
+
 /// R40.1, `test/fork/LeanExecutor3Fork.t.sol` at block 53,155,787, each call
 /// its own transaction. `read` solves the six venue pairs' `NoTrade` gas (82k
 /// to 113k) for each venue's half; the second Slipstream factory reads its fee

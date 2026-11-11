@@ -29,7 +29,7 @@ use super::lines::{Arm, ArmedLine, SizedLine, StartAt};
 use super::moves::{spread_key, MoveStats};
 use super::plan::{sized_call, sized_trade, SizedOutcome, SizedTerms};
 use super::predicate;
-use super::threshold::{expected_net, sized_points, trigger_up, Pricing, SizedArmPoint, BAND_WIDTHS, TIER1_BID_STEPS};
+use super::threshold::{expected_net, sized_points, spike_point, trigger_up, Pricing, SizedArmPoint, SpikeTier, BAND_WIDTHS, SPIKE_TIER_BASE, TIER1_BID_STEPS};
 use crate::live::book::PoolSnapshot;
 use crate::live::frontier::Cycle;
 use crate::live::gas::{LEAN, SIZED};
@@ -71,7 +71,63 @@ pub const P_WIN_FLOOR: f64 = 0.001;
 /// yet seen moving that far is not known never to.
 pub const P_MOVE_FLOOR: f64 = 0.000_1;
 
-#[derive(Clone, Copy, Debug)]
+/// R43: what a pending sized arm holds of the day's budget.
+///
+/// The executor trades only when the trade nets its floor after its own gas
+/// at the price it was included at, so an inclusion costs the sender either
+/// nothing net, or a `NoTrade`'s gas, or, rarely, a revert's. `WorstCase`
+/// holds the whole gas limit at the arm's fee, which no bid for a large trade
+/// fits under a small budget: at 20 gwei the limit alone is 0.02 ETH.
+/// `NoTrade` holds what an inclusion that does not trade costs; a revert is
+/// then the day's loss cap's to stop, after the fact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reserve {
+    #[default]
+    WorstCase,
+    NoTrade,
+}
+
+impl Reserve {
+    /// The gas a pending sized arm holds at its fee.
+    pub const fn gas(self) -> u64 {
+        match self {
+            Self::WorstCase => SIZED.limit,
+            Self::NoTrade => SIZED.no_trade_ceiling(),
+        }
+    }
+}
+
+/// R43: the lane's senders, and which of them each spike tier holds: the
+/// ordinary tiers arm on the first, each spike tier on its own after them, in
+/// the tiers' order. A sender is funded for its tier's cap, so the engine
+/// and the live worker both read the split from here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Senders {
+    pub total: usize,
+    pub tiers: Vec<SpikeTier>,
+}
+
+impl Senders {
+    pub fn ordinary(&self) -> usize {
+        self.total.saturating_sub(self.tiers.iter().map(|t| t.senders).sum())
+    }
+
+    /// `tier`'s spike tier; None for 1 and 2, and past the last configured.
+    pub fn spike(&self, tier: u8) -> Option<&SpikeTier> {
+        self.tiers.get(usize::from(tier.checked_sub(SPIKE_TIER_BASE)?))
+    }
+
+    /// The slots `tier`'s arms are sent from.
+    pub fn slots(&self, tier: u8) -> std::ops::Range<usize> {
+        let ordinary = self.ordinary();
+        let Some(k) = tier.checked_sub(SPIKE_TIER_BASE).map(usize::from) else { return 0..ordinary };
+        let start = ordinary + self.tiers.iter().take(k).map(|t| t.senders).sum::<usize>();
+        start..start + self.tiers.get(k).map_or(0, |t| t.senders)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct SizedSettings {
     pub max_senders: usize,
     pub window_s: u64,
@@ -94,9 +150,24 @@ pub struct SizedSettings {
     pub reprice_for: Duration,
     pub workers: usize,
     pub l1_fee_bound_wei: u128,
+    /// R43: the tiers for large moves, each with its own senders, cap and
+    /// size; none is R40.1's lane.
+    pub tiers: Vec<SpikeTier>,
+    /// R43: what a pending arm holds of the budget.
+    pub reserve: Reserve,
 }
 
 impl SizedSettings {
+    /// R43: the senders, split by tier.
+    pub fn senders(&self) -> Senders {
+        Senders { total: self.max_senders, tiers: self.tiers.clone() }
+    }
+
+    /// R43: the priority cap `tier`'s bid is held to.
+    pub fn cap_for(&self, tier: u8) -> u128 {
+        tier.checked_sub(SPIKE_TIER_BASE).and_then(|k| self.tiers.get(usize::from(k))).map_or(self.max_priority_wei_per_gas, |t| t.cap_wei_per_gas)
+    }
+
     pub fn window_blocks(&self) -> u64 {
         (self.window_s * 1_000).div_ceil(self.block_time_ms.max(1)).max(1)
     }
@@ -117,6 +188,42 @@ pub struct Candidate {
     pub group: (Address, bool),
     pub ev: f64,
     pub worst_wei: u128,
+    /// R43: what the census values the arm's pair at: a spike tier's senders
+    /// go to the highest. Nothing for a pair it does not target.
+    pub rank: f64,
+}
+
+/// R43: the spike tiers' arms: for each tier, up to its senders
+/// (`senders[k]` for tier `SPIKE_TIER_BASE + k`), the best ranked first, then
+/// the most valuable, one for each trigger pool and direction. Indices into
+/// `cands`, tier by tier.
+///
+/// A spike move happens a few times a day on a pair, so its measured chance
+/// says little, and what orders these arms is where such trades have been:
+/// the census's value of the pair. One for each trigger, because the first
+/// arm to trade on a move takes it back: a second on the same trigger would
+/// then be included only to find no trade, at its own tier's price.
+pub fn fill_spike(cands: &[Candidate], senders: &[usize], budget_wei: u128) -> Vec<usize> {
+    let mut chosen = Vec::new();
+    let mut left = budget_wei;
+    for (k, held) in senders.iter().enumerate() {
+        let tier = SPIKE_TIER_BASE.saturating_add(u8::try_from(k).unwrap_or(u8::MAX));
+        let mut order: Vec<usize> = (0..cands.len()).filter(|i| cands[*i].key.2 == tier && cands[*i].ev > 0.0).collect();
+        order.sort_by(|a, b| cands[*b].rank.total_cmp(&cands[*a].rank).then(cands[*b].ev.total_cmp(&cands[*a].ev)).then(a.cmp(b)));
+        let mut groups: BTreeSet<(Address, bool)> = BTreeSet::new();
+        for i in order {
+            if groups.len() >= *held {
+                break;
+            }
+            if cands[i].worst_wei > left || groups.contains(&cands[i].group) {
+                continue;
+            }
+            groups.insert(cands[i].group);
+            left -= cands[i].worst_wei;
+            chosen.push(i);
+        }
+    }
+    chosen
 }
 
 /// The greedy fill: indices of the chosen candidates, in the order chosen.
@@ -125,7 +232,8 @@ pub struct Candidate {
 /// the budget); only the group it was taken from is re-valued, by
 /// `marginal(candidate, chosen in its group)`. It stops at no positive value,
 /// or when senders or budget run out. Every arm holds a sender for one window,
-/// so sender-time needs no term of its own.
+/// so sender-time needs no term of its own. R43: a spike tier's candidate is
+/// never chosen here: its senders are [`fill_spike`]'s.
 pub fn fill(
     cands: &[Candidate],
     senders: usize,
@@ -138,7 +246,7 @@ pub fn fill(
     let density = |v: f64, c: &Candidate| v / (1.0 / senders.max(1) as f64 + c.worst_wei as f64 / budget_wei.max(1) as f64);
     while chosen.len() < senders {
         let best = (0..cands.len())
-            .filter(|i| !chosen.contains(i) && value[*i] > 0.0 && cands[*i].worst_wei <= left)
+            .filter(|i| cands[*i].key.2 < SPIKE_TIER_BASE && !chosen.contains(i) && value[*i] > 0.0 && cands[*i].worst_wei <= left)
             .max_by(|a, b| density(value[*a], &cands[*a]).total_cmp(&density(value[*b], &cands[*b])).then(b.cmp(a)));
         let Some(i) = best else { break };
         chosen.push(i);
@@ -162,6 +270,16 @@ struct Priced {
     points: Vec<SizedArmPoint>,
     terms: SizedTerms,
     lender: Lean2Lender,
+    /// R43: each spike tier's own terms and lender, in the tiers' order: its
+    /// size cap is not the slot's.
+    spike: Vec<(SizedTerms, Lean2Lender)>,
+}
+
+impl Priced {
+    /// The plan terms and lender `tier`'s arms carry.
+    fn plan(&self, tier: u8) -> (&SizedTerms, Lean2Lender) {
+        tier.checked_sub(SPIKE_TIER_BASE).and_then(|k| self.spike.get(usize::from(k))).map_or((&self.terms, self.lender), |(t, l)| (t, *l))
+    }
 }
 
 struct Live {
@@ -178,9 +296,13 @@ struct State {
     next_arm_id: u64,
 }
 
+/// R43: what the census values a route at, start-in pool first.
+pub type RouteRank = Arc<dyn Fn(Address, Address) -> f64 + Send + Sync>;
+
 pub struct SizedEngine {
     cycles: BTreeMap<RouteId, Cycle>,
     bids: RouteBids,
+    rank: RouteRank,
     contest: Option<Arc<ShareSample>>,
     bid_model: BidModel,
     settings: SizedSettings,
@@ -205,6 +327,7 @@ impl SizedEngine {
         Self {
             cycles,
             bids: Arc::new(|_, _| RouteWinners::default()),
+            rank: Arc::new(|_, _| 0.0),
             contest: None,
             bid_model: BidModel::BestBid,
             settings,
@@ -221,6 +344,14 @@ impl SizedEngine {
     #[must_use]
     pub fn with_bids(mut self, bids: RouteBids) -> Self {
         self.bids = bids;
+        self
+    }
+
+    /// R43: the census's value of each route, which orders the spike tiers'
+    /// senders.
+    #[must_use]
+    pub fn with_rank(mut self, rank: RouteRank) -> Self {
+        self.rank = rank;
         self
     }
 
@@ -252,11 +383,10 @@ impl SizedEngine {
         }
     }
 
-    /// The plan terms and lender for `c`: the size cap, or the largest
-    /// holding when no lender holds it.
-    fn terms_for(&self, c: &Cycle, px: &Pricing, l1_upper_wei: u128) -> (SizedTerms, Lean2Lender) {
-        let s = self.settings;
-        let max = s.max_size(c.start);
+    /// The plan terms and lender for `c` sized up to `max`: that cap, or the
+    /// largest holding when no lender holds it.
+    fn terms_for(&self, c: &Cycle, px: &Pricing, l1_upper_wei: u128, max: U256) -> (SizedTerms, Lean2Lender) {
+        let s = &self.settings;
         let (cap, lender, extra) = match px.lenders {
             Some(l) => match l.for_size(max) {
                 Some(choice) => (max, choice, choice.extra_gas),
@@ -309,16 +439,28 @@ impl SizedEngine {
     fn price_slot(&self, c: &Cycle, leg: u8, snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>, px: &Pricing, l1_upper_wei: u128, moves: &MoveStats) -> Option<Priced> {
         let pair = [Arc::clone(snapshot.get(&c.legs[0].pool)?), Arc::clone(snapshot.get(&c.legs[1].pool)?)];
         let pxc = px.for_cycle(c)?;
-        let (terms, lender) = self.terms_for(c, &pxc, l1_upper_wei);
+        let (terms, lender) = self.terms_for(c, &pxc, l1_upper_wei, self.settings.max_size(c.start));
         let winners = (self.bids)(c.legs[0].pool, c.legs[1].pool);
         let inputs = BidInputs { winners: &winners.all, banded: Some(&winners), sample: self.contest.as_deref(), model: self.bid_model };
         let cap = self.settings.max_priority_wei_per_gas;
         let l = usize::from(leg);
         let at5 = sized_points(c, &pair, l, &pxc, &terms, BAND_WIDTHS[0], self.settings.tier2_multiple, &inputs, cap);
         let band = at5.first().map_or(BAND_WIDTHS[0], |p| self.band_for(moves, c, l, p.step));
-        let points =
+        let mut points =
             if band == BAND_WIDTHS[0] { at5 } else { sized_points(c, &pair, l, &pxc, &terms, band, self.settings.tier2_multiple, &inputs, cap) };
-        Some(Priced { seqs: [pair[0].seq, pair[1].seq], at_ns: 0, points, terms, lender })
+        // R43: each spike tier past the points before it, on its own terms. A
+        // slot no ordinary move pays has no spike arm either.
+        let mut spike = Vec::with_capacity(self.settings.tiers.len());
+        for (k, tier) in self.settings.tiers.iter().enumerate() {
+            let max = U256::from(if c.start == apex_exec::lean2::USDC { tier.max_size_usdc } else { tier.max_size_wei });
+            let plan = self.terms_for(c, &pxc, l1_upper_wei, max);
+            if let Some(from) = points.last().map(|p| p.step) {
+                let number = SPIKE_TIER_BASE.saturating_add(u8::try_from(k).unwrap_or(u8::MAX));
+                points.extend(spike_point(c, &pair, l, &pxc, &plan.0, band, number, tier, from, &inputs));
+            }
+            spike.push(plan);
+        }
+        Some(Priced { seqs: [pair[0].seq, pair[1].seq], at_ns: 0, points, terms, lender, spike })
     }
 
     /// One pass: observe moves, reprice stale slots, choose by marginal net,
@@ -337,7 +479,7 @@ impl SizedEngine {
         l1_upper_wei: u128,
     ) -> Vec<ArmedLine> {
         let started = std::time::Instant::now();
-        let s = self.settings;
+        let s = &self.settings;
         let window_ns = s.window_s * 1_000_000_000;
         let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let st = &mut *guard;
@@ -424,17 +566,24 @@ impl SizedEngine {
                     group: (pool, up),
                     ev: self.value(point, p, base_fee_wei, &chance),
                     worst_wei: self.worst(point, base_fee_wei, l1_upper_wei),
+                    rank: (self.rank)(c.legs[0].pool, c.legs[1].pool),
                 });
             }
         }
         // The set to hold this window: the arms already pending are in it, on
         // their own senders and reservations, so the fill counts them all.
+        // R43: the spike tiers' senders first, on what the budget has; the
+        // ordinary tiers then fill theirs on what is left of it.
+        let senders = s.senders();
         let chosen = {
             let priced = &st.priced;
             let moves = &st.moves;
-            fill(&cands, s.max_senders, budget_left_wei.max(1), |cand, in_group| {
+            let mut chosen = fill_spike(&cands, &s.tiers.iter().map(|t| t.senders).collect::<Vec<_>>(), budget_left_wei);
+            let held: u128 = chosen.iter().map(|i| cands[*i].worst_wei).sum();
+            chosen.extend(fill(&cands, senders.ordinary(), budget_left_wei.saturating_sub(held).max(1), |cand, in_group| {
                 self.marginal(cand, in_group.iter().map(|i| &cands[*i]), priced, moves, snapshot, px, base_fee_wei)
-            })
+            }));
+            chosen
         };
 
         for busy in &mut st.senders {
@@ -462,7 +611,8 @@ impl SizedEngine {
                 if live.fingerprint == fingerprint {
                     if live.arm.to_block <= head {
                         let deadline = now_ns / 1_000_000_000 + s.window_s + 1;
-                        let Ok(call) = sized_call(c, snapshot, &p.terms, s.executor3, s.chain_id, deadline, p.lender, &px.gas) else { continue };
+                        let (terms, lender) = p.plan(tier);
+                        let Ok(call) = sized_call(c, snapshot, terms, s.executor3, s.chain_id, deadline, lender, &px.gas) else { continue };
                         let calldata = format!("0x{}", alloy_primitives::hex::encode(call.data()));
                         live.arm.to_block = to_block;
                         live.arm.deadline = deadline;
@@ -478,7 +628,14 @@ impl SizedEngine {
                     continue;
                 }
             }
-            let Some(sender) = st.senders.iter().position(|b| *b == 0) else { break };
+            // R43: on one of its tier's own senders. A spike tier with none
+            // free waits; the ordinary tiers, chosen after them, end the pass.
+            let Some(sender) = senders.slots(tier).find(|i| st.senders.get(*i).is_some_and(|b| *b == 0)) else {
+                if tier >= SPIKE_TIER_BASE {
+                    continue;
+                }
+                break;
+            };
             let Some(arm) = self.arm(c, leg, point, p, snapshot, (head, to_block), base_fee_wei, px, now_ns, sender, st.next_arm_id) else { continue };
             st.next_arm_id += 1;
             st.senders[sender] = to_block;
@@ -497,18 +654,23 @@ impl SizedEngine {
     /// chance of winning, less what its `NoTrade`s and reverts are expected to
     /// cost.
     fn value(&self, point: &SizedArmPoint, p: &Priced, base_fee_wei: u128, chance: &impl Fn(u32) -> f64) -> f64 {
-        let s = self.settings;
+        let s = &self.settings;
+        let terms = p.plan(point.tier).0;
         let won = point.bid.sent.p_win.max(P_WIN_FLOOR) * expected_net(&point.grid, chance);
         let price = (base_fee_wei + point.bid.sent.per_gas) as f64;
-        let no_trade = p.terms.read_gas as f64 * price + p.terms.l1_bound as f64;
-        let revert = (p.terms.read_gas + u64::from(p.terms.swap_gas)) as f64 * price + p.terms.l1_bound as f64;
+        let no_trade = terms.read_gas as f64 * price + terms.l1_bound as f64;
+        let revert = (terms.read_gas + u64::from(terms.swap_gas)) as f64 * price + terms.l1_bound as f64;
         let costs = f64::from(s.p_no_trade_ppm) / 1e6 * no_trade + f64::from(s.p_revert_ppm) / 1e6 * revert;
         won - chance(point.step) * costs
     }
 
+    /// What the arm holds of the day's budget while it is pending
+    /// ([`Reserve`]), at twice the base fee and its bid under its tier's cap:
+    /// the live worker's own figure.
     fn worst(&self, point: &SizedArmPoint, base_fee_wei: u128, l1_upper_wei: u128) -> u128 {
-        let fee = base_fee_wei.saturating_mul(2).saturating_add(point.bid.sent.per_gas.min(self.settings.max_priority_wei_per_gas));
-        u128::from(SIZED.limit).saturating_mul(fee).saturating_add(self.settings.l1_fee_bound_wei.max(l1_upper_wei.saturating_mul(2)))
+        let s = &self.settings;
+        let fee = base_fee_wei.saturating_mul(2).saturating_add(point.bid.sent.per_gas.min(s.cap_for(point.tier)));
+        u128::from(s.reserve.gas()).saturating_mul(fee).saturating_add(s.l1_fee_bound_wei.max(l1_upper_wei.saturating_mul(2)))
     }
 
     /// What `cand` adds once `chosen` (its group's arms, in the order chosen)
@@ -559,7 +721,7 @@ impl SizedEngine {
             book.insert(pc.legs[pl].pool, Arc::new(after.clone()));
             book.insert(o.spec.pool, Arc::clone(o));
             let price = U256::from(pxc.costs.wei_per_gas);
-            if let SizedOutcome::Trade { size, mid, .. } = sized_trade(pc, &book, &pp.terms, price, &pxc.gas) {
+            if let SizedOutcome::Trade { size, mid, .. } = sized_trade(pc, &book, pp.plan(ptier).0, price, &pxc.gas) {
                 // The trigger is the prior route's hop `pl`: its input there is
                 // the size on hop 0, and what hop 0 returned on hop 1.
                 let input = if pl == 0 { size } else { mid };
@@ -586,7 +748,7 @@ impl SizedEngine {
         let mut book = BTreeMap::new();
         book.insert(c.legs[leg].pool, Arc::new(trigger.clone()));
         book.insert(other.spec.pool, Arc::clone(other));
-        let (terms, _) = self.terms_for(c, &pxc, 0);
+        let (terms, _) = self.terms_for(c, &pxc, 0, self.settings.max_size(c.start));
         match sized_trade(c, &book, &terms, U256::from(pxc.costs.wei_per_gas), &pxc.gas) {
             SizedOutcome::Trade { gross, .. } => pxc.in_wei(gross).as_u128() as f64,
             SizedOutcome::NoTrade(_) => 0.0,
@@ -608,7 +770,8 @@ impl SizedEngine {
         sender: usize,
         arm_id: u64,
     ) -> Option<Arm> {
-        let s = self.settings;
+        let s = &self.settings;
+        let (terms, plan_lender) = p.plan(point.tier);
         let (t, o) = (usize::from(leg), 1 - usize::from(leg));
         let trigger_pool = snapshot.get(&c.legs[t].pool)?;
         let other_pool = snapshot.get(&c.legs[o].pool)?;
@@ -617,17 +780,17 @@ impl SizedEngine {
         predicates.push(predicate::expiry(to_block));
         let deadline = now_ns / 1_000_000_000 + s.window_s + 1;
         let pxc = px.for_cycle(c)?;
-        let call = sized_call(c, snapshot, &p.terms, s.executor3, s.chain_id, deadline, p.lender, &px.gas).ok()?;
+        let call = sized_call(c, snapshot, terms, s.executor3, s.chain_id, deadline, plan_lender, &px.gas).ok()?;
         let lender = match call.plan() {
             apex_exec::call::CallPlan::Lean3(plan) if plan.lender == Lean2Lender::PoolManager => "pool_manager",
-            _ if p.lender == Lean2Lender::Morpho => "morpho",
+            _ if plan_lender == Lean2Lender::Morpho => "morpho",
             _ => "balancer",
         };
         // The engine's prediction at the threshold: logged, never enforced.
         let mut at = snapshot.clone();
         at.insert(c.legs[t].pool, Arc::new(point.trigger.clone()));
         let price = U256::from(base_fee_wei.saturating_add(point.bid.sent.per_gas));
-        let (size, gross) = match sized_trade(c, &at, &p.terms, price, &pxc.gas) {
+        let (size, gross) = match sized_trade(c, &at, terms, price, &pxc.gas) {
             SizedOutcome::Trade { size, gross, .. } => (size, gross),
             SizedOutcome::NoTrade(_) => (U256::zero(), U256::zero()),
         };
@@ -676,13 +839,13 @@ impl SizedEngine {
                 .collect(),
             sized: Some(SizedLine {
                 tier: point.tier,
-                cap: p.terms.cap.to_string(),
-                rate: p.terms.plan_rate().unwrap_or_default().to_string(),
-                gas_overhead: p.terms.overhead,
-                swap_gas: p.terms.swap_gas,
-                l1_bound: p.terms.l1_bound,
-                min_net: p.terms.min_net,
-                max_steps: p.terms.max_steps,
+                cap: terms.cap.to_string(),
+                rate: terms.plan_rate().unwrap_or_default().to_string(),
+                gas_overhead: terms.overhead,
+                swap_gas: terms.swap_gas,
+                l1_bound: terms.l1_bound,
+                min_net: terms.min_net,
+                max_steps: terms.max_steps,
             }),
         })
     }
@@ -761,6 +924,8 @@ mod tests {
             reprice_for: Duration::MAX,
             workers: 1,
             l1_fee_bound_wei: 1_000_000_000_000,
+            tiers: Vec::new(),
+            reserve: Reserve::WorstCase,
         };
         let px = Pricing {
             costs: RouteCosts { other_wei: 0, wei_per_gas: 1 },
@@ -805,7 +970,7 @@ mod tests {
             if let Some(point) = p.points.first() {
                 let chance = |s: u32| st.moves.p_at_least(spread_key(UNI, c.legs[1 - l].pool), true, s).max(P_MOVE_FLOOR);
                 let ev = e.value(point, p, 1, &chance);
-                by_other.insert(c.legs[1 - l].pool, Candidate { key: (*id, *leg, 1), group: (UNI, true), ev, worst_wei: 1 });
+                by_other.insert(c.legs[1 - l].pool, Candidate { key: (*id, *leg, 1), group: (UNI, true), ev, worst_wei: 1, rank: 0.0 });
             }
         }
         let (Some(first), Some(second)) = (by_other.get(&CAKE).cloned(), by_other.get(&SLIP).cloned()) else {

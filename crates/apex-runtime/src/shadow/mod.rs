@@ -818,6 +818,8 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
                         reprice_for: crate::armed::engine::REPRICE_FOR,
                         workers: crate::armed::engine::workers(),
                         l1_fee_bound_wei: a.l1_fee_bound_wei,
+                        tiers: Vec::new(),
+                        reserve: crate::armed::sized::Reserve::WorstCase,
                     };
                     let t = targets.clone();
                     let engine = crate::armed::sized::SizedEngine::new(armed_set.clone(), settings, unarmable.clone())
