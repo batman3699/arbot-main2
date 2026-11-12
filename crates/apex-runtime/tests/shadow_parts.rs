@@ -1015,6 +1015,54 @@ fn the_spike_tiers_load_and_their_checks_hold() {
     );
 }
 
+/// R43: both lanes send only when the sized lane sends its spike tiers
+/// alone: every one of its senders a tier's, and a write-ahead ledger of its
+/// own. R39's worker is then the first, on the first keys; the sized lane's
+/// has the rest, its own executor and its own day's budget.
+#[test]
+fn both_lanes_send_only_with_the_sized_lane_on_its_spike_tiers_alone() {
+    use apex_runtime::shadow::config::Lane;
+    let var = "APEX_SECRET_SHADOW_TEST_BOTH";
+    let e = env(var, SECRET);
+    let base = armed_live(var, ARMED_LIVE);
+    let with = |section: &str| base.replace("executor:\n  address", &format!("{section}executor:\n  address"));
+    let sized = |more: &str| {
+        format!("  sized:\n    mode: live\n    max_senders: 8\n    ledger: var/s.jsonl\n    verdicts: var/sv.jsonl\n    executor3:\n      address: \"0x00000000000000000000000000000000000000e3\"\n      code_hash: \"0x00000000000000000000000000000000000000000000000000000000000000c3\"\n{more}")
+    };
+    let tier = |least: &str, cap: &str, senders: usize| {
+        format!("      - least_net_wei: {least}\n        bid_share_bps: 2500\n        max_priority_wei_per_gas: {cap}\n        senders: {senders}\n")
+    };
+    let tiers = |first: usize| format!("    tiers:\n{}{}", tier("47000000000000000", "25000000000", first), tier("470000000000000000", "200000000000", 2));
+    let ledger = "    live_ledger: var/apex/armed-live-sized.jsonl\n";
+    let good = format!("{ledger}    daily_loss_budget_wei: 50000000000000000\n{}", tiers(6));
+    let c = ShadowConfig::canary_from_yaml_str(&with(&sized(&good)), &e).expect("both lanes live");
+    assert_eq!(c.live_lane(), Some(Lane::Fixed), "R39's worker is the first");
+    assert_ne!(format!("{:#x}", c.armed_executor()), "0x00000000000000000000000000000000000000e3", "and sends to its own executor");
+    assert_eq!(c.live_senders(), c.armed.max_arms);
+    let beside = c.sized_beside().expect("the sized lane sends beside it");
+    assert_eq!(beside.max_senders, 8);
+    assert_eq!(beside.live_ledger.as_deref(), Some(std::path::Path::new("var/apex/armed-live-sized.jsonl")));
+    assert_eq!(c.sized_budget_wei(), 50_000_000_000_000_000, "its own day's budget");
+    let unset = ShadowConfig::canary_from_yaml_str(&with(&sized(&format!("{ledger}{}", tiers(6)))), &e).unwrap();
+    assert_eq!(unset.sized_budget_wei(), unset.armed.daily_loss_budget_wei, "armed's when it names none");
+
+    let refused = |more: String, field: &str| match ShadowConfig::canary_from_yaml_str(&with(&sized(&more)), &e) {
+        Err(ShadowConfigError::Invalid(m)) => assert!(m.contains(field), "{m} should name {field}"),
+        other => panic!("{field}: expected a refusal, got {:?}", other.map(|c| c.armed.sized)),
+    };
+    refused(tiers(6), "both live");
+    refused(format!("{ledger}{}", tiers(5)), "both live");
+    refused(ledger.to_string(), "both live");
+    refused(format!("    live_ledger: var/apex/armed-live.jsonl\n{}", tiers(6)), "armed.live.ledger");
+    refused(format!("{ledger}    daily_loss_budget_wei: 100000000000000001\n{}", tiers(6)), "armed.sized.daily_loss_budget_wei");
+    refused(format!("{ledger}    daily_loss_budget_wei: 0\n{}", tiers(6)), "armed.sized.daily_loss_budget_wei");
+
+    // One lane live: nothing sends beside it.
+    let alone = ShadowConfig::canary_from_yaml_str(&with(&sized(&good).replace("mode: live", "mode: shadow")), &e).unwrap();
+    assert!(alone.sized_beside().is_none());
+    assert_eq!(alone.live_lane(), Some(Lane::Fixed));
+}
+
 /// R40.1: one lane sends. With the sized lane absent or in shadow, R39's
 /// sends as before; flipped live, the sized lane's does, to its executor,
 /// with its own count of senders.

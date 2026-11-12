@@ -405,6 +405,14 @@ pub struct SizedConfig {
     /// trade costs.
     #[serde(default)]
     pub reserve: crate::armed::sized::Reserve,
+    /// R43: the lane's own write-ahead live ledger, for when it sends beside
+    /// R39's: two workers never share one.
+    #[serde(default)]
+    pub live_ledger: Option<PathBuf>,
+    /// R43: the lane's own day's loss budget; `armed.daily_loss_budget_wei`
+    /// when unset. Its engine fills against it, and its worker holds to it.
+    #[serde(default)]
+    pub daily_loss_budget_wei: Option<u128>,
 }
 
 /// R43: the most spike tiers a lane holds.
@@ -623,8 +631,16 @@ fn invalid(detail: impl Into<String>) -> ShadowConfigError {
 /// plan's; its executor is not R39's.
 fn sized(a: &ArmedConfig, sz: &SizedConfig, command: Command) -> Result<(), ShadowConfigError> {
     if sz.mode == ArmedMode::Live {
-        if a.mode == ArmedMode::Live {
-            return Err(invalid("armed.mode and armed.sized.mode are both live: one lane sends, the other shadows"));
+        // R43: both send only with the sized lane on its spike tiers alone,
+        // from senders that are all a tier's, into a ledger of its own.
+        let spike_only = !sz.tiers.is_empty() && sz.tiers.iter().map(|t| t.senders).sum::<usize>() == sz.max_senders;
+        if a.mode == ArmedMode::Live && !(spike_only && sz.live_ledger.is_some()) {
+            return Err(invalid(
+                "armed.mode and armed.sized.mode are both live: that needs armed.sized.live_ledger, and armed.sized.tiers holding every one of armed.sized.max_senders",
+            ));
+        }
+        if a.mode == ArmedMode::Live && sz.live_ledger.as_ref() == a.live.as_ref().map(|l| &l.ledger) {
+            return Err(invalid("armed.sized.live_ledger is armed.live.ledger: each lane's worker writes its own"));
         }
         if command == Command::Shadow {
             return Err(invalid("armed.sized.mode live sends: it runs under `apex canary`, never `apex shadow`"));
@@ -650,6 +666,12 @@ fn sized(a: &ArmedConfig, sz: &SizedConfig, command: Command) -> Result<(), Shad
         return Err(invalid(
             "armed.sized: max_senders 1-64, band_cap_bps 1-20, window_s 2-50, max_steps 1-16, tier2_multiple >= 2, priors <= 1000000 ppm",
         ));
+    }
+    if let Some(budget) = sz.daily_loss_budget_wei {
+        let most = ARMED_CAPS.iter().find(|(n, _)| *n == "daily_loss_budget_wei").map_or(0, |(_, most)| *most);
+        if budget == 0 || budget > most {
+            return Err(invalid(format!("armed.sized.daily_loss_budget_wei {budget} is outside 1..={most} wei")));
+        }
     }
     spike_tiers(a, sz)
 }
@@ -734,22 +756,35 @@ impl ShadowConfig {
     /// R37: the executor the arming engine builds for, and armed-live sends
     /// to: `LeanExecutor2` when `armed.executor2` is set, else v1.
     pub fn armed_executor(&self) -> Address {
-        if let Some(s) = self.armed.sized.as_ref().filter(|s| s.mode == ArmedMode::Live) {
-            return s.executor3.address;
+        match (self.live_lane(), &self.armed.sized) {
+            (Some(Lane::Sized), Some(s)) => s.executor3.address,
+            _ => self.armed.executor2.as_ref().map_or(self.executor.address, |e| e.address),
         }
-        self.armed.executor2.as_ref().map_or(self.executor.address, |e| e.address)
     }
 
     /// R40.1: which lane's lines go to armed-live: R39's, the sized lane's,
-    /// or neither. The load check lets at most one be live.
+    /// or neither. R43: with both live it is R39's, and the sized lane has a
+    /// worker of its own ([`Self::sized_beside`]).
     pub fn live_lane(&self) -> Option<Lane> {
-        if self.armed.sized.as_ref().is_some_and(|s| s.mode == ArmedMode::Live) {
-            Some(Lane::Sized)
-        } else if self.armed.mode == ArmedMode::Live {
+        if self.armed.mode == ArmedMode::Live {
             Some(Lane::Fixed)
+        } else if self.armed.sized.as_ref().is_some_and(|s| s.mode == ArmedMode::Live) {
+            Some(Lane::Sized)
         } else {
             None
         }
+    }
+
+    /// R43: the sized lane, when it sends beside R39's: its spike tiers, from
+    /// the keys after R39's, to its own executor and ledger.
+    pub fn sized_beside(&self) -> Option<&SizedConfig> {
+        self.armed.sized.as_ref().filter(|s| s.mode == ArmedMode::Live && self.armed.mode == ArmedMode::Live)
+    }
+
+    /// R43: the day's loss budget the sized lane fills against and is held
+    /// to: its own, or `armed`'s.
+    pub fn sized_budget_wei(&self) -> u128 {
+        self.armed.sized.as_ref().and_then(|s| s.daily_loss_budget_wei).unwrap_or(self.armed.daily_loss_budget_wei)
     }
 
     /// R40.1: the senders the live lane arms with: one key each.

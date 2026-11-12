@@ -271,6 +271,11 @@ struct Shadow {
     /// R36: armed-live's worker, in armed-live; and each pass's lines on their
     /// way to it, with the pass's base fee, in the order they were armed.
     armed_live: Option<Arc<crate::armed::live::ArmedLive>>,
+    /// R43: the sized lane's own worker, when it sends beside R39's, and its
+    /// lines' queue.
+    armed_live_sized: Option<Arc<crate::armed::live::ArmedLive>>,
+    armed_sized_lines: tokio::sync::mpsc::Sender<(Vec<crate::armed::lines::ArmedLine>, u128)>,
+    armed_sized_lines_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Vec<crate::armed::lines::ArmedLine>, u128)>>,
     armed_lines: tokio::sync::mpsc::Sender<(Vec<crate::armed::lines::ArmedLine>, u128)>,
     armed_lines_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Vec<crate::armed::lines::ArmedLine>, u128)>>,
     /// R36: the census's targeted pools, admitted below the floor on every
@@ -490,6 +495,16 @@ pub async fn run(config: ShadowConfig, env: &Env, stop: impl Future<Output = ()>
             }));
         }
     }
+    // R43: the sized lane's worker beside it, the same two tasks.
+    if shadow.armed_live_sized.is_some() {
+        for (name, task) in [("armed-live-sized", Task::ArmedLiveSized), ("armed-heads-sized", Task::ArmedHeadsSized)] {
+            let s = Arc::clone(&shadow);
+            spawn(name, Box::new(move || {
+                let s = Arc::clone(&s);
+                Box::pin(async move { s.task(task).await })
+            }));
+        }
+    }
     {
         let (s, bus) = (Arc::clone(&shadow), Arc::clone(&bus));
         spawn("report", Box::new(move || {
@@ -530,6 +545,9 @@ enum Task {
     /// R40.1: the sized lane's engine, and the L1 bound its plans carry.
     ArmedSized,
     L1Upper,
+    /// R43: the sized lane's own worker, beside R39's.
+    ArmedLiveSized,
+    ArmedHeadsSized,
 }
 
 async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
@@ -1057,17 +1075,37 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     // R36: armed-live's worker. The configuration allows the mode only under
     // `apex canary`, with its section; the executor pays the canary's recipient.
     // R40.1: whichever lane is live sends; at most one is.
-    let armed_live = match (config.live_lane(), &config.armed.live, &config.canary) {
+    // R43: with both live, each has its own worker: R39's on the first keys,
+    // the sized lane's on the rest.
+    let sized_window = |sz: &config::SizedConfig| (sz.window_s * 1_000).div_ceil(config.armed.block_time_ms.max(1)).max(1);
+    let (armed_live, armed_live_sized) = match (config.live_lane(), &config.armed.live, &config.canary) {
         (Some(lane), Some(live), Some(k)) => {
-            let window = match (lane, &config.armed.sized) {
-                (config::Lane::Sized, Some(sz)) => (sz.window_s * 1_000).div_ceil(config.armed.block_time_ms.max(1)).max(1),
-                _ => window_blocks,
+            let keys = crate::armed::keys::load(&live.keys_file).map_err(ShadowError::Boot)?;
+            let (keys, beside) = lane_keys(keys, config.live_senders(), config.sized_beside().map_or(0, |sz| sz.max_senders))
+                .map_err(|(held, slots)| {
+                    ShadowError::Boot(format!(
+                        "{} holds {held} keys for {slots} slots (the live lanes' senders): one sender a slot",
+                        live.keys_file.display()
+                    ))
+                })?;
+            let first = match (lane, &config.armed.sized) {
+                (config::Lane::Sized, Some(sz)) => LaneBoot::sized(&config, sz, keys, live.ledger.clone(), sized_window(sz)),
+                _ => LaneBoot::fixed(&config, keys, live.ledger.clone(), window_blocks),
             };
-            Some(Arc::new(boot_armed_live(&config, live, k.profit_recipient, &rpc, window).await?))
+            let first = Arc::new(boot_armed_live(&config, live, k.profit_recipient, &rpc, first).await?);
+            let second = match config.sized_beside().and_then(|sz| sz.live_ledger.clone().map(|ledger| (sz, ledger))) {
+                Some((sz, ledger)) => {
+                    let lane = LaneBoot::sized(&config, sz, beside, ledger, sized_window(sz));
+                    Some(Arc::new(boot_armed_live(&config, live, k.profit_recipient, &rpc, lane).await?))
+                }
+                None => None,
+            };
+            (Some(first), second)
         }
-        _ => None,
+        _ => (None, None),
     };
     let (armed_lines, armed_lines_rx) = tokio::sync::mpsc::channel(1_024);
+    let (armed_sized_lines, armed_sized_lines_rx) = tokio::sync::mpsc::channel(1_024);
 
     info!(
         config = %config.version,
@@ -1121,6 +1159,9 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
         armed_live,
         armed_lines,
         armed_lines_rx: tokio::sync::Mutex::new(armed_lines_rx),
+        armed_live_sized,
+        armed_sized_lines,
+        armed_sized_lines_rx: tokio::sync::Mutex::new(armed_sized_lines_rx),
         targets_loaded: targets.is_some(),
         targeted_routes: targets.as_ref().map_or(0, |t| t.routes.len() as u64),
         targets_missing: missing as u64,
@@ -1131,6 +1172,58 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     })
 }
 
+/// R43: the key file's keys by lane: the first `first` are the first worker's
+/// slots in order, the `beside` after them the sized lane's own worker's.
+/// Any other count is refused with `(held, wanted)`: one sender a slot.
+fn lane_keys<T>(mut keys: Vec<T>, first: usize, beside: usize) -> Result<(Vec<T>, Vec<T>), (usize, usize)> {
+    if keys.len() != first + beside {
+        return Err((keys.len(), first + beside));
+    }
+    let rest = keys.split_off(first);
+    Ok((keys, rest))
+}
+
+/// R43: one live lane's worker, as its boot takes it: its senders' keys, the
+/// executor they send to, its ledger and budget, and, for the sized lane, its
+/// tiers and what a pending arm holds of the budget.
+struct LaneBoot {
+    keys: Vec<LaneKey>,
+    executor: Address,
+    ledger: std::path::PathBuf,
+    budget_wei: u128,
+    window_blocks: u64,
+    senders: crate::armed::sized::Senders,
+    reserve: crate::armed::sized::Reserve,
+}
+
+impl LaneBoot {
+    /// R39's lane: every arm at its worst case, to `LeanExecutor2` (or v1).
+    fn fixed(config: &ShadowConfig, keys: Vec<LaneKey>, ledger: std::path::PathBuf, window_blocks: u64) -> Self {
+        Self {
+            keys,
+            executor: config.armed.executor2.as_ref().map_or(config.executor.address, |e| e.address),
+            ledger,
+            budget_wei: config.armed.daily_loss_budget_wei,
+            window_blocks,
+            senders: crate::armed::sized::Senders::default(),
+            reserve: crate::armed::sized::Reserve::WorstCase,
+        }
+    }
+
+    /// The sized lane: to `LeanExecutor3`, on its own budget, tiers and reserve.
+    fn sized(config: &ShadowConfig, sz: &config::SizedConfig, keys: Vec<LaneKey>, ledger: std::path::PathBuf, window_blocks: u64) -> Self {
+        Self {
+            keys,
+            executor: sz.executor3.address,
+            ledger,
+            budget_wei: config.sized_budget_wei(),
+            window_blocks,
+            senders: crate::armed::sized::Senders { total: sz.max_senders, tiers: sz.spike_tiers(&config.armed) },
+            reserve: sz.reserve,
+        }
+    }
+}
+
 /// R36: armed-live's worker: one sender a slot, each one the executor lets
 /// trade, its ledger replayed and every nonce read before the first send.
 async fn boot_armed_live(
@@ -1138,38 +1231,33 @@ async fn boot_armed_live(
     live: &config::ArmedLiveConfig,
     recipient: Address,
     rpc: &Arc<dyn RpcTransport>,
-    window_blocks: u64,
+    lane: LaneBoot,
 ) -> Result<crate::armed::live::ArmedLive, ShadowError> {
     use crate::armed::live::{ArmedLive, LivePolicy};
-    let keys = crate::armed::keys::load(&live.keys_file).map_err(ShadowError::Boot)?;
+    let LaneBoot { keys, executor, ledger: ledger_path, budget_wei, window_blocks, senders: lane_senders, reserve } = lane;
     let a = &config.armed;
-    // R40.1: the live lane's senders: `armed.max_arms`, or the sized lane's.
-    let slots = config.live_senders();
-    if keys.len() != slots {
-        return Err(ShadowError::Boot(format!(
-            "{} holds {} keys for {} slots (the live lane's senders): one sender a slot",
-            live.keys_file.display(),
-            keys.len(),
-            slots
-        )));
-    }
     let senders: Vec<Address> = keys.iter().map(LaneKey::address).collect();
-    // R37: the executor every arm is built for: LeanExecutor2 when it is set.
-    let executor = config.armed_executor();
     crate::armed::live_chain::check_executors(&**rpc, executor, &senders).await.map_err(ShadowError::Boot)?;
     // The daily restart compacts a long ledger first: the boot replays all of
     // it, and renewals add ~200 records a minute.
-    match crate::armed::live_ledger::LiveLedger::compact_file(&live.ledger, now_ms(), a.daily_loss_budget_wei, ARMED_LEDGER_COMPACT_ABOVE) {
+    match crate::armed::live_ledger::LiveLedger::compact_file(&ledger_path, now_ms(), budget_wei, ARMED_LEDGER_COMPACT_ABOVE) {
         Ok(Some(archive)) => info!(archive = %archive.display(), "armed-live's ledger compacted; the original is kept beside it"),
         Ok(None) => {}
         Err(e) => warn!(error = %e, "armed-live's ledger was not compacted; it is read whole"),
     }
-    let (ledger, records) = crate::armed::live_ledger::LiveLedger::open(&live.ledger).map_err(|e| boot_err("the armed live ledger", e))?;
+    let (ledger, records) = crate::armed::live_ledger::LiveLedger::open(&ledger_path).map_err(|e| boot_err("the armed live ledger", e))?;
     let submit = apex_chain::base::validity::ValiditySubmitter::new(&live.sequencer, Duration::from_secs(3))
         .map_err(|e| ShadowError::Boot(format!("armed-live's submitter: {e}")))?;
-    info!(endpoint = submit.label(), senders = senders.len(), records = records.len(), "armed-live sends validity transactions through this endpoint");
+    info!(
+        endpoint = submit.label(),
+        %executor,
+        ledger = %ledger_path.display(),
+        senders = senders.len(),
+        records = records.len(),
+        "armed-live sends validity transactions through this endpoint"
+    );
     let policy = LivePolicy {
-        budget_wei: a.daily_loss_budget_wei,
+        budget_wei,
         max_priority_wei_per_gas: a.max_priority_wei_per_gas,
         max_size_wei: ethers_core::types::U256::from(a.max_size_wei),
         max_size_usdc: ethers_core::types::U256::from(a.max_size_usdc),
@@ -1182,11 +1270,8 @@ async fn boot_armed_live(
         max_head_lag_ms: a.max_head_lag_ms,
         head_reads_every_ms: config.policy.head_reads_every_ms,
         // R43: the sized lane's tiers and reserve; R39's lane has neither.
-        senders: match (config.live_lane(), &a.sized) {
-            (Some(config::Lane::Sized), Some(sz)) => crate::armed::sized::Senders { total: sz.max_senders, tiers: sz.spike_tiers(a) },
-            _ => crate::armed::sized::Senders::default(),
-        },
-        reserve: a.sized.as_ref().map_or_else(Default::default, |sz| sz.reserve),
+        senders: lane_senders,
+        reserve,
     };
     let chain = Arc::new(crate::armed::live_chain::RpcChain::new(Arc::clone(rpc)));
     let worker = ArmedLive::new(keys, chain, Arc::new(submit), ledger, records, policy, executor, recipient, config.chain_id);
@@ -1342,6 +1427,8 @@ impl Shadow {
             Task::ArmedMoves => self.armed_moves_loop().await,
             Task::ArmedSized => self.armed_sized_loop().await,
             Task::L1Upper => self.l1_upper_loop().await,
+            Task::ArmedLiveSized => self.armed_live_sized_loop().await,
+            Task::ArmedHeadsSized => self.armed_head_sized_loop().await,
             Task::FullReload => {
                 let mut every = tokio::time::interval(Duration::from_secs(self.config.policy.full_reload_every_s));
                 every.tick().await;
@@ -1580,7 +1667,7 @@ impl Shadow {
             };
             let base_fee = head.base_fee_per_gas.unwrap_or(0);
             let now = SystemClock.now().0;
-            let (budget, l1) = (self.config.armed.daily_loss_budget_wei, u128::from(self.l1_upper.load(Ordering::Relaxed)));
+            let (budget, l1) = (self.config.sized_budget_wei(), u128::from(self.l1_upper.load(Ordering::Relaxed)));
             let lines = tokio::task::spawn_blocking(move || engine.tick(&snapshot, head.number, base_fee, &px, now, budget, l1))
                 .await
                 .unwrap_or_default();
@@ -1589,8 +1676,18 @@ impl Shadow {
                     bump(&self.stats.armed_write_failures);
                 }
             }
-            let sends = self.config.live_lane() == Some(config::Lane::Sized);
-            if sends && self.armed_live.is_some() && !lines.is_empty() && self.armed_lines.try_send((lines, base_fee)).is_err() {
+            // R43: to its own worker when it sends beside R39's; to the one
+            // worker when it is the only live lane.
+            let dropped = if lines.is_empty() {
+                false
+            } else if self.armed_live_sized.is_some() {
+                self.armed_sized_lines.try_send((lines, base_fee)).is_err()
+            } else if self.config.live_lane() == Some(config::Lane::Sized) && self.armed_live.is_some() {
+                self.armed_lines.try_send((lines, base_fee)).is_err()
+            } else {
+                false
+            };
+            if dropped {
                 bump(&self.stats.armed_live_dropped);
             }
         }
@@ -1652,11 +1749,28 @@ impl Shadow {
         }
     }
 
+    /// R43: the same two loops for the sized lane's own worker.
+    async fn armed_live_sized_loop(&self) {
+        let Some(live) = &self.armed_live_sized else { return };
+        let mut rx = self.armed_sized_lines_rx.lock().await;
+        while let Some((lines, base_fee)) = rx.recv().await {
+            live.on_lines(&lines, base_fee, now_ms()).await;
+        }
+    }
+
+    async fn armed_head_sized_loop(&self) {
+        let Some(live) = &self.armed_live_sized else { return };
+        Self::head_hook(live, self.heads.subscribe()).await;
+    }
+
     /// R36: armed-live's head hook: the cadence, and what came of every
     /// pending transaction whose bound a head has passed.
     async fn armed_head_loop(&self) {
         let Some(live) = &self.armed_live else { return };
-        let mut heads = self.heads.subscribe();
+        Self::head_hook(live, self.heads.subscribe()).await;
+    }
+
+    async fn head_hook(live: &crate::armed::live::ArmedLive, mut heads: watch::Receiver<Option<Head>>) {
         while heads.changed().await.is_ok() {
             let head = heads.borrow_and_update().as_ref().map(|h| (h.number, h.timestamp_ms));
             if let Some((number, stamp)) = head {
@@ -1855,6 +1969,7 @@ impl Shadow {
                     engine: self.armed.stats(),
                     write_failures: get(&self.stats.armed_write_failures),
                     live: self.armed_live.as_ref().map(|l| l.report(now_ms())),
+                    live_sized: self.armed_live_sized.as_ref().map(|l| l.report(now_ms())),
                     live_dropped: get(&self.stats.armed_live_dropped),
                     move_checks,
                     move_tick_mismatches,
@@ -1989,6 +2104,9 @@ pub struct ArmedReport {
     pub targets_missing: u64,
     /// R36: armed-live, when this run sends; passes its queue had no room for.
     pub live: Option<crate::armed::live::LiveReport>,
+    /// R43: the sized lane's own worker, when it sends beside R39's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_sized: Option<crate::armed::live::LiveReport>,
     pub live_dropped: u64,
 }
 
@@ -2113,4 +2231,21 @@ pub struct FeedReport {
     pub bytes_logs: u64,
     pub bytes_pending_logs: u64,
     pub bytes_other: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lane_keys;
+
+    /// R43: sixteen keys, eight to R39's worker and the last eight to the
+    /// sized lane's, in the file's order; a file of any other length boots
+    /// nothing.
+    #[test]
+    fn the_key_file_splits_by_lane_in_order() {
+        let keys: Vec<u8> = (0..16).collect();
+        assert_eq!(lane_keys(keys.clone(), 8, 8), Ok(((0..8).collect(), (8..16).collect())));
+        assert_eq!(lane_keys(keys.clone(), 16, 0), Ok((keys.clone(), Vec::new())), "one lane has them all");
+        assert_eq!(lane_keys(keys.clone(), 8, 6), Err((16, 14)), "two keys with no slot");
+        assert_eq!(lane_keys(keys, 16, 8), Err((16, 24)));
+    }
 }
