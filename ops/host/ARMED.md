@@ -584,7 +584,8 @@ The design is `docs/superpowers/specs/2026-10-29-armed-bid-from-own-fires-design
 The plan is `docs/superpowers/plans/2026-11-02-r40-1-any-size-armed-lane.md`.
 `LeanExecutor3` sizes each trade itself at execution, and prices its floor at
 the transaction's own gas price. Its engine runs beside R39's on the same
-feed. One lane sends at a time; the other only records.
+feed. One lane sends at a time; the other only records (R43, §6d: both,
+when this one sends its spike tiers alone).
 
 ### a. Shadow, before the deploy (the host)
 
@@ -639,3 +640,92 @@ the walk: the mirror short of the chain), and `simulated` against
 
 Rollback: the same two fields back, and a restart. `LeanExecutor2` stays
 deployed and authorized.
+
+## 6. R43: spike tiers on the sized lane
+
+Over 2026-11-03..09, 41 trades of $100 or more held 56% of the value on the
+routes this lane trades, and their winners paid a median 15 gwei. No arm
+could bid that: a sender held 0.002 ETH, the cap was 20 gwei, and at 20 gwei
+the sized lane's gas limit alone is twice the day's budget. A spike tier is
+a standing arm for such a move, with its own threshold, bid, senders, size
+cap and budget rule. Nothing below takes effect without the yaml.
+
+### a. The keys (`armed.sized`)
+
+```
+reserve: no_trade                # what a pending arm holds of the budget
+daily_loss_budget_wei: ...       # the lane's own; armed's when unset
+live_ledger: var/armed/armed-live-sized.jsonl   # only when both lanes send
+tiers:
+  - least_net_wei: ...           # the move must open this, before any tip
+    bid_share_bps: 2500          # tipped: a floor under the model's bid
+    max_priority_wei_per_gas: ...
+    senders: 6
+    max_size_wei: ...            # armed's when unset
+    max_size_usdc: ...
+```
+
+- A tier's threshold is the smallest move whose net reaches `least_net_wei`.
+  Its bid is the larger of the model's and `bid_share_bps` of that net over
+  the trade's gas, under the tier's own cap.
+- Senders: the ordinary tiers arm on the first slots, each spike tier on its
+  own after them, in the tiers' order. With `max_senders: 16` and tiers of 6
+  and 2: slots 0-7, 8-13, 14-15. A tier's senders go to the routes the census
+  values most, one arm for each trigger pool and direction.
+- `reserve: worst_case` holds the gas limit at the arm's fee, as before.
+  `no_trade` holds 140,000 gas at it: what an inclusion that does not trade
+  costs. A trade nets its floor after its own gas. A revert is not covered:
+  it can cost up to the gas it used at the arm's fee, and the day's loss cap
+  stops the lane only afterwards. A sender can never lose more than its
+  balance.
+- The ceilings are `armed`'s own: 1,000 gwei, 100 WETH, 100,000 USDC, 0.1 ETH
+  a day, at most half the net tipped, at most three tiers.
+
+### b. Funding a tier's senders (the owner)
+
+The protocol holds a sender to its gas limit at its fee, whatever it then
+uses, and the worker to `armed.sender_reserve_wei` beside it:
+
+```
+balance >= 1,000,000 x (2 x base fee + max_priority_wei_per_gas) + l1_fee_bound_wei + sender_reserve_wei
+```
+
+A 20 gwei tier needs about 0.0205 ETH a sender; a 157 gwei tier about 0.158
+ETH. A sender short of that is skipped as `balance`, every time. The slots
+are positions in the key file; take the addresses from
+`ops/armed-senders.json`, in its order.
+
+### c. Shadow first
+
+In `mode: shadow` the tiers arm and record, and nothing is sent. Shadow needs
+no keys, so the shipped config can add the spike senders to the ordinary
+sixteen (`max_senders: 24`) and leave gate C's lane as it was. Read it with
+`ops/host/remote.sh armed-sized`; a spike arm's line carries `sized.tier` 3
+or more and `bid_model: tier_share`. Each tier's senders should hold arms on
+target routes; `beyond_cap_usd` says what the tier's size cap left.
+
+### d. Both lanes live
+
+`armed.mode: live` with `armed.sized.mode: live` boots only when the sized
+lane's tiers hold every one of its senders and it names `live_ledger`. Then:
+
+- the key file's first `armed.max_arms` keys are R39's worker, to
+  `LeanExecutor2`; the next `armed.sized.max_senders` are the sized lane's own
+  worker, to `LeanExecutor3`, with its own ledger and day's budget;
+- each worker checks its senders against its own executor at boot, so the
+  owner authorizes the spike senders on `LeanExecutor3` first (§5c step 2,
+  with only those addresses);
+- the key file must hold exactly `max_arms + max_senders` keys;
+- the report's `armed.live_sized` is the second worker's section; the kill
+  file stops both.
+
+Rollback: `armed.sized.mode: shadow` and a restart. R39's lane is untouched.
+
+### e. The feed's fallbacks (`rpc.ws`)
+
+`rpc.ws` is one endpoint or a list. A session that ends having delivered
+nothing moves the feed to the next endpoint; one that was delivering is
+reconnected to, and after it the first endpoint is tried first. The shipped
+config lists one: a fallback must serve Denim heads (`timestampMs`) and the
+log subscriptions at this volume, which is to be probed before one is added.
+`rpc.http` already takes a list.

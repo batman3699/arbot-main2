@@ -886,7 +886,7 @@ fn a_live_run_sends_to_the_deployed_executor2() {
     let refused = ShadowConfig::load_canary(at.to_str().unwrap(), &env).unwrap_err();
     assert!(matches!(&refused, ShadowConfigError::Invalid(m) if m.contains("runtime_code")), "{refused:?}");
     let v1_only: String = text.lines().take_while(|l| !l.trim_start().starts_with("# R37: LeanExecutor2")).map(|l| format!("{l}\n")).collect::<String>()
-        + &text.lines().skip_while(|l| !l.trim_start().starts_with("max_size_usdc:")).map(|l| format!("{l}\n")).collect::<String>();
+        + &text.lines().skip_while(|l| !l.starts_with("  max_size_usdc:")).map(|l| format!("{l}\n")).collect::<String>();
     std::fs::write(&at, v1_only).unwrap();
     let v1 = ShadowConfig::load_canary(at.to_str().unwrap(), &env).unwrap();
     assert_eq!((v1.armed.executor2.as_ref(), v1.armed_executor()), (None, v1.executor.address), "no LeanExecutor2: v1");
