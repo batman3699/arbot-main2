@@ -16,6 +16,9 @@ use apex_runtime::armed::live::{ArmedLive, LiveChain, LivePolicy, Stops, Validit
 use apex_runtime::armed::live_chain::{check_executors, executors_call};
 use apex_runtime::armed::live_ledger::{Halt, LiveLedger, LiveRecord};
 use apex_runtime::armed::predicate::{expiry, Op, Predicate};
+use apex_runtime::armed::sized::{Reserve, Senders};
+use apex_runtime::armed::threshold::{SpikeTier, SPIKE_TIER_BASE};
+use apex_runtime::live::gas::SIZED;
 use apex_runtime::sign::LaneKey;
 use ethers_core::types::transaction::eip2718::TypedTransaction;
 use ethers_core::types::U256;
@@ -201,6 +204,8 @@ fn policy(budget_wei: u128, cap: u128) -> LivePolicy {
         denim: false,
         max_head_lag_ms: 0,
         head_reads_every_ms: 0,
+        senders: Senders::default(),
+        reserve: Reserve::WorstCase,
     }
 }
 
@@ -1155,4 +1160,133 @@ async fn a_late_send_in_a_batch_is_held_to_the_lag_at_its_own_time() {
     let batch = [ArmedLine::Arm(Box::new(arm(1, 0, 1_000_000, 600_000))), ArmedLine::Arm(Box::new(arm(2, 1, 1_000_000, 600_000)))];
     f.live.on_lines(&batch, 0, NOW).await;
     assert_eq!(sent(&f), 1, "the second send came 1.1 s after the first, with no head since: 1,266 ms of lag");
+}
+
+// ------------------------------------------------------------- R43: spike tiers
+
+const GWEI: u128 = 1_000_000_000;
+
+/// A sized arm of `tier`, whose plan may size to `cap`.
+fn sized_arm(arm_id: u64, slot: u16, tier: u8, bid: u128, cap: u128) -> Arm {
+    let sized = apex_runtime::armed::lines::SizedLine {
+        tier,
+        cap: cap.to_string(),
+        rate: "0".into(),
+        gas_overhead: 110_000,
+        swap_gas: 400_000,
+        l1_bound: 1,
+        min_net: 1,
+        max_steps: 8,
+    };
+    Arm { rung: tier, sized: Some(sized), ..arm(arm_id, slot, bid, SIZED.limit) }
+}
+
+/// Sixteen senders: eight ordinary, six for a tier capped at 25 gwei and 50
+/// WETH, two for one capped at 200 gwei and 80 WETH. The lane's own cap is 20
+/// gwei, and 10 WETH.
+fn spike_policy(budget_wei: u128, reserve: Reserve) -> LivePolicy {
+    let tier = |cap_gwei: u128, senders: usize, weth: u128| SpikeTier {
+        least_net_wei: 1,
+        bid_share_bps: 2_500,
+        cap_wei_per_gas: cap_gwei * GWEI,
+        senders,
+        max_size_wei: weth * ETH,
+        max_size_usdc: 100_000_000_000,
+    };
+    LivePolicy { senders: Senders { total: 16, tiers: vec![tier(25, 6, 50), tier(200, 2, 80)] }, reserve, ..policy(budget_wei, 20 * GWEI) }
+}
+
+fn send(a: Arm) -> [ArmedLine; 1] {
+    [ArmedLine::Arm(Box::new(a))]
+}
+
+/// R43: a spike arm's bid is held to its own tier's cap, above the lane's;
+/// an ordinary sized arm's to the lane's, as before.
+#[tokio::test]
+async fn a_spike_arm_bids_up_to_its_tiers_cap_and_no_further() {
+    let f = fixture(spike_policy(100 * ETH, Reserve::WorstCase), vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&send(sized_arm(1, 8, SPIKE_TIER_BASE, 22 * GWEI, 50 * ETH)), 0, NOW).await;
+    f.live.on_lines(&send(sized_arm(2, 9, SPIKE_TIER_BASE, 30 * GWEI, 50 * ETH)), 0, NOW).await;
+    f.live.on_lines(&send(sized_arm(3, 14, SPIKE_TIER_BASE + 1, 157 * GWEI, 80 * ETH)), 0, NOW).await;
+    f.live.on_lines(&send(sized_arm(4, 0, 1, 22 * GWEI, 10 * ETH)), 0, NOW).await;
+    let sent: Vec<u128> = f.script.sent.lock().unwrap().iter().map(|(raw, _)| fees(raw).0).collect();
+    assert_eq!(sent, vec![22 * GWEI, 25 * GWEI, 157 * GWEI, 20 * GWEI], "{:?}", skipped(&f.ledger));
+}
+
+/// R43: a sender is funded for one tier, so an arm is sent only from its own
+/// tier's senders: no spike arm from an ordinary sender or another tier's,
+/// no ordinary arm from a spike tier's, and none of a tier not configured.
+#[tokio::test]
+async fn a_sized_arm_is_sent_only_from_its_own_tiers_senders() {
+    let f = fixture(spike_policy(100 * ETH, Reserve::WorstCase), vec![], vec![]);
+    start(&f).await;
+    for (id, slot, tier) in [(1, 7, SPIKE_TIER_BASE), (2, 14, SPIKE_TIER_BASE), (3, 8, 1), (4, 13, SPIKE_TIER_BASE + 1), (5, 15, SPIKE_TIER_BASE + 2)] {
+        f.live.on_lines(&send(sized_arm(id, slot, tier, GWEI, ETH)), 0, NOW).await;
+    }
+    assert!(f.script.sent.lock().unwrap().is_empty());
+    assert_eq!(skipped(&f.ledger), vec!["tier".to_string(); 5]);
+    for (id, slot, tier) in [(6, 7, 2), (7, 13, SPIKE_TIER_BASE), (8, 15, SPIKE_TIER_BASE + 1)] {
+        f.live.on_lines(&send(sized_arm(id, slot, tier, GWEI, ETH)), 0, NOW).await;
+    }
+    assert_eq!(f.script.sent.lock().unwrap().len(), 3, "{:?}", skipped(&f.ledger));
+}
+
+/// R43: a sized plan sizes on chain up to its cap, so the cap is what the
+/// worker holds: to its tier's, or the lane's for an ordinary arm.
+#[tokio::test]
+async fn a_sized_plan_over_its_tiers_size_cap_is_skipped() {
+    let f = fixture(spike_policy(100 * ETH, Reserve::WorstCase), vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&send(sized_arm(1, 8, SPIKE_TIER_BASE, GWEI, 50 * ETH + 1)), 0, NOW).await;
+    f.live.on_lines(&send(sized_arm(2, 0, 1, GWEI, 10 * ETH + 1)), 0, NOW).await;
+    f.live.on_lines(&send(Arm { sized: sized_arm(3, 0, 1, GWEI, ETH).sized.map(|s| apex_runtime::armed::lines::SizedLine { cap: "x".into(), ..s }), ..sized_arm(3, 0, 1, GWEI, ETH) }), 0, NOW).await;
+    assert!(f.script.sent.lock().unwrap().is_empty());
+    assert_eq!(skipped(&f.ledger), ["size", "size", "unreadable"].map(String::from).to_vec());
+    f.live.on_lines(&send(sized_arm(4, 8, SPIKE_TIER_BASE, GWEI, 50 * ETH)), 0, NOW).await;
+    assert_eq!(f.script.sent.lock().unwrap().len(), 1);
+}
+
+/// R43: at 20 gwei a sized arm's gas limit is 0.02 ETH, twice a 0.01 ETH
+/// budget, so at its worst case it is never sent. Reserving what an inclusion
+/// that does not trade costs, it holds 0.0028 ETH of the budget and three fit.
+#[tokio::test]
+async fn a_sized_arm_holds_what_the_reserve_says_of_the_budget() {
+    let arms = || (0..4).map(|i| ArmedLine::Arm(Box::new(sized_arm(i, 8 + i as u16, SPIKE_TIER_BASE, 20 * GWEI, ETH)))).collect::<Vec<_>>();
+    let f = fixture(spike_policy(ETH / 100, Reserve::WorstCase), vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&arms(), 0, NOW).await;
+    assert!(f.script.sent.lock().unwrap().is_empty());
+    assert_eq!(skipped(&f.ledger), vec!["budget".to_string(); 4]);
+
+    let f = fixture(spike_policy(ETH / 100, Reserve::NoTrade), vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&arms(), 0, NOW).await;
+    assert_eq!(f.script.sent.lock().unwrap().len(), 3);
+    assert_eq!(skipped(&f.ledger), vec!["budget".to_string()]);
+    let each = u128::from(SIZED.no_trade_ceiling()) * 20 * GWEI;
+    assert_eq!(each, 2_800_000_000_000_000);
+    assert_eq!(f.live.state(NOW).reserved_wei, 3 * each);
+}
+
+/// R43: the reserve is the budget's, not the sender's: the protocol holds a
+/// sender to its gas limit at its fee whatever the transaction then uses.
+#[tokio::test]
+async fn a_no_trade_reserve_still_needs_the_whole_gas_limit_in_the_sender() {
+    let f = fixture(spike_policy(ETH, Reserve::NoTrade), vec![], vec![]);
+    *f.chain.balance.lock().unwrap() = u128::from(SIZED.limit) * 20 * GWEI - 1;
+    start(&f).await;
+    f.live.on_lines(&send(sized_arm(1, 8, SPIKE_TIER_BASE, 20 * GWEI, ETH)), 0, NOW).await;
+    assert!(f.script.sent.lock().unwrap().is_empty());
+    assert_eq!(skipped(&f.ledger), vec!["balance".to_string()]);
+}
+
+/// R43: a fixed-size arm can spend all its gas on a trade that does not pay,
+/// so it holds its whole worst case under either reserve.
+#[tokio::test]
+async fn a_fixed_arm_holds_its_worst_case_under_either_reserve() {
+    let f = fixture(LivePolicy { reserve: Reserve::NoTrade, ..policy(ETH, u128::MAX) }, vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&send(arm(1, 0, GWEI, 600_000)), 0, NOW).await;
+    assert_eq!(f.live.state(NOW).reserved_wei, 600_000 * GWEI);
 }

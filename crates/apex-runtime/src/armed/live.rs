@@ -11,7 +11,9 @@
 //! - no kill file exists;
 //! - the ledger holds no halt;
 //! - the arm's worst case fits both the sender's balance and the day's
-//!   budget, with everything still pending counted at its own worst case.
+//!   budget, with everything still pending counted at its own worst case
+//!   (R43: a sized arm may hold a `NoTrade`'s cost of the budget instead,
+//!   `armed.sized.reserve`; its sender still holds the whole worst case).
 //!
 //! **Write-ahead.** The submission is synced to the ledger before a byte is
 //! sent. An answer is the endpoint's word on that one hash: an acceptance or
@@ -123,6 +125,11 @@ pub struct LivePolicy {
     pub max_head_lag_ms: u64,
     /// R41: the owner's stops are read at most this often; 0 is every head.
     pub head_reads_every_ms: u64,
+    /// R43: the sized lane's senders by tier. With tiers, a sized arm is sent
+    /// only from its own tier's senders, at most at its tier's cap and size.
+    pub senders: super::sized::Senders,
+    /// R43: what a pending sized arm holds of the budget.
+    pub reserve: super::sized::Reserve,
 }
 
 pub struct ArmedLive {
@@ -571,11 +578,33 @@ impl ArmedLive {
         if arm.predicates.iter().all(is_bound) {
             return self.skip(arm, sender, "unconditional", now_ms);
         }
+        // R43: a sender is funded for one tier's cap, so a sized arm goes out
+        // only from its own tier's senders, and under that tier's limits.
+        let tier = arm.sized.as_ref().map(|s| s.tier);
+        let spike = tier.and_then(|t| self.policy.senders.spike(t));
+        if let Some(t) = tier.filter(|_| !self.policy.senders.tiers.is_empty()) {
+            if !self.policy.senders.slots(t).contains(&usize::from(arm.sender_slot)) {
+                return self.skip(arm, sender, "tier", now_ms);
+            }
+        }
         // R37: a USDC arm's size is USDC's units, held to USDC's cap. R40.1: a
         // sized arm's plan clamps to its cap on chain, so its size is a
-        // prediction and not held here.
-        let cap = if read.start == Some(apex_exec::lean2::USDC) { self.policy.max_size_usdc } else { self.policy.max_size_wei };
-        if arm.sized.is_none() && read.size > cap {
+        // prediction; R43: what is held is the cap its plan carries.
+        let usdc = read.start == Some(apex_exec::lean2::USDC);
+        let cap = match (spike, usdc) {
+            (Some(t), true) => U256::from(t.max_size_usdc),
+            (Some(t), false) => U256::from(t.max_size_wei),
+            (None, true) => self.policy.max_size_usdc,
+            (None, false) => self.policy.max_size_wei,
+        };
+        let held = match &arm.sized {
+            Some(s) => match U256::from_dec_str(&s.cap) {
+                Ok(plan_cap) => plan_cap,
+                Err(_) => return self.skip(arm, sender, "unreadable", now_ms),
+            },
+            None => read.size,
+        };
+        if held > cap {
             return self.skip(arm, sender, "size", now_ms);
         }
         let head = match self.chain.head().await {
@@ -593,11 +622,17 @@ impl ArmedLive {
             return self.skip(arm, sender, "unreadable", now_ms);
         };
         let nonce = self.inner().nonces[&sender];
-        let cap = self.policy.max_priority_wei_per_gas;
+        let cap = spike.map_or(self.policy.max_priority_wei_per_gas, |t| t.cap_wei_per_gas);
         let mut priority = read.bid.min(cap);
         let mut max_fee = base_fee_wei.saturating_mul(2).saturating_add(priority);
+        // R43: the gas a pending arm holds of the day's budget. A fixed-size
+        // arm can spend its whole limit on a trade that does not pay; a sized
+        // one trades only above its floor, and holds what `reserve` says.
+        let reserved_gas = if arm.sized.is_some() { self.policy.reserve.gas().min(arm.gas_limit) } else { arm.gas_limit };
         for bump in 0..=MAX_BUMPS {
+            // The sender's balance is held to the whole limit: the protocol's rule.
             let worst = u128::from(arm.gas_limit).saturating_mul(max_fee).saturating_add(self.policy.l1_fee_bound_wei);
+            let reserved = u128::from(reserved_gas).saturating_mul(max_fee).saturating_add(self.policy.l1_fee_bound_wei);
             match self.balance(sender, now_ms).await {
                 Ok(balance) if balance >= worst.saturating_add(self.policy.sender_reserve_wei) => {}
                 Ok(_) => return self.skip(arm, sender, "balance", now_ms),
@@ -606,7 +641,7 @@ impl ArmedLive {
                     return self.skip(arm, sender, "chain", now_ms);
                 }
             }
-            if !self.admits(sender, nonce, worst, now_ms) {
+            if !self.admits(sender, nonce, reserved, now_ms) {
                 return self.skip(arm, sender, "budget", now_ms);
             }
             let tx = Eip1559Tx {
@@ -631,7 +666,7 @@ impl ArmedLive {
                 gas_limit: arm.gas_limit,
                 max_fee_per_gas: max_fee,
                 max_priority_fee_per_gas: priority,
-                worst_case_wei: worst,
+                worst_case_wei: reserved,
                 at_ms: now_ms,
                 start: read.start,
                 start_per_eth: read.start_per_eth.clone(),

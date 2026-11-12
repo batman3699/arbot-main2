@@ -1181,6 +1181,12 @@ async fn boot_armed_live(
         denim: config.denim(),
         max_head_lag_ms: a.max_head_lag_ms,
         head_reads_every_ms: config.policy.head_reads_every_ms,
+        // R43: the sized lane's tiers and reserve; R39's lane has neither.
+        senders: match (config.live_lane(), &a.sized) {
+            (Some(config::Lane::Sized), Some(sz)) => crate::armed::sized::Senders { total: sz.max_senders, tiers: sz.spike_tiers(a) },
+            _ => crate::armed::sized::Senders::default(),
+        },
+        reserve: a.sized.as_ref().map_or_else(Default::default, |sz| sz.reserve),
     };
     let chain = Arc::new(crate::armed::live_chain::RpcChain::new(Arc::clone(rpc)));
     let worker = ArmedLive::new(keys, chain, Arc::new(submit), ledger, records, policy, executor, recipient, config.chain_id);
