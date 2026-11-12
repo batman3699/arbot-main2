@@ -372,6 +372,14 @@ impl std::fmt::Debug for WsFeed {
     }
 }
 
+/// One session's place in the run: which attempt it is, when the session
+/// before it ended, and which endpoint it uses.
+struct Turn {
+    attempt: u32,
+    ended_at: Option<Instant>,
+    at: usize,
+}
+
 enum SessionEnd {
     Stopped,
     /// The session ended, with a description of why. Retried.
@@ -450,7 +458,7 @@ impl WsFeed {
                 return;
             }
             let mut delivered = false;
-            match self.session(&tx, &mut stop, attempt, ended_at, &mut gap, at, &mut delivered).await {
+            match self.session(&tx, &mut stop, Turn { attempt, ended_at, at }, &mut gap, &mut delivered).await {
                 SessionEnd::Stopped => return,
                 SessionEnd::Ended(detail) => {
                     self.stats.fail(&detail);
@@ -473,12 +481,11 @@ impl WsFeed {
         &self,
         tx: &mpsc::Sender<Notification>,
         stop: &mut watch::Receiver<bool>,
-        attempt: u32,
-        ended_at: Option<Instant>,
+        turn: Turn,
         gap: &mut u64,
-        at: usize,
         delivered: &mut bool,
     ) -> SessionEnd {
+        let Turn { attempt, ended_at, at } = turn;
         let (url, label) = self.endpoint(at);
         let connect = tokio::time::timeout(
             self.settings.connect_timeout,

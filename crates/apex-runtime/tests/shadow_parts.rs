@@ -977,7 +977,7 @@ fn the_feed_takes_one_endpoint_or_a_list() {
     let c = ShadowConfig::from_yaml_str(&list, &e).unwrap();
     assert_eq!(c.rpc_ws.expose(), one.rpc_ws.expose(), "the first is the feed's own");
     assert_eq!(c.rpc_ws_fallbacks.iter().map(|u| u.expose().as_str()).collect::<Vec<_>>(), vec!["wss://second.example/ws", "wss://third.example/ws"]);
-    assert_eq!(c.version != one.version, true, "another file, another version");
+    assert_ne!(c.version, one.version, "another file, another version");
     for bad in ["  ws: []\n", "  ws:\n    - \"\"\n    - wss://second.example/ws\n"] {
         match ShadowConfig::from_yaml_str(&base.replace(&line, bad), &e) {
             Err(ShadowConfigError::Invalid(m)) => assert!(m.contains("rpc.ws"), "{m}"),
