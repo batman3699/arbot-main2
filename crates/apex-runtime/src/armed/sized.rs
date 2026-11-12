@@ -812,7 +812,9 @@ impl SizedEngine {
             size_wei: size.to_string(),
             mid: "0".into(),
             output_wei: size.saturating_add(gross).to_string(),
-            surplus_wei: point.grid[0].1.max(0.0).to_string(),
+            // R43: in the start token's units, as the line's other amounts
+            // are; the grid holds it in wei.
+            surplus_wei: pxc.in_start(U256::from(point.grid[0].1.max(0.0) as u128)).to_string(),
             cost_wei: "0".into(),
             gas_expected: point.gas,
             gas_limit: SIZED.limit,

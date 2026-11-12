@@ -485,3 +485,31 @@ fn a_spike_tier_with_no_sender_free_does_not_stop_the_ordinary_arms() {
     assert!(armed.iter().all(|a| a.rung < SPIKE_TIER_BASE), "both spike senders are pending");
     assert!(armed.iter().any(|a| a.pools.contains(&format!("{SLIP:#x}"))), "the new pool's ordinary arms went out: {}", armed.len());
 }
+
+/// R43: a USDC arm's surplus is written in USDC's units, as every other
+/// amount on its line is: the evaluator sweeps its bids on that figure at the
+/// run's price. Written in wei, as the engine holds it, the sweep read 0.0075
+/// ETH as 7.5 billion dollars, and every sized row of it came out in the
+/// hundreds of millions.
+#[test]
+fn a_usdc_arm_s_surplus_is_written_in_usdc_units() {
+    let (built, snap) = engine_with(6, vec![tier(2)], Reserve::WorstCase);
+    let (_, cycles) = frontier::build(ChainId(8453), USDC, &snap);
+    let e = SizedEngine::new(cycles, built.settings_for_test().clone(), BTreeSet::new());
+    let usdc = Pricing {
+        start_per_eth: apex_runtime::armed::threshold::start_per_eth(&snap),
+        usdc_lenders: Some(apex_runtime::live::lenders::Lenders { balancer: U256::zero(), morpho: Some(U256::exp10(12)) }),
+        ..px()
+    };
+    let lines = e.tick(&snap, 1_000, 300_000, &usdc, 1, BUDGET, 1_500_000_000);
+    let spikes: Vec<_> = arms(&lines).into_iter().filter(|a| a.rung >= SPIKE_TIER_BASE).collect();
+    assert_eq!(spikes.len(), 2);
+    for a in spikes {
+        assert_eq!(a.start, Some(USDC));
+        let surplus: u128 = a.surplus_wei.parse().unwrap();
+        // The tier's least net is 0.01 ETH, about $27 here, a quarter tipped.
+        assert!((1_000_000..1_000_000_000).contains(&surplus), "{surplus} is not dollars in USDC's units");
+        let wei = apex_runtime::armed::run::surplus_in_wei(a, 2_680.0);
+        assert!(wei >= U256::exp10(15) && wei < U256::exp10(17), "{wei} wei at the run's price");
+    }
+}
