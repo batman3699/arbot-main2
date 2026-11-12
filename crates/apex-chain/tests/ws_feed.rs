@@ -397,3 +397,82 @@ fn a_filter_with_topic_one_lists_both_positions() {
     assert_eq!(r["params"][1]["topics"], json!([[SWAP]]));
 }
 
+
+// ------------------------------------------------------------- R43: fallbacks
+
+fn closes() -> Script {
+    Script { close_after: true, ..Script::default() }
+}
+
+fn heads(n: u64) -> Script {
+    Script { pushes: vec![Push { subscription: 1, result: head_json(n) }], ..Script::default() }
+}
+
+/// R43: a provider that takes the connection and delivers nothing gives way
+/// to the next endpoint. On 2026-11-08 the one provider ran out of prepaid
+/// units: its socket closed every session at once for two days, and the lane
+/// with it.
+#[tokio::test]
+async fn an_endpoint_that_delivers_nothing_gives_way_to_the_next() {
+    let primary = WsNode::start(vec![closes()]).await;
+    let fallback = WsNode::start(vec![heads(7)]).await;
+    let feed = WsFeed::new(&primary.url("/v1/ws/key"), subs(), fast()).unwrap().with_fallbacks(&[fallback.url("/")]).unwrap();
+    let (stop_tx, stop) = tokio::sync::watch::channel(false);
+    let (handle, mut rx) = feed.spawn(stop);
+
+    assert!(matches!(recv(&mut rx).await, Notification::Reconnected { .. }), "the gap is said first");
+    assert!(matches!(recv(&mut rx).await, Notification::Head(h) if h.number == 7));
+    assert_eq!(primary.connections(), 1, "one session that delivered nothing was enough");
+
+    stop_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
+/// R43: an endpoint that was delivering is the one reconnected to: one dropped
+/// socket does not move a healthy feed to its fallback.
+#[tokio::test]
+async fn an_endpoint_that_was_delivering_is_reconnected_to() {
+    let primary = WsNode::start(vec![Script { close_after: true, ..heads(1) }, heads(2)]).await;
+    let fallback = WsNode::start(vec![heads(99)]).await;
+    let feed = WsFeed::new(&primary.url("/"), subs(), fast()).unwrap().with_fallbacks(&[fallback.url("/")]).unwrap();
+    let (stop_tx, stop) = tokio::sync::watch::channel(false);
+    let (handle, mut rx) = feed.spawn(stop);
+
+    assert!(matches!(recv(&mut rx).await, Notification::Head(h) if h.number == 1));
+    assert!(matches!(recv(&mut rx).await, Notification::Reconnected { .. }));
+    assert!(matches!(recv(&mut rx).await, Notification::Head(h) if h.number == 2));
+    assert_eq!(fallback.connections(), 0);
+
+    stop_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
+/// R43: the first endpoint is the preferred one: when a fallback's session
+/// ends, it is the first that is tried again.
+#[tokio::test]
+async fn after_a_fallback_s_session_the_first_endpoint_is_tried_again() {
+    let primary = WsNode::start(vec![closes(), heads(5)]).await;
+    let fallback = WsNode::start(vec![Script { close_after: true, ..heads(9) }, heads(99)]).await;
+    let feed = WsFeed::new(&primary.url("/"), subs(), fast()).unwrap().with_fallbacks(&[fallback.url("/")]).unwrap();
+    let (stop_tx, stop) = tokio::sync::watch::channel(false);
+    let (handle, mut rx) = feed.spawn(stop);
+
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+        if let Notification::Head(h) = recv(&mut rx).await {
+            seen.push(h.number);
+        }
+    }
+    assert_eq!(seen, vec![9, 5], "the fallback's head, then the first endpoint's");
+    assert_eq!(fallback.connections(), 1);
+
+    stop_tx.send(true).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
+/// R43: a fallback is held to what the first endpoint is: a websocket URL.
+#[test]
+fn a_fallback_that_is_not_a_websocket_is_refused() {
+    let feed = WsFeed::new("wss://example.invalid/ws", subs(), fast()).unwrap();
+    assert!(feed.with_fallbacks(&["https://example.invalid".to_string()]).is_err());
+}

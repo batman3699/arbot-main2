@@ -961,6 +961,31 @@ fn the_sized_section_loads_and_its_checks_hold() {
     refused(with(&shared), "armed.executor2's address");
 }
 
+/// R43: `rpc.ws` is one endpoint or a list: the first is the feed's, the
+/// rest its fallbacks, in order. One endpoint is the file as it was.
+#[test]
+fn the_feed_takes_one_endpoint_or_a_list() {
+    let var = "APEX_SECRET_SHADOW_TEST_WS";
+    let e = env(var, SECRET);
+    let base = yaml(var, "var/apex/shadow.journal");
+    let one = ShadowConfig::from_yaml_str(&base, &e).unwrap();
+    assert!(one.rpc_ws.expose().starts_with("wss://rpc.example/ws/"));
+    assert!(one.rpc_ws_fallbacks.is_empty());
+    let line = format!("  ws: wss://rpc.example/ws/${{{var}}}\n");
+    assert!(base.contains(&line));
+    let list = base.replace(&line, &format!("  ws:\n    - wss://rpc.example/ws/${{{var}}}\n    - wss://second.example/ws\n    - wss://third.example/ws\n"));
+    let c = ShadowConfig::from_yaml_str(&list, &e).unwrap();
+    assert_eq!(c.rpc_ws.expose(), one.rpc_ws.expose(), "the first is the feed's own");
+    assert_eq!(c.rpc_ws_fallbacks.iter().map(|u| u.expose().as_str()).collect::<Vec<_>>(), vec!["wss://second.example/ws", "wss://third.example/ws"]);
+    assert_eq!(c.version != one.version, true, "another file, another version");
+    for bad in ["  ws: []\n", "  ws:\n    - \"\"\n    - wss://second.example/ws\n"] {
+        match ShadowConfig::from_yaml_str(&base.replace(&line, bad), &e) {
+            Err(ShadowConfigError::Invalid(m)) => assert!(m.contains("rpc.ws"), "{m}"),
+            other => panic!("expected a refusal, got {:?}", other.map(|c| c.rpc_ws_fallbacks.len())),
+        }
+    }
+}
+
 /// R43: the spike tiers load with `armed`'s size caps where they name none,
 /// the reservation defaults to the worst case, and the checks refuse a tier
 /// outside the caps' ceilings, out of order, or holding senders the lane

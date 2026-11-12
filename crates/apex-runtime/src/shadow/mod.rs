@@ -1297,7 +1297,9 @@ impl Shadow {
         // R37: the v4 pools' own subscription, filtered to their IDs.
         let v4_ids: Vec<B256> = self.book.snapshot().values().filter_map(|p| Some(p.spec.v4?.pool_id)).collect();
         let subs = subscriptions(&self.config.feed, std::iter::once(filter).chain(crate::live::feed::v4_filter(&v4_ids)).collect());
-        let feed = match WsFeed::new(self.config.rpc_ws.expose(), subs, WsSettings::default()) {
+        // R43: the fallbacks follow the feed's own endpoint, in order.
+        let fallbacks: Vec<String> = self.config.rpc_ws_fallbacks.iter().map(|u| u.expose().clone()).collect();
+        let feed = match WsFeed::new(self.config.rpc_ws.expose(), subs, WsSettings::default()).and_then(|f| f.with_fallbacks(&fallbacks)) {
             Ok(f) => f,
             Err(e) => {
                 error!(error = %e, "the capture feed cannot start");

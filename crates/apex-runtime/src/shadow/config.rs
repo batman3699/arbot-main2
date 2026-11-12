@@ -89,7 +89,25 @@ struct Raw {
 #[serde(deny_unknown_fields)]
 struct RawRpc {
     http: Vec<String>,
-    ws: String,
+    /// R43: one endpoint, or a list: the feed's own, then its fallbacks.
+    ws: OneOrMany,
+}
+
+/// A string, or a list of them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(s) => vec![s],
+            Self::Many(v) => v,
+        }
+    }
 }
 
 /// R28: the live canary. Present only in a canary's configuration.
@@ -593,6 +611,9 @@ pub struct ShadowConfig {
     pub chain_id: u64,
     pub rpc_http: Vec<Secret<String>>,
     pub rpc_ws: Secret<String>,
+    /// R43: the feed's fallbacks, in order: used when the endpoint before
+    /// takes sessions and delivers nothing.
+    pub rpc_ws_fallbacks: Vec<Secret<String>>,
     pub inventory: PathBuf,
     pub journal: PathBuf,
     pub report: PathBuf,
@@ -915,11 +936,20 @@ impl ShadowConfig {
             ));
         }
         regime(&raw)?;
+        let mut ws = raw.rpc.ws.into_vec().into_iter();
+        let Some(rpc_ws) = ws.next().filter(|u| !u.trim().is_empty()) else {
+            return Err(invalid("rpc.ws names no endpoint"));
+        };
+        let rpc_ws_fallbacks: Vec<String> = ws.collect();
+        if rpc_ws_fallbacks.iter().any(|u| u.trim().is_empty()) {
+            return Err(invalid("rpc.ws lists an empty endpoint"));
+        }
         Ok(Self {
             version,
             chain_id: raw.chain_id,
             rpc_http: raw.rpc.http.into_iter().map(Secret::new).collect(),
-            rpc_ws: Secret::new(raw.rpc.ws),
+            rpc_ws: Secret::new(rpc_ws),
+            rpc_ws_fallbacks: rpc_ws_fallbacks.into_iter().map(Secret::new).collect(),
             inventory: raw.inventory,
             journal: raw.journal,
             report: raw.report,

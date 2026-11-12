@@ -356,6 +356,8 @@ impl std::error::Error for FeedError {}
 pub struct WsFeed {
     url: Secret<String>,
     label: String,
+    /// R43: the endpoints after the first, each with its label.
+    fallbacks: Vec<(Secret<String>, String)>,
     subs: Vec<Subscription>,
     settings: WsSettings,
     stats: Arc<WsStats>,
@@ -392,6 +394,7 @@ impl WsFeed {
         Ok(Self {
             url: Secret::new(trimmed.to_string()),
             label,
+            fallbacks: Vec::new(),
             subs,
             settings,
             stats: Arc::new(WsStats::default()),
@@ -400,6 +403,25 @@ impl WsFeed {
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// R43: endpoints to fall back to, in order, when the one in use takes
+    /// sessions and delivers nothing ([`next_endpoint`]). Each must be a
+    /// websocket URL serving the same subscriptions.
+    pub fn with_fallbacks(mut self, urls: &[String]) -> Result<Self, FeedError> {
+        for url in urls {
+            let other = Self::new(url, self.subs.clone(), self.settings)?;
+            self.fallbacks.push((other.url, other.label));
+        }
+        Ok(self)
+    }
+
+    /// Endpoint `at`'s URL and label: 0 is the first, then the fallbacks.
+    fn endpoint(&self, at: usize) -> (&Secret<String>, &str) {
+        match at.checked_sub(1).and_then(|i| self.fallbacks.get(i)) {
+            Some((url, label)) => (url, label),
+            None => (&self.url, &self.label),
+        }
     }
 
     pub fn stats(&self) -> Arc<WsStats> {
@@ -422,15 +444,19 @@ impl WsFeed {
         let mut ended_at: Option<Instant> = None;
         let mut backoff = self.settings.min_backoff;
         let mut gap = 0u64;
+        let mut at = 0usize;
         loop {
             if *stop.borrow() {
                 return;
             }
-            match self.session(&tx, &mut stop, attempt, ended_at, &mut gap).await {
+            let mut delivered = false;
+            match self.session(&tx, &mut stop, attempt, ended_at, &mut gap, at, &mut delivered).await {
                 SessionEnd::Stopped => return,
                 SessionEnd::Ended(detail) => {
                     self.stats.fail(&detail);
-                    warn!(target: "rpc", endpoint = %self.label, %detail, attempt, "websocket session ended; reconnecting");
+                    let next = next_endpoint(at, delivered, 1 + self.fallbacks.len());
+                    warn!(target: "rpc", endpoint = %self.endpoint(at).1, next = %self.endpoint(next).1, %detail, attempt, "websocket session ended; reconnecting");
+                    at = next;
                     ended_at = Some(Instant::now());
                     attempt = attempt.saturating_add(1);
                     tokio::select! {
@@ -450,10 +476,13 @@ impl WsFeed {
         attempt: u32,
         ended_at: Option<Instant>,
         gap: &mut u64,
+        at: usize,
+        delivered: &mut bool,
     ) -> SessionEnd {
+        let (url, label) = self.endpoint(at);
         let connect = tokio::time::timeout(
             self.settings.connect_timeout,
-            tokio_tungstenite::connect_async(self.url.expose().as_str()),
+            tokio_tungstenite::connect_async(url.expose().as_str()),
         );
         let mut ws = match connect.await {
             Err(_) => return SessionEnd::Ended("connect timed out".to_string()),
@@ -466,7 +495,7 @@ impl WsFeed {
         // continuous with the last one.
         if let Some(t) = ended_at {
             self.forward(tx, Notification::Reconnected { outage: t.elapsed(), attempt }, gap);
-            info!(target: "rpc", endpoint = %self.label, attempt, "websocket reconnected");
+            info!(target: "rpc", endpoint = %label, attempt, "websocket reconnected");
         }
 
         let mut awaiting: BTreeMap<u64, Kind> = BTreeMap::new();
@@ -526,6 +555,7 @@ impl WsFeed {
                         continue;
                     }
                     if let Some(n) = parse_notification(&v, &ids) {
+                        *delivered = true;
                         self.forward(tx, n, gap);
                     }
                 }
@@ -556,6 +586,19 @@ impl WsFeed {
             *gap = gap.saturating_add(1);
             self.stats.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+}
+
+/// R43: the endpoint the next session uses, of `endpoints`, after one on
+/// endpoint `at` ended. A session that delivered a notification leaves the
+/// first endpoint next: it is the preferred one, and whichever endpoint just
+/// worked, the first is worth one attempt. A session that delivered nothing
+/// moves on to the next in turn.
+fn next_endpoint(at: usize, delivered: bool, endpoints: usize) -> usize {
+    if delivered {
+        0
+    } else {
+        (at + 1) % endpoints.max(1)
     }
 }
 
