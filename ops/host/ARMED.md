@@ -725,7 +725,20 @@ Rollback: `armed.sized.mode: shadow` and a restart. R39's lane is untouched.
 
 `rpc.ws` is one endpoint or a list. A session that ends having delivered
 nothing moves the feed to the next endpoint; one that was delivering is
-reconnected to, and after it the first endpoint is tried first. The shipped
-config lists one: a fallback must serve Denim heads (`timestampMs`) and the
-log subscriptions at this volume, which is to be probed before one is added.
-`rpc.http` already takes a list.
+reconnected to, and after it the first endpoint is tried first. `rpc.http`
+takes a list too; its reads stay on whichever endpoint last answered, so
+after an outage they return to the first at the next restart.
+
+The shipped configs name publicnode second in both. Probed from the host on
+2026-11-13 (`apex denim-check` on a copy of the config, ten minutes): every
+subscription accepted on one session, 3,000 of 3,000 heads, all with
+`timestampMs`; head lag p50 73 ms, p99 4,216 ms, so the guard held for 97.9%
+of heads against the check's 99%. It keeps the run up through a provider
+outage with the lane idle about 2% of the time; it is not a replacement. Of
+eight other public endpoints none served the feed: no websocket, refused
+subscriptions, throttling, or heads without `timestampMs`.
+
+While the keyed provider is out, the report's `rpc` and the journal's
+"rotating" and "websocket session ended" lines name the endpoint in use. The
+canary's own sends go to `rpc.http[0]` and the sequencer, never to a
+fallback.

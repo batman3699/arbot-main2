@@ -23,9 +23,21 @@ chain_id: 8453
 rpc:
   # BlockPI's keyed endpoint: `eth_simulateV1`, `pendingLogs` and
   # `newFlashblocks` were each probed on it (PLAN.md, Task 8.5 R1, R5, R7).
+  # R43: publicnode after it, a fallback and no more. On 2026-11-08 the
+  # prepaid units ran out and, with one endpoint, the run was down for days.
+  # Probed from the host on 2026-11-13: every read the run makes answered
+  # (`eth_simulateV1` too) with no throttling, and its feed delivered every
+  # head with `timestampMs`; but its heads lag (p50 73 ms, p99 4.2 s over ten
+  # minutes), so on it the send guard idles the lane about 2% of the time.
+  # The keyed endpoint stays first: the canary's own sends go to http[0]
+  # alone. Reads stay on whichever endpoint last answered, so after an outage
+  # they return to the first at the next restart.
   http:
     - https://base.blockpi.network/v1/rpc/${APEX_SECRET_BLOCKPI_KEY}
-  ws: wss://base.blockpi.network/v1/ws/${APEX_SECRET_BLOCKPI_KEY}
+    - https://base-rpc.publicnode.com
+  ws:
+    - wss://base.blockpi.network/v1/ws/${APEX_SECRET_BLOCKPI_KEY}
+    - wss://base-rpc.publicnode.com
 
 # The census's inventory (outside git). The run loads the pools that can form
 # a WETH cycle: pairs with WETH and at least two pools at <= 500 ppm and

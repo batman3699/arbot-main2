@@ -961,6 +961,27 @@ fn the_sized_section_loads_and_its_checks_hold() {
     refused(with(&shared), "armed.executor2's address");
 }
 
+/// R43: both shipped configs name publicnode after the keyed provider, for
+/// reads and for the feed: probed from the host on 2026-11-13, the one public
+/// endpoint that serves every read the run makes and stamped Denim heads. The
+/// keyed endpoint stays first: the canary's own sends go to `rpc.http[0]`
+/// and never to a public endpoint.
+#[test]
+fn the_shipped_configs_fall_back_to_publicnode_after_the_keyed_provider() {
+    let ops = format!("{}/../../ops", env!("CARGO_MANIFEST_DIR"));
+    let e = env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key");
+    let configs = [
+        ShadowConfig::load_canary(&format!("{ops}/canary.base.yaml"), &e).unwrap(),
+        ShadowConfig::load(&format!("{ops}/shadow.base.yaml"), &e).unwrap(),
+    ];
+    for c in configs {
+        let http: Vec<&str> = c.rpc_http.iter().map(|u| u.expose().as_str()).collect();
+        assert_eq!(http, vec!["https://base.blockpi.network/v1/rpc/test-only-not-a-key", "https://base-rpc.publicnode.com"]);
+        assert_eq!(c.rpc_ws.expose(), "wss://base.blockpi.network/v1/ws/test-only-not-a-key", "the keyed feed first");
+        assert_eq!(c.rpc_ws_fallbacks.iter().map(|u| u.expose().as_str()).collect::<Vec<_>>(), vec!["wss://base-rpc.publicnode.com"]);
+    }
+}
+
 /// R43: `rpc.ws` is one endpoint or a list: the first is the feed's, the
 /// rest its fallbacks, in order. One endpoint is the file as it was.
 #[test]
