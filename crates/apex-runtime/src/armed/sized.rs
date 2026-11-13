@@ -71,7 +71,8 @@ pub const P_WIN_FLOOR: f64 = 0.001;
 /// yet seen moving that far is not known never to.
 pub const P_MOVE_FLOOR: f64 = 0.000_1;
 
-/// R43: what a pending sized arm holds of the day's budget.
+/// R43: what a pending spike arm holds of the day's budget. R43.1: an
+/// ordinary sized arm always holds its worst case.
 ///
 /// The executor trades only when the trade nets its floor after its own gas
 /// at the price it was included at, so an inclusion costs the sender either
@@ -153,8 +154,12 @@ pub struct SizedSettings {
     /// R43: the tiers for large moves, each with its own senders, cap and
     /// size; none is R40.1's lane.
     pub tiers: Vec<SpikeTier>,
-    /// R43: what a pending arm holds of the budget.
+    /// R43: what a pending spike arm holds of the budget.
     pub reserve: Reserve,
+    /// R43.1: the most the ordinary tiers' pending worst cases may hold:
+    /// `armed`'s day's budget. The lane's own budget, which a pass is given,
+    /// is for its spike tiers.
+    pub ordinary_budget_wei: u128,
 }
 
 impl SizedSettings {
@@ -580,7 +585,9 @@ impl SizedEngine {
             let moves = &st.moves;
             let mut chosen = fill_spike(&cands, &s.tiers.iter().map(|t| t.senders).collect::<Vec<_>>(), budget_left_wei);
             let held: u128 = chosen.iter().map(|i| cands[*i].worst_wei).sum();
-            chosen.extend(fill(&cands, senders.ordinary(), budget_left_wei.saturating_sub(held).max(1), |cand, in_group| {
+            // R43.1: and never more than `armed`'s own budget.
+            let ordinary = budget_left_wei.saturating_sub(held).min(s.ordinary_budget_wei).max(1);
+            chosen.extend(fill(&cands, senders.ordinary(), ordinary, |cand, in_group| {
                 self.marginal(cand, in_group.iter().map(|i| &cands[*i]), priced, moves, snapshot, px, base_fee_wei)
             }));
             chosen
@@ -670,7 +677,10 @@ impl SizedEngine {
     fn worst(&self, point: &SizedArmPoint, base_fee_wei: u128, l1_upper_wei: u128) -> u128 {
         let s = &self.settings;
         let fee = base_fee_wei.saturating_mul(2).saturating_add(point.bid.sent.per_gas.min(s.cap_for(point.tier)));
-        u128::from(s.reserve.gas()).saturating_mul(fee).saturating_add(s.l1_fee_bound_wei.max(l1_upper_wei.saturating_mul(2)))
+        // R43.1: the reserve is the spike tiers' alone; an ordinary arm holds
+        // its whole limit, as before them.
+        let gas = if point.tier >= SPIKE_TIER_BASE { s.reserve.gas() } else { SIZED.limit };
+        u128::from(gas).saturating_mul(fee).saturating_add(s.l1_fee_bound_wei.max(l1_upper_wei.saturating_mul(2)))
     }
 
     /// What `cand` adds once `chosen` (its group's arms, in the order chosen)
@@ -928,6 +938,7 @@ mod tests {
             l1_fee_bound_wei: 1_000_000_000_000,
             tiers: Vec::new(),
             reserve: Reserve::WorstCase,
+            ordinary_budget_wei: u128::MAX,
         };
         let px = Pricing {
             costs: RouteCosts { other_wei: 0, wei_per_gas: 1 },

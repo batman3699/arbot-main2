@@ -838,6 +838,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
                         l1_fee_bound_wei: a.l1_fee_bound_wei,
                         tiers: sz.spike_tiers(a),
                         reserve: sz.reserve,
+                        ordinary_budget_wei: a.daily_loss_budget_wei,
                     };
                     let t = targets.clone();
                     let ranked = targets.clone();
@@ -1972,6 +1973,7 @@ impl Shadow {
                     write_failures: get(&self.stats.armed_write_failures),
                     live: self.armed_live.as_ref().map(|l| l.report(now_ms())),
                     live_sized: self.armed_live_sized.as_ref().map(|l| l.report(now_ms())),
+                    sized_engine: self.armed_sized.as_ref().map(|e| e.stats()),
                     live_dropped: get(&self.stats.armed_live_dropped),
                     move_checks,
                     move_tick_mismatches,
@@ -2109,6 +2111,10 @@ pub struct ArmedReport {
     /// R43: the sized lane's own worker, when it sends beside R39's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_sized: Option<crate::armed::live::LiveReport>,
+    /// R43.1: the sized lane's engine: its arms, renewals, slots priced and
+    /// the last pass's time, beside R39's `engine`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sized_engine: Option<crate::armed::engine::EngineStats>,
     pub live_dropped: u64,
 }
 

@@ -12,8 +12,9 @@
 //! - the ledger holds no halt;
 //! - the arm's worst case fits both the sender's balance and the day's
 //!   budget, with everything still pending counted at its own worst case
-//!   (R43: a sized arm may hold a `NoTrade`'s cost of the budget instead,
-//!   `armed.sized.reserve`; its sender still holds the whole worst case).
+//!   (R43: a spike tier's arm may hold a `NoTrade`'s cost of the budget
+//!   instead, `armed.sized.reserve`; its sender still holds the whole worst
+//!   case).
 //!
 //! **Write-ahead.** The submission is synced to the ledger before a byte is
 //! sent. An answer is the endpoint's word on that one hash: an acceptance or
@@ -128,7 +129,7 @@ pub struct LivePolicy {
     /// R43: the sized lane's senders by tier. With tiers, a sized arm is sent
     /// only from its own tier's senders, at most at its tier's cap and size.
     pub senders: super::sized::Senders,
-    /// R43: what a pending sized arm holds of the budget.
+    /// R43: what a pending spike arm holds of the budget.
     pub reserve: super::sized::Reserve,
 }
 
@@ -626,9 +627,11 @@ impl ArmedLive {
         let mut priority = read.bid.min(cap);
         let mut max_fee = base_fee_wei.saturating_mul(2).saturating_add(priority);
         // R43: the gas a pending arm holds of the day's budget. A fixed-size
-        // arm can spend its whole limit on a trade that does not pay; a sized
-        // one trades only above its floor, and holds what `reserve` says.
-        let reserved_gas = if arm.sized.is_some() { self.policy.reserve.gas().min(arm.gas_limit) } else { arm.gas_limit };
+        // arm can spend its whole limit on a trade that does not pay. A spike
+        // tier's arm trades only above its floor, and holds what `reserve`
+        // says; R43.1: an ordinary sized arm holds its whole limit, as it did
+        // before the tiers.
+        let reserved_gas = if spike.is_some() { self.policy.reserve.gas().min(arm.gas_limit) } else { arm.gas_limit };
         for bump in 0..=MAX_BUMPS {
             // The sender's balance is held to the whole limit: the protocol's rule.
             let worst = u128::from(arm.gas_limit).saturating_mul(max_fee).saturating_add(self.policy.l1_fee_bound_wei);

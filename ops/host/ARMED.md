@@ -653,8 +653,8 @@ cap and budget rule. Nothing below takes effect without the yaml.
 ### a. The keys (`armed.sized`)
 
 ```
-reserve: no_trade                # what a pending arm holds of the budget
-daily_loss_budget_wei: ...       # the lane's own; armed's when unset
+reserve: no_trade                # what a pending spike arm holds of the budget
+daily_loss_budget_wei: ...       # the spike tiers' own; armed's when unset
 live_ledger: var/armed/armed-live-sized.jsonl   # only when both lanes send
 tiers:
   - least_net_wei: ...           # the move must open this, before any tip
@@ -672,9 +672,11 @@ tiers:
   own after them, in the tiers' order. With `max_senders: 16` and tiers of 6
   and 2: slots 0-7, 8-13, 14-15. A tier's senders go to the routes the census
   values most, one arm for each trigger pool and direction.
-- `reserve: worst_case` holds the gas limit at the arm's fee, as before.
-  `no_trade` holds 140,000 gas at it: what an inclusion that does not trade
-  costs. A trade nets its floor after its own gas. A revert is not covered:
+- `reserve` is the spike tiers' alone (R43.1). `worst_case` holds the gas
+  limit at the arm's fee, as before. `no_trade` holds 140,000 gas at it: what
+  an inclusion that does not trade costs. The ordinary tiers always hold
+  their worst case, and their pending arms stay inside `armed`'s own budget
+  whatever the lane's is. A trade nets its floor after its own gas. A revert is not covered:
   it can cost up to the gas it used at the arm's fee, and the day's loss cap
   stops the lane only afterwards. A sender can never lose more than its
   balance.
@@ -701,7 +703,8 @@ In `mode: shadow` the tiers arm and record, and nothing is sent. Shadow needs
 no keys, so the shipped config can add the spike senders to the ordinary
 sixteen (`max_senders: 24`) and leave gate C's lane as it was. Read it with
 `ops/host/remote.sh armed-sized`; a spike arm's line carries `sized.tier` 3
-or more and `bid_model: tier_share`. Each tier's senders should hold arms on
+or more and `bid_model: tier_share`. The report's `armed.sized_engine` has
+the sized engine's arms and its last pass's time, beside R39's `engine`. Each tier's senders should hold arms on
 target routes; `beyond_cap_usd` says what the tier's size cap left.
 
 ### d. Both lanes live

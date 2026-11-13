@@ -1269,6 +1269,17 @@ async fn a_sized_arm_holds_what_the_reserve_says_of_the_budget() {
     assert_eq!(f.live.state(NOW).reserved_wei, 3 * each);
 }
 
+/// R43.1: the NoTrade reserve is the spike tiers' alone: an ordinary sized arm
+/// holds its whole gas limit at its fee, as it did before the tiers.
+#[tokio::test]
+async fn an_ordinary_sized_arm_holds_its_worst_case_under_a_no_trade_reserve() {
+    let f = fixture(spike_policy(ETH, Reserve::NoTrade), vec![], vec![]);
+    start(&f).await;
+    f.live.on_lines(&send(sized_arm(1, 0, 2, 5 * GWEI, ETH)), 0, NOW).await;
+    assert_eq!(f.script.sent.lock().unwrap().len(), 1, "{:?}", skipped(&f.ledger));
+    assert_eq!(f.live.state(NOW).reserved_wei, u128::from(SIZED.limit) * 5 * GWEI);
+}
+
 /// R43: the reserve is the budget's, not the sender's: the protocol holds a
 /// sender to its gas limit at its fee whatever the transaction then uses.
 #[tokio::test]

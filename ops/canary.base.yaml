@@ -133,10 +133,13 @@ armed:
     # 0.047 ETH (about $100) and tip a quarter of it, slots 22-23 for 0.47 ETH
     # and tip a fifth. Each cap is what its sender would be funded for at the
     # lane's 1,000,000 gas limit: 0.0205 and 0.158 ETH (ops/host/ARMED.md §6).
-    # A pending arm holds a NoTrade's cost of the lane's own day's budget.
+    # A pending spike arm holds a NoTrade's cost of the lane's own day's
+    # budget. R43.1: the ordinary tiers hold their worst cases inside armed's
+    # budget, as before the tiers (the first boot applied both to the whole
+    # lane, and the ordinary tier 2 armed at 5 to 10 gwei).
     max_senders: 24
     reserve: no_trade
-    daily_loss_budget_wei: 100000000000000000  # 0.1 ETH: the eight hold about 0.06 pending
+    daily_loss_budget_wei: 100000000000000000  # 0.1 ETH, the spike tiers': the eight hold about 0.06 pending
     tiers:
       - least_net_wei: 47000000000000000
         bid_share_bps: 2500

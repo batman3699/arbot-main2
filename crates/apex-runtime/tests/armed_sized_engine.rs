@@ -184,6 +184,7 @@ fn engine_with(max_senders: usize, tiers: Vec<SpikeTier>, reserve: Reserve) -> (
         l1_fee_bound_wei: 1_000_000_000_000,
         tiers,
         reserve,
+        ordinary_budget_wei: u128::MAX,
     };
     (SizedEngine::new(cycles, settings, BTreeSet::new()), snap)
 }
@@ -512,4 +513,52 @@ fn a_usdc_arm_s_surplus_is_written_in_usdc_units() {
         let wei = apex_runtime::armed::run::surplus_in_wei(a, 2_680.0);
         assert!(wei >= U256::exp10(15) && wei < U256::exp10(17), "{wei} wei at the run's price");
     }
+}
+
+/// An ordinary arm's worst case at a 300,000 wei base fee and no bid, and what
+/// it would hold if it reserved a NoTrade's cost.
+const ORDINARY_WORST: u128 = 1_000_000 * 600_000 + 1_000_000_000_000;
+const ORDINARY_NO_TRADE: u128 = 140_000 * 600_000 + 1_000_000_000_000;
+
+/// What the two spike arms of `engine_with(6, [tier(2)], NoTrade)` hold.
+fn spike_held() -> u128 {
+    let (e, snap) = engine_with(6, vec![tier(2)], Reserve::NoTrade);
+    let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, BUDGET, 1_500_000_000);
+    arms(&lines)
+        .iter()
+        .filter(|a| a.rung >= SPIKE_TIER_BASE)
+        .map(|a| 140_000 * (600_000 + a.bid_wei_per_gas.parse::<u128>().unwrap()) + 1_000_000_000_000)
+        .sum()
+}
+
+/// R43.1: the NoTrade reserve is the spike tiers' alone. An ordinary arm holds
+/// its whole worst case, as before the tiers: on the first shadow boot
+/// (2026-11-13) the lane-wide rule let the ordinary tier 2 arm at 5 to 10 gwei,
+/// 57 of the first 83 arms, which no budget had admitted before.
+#[test]
+fn the_no_trade_reserve_is_the_spike_tiers_alone() {
+    // Three NoTrade reservations would fit what the spike arms leave; three
+    // worst cases do not.
+    const _: () = assert!(3 * ORDINARY_NO_TRADE < 2 * ORDINARY_WORST + ORDINARY_WORST / 2);
+    let budget = spike_held() + 2 * ORDINARY_WORST + ORDINARY_WORST / 2;
+    let (e, snap) = engine_with(6, vec![tier(2)], Reserve::NoTrade);
+    let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, budget, 1_500_000_000);
+    let armed = arms(&lines);
+    assert_eq!(armed.iter().filter(|a| a.rung >= SPIKE_TIER_BASE).count(), 2, "the spike arms hold a NoTrade's cost");
+    assert_eq!(armed.iter().filter(|a| a.rung < SPIKE_TIER_BASE).count(), 2, "an ordinary arm holds its worst case");
+}
+
+/// R43.1: the lane's own budget is for its spike tiers. The ordinary tiers
+/// stay inside `armed`'s, whatever the lane's is.
+#[test]
+fn the_ordinary_tiers_stay_inside_armeds_budget() {
+    let (built, snap) = engine_with(6, vec![tier(2)], Reserve::NoTrade);
+    let mut settings = built.settings_for_test().clone();
+    settings.ordinary_budget_wei = 3 * ORDINARY_WORST + 1;
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let e = SizedEngine::new(cycles, settings, BTreeSet::new());
+    let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, BUDGET, 1_500_000_000);
+    let armed = arms(&lines);
+    assert_eq!(armed.iter().filter(|a| a.rung >= SPIKE_TIER_BASE).count(), 2);
+    assert_eq!(armed.iter().filter(|a| a.rung < SPIKE_TIER_BASE).count(), 3, "four could pay; armed's budget holds three worst cases");
 }
