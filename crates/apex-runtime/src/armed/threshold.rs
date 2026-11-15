@@ -484,11 +484,17 @@ fn arm_point(
     let at = |s: u32| net_at(cycle, pair, leg, &pair[other], s, px, terms, bid.sent.per_gas);
     let trigger = pair[leg].moved(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
     let mut grid = [(0u32, 0f64); 6];
+    // The grid's first point is the threshold itself: its trade is priced once.
+    let mut at_step = None;
     for (g, off) in grid.iter_mut().zip(NET_GRID) {
         let s = step.saturating_add(off).min(MAX_STEP);
-        *g = (s, at(s).map_or(0.0, |n| n.net_wei.as_u128() as f64));
+        let n = at(s);
+        if s == step {
+            at_step = n;
+        }
+        *g = (s, n.map_or(0.0, |n| n.net_wei.as_u128() as f64));
     }
-    let gas = at(step).map_or(gas, |n| n.gas);
+    let gas = at_step.map_or(gas, |n| n.gas);
     Some(SizedArmPoint { tier, step, trigger, edges: edges.clone(), bid, gas, grid })
 }
 

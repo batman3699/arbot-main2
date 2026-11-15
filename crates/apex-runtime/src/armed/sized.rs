@@ -259,7 +259,9 @@ pub fn fill(
         let group = cands[i].group;
         let in_group: Vec<usize> = chosen.iter().copied().filter(|j| cands[*j].group == group).collect();
         for j in 0..cands.len() {
-            if cands[j].group == group && !chosen.contains(&j) {
+            // R43.2: only what this fill can choose: a spike arm's value is
+            // not read here, and costs the most to find.
+            if cands[j].group == group && cands[j].key.2 < SPIKE_TIER_BASE && !chosen.contains(&j) {
                 value[j] = marginal(&cands[j], &in_group);
             }
         }

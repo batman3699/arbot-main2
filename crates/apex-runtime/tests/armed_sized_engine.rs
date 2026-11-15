@@ -58,6 +58,22 @@ fn a_spike_arm_is_held_to_the_budget_and_to_a_positive_value() {
     assert_eq!(fill_spike(&cands, &[4], 1_000), vec![0, 3], "the second's reservation does not fit; the fourth's does");
 }
 
+/// R43.2: nor is a spike arm valued there. Re-valuing one replays trades on a
+/// trigger moved hundreds of ticks; done for every spike candidate of every
+/// group chosen from, it made a pass with nothing to price four times longer
+/// (4.4 ms to 17 ms on twelve slots).
+#[test]
+fn the_ordinary_fill_never_values_a_spike_arm() {
+    let cands = vec![cand(1, 1, 5.0, 1), spike(2, 1, 0, 9.0, 1), cand(3, 1, 4.0, 1), spike(4, 1, 1, 9.0, 1)];
+    let mut asked = Vec::new();
+    let chosen = fill(&cands, 4, 1_000, |c, _| {
+        asked.push(c.key.2);
+        c.ev
+    });
+    assert_eq!(chosen, vec![0, 2]);
+    assert_eq!(asked, vec![1], "the other ordinary arm of the group, and no spike arm");
+}
+
 #[test]
 fn the_ordinary_fill_never_takes_a_spike_arm() {
     let cands = vec![spike(1, 1, 0, 9.0, 1), cand(2, 2, 3.0, 1)];
