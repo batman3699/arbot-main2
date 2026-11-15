@@ -130,8 +130,7 @@ impl PoolSnapshot {
         match (to, &self.reserves) {
             (Move::Bps { up, bps }, Some(r)) => next.reserves = Some(crate::live::cp::move_reserves(r, up, bps)?),
             (Move::Tick(t), None) => {
-                let target = apex_math::cl_math::get_sqrt_ratio_at_tick(t)?;
-                next.state = apex_math::cl_move::move_to_price(&self.state, &self.ladder, target)?;
+                next.state = apex_math::cl_move::move_to_tick(&self.state, &self.ladder, t)?;
                 next.fee_from_tick();
             }
             _ => return None,

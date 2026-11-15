@@ -52,12 +52,15 @@ pub struct PositionApplied {
 /// into a reported `Exhausted` and a caller-side fallback.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TickLadder {
-    /// `(tick, liquidity_net)` sorted ascending by tick, deduplicated.
-    ticks: Vec<(i32, i128)>,
+    /// `(tick, liquidity_net)` sorted ascending by tick, deduplicated. Shared:
+    /// a ladder is never changed in place (`apply_position` builds another),
+    /// and pricing copies a pool's snapshot for every state it tries, which
+    /// on a ladder of thousands of ticks was most of a quote's time (R43.2).
+    ticks: std::sync::Arc<Vec<(i32, i128)>>,
     /// Each tick's `liquidityGross`, aligned with `ticks`, when the ladder was
     /// read with it (R28.1): what tells a burn that empties a tick from one
     /// that leaves it initialized at a zero net.
-    gross: Option<Vec<u128>>,
+    gross: Option<std::sync::Arc<Vec<u128>>>,
     lower_bound: i32,
     upper_bound: i32,
 }
@@ -70,7 +73,7 @@ impl TickLadder {
         ticks.sort_unstable_by_key(|(t, _)| *t);
         ticks.dedup_by_key(|(t, _)| *t);
         Self {
-            ticks,
+            ticks: std::sync::Arc::new(ticks),
             gross: None,
             lower_bound: lower_bound.max(MIN_TICK),
             upper_bound: upper_bound.min(MAX_TICK),
@@ -84,8 +87,8 @@ impl TickLadder {
         ticks.sort_unstable_by_key(|(t, _, _)| *t);
         ticks.dedup_by_key(|(t, _, _)| *t);
         Self {
-            gross: Some(ticks.iter().map(|(_, g, _)| *g).collect()),
-            ticks: ticks.into_iter().map(|(t, _, n)| (t, n)).collect(),
+            gross: Some(std::sync::Arc::new(ticks.iter().map(|(_, g, _)| *g).collect())),
+            ticks: std::sync::Arc::new(ticks.into_iter().map(|(t, _, n)| (t, n)).collect()),
             lower_bound: lower_bound.max(MIN_TICK),
             upper_bound: upper_bound.min(MAX_TICK),
         }
@@ -103,7 +106,7 @@ impl TickLadder {
     /// Each tick's gross, aligned with [`Self::ticks`], if the ladder was read
     /// with it.
     pub fn gross(&self) -> Option<&[u128]> {
-        self.gross.as_deref()
+        self.gross.as_ref().map(|g| g.as_slice())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -141,8 +144,8 @@ impl TickLadder {
         if tick_lower >= tick_upper {
             return Err(PositionUnknown::Inconsistent(tick_lower));
         }
-        let mut ticks = self.ticks.clone();
-        let mut gross = self.gross.clone();
+        let mut ticks: Vec<(i32, i128)> = (*self.ticks).clone();
+        let mut gross: Option<Vec<u128>> = self.gross.as_ref().map(|g| (**g).clone());
         let mut unconfirmed = None;
         let upper_change = delta.checked_neg().ok_or(PositionUnknown::Overflow(tick_upper))?;
         for (tick, change) in [(tick_lower, delta), (tick_upper, upper_change)] {
@@ -183,7 +186,12 @@ impl TickLadder {
                 }
             }
         }
-        let ladder = Self { ticks, gross, lower_bound: self.lower_bound, upper_bound: self.upper_bound };
+        let ladder = Self {
+            ticks: std::sync::Arc::new(ticks),
+            gross: gross.map(std::sync::Arc::new),
+            lower_bound: self.lower_bound,
+            upper_bound: self.upper_bound,
+        };
         Ok(PositionApplied { ladder, unconfirmed })
     }
 
@@ -196,15 +204,11 @@ impl TickLadder {
         if !self.covers(from_tick) {
             return LadderStep::Exhausted;
         }
-        let found = if zero_for_one {
-            self.ticks
-                .iter()
-                .rev()
-                .find(|(t, _)| *t <= from_tick)
-                .copied()
-        } else {
-            self.ticks.iter().find(|(t, _)| *t > from_tick).copied()
-        };
+        // The ticks are sorted and distinct, so the first above `from_tick` is
+        // found by search: a scan from one end was most of a far move's time
+        // on a ladder of thousands (R43.2).
+        let above = self.ticks.partition_point(|(t, _)| *t <= from_tick);
+        let found = if zero_for_one { above.checked_sub(1).and_then(|i| self.ticks.get(i)) } else { self.ticks.get(above) }.copied();
         match found {
             Some((tick, liquidity_net)) if self.covers(tick) => {
                 LadderStep::Initialized { tick, liquidity_net }
@@ -488,6 +492,42 @@ mod tests {
             -180,
             180,
         )
+    }
+
+    /// The scan `next_initialized` was before it searched: the greatest
+    /// initialized tick at or below `from` going down, the least above it
+    /// going up, and nothing outside the proven range.
+    fn scanned(l: &TickLadder, from: i32, down: bool) -> LadderStep {
+        if !l.covers(from) {
+            return LadderStep::Exhausted;
+        }
+        let found = if down { l.ticks().iter().rev().find(|(t, _)| *t <= from).copied() } else { l.ticks().iter().find(|(t, _)| *t > from).copied() };
+        match found {
+            Some((tick, liquidity_net)) if l.covers(tick) => LadderStep::Initialized { tick, liquidity_net },
+            _ => LadderStep::Exhausted,
+        }
+    }
+
+    /// The search answers what the scan answered, from every tick, both ways:
+    /// on ticks unevenly spaced, on one tick, on none, and on ticks the
+    /// ladder holds outside the range it proves.
+    #[test]
+    fn next_initialized_searches_to_what_a_scan_finds() {
+        let uneven: Vec<(i32, i128)> = [-300, -299, -180, -61, -60, 0, 1, 59, 60, 177, 240, 241].iter().map(|t| (*t, i128::from(*t) * 7 + 1)).collect();
+        let ladders = [
+            TickLadder::new(uneven.clone(), -400, 400),
+            // Bounds inside the ticks held: those outside are not proven.
+            TickLadder::new(uneven, -180, 177),
+            TickLadder::new(vec![(5, 9)], -50, 50),
+            TickLadder::new(vec![], -50, 50),
+        ];
+        for l in &ladders {
+            for from in -420..=420 {
+                for down in [true, false] {
+                    assert_eq!(l.next_initialized(from, down), scanned(l, from, down), "from {from}, down {down}, bounds {}..{}", l.lower_bound(), l.upper_bound());
+                }
+            }
+        }
     }
 
     #[test]

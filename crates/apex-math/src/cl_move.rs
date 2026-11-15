@@ -34,6 +34,21 @@ fn apply_net(liquidity: u128, net: i128) -> Option<u128> {
 /// would hold them. `None` when the move would leave the ladder's proven range,
 /// drain liquidity or a balance, or the target is outside the protocol's prices.
 pub fn move_to_price(state: &ClPoolState, ladder: &TickLadder, target: U256) -> Option<ClPoolState> {
+    move_to(state, ladder, target, None)
+}
+
+/// [`move_to_price`] to `tick`'s own price (R43.2). The same state to the
+/// unit, without the search for the tick the target is at: the caller named
+/// it. That search is 21 ratios over the whole tick range and was made twice
+/// a move, nine tenths of what an armed quote took.
+pub fn move_to_tick(state: &ClPoolState, ladder: &TickLadder, tick: i32) -> Option<ClPoolState> {
+    move_to(state, ladder, get_sqrt_ratio_at_tick(tick)?, Some(tick))
+}
+
+/// `target_tick` is the tick `target` is at when the caller knows it: the
+/// greatest whose ratio is at most `target`, which for a tick's own ratio is
+/// that tick. Unknown, it is searched for once, when first needed.
+fn move_to(state: &ClPoolState, ladder: &TickLadder, target: U256, mut target_tick: Option<i32>) -> Option<ClPoolState> {
     if state.liquidity == 0 || target < min_sqrt_ratio() || target >= max_sqrt_ratio() || !ladder.covers(state.tick) {
         return None;
     }
@@ -52,8 +67,15 @@ pub fn move_to_price(state: &ClPoolState, ladder: &TickLadder, target: U256) -> 
         let stop = crossing.map_or(target, |(_, _, at)| at);
         // With no initialized tick before the target, the ladder must prove the
         // target itself, or the liquidity on the way is unknown.
-        if crossing.is_none() && !ladder.covers(get_tick_at_sqrt_ratio(target)?) {
-            return None;
+        if crossing.is_none() {
+            let at = match target_tick {
+                Some(t) => t,
+                None => get_tick_at_sqrt_ratio(target)?,
+            };
+            target_tick = Some(at);
+            if !ladder.covers(at) {
+                return None;
+            }
         }
         let (from, to) = (s.sqrt_price_x96, stop);
         if down {
@@ -65,7 +87,8 @@ pub fn move_to_price(state: &ClPoolState, ladder: &TickLadder, target: U256) -> 
         }
         s.sqrt_price_x96 = stop;
         let Some((tick, net, _)) = crossing else {
-            s.tick = get_tick_at_sqrt_ratio(stop)?;
+            // No crossing: the move stops at the target, whose tick is known.
+            s.tick = target_tick?;
             return settle(s, down, into, out);
         };
         let signed = if down { net.checked_neg()? } else { net };
