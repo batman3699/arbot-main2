@@ -54,6 +54,53 @@ pub const fn settle_blocks(block_time_ms: u64) -> u64 {
     60_000 / if block_time_ms == 0 { 1 } else { block_time_ms }
 }
 
+/// R43.6: the stretch of chain one run judges, and how far before it a run
+/// reads logs, in the configuration's blocks: half an hour and an hour, 9,000
+/// and 18,000 at 200 ms. A run every five minutes then clears a backlog six
+/// times as fast as it grows, on some 430 log queries a lane.
+pub const fn run_span_blocks(block_time_ms: u64) -> (u64, u64) {
+    let ms = if block_time_ms == 0 { 1 } else { block_time_ms };
+    (1_800_000 / ms, 3_600_000 / ms)
+}
+
+/// R43.6: what one run judges of the arms due.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Batch {
+    /// The arms to judge.
+    pub arms: Vec<Arm>,
+    /// The blocks their logs are read over.
+    pub from: u64,
+    pub to: u64,
+    /// Where the cursor moves: the last window any of the batch closed in.
+    pub cursor: u64,
+    /// Arms passed over unjudged: armed before the lookback.
+    pub skipped: usize,
+}
+
+/// R43.6: of `due`, the arms whose windows closed within `span` blocks of the
+/// earliest to close; of those, the ones armed no more than `lookback` blocks
+/// before it are judged, and the rest counted. None when nothing is due.
+///
+/// Judging everything due at once holds only while runs keep up. After the
+/// provider's outage two days of arms were due, a run asked for 860,000
+/// blocks of logs, was stopped at its four minutes, and began again from the
+/// same cursor. A span bounds the windows a run takes; the lookback bounds
+/// the logs, which an arm renewed for hours would otherwise stretch to its
+/// whole life. Such an arm's pools both stood still for all of it, or the
+/// engine would have armed it again, so it did not fire.
+pub fn batch(due: Vec<Arm>, span: u64, lookback: u64) -> Option<Batch> {
+    let first = due.iter().map(|a| a.to_block).min()?;
+    let limit = first.saturating_add(span);
+    let floor = first.saturating_sub(lookback);
+    let taken: Vec<Arm> = due.into_iter().filter(|a| a.to_block <= limit).collect();
+    let cursor = taken.iter().map(|a| a.to_block).max().unwrap_or(first);
+    let all = taken.len();
+    let arms: Vec<Arm> = taken.into_iter().filter(|a| a.armed_block >= floor).collect();
+    let from = arms.iter().map(|a| a.armed_block + 1).min().unwrap_or(cursor);
+    let to = arms.iter().map(|a| a.to_block).max().unwrap_or(cursor);
+    Some(Batch { skipped: all - arms.len(), arms, from, to, cursor })
+}
+
 /// R41: the unit a verdict's positions count in, so that offsets from
 /// different eras are never pooled as one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,6 +463,9 @@ pub struct RunReport {
     pub simulated: usize,
     pub sim_agreed: usize,
     pub cursor: u64,
+    /// R43.6: arms the run passed over unjudged: armed before its lookback.
+    #[serde(default)]
+    pub skipped: usize,
     /// R40.1: the sized lane's run, when it is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sized: Option<Box<RunReport>>,
@@ -496,10 +546,17 @@ async fn run_lane(config: &ShadowConfig, lane: &EvalLane) -> Result<RunReport, S
         .filter(|a| a.to_block > cursor && a.to_block + settle_blocks(config.armed.block_time_ms) <= head)
         .collect();
     let mut report = RunReport { cursor, ..Default::default() };
+    // R43.6: a span of what is due, so that a run ends and its cursor moves.
+    let (span, lookback) = run_span_blocks(config.armed.block_time_ms);
+    let Some(Batch { arms: due, from, to, cursor: new_cursor, skipped }) = batch(due, span, lookback) else {
+        return Ok(report);
+    };
+    report.skipped = skipped;
     if due.is_empty() {
+        report.cursor = new_cursor;
+        std::fs::write(&cursor_path, report.cursor.to_string()).map_err(|e| e.to_string())?;
         return Ok(report);
     }
-    let new_cursor = due.iter().map(|a| a.to_block).max().unwrap_or(cursor);
     let pools: BTreeSet<Address> = due.iter().flat_map(|a| a.pools.iter().filter_map(|p| p.parse().ok())).collect();
     // R36: an armed pool may sit below the floor (a census target): every pool
     // that was armed is read whatever its depth.
@@ -507,8 +564,6 @@ async fn run_lane(config: &ShadowConfig, lane: &EvalLane) -> Result<RunReport, S
     let specs = inventory::load(&config.inventory, config.universe.filter(), &pools, &hooks).map_err(|e| e.to_string())?;
     let venues: BTreeMap<Address, Venue> = specs.iter().map(|s| (s.pool, s.venue)).collect();
     let v4_ids: Vec<B256> = specs.iter().filter_map(|s| s.v4.map(|k| k.pool_id)).collect();
-    let from = due.iter().map(|a| a.armed_block + 1).min().unwrap_or(head);
-    let to = due.iter().map(|a| a.to_block).max().unwrap_or(head);
     let logs = get_logs(&*rpc, &pools, &v4_ids, from, to).await?;
     let effects = effects_of(&logs, &venues);
     let flashblocks: Vec<FlashblockSeen> = config.flashblocks.as_ref().map(|f| read_lines(&f.ledger, now, 2)).unwrap_or_default();

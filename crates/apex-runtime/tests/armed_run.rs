@@ -965,3 +965,53 @@ fn a_sized_arm_s_terms_come_from_its_line_and_its_outcome_has_a_class() {
     fixed.sized = None;
     assert!(sized_terms_of(&fixed, &cycle).is_none());
 }
+
+// ------------------------------------------------------------- R43.6: a run's batch
+
+/// An arm armed at `armed` whose window, renewals folded in, closed at `to`.
+fn lived(arm_id: u64, armed: u64, to: u64) -> apex_runtime::armed::lines::Arm {
+    let text = format!(
+        r#"{{"arm_id":{arm_id},"at_ns":0,"armed_block":{armed},"to_block":{to},"route_hash":"0xr","trigger_leg":0,"rung":1,"step":3,
+        "pools":["0xaa","0xbb"],"venues":["UniswapV3","UniswapV3"],"predicates":[],"start_words":[],"start_ticks":[],
+        "size_wei":"1","mid":"1","output_wei":"2","surplus_wei":"1","cost_wei":"0","gas_expected":1,"gas_limit":900000,
+        "base_fee_wei":"5000000","other_wei":"0","deadline":11,"calldata":"0x","calldata_hash":"0x","sender_slot":0}}"#
+    );
+    serde_json::from_str(&text).unwrap()
+}
+
+/// R43.6: one run judges the arms whose windows closed within a span of the
+/// earliest still due, and reads logs no further back than its lookback; the
+/// cursor moves past all of them. Judging everything due at once, two days of
+/// arms after an outage, a run asked for 860,000 blocks of logs, was stopped
+/// at its four minutes and began again from the same cursor: no verdict from
+/// 2026-11-07 09:36 UTC on.
+#[test]
+fn a_run_judges_a_span_of_the_arms_due_and_moves_its_cursor_past_them() {
+    use apex_runtime::armed::run::batch;
+    let due = vec![lived(1, 100, 150), lived(2, 120, 160), lived(3, 5_000, 5_050), lived(4, 9_500, 9_550), lived(5, 9_100, 9_150)];
+    let b = batch(due.clone(), 9_000, 100_000).expect("arms are due");
+    assert_eq!(b.arms.iter().map(|a| a.arm_id).collect::<Vec<_>>(), vec![1, 2, 3, 5], "closed within 9,000 blocks of the first to close, at 150");
+    assert_eq!((b.from, b.to, b.cursor, b.skipped), (101, 9_150, 9_150, 0));
+    // The rest is the next run's: the arm that closed past the span.
+    let rest: Vec<_> = due.into_iter().filter(|a| a.to_block > b.cursor).collect();
+    let next = batch(rest, 9_000, 100_000).unwrap();
+    assert_eq!((next.arms.len(), next.from, next.to, next.cursor), (1, 9_501, 9_550, 9_550));
+    assert!(batch(Vec::new(), 9_000, 100_000).is_none(), "nothing due, nothing to do");
+}
+
+/// R43.6: an arm renewed for longer than the lookback is not judged: its
+/// logs would be the whole of its life, and both its pools stood still for
+/// all of it, or it would have been armed again. It is counted, and the
+/// cursor passes it, so one such arm never holds the others up.
+#[test]
+fn an_arm_older_than_the_lookback_is_passed_over_and_counted() {
+    use apex_runtime::armed::run::batch;
+    // Armed at 10 and renewed to 8,000; the earliest due closes at 6,000.
+    let due = vec![lived(1, 10, 8_000), lived(2, 5_900, 6_000), lived(3, 7_000, 7_050)];
+    let b = batch(due, 9_000, 1_000).unwrap();
+    assert_eq!(b.arms.iter().map(|a| a.arm_id).collect::<Vec<_>>(), vec![2, 3], "logs are read from 5,000 on: block 10 is before it");
+    assert_eq!((b.from, b.to, b.cursor, b.skipped), (5_901, 7_050, 8_000, 1));
+    // Alone, it is still passed: the cursor moves and no log is asked for.
+    let alone = batch(vec![lived(1, 10, 8_000)], 9_000, 1_000).unwrap();
+    assert_eq!((alone.arms.len(), alone.cursor, alone.skipped), (0, 8_000, 1));
+}
