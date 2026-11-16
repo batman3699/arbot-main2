@@ -79,6 +79,9 @@ pub fn unit_of(granular: bool, fire_timestamp: Option<u64>) -> Option<OffsetUnit
 }
 /// Blocks per `eth_getLogs`.
 const LOG_CHUNK: u64 = 500;
+/// R43.4: addresses per `eth_getLogs`: publicnode, the keyed provider's
+/// fallback, refuses a filter of more than ten (HTTP 403).
+const LOG_ADDRESSES: usize = 10;
 
 fn topic_i32(topic: &B256) -> i32 {
     i32::from_be_bytes(topic.0[28..32].try_into().unwrap_or([0; 4]))
@@ -1055,7 +1058,14 @@ fn too_many_logs(error: &str) -> bool {
 pub async fn get_logs(rpc: &dyn RpcTransport, pools: &BTreeSet<Address>, v4_ids: &[B256], from: u64, to: u64) -> Result<Vec<RawLog>, String> {
     let addresses: Vec<String> = pools.iter().map(|a| format!("{a:#x}")).collect();
     let topics: Vec<String> = [SWAP, PANCAKE_SWAP, SYNC, MINT, BURN].iter().map(|t| format!("{t:#x}")).collect();
-    let mut out = logs_of(rpc, &json!({"address": addresses, "topics": [topics]}), from, to).await?;
+    let mut out = Vec::new();
+    for some in addresses.chunks(LOG_ADDRESSES) {
+        out.extend(logs_of(rpc, &json!({"address": some, "topics": [topics]}), from, to).await?);
+    }
+    // In chain order, whichever query a log came back in.
+    if addresses.len() > LOG_ADDRESSES {
+        out.sort_by_key(|l| (l.block_number, l.transaction_index, l.log_index));
+    }
     if !v4_ids.is_empty() {
         let topics0: Vec<String> = [V4_SWAP, MODIFY_LIQUIDITY].iter().map(|t| format!("{t:#x}")).collect();
         let ids: Vec<String> = v4_ids.iter().map(|i| format!("{i:#x}")).collect();

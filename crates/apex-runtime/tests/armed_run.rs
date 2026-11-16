@@ -381,6 +381,57 @@ async fn a_range_too_full_for_one_query_is_split_until_it_fits() {
     assert_eq!(*full.asked.lock().unwrap(), vec![(1_000, 1_001), (1_000, 1_000)]);
 }
 
+/// A provider that takes at most ten addresses a log query, as publicnode
+/// does, and answers one log for each address asked in each block.
+struct TenAddresses {
+    asked: std::sync::Mutex<Vec<usize>>,
+}
+
+#[async_trait::async_trait]
+impl apex_chain::rpc::RpcTransport for TenAddresses {
+    async fn call(&self, _method: &str, params: serde_json::Value) -> Result<serde_json::Value, apex_chain::rpc::RpcError> {
+        let q = |k: &str| u64::from_str_radix(params[0][k].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+        let addresses: Vec<String> = params[0]["address"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect();
+        self.asked.lock().unwrap().push(addresses.len());
+        if addresses.len() > 10 {
+            return Err(apex_chain::rpc::RpcError::Exhausted {
+                method: "eth_getLogs".into(),
+                endpoints: 1,
+                last: "https://base-rpc.publicnode.com: http 403 Forbidden".into(),
+            });
+        }
+        let mut logs = Vec::new();
+        for b in q("fromBlock")..=q("toBlock") {
+            for a in &addresses {
+                // Its place in the block is the address's last byte.
+                let at = u64::from_str_radix(&a[40..], 16).unwrap();
+                logs.push(serde_json::json!({
+                    "address": a, "topics": [format!("{SWAP:#x}")], "data": "0x",
+                    "blockNumber": format!("{b:#x}"), "transactionHash": format!("0x{:064x}", b * 1_000 + at),
+                    "logIndex": format!("{at:#x}"), "transactionIndex": format!("{at:#x}"),
+                }));
+            }
+        }
+        Ok(serde_json::Value::Array(logs))
+    }
+}
+
+/// R43.4: the pools' logs are asked for ten addresses a query. Publicnode
+/// refuses a filter of more ("A maximum of 10 addresses is allowed", HTTP
+/// 403), the evaluator asked for every pool at once, and with the keyed
+/// provider out it judged nothing from 2026-11-13: no verdict on any arm the
+/// lane sent. Every pool's logs come back once, in chain order.
+#[tokio::test]
+async fn the_pools_logs_are_asked_for_ten_addresses_a_query() {
+    let pools: std::collections::BTreeSet<Address> = (1..=25u8).map(Address::with_last_byte).collect();
+    let rpc = TenAddresses { asked: Default::default() };
+    let logs = get_logs(&rpc, &pools, &[], 1_000, 1_001).await.unwrap();
+    assert_eq!(*rpc.asked.lock().unwrap(), vec![10, 10, 5]);
+    let got: Vec<(u64, u64)> = logs.iter().map(|l| (l.block_number.unwrap(), l.log_index.unwrap())).collect();
+    let want: Vec<(u64, u64)> = (1_000..=1_001).flat_map(|b| (1..=25).map(move |i| (b, i))).collect();
+    assert_eq!(got, want, "each pool's log in each block, once, in chain order");
+}
+
 /// R27: what the replay itself wrote to the arm's pools, as the book applies
 /// it: each log on a watched pool from a replayed transaction, under that
 /// transaction's real index and hash, in order; nothing from other addresses.
