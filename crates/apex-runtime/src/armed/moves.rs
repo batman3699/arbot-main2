@@ -34,8 +34,75 @@ struct PoolMoves {
     max_up: f64,
     max_down: f64,
     windows: VecDeque<(f64, f64)>,
+    /// R43.5: the windows' moves up and down, each ascending: the share at
+    /// least a step is a search here, not a scan of the day. Kept with
+    /// `windows` by [`PoolMoves::close`], [`PoolMoves::holding`] and nothing
+    /// else.
+    sorted: [Sorted; 2],
     /// Restored with no open window: the next observation opens one.
     fresh: bool,
+}
+
+/// Moves in ascending order. One that is not a number is left out: it is at
+/// least no step, and the largest of nothing.
+#[derive(Debug, Default)]
+struct Sorted(Vec<f64>);
+
+impl Sorted {
+    fn add(&mut self, v: f64) {
+        if !v.is_nan() {
+            let i = self.0.partition_point(|x| *x < v);
+            self.0.insert(i, v);
+        }
+    }
+
+    fn remove(&mut self, v: f64) {
+        let i = self.0.partition_point(|x| *x < v);
+        if self.0.get(i).is_some_and(|x| *x == v) {
+            self.0.remove(i);
+        }
+    }
+
+    /// How many are at least `m`.
+    fn at_least(&self, m: f64) -> usize {
+        self.0.len() - self.0.partition_point(|x| *x < m)
+    }
+}
+
+impl PoolMoves {
+    /// A pool holding `windows`, oldest first, with no window open.
+    fn holding(windows: impl Iterator<Item = (f64, f64)>) -> Self {
+        let mut p = Self { fresh: true, ..Default::default() };
+        for w in windows {
+            p.sorted[0].add(w.0);
+            p.sorted[1].add(w.1);
+            p.windows.push_back(w);
+        }
+        p
+    }
+
+    /// Close the open window into the history, dropping the oldest past a day.
+    fn close(&mut self) {
+        let w = (self.max_up, self.max_down);
+        self.sorted[0].add(w.0);
+        self.sorted[1].add(w.1);
+        self.windows.push_back(w);
+        if self.windows.len() > KEEP {
+            if let Some(old) = self.windows.pop_front() {
+                self.sorted[0].remove(old.0);
+                self.sorted[1].remove(old.1);
+            }
+        }
+    }
+
+    /// Open a window at `position`, the history kept.
+    fn open(&mut self, now_ns: u64, position: f64) {
+        self.window_start_ns = now_ns;
+        self.start = position;
+        self.max_up = 0.0;
+        self.max_down = 0.0;
+        self.fresh = false;
+    }
 }
 
 #[derive(Debug)]
@@ -56,15 +123,11 @@ impl MoveStats {
             .entry(pool)
             .or_insert_with(|| PoolMoves { window_start_ns: now_ns, start: position, ..Default::default() });
         if p.fresh {
-            *p = PoolMoves { window_start_ns: now_ns, start: position, windows: std::mem::take(&mut p.windows), ..Default::default() };
+            p.open(now_ns, position);
         }
         if now_ns >= p.window_start_ns.saturating_add(w) {
-            p.windows.push_back((p.max_up, p.max_down));
-            if p.windows.len() > KEEP {
-                p.windows.pop_front();
-            }
-            let windows = std::mem::take(&mut p.windows);
-            *p = PoolMoves { window_start_ns: now_ns, start: position, windows, ..Default::default() };
+            p.close();
+            p.open(now_ns, position);
         }
         p.max_up = p.max_up.max(position - p.start);
         p.max_down = p.max_down.max(p.start - position);
@@ -79,11 +142,13 @@ impl MoveStats {
     /// A pool seen not to move that way gets nothing.
     pub fn p_at_least(&self, pool: Address, up: bool, step: u32) -> f64 {
         let Some(p) = self.pools.get(&pool) else { return 0.5 };
-        let way = |(u, d): &(f64, f64)| if up { *u } else { *d };
+        // R43.5: by search in the moves kept sorted. Scanning the day's
+        // windows, twice a question, was 22 ms of a 22.2 ms sized pass.
+        let (sorted, open) = if up { (&p.sorted[0], p.max_up) } else { (&p.sorted[1], p.max_down) };
         let n = p.windows.len() as f64 + 2.0;
-        let share = |m: f64| (p.windows.iter().filter(|w| way(w) >= m).count() as f64 + 1.0) / n;
+        let share = |m: f64| (sorted.at_least(m) as f64 + 1.0) / n;
         let step = f64::from(step);
-        let seen = p.windows.iter().map(way).fold(way(&(p.max_up, p.max_down)), f64::max);
+        let seen = sorted.0.last().map_or(open, |most| open.max(*most));
         // The two agree at `seen`, and a pool seen not to move gets 0^k = 0.
         if step <= seen {
             share(step)
@@ -142,7 +207,7 @@ impl MoveStats {
         }
         for (pool, windows) in &snap.pools {
             let keep = windows.len().saturating_sub(KEEP);
-            self.pools.insert(*pool, PoolMoves { windows: windows[keep..].iter().copied().collect(), fresh: true, ..Default::default() });
+            self.pools.insert(*pool, PoolMoves::holding(windows[keep..].iter().copied()));
         }
         Ok(snap.pools.len())
     }

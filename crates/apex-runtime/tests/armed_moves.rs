@@ -214,3 +214,67 @@ fn the_seed_replays_each_pair_s_spread() {
     assert_eq!(m.snapshot(64 * S).pools[&spread_key(AERO, UNI)][1], (0.0, 25.0), "the other way round, the same gap downward");
     assert_eq!(m.snapshot(64 * S).pools[&UNI][0], (25.0, 0.0), "the pools' own series as before");
 }
+
+/// What `p_at_least` is, by the scan it was before R43.5, from the closed
+/// windows alone: asked just after a window closes, when the open one has not
+/// moved.
+fn scanned(windows: &[(f64, f64)], up: bool, step: u32) -> f64 {
+    let way = |(u, d): &(f64, f64)| if up { *u } else { *d };
+    let n = windows.len() as f64 + 2.0;
+    let share = |m: f64| (windows.iter().filter(|w| way(w) >= m).count() as f64 + 1.0) / n;
+    let step = f64::from(step);
+    let seen = windows.iter().map(way).fold(0.0, f64::max);
+    if step <= seen {
+        share(step)
+    } else {
+        share(seen) * (seen / step).powf(apex_runtime::armed::moves::TAIL_EXPONENT)
+    }
+}
+
+/// R43.5: the share of windows with a move of at least a step is found by
+/// search in the moves kept sorted, and is what scanning every window found:
+/// while the history fills, once its oldest windows are dropped (a day,
+/// 8,640), and restored from a snapshot. The scan read a pool's whole day
+/// twice a question, and a sized pass asks some 1,750: 22 ms of the host's
+/// 22.2 ms pass (2026-11-16, pricing 0.08 ms).
+#[test]
+fn the_share_of_windows_is_searched_to_what_a_scan_finds() {
+    let mut m = MoveStats::new(W);
+    let mut x = 9u64;
+    let mut position = 0.0f64;
+    let mut checked = 0;
+    for i in 0..9_400u64 {
+        // A walk with the odd large move, and a repeat of the last position.
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        let r = (x >> 33) % 1_000;
+        position += match r {
+            0..=4 => 400.0,
+            5..=9 => -350.0,
+            10..=499 => (r % 7) as f64 - 3.0,
+            _ => 0.0,
+        };
+        // One observation a window: each closes the one before it.
+        m.observe(UNI, position, i * W);
+        if i % 211 == 0 || i > 9_380 {
+            let snap = m.snapshot(i * W);
+            let windows = &snap.pools[&UNI];
+            assert_eq!(windows.len() as u64, i.min(8_640), "a day of windows at most");
+            for up in [true, false] {
+                for step in [0u32, 1, 2, 3, 5, 50, 349, 350, 351, 399, 400, 401, 5_000] {
+                    assert_eq!(m.p_at_least(UNI, up, step), scanned(windows, up, step), "window {i}, up {up}, step {step}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 1_500);
+    // Restored: the same shares from the same windows.
+    let snap = m.snapshot(0);
+    let mut back = MoveStats::new(W);
+    back.restore(&snap).unwrap();
+    for up in [true, false] {
+        for step in [0u32, 1, 3, 50, 350, 400, 401, 5_000] {
+            assert_eq!(back.p_at_least(UNI, up, step), scanned(&snap.pools[&UNI], up, step), "restored, up {up}, step {step}");
+        }
+    }
+}
