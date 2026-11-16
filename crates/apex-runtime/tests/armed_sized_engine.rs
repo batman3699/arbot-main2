@@ -650,6 +650,11 @@ fn the_lazy_fill_chooses_what_the_eager_fill_chose() {
     }
 }
 
+/// What an arm is worth after the arms of its group chosen before it, and a
+/// fill over candidates asking that.
+type Worth<'a> = &'a mut dyn FnMut(&Candidate, &[usize]) -> f64;
+type Fill<'a> = &'a dyn Fn(&[Candidate], Worth) -> Vec<usize>;
+
 /// R43.3: and it asks less. Two groups of six arms and four senders, an arm
 /// keeping a tenth of its value for each arm of its group chosen before it.
 /// Valuing every arm of the group after every pick asks 18 times
@@ -663,7 +668,7 @@ fn the_lazy_fill_values_an_arm_only_when_it_may_be_chosen() {
     cands.extend((0..6).map(|i| cand(6 + i, 2, 50.0 - f64::from(i), 1)));
     // And one arm of the first group worth almost nothing beside the others.
     cands.push(cand(12, 1, 0.001, 1));
-    let count = |f: &dyn Fn(&[Candidate], &mut dyn FnMut(&Candidate, &[usize]) -> f64) -> Vec<usize>| {
+    let count = |f: Fill| {
         let mut asked = Vec::new();
         let chosen = f(&cands, &mut |c, before| {
             asked.push(c.key.0);
