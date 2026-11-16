@@ -519,6 +519,49 @@ pub fn compose_dynamic_fee(
     })
 }
 
+/// R44: `DynamicSwapFeeHook`'s `ZERO_FEE_INDICATOR`: "the tick spacing's fee,
+/// flat". Not the old module's 420, which means free.
+const HOOK_FLAT_FEE: u128 = 0x00ff_ffff;
+
+/// R44: one pool's fee regime from the swap hook's `dynamicFeeConfig(pool)`
+/// (Slipstream's third factory, `0x9cb2…`; `DynamicSwapFeeHook`, read in full
+/// 2026-11-16), by the hook's own rules. They are [`compose_dynamic_fee`]'s
+/// but for the indicator: a base of `type(uint24).max` is the spacing's fee
+/// and nothing else, initial fee or not; as an initial fee it is the
+/// spacing's. The hook's discount is keyed on the swap's caller, and no
+/// address of ours is registered for one; its MEV tax is not here, and a pool
+/// whose tax is switched on is refused where this is read.
+pub fn compose_hook_fee(
+    config: &[u8],
+    defaults: ModuleDefaults,
+    spacing_fee: Option<u128>,
+) -> Result<DynamicFee, &'static str> {
+    let word = |w: usize, bits: u32| abi::word_uint(config, w, bits).ok_or("dynamicFeeConfig");
+    let (base, cap, k, on, initial) = (word(0, 24)?, word(1, 24)?, word(2, 64)?, word(3, 1)?, word(4, 24)?);
+    let n = |v: u128| u32::try_from(v).map_err(|_| "dynamicFeeConfig");
+    let seconds_ago = u32::try_from(defaults.seconds_ago).map_err(|_| "secondsAgo")?;
+    if base == HOOK_FLAT_FEE {
+        let flat = n(spacing_fee.ok_or("tickSpacingToFee")?)?;
+        return Ok(DynamicFee { base: flat, cap: flat, scaling: 0, initial: None, seconds_ago, twap_tick: None });
+    }
+    let base = if base != 0 { base } else { spacing_fee.ok_or("tickSpacingToFee")? };
+    let (k, cap) = if k != 0 { (k, cap) } else { (defaults.scaling, defaults.cap) };
+    let initial = match (on == 1, initial) {
+        (false, _) => None,
+        (true, 0) => Some(base),
+        (true, HOOK_FLAT_FEE) => Some(spacing_fee.ok_or("tickSpacingToFee")?),
+        (true, x) => Some(x),
+    };
+    Ok(DynamicFee {
+        base: n(base)?,
+        cap: n(cap)?,
+        scaling: u64::try_from(k).map_err(|_| "dynamicFeeConfig")?,
+        initial: initial.map(n).transpose()?,
+        seconds_ago,
+        twap_tick: None,
+    })
+}
+
 /// Each Slipstream pool's fee regime at `block`, or which read failed.
 ///
 /// Three rounds, because each names what the next reads: the factory's fee

@@ -11,7 +11,7 @@ use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::live::abi;
-use apex_runtime::live::book::{compose_dynamic_fee, DynamicFee, ModuleDefaults, PoolBook, PoolSnapshot};
+use apex_runtime::live::book::{compose_dynamic_fee, compose_hook_fee, DynamicFee, ModuleDefaults, PoolBook, PoolSnapshot};
 use apex_runtime::live::frontier::WETH;
 use apex_runtime::live::inventory::{PoolSpec, Venue};
 use apex_types::state::ReconstructionStatus;
@@ -214,4 +214,65 @@ fn the_book_prices_slipstream_by_its_tick() {
 
     book.apply_swap(UNI, sqrt(-197_500), 1_400_000_000_000_000_000, -197_500, (103, 0));
     assert_eq!(book.get(UNI).unwrap().state.fee_ppm, 500, "a fixed fee stays fixed");
+}
+
+// ------------------------------------------------------------- R44: the swap hook's fee
+
+/// The hook's `ZERO_FEE_INDICATOR`: `type(uint24).max`.
+const FLAT: u32 = 0x00ff_ffff;
+const HOOK_DEFAULTS: ModuleDefaults = ModuleDefaults { scaling: 0, cap: 50_000, seconds_ago: 600 };
+
+/// R44: `DynamicSwapFeeHook`'s rules (Slipstream's third factory, `0x9cb2…`),
+/// each one. They are the old module's but for its indicator: there it is 420
+/// and means free; here it is `type(uint24).max` and means the tick spacing's
+/// fee, flat, whatever else the pool is configured with. An unset base is the
+/// spacing's; an unset scaling takes the default scaling *and* cap; an initial
+/// fee of nothing is the base, and of the indicator the spacing's.
+#[test]
+fn the_hooks_rules() {
+    let compose = |c: Vec<u8>| compose_hook_fee(&c, HOOK_DEFAULTS, Some(3_000)).unwrap();
+    // As configured: WETH/USDC at spacing 50 on 2026-11-16.
+    let d = compose(config(220, 7_500, 32_200_000, false, 0));
+    assert_eq!((d.base, d.cap, d.scaling, d.initial, d.seconds_ago), (220, 7_500, 32_200_000, None, 600));
+    // An unset base is the spacing's fee, and needs it.
+    assert_eq!(compose(config(0, 7_500, 1, false, 0)).base, 3_000);
+    assert_eq!(compose_hook_fee(&config(0, 7_500, 1, false, 0), HOOK_DEFAULTS, None), Err("tickSpacingToFee"));
+    // An unset scaling takes the defaults for both: the pool's own cap is not read.
+    let unset = compose(config(220, 7_500, 0, false, 0));
+    assert_eq!((unset.scaling, unset.cap), (0, 50_000));
+    // The indicator: the spacing's fee and nothing else, an initial fee included.
+    let flat = compose(config(FLAT, 7_500, 32_200_000, true, 150));
+    assert_eq!((flat.base, flat.cap, flat.scaling, flat.initial), (3_000, 3_000, 0, None));
+    assert_eq!((flat.after_first(-5_000), flat.first_in_block(-5_000)), (3_000, 3_000));
+    // It is not the old module's 420, which here is a base fee like any other.
+    assert_eq!(compose(config(420, 7_500, 1, false, 0)).base, 420);
+    // An initial fee: nothing set is the base, the indicator the spacing's, else its own.
+    assert_eq!(compose(config(220, 7_500, 1, true, 0)).initial, Some(220));
+    assert_eq!(compose(config(0, 7_500, 1, true, 0)).initial, Some(3_000), "the base the pool ends up with");
+    assert_eq!(compose(config(220, 7_500, 1, true, FLAT)).initial, Some(3_000));
+    assert_eq!(compose(config(220, 7_500, 1, true, 90)).initial, Some(90));
+    assert_eq!(compose(config(220, 7_500, 1, false, 90)).initial, None, "not enabled");
+    assert_eq!(compose_hook_fee(&[0u8; 31], HOOK_DEFAULTS, Some(3_000)), Err("dynamicFeeConfig"));
+}
+
+/// R44: the model is the hook's `fee()`, on twelve Base blocks in which the
+/// pool had not yet swapped (58,230,447 to 58,230,468, 2026-11-16): three
+/// pools, each `(base, cap, K)` as configured, its tick and ten-minute TWAP
+/// as read, and the fee the pool answered.
+#[test]
+fn the_hook_model_reproduces_twelve_sampled_blocks() {
+    let sampled: [((u32, u32, u64), [(i32, i32, u32); 4]); 3] = [
+        // WETH/USDC, spacing 50.
+        ((220, 7_500, 32_200_000), [(-201_354, -201_351, 316), (-201_354, -201_351, 316), (-201_355, -201_351, 348), (-201_357, -201_351, 413)]),
+        // WETH/cbBTC, spacing 10.
+        ((250, 50_000, 100_000_000), [(-266_013, -266_011, 450), (-266_013, -266_011, 450), (-266_013, -266_011, 450), (-266_013, -266_011, 450)]),
+        // USDC/cbBTC, spacing 100.
+        ((400, 50_000, 12_000_000), [(-64_661, -64_664, 436), (-64_661, -64_664, 436), (-64_659, -64_664, 460), (-64_659, -64_664, 460)]),
+    ];
+    for ((base, cap, k), rows) in sampled {
+        let d = compose_hook_fee(&config(base, cap, k, false, 0), HOOK_DEFAULTS, Some(3_000)).unwrap();
+        for (tick, twap, fee) in rows {
+            assert_eq!(DynamicFee { twap_tick: Some(twap), ..d }.after_first(tick), fee, "base {base}, tick {tick}, TWAP {twap}");
+        }
+    }
 }
