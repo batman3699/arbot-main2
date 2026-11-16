@@ -196,3 +196,56 @@ fn where_a_sized_pass_spends_its_time() {
         }
     }
 }
+
+/// R43.3: the host's shape: many routes sharing each trigger pool. Seven pools
+/// of one pair are 42 cycles and 84 slots, each pool the trigger of twelve in
+/// each direction. After R43.2 the host's pass still took 35 ms (it had been
+/// 45) while pricing two or three slots: the time was in choosing, not
+/// pricing, which the four-pool measurement above could not show. A pass with
+/// nothing stale here: 12.1 ms valuing every arm of a group after every pick,
+/// 2.4 ms valuing an arm only when it may be chosen.
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn where_a_pass_spends_its_time_when_routes_share_triggers() {
+    let venues = [Venue::UniswapV3, Venue::PancakeV3, Venue::Slipstream, Venue::SlipstreamV3, Venue::UniswapV3, Venue::PancakeV3, Venue::Slipstream];
+    let fees = [500, 100, 400, 300, 3000, 500, 100];
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> = (0..7u8)
+        .map(|i| pool(0xa0 + i, venues[usize::from(i)], -197_350 + i32::from(i), fees[usize::from(i)], 1_000))
+        .map(|p| (p.spec.pool, Arc::new(p)))
+        .collect();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    for (label, tiers) in [("no tiers", Vec::new()), ("two tiers", tiers())] {
+        let settings = SizedSettings {
+            max_senders: 24,
+            window_s: 10,
+            block_time_ms: 200,
+            band_cap_bps: 20,
+            liquidity_floor_bps: 9_800,
+            tier2_multiple: 10,
+            executor3: Address::repeat_byte(0xe3),
+            chain_id: 8453,
+            max_size_wei: 5 * 10u128.pow(18),
+            max_size_usdc: 12_000_000_000,
+            max_priority_wei_per_gas: 20_000_000_000,
+            min_net_wei: 1,
+            max_steps: 8,
+            p_no_trade_ppm: 20_000,
+            p_revert_ppm: 3_100,
+            reprice_for: Duration::MAX,
+            workers: 1,
+            l1_fee_bound_wei: 1_000_000_000_000,
+            tiers,
+            reserve: Reserve::NoTrade,
+            ordinary_budget_wei: 10_000_000_000_000_000,
+        };
+        let e = SizedEngine::new(cycles.clone(), settings, BTreeSet::new());
+        let t = Instant::now();
+        let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, 100_000_000_000_000_000, 1_500_000_000);
+        eprintln!("{label}: first pass, {} slots: {:?}, {} lines", 2 * cycles.len(), t.elapsed(), lines.len());
+        let mut now = 1u64;
+        timed(&format!("{label}: a pass with nothing stale"), 20, || {
+            now += 50_000_000;
+            e.tick(&snap, 1_000, 300_000, &px(), now, 100_000_000_000_000_000, 1_500_000_000)
+        });
+    }
+}

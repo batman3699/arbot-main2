@@ -238,7 +238,7 @@ pub fn fill_spike(cands: &[Candidate], senders: &[usize], budget_wei: u128) -> V
 /// `marginal(candidate, chosen in its group)`. It stops at no positive value,
 /// or when senders or budget run out. Every arm holds a sender for one window,
 /// so sender-time needs no term of its own. R43: a spike tier's candidate is
-/// never chosen here: its senders are [`fill_spike`]'s.
+/// never chosen here, nor valued: its senders are [`fill_spike`]'s.
 pub fn fill(
     cands: &[Candidate],
     senders: usize,
@@ -246,6 +246,15 @@ pub fn fill(
     mut marginal: impl FnMut(&Candidate, &[usize]) -> f64,
 ) -> Vec<usize> {
     let mut value: Vec<f64> = cands.iter().map(|c| c.ev).collect();
+    // How many of its group were chosen when each arm was last valued: its
+    // own value to begin with, valued again only when it is about to be
+    // chosen (R43.3). An arm is worth no more once another of its group is
+    // armed, so a value from before a pick is at least what it is after: the
+    // best by such values, once its own is current, is the best there is.
+    // Valuing every arm of the group after every pick asked the same
+    // question some twelve times as often, each time a trade replayed.
+    let mut valued_at: Vec<usize> = vec![0; cands.len()];
+    let mut picked: BTreeMap<(Address, bool), Vec<usize>> = BTreeMap::new();
     let mut chosen: Vec<usize> = Vec::new();
     let mut left = budget_wei;
     let density = |v: f64, c: &Candidate| v / (1.0 / senders.max(1) as f64 + c.worst_wei as f64 / budget_wei.max(1) as f64);
@@ -254,17 +263,16 @@ pub fn fill(
             .filter(|i| cands[*i].key.2 < SPIKE_TIER_BASE && !chosen.contains(i) && value[*i] > 0.0 && cands[*i].worst_wei <= left)
             .max_by(|a, b| density(value[*a], &cands[*a]).total_cmp(&density(value[*b], &cands[*b])).then(b.cmp(a)));
         let Some(i) = best else { break };
+        let in_group = picked.entry(cands[i].group).or_default();
+        if valued_at[i] != in_group.len() {
+            // Valued before its group's last pick: again, and the choice again.
+            value[i] = marginal(&cands[i], in_group);
+            valued_at[i] = in_group.len();
+            continue;
+        }
+        in_group.push(i);
         chosen.push(i);
         left -= cands[i].worst_wei;
-        let group = cands[i].group;
-        let in_group: Vec<usize> = chosen.iter().copied().filter(|j| cands[*j].group == group).collect();
-        for j in 0..cands.len() {
-            // R43.2: only what this fill can choose: a spike arm's value is
-            // not read here, and costs the most to find.
-            if cands[j].group == group && cands[j].key.2 < SPIKE_TIER_BASE && !chosen.contains(&j) {
-                value[j] = marginal(&cands[j], &in_group);
-            }
-        }
     }
     chosen
 }
@@ -320,6 +328,10 @@ pub struct SizedEngine {
     priced: AtomicU64,
     armable: AtomicU64,
     last_tick_us: AtomicU64,
+    /// R43.3: the last pass's two parts: pricing its stale slots, and
+    /// choosing among the candidates.
+    last_price_us: AtomicU64,
+    last_fill_us: AtomicU64,
 }
 
 impl SizedEngine {
@@ -345,6 +357,8 @@ impl SizedEngine {
             priced: AtomicU64::new(0),
             armable: AtomicU64::new(0),
             last_tick_us: AtomicU64::new(0),
+            last_price_us: AtomicU64::new(0),
+            last_fill_us: AtomicU64::new(0),
         }
     }
 
@@ -386,6 +400,8 @@ impl SizedEngine {
             slots_armable: self.armable.load(Relaxed),
             unarmable_pools: self.unarmable.len() as u64,
             last_tick_us: self.last_tick_us.load(Relaxed),
+            last_price_us: self.last_price_us.load(Relaxed),
+            last_fill_us: self.last_fill_us.load(Relaxed),
             ..EngineStats::default()
         }
     }
@@ -553,6 +569,9 @@ impl SizedEngine {
         };
         self.priced.fetch_add(done.len() as u64, Relaxed);
         st.priced.extend(done);
+        let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        let priced_in = started.elapsed();
+        self.last_price_us.store(micros(priced_in), Relaxed);
         self.armable.store(st.priced.values().filter(|p| !p.points.is_empty()).count() as u64, Relaxed);
 
         // Candidates: every point of every slot priced at this book.
@@ -595,6 +614,7 @@ impl SizedEngine {
             chosen
         };
 
+        self.last_fill_us.store(micros(started.elapsed().saturating_sub(priced_in)), Relaxed);
         for busy in &mut st.senders {
             if *busy <= head {
                 *busy = 0;

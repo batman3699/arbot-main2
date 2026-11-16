@@ -132,6 +132,10 @@ pub struct EngineStats {
     pub slots_armable: u64,
     pub unarmable_pools: u64,
     pub last_tick_us: u64,
+    /// R43.3: the sized engine's last pass, in its two parts: pricing its
+    /// stale slots, and choosing among the candidates. R39's engine: 0.
+    pub last_price_us: u64,
+    pub last_fill_us: u64,
     /// The slots the engine prices: each cycle, either pool the trigger.
     pub slots: u64,
     /// Of those, the slots priced at the book as the last pass saw it: the
@@ -264,6 +268,8 @@ impl Engine {
             slots_armable: self.armable.load(Relaxed),
             unarmable_pools: self.unarmable.len() as u64,
             last_tick_us: self.last_tick_us.load(Relaxed),
+            last_price_us: 0,
+            last_fill_us: 0,
             slots: self.slots,
             slots_current: self.current.load(Relaxed),
             stale_waiting: self.waiting.load(Relaxed),

@@ -578,3 +578,104 @@ fn the_ordinary_tiers_stay_inside_armeds_budget() {
     assert_eq!(armed.iter().filter(|a| a.rung >= SPIKE_TIER_BASE).count(), 2);
     assert_eq!(armed.iter().filter(|a| a.rung < SPIKE_TIER_BASE).count(), 3, "four could pay; armed's budget holds three worst cases");
 }
+
+// ------------------------------------------------------------- R43.3: the lazy fill
+
+/// The fill as it was before R43.3: after each pick, every unchosen arm of
+/// the pick's group is valued again.
+fn eager_fill(cands: &[Candidate], senders: usize, budget_wei: u128, mut marginal: impl FnMut(&Candidate, &[usize]) -> f64) -> Vec<usize> {
+    let mut value: Vec<f64> = cands.iter().map(|c| c.ev).collect();
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut left = budget_wei;
+    let density = |v: f64, c: &Candidate| v / (1.0 / senders.max(1) as f64 + c.worst_wei as f64 / budget_wei.max(1) as f64);
+    while chosen.len() < senders {
+        let best = (0..cands.len())
+            .filter(|i| cands[*i].key.2 < SPIKE_TIER_BASE && !chosen.contains(i) && value[*i] > 0.0 && cands[*i].worst_wei <= left)
+            .max_by(|a, b| density(value[*a], &cands[*a]).total_cmp(&density(value[*b], &cands[*b])).then(b.cmp(a)));
+        let Some(i) = best else { break };
+        chosen.push(i);
+        left -= cands[i].worst_wei;
+        let group = cands[i].group;
+        let in_group: Vec<usize> = chosen.iter().copied().filter(|j| cands[*j].group == group).collect();
+        for j in 0..cands.len() {
+            if cands[j].group == group && cands[j].key.2 < SPIKE_TIER_BASE && !chosen.contains(&j) {
+                value[j] = marginal(&cands[j], &in_group);
+            }
+        }
+    }
+    chosen
+}
+
+/// A book of candidates from a seed: a few groups, values and reservations
+/// that tie now and then, spike arms among them, and for each arm how much
+/// of its value each arm chosen before it in its group leaves.
+fn seeded(seed: u64, n: usize) -> (Vec<Candidate>, Vec<f64>) {
+    let mut x = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+    let mut next = |m: u64| {
+        x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (x >> 33) % m
+    };
+    let mut cands = Vec::new();
+    let mut keeps = Vec::new();
+    for i in 0..n {
+        let tier = [1u8, 1, 2, SPIKE_TIER_BASE][next(4) as usize];
+        cands.push(Candidate {
+            key: (route(i as u8), 0, tier),
+            group: (Address::repeat_byte(1 + next(4) as u8), next(2) == 0),
+            ev: next(6) as f64 - 1.0,
+            worst_wei: 1 + next(3) as u128 * 40,
+            rank: 0.0,
+        });
+        keeps.push([0.0, 0.3, 0.6, 0.9, 1.0][next(5) as usize]);
+    }
+    (cands, keeps)
+}
+
+/// R43.3: the fill values an arm again only when it is about to be chosen,
+/// and chooses what valuing every arm after every pick chose: the same arms
+/// in the same order, on 400 seeded books, for any senders and budget. It
+/// rests on what the engine's marginal is: an arm is worth no more once
+/// another of its group is armed.
+#[test]
+fn the_lazy_fill_chooses_what_the_eager_fill_chose() {
+    for seed in 0..400u64 {
+        let (cands, keeps) = seeded(seed, 6 + (seed % 30) as usize);
+        let worth = |c: &Candidate, before: &[usize]| {
+            let i = cands.iter().position(|x| x.key == c.key).unwrap();
+            c.ev * keeps[i].powi(before.len() as i32)
+        };
+        for (senders, budget) in [(1usize, 1_000u128), (4, 1_000), (16, 1_000), (16, 150), (3, 90)] {
+            assert_eq!(fill(&cands, senders, budget, worth), eager_fill(&cands, senders, budget, worth), "seed {seed}, {senders} senders, budget {budget}");
+        }
+    }
+}
+
+/// R43.3: and it asks less. Two groups of six arms and four senders, an arm
+/// keeping a tenth of its value for each arm of its group chosen before it.
+/// Valuing every arm of the group after every pick asks 18 times
+/// (5 + 5 + 4 + 4); the lazy fill does not value again what a pick left
+/// unreachable, the arms of the last group chosen from: 14. The saving grows
+/// with the spread of values inside a group: an arm far below the rest is
+/// never valued again at all.
+#[test]
+fn the_lazy_fill_values_an_arm_only_when_it_may_be_chosen() {
+    let mut cands: Vec<Candidate> = (0..6).map(|i| cand(i, 1, 100.0 - f64::from(i), 1)).collect();
+    cands.extend((0..6).map(|i| cand(6 + i, 2, 50.0 - f64::from(i), 1)));
+    // And one arm of the first group worth almost nothing beside the others.
+    cands.push(cand(12, 1, 0.001, 1));
+    let count = |f: &dyn Fn(&[Candidate], &mut dyn FnMut(&Candidate, &[usize]) -> f64) -> Vec<usize>| {
+        let mut asked = Vec::new();
+        let chosen = f(&cands, &mut |c, before| {
+            asked.push(c.key.0);
+            c.ev * 0.1f64.powi(before.len() as i32)
+        });
+        (chosen, asked)
+    };
+    let (eager, eager_asked) = count(&|c, m| eager_fill(c, 4, 1_000, m));
+    let (lazy, lazy_asked) = count(&|c, m| fill(c, 4, 1_000, m));
+    assert_eq!(lazy, eager);
+    assert_eq!(lazy, vec![0, 6, 1, 7]);
+    assert_eq!(eager_asked.len(), 6 + 5 + 5 + 4, "every arm of the group, the small one too, after every pick");
+    assert_eq!(lazy_asked.len(), 5 + 5 + 4);
+    assert!(!lazy_asked.contains(&route(12)), "the arm that can never reach the top is never valued again");
+}
