@@ -529,23 +529,41 @@ def offset_unit(has_flashblocks: bool, lo: int | None, fork: int | None) -> str:
 
 
 def _first_block_at_or_after(rpc: Any, head: int, timestamp: int) -> int:
-    """Binary-search the first Base block whose timestamp >= ``timestamp``.
+    """The first Base block whose timestamp >= ``timestamp``; ``head + 1``
+    when that is beyond the head.
 
-    Returns ``head + 1`` if the requested timestamp is beyond the current
-    head. This handles Denim's shorter block cadence without assuming a fixed
-    blocks-per-day constant.
+    The search works back from the head: one step of the distance at the
+    head's own cadence, doubled until a block before the time is found, then
+    halving between the two. It assumes no blocks-per-day constant (Denim
+    changed the cadence), and it reads nothing much older than the answer: a
+    public endpoint that prunes refuses an old block (2026-11-17: "pruned
+    history unavailable" under block 52,000,000), and a search that halves
+    from block 0 asks for one on its second read.
     """
-    low, high = 0, head + 1
+    def at(number: int) -> int:
+        block = rpc.call("eth_getBlockByNumber", [hex(number), False])
+        if not block or "timestamp" not in block:
+            raise RuntimeError(f"cannot read timestamp for block {number}")
+        return int(block["timestamp"], 16)
+
+    head_time = at(head)
+    if head_time < timestamp:
+        return head + 1
+    # `high` is always a block at or after the time.
+    high, low, step = head, 0, 1
+    reference = max(head - 1_000, 0)
+    elapsed = head_time - at(reference) if reference < head else 0
+    if elapsed > 0:
+        step = int((head_time - timestamp) * (head - reference) / elapsed * 1.02) + 16
+    while high > 0:
+        probe = max(high - step, 0)
+        if at(probe) < timestamp:
+            low = probe + 1
+            break
+        high, step = probe, step * 2
     while low < high:
         mid = (low + high) // 2
-        if mid > head:
-            high = mid
-            continue
-        block = rpc.call("eth_getBlockByNumber", [hex(mid), False])
-        if not block or "timestamp" not in block:
-            raise RuntimeError(f"cannot read timestamp for block {mid}")
-        observed = int(block["timestamp"], 16)
-        if observed >= timestamp:
+        if at(mid) >= timestamp:
             high = mid
         else:
             low = mid + 1

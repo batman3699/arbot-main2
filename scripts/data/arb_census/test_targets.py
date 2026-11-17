@@ -325,6 +325,52 @@ class UtcBlockRange(unittest.TestCase):
 
         self.assertEqual(T._utc_day_block_range(FakeRpc(), "1970-01-01"), (0, 0))
 
+    def test_a_days_first_block_is_found_without_reading_old_history(self):
+        # 2026-11-17: a public endpoint began refusing blocks under 52,000,000
+        # ("pruned history unavailable"), and a search that halves from block 0
+        # asks for block 43.8M on its second read: the daily census died there.
+        # A day's bounds are days back, so the search works back from the head.
+        class Pruned:
+            HEAD, FLOOR, FORK, FORK_TS = 58_400_000, 52_000_000, 57_000_000, 1_793_901_600
+
+            def __init__(self):
+                self.asked = []
+
+            def ts(self, n):
+                # 200 ms blocks from the fork on (five to a second), 2 s before it.
+                return self.FORK_TS + (n - self.FORK) // 5 if n >= self.FORK else self.FORK_TS - (self.FORK - n) * 2
+
+            def call(self, method, params):
+                assert method == "eth_getBlockByNumber"
+                n = int(params[0], 16)
+                self.asked.append(n)
+                if n < self.FLOOR:
+                    raise RuntimeError(f"pruned history unavailable: requested {n}, earliest available {self.FLOOR}")
+                return {"timestamp": hex(self.ts(n))}
+
+        def first(rpc, t):
+            lo, hi = 0, rpc.HEAD + 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                lo, hi = (lo, mid) if rpc.ts(mid) >= t else (mid + 1, hi)
+            return lo
+
+        for back_s in (1, 3_600, 86_400, 2 * 86_400, 6 * 86_400, 12 * 86_400):
+            rpc = Pruned()
+            t = rpc.ts(rpc.HEAD) - back_s
+            self.assertEqual(T._first_block_at_or_after(rpc, rpc.HEAD, t), first(rpc, t), back_s)
+            self.assertGreaterEqual(min(rpc.asked), rpc.FLOOR, back_s)
+            self.assertLess(len(rpc.asked), 60, back_s)
+        # Beyond the head, and the head's own second.
+        rpc = Pruned()
+        self.assertEqual(T._first_block_at_or_after(rpc, rpc.HEAD, rpc.ts(rpc.HEAD) + 1), rpc.HEAD + 1)
+        self.assertEqual(T._first_block_at_or_after(rpc, rpc.HEAD, rpc.ts(rpc.HEAD)), first(rpc, rpc.ts(rpc.HEAD)))
+        # A time before the chain began: block 0, as before.
+        class Young(Pruned):
+            HEAD, FLOOR, FORK = 1_000, 0, 0
+        rpc = Young()
+        self.assertEqual(T._first_block_at_or_after(rpc, rpc.HEAD, rpc.FORK_TS - 10), 0)
+
     def test_cache_is_rebuilt_when_offsets_are_not_block_deltas(self):
         data = {"arbs": [{"pools": ["pa", "pb"], "weth_in": "pa", "gain": [WETH],
                           "venues": ["uniswap_v3"], "hops": 2, "offset": 0,
