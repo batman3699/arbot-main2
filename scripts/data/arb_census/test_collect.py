@@ -23,6 +23,12 @@ class ResolverCacheTest(unittest.TestCase):
         self.assertEqual(meta["0x01"][2], "quickswap")
         self.assertEqual(meta["0x02"][2], f"factory:{UNNAMED_FACTORY}")
 
+    def test_slipstreams_third_factory_has_a_name(self):
+        # R44: 640 pools and 45% of Base's arbitrage value were `factory:0x9cb2...`.
+        from arb_census import venues as V
+        self.assertEqual(V.VENUE_OF_FACTORY["0x9cb220581b91b0c83223012fe69688b92ad07a76"], "slipstream_9cb2")
+        self.assertTrue(V.holds_at_emitter("slipstream_9cb2"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -745,3 +745,67 @@ While the keyed provider is out, the report's `rpc` and the journal's
 "rotating" and "websocket session ended" lines name the endpoint in use. The
 canary's own sends go to `rpc.http[0]` and the sequencer, never to a
 fallback.
+
+## 7. R44: Slipstream's third factory
+
+Aerodrome's third Slipstream factory, `0x9CB220581b91b0C83223012FE69688b92aD07a76`
+(641 pools on 2026-11-17), held 45% of Base's arbitrage value in the
+2026-11-10 audit, and none of its pools were in the book. They are Slipstream
+pools to their caller, so every lean executor trades them as deployed
+(`test/fork/LeanExecutor2HookFork.t.sol`, `LeanExecutor3HookFork.t.sol`); what
+differs is the fee, which comes from a swap hook:
+
+- the fee is fixed for a block by the pool's first swap of that block, at the
+  tick the pool stood at before it: `min(base + |tick − TWAP| × K / 1e6, cap)`,
+  the TWAP over ten minutes and **rounded down** (the older factories' module
+  truncates);
+- a backrun behind a trigger on the pool pays the trigger's fee, not the fee of
+  where the trigger left the price; the book keeps it (`triggered`);
+- the hook can add a tax that grows with the transaction's priority fee. Its
+  parameters are zero today. The boot refuses a pool whose tax module charges
+  anything ("mev tax"), and a pool whose hook is not the reviewed
+  `DynamicSwapFeeHook` at `0xC0ed888AfE87ed1AcF01D9f19bB850159e3ce434`
+  ("swap hook"): the refusals are in the boot's `refused` list.
+
+### a. The switch: the venue's inventory
+
+The venue is off until `data/base/aerodrome_slipstream_hook/pools.jsonl`
+exists. Without the file the runtime loads none of its pools, the daily
+census targets no route through one, and `target_pools.py` is never asked for
+one. With it, **every lane that is running trades the venue**, the live armed
+lane included: placing the file on the host is the decision.
+
+Build it from the factory (WETH pools of the census's tokens; nothing scraped):
+
+```
+$ BASE_RPC_URL=https://base-rpc.publicnode.com,https://base.drpc.org \
+    scripts/data/refresh_weth_pools.py --only aerodrome_slipstream_hook --out /tmp/r44   # review
+$ BASE_RPC_URL=... scripts/data/refresh_weth_pools.py --only aerodrome_slipstream_hook --write
+```
+
+`ops/host/deploy.sh` packs the file when it is there, and says so when it is
+not. USDC pairs and pools under the floor arrive as the census targets them
+(`target_pools.py`, daily, once the venue is on).
+
+### b. After switching it on
+
+- The boot line's `pools=` and `admitted=` rise together, and `refused` names
+  no hooked pool for "swap hook" or "mev tax".
+- Against the chain, from the operator's machine (public endpoints): the
+  eight deepest pools load and the book's fee is the fee each pool answers.
+
+  ```
+  $ cargo test -j 3 -p apex-runtime --test live_book -- --ignored --nocapture the_third_factorys
+  ```
+
+- The first census after it (`apex-targets`, daily) may target its routes;
+  `targets.json` then names pools of the factory, and the armed report's arms
+  name the venue `SlipstreamHook`.
+
+### c. Switching it off
+
+Remove the file on the host and restart `apex-canary`: the venue loads
+nothing, and the next census drops its routes. If the tax module's
+parameters are ever set, the boot refuses the venue's pools by itself; what
+it cannot see is a parameter set between boots, so a "mev tax" refusal at a
+restart is the cue to leave the venue off until the book prices the tax.

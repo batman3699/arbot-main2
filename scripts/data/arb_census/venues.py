@@ -50,6 +50,8 @@ VENUE_OF_FACTORY = {
     "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865": "pancakeswap_v3",
     "0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a": "slipstream_5e7b",
     "0xf8f2eb4940cfe7d13603dddd87f123820fc061ef": "slipstream_f8f2",
+    # R44: Slipstream's third factory (fee from a swap hook).
+    "0x9cb220581b91b0c83223012fe69688b92ad07a76": "slipstream_9cb2",
     "0xade65c38cd4849adba595a4323a8c7ddfe89716a": "cl_ade6",
     "0x8909dc15e40173ff4699343b6eb8132c65e18ec6": "uniswap_v2",
     "0x420dd381b31aef6683db6b902084cb0ffece40da": "aerodrome_v2",
@@ -59,7 +61,7 @@ VENUE_OF_FACTORY = {
 }
 # Venues whose tokens sit at the address that emits the trade event, so a
 # trade's tokens move to and from that address by Transfer.
-HOLDS_AT_EMITTER = frozenset({"uniswap_v3", "pancakeswap_v3", "slipstream_5e7b", "slipstream_f8f2", "cl_ade6",
+HOLDS_AT_EMITTER = frozenset({"uniswap_v3", "pancakeswap_v3", "slipstream_5e7b", "slipstream_f8f2", "slipstream_9cb2", "cl_ade6",
                               "uniswap_v2", "aerodrome_v2", "maverick_v2", "curve", "metric", "quickswap",
                               "quickswap_v2"})
 

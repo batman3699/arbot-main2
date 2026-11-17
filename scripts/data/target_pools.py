@@ -8,7 +8,7 @@ depth is enough.
 
 Each record is read from the pool itself (factory, token0, token1, and its
 tier: fee, tick spacing or curve) and is kept only when the factory is one
-of our five venues' and its own `getPool` names this pool: a contract that
+of our six venues' and its own `getPool` names this pool: a contract that
 claims a factory it was not made by is refused. Its depth is its hub side,
 as R30's records carry it: its USDC, or its WETH at the WETH/USDC pool's
 price, with `hub_symbol` (every record must rank in the legacy loader).
@@ -33,6 +33,9 @@ FACTORIES = {
     "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865": ("pancakeswap_v3", "fee"),
     "0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a": ("aerodrome_slipstream", "spacing"),
     "0xf8f2eb4940cfe7d13603dddd87f123820fc061ef": ("aerodrome_slipstream_v3", "spacing"),
+    # R44: Slipstream's third factory. The census targets a route through it
+    # only while its inventory is on the host (arb_census.targets.venues_for).
+    "0x9cb220581b91b0c83223012fe69688b92ad07a76": ("aerodrome_slipstream_hook", "spacing"),
     "0x420dd381b31aef6683db6b902084cb0ffece40da": ("aerodrome_v2", "stable"),
 }
 WETH = "0x4200000000000000000000000000000000000006"

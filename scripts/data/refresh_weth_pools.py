@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""refresh_weth_pools.py -- find every WETH pool our five venues hold for the
+"""refresh_weth_pools.py -- find every WETH pool our six venues hold for the
 tokens Base's arbitrage trades, measure each on chain, and merge them into the
 inventories (Task 8.5 R30).
 
@@ -34,7 +34,7 @@ first. Each inventory is backed up before it is rewritten.
 The RPC endpoint comes from BASE_RPC_URL (comma-separated for several) and is
 never printed. Use public endpoints: the canary's key is the canary's.
 
-Usage: BASE_RPC_URL=... scripts/data/refresh_weth_pools.py [--block N] [--out DIR | --write]
+Usage: BASE_RPC_URL=... scripts/data/refresh_weth_pools.py [--block N] [--only VENUE] [--out DIR | --write]
 """
 import argparse
 import collections
@@ -55,7 +55,10 @@ WETH = "0x4200000000000000000000000000000000000006"
 USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 WETH_USDC_UNI = "0xd0b53d9277642d899df5c87a3966a349a798f224"
 MULTICALL3 = "0xca11bde05977b3631167028862be2a173976ca11"
-CENSUS_VENUES = {"uniswap_v3", "pancakeswap_v3", "slipstream_5e7b", "slipstream_f8f2", "aerodrome_v2"}
+# R44: Slipstream's third factory, as the census names it and as a day
+# collected before it had a name does.
+CENSUS_VENUES = {"uniswap_v3", "pancakeswap_v3", "slipstream_5e7b", "slipstream_f8f2", "aerodrome_v2",
+                 "slipstream_9cb2", "factory:0x9cb220581b91b0c83223012fe69688b92ad07a76"}
 
 # Each inventory directory: its factory, how a pool is asked for, and the
 # tiers it is asked at (fee tiers; Slipstream's tick spacings are read from
@@ -65,6 +68,11 @@ VENUES = {
     "pancakeswap_v3": dict(factory="0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865", kind="fee", tiers=[100, 500, 2500]),
     "aerodrome_slipstream": dict(factory="0x5e7bb104d84c7cb9b682aac2f3d509f5f406809a", kind="spacing", tiers=None),
     "aerodrome_slipstream_v3": dict(factory="0xf8f2eb4940cfe7d13603dddd87f123820fc061ef", kind="spacing", tiers=None),
+    # R44: the third Slipstream factory, whose pools take their fee from a
+    # swap hook. Its inventory file is the venue's switch in the runtime
+    # (live::inventory::load), so it may be absent here, and is written only
+    # with pools in it.
+    "aerodrome_slipstream_hook": dict(factory="0x9cb220581b91b0c83223012fe69688b92ad07a76", kind="spacing", tiers=None),
     "aerodrome_v2": dict(factory="0x420dd381b31aef6683db6b902084cb0ffece40da", kind="volatile", tiers=[None]),
 }
 
@@ -298,9 +306,10 @@ def tick_spacings(rpc, factory, block):
     return [as_int(raw[64 + 32 * i:96 + 32 * i], signed=True) for i in range(n)]
 
 
-def discover(rpc, tokens, block):
+def discover(rpc, tokens, block, venues=None):
     found = []
-    for venue, v in VENUES.items():
+    for venue in venues or VENUES:
+        v = VENUES[venue]
         tiers = v["tiers"] if v["tiers"] is not None else tick_spacings(rpc, v["factory"], block)
         sel = {"fee": SEL["getPool_fee"], "spacing": SEL["getPool_spacing"], "volatile": SEL["getPool_stable"]}[v["kind"]]
         asks = [(t, tier) for t in tokens for tier in tiers]
@@ -349,9 +358,26 @@ def candidate_tokens(inventories):
     return sorted(toks)
 
 
-def read_inventory(venue):
-    path = BASE_DATA / venue / "pools.jsonl"
+def read_inventory(venue, root=BASE_DATA):
+    """A venue's records; none when it has no inventory yet."""
+    path = Path(root) / venue / "pools.jsonl"
+    if not path.exists():
+        return []
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def write_inventories(root, inventories: dict, stamp=None):
+    """Each venue's records to `root`/<venue>/pools.jsonl, the file there
+    backed up first when `stamp` is given. A venue with no file and no
+    records gets none: an empty inventory would switch it on with nothing."""
+    for venue, recs in inventories.items():
+        path = Path(root) / venue / "pools.jsonl"
+        if not recs and not path.exists():
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if stamp and path.exists():
+            shutil.copy2(path, path.with_name(f"pools.jsonl.bak-{stamp}"))
+        path.write_text("".join(json.dumps(r) + "\n" for r in recs))
 
 
 def main():
@@ -359,7 +385,9 @@ def main():
     ap.add_argument("--write", action="store_true", help="rewrite the inventories (backed up first)")
     ap.add_argument("--block", type=int, help="pin the reads to this block (default: the head less 5)")
     ap.add_argument("--out", help="write the merged inventories under this directory instead, for review")
+    ap.add_argument("--only", choices=sorted(VENUES), help="ask and rewrite this venue alone; the others stay as they are")
     a = ap.parse_args()
+    asked = [a.only] if a.only else list(VENUES)
     urls = [u.strip() for u in os.environ.get("BASE_RPC_URL", "").split(",")]
     if not any(urls):
         raise SystemExit("set BASE_RPC_URL")
@@ -369,9 +397,9 @@ def main():
     tokens = candidate_tokens(before)
     eth_usd = eth_usd_at(rpc, block)
     print(f"block {block}: ETH ${eth_usd:,.2f}; {len(tokens)} candidate tokens", file=sys.stderr)
-    found = discover(rpc, tokens, block)
-    after, report = {}, {}
-    for v in VENUES:
+    found = discover(rpc, tokens, block, asked)
+    after, report = dict(before), {}
+    for v in asked:
         after[v], s = merge(before[v], [f for f in found if f.venue == v], eth_usd, block)
         report[v] = dataclasses.asdict(s)
     p0, c0 = universe(before, 3000, 100_000)
@@ -382,17 +410,11 @@ def main():
                       "universe": {"before": {"pools": len(p0), "cycles": c0}, "after": {"pools": len(p1), "cycles": c1},
                                    "added": added, "dropped": dropped}}, indent=1))
     if a.out:
-        for v in VENUES:
-            path = Path(a.out) / v / "pools.jsonl"
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("".join(json.dumps(r) + "\n" for r in after[v]))
+        write_inventories(a.out, {v: after[v] for v in asked})
         print(f"merged inventories under {a.out}", file=sys.stderr)
     if a.write:
         stamp = time.strftime("%Y%m%dT%H%M%S")
-        for v in VENUES:
-            path = BASE_DATA / v / "pools.jsonl"
-            shutil.copy2(path, path.with_name(f"pools.jsonl.bak-{stamp}"))
-            path.write_text("".join(json.dumps(r) + "\n" for r in after[v]))
+        write_inventories(BASE_DATA, {v: after[v] for v in asked}, stamp=stamp)
         print(f"written; backups pools.jsonl.bak-{stamp}", file=sys.stderr)
 
 

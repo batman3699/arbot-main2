@@ -55,6 +55,27 @@ class Select(unittest.TestCase):
         self.assertEqual(T.route_start(usdc), USDC)
         self.assertEqual(T.route_start(arb()), WETH)
 
+    def test_slipstreams_third_factory_is_selected_only_with_its_inventory(self):
+        # R44: the venue's inventory file is its switch on the host; without
+        # it the engine cannot load the pool, and a route through it would
+        # only take a place among the targets. A day cached before the
+        # factory had a name calls it by its address.
+        named = arb(venues=("slipstream_9cb2", "uniswap_v3"))
+        unnamed = arb(venues=("factory:0x9cb220581b91b0c83223012fe69688b92ad07a76", "uniswap_v4"))
+        with tempfile.TemporaryDirectory() as d:
+            off = T.venues_for(Path(d))
+            self.assertEqual(off, T.VENUES)
+            self.assertFalse(T.select(named) or T.select(unnamed))
+            hook = Path(d) / "aerodrome_slipstream_hook"
+            hook.mkdir()
+            (hook / "pools.jsonl").write_text("{}\n")
+            on = T.venues_for(Path(d))
+        self.addCleanup(setattr, T, "VENUES", T.VENUES)
+        T.VENUES = on
+        self.assertTrue(T.select(named) and T.select(unnamed))
+        self.assertTrue(T.select(arb()), "and every venue it had")
+        self.assertFalse(T.select(arb(venues=("slipstream_9cb2", "balancer_v2"))))
+
     def test_a_usdc_route_without_start_in_is_skipped(self):
         # A cache from before R37: a WETH route falls back to `weth_in`; a
         # USDC route has nothing to fall back to, so it waits, unguessed.

@@ -37,6 +37,13 @@ class Records(unittest.TestCase):
         r = R.record(found(POOL_A, "aerodrome_slipstream_v3", 100, 400, 10**18), ETH_USD, block=52_800_123)
         self.assertEqual((r["fee"], r["fee_ppm_onchain"], r["fee_measured_block"]), (100, 400, 52_800_123))
 
+    def test_the_third_slipstream_factory_is_asked_as_slipstream_is(self):
+        # R44: factory 0x9cb2..., whose pools take their fee from a swap hook.
+        v = R.VENUES["aerodrome_slipstream_hook"]
+        self.assertEqual((v["factory"], v["kind"], v["tiers"]), ("0x9cb220581b91b0c83223012fe69688b92ad07a76", "spacing", None))
+        r = R.record(found(POOL_A, "aerodrome_slipstream_hook", 50, 316, 10**18), ETH_USD, block=58_230_447)
+        self.assertEqual((r["fee"], r["fee_ppm_onchain"], r["fee_measured_block"]), (50, 316, 58_230_447))
+
     def test_an_aerodrome_record_is_volatile_with_its_fee_in_basis_points(self):
         r = R.record(found(POOL_A, "aerodrome_v2", None, 3000, 10**18), ETH_USD, block=1)
         self.assertEqual((r["stable"], r["fee"], r["fee_ppm_onchain"]), (False, 30, 3000))
@@ -101,6 +108,39 @@ class Merge(unittest.TestCase):
             self.assertEqual(summary.updated, 1)
 
 
+class Files(unittest.TestCase):
+    """R44: the third Slipstream factory's inventory is its switch
+    (live::inventory::load skips the venue without the file), so it may be
+    absent, and is not made empty."""
+
+    def test_a_venue_without_an_inventory_file_holds_nothing(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "uniswap_v3").mkdir()
+            (root / "uniswap_v3" / "pools.jsonl").write_text(json.dumps({"pool": POOL_A}) + "\n")
+            self.assertEqual(R.read_inventory("uniswap_v3", root), [{"pool": POOL_A}])
+            self.assertEqual(R.read_inventory("aerodrome_slipstream_hook", root), [])
+
+    def test_an_inventory_is_written_over_a_backup_and_never_made_empty(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "uniswap_v3").mkdir()
+            (root / "uniswap_v3" / "pools.jsonl").write_text("old\n")
+            R.write_inventories(root, {"uniswap_v3": [{"pool": POOL_A}], "aerodrome_slipstream_hook": []}, stamp="S")
+            self.assertEqual((root / "uniswap_v3" / "pools.jsonl.bak-S").read_text(), "old\n")
+            self.assertEqual((root / "uniswap_v3" / "pools.jsonl").read_text(), json.dumps({"pool": POOL_A}) + "\n")
+            self.assertFalse((root / "aerodrome_slipstream_hook").exists(), "no pools: the venue stays off")
+            # Pools found: the file is made, with nothing to back up.
+            R.write_inventories(root, {"aerodrome_slipstream_hook": [{"pool": POOL_B}]}, stamp="T")
+            hook = root / "aerodrome_slipstream_hook"
+            self.assertEqual(sorted(x.name for x in hook.iterdir()), ["pools.jsonl"])
+            self.assertEqual(hook.joinpath("pools.jsonl").read_text(), json.dumps({"pool": POOL_B}) + "\n")
+
+
 class Universe(unittest.TestCase):
     """The runtime's rules: fee 1..max, depth >= min, Aerodrome volatile only, a
     Slipstream record only with a measured fee, then pairs of two or more pools,
@@ -118,13 +158,15 @@ class Universe(unittest.TestCase):
             "pancakeswap_v3": [rec("0xb1", TOK, 2500, 2500, 1e5)],
             "aerodrome_slipstream": [rec("0xc1", TOK, 100, None, 9e6), rec("0xc2", LOW, 100, 400, 9e6)],
             "aerodrome_slipstream_v3": [],
+            "aerodrome_slipstream_hook": [rec("0xe1", TOK, 50, None, 9e6), rec("0xe2", TOK, 50, 316, 9e6)],
             "aerodrome_v2": [rec("0xd1", TOK, 30, 3000, 9e6, stable=True), rec("0xd2", TOK, 30, 3000, 99_999.0, stable=False)],
         }
         pools, cycles = R.universe(inv, max_fee_ppm=3000, min_depth_usd=100_000)
         # TOK: 0xa1 and 0xb1 (0xa2's fee, 0xc1's unmeasured fee, 0xd1's curve and
         # 0xd2's depth leave them out); LOW: 0xa3 and 0xc2.
-        self.assertEqual(sorted(pools), ["0xa1", "0xa3", "0xb1", "0xc2"])
-        self.assertEqual(cycles, 4, "two directions for each of two pairs")
+        # R44: a hooked pool counts as a Slipstream one does, with a measured fee (0xe2).
+        self.assertEqual(sorted(pools), ["0xa1", "0xa3", "0xb1", "0xc2", "0xe2"])
+        self.assertEqual(cycles, 3 * 2 + 2, "TOK's three pools pair six ways, LOW's two two")
 
 
 if __name__ == "__main__":

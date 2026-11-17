@@ -28,6 +28,13 @@ if [[ -f data/base/uniswap_v4/pools.jsonl ]]; then
 else
   echo "deploy: no data/base/uniswap_v4/pools.jsonl: the host will load no v4 pool" >&2
 fi
+# R44: Slipstream's third factory (ARMED.md §7). Its inventory is the venue's
+# switch: without it the host loads none of its pools and targets none.
+if [[ -f data/base/aerodrome_slipstream_hook/pools.jsonl ]]; then
+  files+=("data/base/aerodrome_slipstream_hook/pools.jsonl")
+else
+  echo "deploy: no data/base/aerodrome_slipstream_hook/pools.jsonl: the host will load no pool of Slipstream's third factory" >&2
+fi
 mkdir -p dist
 rm -f dist/apex-*.tar.gz dist/data-base.tar.gz dist/MANIFEST.sha256 dist/REVISION dist/LeanExecutor2.runtime.hex dist/LeanExecutor3.runtime.hex
 # R37: LeanExecutor2's runtime code, which must hash to the revision's

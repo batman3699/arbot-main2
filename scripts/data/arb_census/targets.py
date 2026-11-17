@@ -49,6 +49,17 @@ SMALL_SAMPLE = 40
 # R37: the tokens a route may start in, and gain.
 STARTS = frozenset({WETH, USDC})
 VENUES = race.OURS | {race.V4}
+# R44: Slipstream's third factory, as the census names it and as a day cached
+# before it had a name does. Its routes are targets only while its inventory
+# is on the host: without that file the runtime loads none of its pools
+# (live::inventory::load), and a route through one would only take a place.
+HOOK_VENUES = frozenset({"slipstream_9cb2", "factory:0x9cb220581b91b0c83223012fe69688b92ad07a76"})
+HOOK_INVENTORY = Path("aerodrome_slipstream_hook") / "pools.jsonl"
+
+
+def venues_for(data: Path) -> frozenset:
+    """The venues a route may trade, given the inventories under `data`."""
+    return VENUES | HOOK_VENUES if (data / HOOK_INVENTORY).is_file() else VENUES
 
 
 def _normalise(value: Any) -> str | None:
@@ -768,7 +779,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--gaps", default=None, help="legacy R33 gaps path accepted for ops compatibility; not used by the R36 bid model")
     parser.add_argument("--live-ledger", required=True, help="Task 8 armed-live.jsonl path")
     parser.add_argument("--rate", type=float, default=6.0, help="RPC calls per second per endpoint")
+    parser.add_argument("--data", default="/opt/apex/data/base", help="the inventory root: which venues are switched on")
     args = parser.parse_args(argv)
+    global VENUES
+    VENUES = venues_for(Path(args.data))
 
     if args.days < 1:
         parser.error("--days must be >= 1")

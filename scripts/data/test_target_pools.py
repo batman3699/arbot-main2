@@ -86,6 +86,23 @@ class Records(unittest.TestCase):
         self.assertTrue(5_370 < hub[0] < 5_380, hub)
         self.assertIsNone(T.depth(chain({}), POOL, AXIS, "0x" + "44" * 20), "no hub token: no depth")
 
+    def test_a_pool_of_slipstreams_third_factory_gets_its_record(self):
+        # R44: WETH/USDC at spacing 50 on factory 0x9cb2..., its fee the hook's.
+        hook_factory = "0x9cb220581b91b0c83223012fe69688b92ad07a76"
+        weth, pool = T.WETH, "0x4a7af46bc8abc00048c6c7920a1488daf568366c"
+        answers = {
+            (pool, "0xc45a0155"): word(hook_factory),
+            (pool, "0x0dfe1681"): word(weth),
+            (pool, "0xd21220a7"): word(USDC),
+            (pool, "0xd0c93a7c"): word(50),
+            (pool, "0xddca3f43"): word(316),
+            (hook_factory, "0x28af8d0b" + word(weth)[2:] + word(USDC)[2:] + word(50)[2:]): word(pool),
+            (USDC, "0x70a08231" + word(pool)[2:]): word(1_000_000_000_000),
+        }
+        venue, rec = T.record_for(chain(answers), pool)
+        self.assertEqual(venue, "aerodrome_slipstream_hook")
+        self.assertEqual((rec["fee"], rec["fee_ppm_onchain"], rec["hub_symbol"], rec["targeted"]), (50, 316, "USDC", True))
+
     def test_a_pool_its_factory_does_not_name_is_refused(self):
         # A contract that answers factory() with ours, but is not its pool.
         self.assertEqual(T.record_for(chain(uni(named="0x" + "99" * 20)), POOL), (None, "not its factory's pool"))
