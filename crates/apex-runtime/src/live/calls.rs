@@ -143,7 +143,7 @@ pub fn lean3_hop(leg: &Leg, spacing: i32, cross_gas: u64) -> Result<apex_exec::l
     let (kind, pool, fee, tick_spacing) = match leg.venue {
         Venue::UniswapV3 => (Hop3Kind::UniswapV3, leg.pool, leg.fee_ppm, spacing),
         Venue::PancakeV3 => (Hop3Kind::PancakeV3, leg.pool, leg.fee_ppm, spacing),
-        Venue::Slipstream | Venue::SlipstreamV3 => (Hop3Kind::Slipstream, leg.pool, 0, spacing),
+        Venue::Slipstream | Venue::SlipstreamV3 | Venue::SlipstreamHook => (Hop3Kind::Slipstream, leg.pool, 0, spacing),
         Venue::AerodromeV2 => (Hop3Kind::AerodromeV2, leg.pool, 0, 0),
         Venue::UniswapV4 => {
             let k = leg.v4.ok_or_else(|| format!("the v4 pool {:#x} has no key", leg.pool))?;
@@ -156,7 +156,9 @@ pub fn lean3_hop(leg: &Leg, spacing: i32, cross_gas: u64) -> Result<apex_exec::l
 pub fn lean2_hop(leg: &Leg, quote: U256, min_out: U256) -> Result<apex_exec::lean2::Lean2Hop, String> {
     use apex_exec::lean2::{Hop2Kind, Lean2Hop, V4HopKey};
     let (kind, min_out, v4) = match leg.venue {
-        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => (Hop2Kind::UniswapV3Style, min_out, None),
+        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 | Venue::SlipstreamHook => {
+            (Hop2Kind::UniswapV3Style, min_out, None)
+        }
         Venue::PancakeV3 => (Hop2Kind::PancakeV3, min_out, None),
         Venue::AerodromeV2 => (Hop2Kind::AerodromeV2, quote, None),
         Venue::UniswapV4 => {
@@ -174,7 +176,7 @@ pub fn lean2_hop(leg: &Leg, quote: U256, min_out: U256) -> Result<apex_exec::lea
 /// asked for the hop's `quote`.
 pub fn lean_hop(leg: &Leg, quote: U256, min_out: U256) -> Result<LeanHop, String> {
     let (kind, min_out) = match leg.venue {
-        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => (HopKind::UniswapV3Style, min_out),
+        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 | Venue::SlipstreamHook => (HopKind::UniswapV3Style, min_out),
         Venue::PancakeV3 => (HopKind::PancakeV3, min_out),
         Venue::AerodromeV2 => (HopKind::AerodromeV2, quote),
         // v1's plan has no v4 hop: only LeanExecutor2 runs one (R37).

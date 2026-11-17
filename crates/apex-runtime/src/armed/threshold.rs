@@ -189,7 +189,7 @@ pub fn best_at(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, trigger
 }
 
 fn at(cycle: &Cycle, pair: &[Arc<PoolSnapshot>; 2], leg: usize, px: &Pricing, step: u32) -> Option<(Point, PoolSnapshot)> {
-    let moved = pair[leg].moved(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
+    let moved = pair[leg].triggered(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
     Some((best_at(cycle, pair, leg, moved.clone(), px)?, moved))
 }
 
@@ -345,7 +345,7 @@ pub fn net_at(
     terms: &super::plan::SizedTerms,
     bid_wei_per_gas: u128,
 ) -> Option<NetAt> {
-    let trigger = pair[leg].moved(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
+    let trigger = pair[leg].triggered(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
     let book = map_of(cycle, with(pair, leg, &trigger, other));
     let price = U256::from(px.costs.wei_per_gas.saturating_add(bid_wei_per_gas));
     let super::plan::SizedOutcome::Trade { gross, walked, size, .. } = super::plan::sized_trade(cycle, &book, terms, price, &px.gas)
@@ -482,7 +482,7 @@ fn arm_point(
 ) -> Option<SizedArmPoint> {
     let other = 1 - leg;
     let at = |s: u32| net_at(cycle, pair, leg, &pair[other], s, px, terms, bid.sent.per_gas);
-    let trigger = pair[leg].moved(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
+    let trigger = pair[leg].triggered(move_of(&pair[leg], trigger_up(cycle, leg), step))?;
     let mut grid = [(0u32, 0f64); 6];
     // The grid's first point is the threshold itself: its trade is priced once.
     let mut at_step = None;

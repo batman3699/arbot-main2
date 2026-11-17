@@ -45,6 +45,11 @@ pub enum Venue {
     /// pool and router code as the first, with its own pools, router and fee
     /// module (R22). Named after its inventory directory.
     SlipstreamV3,
+    /// Aerodrome's third Slipstream deployment, factory `0x9cb2…` (R44): the
+    /// pool swaps and calls back as the first two do, but its fee comes from
+    /// a swap hook and is fixed for a block by the block's first swap, and
+    /// its storage is laid out differently. Lean executors only.
+    SlipstreamHook,
     /// Aerodrome v2's volatile (x·y=k) pools, factory `0x420D…` (R24). Stable
     /// pools are refused.
     AerodromeV2,
@@ -54,8 +59,15 @@ pub enum Venue {
 }
 
 impl Venue {
-    pub const ALL: [Self; 6] =
-        [Self::UniswapV3, Self::Slipstream, Self::PancakeV3, Self::SlipstreamV3, Self::AerodromeV2, Self::UniswapV4];
+    pub const ALL: [Self; 7] = [
+        Self::UniswapV3,
+        Self::Slipstream,
+        Self::PancakeV3,
+        Self::SlipstreamV3,
+        Self::AerodromeV2,
+        Self::UniswapV4,
+        Self::SlipstreamHook,
+    ];
 
     pub const fn id(self) -> VenueId {
         match self {
@@ -63,9 +75,15 @@ impl Venue {
             Self::Slipstream => venue_ids::AERODROME_SLIPSTREAM,
             Self::PancakeV3 => venue_ids::PANCAKESWAP_V3,
             Self::SlipstreamV3 => venue_ids::AERODROME_SLIPSTREAM_V3,
+            Self::SlipstreamHook => venue_ids::AERODROME_SLIPSTREAM_HOOK,
             Self::AerodromeV2 => venue_ids::AERODROME_VOLATILE,
             Self::UniswapV4 => venue_ids::UNISWAP_V4,
         }
+    }
+
+    /// R44: the venue an arm's line names, as `{:?}` writes it.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| format!("{v:?}") == name)
     }
 
     /// The inventory directory under `data/base/`.
@@ -75,6 +93,7 @@ impl Venue {
             Self::Slipstream => "aerodrome_slipstream",
             Self::PancakeV3 => "pancakeswap_v3",
             Self::SlipstreamV3 => "aerodrome_slipstream_v3",
+            Self::SlipstreamHook => "aerodrome_slipstream_hook",
             Self::AerodromeV2 => "aerodrome_v2",
             Self::UniswapV4 => "uniswap_v4",
         }
@@ -92,6 +111,9 @@ impl Venue {
             Self::Slipstream => address!("5e7BB104d84c7CB9B682AaC2F3d509f5F406809A"),
             Self::PancakeV3 => address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"),
             Self::SlipstreamV3 => address!("f8f2eB4940CFE7d13603DDDD87f123820Fc061Ef"),
+            // R44: read from the chain 2026-11-16: 640 pools, each a clone of
+            // CLPool `0x1642634C…89f8`, whose `factory()` answers this.
+            Self::SlipstreamHook => address!("9CB220581b91b0C83223012FE69688b92aD07a76"),
             Self::AerodromeV2 => address!("420DD381b31aEf6683db6B902084cB0FFECe40Da"),
             // v4 has no factory: its pools live in PoolManager.
             Self::UniswapV4 => crate::live::v4::POOL_MANAGER,
@@ -106,6 +128,14 @@ impl Venue {
     /// A v4 pool's fee is static once admitted: a dynamic one is refused.
     pub const fn fee_is_static(self) -> bool {
         matches!(self, Self::UniswapV3 | Self::PancakeV3 | Self::AerodromeV2 | Self::UniswapV4)
+    }
+
+    /// R44: whether the venue fixes a pool's fee for a block at the block's
+    /// first swap: the third Slipstream factory's hook. A swap later in the
+    /// block, a backrun's, pays the fee of the tick the pool stood at before
+    /// the first, not of where that swap left it.
+    pub const fn fee_is_the_blocks(self) -> bool {
+        matches!(self, Self::SlipstreamHook)
     }
 
     /// A constant-product venue: reserves and a fee, no ticks (R24).
@@ -215,6 +245,11 @@ pub fn load(
             continue;
         }
         let path = data_dir.join(venue.dir()).join("pools.jsonl");
+        // R44: the hook factory's inventory is the venue's switch: while no
+        // file is there, the venue has no pools and nothing arms on it.
+        if venue == Venue::SlipstreamHook && !path.exists() {
+            continue;
+        }
         let shown = path.display().to_string();
         let text = std::fs::read_to_string(&path)
             .map_err(|e| InventoryError::Io { path: shown.clone(), detail: e.to_string() })?;

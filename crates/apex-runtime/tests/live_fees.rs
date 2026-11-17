@@ -261,7 +261,9 @@ fn the_hooks_rules() {
 /// as read, and the fee the pool answered.
 #[test]
 fn the_hook_model_reproduces_twelve_sampled_blocks() {
-    let sampled: [((u32, u32, u64), [(i32, i32, u32); 4]); 3] = [
+    // A pool's `(base, cap, K)`, and four blocks' `(tick, TWAP, fee)`.
+    type Pool = ((u32, u32, u64), [(i32, i32, u32); 4]);
+    let sampled: [Pool; 3] = [
         // WETH/USDC, spacing 50.
         ((220, 7_500, 32_200_000), [(-201_354, -201_351, 316), (-201_354, -201_351, 316), (-201_355, -201_351, 348), (-201_357, -201_351, 413)]),
         // WETH/cbBTC, spacing 10.
@@ -275,4 +277,66 @@ fn the_hook_model_reproduces_twelve_sampled_blocks() {
             assert_eq!(DynamicFee { twap_tick: Some(twap), ..d }.after_first(tick), fee, "base {base}, tick {tick}, TWAP {twap}");
         }
     }
+}
+
+/// R44: a hooked pool's fee is fixed for a block by the block's first swap,
+/// at the tick the pool stood at before it. A backrun follows the trigger in
+/// its block, so the pool as the trigger leaves it (`triggered`) still
+/// charges the fee of where it stood; on the older factories the module
+/// reads the tick at every swap, and the fee moves with it. A pool merely
+/// standing elsewhere when its block begins (`moved`: a band's edge) charges
+/// the fee of that tick on every venue.
+#[test]
+fn a_hooked_pool_a_trigger_moved_keeps_the_fee_of_where_it_stood() {
+    use apex_runtime::live::book::Move;
+    let regime = DynamicFee { base: 220, cap: 7_500, scaling: 32_200_000, initial: None, seconds_ago: 600, twap_tick: Some(-197_350) };
+    let book = PoolBook::from_snapshots(
+        [pool(SLIP, Venue::SlipstreamHook, -197_350, 1, Some(regime)), pool(UNI, Venue::Slipstream, -197_350, 1, Some(regime))],
+        ReconstructionStatus::Verified,
+    );
+    let (hooked, older) = (book.get(SLIP).unwrap(), book.get(UNI).unwrap());
+    assert_eq!((hooked.state.fee_ppm, older.state.fee_ppm), (220, 220), "at the TWAP: the base");
+    // A trigger moves each 40 ticks: 220 + 40 x 32.2 = 1,508 where the fee follows the tick.
+    let (h, o) = (hooked.triggered(Move::Tick(-197_310)).unwrap(), older.triggered(Move::Tick(-197_310)).unwrap());
+    assert_eq!((h.state.tick, o.state.tick), (-197_310, -197_310));
+    assert_eq!(o.state.fee_ppm, 1_508, "the module reads the tick at every swap");
+    assert_eq!(h.state.fee_ppm, 220, "the block's fee was set before the trigger moved it");
+    assert_eq!(h.state.sqrt_price_x96, o.state.sqrt_price_x96, "the same move, but for the fee");
+    // Standing there when the block begins: its first swap reads that tick.
+    assert_eq!(hooked.moved(Move::Tick(-197_310)).unwrap().state.fee_ppm, 1_508);
+    assert_eq!(older.moved(Move::Tick(-197_310)).unwrap().state.fee_ppm, 1_508);
+    // A swap the book applies is a later block's start: the fee is that tick's.
+    let sqrt = alloy_primitives::U256::from_be_bytes({
+        let mut b = [0u8; 32];
+        get_sqrt_ratio_at_tick(-197_310).unwrap().to_big_endian(&mut b);
+        b
+    });
+    book.apply_swap(SLIP, sqrt, 1_400_000_000_000_000_000, -197_310, (101, 0));
+    assert_eq!(book.get(SLIP).unwrap().state.fee_ppm, 1_508, "the next block's first swap reads the new tick");
+}
+
+/// R44: the evaluator rebuilds a fire's book from the parent block and the
+/// fire block's own swaps, and the book restates a fee from the tick at every
+/// swap. Within the block a hooked pool charges what its first swap found, so
+/// its fee is put back to the parent's; the older factory's stays the tick's.
+#[test]
+fn a_fire_blocks_replay_keeps_a_hooked_pools_fee() {
+    use apex_runtime::armed::run::keep_block_fees;
+    let regime = DynamicFee { base: 220, cap: 7_500, scaling: 32_200_000, initial: None, seconds_ago: 600, twap_tick: Some(-197_350) };
+    let book = PoolBook::from_snapshots(
+        [pool(SLIP, Venue::SlipstreamHook, -197_350, 1, Some(regime)), pool(UNI, Venue::Slipstream, -197_350, 1, Some(regime))],
+        ReconstructionStatus::Verified,
+    );
+    let parent = book.snapshot();
+    let sqrt = alloy_primitives::U256::from_be_bytes({
+        let mut b = [0u8; 32];
+        get_sqrt_ratio_at_tick(-197_310).unwrap().to_big_endian(&mut b);
+        b
+    });
+    for p in [SLIP, UNI] {
+        book.apply_swap(p, sqrt, 1_400_000_000_000_000_000, -197_310, (101, 0));
+    }
+    let kept = keep_block_fees(&parent, &book.snapshot());
+    assert_eq!((kept[&SLIP].state.tick, kept[&SLIP].state.fee_ppm), (-197_310, 220), "the trigger's price, the block's fee");
+    assert_eq!((kept[&UNI].state.tick, kept[&UNI].state.fee_ppm), (-197_310, 1_508));
 }

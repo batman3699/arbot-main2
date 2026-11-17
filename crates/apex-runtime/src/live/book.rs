@@ -138,6 +138,18 @@ impl PoolSnapshot {
         Some(next)
     }
 
+    /// R44: this pool as a swap earlier in the block being priced leaves it at
+    /// `to`: [`Self::moved`], but on a venue that fixes its fee for the block
+    /// at the block's first swap the fee stays the one of where the pool
+    /// stood. A trigger's move, and a trade replayed after it.
+    pub fn triggered(&self, to: Move) -> Option<Self> {
+        let mut next = self.moved(to)?;
+        if self.spec.venue.fee_is_the_blocks() {
+            next.state.fee_ppm = self.state.fee_ppm;
+        }
+        Some(next)
+    }
+
     /// R40.1: this pool after an exact-input swap of `amount_in`, by the book's
     /// own arithmetic: a constant-product pool's reserves exactly, a
     /// concentrated pool moved to the tick its quote ends at. None when the
@@ -159,7 +171,8 @@ impl PoolSnapshot {
         if q.exhausted {
             return None;
         }
-        self.moved(Move::Tick(apex_math::cl_math::get_tick_at_sqrt_ratio(q.sqrt_price_after)?))
+        // A swap inside the block: the block's fee, where the venue fixes one.
+        self.triggered(Move::Tick(apex_math::cl_math::get_tick_at_sqrt_ratio(q.sqrt_price_after)?))
     }
 
     /// Set the fee from the tick, for a pool whose fee is a function of it.
@@ -519,6 +532,12 @@ pub fn compose_dynamic_fee(
     })
 }
 
+/// R44: the swap hooks whose pools the book takes: `DynamicSwapFeeHook` at
+/// `0xC0ed…e434`, the third factory's default, whose source was read in full
+/// on 2026-11-16 (code hash `0x198b45ce…ecbd`). It is not a proxy, so the
+/// address is the code.
+pub const REVIEWED_SWAP_HOOKS: [Address; 1] = [alloy_primitives::address!("C0ed888AfE87ed1AcF01D9f19bB850159e3ce434")];
+
 /// R44: `DynamicSwapFeeHook`'s `ZERO_FEE_INDICATOR`: "the tick spacing's fee,
 /// flat". Not the old module's 420, which means free.
 const HOOK_FLAT_FEE: u128 = 0x00ff_ffff;
@@ -579,18 +598,41 @@ async fn read_dynamic_fees(
     if pools.is_empty() {
         return Ok(Vec::new());
     }
-    let factories: Vec<Address> =
-        pools.iter().map(|p| p.1).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-    let a = reads
-        .multicall(&factories.iter().map(|f| (*f, abi::call0(selector::SWAP_FEE_MODULE))).collect::<Vec<_>>(), block)
-        .await?;
-    let module: BTreeMap<Address, Address> = factories
+    // R44: the third factory names a swap hook for each pool; the older two a
+    // fee module for all of theirs.
+    let hook_factory = crate::live::inventory::Venue::SlipstreamHook.factory();
+    let factories: Vec<Address> = pools
         .iter()
-        .zip(a)
-        .filter_map(|(f, r)| Some((*f, abi::word_address(r.as_deref()?, 0)?)))
+        .map(|p| p.1)
+        .filter(|f| *f != hook_factory)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect();
+    let hooked: Vec<Address> = pools.iter().filter(|p| p.1 == hook_factory).map(|p| p.0).collect();
+    let mut first: Vec<(Address, Vec<u8>)> = factories.iter().map(|f| (*f, abi::call0(selector::SWAP_FEE_MODULE))).collect();
+    first.extend(hooked.iter().map(|p| (hook_factory, abi::call_address(selector::GET_POOL_SWAP_HOOK, *p))));
+    let a = reads.multicall(&first, block).await?;
+    let address_at = |i: usize| a[i].as_deref().and_then(|r| abi::word_address(r, 0));
+    let module: BTreeMap<Address, Address> =
+        factories.iter().enumerate().filter_map(|(i, f)| Some((*f, address_at(i)?))).collect();
+    // A hook other than the one that was read may charge anything: not taken.
+    let hook: BTreeMap<Address, Address> = hooked
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| Some((*p, address_at(factories.len() + i).filter(|h| REVIEWED_SWAP_HOOKS.contains(h))?)))
+        .collect();
+    // Where each pool's regime is read: its hook, or its factory's module.
+    let source = |pool: &Address, factory: &Address| -> Result<Address, &'static str> {
+        if *factory == hook_factory {
+            hook.get(pool).copied().ok_or("swap hook")
+        } else {
+            module.get(factory).copied().ok_or("swapFeeModule")
+        }
+    };
 
-    let modules: Vec<Address> = module.values().copied().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let modules: Vec<Address> =
+        module.values().chain(hook.values()).copied().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let hooks: Vec<Address> = hook.values().copied().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
     let mut calls = Vec::new();
     for m in &modules {
         calls.push((*m, abi::call0(selector::DEFAULT_SCALING_FACTOR)));
@@ -598,8 +640,12 @@ async fn read_dynamic_fees(
         calls.push((*m, abi::call0(selector::SECONDS_AGO)));
     }
     for (pool, factory, spacing, _) in pools {
-        calls.push((module.get(factory).copied().unwrap_or(Address::ZERO), abi::call_address(selector::DYNAMIC_FEE_CONFIG, *pool)));
+        calls.push((source(pool, factory).unwrap_or(Address::ZERO), abi::call_address(selector::DYNAMIC_FEE_CONFIG, *pool)));
         calls.push((*factory, abi::call_signed(selector::TICK_SPACING_TO_FEE, i64::from(*spacing))));
+    }
+    let tax_at = calls.len();
+    for h in &hooks {
+        calls.push((*h, abi::call0(selector::MEV_TAX_MODULE)));
     }
     let b = reads.multicall(&calls, block).await?;
     let uint = |i: usize, bits: u32| b[i].as_deref().and_then(|d| abi::word_uint(d, 0, bits));
@@ -618,17 +664,57 @@ async fn read_dynamic_fees(
         })
         .collect();
 
+    // R44: the hook adds its tax module's fee, which grows with the
+    // transaction's priority fee and which nothing here prices. It is nothing
+    // while the module's multiplier is zero (or there is no module); a hook
+    // whose tax is on, or cannot be read to be off, has its pools refused.
+    let tax_module: Vec<Option<Address>> =
+        (0..hooks.len()).map(|i| b[tax_at + i].as_deref().and_then(|r| abi::word_address(r, 0))).collect();
+    let asked: Vec<Address> = tax_module.iter().flatten().copied().filter(|m| *m != Address::ZERO).collect();
+    let multipliers = if asked.is_empty() {
+        Vec::new()
+    } else {
+        reads.multicall(&asked.iter().map(|m| (*m, abi::call0(selector::PRIORITY_FEE_MULTIPLIER))).collect::<Vec<_>>(), block).await?
+    };
+    let untaxed: std::collections::BTreeSet<Address> = hooks
+        .iter()
+        .zip(&tax_module)
+        .filter(|(_, m)| match m {
+            Some(m) if *m == Address::ZERO => true,
+            Some(m) => asked
+                .iter()
+                .position(|x| x == m)
+                .and_then(|i| multipliers[i].as_deref())
+                .and_then(|r| abi::word_uint(r, 0, 64))
+                == Some(0),
+            None => false,
+        })
+        .map(|(h, _)| *h)
+        .collect();
+
     let mut composed = Vec::with_capacity(pools.len());
     for (j, (pool, factory, _, cardinality)) in pools.iter().enumerate() {
         let at = 3 * modules.len() + 2 * j;
+        let by_hook = *factory == hook_factory;
         let fee = (|| {
-            let m = module.get(factory).ok_or("swapFeeModule")?;
-            let d = defaults.get(m).copied().flatten().ok_or("module defaults")?;
-            compose_dynamic_fee(b[at].as_deref().ok_or("dynamicFeeConfig")?, d, uint(at + 1, 24))
+            let m = source(pool, factory)?;
+            if by_hook && !untaxed.contains(&m) {
+                return Err("mev tax");
+            }
+            let d = defaults.get(&m).copied().flatten().ok_or("module defaults")?;
+            let config = b[at].as_deref().ok_or("dynamicFeeConfig")?;
+            if by_hook {
+                compose_hook_fee(config, d, uint(at + 1, 24))
+            } else {
+                compose_dynamic_fee(config, d, uint(at + 1, 24))
+            }
         })();
         // The module reads a TWAP only with the observations its window needs
         // (`MIN_SECONDS_AGO` = 2); a pool without them pays no dynamic fee.
-        let observable = |d: &DynamicFee| *cardinality >= u64::from(d.seconds_ago) / 2;
+        // R44: the hook has no such rule: it asks `observe`, and adds nothing
+        // when that reverts. A hooked pool with no scaling has nothing to add.
+        let observable =
+            |d: &DynamicFee| if by_hook { d.scaling != 0 } else { *cardinality >= u64::from(d.seconds_ago) / 2 };
         composed.push((*pool, fee.map(|d| (d, observable(&d)))));
     }
 

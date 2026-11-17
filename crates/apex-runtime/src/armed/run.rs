@@ -791,8 +791,32 @@ pub async fn book_after(
     if !unloaded.is_empty() {
         return Err("a pool did not load at the block's parent".into());
     }
+    let parent = book.snapshot();
     apply_through(&book, pools, block, tx_index, logs)?;
-    Ok(book.snapshot())
+    Ok(Arc::new(keep_block_fees(&parent, &book.snapshot())))
+}
+
+/// R44: `after`, the book once a block's writes are applied to `parent`, with
+/// each pool whose venue fixes its fee for the block charging what it charged
+/// at the block's start. The book states a fee from the tick on every write,
+/// which is the next block's fee: within the block, a hooked pool's is the
+/// one its first swap found, at the parent's tick. (Its TWAP is the parent
+/// block's, one block older than the one that swap read.)
+pub fn keep_block_fees(
+    parent: &BTreeMap<Address, Arc<crate::live::book::PoolSnapshot>>,
+    after: &BTreeMap<Address, Arc<crate::live::book::PoolSnapshot>>,
+) -> BTreeMap<Address, Arc<crate::live::book::PoolSnapshot>> {
+    after
+        .iter()
+        .map(|(a, p)| match parent.get(a) {
+            Some(was) if p.spec.venue.fee_is_the_blocks() && was.state.fee_ppm != p.state.fee_ppm => {
+                let mut kept = (**p).clone();
+                kept.state.fee_ppm = was.state.fee_ppm;
+                (*a, Arc::new(kept))
+            }
+            _ => (*a, Arc::clone(p)),
+        })
+        .collect()
 }
 
 /// `block`'s writes to `pools` through transaction `tx_index`, applied to

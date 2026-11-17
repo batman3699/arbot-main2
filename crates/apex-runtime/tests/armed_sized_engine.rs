@@ -273,7 +273,8 @@ fn spike_senders_follow_the_census_rank() {
 
 /// R43: what a pending sized arm holds of the day's budget. Here a spike arm
 /// bids 16.7 gwei: its gas limit at that is 0.0167 ETH, over a budget of
-/// 0.006; what an inclusion that does not trade costs is 0.0023, and two fit.
+/// 0.006; what an inclusion that does not trade costs on its route (R44:
+/// 81,700 gas through these two venues) is 0.0014, and two fit.
 #[test]
 fn a_no_trade_reservation_lets_a_spike_arm_into_a_small_budget() {
     let small = 6_000_000_000_000_000;
@@ -534,7 +535,7 @@ fn a_usdc_arm_s_surplus_is_written_in_usdc_units() {
 /// An ordinary arm's worst case at a 300,000 wei base fee and no bid, and what
 /// it would hold if it reserved a NoTrade's cost.
 const ORDINARY_WORST: u128 = 1_000_000 * 600_000 + 1_000_000_000_000;
-const ORDINARY_NO_TRADE: u128 = 140_000 * 600_000 + 1_000_000_000_000;
+const ORDINARY_NO_TRADE: u128 = 81_700 * 600_000 + 1_000_000_000_000;
 
 /// What the two spike arms of `engine_with(6, [tier(2)], NoTrade)` hold.
 fn spike_held() -> u128 {
@@ -543,7 +544,8 @@ fn spike_held() -> u128 {
     arms(&lines)
         .iter()
         .filter(|a| a.rung >= SPIKE_TIER_BASE)
-        .map(|a| 140_000 * (600_000 + a.bid_wei_per_gas.parse::<u128>().unwrap()) + 1_000_000_000_000)
+        // A NoTrade through Uniswap's and PancakeSwap's pools: 39,800 + 41,900 gas.
+        .map(|a| 81_700 * (600_000 + a.bid_wei_per_gas.parse::<u128>().unwrap()) + 1_000_000_000_000)
         .sum()
 }
 

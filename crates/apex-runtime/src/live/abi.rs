@@ -62,6 +62,12 @@ pub mod selector {
     pub const DEFAULT_FEE_CAP: [u8; 4] = [0xdc, 0xf4, 0xeb, 0x27];
     /// `secondsAgo()` — the module's TWAP window.
     pub const SECONDS_AGO: [u8; 4] = [0x63, 0x3d, 0xd1, 0x45];
+    /// R44: `getPoolSwapHook(address)` — the third Slipstream factory's hook for a pool.
+    pub const GET_POOL_SWAP_HOOK: [u8; 4] = [0xd8, 0xf7, 0x52, 0x99];
+    /// R44: `mevTaxModule()` — the swap hook's tax module.
+    pub const MEV_TAX_MODULE: [u8; 4] = [0xfa, 0x17, 0x24, 0x35];
+    /// R44: `priorityFeeMultiplier()` — the tax module's switch: zero is no tax.
+    pub const PRIORITY_FEE_MULTIPLIER: [u8; 4] = [0xc2, 0x1c, 0x82, 0xbd];
     /// `l1BaseFee()` — the L1 fee oracle's.
     pub const L1_BASE_FEE: [u8; 4] = [0x51, 0x9b, 0x4b, 0xd3];
     /// `blobBaseFee()`

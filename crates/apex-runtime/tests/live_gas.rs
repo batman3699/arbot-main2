@@ -23,12 +23,12 @@ fn hop(venue: Venue, zero_for_one: bool, crossed: u32, word_steps: u32) -> HopSt
 #[test]
 fn a_settlement_is_its_hops_and_what_they_cross() {
     let m = SettlementGas {
-        hop: PerVenue { uniswap_v3: 100_000, slipstream: 200_000, slipstream_v3: 200_000, pancake_v3: 300_000, aerodrome_v2: 400_000, uniswap_v4: 500_000 },
-        crossing_down: PerVenue { uniswap_v3: 1_000, slipstream: 2_000, slipstream_v3: 2_000, pancake_v3: 3_000, aerodrome_v2: 4_000, uniswap_v4: 5_000 },
-        crossing_up: PerVenue { uniswap_v3: 10_000, slipstream: 20_000, slipstream_v3: 20_000, pancake_v3: 30_000, aerodrome_v2: 40_000, uniswap_v4: 50_000 },
+        hop: PerVenue { uniswap_v3: 100_000, slipstream: 200_000, slipstream_v3: 200_000, slipstream_hook: 200_000, pancake_v3: 300_000, aerodrome_v2: 400_000, uniswap_v4: 500_000 },
+        crossing_down: PerVenue { uniswap_v3: 1_000, slipstream: 2_000, slipstream_v3: 2_000, slipstream_hook: 2_000, pancake_v3: 3_000, aerodrome_v2: 4_000, uniswap_v4: 5_000 },
+        crossing_up: PerVenue { uniswap_v3: 10_000, slipstream: 20_000, slipstream_v3: 20_000, slipstream_hook: 20_000, pancake_v3: 30_000, aerodrome_v2: 40_000, uniswap_v4: 50_000 },
         word: 7,
         hop_margin: 500,
-        crossing_ceiling: PerVenue { uniswap_v3: 40_000, slipstream: 50_000, slipstream_v3: 50_000, pancake_v3: 60_000, aerodrome_v2: 70_000, uniswap_v4: 80_000 },
+        crossing_ceiling: PerVenue { uniswap_v3: 40_000, slipstream: 50_000, slipstream_v3: 50_000, slipstream_hook: 50_000, pancake_v3: 60_000, aerodrome_v2: 70_000, uniswap_v4: 80_000 },
         word_ceiling: 900,
     };
     let got = m.estimate(&[hop(Venue::Slipstream, true, 3, 1), hop(Venue::PancakeV3, false, 2, 2)]);
@@ -49,7 +49,7 @@ fn a_settlement_is_its_hops_and_what_they_cross() {
 #[test]
 fn the_ceiling_is_never_below_the_expectation() {
     let m = SettlementGas {
-        crossing_ceiling: PerVenue { uniswap_v3: 0, slipstream: 0, slipstream_v3: 0, pancake_v3: 0, aerodrome_v2: 0, uniswap_v4: 0 },
+        crossing_ceiling: PerVenue { uniswap_v3: 0, slipstream: 0, slipstream_v3: 0, slipstream_hook: 0, pancake_v3: 0, aerodrome_v2: 0, uniswap_v4: 0 },
         ..MEASURED
     };
     let got = m.estimate(&[hop(Venue::UniswapV3, false, 5, 0), hop(Venue::PancakeV3, true, 5, 0)]);
@@ -162,8 +162,9 @@ fn the_lean_model_is_the_fork_measurement() {
     );
     for v in Venue::ALL {
         // v4 runs only through LeanExecutor2 (R37): it has no Phase 5 figure,
-        // and MEASURED carries LEAN's.
-        if v == Venue::UniswapV4 {
+        // and MEASURED carries LEAN's. R44: nor has the third Slipstream
+        // factory, which only the lean executors trade.
+        if v == Venue::UniswapV4 || v == Venue::SlipstreamHook {
             assert_eq!(LEAN.hop.of(v), MEASURED.hop.of(v));
         } else {
             assert!(LEAN.hop.of(v) < MEASURED.hop.of(v), "{v:?}: the lean hop costs less");
@@ -173,6 +174,12 @@ fn the_lean_model_is_the_fork_measurement() {
         assert_eq!(LEAN.crossing_ceiling.of(v), MEASURED.crossing_ceiling.of(v), "{v:?}");
     }
     assert_eq!((LEAN.hop_margin, LEAN.word, LEAN.word_ceiling), (MEASURED.hop_margin, MEASURED.word, MEASURED.word_ceiling));
+    // R44, `test/fork/LeanExecutor3HookFork.t.sol` at block 58,230,400: one
+    // swap on Uniswap's pool 155,310 gas, on the hooked pool 365,911 when it
+    // is the pool's first of the block: Uniswap's hop plus that excess. Its
+    // NoTrade half is the measured 190,670 less Uniswap's.
+    assert_eq!(hop(Venue::SlipstreamHook), 116_000 + (365_911u64 - 155_310).div_ceil(100) * 100);
+    assert_eq!(apex_runtime::live::gas::SIZED.read.of(Venue::SlipstreamHook), (190_670u64 - 39_800).div_ceil(100) * 100);
     // Both Slipstream factories cross ticks as one; their hops now differ.
     assert_eq!(MEASURED.hop.of(Venue::SlipstreamV3), MEASURED.hop.of(Venue::Slipstream));
 }

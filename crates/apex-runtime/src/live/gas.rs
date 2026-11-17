@@ -46,6 +46,8 @@ pub struct PerVenue {
     /// but read their fee module more, which the lean executor's hop shows
     /// (R29).
     pub slipstream_v3: u64,
+    /// The third Slipstream factory (R44): a swap hook computes the fee.
+    pub slipstream_hook: u64,
     pub pancake_v3: u64,
     pub aerodrome_v2: u64,
     /// Uniswap v4 (R37), inside PoolManager's unlock.
@@ -58,6 +60,7 @@ impl PerVenue {
             Venue::UniswapV3 => self.uniswap_v3,
             Venue::Slipstream => self.slipstream,
             Venue::SlipstreamV3 => self.slipstream_v3,
+            Venue::SlipstreamHook => self.slipstream_hook,
             Venue::PancakeV3 => self.pancake_v3,
             Venue::AerodromeV2 => self.aerodrome_v2,
             Venue::UniswapV4 => self.uniswap_v4,
@@ -143,12 +146,19 @@ pub struct SizedGas {
 }
 
 impl SizedGas {
+    /// R44: what a `NoTrade` on a route through these two venues uses: each
+    /// venue's half. The third Slipstream factory's is 150,900, more than any
+    /// other pair's whole: an arm holds its own route's, not the dearest's.
+    pub const fn no_trade(&self, a: Venue, b: Venue) -> u64 {
+        self.read.of(a) + self.read.of(b)
+    }
+
     /// R43: the most a `NoTrade` uses on any pair of venues: twice the
     /// dearest venue's half.
     pub const fn no_trade_ceiling(&self) -> u64 {
         let r = &self.read;
         let mut most = r.uniswap_v3;
-        let rest = [r.slipstream, r.slipstream_v3, r.pancake_v3, r.aerodrome_v2, r.uniswap_v4];
+        let rest = [r.slipstream, r.slipstream_v3, r.slipstream_hook, r.pancake_v3, r.aerodrome_v2, r.uniswap_v4];
         let mut i = 0;
         while i < rest.len() {
             if rest[i] > most {
@@ -174,6 +184,11 @@ pub const SIZED: SizedGas = SizedGas {
         uniswap_v3: 39_800,
         slipstream: 62_000,
         slipstream_v3: 70_000,
+        // R44, `test/fork/LeanExecutor3HookFork.t.sol` at block 58,230,400: a
+        // `NoTrade` with Uniswap's pool is 190,670 either way round, less
+        // Uniswap's half. Its `fee()` runs the hook: the TWAP, the pool's
+        // configuration, the discount registry and the tax module.
+        slipstream_hook: 150_900,
         pancake_v3: 41_900,
         aerodrome_v2: 50_500,
         uniswap_v4: 45_000,
@@ -206,6 +221,8 @@ pub const MEASURED: SettlementGas = SettlementGas {
         // The second factory's pools and router are the first's code, so they
         // cost the same through this executor (R22's router simulation).
         slipstream_v3: 303_000,
+        // R44: never through the Phase 5 executor; LEAN's stands in.
+        slipstream_hook: 326_700,
         pancake_v3: 236_000,
         // R24: PancakeSwap's measured hop (both through GENERIC adapters) plus
         // what Aerodrome's router swap used over PancakeSwap's SmartRouter's,
@@ -222,6 +239,9 @@ pub const MEASURED: SettlementGas = SettlementGas {
         uniswap_v3: 21_300,
         slipstream: 43_400,
         slipstream_v3: 43_400,
+        // R44: the pool's crossing is Slipstream's (net, staked net, reward
+        // growth); not yet measured on its own.
+        slipstream_hook: 43_400,
         pancake_v3: 32_100,
         aerodrome_v2: 0,
         // R37: v4's swap loop is v3's; its crossings are taken as v3's.
@@ -231,6 +251,7 @@ pub const MEASURED: SettlementGas = SettlementGas {
         uniswap_v3: 27_200,
         slipstream: 48_300,
         slipstream_v3: 48_300,
+        slipstream_hook: 48_300,
         pancake_v3: 36_300,
         aerodrome_v2: 0,
         uniswap_v4: 27_200,
@@ -242,6 +263,7 @@ pub const MEASURED: SettlementGas = SettlementGas {
         uniswap_v3: 21_300 + 2 * ZERO_SLOT_PREMIUM,
         slipstream: 43_400 + 3 * ZERO_SLOT_PREMIUM,
         slipstream_v3: 43_400 + 3 * ZERO_SLOT_PREMIUM,
+        slipstream_hook: 43_400 + 3 * ZERO_SLOT_PREMIUM,
         pancake_v3: 32_100 + 3 * ZERO_SLOT_PREMIUM,
         // It crosses no ticks.
         aerodrome_v2: 0,
@@ -270,6 +292,13 @@ pub const LEAN: SettlementGas = SettlementGas {
         uniswap_v3: 116_000,
         slipstream: 232_500,
         slipstream_v3: 256_000,
+        // R44, `testSwapGasFirstAndSecondInTheBlock` at block 58,230,400: one
+        // swap as its own transaction is 155,310 on Uniswap's pool and 365,911
+        // on the hooked pool when it is the pool's first of the block (the
+        // hook reads the TWAP, stores the block's fee and writes its tape);
+        // its second is 228,218. Uniswap's figure plus the first swap's
+        // excess: an arm cannot know it will not be first.
+        slipstream_hook: 326_700,
         pancake_v3: 126_300,
         aerodrome_v2: 168_400,
         // R37, `test/fork/LeanExecutor2Fork.t.sol` at block 53,155,787, AXIS's

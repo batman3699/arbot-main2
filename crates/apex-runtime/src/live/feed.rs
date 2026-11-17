@@ -123,7 +123,7 @@ pub struct SwapLog {
 /// concentrated-liquidity venues, `Sync` for Aerodrome v2.
 pub const fn swap_topic(venue: Venue) -> B256 {
     match venue {
-        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => SWAP,
+        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 | Venue::SlipstreamHook => SWAP,
         Venue::PancakeV3 => PANCAKE_SWAP,
         Venue::AerodromeV2 => SYNC,
         Venue::UniswapV4 => V4_SWAP,

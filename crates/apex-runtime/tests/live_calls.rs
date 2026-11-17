@@ -135,7 +135,7 @@ fn aero(r1: u128) -> PoolSnapshot {
 
 fn kind(v: Venue) -> HopKind {
     match v {
-        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 => HopKind::UniswapV3Style,
+        Venue::UniswapV3 | Venue::Slipstream | Venue::SlipstreamV3 | Venue::SlipstreamHook => HopKind::UniswapV3Style,
         Venue::PancakeV3 => HopKind::PancakeV3,
         Venue::AerodromeV2 => HopKind::AerodromeV2,
         Venue::UniswapV4 => unreachable!("v1's plan has no v4 hop"),

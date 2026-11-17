@@ -90,11 +90,12 @@ pub enum Reserve {
 }
 
 impl Reserve {
-    /// The gas a pending sized arm holds at its fee.
-    pub const fn gas(self) -> u64 {
+    /// The gas a pending spike arm holds at its fee, `no_trade` being what a
+    /// `NoTrade` on its route uses ([`crate::live::gas::SizedGas::no_trade`]).
+    pub const fn gas(self, no_trade: u64) -> u64 {
         match self {
             Self::WorstCase => SIZED.limit,
-            Self::NoTrade => SIZED.no_trade_ceiling(),
+            Self::NoTrade => no_trade,
         }
     }
 }
@@ -591,7 +592,7 @@ impl SizedEngine {
                     key: (*id, *leg, point.tier),
                     group: (pool, up),
                     ev: self.value(point, p, base_fee_wei, &chance),
-                    worst_wei: self.worst(point, base_fee_wei, l1_upper_wei),
+                    worst_wei: self.worst(point, p, base_fee_wei, l1_upper_wei),
                     rank: (self.rank)(c),
                 });
             }
@@ -696,12 +697,13 @@ impl SizedEngine {
     /// What the arm holds of the day's budget while it is pending
     /// ([`Reserve`]), at twice the base fee and its bid under its tier's cap:
     /// the live worker's own figure.
-    fn worst(&self, point: &SizedArmPoint, base_fee_wei: u128, l1_upper_wei: u128) -> u128 {
+    fn worst(&self, point: &SizedArmPoint, p: &Priced, base_fee_wei: u128, l1_upper_wei: u128) -> u128 {
         let s = &self.settings;
         let fee = base_fee_wei.saturating_mul(2).saturating_add(point.bid.sent.per_gas.min(s.cap_for(point.tier)));
         // R43.1: the reserve is the spike tiers' alone; an ordinary arm holds
         // its whole limit, as before them.
-        let gas = if point.tier >= SPIKE_TIER_BASE { s.reserve.gas() } else { SIZED.limit };
+        // R44: a NoTrade's gas is the route's own: its two venues' reads.
+        let gas = if point.tier >= SPIKE_TIER_BASE { s.reserve.gas(p.plan(point.tier).0.read_gas) } else { SIZED.limit };
         u128::from(gas).saturating_mul(fee).saturating_add(s.l1_fee_bound_wei.max(l1_upper_wei.saturating_mul(2)))
     }
 
@@ -732,7 +734,7 @@ impl SizedEngine {
         let mut ev = self.value(point, p, base_fee_wei, &chance);
         // The trigger, moved as far as the reference move takes it.
         let reference = point.step + TIER1_BID_STEPS;
-        let Some(trigger) = snapshot.get(&pool).and_then(|t| t.moved(super::threshold::move_of(t, up, reference))) else { return 0.0 };
+        let Some(trigger) = snapshot.get(&pool).and_then(|t| t.triggered(super::threshold::move_of(t, up, reference))) else { return 0.0 };
         let mut after = trigger.clone();
         for prior in chosen {
             let (pid, pleg, ptier) = prior.key;

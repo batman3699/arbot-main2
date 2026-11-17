@@ -34,6 +34,10 @@ pub fn layout(v: Venue, address: Address) -> Layout {
         Venue::UniswapV3 => cl(0, 4),
         Venue::PancakeV3 => cl(0, 5),
         Venue::Slipstream | Venue::SlipstreamV3 => cl(6, 16),
+        // R44: the hook factory's CLPool keeps slot0 where Slipstream's does,
+        // and its liquidity three words lower: both checked against the
+        // pools' views on three pools at one block, 2026-11-16.
+        Venue::SlipstreamHook => cl(6, 13),
         Venue::AerodromeV2 => {
             Layout { address, price_slot: None, liquidity_slot: None, reserve_slots: Some((U256::from(20), U256::from(21))) }
         }

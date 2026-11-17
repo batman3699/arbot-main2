@@ -46,6 +46,9 @@ pub mod venue_ids {
     pub const UNISWAP_V4: VenueId = VenueId(8);
     /// Aerodrome's second Slipstream factory, `0xf8f2…` (R22).
     pub const AERODROME_SLIPSTREAM_V3: VenueId = VenueId(9);
+    /// Aerodrome's third Slipstream factory, `0x9cb2…`: a swap hook sets each
+    /// pool's fee (R44).
+    pub const AERODROME_SLIPSTREAM_HOOK: VenueId = VenueId(10);
 }
 
 /// Pool state, in whichever shape its venue family needs.

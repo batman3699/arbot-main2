@@ -631,7 +631,13 @@ impl ArmedLive {
         // tier's arm trades only above its floor, and holds what `reserve`
         // says; R43.1: an ordinary sized arm holds its whole limit, as it did
         // before the tiers.
-        let reserved_gas = if spike.is_some() { self.policy.reserve.gas().min(arm.gas_limit) } else { arm.gas_limit };
+        // R44: a NoTrade's gas is the route's own, by the venues its line
+        // names; a venue this build does not know holds the dearest pair's.
+        let no_trade = match (crate::live::inventory::Venue::named(&arm.venues[0]), crate::live::inventory::Venue::named(&arm.venues[1])) {
+            (Some(a), Some(b)) => crate::live::gas::SIZED.no_trade(a, b),
+            _ => crate::live::gas::SIZED.no_trade_ceiling(),
+        };
+        let reserved_gas = if spike.is_some() { self.policy.reserve.gas(no_trade).min(arm.gas_limit) } else { arm.gas_limit };
         for bump in 0..=MAX_BUMPS {
             // The sender's balance is held to the whole limit: the protocol's rule.
             let worst = u128::from(arm.gas_limit).saturating_mul(max_fee).saturating_add(self.policy.l1_fee_bound_wei);

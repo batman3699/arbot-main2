@@ -69,6 +69,9 @@ fn every_selector_is_its_signatures_hash() {
         (selector::GET_RESERVES, "getReserves()"),
         (selector::GET_FEE, "getFee(address,bool)"),
         (selector::IS_POOL, "isPool(address)"),
+        (selector::GET_POOL_SWAP_HOOK, "getPoolSwapHook(address)"),
+        (selector::MEV_TAX_MODULE, "mevTaxModule()"),
+        (selector::PRIORITY_FEE_MULTIPLIER, "priorityFeeMultiplier()"),
     ] {
         assert_eq!(sel, keccak256(sig.as_bytes())[..4], "{sig}");
     }
@@ -142,6 +145,32 @@ fn write_inventory(dir: &std::path::Path, venue: &str, lines: &[Value]) {
     std::fs::create_dir_all(dir.join(venue)).unwrap();
     let text: Vec<String> = lines.iter().map(Value::to_string).collect();
     std::fs::write(dir.join(venue).join("pools.jsonl"), text.join("\n")).unwrap();
+}
+
+/// R44: the third Slipstream factory's inventory is the venue's switch. With
+/// no file for it the other venues load as before and it has no pools; with
+/// one, its pools load under its venue by Slipstream's rule: a record without
+/// a measured fee is skipped.
+#[test]
+fn the_hook_factorys_inventory_is_its_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = ("0x00000000000000000000000000000000000000a1", "0x00000000000000000000000000000000000000b2");
+    for venue in ["uniswap_v3", "aerodrome_slipstream", "pancakeswap_v3", "aerodrome_slipstream_v3", "aerodrome_v2"] {
+        write_inventory(dir.path(), venue, &[]);
+    }
+    let load = || inventory::load(dir.path(), UniverseFilter::default(), &std::collections::BTreeSet::new(), &apex_runtime::live::v4::HookAllowlist::default());
+    assert!(load().unwrap().is_empty(), "no file, no pools, and no error");
+    write_inventory(dir.path(), "aerodrome_slipstream_hook", &[
+        json!({"pool":"0x000000000000000000000000000000000000000a","token0":a,"token1":b,"fee":50,"fee_ppm_onchain":316,"hub_usd_liquidity":3e6}),
+        json!({"pool":"0x000000000000000000000000000000000000000b","token0":a,"token1":b,"fee":50,"hub_usd_liquidity":3e6}),
+    ]);
+    let specs = load().unwrap();
+    assert_eq!(specs.len(), 1, "the record with no measured fee is skipped");
+    assert_eq!((specs[0].venue, specs[0].pool.as_slice()[19], specs[0].fee_ppm), (Venue::SlipstreamHook, 0x0a, 316));
+    assert_eq!(Venue::SlipstreamHook.dir(), "aerodrome_slipstream_hook");
+    assert_eq!(format!("{:#x}", Venue::SlipstreamHook.factory()), "0x9cb220581b91b0c83223012fe69688b92ad07a76");
+    assert!(!Venue::SlipstreamHook.fee_is_static() && Venue::SlipstreamHook.fee_is_the_blocks());
+    assert!(Venue::ALL.iter().filter(|v| v.fee_is_the_blocks()).count() == 1, "the other venues read the tick at every swap, or not at all");
 }
 
 /// The census's thresholds, and its rule for Slipstream: a record without a
@@ -910,6 +939,85 @@ fn slipstream(node: &Scripted, cardinality: u64) {
     node.set(MODULE, abi::call_address(selector::DYNAMIC_FEE_CONFIG, SLIP), cfg);
     node.set(factory, abi::call_signed(selector::TICK_SPACING_TO_FEE, SPACING), w(U256::from(500)));
     node.set(SLIP, abi::call_observe(600), twap_answer(TICK + 11));
+}
+
+const HOOKED: Address = address!("4A7af46bC8aBc00048c6c7920a1488DAF568366c");
+const SWAP_HOOK: Address = address!("C0ed888AfE87ed1AcF01D9f19bB850159e3ce434");
+const TAX_MODULE: Address = address!("29F12cE5Be3D88b56D245B7f4E969C518F799a4a");
+
+fn hooked_spec() -> PoolSpec {
+    PoolSpec { pool: HOOKED, venue: Venue::SlipstreamHook, ..spec() }
+}
+
+/// R44: a healthy pool of Slipstream's third factory: the factory names its
+/// swap hook, the hook answers WETH/USDC CL50's regime as it was on
+/// 2026-11-16 and names its tax module, whose multiplier is `multiplier`; an
+/// oracle of one observation, and a TWAP three ticks above the price.
+fn hooked(node: &Scripted, hook: Address, tax_module: Address, multiplier: u64) {
+    let factory = Venue::SlipstreamHook.factory();
+    healthy_at(node, HOOKED, factory);
+    let mut slot0 = w(U256::from(4_109_375_649_317_904_751_454_295u128));
+    slot0.extend(wi(TICK));
+    for v in [0u64, 1, 1, 1] {
+        slot0.extend(w(U256::from(v)));
+    }
+    node.set(HOOKED, abi::call0(selector::SLOT0), slot0);
+    node.set(factory, abi::call_address(selector::GET_POOL_SWAP_HOOK, HOOKED), wa(hook));
+    node.set(hook, abi::call0(selector::DEFAULT_SCALING_FACTOR), w(U256::ZERO));
+    node.set(hook, abi::call0(selector::DEFAULT_FEE_CAP), w(U256::from(50_000)));
+    node.set(hook, abi::call0(selector::SECONDS_AGO), w(U256::from(600)));
+    node.set(hook, abi::call0(selector::MEV_TAX_MODULE), wa(tax_module));
+    node.set(tax_module, abi::call0(selector::PRIORITY_FEE_MULTIPLIER), w(U256::from(multiplier)));
+    let mut cfg = Vec::new();
+    for v in [220u64, 7_500, 32_200_000, 0, 0] {
+        cfg.extend(w(U256::from(v)));
+    }
+    node.set(hook, abi::call_address(selector::DYNAMIC_FEE_CONFIG, HOOKED), cfg);
+    node.set(factory, abi::call_signed(selector::TICK_SPACING_TO_FEE, SPACING), w(U256::from(3_000)));
+    node.set(HOOKED, abi::call_observe(600), twap_answer(TICK + 3));
+}
+
+/// R44: **a pool of the third Slipstream factory loads with its fee regime**,
+/// read from the swap hook its factory names for it. The hook has no rule
+/// about how many observations the oracle holds: one is enough when `observe`
+/// answers. Its fee is the one its tick implies.
+#[tokio::test]
+async fn a_hooked_pool_loads_with_its_fee_regime_from_its_swap_hook() {
+    let node = Arc::new(Scripted::default());
+    hooked(&node, SWAP_HOOK, TAX_MODULE, 0);
+    let (book, refused) = PoolBook::load(&ChainReads::new(node), &[hooked_spec()], 100).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    let p = book.get(HOOKED).unwrap();
+    assert_eq!(p.dynamic_fee, Some(DynamicFee { base: 220, cap: 7_500, scaling: 32_200_000, initial: None, seconds_ago: 600, twap_tick: Some(TICK as i32 + 3) }));
+    assert_eq!(p.state.fee_ppm, 316, "220 + 3 x 32.2, not the 500 `fee()` answered");
+    // No tax module at all is no tax.
+    let node = Arc::new(Scripted::default());
+    hooked(&node, SWAP_HOOK, Address::ZERO, 0);
+    let (book, refused) = PoolBook::load(&ChainReads::new(node), &[hooked_spec()], 100).await.unwrap();
+    assert!(refused.is_empty() && book.get(HOOKED).is_some(), "{refused:?}");
+}
+
+/// R44: a pool whose hook is not the one that was read is refused: another
+/// hook may charge anything, before the swap or after it. So is one whose
+/// tax module's multiplier is on: the hook then adds a fee that grows with
+/// the transaction's priority fee, which this book does not price, and an arm
+/// sized without it would trade at a loss or revert. Each says which.
+#[tokio::test]
+async fn a_hooked_pool_with_another_hook_or_a_tax_switched_on_is_refused() {
+    let other = address!("00000000000000000000000000000000000000Aa");
+    for (hook, tax, multiplier, read) in [(other, TAX_MODULE, 0, "swap hook"), (SWAP_HOOK, TAX_MODULE, 1, "mev tax"), (Address::ZERO, TAX_MODULE, 0, "swap hook")] {
+        let node = Arc::new(Scripted::default());
+        hooked(&node, hook, tax, multiplier);
+        let (book, refused) = PoolBook::load(&ChainReads::new(node), &[hooked_spec()], 100).await.unwrap();
+        assert!(book.get(HOOKED).is_none(), "{read}");
+        assert_eq!(refused[0].why, Unloadable::FeeUnreadable { read }, "{read}");
+    }
+    // A tax module that does not answer is not known to be off.
+    let node = Arc::new(Scripted::default());
+    hooked(&node, SWAP_HOOK, TAX_MODULE, 0);
+    node.answers.lock().unwrap().remove(&(TAX_MODULE, abi::call0(selector::PRIORITY_FEE_MULTIPLIER)));
+    let (_, refused) = PoolBook::load(&ChainReads::new(node), &[hooked_spec()], 100).await.unwrap();
+    assert_eq!(refused[0].why, Unloadable::FeeUnreadable { read: "mev tax" });
 }
 
 /// **A Slipstream pool loads with its fee regime**, read from its factory's

@@ -19,6 +19,7 @@ use apex_runtime::armed::predicate::{expiry, Op, Predicate};
 use apex_runtime::armed::sized::{Reserve, Senders};
 use apex_runtime::armed::threshold::{SpikeTier, SPIKE_TIER_BASE};
 use apex_runtime::live::gas::SIZED;
+use apex_runtime::live::inventory::Venue;
 use apex_runtime::sign::LaneKey;
 use ethers_core::types::transaction::eip2718::TypedTransaction;
 use ethers_core::types::U256;
@@ -1249,24 +1250,47 @@ async fn a_sized_plan_over_its_tiers_size_cap_is_skipped() {
 
 /// R43: at 20 gwei a sized arm's gas limit is 0.02 ETH, twice a 0.01 ETH
 /// budget, so at its worst case it is never sent. Reserving what an inclusion
-/// that does not trade costs, it holds 0.0028 ETH of the budget and three fit.
+/// that does not trade costs on its own route (R44: 101,800 gas through
+/// Uniswap's and Slipstream's pools), it holds 0.002036 ETH and four fit.
 #[tokio::test]
 async fn a_sized_arm_holds_what_the_reserve_says_of_the_budget() {
-    let arms = || (0..4).map(|i| ArmedLine::Arm(Box::new(sized_arm(i, 8 + i as u16, SPIKE_TIER_BASE, 20 * GWEI, ETH)))).collect::<Vec<_>>();
+    let arms = || (0..5).map(|i| ArmedLine::Arm(Box::new(sized_arm(i, 8 + i as u16, SPIKE_TIER_BASE, 20 * GWEI, ETH)))).collect::<Vec<_>>();
     let f = fixture(spike_policy(ETH / 100, Reserve::WorstCase), vec![], vec![]);
     start(&f).await;
     f.live.on_lines(&arms(), 0, NOW).await;
     assert!(f.script.sent.lock().unwrap().is_empty());
-    assert_eq!(skipped(&f.ledger), vec!["budget".to_string(); 4]);
+    assert_eq!(skipped(&f.ledger), vec!["budget".to_string(); 5]);
 
     let f = fixture(spike_policy(ETH / 100, Reserve::NoTrade), vec![], vec![]);
     start(&f).await;
     f.live.on_lines(&arms(), 0, NOW).await;
-    assert_eq!(f.script.sent.lock().unwrap().len(), 3);
+    assert_eq!(f.script.sent.lock().unwrap().len(), 4);
     assert_eq!(skipped(&f.ledger), vec!["budget".to_string()]);
-    let each = u128::from(SIZED.no_trade_ceiling()) * 20 * GWEI;
-    assert_eq!(each, 2_800_000_000_000_000);
-    assert_eq!(f.live.state(NOW).reserved_wei, 3 * each);
+    let each = u128::from(SIZED.no_trade(Venue::UniswapV3, Venue::Slipstream)) * 20 * GWEI;
+    assert_eq!(each, 2_036_000_000_000_000);
+    assert_eq!(f.live.state(NOW).reserved_wei, 4 * each);
+}
+
+/// R44: an arm through the third Slipstream factory holds that venue's dearer
+/// read: 190,700 gas with Uniswap's. A venue this build does not know by name
+/// holds the dearest pair's.
+#[tokio::test]
+async fn a_no_trade_reserve_is_the_routes_own_venues() {
+    let through = |a: &str, b: &str| Arm { venues: [a.into(), b.into()], ..sized_arm(1, 8, SPIKE_TIER_BASE, GWEI, ETH) };
+    for (arm, gas) in [
+        (through("UniswapV3", "SlipstreamHook"), 190_700u128),
+        (through("UniswapV3", "PancakeV3"), 81_700),
+        (through("UniswapV3", "SomethingNew"), u128::from(SIZED.no_trade_ceiling())),
+    ] {
+        let f = fixture(spike_policy(ETH, Reserve::NoTrade), vec![], vec![]);
+        start(&f).await;
+        f.live.on_lines(&send(arm), 0, NOW).await;
+        assert_eq!(f.live.state(NOW).reserved_wei, gas * GWEI, "{gas}");
+    }
+    assert_eq!(SIZED.no_trade_ceiling(), 301_800, "twice the hooked venue's half");
+    for v in Venue::ALL {
+        assert_eq!(Venue::named(&format!("{v:?}")), Some(v));
+    }
 }
 
 /// R43.1: the NoTrade reserve is the spike tiers' alone: an ordinary sized arm
