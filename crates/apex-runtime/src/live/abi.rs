@@ -160,13 +160,32 @@ pub fn call_observe(seconds_ago: u32) -> Vec<u8> {
 /// truncating toward zero as Solidity's signed division does. `None` for an
 /// answer that is not two `int56` cumulatives, or a zero window.
 pub fn decode_twap(data: &[u8], seconds_ago: u32) -> Option<i32> {
+    let (delta, window) = twap_delta(data, seconds_ago)?;
+    int24(delta / window)
+}
+
+/// R44: the same tick as the third factory's swap hook computes it: the
+/// module's division, then one lower for a negative delta that does not
+/// divide (`DynamicSwapFeeHook._getDynamicFee`: "round down toward negative
+/// Inf"). `None` as [`decode_twap`], and for a tick rounded out of an `int24`.
+pub fn decode_twap_down(data: &[u8], seconds_ago: u32) -> Option<i32> {
+    let (delta, window) = twap_delta(data, seconds_ago)?;
+    int24(delta.div_euclid(window))
+}
+
+/// `observe([seconds_ago, 0])`'s cumulatives' difference, and the window.
+fn twap_delta(data: &[u8], seconds_ago: u32) -> Option<(i128, i128)> {
     let off = usize_at(data, 0)?;
     if off % WORD != 0 || seconds_ago == 0 || usize_at(data, off)? != 2 {
         return None;
     }
     let first = off / WORD + 1;
     let (c0, c1) = (word_int(data, first, 56)?, word_int(data, first + 1, 56)?);
-    i32::try_from((c1 - c0) / i128::from(seconds_ago)).ok().filter(|t| (-(1 << 23)..(1 << 23)).contains(t))
+    Some((c1 - c0, i128::from(seconds_ago)))
+}
+
+fn int24(tick: i128) -> Option<i32> {
+    i32::try_from(tick).ok().filter(|t| (-(1 << 23)..(1 << 23)).contains(t))
 }
 
 /// `Multicall3.aggregate3(calls)`, every call with `allowFailure = true`.

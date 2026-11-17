@@ -138,6 +138,12 @@ impl Venue {
         matches!(self, Self::SlipstreamHook)
     }
 
+    /// R44: whether the venue's fee rule rounds its TWAP down. The third
+    /// factory's hook does; the older factories' module truncates toward zero.
+    pub const fn twap_rounds_down(self) -> bool {
+        matches!(self, Self::SlipstreamHook)
+    }
+
     /// A constant-product venue: reserves and a fee, no ticks (R24).
     pub const fn is_constant_product(self) -> bool {
         matches!(self, Self::AerodromeV2)

@@ -145,6 +145,27 @@ fn observe_answer(c0: i64, c1: i64) -> Vec<u8> {
     out
 }
 
+/// R44: the swap hook's TWAP is the module's, then **rounded down**: its
+/// `_getDynamicFee` takes one more off a negative delta that does not divide
+/// (`if (delta < 0 && delta % secondsAgo != 0) twAvgTick -= 1`). Base's ticks
+/// are negative, so truncating as the module does puts nearly every hooked
+/// TWAP one tick high: 32 ppm on WETH/USDC CL50, 100 on WETH/cbBTC CL10. The
+/// last case is that pool at block 58,454,742, whose `fee()` answered 284:
+/// 220 + |-201,248 - (-201,250)| x 32.2.
+#[test]
+fn the_hooks_twap_rounds_down() {
+    assert_eq!(abi::decode_twap_down(&observe_answer(0, -1_001), 10), Some(-101));
+    assert_eq!(abi::decode_twap_down(&observe_answer(0, -1_000), 10), Some(-100), "exact: nothing to round");
+    assert_eq!(abi::decode_twap_down(&observe_answer(0, 1_001), 10), Some(100), "positive: truncation is down");
+    let (c0, c1) = (-462_590_427_272i64, -462_711_176_716i64);
+    assert_eq!(abi::decode_twap(&observe_answer(c0, c1), 600), Some(-201_249));
+    assert_eq!(abi::decode_twap_down(&observe_answer(c0, c1), 600), Some(-201_250));
+    // The module's refusals are its own.
+    assert_eq!(abi::decode_twap_down(&observe_answer(0, 10), 0), None);
+    assert_eq!(abi::decode_twap_down(&observe_answer(0, -(1 << 30)), 1), None);
+    assert_eq!(abi::decode_twap_down(&observe_answer(0, -(1 << 23) * 2 - 1), 2), None, "rounds down out of an int24");
+}
+
 /// Solidity's signed division truncates toward zero, and the module's TWAP is
 /// `int24((c1 − c0) / secondsAgo)`. Base's ticks are negative, so a floor would
 /// put every inexact TWAP one tick low — 15 ppm on this pool.

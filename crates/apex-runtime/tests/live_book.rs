@@ -997,6 +997,33 @@ async fn a_hooked_pool_loads_with_its_fee_regime_from_its_swap_hook() {
     assert!(refused.is_empty() && book.get(HOOKED).is_some(), "{refused:?}");
 }
 
+/// R44: **a hooked pool's TWAP rounds down, at the load and at every
+/// refresh**, as its hook rounds it; the older factories' module truncates,
+/// and the same answer from one of their pools is a tick higher. Ticks here
+/// are negative, as Base's are.
+#[tokio::test]
+async fn a_hooked_pools_twap_rounds_down_where_the_modules_truncates() {
+    let node = Arc::new(Scripted::default());
+    hooked(&node, SWAP_HOOK, TAX_MODULE, 0);
+    slipstream(&node, 1_000);
+    // One short of dividing: three ticks above the price truncated, two rounded down.
+    let short_of = |ticks: i64| observe_answer(0, (TICK + ticks) * 600 - 1);
+    node.set(HOOKED, abi::call_observe(600), short_of(3));
+    node.set(SLIP, abi::call_observe(600), short_of(3));
+    let reads = ChainReads::new(node.clone());
+    let (book, refused) = PoolBook::load(&reads, &[hooked_spec(), slip_spec()], 100).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    let twap = |pool| book.get(pool).unwrap().dynamic_fee.unwrap().twap_tick;
+    assert_eq!((twap(HOOKED), twap(SLIP)), (Some(TICK as i32 + 2), Some(TICK as i32 + 3)));
+    assert_eq!(book.get(HOOKED).unwrap().state.fee_ppm, 284, "220 + 2 x 32.2");
+
+    node.set(HOOKED, abi::call_observe(600), short_of(5));
+    node.set(SLIP, abi::call_observe(600), short_of(5));
+    assert_eq!(book.refresh_twaps(&reads, 101).await.unwrap(), 2);
+    assert_eq!((twap(HOOKED), twap(SLIP)), (Some(TICK as i32 + 4), Some(TICK as i32 + 5)));
+    assert_eq!(book.get(HOOKED).unwrap().state.fee_ppm, 348, "220 + 4 x 32.2");
+}
+
 /// R44: a pool whose hook is not the one that was read is refused: another
 /// hook may charge anything, before the swap or after it. So is one whose
 /// tax module's multiplier is on: the hook then adds a fee that grows with
@@ -1336,4 +1363,72 @@ async fn through_follows_every_applied_log() {
     book.reload(&reads, &[WETH_USDC], 112).await.unwrap();
     let p = book.get(WETH_USDC).unwrap();
     assert_eq!((p.through, p.block), (None, 112), "the read holds it");
+}
+
+/// R44, **against the chain** (ignored: network, through Base's public
+/// endpoints, never the canary's key). The eight deepest WETH pools of
+/// Slipstream's third factory load through the book as the runtime loads
+/// them: each names the reviewed swap hook, none is taxed, none is refused.
+/// And the fee the book composes for a pool is the fee the pool itself
+/// answers at that block, for every pool that did not swap in it (one that
+/// did answers the block's fixed fee, of the tick before its first swap).
+///
+/// ```text
+/// cargo test -j 3 -p apex-runtime --test live_book -- --ignored --nocapture the_third_factorys
+/// ```
+#[tokio::test]
+#[ignore = "network: reads Base through its public endpoints"]
+async fn the_third_factorys_deepest_pools_load_with_the_fee_they_answer() {
+    use apex_chain::rpc::failover::{FailoverSettings, FailoverTransport};
+    use apex_runtime::live::feed;
+
+    let settings = FailoverSettings {
+        request_timeout: std::time::Duration::from_secs(30),
+        extra_passes: 4,
+        base_backoff: std::time::Duration::from_secs(1),
+    };
+    let urls = ["https://base-rpc.publicnode.com".to_string(), "https://mainnet.base.org".to_string()];
+    let http = FailoverTransport::connect(&urls, 8453, settings).await.unwrap();
+    let rpc: Arc<dyn RpcTransport> = Arc::new(http);
+    let reads = ChainReads::new(Arc::clone(&rpc));
+    let cbbtc = address!("cbB7C0000aB88B473b1f5aFd9ef808440eed33Bf");
+    let pools = [
+        (address!("4A7af46bC8aBc00048c6c7920a1488DAF568366c"), WETH, USDC),
+        (address!("bB5507DaaE822ba89C4dA61BbfDf4b49a1666BAc"), WETH, cbbtc),
+        (address!("2A430bEbD2082d8e05D56d64DEDE8944279bbC24"), WETH, USDC),
+        (address!("eC3c3755b9DED4a2960ef50C9b48C1694CE274C2"), WETH, cbbtc),
+        (address!("2DBe0E264C7C246e05c6614794899937f264cf7b"), WETH, address!("fde4C96c8593536E31F229EA8f37b2ADa2699bb2")),
+        (address!("deBAEbE5B2729f7D62072b2eA40472d78d2C1626"), WETH, address!("acfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf")),
+        (address!("03bf20662F76312aEc31EF28d4a024E1ECa108Af"), address!("2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"), WETH),
+        (address!("52C53a3232C84cB17b05349d68c9fd75df549e03"), WETH, address!("63706e401c06ac8513145b7687A14804d17f814b")),
+    ];
+    let specs: Vec<PoolSpec> = pools
+        .iter()
+        .map(|&(pool, token0, token1)| PoolSpec { pool, venue: Venue::SlipstreamHook, token0, token1, fee_ppm: 0, depth_usd: 0.0, v4: None })
+        .collect();
+    // A few blocks back: a load-balanced public endpoint's nodes lag each other.
+    let at = reads.head().await.unwrap() - 5;
+    let (book, refused) = PoolBook::load(&reads, &specs, at).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    let block = format!("0x{at:x}");
+    let addresses: Vec<Address> = pools.iter().map(|p| p.0).collect();
+    let logs = rpc
+        .call("eth_getLogs", json!([{ "address": addresses, "fromBlock": block, "toBlock": block, "topics": [[feed::SWAP]] }]))
+        .await
+        .unwrap();
+    let swapped: Vec<String> = logs.as_array().unwrap().iter().map(|l| l["address"].as_str().unwrap().to_lowercase()).collect();
+    let mut held = 0;
+    for &(pool, ..) in &pools {
+        let p = book.get(pool).unwrap();
+        let regime = p.dynamic_fee.expect("a hooked pool has a regime");
+        let answer = rpc.call("eth_call", json!([{ "to": pool, "data": "0xddca3f43" }, block])).await.unwrap();
+        let answered = u32::from_str_radix(answer.as_str().unwrap().trim_start_matches("0x").trim_start_matches('0'), 16).unwrap_or(0);
+        println!("{pool}: book {} ppm, fee() {answered} ppm, tick {}, {regime:?}", p.state.fee_ppm, p.state.tick);
+        if swapped.contains(&format!("{pool:#x}")) {
+            continue;
+        }
+        assert_eq!(p.state.fee_ppm, answered, "{pool}: the book's fee is the pool's own");
+        held += 1;
+    }
+    assert!(held >= 4, "only {held} of 8 pools were quiet in block {at}: run it again");
 }

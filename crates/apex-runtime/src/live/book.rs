@@ -590,6 +590,16 @@ pub fn compose_hook_fee(
 /// the defaults for scaling *and* cap, an unset initial fee is the base — and a
 /// pool with fewer observations than the window needs gets no TWAP, as the
 /// module gives it no dynamic fee.
+/// The TWAP tick `observe`'s answer gives a pool's fee rule: rounded down by
+/// the third factory's hook (R44), truncated by the older factories' module.
+fn twap_tick(rounds_down: bool, data: &[u8], seconds_ago: u32) -> Option<i32> {
+    if rounds_down {
+        abi::decode_twap_down(data, seconds_ago)
+    } else {
+        abi::decode_twap(data, seconds_ago)
+    }
+}
+
 async fn read_dynamic_fees(
     reads: &ChainReads,
     pools: &[(Address, Address, i32, u64)],
@@ -693,6 +703,7 @@ async fn read_dynamic_fees(
         .collect();
 
     let mut composed = Vec::with_capacity(pools.len());
+    let mut hooked = std::collections::BTreeSet::new();
     for (j, (pool, factory, _, cardinality)) in pools.iter().enumerate() {
         let at = 3 * modules.len() + 2 * j;
         let by_hook = *factory == hook_factory;
@@ -716,6 +727,9 @@ async fn read_dynamic_fees(
         let observable =
             |d: &DynamicFee| if by_hook { d.scaling != 0 } else { *cardinality >= u64::from(d.seconds_ago) / 2 };
         composed.push((*pool, fee.map(|d| (d, observable(&d)))));
+        if by_hook {
+            hooked.insert(*pool);
+        }
     }
 
     let observe: Vec<(Address, Vec<u8>)> = composed
@@ -731,7 +745,7 @@ async fn read_dynamic_fees(
         .zip(c)
         .map(|((p, _), r)| {
             let d = composed.iter().find(|(q, _)| q == p).and_then(|(_, f)| f.as_ref().ok()).map(|(d, _)| d.seconds_ago);
-            (*p, r.as_deref().zip(d).and_then(|(r, sa)| abi::decode_twap(r, sa)))
+            (*p, r.as_deref().zip(d).and_then(|(r, sa)| twap_tick(hooked.contains(p), r, sa)))
         })
         .collect();
     Ok(composed
@@ -1103,19 +1117,22 @@ impl PoolBook {
     /// fee. A pool loaded without one stays without until it is reloaded.
     pub async fn refresh_twaps(&self, reads: &ChainReads, block: u64) -> Result<usize, ReadError> {
         let snap = self.snapshot();
-        let targets: Vec<(Address, u32)> = snap
+        let targets: Vec<(Address, u32, bool)> = snap
             .values()
-            .filter_map(|p| p.dynamic_fee.filter(|d| d.twap_tick.is_some()).map(|d| (p.spec.pool, d.seconds_ago)))
+            .filter_map(|p| {
+                let down = p.spec.venue.twap_rounds_down();
+                p.dynamic_fee.filter(|d| d.twap_tick.is_some()).map(|d| (p.spec.pool, d.seconds_ago, down))
+            })
             .collect();
         if targets.is_empty() {
             return Ok(0);
         }
-        let calls: Vec<(Address, Vec<u8>)> = targets.iter().map(|(p, sa)| (*p, abi::call_observe(*sa))).collect();
+        let calls: Vec<(Address, Vec<u8>)> = targets.iter().map(|(p, sa, _)| (*p, abi::call_observe(*sa))).collect();
         let answers = reads.multicall(&calls, block).await?;
         let twaps: Vec<(Address, Option<i32>)> = targets
             .iter()
             .zip(answers)
-            .map(|((p, sa), a)| (*p, a.as_deref().and_then(|d| abi::decode_twap(d, *sa))))
+            .map(|((p, sa, down), a)| (*p, a.as_deref().and_then(|d| twap_tick(*down, d, *sa))))
             .collect();
         Ok(self.write(|map, w, status| {
             let mut changed = 0;
