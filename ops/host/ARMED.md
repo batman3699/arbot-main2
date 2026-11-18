@@ -746,6 +746,35 @@ While the keyed provider is out, the report's `rpc` and the journal's
 canary's own sends go to `rpc.http[0]` and the sequencer, never to a
 fallback.
 
+### f. Switched on: both lanes live (2026-11-18, the operator's decision)
+
+`ops/canary.base.yaml` runs §6d: R39 on `LeanExecutor2` with the key file's
+first 16 keys, and the sized lane's two spike tiers alone (6 senders at 20
+gwei, 2 at 157 gwei) on the next 8, to `LeanExecutor3` at
+`0xf7E38331f605a5cBE5062948804e243Ab2dF17Da`. In order:
+
+1. The host, as root: the eight keys, then one file of all 24, R39's first.
+   Neither command overwrites a file.
+   ```
+   # sudo -u apex /opt/apex/bin/apex keys new --count 8 --out /opt/apex/var/armed/armed-spike.keys
+   # (umask 377; cat armed.keys armed-spike.keys > armed24.keys.tmp) && chown apex:apex armed24.keys.tmp && mv armed24.keys.tmp armed24.keys
+   ```
+   `ops/armed-senders-spike.json` lists the eight addresses for `LeanExecutor3`.
+   `-20gwei.json` (the first six, 0.0203 ETH) and `-157gwei.json` (the last
+   two, 0.1575 ETH) are their funding.
+2. The owner deploys `LeanExecutor3` (§5c step 1). Its code hash must print
+   `0xfc90…0767`, the shadow's `code_hash`.
+3. The owner authorizes the eight senders:
+   `--sig "runBatchFrom(string)" ops/armed-senders-spike.json`.
+4. The owner funds them: `FundArmedSenders.s.sol --sig "runFrom(string)"`,
+   once for each funding file. The script refuses more than 0.2 ETH a sender.
+5. Deploy the revision (README §7) and restart `apex-canary`. The boot logs
+   both workers' senders. The report's `armed.live_sized` is the sized lane's.
+
+Rollback: `armed.sized.mode: shadow`, `max_senders: 24` and
+`keys_file: var/armed/armed.keys`, then a restart. R39's lane is untouched.
+`var/armed/armed.disable` stops both workers.
+
 ## 7. R44: Slipstream's third factory
 
 Aerodrome's third Slipstream factory, `0x9CB220581b91b0C83223012FE69688b92aD07a76`

@@ -106,38 +106,36 @@ armed:
   executor2:
     address: "0x443A997cF27Dac4BB32e007d4168492abC77ad6e"
     code_hash: "0xb67e7dd210e440dae114d36ca40d13d65fd2150a26a71dc53c86a3af83b39c7e"
-  # R40.1: the sized lane, LeanExecutor3's, beside R39's on the same feed: in
-  # shadow it arms and records, and never sends. Until the owner deploys it,
-  # the address is a placeholder with no code, and the evaluator simulates
-  # every fire against runtime_code put there (`forge inspect LeanExecutor3
-  # deployedBytecode`, packaged by ops/host/deploy.sh), whose keccak is
-  # code_hash. Live refuses runtime_code. Both lanes are live only with
-  # this one on its spike tiers alone (ops/host/ARMED.md §5, §6).
+  # R40.1: the sized lane, LeanExecutor3's, beside R39's on the same feed.
+  # R43 live (2026-11-18, the operator's decision): both lanes send (ops/host/
+  # ARMED.md §6d). R39 keeps the key file's first 16 keys and LeanExecutor2;
+  # this lane sends its spike tiers alone, on the next 8 keys, to
+  # LeanExecutor3, deployed by the owner with script/DeployLeanExecutor3.s.sol.
+  # The boot reads its code from the chain: a keccak other than code_hash
+  # arms nothing, and live refuses to boot.
   sized:
-    mode: shadow
+    mode: live
     ledger: var/apex/armed-sized.jsonl
     verdicts: var/apex/armed-sized-verdicts.jsonl
+    live_ledger: var/armed/armed-live-sized.jsonl
     executor3:
-      address: "0x00000000000000000000000000000000000e3e03"
+      address: "0xf7E38331f605a5cBE5062948804e243Ab2dF17Da"
       code_hash: "0xfc900951ded02368fc5e39d88682d01d9af72eb75552fc1b1e88283ee5110767"
-      runtime_code: var/armed/LeanExecutor3.runtime.hex
     # R39 on chain, 2026-10-29 18:23 to 11-03 08:15 UTC: 1 revert in 325
     # sends (16 senders, at most 2 landings a block); the send-rate limit
     # waits for the 32-sender ramp.
     p_revert_ppm: 3100
-    # R43: tiers for large moves, in shadow: they arm and record, and nothing
-    # is sent. Over 2026-11-03..09, 41 trades of $100 or more held 56% of
-    # this lane's routes' value; their winners paid a median 15 gwei, at most
-    # 157. Eight spike senders beside the ordinary sixteen (shadow needs no
-    # keys), so gate C's lane is as it was: slots 16-21 wait for a net of
-    # 0.047 ETH (about $100) and tip a quarter of it, slots 22-23 for 0.47 ETH
-    # and tip a fifth. Each cap is what its sender would be funded for at the
-    # lane's 1,000,000 gas limit: 0.0205 and 0.158 ETH (ops/host/ARMED.md §6).
-    # A pending spike arm holds a NoTrade's cost of the lane's own day's
-    # budget. R43.1: the ordinary tiers hold their worst cases inside armed's
-    # budget, as before the tiers (the first boot applied both to the whole
-    # lane, and the ordinary tier 2 armed at 5 to 10 gwei).
-    max_senders: 24
+    # R43: tiers for large moves. Over 2026-11-03..09, 41 trades of $100 or
+    # more held 56% of this lane's routes' value; their winners paid a median
+    # 15 gwei, at most 157. Live, the lane is its eight spike senders alone
+    # (no ordinary slots): its slots 0-5 wait for a net of 0.047 ETH (about
+    # $85) and tip a quarter of it, slots 6-7 for 0.47 ETH and tip a fifth.
+    # Each cap is what its sender is funded for at the lane's 1,000,000 gas
+    # limit: 0.0203 and 0.1575 ETH (ops/host/ARMED.md §6b). A pending spike
+    # arm holds a NoTrade's cost of the lane's own day's budget; a fire that
+    # finds no paying size returns without trading and still pays its gas at
+    # its bid (up to ~$6 at 20 gwei, ~$48 at 157), which this budget caps.
+    max_senders: 8
     reserve: no_trade
     daily_loss_budget_wei: 100000000000000000  # 0.1 ETH, the spike tiers': the eight hold about 0.06 pending
     tiers:
@@ -162,7 +160,7 @@ armed:
   # fires, 3,261 in four hours, spent BlockPI's prepaid units on 2026-10-29.
   eval_simulations_per_run: 2
   live:
-    keys_file: var/armed/armed.keys
+    keys_file: var/armed/armed24.keys          # R43: R39's 16, then the sized lane's 8
     sequencer: https://mainnet-sequencer.base.org
     ledger: var/armed/armed-live.jsonl
     kill_file: var/armed/armed.disable

@@ -461,7 +461,19 @@ fn the_shipped_canary_config_parses() {
     assert_eq!((a.max_size_wei, a.l1_fee_bound_wei, a.sender_reserve_wei), (5_000_000_000_000_000_000, 1_000_000_000_000, 200_000_000_000_000));
     let live = a.live.as_ref().expect("armed.live");
     assert_eq!(live.sequencer, "https://mainnet-sequencer.base.org");
-    assert_eq!(live.keys_file, std::path::PathBuf::from("var/armed/armed.keys"));
+    // R43 live (the operator, 2026-11-18): both lanes send. R39 keeps the key
+    // file's first 16 keys; the sized lane is its eight spike senders alone,
+    // to the deployed LeanExecutor3, with its own ledger and day's budget.
+    assert_eq!(live.keys_file, std::path::PathBuf::from("var/armed/armed24.keys"));
+    let sz = a.sized.as_ref().expect("armed.sized");
+    assert_eq!(sz.mode, apex_runtime::shadow::config::ArmedMode::Live);
+    assert_eq!(sz.max_senders, 8);
+    assert_eq!(sz.tiers.iter().map(|t| t.senders).sum::<usize>(), sz.max_senders, "the spike tiers hold every sender");
+    assert_eq!(sz.live_ledger.as_deref(), Some(std::path::Path::new("var/armed/armed-live-sized.jsonl")));
+    assert_eq!(sz.daily_loss_budget_wei, Some(100_000_000_000_000_000));
+    assert_eq!(sz.executor3.address, address!("f7E38331f605a5cBE5062948804e243Ab2dF17Da"));
+    assert_eq!(sz.executor3.code_hash, b256!("fc900951ded02368fc5e39d88682d01d9af72eb75552fc1b1e88283ee5110767"));
+    assert!(sz.executor3.runtime_code.is_none(), "live refuses the pre-deploy override");
     // Everything else is the shadow's.
     let shadow = ShadowConfig::load(&path.replace("canary", "shadow"), &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap();
     assert_eq!((c.executor, c.universe), (shadow.executor, shadow.universe));

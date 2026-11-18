@@ -14,8 +14,9 @@ import {Script, console2} from "forge-std/Script.sol";
 /// `--sig "runFrom(string)" <path>` reads another file. (One name each:
 /// `forge script` refuses an overloaded `run`.)
 contract FundArmedSenders is Script {
-    /// A slipped decimal point stops here: no sender holds more.
-    uint256 constant MOST = 0.01 ether;
+    /// A slipped decimal point stops here: no sender holds more. R43: a
+    /// 157 gwei spike sender needs about 0.1575 ETH (ops/host/ARMED.md §6b).
+    uint256 constant MOST = 0.2 ether;
 
     function run() external {
         _run("ops/armed-senders.json");
@@ -31,7 +32,7 @@ contract FundArmedSenders is Script {
         address[] memory senders = vm.parseJsonAddressArray(json, ".senders");
         uint256 amount = vm.parseUint(vm.parseJsonString(json, ".amount_wei"));
         require(senders.length > 0, "no senders");
-        require(amount > 0 && amount <= MOST, "amount_wei is 1 wei to 0.01 ETH");
+        require(amount > 0 && amount <= MOST, "amount_wei is 1 wei to 0.2 ETH");
         uint256 total;
         vm.startBroadcast();
         for (uint256 i; i < senders.length; ++i) {
