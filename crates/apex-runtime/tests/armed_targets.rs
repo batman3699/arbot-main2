@@ -104,9 +104,9 @@ fn routes_are_matched_weth_in_pool_first() {
 fn a_route_without_twenty_bids_bids_against_everyone_s() {
     let routes = [route(p(1), p(2), Some("5,6")), route(p(3), p(4), None)].join(",");
     let t = load(&targets_json("2026-10-24T01:10:00Z", true, &routes, "1,2,3"), GENERATED).unwrap();
-    assert_eq!(t.bids_for(p(1), p(2)), &[5, 6]);
-    assert_eq!(t.bids_for(p(3), p(4)), &[1, 2, 3]);
-    assert_eq!(t.bids_for(p(7), p(8)), &[1, 2, 3], "a route not targeted bids against everyone's too");
+    assert_eq!(t.bids_for(WETH, p(1), p(2)), &[5, 6]);
+    assert_eq!(t.bids_for(WETH, p(3), p(4)), &[1, 2, 3]);
+    assert_eq!(t.bids_for(WETH, p(7), p(8)), &[1, 2, 3], "a route not targeted bids against everyone's too");
 }
 
 /// R41.2: a file with gap band `edges`, p(1), p(2)'s own bands `own` beside
@@ -125,32 +125,61 @@ fn banded_targets(edges: &str, own: &str) -> String {
 #[test]
 fn a_rung_s_winners_are_its_band_s_own_else_its_r36_list() {
     let t = load(&banded_targets("[100,1000]", "[[7],[],[9]]"), GENERATED).unwrap();
-    let w = t.winners_for(p(1), p(2));
+    let w = t.winners_for(WETH, p(1), p(2));
     assert_eq!(w.at(U256::from(99)), &[7], "its own band");
     assert_eq!(w.at(U256::from(100)), &[5, 6], "an edge opens the band above; under twenty of its own there, its R36 list");
     assert_eq!(w.at(U256::from(5_000)), &[9]);
-    assert_eq!(t.winners_for(p(3), p(4)).at(U256::from(50)), &[1, 2, 3], "no bands of its own: R36's, everyone's");
-    assert_eq!(t.winners_for(p(7), p(8)).at(U256::from(50)), &[1, 2, 3], "a route not targeted: everyone's");
+    assert_eq!(t.winners_for(WETH, p(3), p(4)).at(U256::from(50)), &[1, 2, 3], "no bands of its own: R36's, everyone's");
+    assert_eq!(t.winners_for(WETH, p(7), p(8)).at(U256::from(50)), &[1, 2, 3], "a route not targeted: everyone's");
 }
 
+/// A route on p(1), p(2) starting in USDC, beside `banded_targets`'s WETH one.
+fn with_usdc_route(t: String, usdc: &str) -> String {
+    t.replacen(r#"}],"bids_wei_per_gas""#, &format!(r#"}},{usdc}],"bids_wei_per_gas""#), 1)
+}
+
+/// WETH into a pool and USDC into it are opposite trades: each start token's
+/// route bids against its own winners, whichever the file names first.
 #[test]
-fn two_start_tokens_on_one_pool_order_bid_as_the_first_as_r36() {
+fn two_start_tokens_on_one_pool_order_bid_against_their_own() {
     let usdc = format!(r#"{{"pools":["{:#x}","{:#x}"],"usd":1.0,"arbs":3,"start":"{USDC:#x}","bids_wei_per_gas":[8],"bands_wei_per_gas":[[8],[],[]]}}"#, p(1), p(2));
-    let t = banded_targets("[100,1000]", "[[7],[],[]]").replacen(r#"}],"bids_wei_per_gas""#, &format!(r#"}},{usdc}],"bids_wei_per_gas""#), 1);
-    let t = load(&t, GENERATED).unwrap();
-    assert_eq!(t.winners_for(p(1), p(2)).at(U256::from(50)), &[7]);
-    assert_eq!(t.bids_for(p(1), p(2)), &[5, 6]);
+    let weth_first = with_usdc_route(banded_targets("[100,1000]", "[[7],[],[]]"), &usdc);
+    let t = load(&weth_first, GENERATED).unwrap();
+    assert_eq!(t.winners_for(WETH, p(1), p(2)).at(U256::from(50)), &[7]);
+    assert_eq!(t.bids_for(WETH, p(1), p(2)), &[5, 6]);
+    assert_eq!(t.winners_for(USDC, p(1), p(2)).at(U256::from(50)), &[8], "USDC's own band, not WETH's");
+    assert_eq!(t.bids_for(USDC, p(1), p(2)), &[8], "USDC's own list, not WETH's");
+    // The same two routes, USDC's named first: the same answers.
+    let usdc_first = weth_first.replacen(r#""routes":[{"#, &format!(r#""routes":[{usdc},{{"#), 1);
+    let usdc_first = usdc_first.replacen(&format!(r#"}},{usdc}],"bids_wei_per_gas""#), r#"}],"bids_wei_per_gas""#, 1);
+    let t = load(&usdc_first, GENERATED).unwrap();
+    assert_eq!(t.routes[0].start, USDC, "the fixture names USDC's first");
+    assert_eq!(t.winners_for(WETH, p(1), p(2)).at(U256::from(50)), &[7]);
+    assert_eq!(t.winners_for(USDC, p(1), p(2)).at(U256::from(50)), &[8]);
+}
+
+/// A start token's route with nothing of its own bids against everyone's,
+/// never the other start token's on the same pools.
+#[test]
+fn a_route_without_its_own_winners_never_borrows_the_other_start_token_s() {
+    let usdc = format!(r#"{{"pools":["{:#x}","{:#x}"],"usd":1.0,"arbs":3,"start":"{USDC:#x}"}}"#, p(1), p(2));
+    let t = load(&with_usdc_route(banded_targets("[100,1000]", "[[7],[],[]]"), &usdc), GENERATED).unwrap();
+    assert_eq!(t.winners_for(USDC, p(1), p(2)).at(U256::from(50)), &[1, 2, 3], "everyone's, not WETH's [7]");
+    assert_eq!(t.bids_for(USDC, p(1), p(2)), &[1, 2, 3], "everyone's, not WETH's [5, 6]");
+    let other = Address::with_last_byte(0xee);
+    assert_eq!(t.winners_for(other, p(1), p(2)).at(U256::from(50)), &[1, 2, 3], "a start token not targeted: everyone's");
+    assert_eq!(t.winners_for(WETH, p(1), p(2)).at(U256::from(50)), &[7], "WETH's is untouched");
 }
 
 #[test]
 fn bands_that_do_not_line_up_are_not_read() {
     for (edges, own) in [("[1000,100]", "[[7],[],[9]]"), ("[100,1000]", "[[7],[9]]")] {
         let t = load(&banded_targets(edges, own), GENERATED).unwrap();
-        assert_eq!(t.winners_for(p(1), p(2)).at(U256::from(50)), &[5, 6], "R36's: {edges} {own}");
-        assert_eq!(t.winners_for(p(1), p(2)).at(U256::from(5_000)), &[5, 6], "R36's: {edges} {own}");
+        assert_eq!(t.winners_for(WETH, p(1), p(2)).at(U256::from(50)), &[5, 6], "R36's: {edges} {own}");
+        assert_eq!(t.winners_for(WETH, p(1), p(2)).at(U256::from(5_000)), &[5, 6], "R36's: {edges} {own}");
     }
     let t = load(&targets_json("2026-10-24T01:10:00Z", true, &route(p(1), p(2), Some("5,6")), "1,2,3"), GENERATED).unwrap();
-    assert_eq!(t.winners_for(p(1), p(2)).at(U256::from(50)), t.bids_for(p(1), p(2)), "a file without bands bids as R36's did");
+    assert_eq!(t.winners_for(WETH, p(1), p(2)).at(U256::from(50)), t.bids_for(WETH, p(1), p(2)), "a file without bands bids as R36's did");
 }
 
 #[test]
@@ -164,6 +193,45 @@ fn a_stale_or_malformed_file_is_refused() {
     assert!(load(&good.replace("12.5", "1e400"), GENERATED).is_err(), "a value past f64");
     assert!(load(&good.replace("12.5", "-1.0"), GENERATED).is_err(), "a negative value");
     assert!(load(&good.replace("2026-10-24T01:10:00Z", "yesterday"), GENERATED).is_err(), "an unreadable time");
+}
+
+/// A file stamped later than now by more than the clock skew allowed is
+/// refused, not read as brand new.
+#[test]
+fn a_file_from_the_future_is_refused() {
+    use apex_runtime::armed::targets::CLOCK_SKEW_S;
+    let good = targets_json("2026-10-24T01:10:00Z", true, &route(p(1), p(2), None), "1");
+    assert!(load(&good, GENERATED).is_ok());
+    assert!(load(&good, GENERATED - CLOCK_SKEW_S).is_ok(), "within the skew allowed");
+    let err = load(&good, GENERATED - CLOCK_SKEW_S - 1).unwrap_err();
+    assert!(err.contains("future"), "{err}");
+}
+
+/// The bid rules read winners as sorted lists: one out of order is refused.
+#[test]
+fn winners_out_of_order_are_refused() {
+    let good = load(&banded_targets("[100,1000]", "[[7,9],[],[]]"), GENERATED);
+    assert!(good.is_ok(), "{good:?}");
+    let everyone = targets_json("2026-10-24T01:10:00Z", true, &route(p(1), p(2), None), "3,1");
+    let own = targets_json("2026-10-24T01:10:00Z", true, &route(p(1), p(2), Some("6,5")), "1");
+    for (what, text) in [("everyone's", everyone), ("a route's own", own), ("a band's", banded_targets("[100,1000]", "[[9,7],[],[]]"))] {
+        let err = load(&text, GENERATED).unwrap_err();
+        assert!(err.contains("ascend"), "{what}: {err}");
+    }
+    let equal = targets_json("2026-10-24T01:10:00Z", true, &route(p(1), p(2), Some("5,5")), "1,1");
+    assert!(load(&equal, GENERATED).is_ok(), "equal winners are in order");
+}
+
+/// One route, start token and pools alike, named twice is refused; the same
+/// pools in the other start token are another route.
+#[test]
+fn one_route_named_twice_is_refused() {
+    let twice = targets_json("2026-10-24T01:10:00Z", true, &[route(p(1), p(2), None), route(p(1), p(2), None)].join(","), "1");
+    let err = load(&twice, GENERATED).unwrap_err();
+    assert!(err.contains("twice"), "{err}");
+    let usdc = format!(r#"{{"pools":["{:#x}","{:#x}"],"usd":1.0,"arbs":3,"start":"{USDC:#x}"}}"#, p(1), p(2));
+    let both = targets_json("2026-10-24T01:10:00Z", true, &[route(p(1), p(2), None), usdc].join(","), "1");
+    assert!(load(&both, GENERATED).is_ok(), "two start tokens: two routes");
 }
 
 /// The arming engine's settings in `mode`. Built directly: the config file

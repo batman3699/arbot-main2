@@ -199,7 +199,7 @@ fn every_arm_carries_its_bid() {
         max_size_wei: u128::MAX,
         max_size_usdc: u128::MAX,
     };
-    let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _| RouteWinners::unbanded(BIDS.to_vec())));
+    let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _, _| RouteWinners::unbanded(BIDS.to_vec())));
     let arms: Vec<_> = engine
         .tick(&snap, 1_000, 5_000_000, &px(), 1)
         .into_iter()
@@ -238,7 +238,7 @@ fn a_rung_that_outbids_no_one_takes_no_sender() {
         max_size_usdc: u128::MAX,
     };
     // Winners who paid a whole ETH per gas: no surplus here outbids them.
-    let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _| RouteWinners::unbanded(vec![10u128.pow(18)])));
+    let engine = Engine::new(cycles, settings, BTreeSet::new()).with_bids(Arc::new(|_, _, _| RouteWinners::unbanded(vec![10u128.pow(18)])));
     assert!(engine.tick(&snap, 1_000, 5_000_000, &px(), 1).is_empty());
 }
 
@@ -253,7 +253,7 @@ fn a_rung_bids_against_its_own_bands_winners() {
         let whole_eth: Arc<[u128]> = vec![10u128.pow(18)].into();
         let w = RouteWinners { all: Arc::clone(&whole_eth), bands: Some((vec![edge].into(), vec![BIDS.to_vec().into(), whole_eth])) };
         Engine::new(cycles.clone(), settings(20_000_000), BTreeSet::new())
-            .with_bids(Arc::new(move |_, _| w.clone()))
+            .with_bids(Arc::new(move |_, _, _| w.clone()))
             .tick(&snap, 1_000, 5_000_000, &px(), 1)
             .into_iter()
             .filter_map(|l| if let ArmedLine::Arm(a) = l { Some(a) } else { None })
@@ -281,7 +281,7 @@ fn every_arm_carries_both_rules_bids() {
     let mut sent_by = Vec::new();
     for (model, label) in [(BidModel::BestBid, "best_bid"), (BidModel::BestShare, "best_share")] {
         let engine = Engine::new(cycles.clone(), settings(20_000_000), BTreeSet::new())
-            .with_bids(Arc::new(|_, _| RouteWinners::unbanded(BIDS.to_vec())))
+            .with_bids(Arc::new(|_, _, _| RouteWinners::unbanded(BIDS.to_vec())))
             .with_contest(Some(Arc::clone(&sample)), model);
         let arms: Vec<_> = engine
             .tick(&snap, 1_000, 5_000_000, &px(), 1)
@@ -308,7 +308,7 @@ fn every_arm_carries_both_rules_bids() {
 fn without_a_sample_an_arm_records_best_bid_alone() {
     let snap = snap();
     let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
-    let engine = Engine::new(cycles, settings(20_000_000), BTreeSet::new()).with_bids(Arc::new(|_, _| RouteWinners::unbanded(BIDS.to_vec())));
+    let engine = Engine::new(cycles, settings(20_000_000), BTreeSet::new()).with_bids(Arc::new(|_, _, _| RouteWinners::unbanded(BIDS.to_vec())));
     let arms: Vec<_> = engine
         .tick(&snap, 1_000, 5_000_000, &px(), 1)
         .into_iter()
@@ -318,4 +318,26 @@ fn without_a_sample_an_arm_records_best_bid_alone() {
     for a in &arms {
         assert_eq!((a.bid_model.as_deref(), a.alt_bid_wei_per_gas.as_deref(), a.alt_p_win, a.model_version.as_deref()), (Some("best_bid"), None, None, None));
     }
+}
+
+/// What a bid callback was asked: each cycle's start token and pools.
+type Asked = Arc<std::sync::Mutex<BTreeSet<(Address, Address, Address)>>>;
+
+/// The census keys winners by start token too (WETH into a pool and USDC
+/// into it are opposite trades): the engine asks in each cycle's own.
+#[test]
+fn the_engine_asks_each_cycle_s_winners_in_its_start_token() {
+    let snap = snap();
+    let (_, cycles) = frontier::build_starts(ChainId(8453), &[WETH, USDC], &snap);
+    assert!(cycles.values().any(|c| c.start == USDC) && cycles.values().any(|c| c.start == WETH), "the fixture has both");
+    let asked: Asked = Arc::default();
+    let seen = Arc::clone(&asked);
+    let engine = Engine::new(cycles.clone(), settings(20_000_000), BTreeSet::new()).with_bids(Arc::new(move |start, a, b| {
+        seen.lock().unwrap().insert((start, a, b));
+        RouteWinners::unbanded(BIDS.to_vec())
+    }));
+    engine.tick(&snap, 1_000, 5_000_000, &px(), 1);
+    let asked = asked.lock().unwrap().clone();
+    let routes: BTreeSet<_> = cycles.values().map(|c| (c.start, c.legs[0].pool, c.legs[1].pool)).collect();
+    assert_eq!(asked, routes, "every cycle asked once each, in its own start token");
 }

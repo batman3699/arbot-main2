@@ -346,7 +346,7 @@ impl SizedEngine {
         };
         Self {
             cycles,
-            bids: Arc::new(|_, _| RouteWinners::default()),
+            bids: Arc::new(|_, _, _| RouteWinners::default()),
             rank: Arc::new(|_| 0.0),
             contest: None,
             bid_model: BidModel::BestBid,
@@ -464,7 +464,7 @@ impl SizedEngine {
         let pair = [Arc::clone(snapshot.get(&c.legs[0].pool)?), Arc::clone(snapshot.get(&c.legs[1].pool)?)];
         let pxc = px.for_cycle(c)?;
         let (terms, lender) = self.terms_for(c, &pxc, l1_upper_wei, self.settings.max_size(c.start));
-        let winners = (self.bids)(c.legs[0].pool, c.legs[1].pool);
+        let winners = (self.bids)(c.start, c.legs[0].pool, c.legs[1].pool);
         let inputs = BidInputs { winners: &winners.all, banded: Some(&winners), sample: self.contest.as_deref(), model: self.bid_model };
         let cap = self.settings.max_priority_wei_per_gas;
         let l = usize::from(leg);

@@ -843,7 +843,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
                     let t = targets.clone();
                     let ranked = targets.clone();
                     let engine = crate::armed::sized::SizedEngine::new(armed_set.clone(), settings, unarmable.clone())
-                        .with_bids(Arc::new(move |weth_in, other| t.as_ref().map_or_else(Default::default, |t| t.winners_for(weth_in, other))))
+                        .with_bids(Arc::new(move |start, start_in, other| t.as_ref().map_or_else(Default::default, |t| t.winners_for(start, start_in, other))))
                         // R43: a spike tier's senders go where the census found the most value.
                         .with_rank(Arc::new(move |c| ranked.as_ref().map_or(0.0, |t| t.usd_for(c.start, c.legs[0].pool, c.legs[1].pool))))
                         .with_contest(contest.clone(), config.armed.bid_model);
@@ -875,7 +875,7 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
     let armed = Arc::new(crate::armed::engine::Engine::new(armed_set.clone(), engine_settings, unarmable)
     .with_bids({
         let t = targets.clone();
-        Arc::new(move |weth_in, other| t.as_ref().map_or_else(Default::default, |t| t.winners_for(weth_in, other)))
+        Arc::new(move |start, start_in, other| t.as_ref().map_or_else(Default::default, |t| t.winners_for(start, start_in, other)))
     })
     .with_contest(contest, config.armed.bid_model));
     // R36: the move statistics an earlier run saved (or a seed wrote), so the

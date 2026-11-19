@@ -11,6 +11,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
+/// How far ahead of this host's clock a file's `generated_at` may be: the
+/// census runs on the same host, so only a small step of the clock.
+pub const CLOCK_SKEW_S: u64 = 300;
+
+/// A route's key: its start token, then its pools, start-in pool first. WETH
+/// into a WETH/USDC pool and USDC into it are opposite trades, with their own
+/// winners.
+pub type RouteKey = (Address, [Address; 2]);
+
 /// R41.2: the band edges in wei, ascending, and each band's winners: one
 /// more list than edges.
 pub type Bands = (Arc<[u128]>, Vec<Arc<[u128]>>);
@@ -120,10 +129,10 @@ pub struct Targets {
     /// so that a malformed one never refuses the targets.
     #[serde(default)]
     pub contest: Option<serde_json::Value>,
-    /// R41.2: each route's winners, and everyone's (R36's, unbanded),
-    /// built by `load`.
+    /// R41.2: each route's winners, by start token and pools, and
+    /// everyone's (R36's, unbanded), built by `load`.
     #[serde(skip)]
-    winners: BTreeMap<[Address; 2], RouteWinners>,
+    winners: BTreeMap<RouteKey, RouteWinners>,
     #[serde(skip)]
     everyone: RouteWinners,
 }
@@ -140,14 +149,22 @@ struct Contest {
 }
 
 impl Targets {
-    /// The file at `path`, refused when older than `max_age_s` at `now_unix`,
-    /// or when a route is malformed.
+    /// The file at `path`, refused when older than `max_age_s` at `now_unix`
+    /// or stamped more than [`CLOCK_SKEW_S`] after it, when a route is
+    /// malformed or named twice, or when a winners' list does not ascend.
     pub fn load(path: &Path, now_unix: u64, max_age_s: u64) -> Result<Self, String> {
         let shown = path.display();
         let text = std::fs::read_to_string(path).map_err(|e| format!("targets file {shown}: {e}"))?;
         let mut t: Self = serde_json::from_str(&text).map_err(|e| format!("targets file {shown}: {e}"))?;
         let at = unix_of(&t.generated_at)
             .ok_or_else(|| format!("targets file {shown}: generated_at {:?} is not YYYY-MM-DDTHH:MM:SSZ", t.generated_at))?;
+        if at > now_unix.saturating_add(CLOCK_SKEW_S) {
+            return Err(format!(
+                "targets file {shown} is from the future: generated {}, {} s after this host's clock, at most {CLOCK_SKEW_S} s allowed",
+                t.generated_at,
+                at - now_unix
+            ));
+        }
         let age = now_unix.saturating_sub(at);
         if age > max_age_s {
             return Err(format!(
@@ -155,7 +172,22 @@ impl Targets {
                 t.generated_at
             ));
         }
+        let ascends = |v: &[u128]| v.windows(2).all(|w| w[0] <= w[1]);
+        if !ascends(&t.bids_wei_per_gas) {
+            return Err(format!("targets file {shown}: everyone's winners do not ascend"));
+        }
+        let mut keys = BTreeSet::new();
         for r in &t.routes {
+            let named = format!("the route {:#x}, {:#x} from {:#x}", r.pools[0], r.pools[1], r.start);
+            if !keys.insert((r.start, r.pools)) {
+                return Err(format!("targets file {shown}: {named} is named twice"));
+            }
+            if !r.bids_wei_per_gas.as_deref().is_none_or(ascends) {
+                return Err(format!("targets file {shown}: {named}'s winners do not ascend"));
+            }
+            if !r.bands_wei_per_gas.iter().flatten().all(|b| ascends(b)) {
+                return Err(format!("targets file {shown}: {named}'s winners in a band do not ascend"));
+            }
             if r.pools[0] == r.pools[1] {
                 return Err(format!("targets file {shown}: a route whose two pools are both {:#x}", r.pools[0]));
             }
@@ -183,8 +215,8 @@ impl Targets {
                 let lists = own.iter().map(|b| if b.is_empty() { Arc::clone(&own_all) } else { Arc::from(b.as_slice()) }).collect();
                 (Arc::clone(edges), lists)
             });
-            // As `bids_for`: the first route on these pools, in either start token.
-            by_route.entry(r.pools).or_insert(RouteWinners { all: own_all, bands });
+            // `load` refuses a route named twice: one entry a route.
+            by_route.entry((r.start, r.pools)).or_insert(RouteWinners { all: own_all, bands });
         }
         self.everyone = RouteWinners { all, bands: None };
         self.winners = by_route;
@@ -214,20 +246,21 @@ impl Targets {
         self.routes.iter().filter(|r| r.start == start && r.pools == [start_in, other]).map(|r| r.usd).sum()
     }
 
-    /// The winners' bids an arm on that route bids against: its own when it
-    /// has them, every targeted route's otherwise.
-    pub fn bids_for(&self, weth_in: Address, other: Address) -> &[u128] {
+    /// The winners' bids an arm on the route `start` into `start_in`, then
+    /// `other`, bids against: its own when it has them, every targeted
+    /// route's otherwise, never the other start token's on the same pools.
+    pub fn bids_for(&self, start: Address, start_in: Address, other: Address) -> &[u128] {
         self.routes
             .iter()
-            .find(|r| r.pools == [weth_in, other])
+            .find(|r| r.start == start && r.pools == [start_in, other])
             .and_then(|r| r.bids_wei_per_gas.as_deref())
             .unwrap_or(&self.bids_wei_per_gas)
     }
 
     /// R41.2: the winners an arm on that route bids against, by the gap it
     /// would take: `bids_for`'s, banded when the census banded them.
-    pub fn winners_for(&self, weth_in: Address, other: Address) -> RouteWinners {
-        self.winners.get(&[weth_in, other]).unwrap_or(&self.everyone).clone()
+    pub fn winners_for(&self, start: Address, start_in: Address, other: Address) -> RouteWinners {
+        self.winners.get(&(start, [start_in, other])).unwrap_or(&self.everyone).clone()
     }
 
     /// R38: the contest sample the arms' `best_share` bids against, or why

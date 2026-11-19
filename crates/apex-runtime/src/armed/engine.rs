@@ -151,9 +151,10 @@ pub struct EngineStats {
     pub current_total: u64,
 }
 
-/// The measured winners' bids per gas on a route, WETH-in pool first (R36),
-/// by the gap they took (R41.2).
-pub type RouteBids = Arc<dyn Fn(Address, Address) -> RouteWinners + Send + Sync>;
+/// The measured winners' bids per gas on a route, by the gap they took
+/// (R41.2): asked with the cycle's start token, then its pools, start-in
+/// pool first (R36). WETH into a pool and USDC into it are opposite trades.
+pub type RouteBids = Arc<dyn Fn(Address, Address, Address) -> RouteWinners + Send + Sync>;
 
 pub struct Engine {
     cycles: BTreeMap<RouteId, Cycle>,
@@ -212,7 +213,7 @@ impl Engine {
         let slots = 2 * cycles.values().filter(|c| !c.legs.iter().any(|l| unarmable.contains(&l.pool))).count() as u64;
         Self {
             cycles,
-            bids: Arc::new(|_, _| RouteWinners::default()),
+            bids: Arc::new(|_, _, _| RouteWinners::default()),
             contest: None,
             bid_model: BidModel::BestBid,
             settings,
@@ -471,7 +472,7 @@ impl Engine {
                 let (id, leg) = work[i];
                 let c = &self.cycles[&id];
                 let pair = [Arc::clone(&snapshot[&c.legs[0].pool]), Arc::clone(&snapshot[&c.legs[1].pool])];
-                let winners = (self.bids)(c.legs[0].pool, c.legs[1].pool);
+                let winners = (self.bids)(c.start, c.legs[0].pool, c.legs[1].pool);
                 // R41.2: each rung against the winners of gaps its size.
                 let inputs = BidInputs { winners: &winners.all, banded: Some(&winners), sample: self.contest.as_deref(), model: self.bid_model };
                 // R37: priced in the cycle's own start token; a USDC cycle

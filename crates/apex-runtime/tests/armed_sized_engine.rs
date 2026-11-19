@@ -172,14 +172,8 @@ fn engine(max_senders: usize) -> (SizedEngine, BTreeMap<Address, Arc<PoolSnapsho
     engine_with(max_senders, Vec::new(), Reserve::WorstCase)
 }
 
-fn engine_with(max_senders: usize, tiers: Vec<SpikeTier>, reserve: Reserve) -> (SizedEngine, BTreeMap<Address, Arc<PoolSnapshot>>) {
-    let snap: BTreeMap<Address, Arc<PoolSnapshot>> =
-        [(UNI, pool(UNI, Venue::UniswapV3, -197_350, 500)), (CAKE, pool(CAKE, Venue::PancakeV3, -197_350, 100))]
-            .into_iter()
-            .map(|(a, p)| (a, Arc::new(p)))
-            .collect();
-    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
-    let settings = SizedSettings {
+fn sized_settings(max_senders: usize, tiers: Vec<SpikeTier>, reserve: Reserve) -> SizedSettings {
+    SizedSettings {
         max_senders,
         window_s: 10,
         block_time_ms: 200,
@@ -201,7 +195,17 @@ fn engine_with(max_senders: usize, tiers: Vec<SpikeTier>, reserve: Reserve) -> (
         tiers,
         reserve,
         ordinary_budget_wei: u128::MAX,
-    };
+    }
+}
+
+fn engine_with(max_senders: usize, tiers: Vec<SpikeTier>, reserve: Reserve) -> (SizedEngine, BTreeMap<Address, Arc<PoolSnapshot>>) {
+    let snap: BTreeMap<Address, Arc<PoolSnapshot>> =
+        [(UNI, pool(UNI, Venue::UniswapV3, -197_350, 500)), (CAKE, pool(CAKE, Venue::PancakeV3, -197_350, 100))]
+            .into_iter()
+            .map(|(a, p)| (a, Arc::new(p)))
+            .collect();
+    let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+    let settings = sized_settings(max_senders, tiers, reserve);
     (SizedEngine::new(cycles, settings, BTreeSet::new()), snap)
 }
 
@@ -685,4 +689,27 @@ fn the_lazy_fill_values_an_arm_only_when_it_may_be_chosen() {
     assert_eq!(eager_asked.len(), 6 + 5 + 5 + 4, "every arm of the group, the small one too, after every pick");
     assert_eq!(lazy_asked.len(), 5 + 5 + 4);
     assert!(!lazy_asked.contains(&route(12)), "the arm that can never reach the top is never valued again");
+}
+
+/// The census keys winners by start token too: the sized engine asks in each
+/// cycle's own, USDC's priced at the book's WETH/USDC rate.
+#[test]
+fn the_sized_engine_asks_each_cycle_s_winners_in_its_start_token() {
+    let (_, snap) = engine(16);
+    let (_, cycles) = frontier::build_starts(ChainId(8453), &[WETH, USDC], &snap);
+    assert!(cycles.values().any(|c| c.start == USDC) && cycles.values().any(|c| c.start == WETH), "the fixture has both");
+    let settings = sized_settings(16, Vec::new(), Reserve::WorstCase);
+    let asked: Arc<std::sync::Mutex<BTreeSet<(Address, Address, Address)>>> = Arc::default();
+    let seen = Arc::clone(&asked);
+    let e = SizedEngine::new(cycles.clone(), settings, BTreeSet::new()).with_bids(Arc::new(move |start, a, b| {
+        seen.lock().unwrap().insert((start, a, b));
+        apex_runtime::armed::targets::RouteWinners::unbanded(vec![0])
+    }));
+    let px = Pricing { start_per_eth: apex_runtime::armed::threshold::start_per_eth(&snap), ..px() };
+    e.tick(&snap, 1_000, 300_000, &px, 1, 10_000_000_000_000_000, 1_500_000_000);
+    let asked = asked.lock().unwrap().clone();
+    assert!(asked.iter().any(|(s, _, _)| *s == USDC), "a USDC cycle asked in USDC: {asked:?}");
+    assert!(asked.iter().any(|(s, _, _)| *s == WETH), "a WETH cycle asked in WETH: {asked:?}");
+    let routes: BTreeSet<_> = cycles.values().map(|c| (c.start, c.legs[0].pool, c.legs[1].pool)).collect();
+    assert!(asked.is_subset(&routes), "only cycles' own (start, pools): {asked:?}");
 }
