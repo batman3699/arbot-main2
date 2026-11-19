@@ -234,7 +234,9 @@ struct Record {
 /// fee tier, so it may stand in — the census's own rule.
 ///
 /// A pool in `include` (R36: a pool the census targets) passes the depth
-/// floor; the fee ceiling and the venue's own rules still hold for it.
+/// floor and (R47) the fee ceiling: the census saw it pay, and pricing is
+/// exact at any fee. A fee nobody read (0) and the venue's own rules, v4's
+/// admission rules among them, still hold for it.
 ///
 /// v4 pools (R37) come from `uniswap_v4/pools.jsonl`, which may be absent: no
 /// file, no v4 pools. A record [`crate::live::v4::refusal`] refuses, or whose
@@ -286,7 +288,7 @@ pub fn load(
             };
             let Ok(fee) = u32::try_from(fee) else { continue };
             let depth = r.hub_usd_liquidity.unwrap_or(0.0);
-            if fee == 0 || fee > filter.max_fee_ppm || (depth < filter.min_depth_usd && !include.contains(&r.pool)) {
+            if fee == 0 || (!include.contains(&r.pool) && (fee > filter.max_fee_ppm || depth < filter.min_depth_usd)) {
                 continue;
             }
             out.push(PoolSpec {
@@ -362,7 +364,7 @@ fn load_v4(
             continue;
         }
         let depth = r.hub_usd_liquidity.unwrap_or(0.0);
-        if r.fee > filter.max_fee_ppm || (depth < filter.min_depth_usd && !include.contains(&pool)) {
+        if !include.contains(&pool) && (r.fee > filter.max_fee_ppm || depth < filter.min_depth_usd) {
             continue;
         }
         if out.iter().any(|s| s.pool == pool) {

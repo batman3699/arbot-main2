@@ -258,6 +258,10 @@ capacity:
 # pools and 212 cycles, holding $8.5k a week of the R23 census's two-hop WETH
 # arbitrage against $7.5k at $100k; each pool adds at most ~64 MB a day of
 # BlockPI traffic.
+# R47 (operator, 2026-11-20): a pool the census targets passes the fee cap as
+# well as the floor. Targeted pools over 3,000 ppm held 23% of the rival profit
+# on our routes over 2026-11-15..18; on 11-19's targets the exception loads 13
+# more pools and makes 11 more routes armable.
 universe:
   max_fee_ppm: 3000
   min_depth_usd: 50000

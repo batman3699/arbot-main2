@@ -134,6 +134,24 @@ fn a_load_that_refuses_nothing_says_nothing_of_refusals() {
     assert!(!logs.contains("refused"), "{logs}");
 }
 
+/// R47: a targeted v4 pool passes the fee cap as it passes the depth floor.
+#[test]
+fn a_targeted_v4_pool_over_the_fee_cap_loads() {
+    let dir = inventory(&[], Some(&[record(&format!("{AXIS_POOL:#x}"), 10_000, 200, &format!("{ALPHA:#x}"))]));
+    assert!(load(dir.path(), filter(), &BTreeSet::new(), &allow_alpha()).unwrap().is_empty(), "10,000 ppm is over the 3,000 cap");
+    let targeted = BTreeSet::from([key_address(AXIS_POOL)]);
+    let specs = load(dir.path(), filter(), &targeted, &allow_alpha()).unwrap();
+    assert_eq!(specs.iter().map(|s| (s.pool, s.fee_ppm)).collect::<Vec<_>>(), vec![(key_address(AXIS_POOL), 10_000)]);
+}
+
+#[test]
+fn a_targeted_v4_pool_the_admission_rules_refuse_stays_refused() {
+    let dynamic = "0x2222222222222222222222222222222222222222222222222222222222222222";
+    let dir = inventory(&[], Some(&[record(dynamic, 0x80_0000, 60, "0x0000000000000000000000000000000000000000")]));
+    let targeted = BTreeSet::from([key_address(dynamic.parse().unwrap())]);
+    assert!(load(dir.path(), filter(), &targeted, &allow_alpha()).unwrap().is_empty(), "a dynamic fee is refused, targeted or not");
+}
+
 #[test]
 fn a_key_colliding_with_an_inventoried_pool_is_dropped() {
     let v3 = format!(

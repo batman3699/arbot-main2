@@ -51,12 +51,17 @@ fn load(text: &str, now: u64) -> Result<Targets, String> {
 
 /// One venue's inventory: `(pool, depth)` WETH/USDC records at 500 ppm.
 fn inventory_dir(records: &[(u8, f64)]) -> tempfile::TempDir {
+    inventory_dir_at(&records.iter().map(|&(n, depth)| (n, depth, 500)).collect::<Vec<_>>())
+}
+
+/// One venue's inventory: `(pool, depth, fee ppm)` WETH/USDC records.
+fn inventory_dir_at(records: &[(u8, f64, u32)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let lines: Vec<String> = records
         .iter()
-        .map(|(n, depth)| {
+        .map(|(n, depth, fee)| {
             serde_json::json!({ "pool": format!("{:#x}", p(*n)), "token0": format!("{WETH:#x}"), "token1": format!("{USDC:#x}"),
-                                "fee": 500, "fee_ppm_onchain": 500, "hub_usd_liquidity": depth })
+                                "fee": fee, "fee_ppm_onchain": fee, "hub_usd_liquidity": depth })
             .to_string()
         })
         .collect();
@@ -81,6 +86,30 @@ fn a_target_pool_below_the_floor_is_admitted_and_others_are_not() {
     let dir = inventory_dir(&[(1, 5e3), (2, 5e3), (3, 1e6)]);
     assert_eq!(loaded(dir.path(), &BTreeSet::new()), vec![3]);
     assert_eq!(loaded(dir.path(), &BTreeSet::from([p(1)])), vec![1, 3]);
+}
+
+/// R47: the fee cap went the depth floor's way. 23% of the rival profit on our
+/// routes over 2026-11-15..18 ($2,795) sat on targeted pools over 3,000 ppm,
+/// which the cap dropped although the census had seen them pay. Pricing is
+/// exact at any fee, and the executors carry the fee as a uint24.
+#[test]
+fn a_target_pool_over_the_fee_cap_is_admitted_and_others_are_not() {
+    // The cap is 500 ppm: pools 1 and 2 charge 3,988, pool 3 charges 500.
+    let dir = inventory_dir_at(&[(1, 1e6, 3_988), (2, 1e6, 3_988), (3, 1e6, 500)]);
+    assert_eq!(loaded(dir.path(), &BTreeSet::new()), vec![3]);
+    assert_eq!(loaded(dir.path(), &BTreeSet::from([p(1)])), vec![1, 3]);
+}
+
+#[test]
+fn a_target_pool_over_both_the_cap_and_the_floor_is_admitted() {
+    let dir = inventory_dir_at(&[(1, 5e3, 10_000), (3, 1e6, 500)]);
+    assert_eq!(loaded(dir.path(), &BTreeSet::from([p(1)])), vec![1, 3]);
+}
+
+#[test]
+fn a_target_pool_with_no_fee_is_still_refused() {
+    let dir = inventory_dir_at(&[(1, 1e6, 0), (3, 1e6, 500)]);
+    assert_eq!(loaded(dir.path(), &BTreeSet::from([p(1)])), vec![3], "a fee of 0 is a record nobody read");
 }
 
 #[test]
