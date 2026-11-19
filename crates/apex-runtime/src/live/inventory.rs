@@ -343,6 +343,10 @@ fn load_v4(
     };
     let allowed = hooks.addresses();
     let mut out: Vec<PoolSpec> = Vec::new();
+    // Refusals are the admission rules working. The evaluator loads every five
+    // minutes, and one WARN a pool was ~22,000 lines a load (2026-11-19): so
+    // one line a load, by reason, and each pool at debug.
+    let mut refused: BTreeMap<&'static str, usize> = BTreeMap::new();
     for (i, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -353,7 +357,8 @@ fn load_v4(
         let key = V4Key { pool_id: r.pool_id, fee: r.fee, tick_spacing: r.tick_spacing, hooks: r.hooks };
         let pool = key_address(r.pool_id);
         if let Some(why) = refusal(&key, r.currency0, r.currency1, &allowed) {
-            tracing::warn!(pool_id = %r.pool_id, why, "a v4 pool refused");
+            tracing::debug!(pool_id = %r.pool_id, why, "a v4 pool refused");
+            *refused.entry(why).or_default() += 1;
             continue;
         }
         let depth = r.hub_usd_liquidity.unwrap_or(0.0);
@@ -373,6 +378,10 @@ fn load_v4(
             depth_usd: depth,
             v4: Some(key),
         });
+    }
+    if !refused.is_empty() {
+        let by_reason = refused.iter().map(|(why, n)| format!("{why}: {n}")).collect::<Vec<_>>().join(", ");
+        tracing::info!(refused = refused.values().sum::<usize>(), by_reason, "v4 pools refused by the admission rules");
     }
     Ok(out)
 }

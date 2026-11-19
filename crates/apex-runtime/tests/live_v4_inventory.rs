@@ -71,6 +71,69 @@ fn an_unlisted_hook_and_a_dynamic_fee_are_dropped() {
     assert!(load(dir.path(), filter(), &BTreeSet::new(), &allow_alpha()).unwrap().is_empty());
 }
 
+/// What `f` logs at `level` and above, as the binary's plain formatter writes it.
+fn logged(level: tracing::Level, f: impl FnOnce()) -> String {
+    #[derive(Clone)]
+    struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Buf(Default::default());
+    let writer = buf.clone();
+    let subscriber = tracing_subscriber::fmt().with_ansi(false).with_max_level(level).with_writer(move || writer.clone()).finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = buf.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}
+
+fn three_refused() -> tempfile::TempDir {
+    let unlisted = "0x00000000000000000000000000000000000000c0";
+    inventory(
+        &[],
+        Some(&[
+            record("0x1111111111111111111111111111111111111111111111111111111111111111", 100, 1, unlisted),
+            record("0x3333333333333333333333333333333333333333333333333333333333333333", 100, 1, unlisted),
+            record("0x2222222222222222222222222222222222222222222222222222222222222222", 0x80_0000, 60, "0x0000000000000000000000000000000000000000"),
+        ]),
+    )
+}
+
+/// The evaluator loads the inventory every five minutes. One WARN for each
+/// refused pool came to about 22,000 lines a load and 6 GB of syslog a day
+/// (2026-11-19). Now a load reports its refusals once, by reason.
+#[test]
+fn a_load_reports_its_refusals_in_one_line_by_reason() {
+    let dir = three_refused();
+    let logs = logged(tracing::Level::INFO, || assert!(load(dir.path(), filter(), &BTreeSet::new(), &allow_alpha()).unwrap().is_empty()));
+    assert!(!logs.contains("WARN"), "a refusal is the admission rules working, not a fault:\n{logs}");
+    let refused: Vec<&str> = logs.lines().filter(|l| l.contains("refused")).collect();
+    assert_eq!(refused.len(), 1, "one line a load:\n{logs}");
+    assert!(refused[0].contains("refused=3"), "{}", refused[0]);
+    assert!(refused[0].contains("dynamic fee: 1, hook not allowlisted: 2"), "{}", refused[0]);
+}
+
+#[test]
+fn each_refused_pool_is_named_at_debug() {
+    let dir = three_refused();
+    let logs = logged(tracing::Level::DEBUG, || drop(load(dir.path(), filter(), &BTreeSet::new(), &allow_alpha()).unwrap()));
+    for id in ["0x1111", "0x2222", "0x3333"] {
+        assert!(logs.lines().any(|l| l.contains("DEBUG") && l.contains(id)), "{id} at debug:\n{logs}");
+    }
+}
+
+#[test]
+fn a_load_that_refuses_nothing_says_nothing_of_refusals() {
+    let dir = inventory(&[], Some(&[record(&format!("{AXIS_POOL:#x}"), 100, 1, &format!("{ALPHA:#x}"))]));
+    let logs = logged(tracing::Level::INFO, || assert_eq!(load(dir.path(), filter(), &BTreeSet::new(), &allow_alpha()).unwrap().len(), 1));
+    assert!(!logs.contains("refused"), "{logs}");
+}
+
 #[test]
 fn a_key_colliding_with_an_inventoried_pool_is_dropped() {
     let v3 = format!(
