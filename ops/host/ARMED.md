@@ -775,6 +775,15 @@ Rollback: `armed.sized.mode: shadow`, `max_senders: 24` and
 `keys_file: var/armed/armed.keys`, then a restart. R39's lane is untouched.
 `var/armed/armed.disable` stops both workers.
 
+**In shadow until funded (2026-11-20, the operator's decision).** Step 4 was
+not done: at the 11-19 boots the eight senders held 0 ETH, and every sized
+arm skipped `balance`. `ops/canary.base.yaml` now has `armed.sized.mode:
+shadow` and `keys_file: var/armed/armed.keys`, with `max_senders: 8` kept,
+so the shadow arms exactly the spike tiers that would send (§6c's ordinary
+sixteen stay off). After the owner funds the eight (step 4), going live
+again is `mode: live` and `keys_file: var/armed/armed24.keys`, a deploy and a
+restart, as in step 5.
+
 ## 7. R44: Slipstream's third factory
 
 Aerodrome's third Slipstream factory, `0x9CB220581b91b0C83223012FE69688b92aD07a76`

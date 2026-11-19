@@ -461,12 +461,14 @@ fn the_shipped_canary_config_parses() {
     assert_eq!((a.max_size_wei, a.l1_fee_bound_wei, a.sender_reserve_wei), (5_000_000_000_000_000_000, 1_000_000_000_000, 200_000_000_000_000));
     let live = a.live.as_ref().expect("armed.live");
     assert_eq!(live.sequencer, "https://mainnet-sequencer.base.org");
-    // R43 live (the operator, 2026-11-18): both lanes send. R39 keeps the key
-    // file's first 16 keys; the sized lane is its eight spike senders alone,
-    // to the deployed LeanExecutor3, with its own ledger and day's budget.
-    assert_eq!(live.keys_file, std::path::PathBuf::from("var/armed/armed24.keys"));
+    // R43 live (the operator, 2026-11-18): the sized lane is its eight spike
+    // senders alone, to the deployed LeanExecutor3, with its own ledger and
+    // day's budget. R43 shadow (the operator, 2026-11-20): it arms in shadow
+    // until the owner funds those eight, so R39 sends alone, on its own 16
+    // keys. Going live again is the lane's mode and armed24.keys.
+    assert_eq!(live.keys_file, std::path::PathBuf::from("var/armed/armed.keys"));
     let sz = a.sized.as_ref().expect("armed.sized");
-    assert_eq!(sz.mode, apex_runtime::shadow::config::ArmedMode::Live);
+    assert_eq!(sz.mode, apex_runtime::shadow::config::ArmedMode::Shadow);
     assert_eq!(sz.max_senders, 8);
     assert_eq!(sz.tiers.iter().map(|t| t.senders).sum::<usize>(), sz.max_senders, "the spike tiers hold every sender");
     assert_eq!(sz.live_ledger.as_deref(), Some(std::path::Path::new("var/armed/armed-live-sized.jsonl")));

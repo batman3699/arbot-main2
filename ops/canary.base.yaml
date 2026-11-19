@@ -113,8 +113,13 @@ armed:
   # LeanExecutor3, deployed by the owner with script/DeployLeanExecutor3.s.sol.
   # The boot reads its code from the chain: a keccak other than code_hash
   # arms nothing, and live refuses to boot.
+  # R43 shadow (2026-11-20, the operator's decision): in shadow until the
+  # owner funds the eight spike senders (0.4368 ETH, ARMED.md §6b). It arms
+  # and records the tiers below and sends nothing; R39 sends alone, on its
+  # own 16 keys. Going live again: `mode: live` here, `keys_file:
+  # var/armed/armed24.keys` below, and a restart.
   sized:
-    mode: live
+    mode: shadow
     ledger: var/apex/armed-sized.jsonl
     verdicts: var/apex/armed-sized-verdicts.jsonl
     live_ledger: var/armed/armed-live-sized.jsonl
@@ -160,7 +165,7 @@ armed:
   # fires, 3,261 in four hours, spent BlockPI's prepaid units on 2026-10-29.
   eval_simulations_per_run: 2
   live:
-    keys_file: var/armed/armed24.keys          # R43: R39's 16, then the sized lane's 8
+    keys_file: var/armed/armed.keys            # R39's 16; armed24.keys (R39's 16, then the sized lane's 8) when both send
     sequencer: https://mainnet-sequencer.base.org
     ledger: var/armed/armed-live.jsonl
     kill_file: var/armed/armed.disable
