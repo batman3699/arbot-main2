@@ -671,7 +671,11 @@ tiers:
 - Senders: the ordinary tiers arm on the first slots, each spike tier on its
   own after them, in the tiers' order. With `max_senders: 16` and tiers of 6
   and 2: slots 0-7, 8-13, 14-15. A tier's senders go to the routes the census
-  values most, one arm for each trigger pool and direction.
+  values most, one arm for each trigger pool, direction and pool across from
+  it (R48; R43 held one for each trigger pool and direction). An arm whose
+  trigger is the shallower pool of its pair ranks at 0.11 of its route's
+  value: it fires only when its own pool moves first, and the deeper pool
+  moved first in 89% of the big trades measured.
 - `reserve` is the spike tiers' alone (R43.1). `worst_case` holds the gas
   limit at the arm's fee, as before. `no_trade` holds 140,000 gas at it: what
   an inclusion that does not trade costs. The ordinary tiers always hold

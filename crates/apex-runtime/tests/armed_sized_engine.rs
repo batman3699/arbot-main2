@@ -7,7 +7,7 @@ use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::armed::lines::ArmedLine;
-use apex_runtime::armed::sized::{fill, fill_spike, Candidate, Reserve, SizedEngine, SizedSettings};
+use apex_runtime::armed::sized::{fill, fill_spike, leads, Candidate, Reserve, SizedEngine, SizedSettings};
 use apex_runtime::armed::threshold::{Pricing, SpikeTier, SPIKE_TIER_BASE};
 use apex_runtime::econ::RouteCosts;
 use apex_runtime::live::book::{Move, PoolSnapshot};
@@ -26,20 +26,31 @@ fn route(n: u8) -> RouteId {
 }
 
 fn cand(n: u8, group: u8, ev: f64, worst_wei: u128) -> Candidate {
-    Candidate { key: (route(n), 0, 1), group: (Address::repeat_byte(group), true), ev, worst_wei, rank: 0.0 }
+    Candidate { key: (route(n), 0, 1), group: (Address::repeat_byte(group), true), other: Address::repeat_byte(100 + n), ev, worst_wei, rank: 0.0 }
 }
 
-/// A spike candidate of tier `SPIKE_TIER_BASE + k`.
+/// A spike candidate of tier `SPIKE_TIER_BASE + k`, across from a pool of
+/// its own route's.
 fn spike(n: u8, group: u8, k: u8, rank: f64, worst_wei: u128) -> Candidate {
-    Candidate { key: (route(n), 0, SPIKE_TIER_BASE + k), group: (Address::repeat_byte(group), true), ev: 1.0, worst_wei, rank }
+    Candidate { key: (route(n), 0, SPIKE_TIER_BASE + k), group: (Address::repeat_byte(group), true), other: Address::repeat_byte(100 + n), ev: 1.0, worst_wei, rank }
 }
 
+/// R48: one spike arm for each trigger, direction and pool across from it.
+/// A move on a deep pool opens a gap to each shallower partner, and arbing one
+/// moves the partner, not the trigger: on 2026-11-14 at 02:28:34 UTC one swap
+/// on Uniswap's WETH/USDC pool (index 2 of block 57,164,692) was followed by
+/// $2,913, $2,510 and $793 of arbitrage against three other pools (indices 12,
+/// 15 and 29). A second arm across from the same pool is the same gap.
 #[test]
-fn spike_senders_go_to_the_best_ranked_pairs_one_a_trigger() {
-    // Two on trigger 1, ranked 9 and 8; one on trigger 2, ranked 5; one unranked.
-    let cands = vec![spike(1, 1, 0, 8.0, 1), spike(2, 1, 0, 9.0, 1), spike(3, 2, 0, 5.0, 1), spike(4, 3, 0, 0.0, 1)];
-    assert_eq!(fill_spike(&cands, &[2], 1_000), vec![1, 2], "the second arm on trigger 1 is passed over");
-    assert_eq!(fill_spike(&cands, &[8], 1_000), vec![1, 2, 3], "and an unranked pair comes last");
+fn spike_senders_go_to_the_best_ranked_pairs_one_a_trigger_and_partner() {
+    // On trigger 1: routes 1 and 2 across from pools of their own, ranked 8
+    // and 9, and route 5 across from route 2's pool, ranked 7. One on trigger
+    // 2, ranked 5; one unranked.
+    let mut same_gap = spike(5, 1, 0, 7.0, 1);
+    same_gap.other = Address::repeat_byte(102);
+    let cands = vec![spike(1, 1, 0, 8.0, 1), spike(2, 1, 0, 9.0, 1), spike(3, 2, 0, 5.0, 1), spike(4, 3, 0, 0.0, 1), same_gap];
+    assert_eq!(fill_spike(&cands, &[2], 1_000), vec![1, 0], "one move gaps both partners: both arm");
+    assert_eq!(fill_spike(&cands, &[8], 1_000), vec![1, 0, 2, 3], "the same trigger, direction and partner is passed over; an unranked pair comes last");
 }
 
 #[test]
@@ -273,6 +284,48 @@ fn spike_senders_follow_the_census_rank() {
     let spikes: Vec<_> = arms(&lines).into_iter().filter(|a| a.rung >= SPIKE_TIER_BASE).collect();
     assert_eq!(spikes.len(), 2);
     assert!(spikes.iter().all(|a| a.pools[0] == format!("{CAKE:#x}")), "both legs of the route that starts in the ranked pool");
+}
+
+/// R48: a spike arm waits on the deeper pool of its pair. Its predicates hold
+/// the other pool where it was, so it fires only when its own trigger moves
+/// first, and in 2026-11-13..18's arbitrage of $50 or more on the census
+/// routes (where both pools' depth was known) the deeper pool moved first in
+/// 89% of the value. Here the ranked route's two legs tie on rank, and the
+/// one sender goes to the leg whose trigger holds four times the liquidity,
+/// whichever pool that is.
+#[test]
+fn a_spike_sender_waits_on_the_deeper_pool() {
+    for (deep, shallow) in [(UNI, CAKE), (CAKE, UNI)] {
+        let (e, mut snap) = engine_with(5, vec![tier(1)], Reserve::WorstCase);
+        let mut p = (*snap[&deep]).clone();
+        p.state.liquidity = 4 * L;
+        snap.insert(deep, Arc::new(p));
+        let e = e.with_rank(Arc::new(|c| if c.legs[0].pool == CAKE { 7.0 } else { 0.0 }));
+        let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, BUDGET, 1_500_000_000);
+        let spikes: Vec<_> = arms(&lines).into_iter().filter(|a| a.rung >= SPIKE_TIER_BASE).collect();
+        assert_eq!(spikes.len(), 1);
+        let a = spikes[0];
+        assert_eq!(a.pools[0], format!("{CAKE:#x}"), "the ranked route");
+        let trigger = &a.pools[usize::from(a.trigger_leg)];
+        assert_eq!(trigger, &format!("{deep:#x}"), "the trigger is the deeper pool, not {shallow:#x}");
+    }
+}
+
+/// R48: the depth a spike arm's leg is ranked by: in-range liquidity, or for
+/// a constant-product pool the same quantity, the square root of its reserves'
+/// product. Both pools of a pair trade the same two tokens, so the two compare.
+#[test]
+fn a_pools_depth_is_its_liquidity_at_the_price() {
+    let cl = pool(UNI, Venue::UniswapV3, -197_350, 500);
+    let mut shallow = cl.clone();
+    shallow.state.liquidity = L / 2;
+    assert!(leads(&cl, &shallow) && !leads(&shallow, &cl));
+    assert!(leads(&cl, &cl), "a tie leads both ways");
+    let mut cp = pool(CAKE, Venue::AerodromeV2, 0, 3_000);
+    cp.state.liquidity = 0;
+    // sqrt(1e30 * 4e18) = 2e24, over L = 1.4e24.
+    cp.reserves = Some(apex_runtime::live::cp::Reserves { reserve0: U256::from(10u128.pow(30)), reserve1: U256::from(4 * 10u128.pow(18)) });
+    assert!(leads(&cp, &cl) && !leads(&cl, &cp));
 }
 
 /// R43: what a pending sized arm holds of the day's budget. Here a spike arm
@@ -628,6 +681,7 @@ fn seeded(seed: u64, n: usize) -> (Vec<Candidate>, Vec<f64>) {
         cands.push(Candidate {
             key: (route(i as u8), 0, tier),
             group: (Address::repeat_byte(1 + next(4) as u8), next(2) == 0),
+            other: Address::repeat_byte(100 + next(4) as u8),
             ev: next(6) as f64 - 1.0,
             worst_wei: 1 + next(3) as u128 * 40,
             rank: 0.0,

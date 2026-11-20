@@ -192,23 +192,32 @@ pub struct Candidate {
     pub key: SizedKey,
     /// The trigger pool, and whether the trigger's price rises.
     pub group: (Address, bool),
+    /// The pool across from the trigger.
+    pub other: Address,
     pub ev: f64,
     pub worst_wei: u128,
     /// R43: what the census values the arm's pair at: a spike tier's senders
-    /// go to the highest. Nothing for a pair it does not target.
+    /// go to the highest. Nothing for a pair it does not target. R48: times
+    /// [`LAGGARD_RANK`] when the trigger is the shallower pool of the pair.
     pub rank: f64,
 }
 
 /// R43: the spike tiers' arms: for each tier, up to its senders
 /// (`senders[k]` for tier `SPIKE_TIER_BASE + k`), the best ranked first, then
-/// the most valuable, one for each trigger pool and direction. Indices into
-/// `cands`, tier by tier.
+/// the most valuable, one for each trigger pool, direction and pool across
+/// from it. Indices into `cands`, tier by tier.
 ///
 /// A spike move happens a few times a day on a pair, so its measured chance
 /// says little, and what orders these arms is where such trades have been:
-/// the census's value of the pair. One for each trigger, because the first
-/// arm to trade on a move takes it back: a second on the same trigger would
-/// then be included only to find no trade, at its own tier's price.
+/// the census's value of the pair. R48: one for each trigger *and partner*.
+/// R43 kept one for each trigger, on the view that the first arm to trade on
+/// a move takes it back. On a deep pool it does not: arbing a shallower
+/// partner moves the partner. On 2026-11-14 at 02:28:34 UTC one swap on
+/// Uniswap's WETH/USDC pool was followed by $2,913, $2,510 and $793 of
+/// arbitrage against three other pools in the same block, and R43's rule had
+/// let one route wait on that pool while the next two waited on their own
+/// pools, which did not move. A second arm whose gap is gone costs nothing:
+/// its trigger's predicate no longer holds, so it is never included.
 pub fn fill_spike(cands: &[Candidate], senders: &[usize], budget_wei: u128) -> Vec<usize> {
     let mut chosen = Vec::new();
     let mut left = budget_wei;
@@ -216,20 +225,45 @@ pub fn fill_spike(cands: &[Candidate], senders: &[usize], budget_wei: u128) -> V
         let tier = SPIKE_TIER_BASE.saturating_add(u8::try_from(k).unwrap_or(u8::MAX));
         let mut order: Vec<usize> = (0..cands.len()).filter(|i| cands[*i].key.2 == tier && cands[*i].ev > 0.0).collect();
         order.sort_by(|a, b| cands[*b].rank.total_cmp(&cands[*a].rank).then(cands[*b].ev.total_cmp(&cands[*a].ev)).then(a.cmp(b)));
-        let mut groups: BTreeSet<(Address, bool)> = BTreeSet::new();
+        let mut gaps: BTreeSet<((Address, bool), Address)> = BTreeSet::new();
         for i in order {
-            if groups.len() >= *held {
+            if gaps.len() >= *held {
                 break;
             }
-            if cands[i].worst_wei > left || groups.contains(&cands[i].group) {
+            let gap = (cands[i].group, cands[i].other);
+            if cands[i].worst_wei > left || gaps.contains(&gap) {
                 continue;
             }
-            groups.insert(cands[i].group);
+            gaps.insert(gap);
             left -= cands[i].worst_wei;
             chosen.push(i);
         }
     }
     chosen
+}
+
+/// R48: what a spike candidate's census rank is multiplied by when its
+/// trigger is the shallower pool of its pair. Its predicates hold the other
+/// pool where it was, so it fires only when its own pool moves first, and
+/// in 2026-11-13..18's arbitrage of $50 or more on the census routes, where
+/// both pools' depth was known, the shallower pool moved first in 11% of the
+/// value ($1,382 of $12,987), the deeper in 89%.
+pub const LAGGARD_RANK: f64 = 0.11;
+
+/// R48: whether `trigger` is the deeper pool of its pair, a tie counting for
+/// both: by in-range liquidity, or for a constant-product pool the same
+/// quantity, the square root of its reserves' product. Both pools of a pair
+/// trade the same two tokens, so the two compare.
+pub fn leads(trigger: &PoolSnapshot, other: &PoolSnapshot) -> bool {
+    depth(trigger) >= depth(other)
+}
+
+fn depth(p: &PoolSnapshot) -> f64 {
+    let wide = |v: U256| v.0.iter().rev().fold(0.0, |acc, w| acc * 18_446_744_073_709_551_616.0 + *w as f64);
+    match &p.reserves {
+        Some(r) => (wide(r.reserve0) * wide(r.reserve1)).sqrt(),
+        None => p.state.liquidity as f64,
+    }
 }
 
 /// The greedy fill: indices of the chosen candidates, in the order chosen.
@@ -587,13 +621,17 @@ impl SizedEngine {
             let (pool, other) = (c.legs[l].pool, c.legs[1 - l].pool);
             let up = trigger_up(c, l);
             let chance = |step: u32| st.moves.p_at_least(spread_key(pool, other), up, step).max(P_MOVE_FLOOR);
+            // R48: a spike arm on the shallower pool of its pair ranks lower.
+            let (trigger, across) = if l == 0 { (a, b) } else { (b, a) };
+            let rank = (self.rank)(c) * if leads(trigger, across) { 1.0 } else { LAGGARD_RANK };
             for point in &p.points {
                 cands.push(Candidate {
                     key: (*id, *leg, point.tier),
                     group: (pool, up),
+                    other,
                     ev: self.value(point, p, base_fee_wei, &chance),
                     worst_wei: self.worst(point, p, base_fee_wei, l1_upper_wei),
-                    rank: (self.rank)(c),
+                    rank,
                 });
             }
         }
@@ -1007,7 +1045,7 @@ mod tests {
             if let Some(point) = p.points.first() {
                 let chance = |s: u32| st.moves.p_at_least(spread_key(UNI, c.legs[1 - l].pool), true, s).max(P_MOVE_FLOOR);
                 let ev = e.value(point, p, 1, &chance);
-                by_other.insert(c.legs[1 - l].pool, Candidate { key: (*id, *leg, 1), group: (UNI, true), ev, worst_wei: 1, rank: 0.0 });
+                by_other.insert(c.legs[1 - l].pool, Candidate { key: (*id, *leg, 1), group: (UNI, true), other: c.legs[1 - l].pool, ev, worst_wei: 1, rank: 0.0 });
             }
         }
         let (Some(first), Some(second)) = (by_other.get(&CAKE).cloned(), by_other.get(&SLIP).cloned()) else {
