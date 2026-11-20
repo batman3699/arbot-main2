@@ -407,14 +407,14 @@ pricing stays exact. The proof is a V4Quoter fixture on target route #2's pool
   reads its pool again, and keeps reading it at each new head until a read at
   or after the change's block holds it. Until then (about one block) the pool
   is priced at its old fee.
-- Only R39's lane trades these pools. `LeanExecutor2` swaps through
-  PoolManager against the plan's minimums, which the composed quote sets
-  exactly; PoolManager's write of the protocol's share costs about 5,000 more
-  gas than the v4 model, well inside the arm's limit (1.25 × the ceiling).
-- The deployed `LeanExecutor3` refuses them at execution (`LeanPools3.load`
-  returns unsupported while slot0's protocol fee is set). The sized lane's
-  mirror refuses them the same way, so it arms none of them. Arming them
-  there needs an executor revision and an owner deploy.
+- R39's lane trades these pools. `LeanExecutor2` swaps through PoolManager
+  against the plan's minimums, which the composed quote sets exactly;
+  PoolManager's write of the protocol's share costs about 5,000 more gas than
+  the v4 model, well inside the arm's limit (1.25 × the ceiling).
+- R43's deployed `LeanExecutor3` (0xf7E3…17Da) refuses them at execution
+  (`LeanPools3.load` returned unsupported while slot0's protocol fee was set).
+  R51's revision composes the fee there, per direction, and the sized lane
+  arms them in shadow on it (§5d).
 
 The one-time backfill is an agent step, as on 2026-10-28:
 
@@ -660,6 +660,38 @@ the walk: the mirror short of the chain), and `simulated` against
 
 Rollback: the same two fields back, and a restart. `LeanExecutor2` stays
 deployed and authorized.
+
+### d. R51: the revision that composes v4 protocol fees (shadow first)
+
+R43's deployed `LeanExecutor3` (0xf7E38331f605a5cBE5062948804e243Ab2dF17Da)
+refuses a v4 pool with a protocol fee on. R51 changes one thing in
+`LeanPools3.load`: it composes the fee as v4-core's `calculateSwapFee` does,
+from the trade's own direction's 12 bits, so the sizer walks the pool at the
+fee its swaps step on. The plan format, the storage layout and every other
+path are unchanged.
+
+- Proof: `test/lean/LeanPools3.t.sol` holds the composition to the cases the
+  book's `live_v4.rs` uses; `LeanExecutor3Run.t.sol` trades a v4 route with a
+  protocol fee against a PoolManager double that steps on the composed fee;
+  `test/fork/LeanExecutor3ProtocolFeeFork.t.sol` trades target route #2
+  (NOCK/USDC, v4 and Aerodrome v2) at Base block 59,821,700, both ways, and the
+  pools pay the sizer's quote to the unit. At the LP fee alone the sizer
+  overstates what PoolManager pays by 0.1%.
+- The runtime's mirror walks these pools at the book's composed fee, and a
+  sized plan through one carries PoolManager's write of the protocol's share
+  in its swap gas (`PROTOCOL_FEE_WRITE`, 22,100: the slot written from zero,
+  the dearer case).
+- Both shipped files name the placeholder address with the revision's
+  `forge inspect` code (`runtime_code`, hash 0x415f…082d), as in §5a; the deploy
+  installs `dist/LeanExecutor3.runtime.hex` over the host's copy before the
+  restart. A mismatch leaves the sized lane out with a warning; R39 is
+  untouched.
+- Live refuses `runtime_code`. Going live is §5c with this revision: the owner
+  deploys it from a clean build, authorizes the eight spike senders on it in
+  one transaction (`AuthorizeArmedSenders --sig "runBatchFrom(string)"
+  ops/armed-senders-spike.json`, its `executor` set to the new address), the
+  config takes its address and printed hash with `runtime_code` gone, and then
+  §6f's flip. R43's `LeanExecutor3` stays deployed; nothing sends to it.
 
 ## 6. R43: spike tiers on the sized lane
 

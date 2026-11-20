@@ -180,12 +180,10 @@ fn outcome(
     gas: &SettlementGas,
     limits: bool,
 ) -> SizedOutcome {
+    // R51: a v4 pool with a protocol fee on is walked at its composed fee, the
+    // book's (R50), which the executor composes the same way at execution
+    // (`LeanPools3.load`). R43's deployed LeanExecutor3 refused such a pool.
     let (Some(a), Some(b)) = (book.get(&cycle.legs[0].pool), book.get(&cycle.legs[1].pool)) else { return SizedOutcome::NoTrade(2) };
-    // R50: the executor reads a v4 pool's slot0 at execution and refuses one
-    // with a protocol fee on (`LeanPools3.load`).
-    if a.v4_protocol_fee_on() || b.v4_protocol_fee_on() {
-        return SizedOutcome::NoTrade(2);
-    }
     let legs = [walk_leg(&cycle.legs[0], a, gas), walk_leg(&cycle.legs[1], b, gas)];
     let price = WalkPrice { wei_per_gas, rate: terms.plan_rate() };
     let gross_at = |cap: EthersU256, steps: u32| -> Option<(Walked, EthersU256, EthersU256)> {

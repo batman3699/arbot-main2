@@ -146,13 +146,40 @@ contract LeanPools3Test is Test {
         assertEq(leg.feePpm, 3_000);
     }
 
-    function testV4ProtocolFeeRefused() public {
+    /// R51: a protocol fee is composed with the LP fee as v4-core's
+    /// `ProtocolFeeLibrary.calculateSwapFee` does, into the one fee a swap
+    /// steps on. The cases are `crates/apex-runtime/tests/live_v4.rs`'s, which
+    /// the runtime's book is held to: three of Base's pools as switched on.
+    function testV4ProtocolFeeComposesWithTheLpFee() public {
         MockPoolManager3 m = manager();
-        MockPoolKey3 memory key = MockPoolKey3(lo, hi, 3_000, 60, address(0));
+        uint24[3] memory lp = [uint24(30_000), 1_500, 500];
+        // 1,000 pips each way (0x3e83e8), 262 (0x106106), 125 (0x07d07d).
+        uint24[3] memory pf = [uint24(4_097_000), 1_073_414, 512_125];
+        // 262 × 1,500 / 1e6 rounds to 0.
+        uint24[3] memory want = [uint24(30_970), 1_762, 625];
+        for (uint256 i; i < 3; i++) {
+            MockPoolKey3 memory key = MockPoolKey3(lo, hi, lp[i], 60, address(0));
+            m.initialize(key, 0, L);
+            m.setProtocolFee(key, pf[i]);
+            (bool ok, Leg memory leg) = h.load(hop(3, address(0), hi, lp[i], 60), lo);
+            assertTrue(ok, "loaded");
+            assertEq(leg.feePpm, want[i], "zero for one");
+            (ok, leg) = h.load(hop(3, address(0), lo, lp[i], 60), hi);
+            assertTrue(ok, "loaded");
+            assertEq(leg.feePpm, want[i], "one for zero");
+        }
+    }
+
+    /// Each direction is its own 12 bits: 1,000 zero for one, 125 one for zero.
+    function testV4ProtocolFeeIsTheTradesOwnDirections() public {
+        MockPoolManager3 m = manager();
+        MockPoolKey3 memory key = MockPoolKey3(lo, hi, 30_000, 60, address(0));
         m.initialize(key, 0, L);
-        m.setProtocolFee(key, 1);
-        (bool ok,) = h.load(hop(3, address(0), hi, 3_000, 60), lo);
-        assertFalse(ok);
+        m.setProtocolFee(key, (125 << 12) | 1_000);
+        (, Leg memory leg) = h.load(hop(3, address(0), hi, 30_000, 60), lo);
+        assertEq(leg.feePpm, 30_970, "zero for one");
+        (, leg) = h.load(hop(3, address(0), lo, 30_000, 60), hi);
+        assertEq(leg.feePpm, 30_122, "one for zero: 125 + 30,000 - floor(3.75)");
     }
 
     function testV4DynamicFeeRefused() public {

@@ -473,12 +473,28 @@ fn the_shipped_canary_config_parses() {
     assert_eq!(sz.tiers.iter().map(|t| t.senders).sum::<usize>(), sz.max_senders, "the spike tiers hold every sender");
     assert_eq!(sz.live_ledger.as_deref(), Some(std::path::Path::new("var/armed/armed-live-sized.jsonl")));
     assert_eq!(sz.daily_loss_budget_wei, Some(100_000_000_000_000_000));
-    assert_eq!(sz.executor3.address, address!("f7E38331f605a5cBE5062948804e243Ab2dF17Da"));
-    assert_eq!(sz.executor3.code_hash, b256!("fc900951ded02368fc5e39d88682d01d9af72eb75552fc1b1e88283ee5110767"));
-    assert!(sz.executor3.runtime_code.is_none(), "live refuses the pre-deploy override");
+    // R51 (the operator, 2026-11-21): the lane shadows LeanExecutor3's
+    // revision, which composes a v4 pool's protocol fee, before the owner
+    // deploys it: the placeholder address and its runtime code, as before
+    // R43's deploy, in the evaluator's file too. R43's deployed LeanExecutor3
+    // (0xf7E3…17Da) refuses those pools, so the lane no longer names it.
+    assert_eq!(sz.executor3.address, address!("00000000000000000000000000000000000e3e03"));
+    assert_eq!(sz.executor3.code_hash, b256!("415fedee935a2b2d9be7e01315c59df56d6639320cf46461af24e622122c082d"));
+    assert_eq!(sz.executor3.runtime_code.as_deref(), Some(std::path::Path::new("var/armed/LeanExecutor3.runtime.hex")));
     // Everything else is the shadow's.
     let shadow = ShadowConfig::load(&path.replace("canary", "shadow"), &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap();
     assert_eq!((c.executor, c.universe), (shadow.executor, shadow.universe));
+    assert_eq!(shadow.armed.sized.as_ref().map(|s| &s.executor3), Some(&sz.executor3), "the evaluator simulates the same code");
+    // Live refuses runtime_code: going live waits for the owner's deploy
+    // (ARMED.md §5c).
+    let text = std::fs::read_to_string(&path).unwrap();
+    let live = text.replacen("  sized:\n    mode: shadow\n", "  sized:\n    mode: live\n", 1).replacen("var/armed/armed.keys ", "var/armed/armed24.keys ", 1);
+    assert_ne!(live, text);
+    let dir = tempfile::tempdir().unwrap();
+    let at = dir.path().join("canary.yaml");
+    std::fs::write(&at, live).unwrap();
+    let refused = ShadowConfig::load_canary(at.to_str().unwrap(), &env("APEX_SECRET_BLOCKPI_KEY", "test-only-not-a-key")).unwrap_err();
+    assert!(matches!(&refused, ShadowConfigError::Invalid(m) if m.contains("runtime_code")), "{refused:?}");
 }
 
 /// R31: a run that names no rival bids is refused: it would bid nothing.

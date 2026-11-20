@@ -201,6 +201,12 @@ pub const SIZED: SizedGas = SizedGas {
 /// A slot written from zero, 22,100 cold, over one already non-zero, 5,000.
 pub const ZERO_SLOT_PREMIUM: u64 = 17_100;
 
+/// R51: a v4 swap with a protocol fee on adds the protocol's share to
+/// PoolManager's `protocolFeesAccrued[input currency]`, one cold slot. On
+/// 2026-11-20 WETH's and USDC's held fees already (5,000); another token's may
+/// be written from zero, and an arm cannot know which, so it counts the dearer.
+pub const PROTOCOL_FEE_WRITE: u64 = 5_000 + ZERO_SLOT_PREMIUM;
+
 /// **Measured on Base, 2026-10-04** (blocks 52,155,662 and 52,155,833): the
 /// deployed executor's `startV2`, simulated by `eth_simulateV1` over every
 /// cycle of the live universe after a whale moved one of its pools — all three

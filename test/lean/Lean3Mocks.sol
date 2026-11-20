@@ -83,7 +83,7 @@ abstract contract MockClEngine {
             uint160 target = zeroForOne ? (nextSqrt < limit ? limit : nextSqrt) : (nextSqrt > limit ? limit : nextSqrt);
             uint160 sqrtBefore = p.sqrtP;
             (uint160 after_, uint256 stepIn, uint256 stepOut, uint256 stepFee) =
-                LeanSwapMath3.computeSwapStep(p.sqrtP, target, p.liquidity, remaining, p.fee);
+                LeanSwapMath3.computeSwapStep(p.sqrtP, target, p.liquidity, remaining, _swapFee(id, zeroForOne, p.fee));
             p.sqrtP = after_;
             remaining -= stepIn + stepFee;
             out += stepOut;
@@ -121,6 +121,11 @@ abstract contract MockClEngine {
             x >>= 1;
             r++;
         }
+    }
+
+    /// The fee a swap steps on: the pool's own, unless the venue adds to it.
+    function _swapFee(bytes32, bool, uint24 lpFee) internal view virtual returns (uint24) {
+        return lpFee;
     }
 
     function _changed(bytes32 id) internal virtual {}
@@ -348,6 +353,15 @@ contract MockPoolManager3 is MockClEngine {
 
     function sqrtPriceOf(MockPoolKey3 memory key) external view returns (uint160) {
         return pools[idOf(key)].sqrtP;
+    }
+
+    /// R51: v4-core's `Pool.swap` steps on one fee, its direction's 12 bits of
+    /// the protocol fee composed with the LP fee
+    /// (`ProtocolFeeLibrary.calculateSwapFee`); the protocol's share comes off
+    /// the fee only after each step, so it changes nothing a trader is paid.
+    function _swapFee(bytes32 id, bool zeroForOne, uint24 lpFee) internal view override returns (uint24) {
+        uint256 pf = (zeroForOne ? protocolFee[id] : protocolFee[id] >> 12) & 0xfff;
+        return uint24(pf + lpFee - pf * lpFee / 1_000_000);
     }
 
     function extsload(bytes32 slot) external view returns (bytes32) {

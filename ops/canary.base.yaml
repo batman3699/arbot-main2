@@ -116,16 +116,24 @@ armed:
   # R43 shadow (2026-11-20, the operator's decision): in shadow until the
   # owner funds the eight spike senders (0.4368 ETH, ARMED.md §6b). It arms
   # and records the tiers below and sends nothing; R39 sends alone, on its
-  # own 16 keys. Going live again: `mode: live` here, `keys_file:
-  # var/armed/armed24.keys` below, and a restart.
+  # own 16 keys.
+  # R51 (2026-11-21, the operator's decision): it shadows LeanExecutor3's
+  # revision, which composes a v4 pool's protocol fee where R43's deployed
+  # one (0xf7E38331f605a5cBE5062948804e243Ab2dF17Da) refuses the pool: the
+  # placeholder address, and the evaluator simulates runtime_code there
+  # (ARMED.md §5a). Live refuses runtime_code, so going live again is the
+  # owner's deploy of the revision and setExecutors first (§5c: its address
+  # and printed hash here, runtime_code gone), then `mode: live` here,
+  # `keys_file: var/armed/armed24.keys` below, and a restart.
   sized:
     mode: shadow
     ledger: var/apex/armed-sized.jsonl
     verdicts: var/apex/armed-sized-verdicts.jsonl
     live_ledger: var/armed/armed-live-sized.jsonl
     executor3:
-      address: "0xf7E38331f605a5cBE5062948804e243Ab2dF17Da"
-      code_hash: "0xfc900951ded02368fc5e39d88682d01d9af72eb75552fc1b1e88283ee5110767"
+      address: "0x00000000000000000000000000000000000e3e03"
+      code_hash: "0x415fedee935a2b2d9be7e01315c59df56d6639320cf46461af24e622122c082d"
+      runtime_code: var/armed/LeanExecutor3.runtime.hex
     # R39 on chain, 2026-10-29 18:23 to 11-03 08:15 UTC: 1 revert in 325
     # sends (16 senders, at most 2 landings a block); the send-rate limit
     # waits for the 32-sender ramp.

@@ -317,14 +317,24 @@ contract LeanExecutor3RunTest is Test {
         assertFalse(manager.unlocked());
     }
 
-    function testAV4ProtocolFeeIsNoTrade() public {
+    /// R51: a v4 pool with a protocol fee on is sized at the fee its swaps step
+    /// on, and PoolManager pays exactly the sizer's quote. Sized at the LP fee
+    /// alone, the quote would be more than the swap pays.
+    function testAV4RouteWithAProtocolFeeTradesAtItsComposedFee() public {
         (Hop3 memory a, Hop3 memory b, MockPoolKey3 memory key) = v4Route(WETH);
-        manager.setProtocolFee(key, 1);
+        // 1,000 pips each way on the key's 3,000: 3,997.
+        manager.setProtocolFee(key, 4_097_000);
         Terms memory t = terms();
         t.lender = 2;
+        Sized memory want = expected(t, a, b, WETH);
+        assertGt(want.size, 0);
         Seen memory s = run(encode(t, a, b));
-        assertEq(s.reason, lean.UNSUPPORTED());
-        assertEq(manager.swaps(), 0);
+        assertTrue(s.traded, "traded");
+        assertEq(s.amountIn, want.size, "the sizer's size");
+        assertEq(s.out, want.out, "PoolManager paid the sizer's quote");
+        assertEq(weth.balanceOf(recipient), s.out - s.amountIn);
+        assertEq(manager.nonzeroDeltas(), 0);
+        assertFalse(manager.unlocked());
     }
 
     function testAV4DeltaOfTheWrongSignReverts() public {

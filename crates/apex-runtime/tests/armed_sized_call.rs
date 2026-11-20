@@ -126,13 +126,13 @@ fn a_v4_hop_carries_its_key_and_the_route_borrows_from_pool_manager() {
     assert_eq!((h.kind, h.pool, h.fee, h.tick_spacing), (Hop3Kind::UniswapV4, ALPHA, 100, 1), "the key's hooks, fee and spacing");
 }
 
-/// R50: `LeanExecutor3` reads a v4 pool's slot0 at execution and returns
-/// `NoTrade(UNSUPPORTED)` while a protocol fee is on (`LeanPools3.load`), so
-/// the mirror refuses the route too: an arm on it would pay its gas and bid
-/// for nothing. The book composes the fee, so the pool's fee is then above
-/// its key's.
+/// R51: `LeanExecutor3` composes a v4 pool's protocol fee at execution
+/// (`LeanPools3.load`), as the book does (R50), so the mirror sizes the route
+/// at the composed fee: a trade, and a smaller one than at the key's fee alone.
+/// The deployed LeanExecutor3 of R43 refused such a pool; this mirror is the
+/// revision's.
 #[test]
-fn a_v4_pool_with_a_protocol_fee_is_one_executor3_does_not_trade() {
+fn a_v4_pool_with_a_protocol_fee_is_sized_at_its_composed_fee() {
     use apex_runtime::live::v4::{key_address, V4Key, POOL_MANAGER};
     let id = B256::repeat_byte(0x11);
     let mut v4 = pool(key_address(id), Venue::UniswapV4, -289_960, 100);
@@ -149,9 +149,15 @@ fn a_v4_pool_with_a_protocol_fee_is_one_executor3_does_not_trade() {
         .into_values()
         .find(|c| matches!(sized_outcome(c, &snap, &t, price, &LEAN), SizedOutcome::Trade { .. }))
         .expect("a v4 route that trades");
+    let gross = |o: SizedOutcome| match o {
+        SizedOutcome::Trade { gross, .. } => gross,
+        SizedOutcome::NoTrade(r) => panic!("NoTrade({r}): the composed fee is the executor's, and it trades"),
+    };
+    let at_key = gross(sized_outcome(&c, &snap, &t, price, &LEAN));
     // 10 pips each way composed with the key's 100: 110.
     v4.state.fee_ppm = 110;
-    assert_eq!(sized_outcome(&c, &book(vec![v4, v3]), &t, price, &LEAN), SizedOutcome::NoTrade(2));
+    let composed = gross(sized_outcome(&c, &book(vec![v4, v3]), &t, price, &LEAN));
+    assert!(composed < at_key, "{composed} at 110 pips is not less than {at_key} at the key's 100");
 }
 
 #[test]

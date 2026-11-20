@@ -385,6 +385,42 @@ fn arms(lines: &[ArmedLine]) -> Vec<&apex_runtime::armed::lines::Arm> {
     lines.iter().filter_map(|l| if let ArmedLine::Arm(a) = l { Some(a.as_ref()) } else { None }).collect()
 }
 
+/// R51: a hookless v4 WETH/USDC pool keyed at 500 pips; `fee_ppm` is the
+/// book's composed fee, above the key's while a protocol fee is on.
+fn v4_pool(fee_ppm: u32) -> PoolSnapshot {
+    use apex_runtime::live::v4::{key_address, V4Key};
+    let id = alloy_primitives::B256::repeat_byte(0x22);
+    let mut p = pool(key_address(id), Venue::UniswapV4, -197_350, 500);
+    p.spec.v4 = Some(V4Key { pool_id: id, fee: 500, tick_spacing: 10, hooks: Address::ZERO });
+    p.state.fee_ppm = fee_ppm;
+    p
+}
+
+/// R51: PoolManager adds a v4 swap's protocol fee to its input currency's
+/// accrued slot, so a sized arm through a pool with one on carries that write
+/// in its swap gas, at the dearer case: the slot written from zero.
+#[test]
+fn a_v4_pool_with_a_protocol_fee_adds_its_fee_write_to_the_swap_gas() {
+    use apex_runtime::live::gas::PROTOCOL_FEE_WRITE;
+    let swap_gas = |fee_ppm: u32| -> Vec<u32> {
+        let snap: BTreeMap<Address, Arc<PoolSnapshot>> =
+            [pool(UNI, Venue::UniswapV3, -197_350, 500), v4_pool(fee_ppm)].into_iter().map(|p| (p.spec.pool, Arc::new(p))).collect();
+        let (_, cycles) = frontier::build(ChainId(8453), WETH, &snap);
+        let e = SizedEngine::new(cycles, sized_settings(16, Vec::new(), Reserve::WorstCase), BTreeSet::new());
+        let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, 10_000_000_000_000_000, 1_500_000_000);
+        arms(&lines).iter().map(|a| a.sized.as_ref().expect("a sized arm").swap_gas).collect()
+    };
+    let hops = u32::try_from(LEAN.hop.uniswap_v3 + LEAN.hop.uniswap_v4).unwrap();
+    let plain = swap_gas(500);
+    assert!(!plain.is_empty(), "the route arms");
+    assert!(plain.iter().all(|g| *g == hops), "{plain:?}: no protocol fee, the hops alone ({hops})");
+    // 100 pips each way on the key's 500: 600.
+    let with_fee = swap_gas(600);
+    assert!(!with_fee.is_empty(), "the route arms with its protocol fee on");
+    let want = hops + u32::try_from(PROTOCOL_FEE_WRITE).unwrap();
+    assert!(with_fee.iter().all(|g| *g == want), "{with_fee:?}: the hops and the fee's write ({want})");
+}
+
 #[test]
 fn it_arms_every_slot_for_the_sized_executor() {
     let (e, snap) = engine(16);

@@ -475,8 +475,8 @@ impl SizedEngine {
     }
 
     /// The plan terms and lender for `c` sized up to `max`: that cap, or the
-    /// largest holding when no lender holds it.
-    fn terms_for(&self, c: &Cycle, px: &Pricing, l1_upper_wei: u128, max: U256) -> (SizedTerms, Lean2Lender) {
+    /// largest holding when no lender holds it. `pools` are its two legs'.
+    fn terms_for(&self, c: &Cycle, pools: [&PoolSnapshot; 2], px: &Pricing, l1_upper_wei: u128, max: U256) -> (SizedTerms, Lean2Lender) {
         let s = &self.settings;
         let (cap, lender, extra) = match px.lenders {
             Some(l) => match l.for_size(max) {
@@ -493,7 +493,9 @@ impl SizedEngine {
         };
         let lender = if lender.id == crate::live::lenders::MORPHO_FLASH { Lean2Lender::Morpho } else { Lean2Lender::Balancer };
         let read = SIZED.read.of(c.legs[0].venue) + SIZED.read.of(c.legs[1].venue);
-        let swap = LEAN.hop.of(c.legs[0].venue) + LEAN.hop.of(c.legs[1].venue) + extra;
+        // R51: and PoolManager's write of each v4 swap's protocol fee.
+        let fee_writes = pools.iter().filter(|p| p.v4_protocol_fee_on()).count() as u64 * crate::live::gas::PROTOCOL_FEE_WRITE;
+        let swap = LEAN.hop.of(c.legs[0].venue) + LEAN.hop.of(c.legs[1].venue) + extra + fee_writes;
         // The plan's L1 bound is twice the oracle's; the reservation's never
         // less than the configured bound (`worst`).
         let terms = SizedTerms {
@@ -530,7 +532,7 @@ impl SizedEngine {
     fn price_slot(&self, c: &Cycle, leg: u8, snapshot: &BTreeMap<Address, Arc<PoolSnapshot>>, px: &Pricing, l1_upper_wei: u128, moves: &MoveStats) -> Option<Priced> {
         let pair = [Arc::clone(snapshot.get(&c.legs[0].pool)?), Arc::clone(snapshot.get(&c.legs[1].pool)?)];
         let pxc = px.for_cycle(c)?;
-        let (terms, lender) = self.terms_for(c, &pxc, l1_upper_wei, self.settings.max_size(c.start));
+        let (terms, lender) = self.terms_for(c, [&pair[0], &pair[1]], &pxc, l1_upper_wei, self.settings.max_size(c.start));
         let winners = (self.bids)(c.start, c.legs[0].pool, c.legs[1].pool);
         let inputs = BidInputs { winners: &winners.all, banded: Some(&winners), sample: self.contest.as_deref(), model: self.bid_model };
         let cap = self.settings.max_priority_wei_per_gas;
@@ -544,7 +546,7 @@ impl SizedEngine {
         let mut spike = Vec::with_capacity(self.settings.tiers.len());
         for (k, tier) in self.settings.tiers.iter().enumerate() {
             let max = U256::from(if c.start == apex_exec::lean2::USDC { tier.max_size_usdc } else { tier.max_size_wei });
-            let plan = self.terms_for(c, &pxc, l1_upper_wei, max);
+            let plan = self.terms_for(c, [&pair[0], &pair[1]], &pxc, l1_upper_wei, max);
             if let Some(from) = points.last().map(|p| p.step) {
                 let number = SPIKE_TIER_BASE.saturating_add(u8::try_from(k).unwrap_or(u8::MAX));
                 points.extend(spike_point(c, &pair, l, &pxc, &plan.0, band, number, tier, from, &inputs));
@@ -854,7 +856,8 @@ impl SizedEngine {
         let mut book = BTreeMap::new();
         book.insert(c.legs[leg].pool, Arc::new(trigger.clone()));
         book.insert(other.spec.pool, Arc::clone(other));
-        let (terms, _) = self.terms_for(c, &pxc, 0, self.settings.max_size(c.start));
+        let pools = if leg == 0 { [trigger, &**other] } else { [&**other, trigger] };
+        let (terms, _) = self.terms_for(c, pools, &pxc, 0, self.settings.max_size(c.start));
         match sized_trade(c, &book, &terms, U256::from(pxc.costs.wei_per_gas), &pxc.gas) {
             SizedOutcome::Trade { gross, .. } => pxc.in_wei(gross).as_u128() as f64,
             SizedOutcome::NoTrade(_) => 0.0,

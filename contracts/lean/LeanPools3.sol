@@ -95,8 +95,7 @@ library LeanPools3 {
             uint256 word = uint256(IExtsload3(POOL_MANAGER).extsload(leg.state));
             leg.sqrtP = uint160(word);
             leg.tick = int24(uint24(word >> 160));
-            if (uint24(word >> 184) != 0) return false;
-            leg.feePpm = uint24(word >> 208);
+            leg.feePpm = _swapFee(uint24(word >> 184), uint24(word >> 208), leg.zeroForOne);
             leg.liquidity = uint128(uint256(IExtsload3(POOL_MANAGER).extsload(bytes32(uint256(leg.state) + 3))));
         } else {
             (uint256 sqrtWord, uint256 tickWord) = _twoWords(hop.pool, abi.encodeWithSignature("slot0()"));
@@ -161,6 +160,16 @@ library LeanPools3 {
             b.netRead = true;
         }
         return b.net;
+    }
+
+    /// R51: the one fee a v4 swap steps on, v4-core's
+    /// `ProtocolFeeLibrary.calculateSwapFee`: the trade's direction's 12 bits of
+    /// the protocol fee (zero for one the low 12) composed with the LP fee.
+    /// `Pool.swap` takes the protocol's share off each step's fee afterwards,
+    /// so what the trade is paid depends on this fee alone.
+    function _swapFee(uint24 protocolFee, uint24 lpFee, bool zeroForOne) private pure returns (uint24) {
+        uint256 pf = (zeroForOne ? protocolFee : protocolFee >> 12) & 0xfff;
+        return uint24(pf + lpFee - pf * lpFee / 1_000_000);
     }
 
     function _word(Leg memory leg, int16 wordPos) private view returns (uint256) {
