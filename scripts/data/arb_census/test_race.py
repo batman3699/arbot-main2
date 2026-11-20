@@ -36,6 +36,13 @@ class Trigger(unittest.TestCase):
         history = {"p": [((1, 0, 0), leg("p", -60))], "q": [((1, 5, 0), leg("q", 70))]}
         self.assertEqual(race.trigger(history, [leg("p", 100), leg("q", -100)]), (1, 5, 0))
 
+    def test_the_trigger_names_its_pool(self):
+        # R49: which of the arbitrage's pools the trigger was on.
+        history = {"p": [((1, 0, 0), leg("p", -60))], "q": [((1, 5, 0), leg("q", 70))]}
+        self.assertEqual(race.trigger_of(history, [leg("p", 100), leg("q", -100)]), ((1, 5, 0), "q"))
+        self.assertEqual(race.trigger_of({"p": history["p"]}, [leg("p", 100), leg("q", -100)]), ((1, 0, 0), "p"))
+        self.assertIsNone(race.trigger_of({}, [leg("p", 100)]))
+
     def test_no_trigger_when_the_flow_never_reached_half(self):
         history = {"p": [((1, 0, 0), leg("p", -20)), ((1, 1, 0), leg("p", -20))]}
         self.assertIsNone(race.trigger(history, [leg("p", 100)]))
@@ -45,6 +52,51 @@ class Trigger(unittest.TestCase):
         three = Leg("0xh", 1, "v", "p", {T: 5, U: -1, WETH: -4})
         self.assertIsNone(race.flow(three))
         self.assertEqual(race.flow(leg("p", -7)), (T, -7))
+
+
+class TriggerPools(unittest.TestCase):
+    """R49: a cached day's triggers given their pools, from the log at each
+    trigger's position in its transaction's receipt."""
+
+    V4_ID = "0x" + "c1" * 32
+
+    class Rpc:
+        """Block 7's transaction 2 logs a swap on 0xpp at 5, on 0xqq at 4 and
+        a v4 swap at 8; block 9's transaction 9 does not read."""
+
+        def __init__(self):
+            self.asked = []
+
+        def batch(self, calls):
+            out = []
+            for method, params in calls:
+                self.asked.append((method, tuple(params)))
+                if method == "eth_getTransactionByBlockNumberAndIndex":
+                    out.append(None if params == [hex(9), hex(9)] else {"hash": "0xt7"})
+                else:
+                    out.append({"logs": [
+                        {"logIndex": hex(4), "address": "0xQQ", "topics": ["0x" + "ab" * 32]},
+                        {"logIndex": hex(5), "address": "0xPP", "topics": ["0x" + "ab" * 32]},
+                        {"logIndex": hex(8), "address": race.V.POOL_MANAGER, "topics": [race.V.UNI_V4, TriggerPools.V4_ID]}]})
+            return out
+
+    def test_the_log_at_the_trigger_names_its_pool(self):
+        a = {"pools": ["0xpp", "0xqq"], "trigger": [7, 2, 5]}
+        b = {"pools": ["0xpp", "0xqq"], "trigger": [7, 2, 4]}
+        v4 = {"pools": [self.V4_ID, "0xpp"], "trigger": [7, 2, 8]}
+        rpc = self.Rpc()
+        self.assertEqual(len(race.read_trigger_pools(rpc, [a, b, v4])), 3)
+        self.assertEqual((a["trigger_pool"], b["trigger_pool"], v4["trigger_pool"]), ("0xpp", "0xqq", self.V4_ID))
+        self.assertEqual(sum(1 for m, _ in rpc.asked if m == "eth_getTransactionReceipt"), 1, "one receipt a transaction")
+
+    def test_a_trigger_that_does_not_read_is_marked(self):
+        gone = {"pools": ["0xpp", "0xqq"], "trigger": [9, 9, 1]}       # its transaction does not read
+        no_log = {"pools": ["0xpp", "0xqq"], "trigger": [7, 2, 6]}     # no log at that position
+        elsewhere = {"pools": ["0xpp", "0xrr"], "trigger": [7, 2, 4]}  # a log on a pool not the arbitrage's
+        self.assertEqual(race.read_trigger_pools(self.Rpc(), [gone, no_log, elsewhere]), [])
+        for x in (gone, no_log, elsewhere):
+            self.assertNotIn("trigger_pool", x)
+            self.assertTrue(x["trigger_unread"])
 
 
 class Route(unittest.TestCase):

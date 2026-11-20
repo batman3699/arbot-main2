@@ -197,8 +197,8 @@ pub struct Candidate {
     pub ev: f64,
     pub worst_wei: u128,
     /// R43: what the census values the arm's pair at: a spike tier's senders
-    /// go to the highest. Nothing for a pair it does not target. R48: times
-    /// [`LAGGARD_RANK`] when the trigger is the shallower pool of the pair.
+    /// go to the highest. Nothing for a pair it does not target. R48/R49:
+    /// split between its two legs by [`spike_rank`].
     pub rank: f64,
 }
 
@@ -256,6 +256,25 @@ pub const LAGGARD_RANK: f64 = 0.11;
 /// trade the same two tokens, so the two compare.
 pub fn leads(trigger: &PoolSnapshot, other: &PoolSnapshot) -> bool {
     depth(trigger) >= depth(other)
+}
+
+/// R49: what R48's depth rule counts for, in dollars of the census's
+/// observed triggers, when a leg is ranked by its route's trigger split.
+pub const TRIGGER_PRIOR_USD: f64 = 100.0;
+
+/// R49: a spike candidate's rank, for the leg `leg` of a route worth
+/// `route_usd`, whose trigger is the deeper pool when `leads`: the route's
+/// value times the share of it the census saw start on that leg's pool, the
+/// depth rule (R48's weight, 1 or [`LAGGARD_RANK`]) counting for
+/// [`TRIGGER_PRIOR_USD`] of the observations. Without a split it is R48's
+/// rank; with a large one, the route's value times the leg's share. Route #2
+/// on 2026-11-20 is why: its $2,169 trade of the week began on the pool
+/// R48's rule ranked second.
+pub fn spike_rank(route_usd: f64, trigger_usd: Option<[f64; 2]>, leg: usize, leads: bool) -> f64 {
+    let prior = if leads { 1.0 } else { LAGGARD_RANK };
+    let [first, second] = trigger_usd.unwrap_or([0.0, 0.0]);
+    let seen = if leg == 0 { first } else { second };
+    route_usd * (seen + TRIGGER_PRIOR_USD * prior) / (first + second + TRIGGER_PRIOR_USD)
 }
 
 fn depth(p: &PoolSnapshot) -> f64 {
@@ -349,10 +368,15 @@ struct State {
 /// R43: what the census values a cycle's route at.
 pub type RouteRank = Arc<dyn Fn(&Cycle) -> f64 + Send + Sync>;
 
+/// R49: how much of a cycle's route's value the census saw start on each of
+/// its pools, in the cycle's leg order; `None` without a split.
+pub type TriggerSplit = Arc<dyn Fn(&Cycle) -> Option<[f64; 2]> + Send + Sync>;
+
 pub struct SizedEngine {
     cycles: BTreeMap<RouteId, Cycle>,
     bids: RouteBids,
     rank: RouteRank,
+    trigger_usd: TriggerSplit,
     contest: Option<Arc<ShareSample>>,
     bid_model: BidModel,
     settings: SizedSettings,
@@ -382,6 +406,7 @@ impl SizedEngine {
             cycles,
             bids: Arc::new(|_, _, _| RouteWinners::default()),
             rank: Arc::new(|_| 0.0),
+            trigger_usd: Arc::new(|_| None),
             contest: None,
             bid_model: BidModel::BestBid,
             settings,
@@ -408,6 +433,14 @@ impl SizedEngine {
     #[must_use]
     pub fn with_rank(mut self, rank: RouteRank) -> Self {
         self.rank = rank;
+        self
+    }
+
+    /// R49: where the census saw each route's trades start, which orders a
+    /// spike tier's legs ([`spike_rank`]).
+    #[must_use]
+    pub fn with_trigger_usd(mut self, split: TriggerSplit) -> Self {
+        self.trigger_usd = split;
         self
     }
 
@@ -621,9 +654,10 @@ impl SizedEngine {
             let (pool, other) = (c.legs[l].pool, c.legs[1 - l].pool);
             let up = trigger_up(c, l);
             let chance = |step: u32| st.moves.p_at_least(spread_key(pool, other), up, step).max(P_MOVE_FLOOR);
-            // R48: a spike arm on the shallower pool of its pair ranks lower.
+            // R48: a spike arm on the shallower pool of its pair ranks lower;
+            // R49: unless the census saw the route's trades begin there.
             let (trigger, across) = if l == 0 { (a, b) } else { (b, a) };
-            let rank = (self.rank)(c) * if leads(trigger, across) { 1.0 } else { LAGGARD_RANK };
+            let rank = spike_rank((self.rank)(c), (self.trigger_usd)(c), l, leads(trigger, across));
             for point in &p.points {
                 cands.push(Candidate {
                     key: (*id, *leg, point.tier),

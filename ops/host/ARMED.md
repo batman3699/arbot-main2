@@ -675,7 +675,12 @@ tiers:
   it (R48; R43 held one for each trigger pool and direction). An arm whose
   trigger is the shallower pool of its pair ranks at 0.11 of its route's
   value: it fires only when its own pool moves first, and the deeper pool
-  moved first in 89% of the big trades measured.
+  moved first in 89% of the big trades measured. R49: where the census saw
+  the route's trades begin outranks depth. targets.json carries each route's
+  `trigger_usd` (its $1-or-more arbitrage by the pool its trigger was on,
+  first pool first), and a leg ranks at the route's value times that share,
+  with the depth rule counting for $100 of it. The targets job reads the
+  trigger pools of days cached before R49 from their receipts, once.
 - `reserve` is the spike tiers' alone (R43.1). `worst_case` holds the gas
   limit at the arm's fee, as before. `no_trade` holds 140,000 gas at it: what
   an inclusion that does not trade costs. The ordinary tiers always hold

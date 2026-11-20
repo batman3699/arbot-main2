@@ -224,6 +224,22 @@ fn a_stale_or_malformed_file_is_refused() {
     assert!(load(&good.replace("2026-10-24T01:10:00Z", "yesterday"), GENERATED).is_err(), "an unreadable time");
 }
 
+/// R49: a route's value split by the pool its trigger was on, first pool
+/// first, when the census recorded it; a negative share is refused.
+#[test]
+fn a_routes_trigger_split_loads_and_a_negative_one_is_refused() {
+    let split = format!(r#"{{"pools":["{:#x}","{:#x}"],"usd":12.5,"arbs":3,"trigger_usd":[3.25,9.0]}}"#, p(1), p(2));
+    let routes = [split, route(p(3), p(4), None)].join(",");
+    let t = load(&targets_json("2026-10-24T01:10:00Z", true, &routes, "1"), GENERATED).unwrap();
+    assert_eq!(t.trigger_usd_for(WETH, p(1), p(2)), Some([3.25, 9.0]));
+    assert_eq!(t.trigger_usd_for(WETH, p(3), p(4)), None, "a route the census has no split for");
+    assert_eq!(t.trigger_usd_for(WETH, p(2), p(1)), None, "the other direction is another route");
+    assert_eq!(t.trigger_usd_for(USDC, p(1), p(2)), None, "and so is the other start token");
+    let negative = targets_json("2026-10-24T01:10:00Z", true, &routes.replace("3.25", "-3.25"), "1");
+    let err = load(&negative, GENERATED).unwrap_err();
+    assert!(err.contains("trigger"), "{err}");
+}
+
 /// A file stamped later than now by more than the clock skew allowed is
 /// refused, not read as brand new.
 #[test]

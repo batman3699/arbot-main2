@@ -11,7 +11,9 @@ The trigger is inferred, counting back from the arbitrage: on one of its
 pools, where the net flow against the arbitrage's leg there reached half of
 what that leg moved; the latest such point over its pools. On a pool that
 trades every block, the last opposite trade before an arbitrage is usually
-noise; half its flow is the move it took back.
+noise; half its flow is the move it took back. R49: the pool it was on is
+recorded beside it (`trigger_pool`), and a day cached before that is given
+it from the receipts (`read_trigger_pools`).
 
 Then what our landings would have kept of each (R33's: each measured
 sequencer-route delay, sent 52 ms after the proposal): all of it, landing in
@@ -78,6 +80,13 @@ def trigger(history, arb_legs, share=SHARE):
     arbitrage. The latest position by which, on one of its pools, the net
     flow against its leg there, counted back from it, reached `share` of what
     that leg moved; None when none did."""
+    t = trigger_of(history, arb_legs, share)
+    return t[0] if t else None
+
+
+def trigger_of(history, arb_legs, share=SHARE):
+    """R49: `trigger`'s position and the pool it was on, of the arbitrage's
+    own; None when there is none."""
     best = None
     for a in arb_legs:
         f = flow(a)
@@ -91,9 +100,38 @@ def trigger(history, arb_legs, share=SHARE):
                 continue
             acc += -hf[1] if d > 0 else hf[1]
             if acc >= need:
-                best = pos if best is None or pos > best else best
+                if best is None or pos > best[0]:
+                    best = (pos, a.pool)
                 break
     return best
+
+
+def read_trigger_pools(rpc, want):
+    """R49: each arbitrage in `want` given `trigger_pool`, the pool of the log
+    at its trigger's position, from that transaction's receipt: for a day
+    cached before the race census recorded it. One whose transaction or
+    receipt did not read, with no log at that position, or whose log is on
+    none of its own pools, is marked `trigger_unread`. Returns those given a
+    pool."""
+    if not want:
+        return []
+    spots = sorted({(int(a["trigger"][0]), int(a["trigger"][1])) for a in want})
+    txs = rpc.batch([("eth_getTransactionByBlockNumberAndIndex", [hex(b), hex(i)]) for b, i in spots])
+    hashes = {s: t["hash"] for s, t in zip(spots, txs) if t and t.get("hash")}
+    order = sorted(set(hashes.values()))
+    receipts = dict(zip(order, rpc.batch([("eth_getTransactionReceipt", [h]) for h in order]))) if order else {}
+    read = []
+    for a in want:
+        b, i, at = (int(x) for x in a["trigger"][:3])
+        r = receipts.get(hashes.get((b, i))) or {}
+        log = next((l for l in r.get("logs", ()) if int(l["logIndex"], 16) == at), None)
+        pool = V.pool_key(log) if log else None
+        if pool is not None and pool.lower() in {str(p).lower() for p in a.get("pools", ())}:
+            a["trigger_pool"] = pool.lower()
+            read.append(a)
+        else:
+            a["trigger_unread"] = True
+    return read
 
 
 def route_of(legs):
@@ -284,10 +322,11 @@ def _race_day(rpc, resolver, ledger, lo, hi, say, back=BACK_BLOCKS):
                     venues = sorted({x.venue for x in legs})
                     past = {g.pool: _decoded(history.get(g.pool, ()), resolver.meta) for g in legs}
                     weth_in, pools, gain, start_in = route_of(legs)
+                    t = trigger_of(past, legs)
                     arbs.append({"tx": tx, "block": blk, "txi": txi, "venues": venues, "category": category(venues),
                                  "hops": len(legs), "change": {k: x for k, x in detect.trader_change(legs).items() if x > 0},
                                  "pools": pools, "weth_in": weth_in, "gain": gain, "start_in": start_in,
-                                 "trigger": trigger(past, legs)})
+                                 "trigger": t[0] if t else None, "trigger_pool": t[1] if t else None})
             for pos, l in items:
                 k = V.pool_key(l)
                 if k is not None:

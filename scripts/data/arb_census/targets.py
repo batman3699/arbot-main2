@@ -224,6 +224,22 @@ def sample_small(day: Mapping[str, Any], selected: set[tuple[str, str, str]], rp
     return len(read)
 
 
+def fill_trigger_pools(day: Mapping[str, Any], selected: set[tuple[str, str, str]], rpc: Any) -> int:
+    """R49: give the selected routes' eligible arbitrage of
+    ``race.VALUED_USD`` or more on ``day`` the pool its trigger was on, where
+    a day cached before the race census recorded it has none. A rerun reads
+    only what is left: one given a pool, or marked unread, is not asked for
+    again. Returns how many were given a pool."""
+    want: list[dict[str, Any]] = []
+    for arb in day.get("arbs", []):
+        if not select(arb) or arb.get("trigger_pool") or arb.get("trigger_unread") or not arb.get("trigger"):
+            continue
+        usd = _finite_number(arb.get("usd"))
+        if _build_key(arb) in selected and usd is not None and usd >= race.VALUED_USD:
+            want.append(arb)
+    return len(race.read_trigger_pools(rpc, want)) if want else 0
+
+
 def _day_label(day: Mapping[str, Any]) -> str | None:
     value = day.get("date") or day.get("day")
     if not isinstance(value, str):
@@ -356,9 +372,18 @@ def build(days: Sequence[Mapping[str, Any]], top: int = 50) -> dict[str, Any]:
                     finite_source_data = False
 
             item = by_route.setdefault(key, {"pools": [key[0], key[1]], "start": key[2], "usd": 0.0,
-                                             "arbs": 0, "_bids": [], "_bands": [[] for _ in range(len(BAND_EDGES_USD) + 1)]})
+                                             "arbs": 0, "_bids": [], "_bands": [[] for _ in range(len(BAND_EDGES_USD) + 1)],
+                                             "_trigger": [0.0, 0.0]})
             item["usd"] += usd
             item["arbs"] += 1
+            # R49: what each of its pools triggered, of its arbitrage of
+            # race.VALUED_USD or more (a cached day's are read back from the
+            # receipts down to that, by fill_trigger_pools).
+            trigger_pool = _normalise(arb.get("trigger_pool"))
+            if trigger_pool is not None and usd >= race.VALUED_USD:
+                for leg, pool in enumerate(item["pools"]):
+                    if trigger_pool == pool:
+                        item["_trigger"][leg] += usd
             bid = _observed_bid(arb)
             if bid is not None:
                 if usd >= race.VALUED_USD:
@@ -384,6 +409,9 @@ def build(days: Sequence[Mapping[str, Any]], top: int = 50) -> dict[str, Any]:
             # A band with too few of the route's own is left empty: the
             # runtime bids it against the route's R36 list, as before bands.
             row["bands_wei_per_gas"] = [sorted(b) if len(b) >= MIN_ROUTE_BIDS else [] for b in item["_bands"]]
+        if item["_trigger"][0] + item["_trigger"][1] > 0:
+            # R49: the engine's spike tiers wait on the pool that moves first.
+            row["trigger_usd"] = list(item["_trigger"])
         routes.append(row)
 
     all_bids, _, bids_by_day = _selected_route_observations(days, selected_keys)
@@ -831,9 +859,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     selected = {(r["pools"][0], r["pools"][1], r["start"]) for r in build(days, args.top)["routes"]}
     for day, data in zip(days_to_process, days):
         read = sample_small(data, selected, rpc)
-        if read:
+        # R49: and the pools their triggers were on, where the cache has none.
+        pools = fill_trigger_pools(data, selected, rpc)
+        if read or pools:
             _atomic_gzip_json(race_dir / f"race-{day}.json.gz", data)
-            print(f"{day}: read {read} cheap winners' receipts", flush=True)
+            print(f"{day}: read {read} cheap winners' receipts, {pools} trigger pools", flush=True)
     targets = build(days, args.top)
     # R38: the armed bid's contest sample, from our own judged fires. It
     # never changes whether the targets publish.

@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from arb_census import race, targets as T
 from arb_census.venues import USDC, WETH
@@ -289,6 +290,53 @@ class SampleSmall(unittest.TestCase):
         out = T.build(days, top=50)
         self.assertEqual(out["bids_wei_per_gas"], [])
         self.assertEqual(out["routes"][0]["bands_wei_per_gas"][0], sorted(list(range(1, 11)) * 3))
+
+
+class TriggerUsd(unittest.TestCase):
+    """R49: a route's value split by the pool its trigger was on: the
+    engine's spike tiers wait on the pool that moves first."""
+
+    def test_a_routes_value_is_split_by_its_trigger_pool(self):
+        rows = [dict(arb(usd=30.0), trigger_pool="pa"), dict(arb(usd=5.0), trigger_pool="PB"),
+                dict(arb(usd=0.5), trigger_pool="pb"),   # under $1: not counted
+                arb(usd=7.0)]                             # no trigger pool: not counted
+        out = T.build([{"arbs": rows}] * 3, top=50)
+        self.assertEqual(out["routes"][0]["trigger_usd"], [90.0, 15.0])
+        self.assertEqual(out["routes"][0]["usd"], 127.5, "the route's own value is unchanged")
+
+    def test_a_route_with_no_trigger_pool_has_no_split(self):
+        out = T.build([{"arbs": [arb(usd=30.0)]}] * 3, top=50)
+        self.assertNotIn("trigger_usd", out["routes"][0])
+
+
+class FillTriggerPools(unittest.TestCase):
+    """R49: the cached days' trigger pools, read once for the selected
+    routes' arbitrage of $1 or more."""
+
+    ROUTE = {("pa", "pb", WETH)}
+
+    def test_only_the_selected_routes_valued_triggers_without_a_pool_are_read(self):
+        a = dict(arb(usd=5.0), trigger=[7, 1, 3])
+        small = dict(arb(usd=0.5), trigger=[7, 1, 3])
+        other = dict(arb(usd=5.0, pools=("pc", "pd"), weth_in="pc"), trigger=[7, 1, 3])
+        have = dict(arb(usd=5.0), trigger=[7, 1, 3], trigger_pool="pb")
+        none = dict(arb(usd=5.0), trigger=None)
+        failed = dict(arb(usd=5.0), trigger=[7, 1, 4], trigger_unread=True)
+        day = {"arbs": [a, small, other, have, none, failed]}
+
+        def read(rpc, want):
+            for w in want:
+                w["trigger_pool"] = "pa"
+            return list(want)
+        with mock.patch.object(race, "read_trigger_pools", side_effect=read) as m:
+            self.assertEqual(T.fill_trigger_pools(day, self.ROUTE, object()), 1)
+        self.assertEqual(m.call_args[0][1], [a])
+        self.assertEqual(a["trigger_pool"], "pa")
+
+    def test_nothing_to_read_asks_nothing(self):
+        with mock.patch.object(race, "read_trigger_pools") as m:
+            self.assertEqual(T.fill_trigger_pools({"arbs": [arb(usd=5.0)]}, self.ROUTE, object()), 0)
+        m.assert_not_called()
 
 
 class MarketShare(unittest.TestCase):

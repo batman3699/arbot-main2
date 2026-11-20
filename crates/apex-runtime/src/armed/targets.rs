@@ -66,6 +66,10 @@ pub struct TargetRoute {
     pub start: Address,
     /// R37: the route's v4 pools' IDs, as the census named them.
     pub v4_ids: Vec<B256>,
+    /// R49: the value of the route's arbitrage of $1 or more whose trigger
+    /// the census saw on its first pool, and on its second; `None` from a
+    /// census that did not record it.
+    pub trigger_usd: Option<[f64; 2]>,
 }
 
 /// A route as the file holds it: pools as 20-byte addresses or 32-byte v4
@@ -81,6 +85,8 @@ struct RawRoute {
     bands_wei_per_gas: Option<Vec<Vec<u128>>>,
     #[serde(default)]
     start: Option<Address>,
+    #[serde(default)]
+    trigger_usd: Option<[f64; 2]>,
 }
 
 impl TryFrom<RawRoute> for TargetRoute {
@@ -109,6 +115,7 @@ impl TryFrom<RawRoute> for TargetRoute {
             bands_wei_per_gas: r.bands_wei_per_gas,
             start: r.start.unwrap_or(crate::live::frontier::WETH),
             v4_ids,
+            trigger_usd: r.trigger_usd,
         })
     }
 }
@@ -194,6 +201,9 @@ impl Targets {
             if r.usd < 0.0 {
                 return Err(format!("targets file {shown}: the route {:#x}, {:#x} is worth {}", r.pools[0], r.pools[1], r.usd));
             }
+            if r.trigger_usd.is_some_and(|v| v.iter().any(|x| *x < 0.0)) {
+                return Err(format!("targets file {shown}: {named}'s trigger split {:?} is negative", r.trigger_usd));
+            }
         }
         t.index();
         Ok(t)
@@ -244,6 +254,12 @@ impl Targets {
     /// target.
     pub fn usd_for(&self, start: Address, start_in: Address, other: Address) -> f64 {
         self.routes.iter().filter(|r| r.start == start && r.pools == [start_in, other]).map(|r| r.usd).sum()
+    }
+
+    /// R49: the route's value by the pool its trades began on, `start_in`'s
+    /// first; `None` for a route it does not target or has no split for.
+    pub fn trigger_usd_for(&self, start: Address, start_in: Address, other: Address) -> Option<[f64; 2]> {
+        self.routes.iter().find(|r| r.start == start && r.pools == [start_in, other]).and_then(|r| r.trigger_usd)
     }
 
     /// The winners' bids an arm on the route `start` into `start_in`, then

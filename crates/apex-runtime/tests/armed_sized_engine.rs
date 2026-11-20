@@ -7,7 +7,7 @@ use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::armed::lines::ArmedLine;
-use apex_runtime::armed::sized::{fill, fill_spike, leads, Candidate, Reserve, SizedEngine, SizedSettings};
+use apex_runtime::armed::sized::{fill, fill_spike, leads, spike_rank, Candidate, Reserve, SizedEngine, SizedSettings, LAGGARD_RANK};
 use apex_runtime::armed::threshold::{Pricing, SpikeTier, SPIKE_TIER_BASE};
 use apex_runtime::econ::RouteCosts;
 use apex_runtime::live::book::{Move, PoolSnapshot};
@@ -309,6 +309,44 @@ fn a_spike_sender_waits_on_the_deeper_pool() {
         let trigger = &a.pools[usize::from(a.trigger_leg)];
         assert_eq!(trigger, &format!("{deep:#x}"), "the trigger is the deeper pool, not {shallow:#x}");
     }
+}
+
+/// R49: a spike leg's rank is its route's value split by where the census saw
+/// the route's trades start, with R48's depth rule counting for
+/// `TRIGGER_PRIOR_USD` of them, so one small trade does not flip a leg.
+#[test]
+fn a_spike_legs_rank_follows_the_census_trigger_split() {
+    assert_eq!(spike_rank(1_000.0, None, 0, true), 1_000.0, "without a split, R48's");
+    assert_eq!(spike_rank(1_000.0, None, 1, false), 1_000.0 * LAGGARD_RANK);
+    assert_eq!(spike_rank(1_000.0, Some([0.0, 0.0]), 1, false), 1_000.0 * LAGGARD_RANK, "an empty split says nothing");
+    // Route #2 on 2026-11-20: its $2,169 trade began on the shallower pool.
+    let deep = spike_rank(2_224.0, Some([0.0, 2_169.0]), 0, true);
+    let shallow = spike_rank(2_224.0, Some([0.0, 2_169.0]), 1, false);
+    assert!(shallow > 10.0 * deep, "{shallow} against {deep}");
+    assert!(shallow <= 2_224.0, "never more than the route's value");
+    let leader = spike_rank(1_000.0, Some([20.0, 0.0]), 1, true);
+    let one_trade = spike_rank(1_000.0, Some([20.0, 0.0]), 0, false);
+    assert!(leader > one_trade, "$20 of trades does not outweigh depth: {leader} against {one_trade}");
+}
+
+/// R49: where the census saw a route's trades start outranks depth: the one
+/// sender waits on Pancake's pool although Uniswap's holds four times its
+/// liquidity.
+#[test]
+fn a_spike_sender_waits_where_the_census_saw_the_trades_start() {
+    let (e, mut snap) = engine_with(5, vec![tier(1)], Reserve::WorstCase);
+    let mut p = (*snap[&UNI]).clone();
+    p.state.liquidity = 4 * L;
+    snap.insert(UNI, Arc::new(p));
+    let e = e
+        .with_rank(Arc::new(|c| if c.legs[0].pool == CAKE { 7.0 } else { 0.0 }))
+        .with_trigger_usd(Arc::new(|c| (c.legs[0].pool == CAKE).then_some([500.0, 0.0])));
+    let lines = e.tick(&snap, 1_000, 300_000, &px(), 1, BUDGET, 1_500_000_000);
+    let spikes: Vec<_> = arms(&lines).into_iter().filter(|a| a.rung >= SPIKE_TIER_BASE).collect();
+    assert_eq!(spikes.len(), 1);
+    let a = spikes[0];
+    assert_eq!(a.pools[0], format!("{CAKE:#x}"), "the ranked route");
+    assert_eq!(a.pools[usize::from(a.trigger_leg)], format!("{CAKE:#x}"), "its trades began on Pancake's pool");
 }
 
 /// R48: the depth a spike arm's leg is ranked by: in-range liquidity, or for

@@ -842,10 +842,13 @@ async fn boot(config: ShadowConfig, env: &Env) -> Result<Shadow, ShadowError> {
                     };
                     let t = targets.clone();
                     let ranked = targets.clone();
+                    let split = targets.clone();
                     let engine = crate::armed::sized::SizedEngine::new(armed_set.clone(), settings, unarmable.clone())
                         .with_bids(Arc::new(move |start, start_in, other| t.as_ref().map_or_else(Default::default, |t| t.winners_for(start, start_in, other))))
                         // R43: a spike tier's senders go where the census found the most value.
                         .with_rank(Arc::new(move |c| ranked.as_ref().map_or(0.0, |t| t.usd_for(c.start, c.legs[0].pool, c.legs[1].pool))))
+                        // R49: and wait on the pool its trades began on.
+                        .with_trigger_usd(Arc::new(move |c| split.as_ref().and_then(|t| t.trigger_usd_for(c.start, c.legs[0].pool, c.legs[1].pool))))
                         .with_contest(contest.clone(), config.armed.bid_model);
                     if let Some(path) = &config.armed.moves {
                         if let Ok(snap) = crate::armed::moves::MovesSnapshot::load(path) {
