@@ -114,6 +114,14 @@ pub struct PoolSnapshot {
 }
 
 impl PoolSnapshot {
+    /// R50: whether a v4 pool's fee holds a protocol fee: the book composes
+    /// one into the fee, which is then above the key's. Exact for every v4
+    /// pool the book loads: a static fee's LP fee is the key's (PoolManager's
+    /// `initialize`), and dynamic fees are refused.
+    pub fn v4_protocol_fee_on(&self) -> bool {
+        self.spec.v4.is_some_and(|k| self.state.fee_ppm != k.fee)
+    }
+
     /// Whether the current price is inside the range the ladder proved. Outside
     /// it a quote would walk off the ladder, so the pricer refuses the pool until
     /// it is reloaded.
@@ -252,7 +260,8 @@ pub enum Unloadable {
     /// An Aerodrome v2 pool on the stable curve, which is not the one priced.
     NotVolatile,
     /// R37: a v4 pool refused: its key does not hash to its ID, its hook is
-    /// off the allowlist or its code changed, or a protocol fee is on.
+    /// off the allowlist or its code changed, or (R50) its protocol fee
+    /// differs by direction.
     V4Refused { why: &'static str },
 }
 
@@ -771,9 +780,11 @@ pub struct V4Read {
 const EMPTY_CODE_HASH: B256 = alloy_primitives::b256!("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470");
 
 /// A v4 pool's snapshot from its read, its ladder through `ticks` (R37). The
-/// inventory is not trusted: the key must hash to the pool's ID, its hook must
-/// be on the allowlist with the code it was reviewed at, and no protocol fee
-/// may be on (the R37 plan's ruling: exact over composed).
+/// inventory is not trusted: the key must hash to the pool's ID, and its hook
+/// must be on the allowlist with the code it was reviewed at. A protocol fee
+/// is composed into the pool's fee (R50: composing is exact, so the R37
+/// plan's "exact over composed" no longer refuses it), unless its two
+/// directions differ.
 pub async fn v4_snapshot<S: apex_venues::cl_ticks::TickDataSource + ?Sized>(
     spec: &PoolSpec,
     read: &V4Read,
@@ -795,8 +806,12 @@ pub async fn v4_snapshot<S: apex_venues::cl_ticks::TickDataSource + ?Sized>(
         }
     }
     let s0 = decode_slot0(read.slot0);
-    if s0.protocol_fee != 0 {
-        return refuse("protocol fee");
+    // R50: a protocol fee is composed into the fee its swaps step on, which is
+    // exact (`swap_fee`). The book holds one fee a pool, so the two directions'
+    // must agree; on Base every pool Uniswap has switched sets both alike.
+    let fee_ppm = crate::live::v4::swap_fee(s0.protocol_fee, s0.lp_fee, true);
+    if fee_ppm != crate::live::v4::swap_fee(s0.protocol_fee, s0.lp_fee, false) {
+        return refuse("asymmetric protocol fee");
     }
     let liquidity = u128::try_from(read.liquidity).map_err(|_| Unloadable::Unreadable { read: "liquidity" })?;
     if liquidity == 0 || s0.sqrt_price_x96.is_zero() {
@@ -807,7 +822,7 @@ pub async fn v4_snapshot<S: apex_venues::cl_ticks::TickDataSource + ?Sized>(
         liquidity,
         tick: s0.tick,
         tick_spacing: key.tick_spacing,
-        fee_ppm: s0.lp_fee,
+        fee_ppm,
         balance0: read.balance0,
         balance1: read.balance1,
     };
@@ -1456,6 +1471,17 @@ impl PoolBook {
         if let Some(pos) = w.positions.get_mut(&pool) {
             pos.applied.remove(&at);
             pos.refused = pos.refused.max(Some(at.0));
+        }
+    }
+
+    /// A change to `pool` at `block` that the book does not apply in place
+    /// (R50: a v4 protocol fee, composed at the pool's read): the pool is not
+    /// the chain's until a read at or after `block`, and is listed by
+    /// [`Self::positions_unconfirmed`] until one holds it.
+    pub fn read_again_from(&self, pool: Address, block: u64) {
+        let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(pos) = w.positions.get_mut(&pool) {
+            pos.refused = pos.refused.max(Some(block));
         }
     }
 

@@ -107,6 +107,21 @@ pub fn decode_slot0(word: U256) -> Slot0 {
     }
 }
 
+/// The fee a swap in one direction steps on, in pips (R50): v4-core's
+/// `ProtocolFeeLibrary.calculateSwapFee`, `pf + lp − pf·lp/1e6`, where `pf` is
+/// that direction's 12 bits of `protocol_fee` (zero-for-one low). `Pool.swap`
+/// prices every step at this one fee and only then splits the protocol's share
+/// off the step's fee, so a trader's amounts are exactly a pool's at this fee.
+pub fn swap_fee(protocol_fee: u32, lp_fee: u32, zero_for_one: bool) -> u32 {
+    let pf = u64::from(if zero_for_one { protocol_fee } else { protocol_fee >> 12 } & 0xfff);
+    if pf == 0 {
+        return lp_fee;
+    }
+    let lp = u64::from(lp_fee & 0xff_ffff);
+    // pf < 2^12 and lp < 2^24: no step overflows, and the result is below 2^25.
+    u32::try_from(pf + lp - pf * lp / 1_000_000).unwrap_or(u32::MAX)
+}
+
 /// A pool's ID: `keccak256(abi.encode(currency0, currency1, fee, tickSpacing,
 /// hooks))`, the key PoolManager hashes. A record whose key does not hash to
 /// its ID names another pool, or none.

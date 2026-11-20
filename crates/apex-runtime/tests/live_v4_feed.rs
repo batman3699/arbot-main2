@@ -9,7 +9,9 @@ use apex_math::cl_math::get_sqrt_ratio_at_tick;
 use apex_math::cl_state::ClPoolState;
 use apex_math::cl_swap::TickLadder;
 use apex_runtime::live::book::{PoolBook, PoolSnapshot};
-use apex_runtime::live::feed::{decode_modify_liquidity, decode_v4_swap, v4_filter, Effect, FeedHandler, MODIFY_LIQUIDITY, V4_SWAP};
+use apex_runtime::live::feed::{
+    decode_modify_liquidity, decode_v4_swap, v4_filter, Effect, FeedHandler, MODIFY_LIQUIDITY, PROTOCOL_FEE_UPDATED, V4_SWAP,
+};
 use apex_runtime::live::inventory::{PoolSpec, Venue};
 use apex_runtime::live::v4::{key_address, V4Key, POOL_MANAGER};
 use apex_types::ids::ChainId;
@@ -158,5 +160,52 @@ fn a_removed_v4_log_reloads_its_pool() {
 fn no_pool_ids_no_v4_subscription() {
     assert_eq!(v4_filter(&[]), None);
     let f = v4_filter(&[ID]).unwrap();
-    assert_eq!((f.addresses, f.topics0, f.topics1), (vec![POOL_MANAGER], vec![V4_SWAP, MODIFY_LIQUIDITY], vec![ID]));
+    assert_eq!(
+        (f.addresses, f.topics0, f.topics1),
+        (vec![POOL_MANAGER], vec![V4_SWAP, MODIFY_LIQUIDITY, PROTOCOL_FEE_UPDATED], vec![ID])
+    );
+}
+
+/// PoolManager's ProtocolFeeUpdated: the pool ID in topic 1, the new fee the
+/// one word of data.
+fn fee_updated(protocol_fee: u32, block: u64, pending: bool) -> RawLog {
+    RawLog {
+        pending,
+        removed: false,
+        address: POOL_MANAGER,
+        topics: vec![PROTOCOL_FEE_UPDATED, ID],
+        data: word_u(U256::from(protocol_fee)).to_vec(),
+        block_number: Some(block),
+        transaction_hash: Some(keccak256(block.to_be_bytes())),
+        log_index: Some(0),
+        transaction_index: Some(0),
+    }
+}
+
+#[test]
+fn protocol_fee_updated_is_v4_core_s_event() {
+    assert_eq!(PROTOCOL_FEE_UPDATED, keccak256("ProtocolFeeUpdated(bytes32,uint24)"));
+}
+
+/// R50: a protocol fee is composed at the pool's read, so a change reads the
+/// pool again; a preconfirmed one may postdate the next sealed read, so the
+/// pool is read again until a read at or after the change's block holds it.
+#[test]
+fn a_protocol_fee_update_reads_its_pool_again_until_a_read_holds_it() {
+    let b = book();
+    let mut h = FeedHandler::new(ChainId(8453));
+    assert!(b.positions_unconfirmed().is_empty());
+    let effects = h.handle(&b, Notification::Log(fee_updated(0x3e83e8, 101, true)), NOW);
+    assert_eq!(effects, vec![Effect::Reload(vec![key_address(ID)])]);
+    assert_eq!(b.positions_unconfirmed(), vec![key_address(ID)], "read again until a read at 101 or later");
+    assert_eq!(b.get(key_address(ID)).unwrap().state.fee_ppm, 100, "nothing applied in place");
+}
+
+#[test]
+fn a_protocol_fee_update_without_a_pool_id_does_nothing() {
+    let b = book();
+    let mut h = FeedHandler::new(ChainId(8453));
+    let bare = RawLog { topics: vec![PROTOCOL_FEE_UPDATED], ..fee_updated(0x3e83e8, 101, false) };
+    assert_eq!(h.handle(&b, Notification::Log(bare), NOW), Vec::new());
+    assert!(b.positions_unconfirmed().is_empty());
 }

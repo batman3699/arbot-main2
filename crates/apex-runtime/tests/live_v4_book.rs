@@ -188,12 +188,55 @@ async fn negative_word_positions_read_their_own_slots() {
     assert!(book.get(key_address(k.pool_id)).unwrap().ladder.ticks().iter().any(|(t, _)| *t == lower));
 }
 
+/// R50: a protocol fee is composed into the fee its swaps step on, 10 pips
+/// each way on a 100-pip LP fee: 10 + 100 − ⌊10·100/1e6⌋.
 #[tokio::test]
-async fn a_v4_pool_whose_protocol_fee_turns_on_is_refused_at_read() {
+async fn a_v4_pool_with_a_protocol_fee_loads_at_the_fee_its_swaps_step_on() {
     let (c, k, _, _) = chain(0x00a00a);
     let (book, refused) = load(c, spec(k), &allow()).await;
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(book.get(key_address(k.pool_id)).expect("loaded").state.fee_ppm, 110);
+}
+
+/// The book holds one fee a pool: two directions that differ are refused.
+#[tokio::test]
+async fn an_asymmetric_protocol_fee_is_refused_at_read() {
+    let (c, k, _, _) = chain(0x00a014);
+    let (book, refused) = load(c, spec(k), &allow()).await;
     assert!(book.get(key_address(k.pool_id)).is_none());
-    assert_eq!(refused[0].why, Unloadable::V4Refused { why: "protocol fee" });
+    assert_eq!(refused[0].why, Unloadable::V4Refused { why: "asymmetric protocol fee" });
+}
+
+/// Uniswap switches protocol fees on pool by pool (1,431 on Base 2026-11-17
+/// to 20): one switched on while the book holds the pool is composed at the
+/// pool's next read, and the pool stays.
+#[tokio::test]
+async fn a_protocol_fee_switched_on_mid_run_is_composed_at_the_next_read() {
+    let (c, k, _, _) = chain(0);
+    let (book, _) = load(Arc::clone(&c), spec(k), &allow()).await;
+    assert_eq!(book.get(key_address(k.pool_id)).unwrap().state.fee_ppm, 100);
+    c.slots.lock().unwrap().insert(state_slot(k.pool_id), slot0(TICK, 0x00a00a, 100));
+    let refused = book.reload(&ChainReads::new(c), &[key_address(k.pool_id)], BLOCK + 1).await.unwrap();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert_eq!(book.get(key_address(k.pool_id)).expect("still held").state.fee_ppm, 110);
+}
+
+/// R50: a fee change the feed saw before its block was sealed. A read at an
+/// earlier block leaves the pool listed to be read again; one at the change's
+/// block clears it, its fee composed.
+#[tokio::test]
+async fn a_pool_flagged_for_a_protocol_fee_is_read_again_until_a_read_holds_it() {
+    let (c, k, _, _) = chain(0);
+    let (book, _) = load(Arc::clone(&c), spec(k), &allow()).await;
+    let pool = key_address(k.pool_id);
+    book.read_again_from(pool, BLOCK + 2);
+    let reads = ChainReads::new(c.clone());
+    book.reload(&reads, &[pool], BLOCK + 1).await.unwrap();
+    assert_eq!(book.positions_unconfirmed(), vec![pool], "read before the change");
+    c.slots.lock().unwrap().insert(state_slot(k.pool_id), slot0(TICK, 0x00a00a, 100));
+    book.reload(&reads, &[pool], BLOCK + 2).await.unwrap();
+    assert!(book.positions_unconfirmed().is_empty(), "the read holds the change");
+    assert_eq!(book.get(pool).unwrap().state.fee_ppm, 110);
 }
 
 #[tokio::test]

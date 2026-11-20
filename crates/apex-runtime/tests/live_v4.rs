@@ -90,6 +90,28 @@ fn refusals() {
     assert_eq!(refusal(&key(100, ALPHA_HOOK), AXIS, USDC, &none), Some("hook not allowlisted"));
 }
 
+/// R50: the fee a v4 swap steps on with a protocol fee on, v4-core's
+/// `ProtocolFeeLibrary.calculateSwapFee`: `pf + lp − pf·lp/1e6`, rounded down
+/// in the product, with the direction's 12 bits (zero-for-one low). The
+/// protocol fees are the chain's, read by StateView 2026-11-20 from three of
+/// the target pools the book refused.
+#[test]
+fn a_protocol_fee_composes_with_the_lp_fee_as_v4_core_does() {
+    use apex_runtime::live::v4::swap_fee;
+    // 0x064a…: 1,000 pips each way (0x3e83e8) on a 30,000 LP fee.
+    assert_eq!(swap_fee(4_097_000, 30_000, true), 30_970);
+    assert_eq!(swap_fee(4_097_000, 30_000, false), 30_970);
+    // 0xf97d…: 262 each way (0x106106) on 1,500; 262·1,500/1e6 rounds to 0.
+    assert_eq!(swap_fee(1_073_414, 1_500, true), 1_762);
+    // 0x12d7…: 125 each way (0x07d07d) on 500.
+    assert_eq!(swap_fee(512_125, 500, false), 625);
+    // Each direction its own 12 bits: 1,000 zero-for-one, 125 one-for-zero.
+    let split = (125 << 12) | 1_000;
+    assert_eq!(swap_fee(split, 30_000, true), 30_970);
+    assert_eq!(swap_fee(split, 30_000, false), 30_122, "125 + 30,000 − ⌊3.75⌋");
+    assert_eq!(swap_fee(0, 30_000, true), 30_000, "no protocol fee: the LP fee alone");
+}
+
 /// A pool's ID is `keccak256(abi.encode(PoolKey))`: AXIS's leading pool's key
 /// hashes to the ID its `Initialize` event named.
 #[test]

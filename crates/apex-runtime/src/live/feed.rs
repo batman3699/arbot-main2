@@ -89,6 +89,9 @@ pub const V4_SWAP: B256 = b256!("40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708
 /// Uniswap v4's `ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)`,
 /// from PoolManager, the pool ID in topic 1 (R37).
 pub const MODIFY_LIQUIDITY: B256 = b256!("f208f4912782fd25c7f114ca3723a2d5dd6f3bcc3ac8db5af63baa85f711d5ec");
+/// Uniswap v4's `ProtocolFeeUpdated(bytes32,uint24)`, from PoolManager, the
+/// pool ID in topic 1 (R50).
+pub const PROTOCOL_FEE_UPDATED: B256 = b256!("e9c42593e71f84403b84352cd168d693e2c9fcd1fdbcc3feb21d92b43e6696f9");
 /// Aerodrome v2's `Sync(uint256,uint256)`: a volatile pool's reserves after
 /// every swap, mint and burn — its whole state (R24).
 pub const SYNC: B256 = b256!("cf2aa50876cdfbb541206f89af0ee78d44a2abf8d328e37fa4917f982149848a");
@@ -272,12 +275,12 @@ pub fn decode_modify_liquidity(l: &RawLog) -> Option<LiquidityLog> {
 }
 
 /// R37: the v4 pools' subscription, PoolManager's Swap and ModifyLiquidity
-/// filtered to `pool_ids`. None for no pools: an unfiltered subscription
-/// would carry every v4 swap on Base.
+/// (and, R50, ProtocolFeeUpdated) filtered to `pool_ids`. None for no pools:
+/// an unfiltered subscription would carry every v4 swap on Base.
 pub fn v4_filter(pool_ids: &[B256]) -> Option<apex_chain::rpc::ws::LogFilter> {
     (!pool_ids.is_empty()).then(|| apex_chain::rpc::ws::LogFilter {
         addresses: vec![crate::live::v4::POOL_MANAGER],
-        topics0: vec![V4_SWAP, MODIFY_LIQUIDITY],
+        topics0: vec![V4_SWAP, MODIFY_LIQUIDITY, PROTOCOL_FEE_UPDATED],
         topics1: pool_ids.to_vec(),
     })
 }
@@ -554,6 +557,18 @@ impl FeedHandler {
                     Some(p) if p.delta == 0 => Vec::new(),
                     Some(p) => self.hold(book, Held::Liquidity(p), now),
                     None => v4_pool(&l).map_or_else(Vec::new, |pool| vec![Effect::Reload(vec![pool])]),
+                },
+                // R50: a v4 pool's protocol fee is composed at its read, so the
+                // pool is read again; a preconfirmed change may postdate the
+                // next sealed read, so until a read at or after its block.
+                Some(t) if *t == PROTOCOL_FEE_UPDATED => match v4_pool(&l) {
+                    Some(pool) => {
+                        if let Some(block) = l.block_number {
+                            book.read_again_from(pool, block);
+                        }
+                        vec![Effect::Reload(vec![pool])]
+                    }
+                    None => Vec::new(),
                 },
                 _ => Vec::new(),
             },

@@ -126,6 +126,34 @@ fn a_v4_hop_carries_its_key_and_the_route_borrows_from_pool_manager() {
     assert_eq!((h.kind, h.pool, h.fee, h.tick_spacing), (Hop3Kind::UniswapV4, ALPHA, 100, 1), "the key's hooks, fee and spacing");
 }
 
+/// R50: `LeanExecutor3` reads a v4 pool's slot0 at execution and returns
+/// `NoTrade(UNSUPPORTED)` while a protocol fee is on (`LeanPools3.load`), so
+/// the mirror refuses the route too: an arm on it would pay its gas and bid
+/// for nothing. The book composes the fee, so the pool's fee is then above
+/// its key's.
+#[test]
+fn a_v4_pool_with_a_protocol_fee_is_one_executor3_does_not_trade() {
+    use apex_runtime::live::v4::{key_address, V4Key, POOL_MANAGER};
+    let id = B256::repeat_byte(0x11);
+    let mut v4 = pool(key_address(id), Venue::UniswapV4, -289_960, 100);
+    (v4.spec.token0, v4.factory) = (AXIS, POOL_MANAGER);
+    v4.spec.v4 = Some(V4Key { pool_id: id, fee: 100, tick_spacing: 1, hooks: ALPHA });
+    let mut v3 = pool(UNI, Venue::UniswapV3, -289_900, 500);
+    v3.spec.token0 = AXIS;
+    let mut t = terms(U256::from(12_000_000_000u64));
+    t.rate = Some((U256::from(3u64), U256::from(1_000_000_000u64)));
+    let price = U256::from(10_000_000u64);
+    let snap = book(vec![v4.clone(), v3.clone()]);
+    let (_, cycles) = frontier::build_starts(ChainId(8453), &[USDC], &snap);
+    let c = cycles
+        .into_values()
+        .find(|c| matches!(sized_outcome(c, &snap, &t, price, &LEAN), SizedOutcome::Trade { .. }))
+        .expect("a v4 route that trades");
+    // 10 pips each way composed with the key's 100: 110.
+    v4.state.fee_ppm = 110;
+    assert_eq!(sized_outcome(&c, &book(vec![v4, v3]), &t, price, &LEAN), SizedOutcome::NoTrade(2));
+}
+
 #[test]
 fn the_plan_rate_is_the_books_plus_five_percent_rounded_up() {
     let mut t = terms(U256::one());

@@ -394,7 +394,27 @@ inventory), one record per pool, folded from PoolManager's `Initialize` logs by
 `scripts/data/v4_inventory.py`. Records carry no depth, so a v4 pool loads only
 when the census targets it (a targeted pool loads below the floor). The loader
 then applies the hook allowlist (`ops/v4-hooks.base.json`), and refuses native
-currency, dynamic fees and protocol fees.
+currency and dynamic fees.
+
+R50: a protocol fee is composed into the pool's fee at its read, as v4-core's
+`calculateSwapFee` does: the pool's swaps step on `pf + lp − pf·lp/1e6`, so
+pricing stays exact. The proof is a V4Quoter fixture on target route #2's pool
+(`tests/fixtures/v4_protocol_fee_quotes.json`).
+- Only a fee that differs by direction is refused ("asymmetric protocol fee").
+  The book holds one fee a pool. All 1,431 pools Uniswap switched on Base from
+  2026-11-17 to 11-20 set both directions alike.
+- The feed follows `ProtocolFeeUpdated` for the subscribed pools. A change
+  reads its pool again, and keeps reading it at each new head until a read at
+  or after the change's block holds it. Until then (about one block) the pool
+  is priced at its old fee.
+- Only R39's lane trades these pools. `LeanExecutor2` swaps through
+  PoolManager against the plan's minimums, which the composed quote sets
+  exactly; PoolManager's write of the protocol's share costs about 5,000 more
+  gas than the v4 model, well inside the arm's limit (1.25 × the ceiling).
+- The deployed `LeanExecutor3` refuses them at execution (`LeanPools3.load`
+  returns unsupported while slot0's protocol fee is set). The sized lane's
+  mirror refuses them the same way, so it arms none of them. Arming them
+  there needs an executor revision and an owner deploy.
 
 The one-time backfill is an agent step, as on 2026-10-28:
 

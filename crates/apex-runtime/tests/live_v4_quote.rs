@@ -18,6 +18,12 @@ fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/v4_axis_quotes.json")).expect("the fixture parses")
 }
 
+/// R50: target route #2's NOCK/USDC pool at Base block 59,821,700, its
+/// protocol fee on, recorded the same way.
+fn protocol_fee_fixture() -> Value {
+    serde_json::from_str(include_str!("fixtures/v4_protocol_fee_quotes.json")).expect("the fixture parses")
+}
+
 fn big(v: &Value) -> U256 {
     v.as_str().expect("a decimal string").parse().expect("a number")
 }
@@ -102,6 +108,27 @@ async fn snapshot(f: &Value) -> PoolSnapshot {
 async fn every_recorded_quote_is_the_ladder_s_to_the_unit() {
     let f = fixture();
     let p = snapshot(&f).await;
+    let compared = compare(&f, &p);
+    assert!(compared[0] >= 6 && compared[1] >= 6, "most sizes inside the ladder: {compared:?}");
+}
+
+/// R50: with a protocol fee on, the pool priced at the fee its swaps step on
+/// (1,000 pips each way composed with 30,000: 30,970) is the quoter's to the
+/// unit in both directions. Priced at the LP fee alone it would return about
+/// 0.1% more on every size.
+#[tokio::test]
+async fn a_pool_with_a_protocol_fee_is_the_quoter_s_at_its_composed_fee() {
+    let f = protocol_fee_fixture();
+    assert_eq!(f["slot0"]["protocol_fee"].as_u64(), Some(4_097_000), "recorded with the fee on");
+    let p = snapshot(&f).await;
+    assert_eq!(p.state.fee_ppm, 30_970);
+    let compared = compare(&f, &p);
+    assert!(compared[0] >= 6 && compared[1] >= 6, "most sizes inside the ladder: {compared:?}");
+}
+
+/// Every recorded quote inside the ladder's reach, against the book's: how
+/// many were compared in each direction (one-for-zero first).
+fn compare(f: &Value, p: &PoolSnapshot) -> [usize; 2] {
     let mut compared = [0usize; 2];
     for q in f["quotes"].as_array().unwrap() {
         let zero_for_one = q["zero_for_one"].as_bool().unwrap();
@@ -118,7 +145,7 @@ async fn every_recorded_quote_is_the_ladder_s_to_the_unit() {
         );
         compared[usize::from(zero_for_one)] += 1;
     }
-    assert!(compared[0] >= 6 && compared[1] >= 6, "most sizes inside the ladder: {compared:?}");
+    compared
 }
 
 /// LEAN's v4 hop: the fork's v4 hop inside the AXIS trade (swap 141,429,
